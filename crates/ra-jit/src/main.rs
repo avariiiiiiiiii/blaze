@@ -9222,6 +9222,7 @@ fn run_holding(
             .collect();
         let paths = Arc::new(Sources { paths });
         let before_outlines = start.elapsed();
+        let edited_sources = sources.clone();
         let sources = outlines.after_edit(&db, &listed, sources);
         let outlined = start.elapsed();
         // The files that changed in more than what the outline tells, and their crates: what
@@ -9293,6 +9294,10 @@ fn run_holding(
             let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
             programs.iter_mut().for_each(|it| it.known.touch_items(&db, crates, &by_items, fan));
             listed.touch(&db, Some(crates));
+        }
+        {
+            let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
+            programs.iter_mut().for_each(|it| it.known.after_edit(&db, &edited_sources, fan));
         }
         if !moved.is_empty() {
             programs.iter_mut().for_each(|it| {

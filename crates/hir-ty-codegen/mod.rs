@@ -116,6 +116,7 @@ mod naming;
 mod patch;
 pub use patch::Handout;
 mod places;
+mod placing;
 #[cfg(feature = "llvm")]
 mod units;
 use self::places::{row_location, source_location};
@@ -1577,6 +1578,14 @@ impl Rejections {
         }
     }
 
+    /// After an edit of `files`, once what changed in them is noted: which bodies the base
+    /// finds the places of apart from their code lower otherwise now.
+    pub fn after_edit(&mut self, db: &dyn HirDatabase, files: &[base_db::FileId], fan: &Fan<'_>) {
+        if let Some(base) = &mut self.base {
+            base.after_edit(db, files, fan);
+        }
+    }
+
     /// Notes that `files` of `crates` changed in more than the bodies of functions, and what
     /// changed can be told by the items that did, with the threads `fan` has.
     pub fn touch_items(
@@ -2008,6 +2017,10 @@ struct ObjectCodegen<'a, 'db> {
     frozen_statics: FxHashMap<StaticId, DataId>,
     imported_statics: FxHashMap<StaticId, DataId>,
     consts: FxHashMap<ConstBlob, DataId>,
+    /// The places of bodies a base's code tells of, each a data object of its own that the
+    /// patches after it define again where one moved. `None` for a patch, and an object no
+    /// edits follow.
+    places: Option<FxHashMap<placing::PlaceKey, DataId>>,
     source_paths: FxHashMap<base_db::FileId, Option<String>>,
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
@@ -4656,6 +4669,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             frozen_statics: FxHashMap::default(),
             imported_statics: FxHashMap::default(),
             consts: FxHashMap::default(),
+            places: (base.is_none()
+                && backend::edits_follow()
+                && !Target::current().writes_wasm_objects())
+            .then(FxHashMap::default),
             source_paths: FxHashMap::default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
@@ -6210,6 +6227,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 Ok(id)
             }
             DataRequest::Static(id) => self.static_data(*id),
+            DataRequest::Location(_) | DataRequest::Declaration(_)
+                if let Some(key) = placing::PlaceKey::of(request)
+                    && self.places.is_some() =>
+            {
+                self.place(key)
+            }
             DataRequest::Location(at) => self.location(*at),
             DataRequest::Declaration(func) => {
                 let found = self.declaration_at(*func);
@@ -6424,6 +6447,43 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// A `core::panic::Location`, of no place in particular when the place is not known.
     fn define_location(&mut self, found: Option<(String, u32, u32)>) -> Result<DataId> {
+        let location = self.location_blob(found)?;
+        self.define_const(location)
+    }
+
+    /// A place of a body of the base, as a data object of its own a patch can define again
+    /// where the place moved ([`placing`]).
+    fn place(&mut self, key: placing::PlaceKey) -> Result<DataId> {
+        if let Some(&id) = self.places.as_ref().and_then(|it| it.get(&key)) {
+            return Ok(id);
+        }
+        let found = match key {
+            placing::PlaceKey::At(func, span) => self.location_at(Some((func.into(), span))),
+            placing::PlaceKey::Declared(func) => self.declaration_at(func),
+        };
+        let location = self.location_blob(found)?;
+        let name = format!("ra_jit::place::{}", self.location_counter);
+        self.location_counter += 1;
+        let id = self.module.declare_data(&name, Linkage::Hidden, false, false)?;
+        self.fill_data(id, location, Target::current().section_of_static(false))?;
+        self.places.as_mut().expect("a base names its places").insert(key, id);
+        Ok(id)
+    }
+
+    /// Defines a place of the base again, under its name there, where it is now.
+    fn define_place_again(
+        &mut self,
+        symbol: &str,
+        at: placing::Location,
+    ) -> Result<()> {
+        let found = at.and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)));
+        let location = self.location_blob(found)?;
+        let id = self.module.declare_data(symbol, Linkage::Hidden, false, false)?;
+        self.fill_data(id, location, Target::current().section_of_static(false))
+    }
+
+    /// The value of a `core::panic::Location`, pointing to its file's name.
+    fn location_blob(&mut self, found: Option<(String, u32, u32)>) -> Result<ConstBlob> {
         let (file, line, col) = found.unwrap_or_else(|| ("<ra-jit>".to_owned(), 0u32, 0u32));
         let mut bytes = vec![0u8; 2 * word() + 8];
         bytes[word()..2 * word()].copy_from_slice(&(file.len() as u64).to_le_bytes()[..word()]);
@@ -6441,7 +6501,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let mut location =
             ConstBlob { bytes, relocs: Vec::new(), fn_relocs: Vec::new(), align: word() as u64 };
         location.point_to(0, name, 0);
-        self.define_const(location)
+        Ok(location)
     }
 
     /// The function to call for `func` instantiated with `args`: the rustc-compiled one when it

@@ -11,7 +11,7 @@ use std::{
 };
 
 use base_db::{Crate, FileId};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{DataId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, StaticId,
@@ -34,12 +34,16 @@ use super::{
     Rejections, Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
     compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
-    home::{body_file, body_files, instance_gone, mentioned_crates, type_gone, written_in},
+    home::{
+        body_file, body_files, instance_gone, mentioned_bodies, mentioned_crates, type_gone,
+        written_in,
+    },
     instance_serial, is_thread_local,
     itempush::{Asked, ItemPush, Settled},
     left_to_rustc,
     naming::Naming,
     root_serial, row_location, source_location,
+    placing::{Now, PlaceKey, Placing, Places, Rows, code_print},
     stable::StableNames,
     static_serial, target,
 };
@@ -174,6 +178,12 @@ impl Mark {
         let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok()?;
         let serial = instance_serial(db, instance.clone(), env.clone());
         Some(Mark::of_function(db, serial, compiled, false))
+    }
+
+    /// The mark of code whose places the base finds apart from it ([`Placing`]): of the code
+    /// but for where it is, with where it is beside.
+    fn of_code(db: &dyn HirDatabase, compiled: &CompiledFunction, debug: bool) -> Mark {
+        Mark { serial: code_print(compiled), ..Mark::of_function(db, 0, compiled, debug) }
     }
 
     /// Whether the code is the same, wherever in the file it is: a copy of rustc's that no
@@ -784,6 +794,14 @@ pub(super) struct Base {
     /// The code of the instances of functions of the files an edit changes, from before it,
     /// by the function each is of then: what one the edit moves compiles to where it is now.
     snapshots: FxHashMap<FunctionId, (Instance, Arc<CompiledFunction>)>,
+    /// What of the code of the roots, by index, and instances, by index, the base finds the
+    /// places of apart from the code, whose marks are of the code alone: see [`placing`].
+    /// That is the code compiled here of the crates of the checkout.
+    placed_roots: FxHashMap<u32, Arc<Placing>>,
+    placed_instances: FxHashMap<u32, Arc<Placing>>,
+    /// Those of them by the bodies they come from.
+    placed_of_owner: FxHashMap<DefWithBodyId, (Vec<u32>, Vec<u32>)>,
+    places: Places,
 }
 
 /// An instance of the base whose function an edit moved.
@@ -1256,6 +1274,11 @@ pub struct Stale {
     declined: Option<&'static str>,
     /// Something the functions left to rustc reach changed, so what they reach may have.
     their_walk_changed: bool,
+    /// The places of the base that code the same as its own finds by other spans now, and the
+    /// rows of such code, by index, that are of other spans: see [`placing`].
+    remapped: Vec<(PlaceKey, PlaceKey)>,
+    root_rows: Vec<(u32, Arc<Rows>)>,
+    instance_rows: Vec<(u32, Arc<Rows>)>,
     pub steps: StaleSteps,
 }
 
@@ -1478,10 +1501,34 @@ impl Base {
             .filter_map(|i| Some((i as u32, stored_entry(compiled[i].0)?.tracked.as_ref()?.mark)))
             .collect();
         let stored = |i: usize| stored_marks.contains_key(&(i as u32));
-        let root_mark = |db: &dyn HirDatabase, root| Mark::of_root(db, root, debug);
+        // The code of the checkout compiled here has its places apart from its code.
+        let places = cg.places.as_ref();
+        let ours = |db: &dyn HirDatabase, owner: DefWithBodyId| {
+            places.is_some() && owner.krate(db).data(db).origin.is_local()
+        };
+        let root_mark = |db: &dyn HirDatabase, root: FunctionId| {
+            if !ours(db, root.into()) {
+                return (Mark::of_root(db, root, debug), None);
+            }
+            let Ok(compiled) = compiled_root(db, root) else { return (None, None) };
+            let placing = Placing::new(db, compiled, &[root.into()], debug);
+            (Some(Mark::of_code(db, compiled, debug)), Some(Arc::new(placing)))
+        };
         let instance_mark =
             |db: &dyn HirDatabase, (instance, env): &(Instance, StoredParamEnvAndCrate)| {
-                (Mark::of_instance(db, instance, env, debug), body_files(db, instance))
+                let bodies = mentioned_bodies(db, instance)
+                    .filter(|bodies| bodies.iter().any(|it| ours(db, *it)));
+                let Some(bodies) = bodies else {
+                    return (Mark::of_instance(db, instance, env, debug), body_files(db, instance), None);
+                };
+                let mut files: Vec<FileId> = bodies.iter().map(|it| body_file(db, *it)).collect();
+                files.sort_unstable();
+                files.dedup();
+                let compiled = compiled_instance(db, instance.clone(), env.clone());
+                let Ok(compiled) = compiled else { return (None, Some(files.into()), None) };
+                let placing = Placing::new(db, compiled, &bodies, debug);
+                let mark = Mark::of_code(db, compiled, debug);
+                (Some(mark), Some(files.into()), Some(Arc::new(placing)))
             };
         // The marks are a hash of each function's code and of its lines, which every thread
         // works out: the object waits for this.
@@ -1494,22 +1541,30 @@ impl Base {
             None => _ = root_marks[at].set(root_mark(db, compiled[at].0)),
         });
         let nothing = Mark { serial: 0, locations: 0, lines: 0 };
+        let mut placed_roots = FxHashMap::default();
         let marks = compiled
             .iter()
             .zip(root_marks)
             .enumerate()
             .map(|(i, (&(root, _), mark))| match stored(i) {
                 true => Some(nothing),
-                false => mark.into_inner().unwrap_or_else(|| root_mark(db, root)),
+                false => {
+                    let (mark, placing) = mark.into_inner().unwrap_or_else(|| root_mark(db, root));
+                    placed_roots.extend(placing.map(|it| (i as u32, it)));
+                    mark
+                }
             })
             .collect::<Option<Vec<_>>>()?;
+        let mut placed_instances: Vec<(Instance, Arc<Placing>)> = Vec::new();
         let mut instances = envs
             .iter()
             .zip(instance_marks)
             .map(|(of, mark)| {
                 let (instance, env) = of;
                 let id = *cg.instances.get(instance)?;
-                let (mark, files) = mark.into_inner().unwrap_or_else(|| instance_mark(db, of));
+                let (mark, files, placing) =
+                    mark.into_inner().unwrap_or_else(|| instance_mark(db, of));
+                placed_instances.extend(placing.map(|it| (instance.clone(), it)));
                 let known = BaseInstance {
                     env: env.clone(),
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
@@ -1619,6 +1674,34 @@ impl Base {
         let crates: Vec<Crate> = compiled.iter().map(|&(root, _)| root.krate(db)).collect();
         let files: Vec<FileId> =
             compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect();
+        let placed_instances: FxHashMap<u32, Arc<Placing>> = (placed_instances.into_iter())
+            .filter_map(|(instance, it)| Some((instances.get_index_of(&instance)? as u32, it)))
+            .collect();
+        let mut placed_of_owner: FxHashMap<DefWithBodyId, (Vec<u32>, Vec<u32>)> =
+            FxHashMap::default();
+        for (&i, placing) in &placed_roots {
+            for owner in placing.owners() {
+                placed_of_owner.entry(*owner).or_default().0.push(i);
+            }
+        }
+        for (&i, placing) in &placed_instances {
+            for owner in placing.owners() {
+                placed_of_owner.entry(*owner).or_default().1.push(i);
+            }
+        }
+        let places = {
+            let named: Vec<(PlaceKey, DataId)> =
+                cg.places.iter().flatten().map(|(key, &id)| (*key, id)).collect();
+            let linked: Vec<std::sync::OnceLock<_>> =
+                named.iter().map(|_| std::sync::OnceLock::new()).collect();
+            let at = |db: &dyn HirDatabase, at: usize| probe(|| named[at].0.location(db)).flatten();
+            cg.symbols.in_parallel(named.len(), &|db, _, i| _ = linked[i].set(at(db, i)));
+            let places = named.iter().zip(linked).enumerate().map(|(i, (&(key, id), linked))| {
+                let symbol = decls.get_data_decl(id).linkage_name(id).into_owned();
+                (key, symbol, linked.into_inner().unwrap_or_else(|| at(db, i)))
+            });
+            Places::new(db, places, placed_of_owner.keys())
+        };
         let cached = |func| super::fncache::cached_closure(db, func).is_some();
         let cached_roots =
             (0..compiled.len() as u32).filter(|&i| cached(compiled[i as usize].0)).collect();
@@ -1695,6 +1778,10 @@ impl Base {
             relocated_now: FxHashMap::default(),
             relocated_funcs: FxHashMap::default(),
             snapshots: FxHashMap::default(),
+            placed_roots,
+            placed_instances,
+            placed_of_owner,
+            places,
         })
         .map(|mut base| {
             base.make_items(db, cg.symbols);
@@ -1788,6 +1875,10 @@ impl Base {
             relocated_now: FxHashMap::default(),
             relocated_funcs: FxHashMap::default(),
             snapshots: FxHashMap::default(),
+            placed_roots: FxHashMap::default(),
+            placed_instances: FxHashMap::default(),
+            placed_of_owner: FxHashMap::default(),
+            places: Places::default(),
         }
     }
 
@@ -2225,6 +2316,7 @@ impl Base {
     ) {
         let start = std::time::Instant::now();
         self.take_made(db);
+        self.places.before_edit(db, files, fan);
         // Nothing changes: what the last edit asked about is taken before one that does.
         if files.is_empty() {
             return;
@@ -2284,6 +2376,20 @@ impl Base {
         let written = written.zip(coded).map(|_| ());
         if written.is_none() {
             self.items = None;
+        }
+    }
+
+    /// After an edit of `files`: which bodies of the code whose places are found apart from it
+    /// lower otherwise now.
+    pub(super) fn after_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+        let start = std::time::Instant::now();
+        self.places.after_edit(db, files, fan);
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "places-after: {} bodies lower otherwise, in {} us",
+                self.places.rewritten_owners().count(),
+                start.elapsed().as_micros()
+            );
         }
     }
 
@@ -2462,6 +2568,22 @@ impl Base {
     /// The mark of `compiled` with what it calls of [`Self::relocated`] called as the base
     /// does: the base's code that is the same calls the base's symbol, which stands for it.
     fn moved_mark(&self, db: &dyn HirDatabase, compiled: &CompiledFunction) -> Mark {
+        let was = self.moved_code(compiled);
+        Mark::of_function(db, super::print_of(&was), compiled, self.debug)
+    }
+
+    /// [`Self::moved_mark`] of the instance at `i`, as [`Mark::of_code`] when the base finds
+    /// its places apart from its code.
+    fn moved_mark_of(&self, db: &dyn HirDatabase, i: usize, compiled: &CompiledFunction) -> Mark {
+        if !self.placed_instances.contains_key(&(i as u32)) {
+            return self.moved_mark(db, compiled);
+        }
+        let serial = code_print(&self.moved_code(compiled));
+        Mark { serial, ..Mark::of_function(db, 0, compiled, self.debug) }
+    }
+
+    /// `compiled` calling what it calls of [`Self::relocated`] as the base does.
+    fn moved_code(&self, compiled: &CompiledFunction) -> CompiledFunction {
         let func = |it: FunctionId| self.relocated_funcs.get(&it).copied().unwrap_or(it);
         let mut was = compiled.clone();
         for request in &mut was.requests.funcs {
@@ -2481,7 +2603,7 @@ impl Base {
         if let Some((DefWithBodyId::FunctionId(it), _)) = &mut was.source {
             *it = func(*it);
         }
-        Mark::of_function(db, super::print_of(&was), compiled, self.debug)
+        was
     }
 
     /// Notes that `files` of `crates` changed in their items: what can have changed is what
@@ -2597,7 +2719,43 @@ impl Base {
     /// Takes what every part of [`Base::stale`] found as where the next edit starts from.
     pub(super) fn settle(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
         self.their_statics(db, found);
+        self.settle_places(db, found);
         self.touched.settle(found);
+    }
+
+    /// Takes the places and rows of code the same as the base's that a whole look found by
+    /// other spans.
+    fn settle_places(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
+        if found.is_empty() || found.iter().any(|it| it.declined.is_some()) {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let remapped = found.iter().flat_map(|it| it.remapped.iter().copied());
+        let remaps = found.iter().map(|it| it.remapped.len()).sum::<usize>();
+        let settled = self.places.settle(db, remapped);
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "places: {remaps} found by other spans, {} moved, in {} us",
+                self.places.moving.len(),
+                start.elapsed().as_micros()
+            );
+        }
+        if settled.is_none() {
+            found[0].declined = Some("code the same as the base's finds a place by two spans");
+            return;
+        }
+        for stale in found.iter() {
+            for (i, rows) in &stale.root_rows {
+                if let Some(it) = self.placed_roots.get_mut(i) {
+                    Arc::make_mut(it).set_rows(rows.clone());
+                }
+            }
+            for (i, rows) in &stale.instance_rows {
+                if let Some(it) = self.placed_instances.get_mut(i) {
+                    Arc::make_mut(it).set_rows(rows.clone());
+                }
+            }
+        }
     }
 
     /// Declines when the functions the base left to rustc reach other statics than they did.
@@ -2650,6 +2808,8 @@ impl Base {
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
         asked.extend(touched.roots.iter().filter_map(|it| homes.root.get(it)));
         asked.extend(&touched.named_roots);
+        let rewritten = self.places.rewritten_owners();
+        asked.extend(rewritten.filter_map(|it| self.placed_of_owner.get(it)).flat_map(|it| &it.0));
         if touched.edited() {
             asked.extend(&self.cached_roots);
         }
@@ -2670,6 +2830,8 @@ impl Base {
             asked.extend(&homes.instances_of_any_file);
         }
         asked.extend(&touched.named_instances);
+        let rewritten = self.places.rewritten_owners();
+        asked.extend(rewritten.filter_map(|it| self.placed_of_owner.get(it)).flat_map(|it| &it.1));
         if touched.edited() {
             asked.extend(&self.cached_instances);
         }
@@ -2918,6 +3080,10 @@ impl Base {
         }
         for i in handout.each(Look::Roots, handout.roots.len()).map(|it| handout.roots[it]) {
             let root = self.compiled[i].0;
+            if let Some(placing) = self.placed_roots.get(&(i as u32)) {
+                self.stale_placed_root(db, i, placing, check_all, &mut stale);
+                continue;
+            }
             let touched = self.touched.reaches(self.crates[i])
                 || self.touched.reaches_bodies(Some(&[self.files[i]]))
                 || self.touched.roots.contains(&root)
@@ -3015,6 +3181,10 @@ impl Base {
             let Some((instance, was)) = self.instances.get_index(i) else { continue };
             // What it is now is the patch's to tell.
             if self.relocated.contains_key(instance) {
+                continue;
+            }
+            if let Some(placing) = self.placed_instances.get(&(i as u32)) {
+                self.stale_placed_instance(db, i, placing, check_all, &mut stale);
                 continue;
             }
             let touched = self.touched.reaches(was.env.krate)
@@ -3154,6 +3324,141 @@ impl Base {
         stale.steps.left =
             start.elapsed() - stale.steps.roots - stale.steps.instances - stale.steps.statics;
         stale
+    }
+
+    /// [`Self::stale`] of a root whose places the base finds apart from its code.
+    fn stale_placed_root(
+        &self,
+        db: &dyn HirDatabase,
+        i: usize,
+        placing: &Placing,
+        check_all: bool,
+        stale: &mut Stale,
+    ) {
+        let root = self.compiled[i].0;
+        let in_edited = self.touched.reaches_bodies(Some(&[self.files[i]]));
+        let touched = self.touched.reaches(self.crates[i])
+            || placing.asked(&self.places, in_edited)
+            || self.touched.roots.contains(&root)
+            || self.touched.named_roots.contains(&(i as u32))
+            || self.touched.edited() && self.cached_roots.binary_search(&(i as u32)).is_ok();
+        // Code not asked about whose lines moved is told of them by a patch of it.
+        if !touched && in_edited && !self.rows_kept(db, placing) {
+            stale.roots.push(root);
+            return;
+        }
+        if !touched && !check_all {
+            return;
+        }
+        let asked = stdx::time::Instant::now();
+        let found = probe(|| {
+            let compiled = compiled_root(db, root).as_ref().ok()?;
+            Some(self.placed_same(db, compiled, self.marks[i], placing))
+        });
+        stale.steps.roots_asked += 1;
+        stale.steps.asked(asked.elapsed());
+        match found {
+            Some(Some(Some((remapped, rows)))) => {
+                if !touched && (!remapped.is_empty() || rows.is_some()) {
+                    eprintln!("check-all: MISSED places of root {root:?} `{}`", self.compiled[i].1);
+                    return;
+                }
+                stale.remapped.extend(remapped);
+                stale.root_rows.extend(rows.map(|it| (i as u32, it)));
+            }
+            _ if !touched => {
+                let (crate_of, name) = (self.crates[i], &self.compiled[i].1);
+                eprintln!("check-all: MISSED root {root:?} `{name}` of {crate_of:?}");
+            }
+            Some(Some(None)) => stale.roots.push(root),
+            Some(None) => stale.declined = Some("a root of the base no longer compiles"),
+            None => stale.gone.push(root),
+        }
+    }
+
+    /// [`Self::stale`] of an instance whose places the base finds apart from its code.
+    fn stale_placed_instance(
+        &self,
+        db: &dyn HirDatabase,
+        i: usize,
+        placing: &Placing,
+        check_all: bool,
+        stale: &mut Stale,
+    ) {
+        let Some((instance, was)) = self.instances.get_index(i) else { return };
+        let in_edited = self.touched.reaches_bodies(was.files.as_deref());
+        let touched = self.touched.reaches(was.env.krate)
+            || placing.asked(&self.places, in_edited)
+            || self.touched.instances.contains(instance)
+            || self.touched.named_instances.contains(&(i as u32))
+            || self.touched.edited() && self.cached_instances.binary_search(&(i as u32)).is_ok();
+        let Some(mark) = was.mark else { return };
+        if !touched && in_edited && !self.rows_kept(db, placing) {
+            if !was.forwarded {
+                stale.instances.push(instance.clone());
+            }
+            return;
+        }
+        if !touched && !check_all {
+            return;
+        }
+        let asked = stdx::time::Instant::now();
+        let found = probe(|| {
+            let compiled = compiled_instance(db, instance.clone(), was.env.clone());
+            let compiled = compiled.as_ref().ok()?;
+            let same = self.placed_same(db, compiled, mark, placing);
+            Some((same, code_print(compiled) != mark.serial))
+        });
+        stale.steps.instances_asked += 1;
+        stale.steps.asked(asked.elapsed());
+        let other_code = !matches!(found, Some(Some((_, false))));
+        stale.their_walk_changed |= touched && was.theirs && other_code;
+        match found {
+            Some(Some((Some((remapped, rows)), _))) => {
+                if !touched && (!remapped.is_empty() || rows.is_some()) {
+                    eprintln!("check-all: MISSED places of instance {instance:?}");
+                    return;
+                }
+                stale.remapped.extend(remapped);
+                stale.instance_rows.extend(rows.map(|it| (i as u32, it)));
+            }
+            _ if !touched => {
+                eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
+            }
+            Some(Some((None, _))) if !was.forwarded => stale.instances.push(instance.clone()),
+            _ => stale.broken.push((
+                Node::Instance(instance.clone()),
+                "an instance of the base gained or lost code of its own",
+            )),
+        }
+    }
+
+    /// Whether code of the base that `placing` is of is the same now, but for where it is:
+    /// with the places it finds by other spans now, and its rows when they are of others.
+    /// `None` when the code is another, or a debugger is told other lines of it, which only
+    /// its code in a patch tells.
+    fn placed_same(
+        &self,
+        db: &dyn HirDatabase,
+        compiled: &CompiledFunction,
+        was: Mark,
+        placing: &Placing,
+    ) -> Option<(Vec<(PlaceKey, PlaceKey)>, Option<Arc<Rows>>)> {
+        let same = code_print(compiled) == was.serial
+            || !self.relocated.is_empty() && code_print(&self.moved_code(compiled)) == was.serial;
+        if !same {
+            return None;
+        }
+        let now = Now::of(db, compiled, self.debug);
+        if now.lines != placing.lines {
+            return None;
+        }
+        now.found(placing, &self.places)
+    }
+
+    /// Whether a debugger is told the lines of code not asked about as the base told them.
+    fn rows_kept(&self, db: &dyn HirDatabase, placing: &Placing) -> bool {
+        !self.debug || probe(|| placing.lines_now(db)) == Some(placing.lines)
     }
 
     /// Whether a root still refers to the node, directly or through others.
@@ -3391,7 +3696,8 @@ impl Base {
                     None => continue,
                 },
             };
-            if Some(self.moved_mark(db, code)) == was.mark {
+            let at = self.instances.get_index_of(key).expect("a key of the base");
+            if Some(self.moved_mark_of(db, at, code)) == was.mark {
                 let id = cg.import(&was.symbol, &code.code.signature)?;
                 cg.instances.insert(it.now.clone(), id);
                 continue;
@@ -3426,6 +3732,9 @@ impl Base {
             if cg.static_data(id).is_err() {
                 return Ok(Err("a static of the base no longer has a value"));
             }
+        }
+        for (symbol, at) in &self.places.moving {
+            cg.define_place_again(symbol, *at)?;
         }
         // rustc's callers of one that hands out a value of a type only its body names go on
         // calling or polling rustc's code for that type, which is of the source before.

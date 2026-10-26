@@ -1504,7 +1504,7 @@ impl Base {
             }
             *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
         };
-        symbols.in_background(db, Box::new(work));
+        symbols.when_idle(db, Box::new(work));
         self.making = Some(making);
     }
 

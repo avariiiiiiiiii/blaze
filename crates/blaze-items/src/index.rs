@@ -915,8 +915,24 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
                         let code =
                             |it: &Entry| it.code.as_ref().map(|(hash, refs)| (*hash, refs.len()));
                         let (was_code, now_code) = (code(was), code(now));
+                        let gone_ids: FxHashSet<ItemId> = gone.iter().map(|it| it.0).collect();
+                        let added_ids: FxHashSet<ItemId> = added.iter().map(|it| it.0).collect();
+                        let side =
+                            |it: &ItemId| match (gone_ids.contains(it), added_ids.contains(it)) {
+                                (true, _) => "gone",
+                                (_, true) => "added",
+                                _ => "kept",
+                            };
+                        let code_diff: Vec<String> = (was.code.iter().zip(&now.code))
+                            .flat_map(|(a, b)| a.1.iter().zip(b.1.iter()))
+                            .filter(|(a, b)| a != b && moved.get(a) != Some(b))
+                            .take(3)
+                            .map(|(a, b)| {
+                                format!("{} {} -> {} {}", a.kind(), side(a), b.kind(), side(b))
+                            })
+                            .collect();
                         eprintln!(
-                            "items-unmoved: {} {names:?}: digest {}, refs {} and {}, {diff:?}, erred {} {}, missed {:?}, code {} and {} ({}), code refs {:?} and {:?}",
+                            "items-unmoved: {} {names:?}: digest {}, refs {} and {}, {diff:?}, erred {} {}, missed {:?}, code {} and {} ({}), code refs {:?} and {:?} {code_diff:?}",
                             id.kind(),
                             if now.digest == was.digest { "same" } else { "other" },
                             was.refs.len(),

@@ -870,24 +870,32 @@ fn write_codes(
     if stats {
         eprintln!("items-coding: {} functions", funcs.len());
     }
-    // A revision the daemon goes to meanwhile, taking in a file, stops the queries: each
-    // function's code is the same at the next, and is written again there.
-    let mut stopped = 0;
-    let codes = loop {
-        let write = || blaze_items::codes_of(db, fan, &funcs, Some(&live));
+    // A revision the daemon goes to meanwhile, as it takes in a file, stops the queries, and
+    // nothing here can go on before the thread lets go of the database: what was written by
+    // then is kept, and an edit of two files writes what its files lack.
+    let mut stopped = false;
+    let mut codes = Vec::with_capacity(funcs.len());
+    for part in funcs.chunks(1024) {
+        let write = || blaze_items::codes_of(db, fan, part, Some(&live));
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)) {
-            Ok(codes) => break codes,
-            Err(why) if why.is::<salsa::Cancelled>() && stopped < 8 => stopped += 1,
+            Ok(written) => codes.extend(written),
+            Err(why) if why.is::<salsa::Cancelled>() => {
+                stopped = true;
+                break;
+            }
             Err(why) => std::panic::resume_unwind(why),
         }
-    };
+    }
+    let mut funcs = funcs;
+    funcs.truncate(codes.len());
     drop(live);
     if stats {
         let written = codes.iter().filter(|it| it.is_some()).count();
         eprintln!(
-            "items-codes: {written} of {} functions in {} us, stopped {stopped} times",
+            "items-codes: {written} of {} functions in {} us{}",
             funcs.len(),
-            start.elapsed().as_micros()
+            start.elapsed().as_micros(),
+            if stopped { ", stopped by a revision" } else { "" }
         );
     }
     *coding.lock().unwrap_or_else(|e| e.into_inner()) = Some((pushes, funcs, codes));
@@ -2162,15 +2170,26 @@ impl Base {
         }
         let settled = start.elapsed();
         let written = probe(|| hir_ty::attach_db(db, || items.index.before_edit(db, files, fan)));
+        let rewritten = start.elapsed();
+        // What a move out of the files is found by, when the threads writing it were stopped.
+        let coded = match written {
+            Some(()) if files.len() >= 2 => {
+                probe(|| hir_ty::attach_db(db, || items.index.write_codes(db, fan, files)))
+            }
+            _ => Some(0),
+        };
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
-                "items-before: taken {} us, settled {} us{}, written {} us",
+                "items-before: taken {} us, settled {} us{}, written {} us, {} codes in {} us",
                 took.as_micros(),
                 (settled - took).as_micros(),
                 if settling.is_none() { " (unsettled)" } else { "" },
-                (start.elapsed() - settled).as_micros()
+                (rewritten - settled).as_micros(),
+                coded.unwrap_or(0),
+                (start.elapsed() - rewritten).as_micros()
             );
         }
+        let written = written.zip(coded).map(|_| ());
         if written.is_none() {
             self.items = None;
         }

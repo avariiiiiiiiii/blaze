@@ -312,6 +312,29 @@ impl Index {
         }
     }
 
+    /// Writes the code of the functions of `files` whose code is not written yet, on the
+    /// threads `fan` has: what a move out of them is found by.
+    pub fn write_codes(&mut self, db: &dyn HirDatabase, fan: &Fan<'_>, files: &[FileId]) -> usize {
+        let funcs: Vec<FunctionId> = (files.iter())
+            .flat_map(|it| self.files.get(it).into_iter().flatten())
+            .filter_map(|id| match (id, self.entries.get(id)) {
+                (ItemId::Function(func), Some(entry))
+                    if entry.code.is_none() && !entry.erred && entry.missed.is_none() =>
+                {
+                    Some(*func)
+                }
+                _ => None,
+            })
+            .collect();
+        let live = self.live();
+        for (func, code) in funcs.iter().zip(codes_of(db, fan, &funcs, Some(&live))) {
+            if let Some(entry) = self.entries.get_mut(&ItemId::Function(*func)) {
+                entry.code = code;
+            }
+        }
+        funcs.len()
+    }
+
     pub fn live(&self) -> Live {
         Live { items: self.live.clone(), crates: Arc::new(self.crates.clone()) }
     }

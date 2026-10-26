@@ -53,6 +53,8 @@ pub struct Index {
     renamed: FxHashSet<ItemId>,
     /// How many edits were pushed, which an entry is written after.
     pushes: u64,
+    /// When each part of the last push was over, said when it is refused.
+    parts: Vec<(&'static str, std::time::Duration)>,
 }
 
 /// The items an index has, which a thread of its own can ask of an item without asking salsa
@@ -267,6 +269,7 @@ impl Index {
             moved: FxHashMap::default(),
             renamed: FxHashSet::default(),
             pushes: 0,
+            parts: Vec::new(),
         };
         for Entries(part) in entries {
             for (id, entry) in part {
@@ -419,9 +422,21 @@ impl Index {
         files: &[FileId],
         fan: &Fan<'_>,
     ) -> Result<Pushed, &'static str> {
+        self.parts.clear();
+        let start = std::time::Instant::now();
         let pushed = self.push_inner(db, files, fan);
         if pushed.is_err() {
             self.scopes_dirty = true;
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                let parts: Vec<String> = (self.parts.iter())
+                    .map(|(part, at)| format!("{part} {}", at.as_micros()))
+                    .collect();
+                eprintln!(
+                    "items-refused-us: {} at {} us",
+                    parts.join(", "),
+                    start.elapsed().as_micros()
+                );
+            }
         }
         pushed
     }
@@ -471,6 +486,7 @@ impl Index {
             Some(())
         };
         took.push(start.elapsed());
+        self.parts.push(("crates", start.elapsed()));
         let mut rewritten: Vec<FileId> = files.to_vec();
         let mut scopes = Vec::new();
         let around: Vec<Crate> = around.into_iter().collect();
@@ -591,6 +607,7 @@ impl Index {
         }
 
         took.push(start.elapsed());
+        self.parts.push(("bindings", start.elapsed()));
         // The files written again, beside their entries.
         let cx = form::Cx::new(db);
         let mut changed: FxHashSet<ItemId> = FxHashSet::default();
@@ -598,8 +615,10 @@ impl Index {
         let mut written = 0;
         let declared = self.declared(db, fan, &rewritten);
         let declared_at = start.elapsed();
+        self.parts.push(("declared", declared_at));
         let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
         let mut entries = entries_of(db, fan, &ids);
+        self.parts.push(("entries", start.elapsed()));
         let now: FxHashSet<ItemId> = ids.iter().copied().collect();
         // The code of an added function is written when a gone one is written alike, with its
         // code known from before the edit.
@@ -640,7 +659,9 @@ impl Index {
             .filter(|(id, _)| !self.entries.contains_key(id))
             .filter_map(|(id, entry)| Some((*id, entry.as_ref()?)))
             .collect();
+        self.parts.push(("codes", start.elapsed()));
         let (moved, renamed) = moves(&gone, &added);
+        self.parts.push(("moves", start.elapsed()));
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
                 "items-moved: {} of {} gone and {} added, {} of them renamed",

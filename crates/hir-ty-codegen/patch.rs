@@ -2372,7 +2372,10 @@ impl Base {
         let start = std::time::Instant::now();
         self.snapshots.clear();
         let mut wanted: Vec<(Instance, Instance, StoredParamEnvAndCrate, Option<_>)> = Vec::new();
-        let moves = !self.rustc && self.items.is_some() && files.len() >= 2;
+        let moves = !self.rustc
+            && self.items.is_some()
+            && files.len() >= 2
+            && std::env::var_os("RA_JIT_NO_SNAPSHOT").is_none();
         let edited: FxHashSet<FileId> = files.iter().copied().collect();
         for (key, it) in &mut self.relocated {
             let code = it.code.take();
@@ -2400,15 +2403,20 @@ impl Base {
         }
         let found: Vec<std::sync::OnceLock<Option<Arc<CompiledFunction>>>> =
             wanted.iter().map(|_| std::sync::OnceLock::new()).collect();
+        let slowest = std::sync::atomic::AtomicU64::new(0);
         let work = |db: &dyn HirDatabase, at: usize| {
             found[at].get_or_init(|| {
                 let (_, now, env, code) = &wanted[at];
                 if let Some(code) = code {
                     return Some(Arc::clone(code));
                 }
+                let one = std::time::Instant::now();
                 let compiled =
                     || compiled_instance(db, now.clone(), env.clone()).as_ref().ok().cloned();
-                probe(|| hir_ty::attach_db(db, compiled)).flatten().map(Arc::new)
+                let compiled = probe(|| hir_ty::attach_db(db, compiled)).flatten().map(Arc::new);
+                let took = one.elapsed().as_micros() as u64;
+                slowest.fetch_max(took, std::sync::atomic::Ordering::Relaxed);
+                compiled
             });
         };
         fan(wanted.len(), &work);
@@ -2421,9 +2429,10 @@ impl Base {
         }
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
-                "relocate-snapshot: {} of {asked} instances in {} us",
+                "relocate-snapshot: {} of {asked} instances in {} us, the slowest {} us",
                 self.snapshots.len(),
-                start.elapsed().as_micros()
+                start.elapsed().as_micros(),
+                slowest.into_inner()
             );
         }
     }
@@ -2575,8 +2584,17 @@ impl Base {
                 if stats {
                     eprintln!("items: whole crates: {why}");
                 }
+                let refused = start.elapsed();
                 self.relocate(db, None);
-                return self.touch(db, Some(crates));
+                self.touch(db, Some(crates));
+                if stats {
+                    eprintln!(
+                        "items-whole-us: refused at {}, all touched at {}",
+                        refused.as_micros(),
+                        start.elapsed().as_micros()
+                    );
+                }
+                return;
             }
         };
         self.relocate(db, Some(&pushed));

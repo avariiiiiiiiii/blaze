@@ -42,11 +42,16 @@ pub(crate) struct Sub {
     /// Whether all it missed is a type or constant with an error, which is written again
     /// with the items the error is of.
     pub(crate) erred: bool,
+    /// The places in its body its code is of, in the order of the code: two written alike
+    /// with these alike have their places at the same nodes of their bodies.
+    pub(crate) spans: Hash,
 }
 
 pub(crate) struct Form {
     /// `None` for a form written for what it refers to alone.
     hasher: Option<blake3::Hasher>,
+    /// Of [`Sub::spans`], beside `hasher`.
+    spans: Option<blake3::Hasher>,
     refs: Vec<ItemId>,
     slots: FxHashMap<ItemId, u32>,
     missed: Option<&'static str>,
@@ -57,6 +62,7 @@ impl Form {
     fn with(tag: &str, hashed: bool) -> Form {
         let mut form = Form {
             hasher: hashed.then(blake3::Hasher::new),
+            spans: hashed.then(blake3::Hasher::new),
             refs: Vec::new(),
             slots: FxHashMap::default(),
             missed: None,
@@ -124,6 +130,20 @@ impl Form {
         self.erred = false;
     }
 
+    fn span(&mut self, span: hir_ty::mir::MirSpan) {
+        use hir_ty::mir::MirSpan;
+        let Some(spans) = &mut self.spans else { return };
+        let (tag, at) = match span {
+            MirSpan::ExprId(it) => (0u8, it.into_raw().into_u32()),
+            MirSpan::ExprEnd(it) => (1, it.into_raw().into_u32()),
+            MirSpan::PatId(it) => (2, it.into_raw().into_u32()),
+            MirSpan::BindingId(it) => (3, it.into_raw().into_u32()),
+            MirSpan::SelfParam => (4, 0),
+            MirSpan::Unknown => (5, 0),
+        };
+        spans.update(&[tag]).update(&at.to_le_bytes());
+    }
+
     fn error(&mut self, why: &'static str) {
         self.missed.get_or_insert(why);
         self.u8(0xff);
@@ -132,6 +152,9 @@ impl Form {
 
     fn sub(&mut self, sub: &Sub) {
         self.update(&sub.digest);
+        if let Some(spans) = &mut self.spans {
+            spans.update(&sub.spans);
+        }
         for &id in &sub.refs {
             self.item(id);
         }
@@ -143,8 +166,10 @@ impl Form {
 
     pub(crate) fn finish(self) -> Sub {
         let digest = self.hasher.map_or([0; 32], |it| *it.finalize().as_bytes());
+        let spans = self.spans.map_or([0; 32], |it| *it.finalize().as_bytes());
         Sub {
             digest,
+            spans,
             refs: self.refs,
             missed: self.missed,
             erred: self.missed.is_some() && self.erred,
@@ -780,6 +805,7 @@ impl<'db> Cx<'db> {
             let block = &body.basic_blocks[id];
             f.u8(block.is_cleanup as u8);
             for (at, statement) in block.statements.iter().enumerate() {
+                f.span(statement.span);
                 if let StatementKind::StorageLive(local) | StatementKind::StorageDead(local) =
                     statement.kind
                     && !c.used(local)
@@ -796,7 +822,10 @@ impl<'db> Cx<'db> {
                 }
             }
             match &block.terminator {
-                Some(terminator) => self.terminator(f, c, &terminator.kind),
+                Some(terminator) => {
+                    f.span(terminator.span);
+                    self.terminator(f, c, &terminator.kind)
+                }
                 None => f.u8(0xfe),
             }
         }

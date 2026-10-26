@@ -19,10 +19,10 @@ from cargo_ra_jit import Side, wait_warm
 from memsplit import logs, wait_own_base
 
 # What the daemon says of an edit with RA_JIT_STATS: how it took the change and what it looked at.
-SAID = re.compile(r"(bodies only|signatures only|functions added|items|items-us|items-made|items-before|items-pushed|items-refused|items-settled|read-us|check-all|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
+SAID = re.compile(r"(bodies only|signatures only|functions added|items|items-us|items-made|items-before|items-pushed|items-refused|items-settled|items-moved|items-unmoved|items-codes|patch-made|read-us|check-all|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
 
 
-def wait_items(daemon, timeout=120):
+def wait_items(daemon, timeout=300):
     """Seconds until the base's items are made (`items-us:`), which an edit that changes items
     is pushed through: a daemon makes them on threads of its own once its base is built, and an
     edit before then asks about all of each crate the edit's files are of. `None` if not made."""
@@ -30,9 +30,27 @@ def wait_items(daemon, timeout=120):
     while time.time() - began < timeout:
         text = logs(daemon)
         at = text.rfind("compiling the program for edits to patch")
-        if at >= 0 and "items-us: " in text[at:]:
+        # A daemon that writes the code of the items' functions, which moves are found by,
+        # is waited for until it has.
+        made = at >= 0 and "items-us: " in text[at:]
+        if made and ("items-coding: " not in text[at:] or "items-codes: " in text[at:]):
             return round(time.time() - began, 1)
         time.sleep(0.5)
+    return None
+
+
+def wait_said(daemon, said, timeout=10):
+    """Seconds until the daemon says `said` after the last build: what it does on threads of
+    its own once the build is over, which the next edit would wait for, as the debug info of
+    the program laid out where splices write it (`laid out: `). `None` if it isn't said in
+    `timeout`."""
+    began = time.time()
+    while time.time() - began < timeout:
+        text = logs(daemon)
+        at = text.rfind("edit-to-binary: ")
+        if at >= 0 and said in text[at:]:
+            return round(time.time() - began, 1)
+        time.sleep(0.1)
     return None
 
 
@@ -92,6 +110,7 @@ def one(name, spec, repo, commit, work, rounds, extra_env, keep):
         row["cold_s"] = round(time.monotonic() - began, 1)
         wait_own_base(daemon, None)
         row["items_s"] = wait_items(daemon)
+        row["laid_out_s"] = wait_said(daemon, "laid out: ")
         walls, said = [], []
         row["base_said"] = [line[:200] for line in daemon.said().splitlines() if SAID.match(line)][-20:]
         for n in range(rounds):

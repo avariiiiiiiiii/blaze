@@ -169,6 +169,11 @@ impl ItemPush {
         items
     }
 
+    /// Why the instance at `at` of the base can't be told, if it can't.
+    pub(super) fn instance_unknown(&self, at: u32) -> Option<&'static str> {
+        self.instances.get(at as usize)?.as_ref().err().copied()
+    }
+
     fn told(&self, at: At) -> &Told {
         match (at as usize).checked_sub(self.roots.len()) {
             None => &self.roots[at as usize],

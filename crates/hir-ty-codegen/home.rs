@@ -146,6 +146,30 @@ pub(super) fn live_bodies(
     (!mentions.opaque).then_some(mentions.bodies).ok_or(false)
 }
 
+/// Whether an instance mentions an item `live` doesn't have.
+pub(super) fn instance_gone(db: &dyn HirDatabase, instance: &Instance, live: &Live) -> bool {
+    Mentions::of_live(db, instance, Some(live)).gone
+}
+
+/// Whether a type or arguments mention an item `live` doesn't have.
+pub(super) fn type_gone<'db>(
+    db: &'db dyn HirDatabase,
+    of: &impl TypeVisitable<DbInterner<'db>>,
+    live: &Live,
+) -> bool {
+    let mut mentions = Mentions {
+        db,
+        live: Some(live),
+        gone: false,
+        crates: FxHashSet::default(),
+        bodies: Vec::new(),
+        opaque: false,
+        seen: FxHashSet::default(),
+    };
+    of.visit_with(&mut mentions);
+    mentions.gone
+}
+
 /// The function the code of an instance is written in: its own, or the one a closure or an
 /// `async` block is in. The symbol of every copy of the instance has its name.
 pub(super) fn written_in(db: &dyn HirDatabase, instance: &Instance) -> Option<FunctionId> {

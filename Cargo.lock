@@ -691,6 +691,7 @@ dependencies = [
  "intern",
  "ra-ap-rustc_type_ir",
  "rustc-hash 2.1.2",
+ "salsa",
  "syntax",
 ]
 

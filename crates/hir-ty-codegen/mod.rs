@@ -1428,6 +1428,18 @@ impl Rejections {
         self.homes() && self.rustc.as_ref().is_some_and(|it| !it.homed(file))
     }
 
+    /// Whether an edit that moves items between files keeps their code: the base is its own and
+    /// its items are made.
+    pub fn keeps_moves(&self) -> bool {
+        self.base.as_ref().is_some_and(|it| it.keeps_moves())
+    }
+
+    /// Whether an edit of `files` keeps the code of items it moves: the base does, and its items
+    /// do not refuse the edit's push before it is made.
+    pub fn keeps_moves_of(&self, files: &[base_db::FileId]) -> bool {
+        self.base.as_ref().is_some_and(|it| it.keeps_moves() && !it.unhashed_in(files))
+    }
+
     /// Whether a patch of what rustc linked has to know `file` before it changes.
     pub fn homes(&self) -> bool {
         self.base.is_none() && self.rustc.as_ref().is_some_and(|it| !it.outdated())
@@ -1551,9 +1563,17 @@ impl Rejections {
     }
 
     /// Before an edit of `files`, of the revision before it, with the threads `fan` has.
-    pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[base_db::FileId], fan: &Fan<'_>) {
+    /// `moves` is whether the edit can move items between the files, which what they are
+    /// before it is kept for.
+    pub fn before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[base_db::FileId],
+        fan: &Fan<'_>,
+        moves: bool,
+    ) {
         if let Some(base) = &mut self.base {
-            base.before_edit(db, files, fan);
+            base.before_edit(db, files, fan, moves);
         }
     }
 
@@ -2013,6 +2033,9 @@ struct ObjectCodegen<'a, 'db> {
     tiers: Option<&'a tier::Tiers>,
     /// What each function built from an entry of the store is an instance of.
     found_instances: FxHashMap<FuncId, (Instance, StoredParamEnvAndCrate)>,
+    /// The code of instances a patch has without compiling them: a moved function's, from
+    /// before the edit that moved it.
+    given: FxHashMap<Instance, std::sync::Arc<CompiledFunction>>,
     /// Whether the store has the code of a root whole, by its name, for the roots asked
     /// about: those it has are put in the object from it, not compiled.
     stored_roots: FxHashMap<FunctionId, Option<StableName>>,
@@ -4668,6 +4691,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             hidden: Vec::new(),
             tiers: None,
             found_instances: FxHashMap::default(),
+            given: FxHashMap::default(),
             stored_roots: FxHashMap::default(),
             root_names: FxHashMap::default(),
         })
@@ -5100,8 +5124,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let wave = std::mem::take(&mut self.pending);
                     let start = stdx::time::Instant::now();
                     let told = self.tells_variables().then_some(&self.told);
+                    let given = &self.given;
                     self.symbols.in_parallel(wave.len(), &|db, _, at| {
                         let (instance, env, _) = &wave[at];
+                        if given.contains_key(instance) {
+                            return;
+                        }
                         let compiled = compiled_instance(db, instance.clone(), env.clone());
                         if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
                             told.ahead(db, compiled);
@@ -5309,9 +5337,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let node = tier::Node(tier::Kind::Instance(instance.clone(), env.clone()));
         let tiered = tiers.and_then(|it| it.code(self.db, &node));
         let unit = self.unit_instances.remove(instance).filter(|_| tiered.is_none());
+        let given = self.given.get(instance).cloned();
         let compiled = match (tiered, &unit) {
             (Some(code), _) => code,
             (None, Some(unit)) => unit,
+            (None, None) if let Some(given) = &given => given,
             (None, None) => compiled_instance(self.db, instance.clone(), env.clone())
                 .as_ref()
                 .map_err(Clone::clone)?,
@@ -11191,6 +11221,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(ty.kind(), TyKind::Uint(UintTy::U32)) {
             return Ok(None);
         }
+        self.cg.placed();
         let layout = self.layout(ty)?;
         let addr = self.stack_slot(&layout);
         let value = self.builder.ins().iconst(types::I32, number as i64);
@@ -13198,6 +13229,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(name) = hir_ty::mir::type_name::rustc_type_name(self.cg.db, ty) else {
                     unsupported!("`type_name` of `{ty:?}`");
                 };
+                self.cg.placed();
                 let len = self.builder.ins().iconst(ptr(), name.len() as i64);
                 let data = self.cg.define_const(ConstBlob {
                     bytes: name.into_bytes(),

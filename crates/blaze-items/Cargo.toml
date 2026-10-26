@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 rustc-hash.workspace = true
+salsa.workspace = true
 
 ra-ap-rustc_type_ir.workspace = true
 

@@ -52,22 +52,73 @@ pub trait Area {
 }
 
 mod e;
+pub use e::{here, named};
+pub use e::same;
 """
+# Functions moved to another file and back: one that tells where it is, which calls others moved
+# with it, and one that names itself by its path, as does one it calls.
+MOVED = """
+pub fn here() -> String {
+    let at = std::panic::Location::caller();
+    format!("{}:{}:{} {}", at.file(), at.line(), inner(), spot())
+}
+
+fn inner() -> u32 {
+    5
+}
+
+fn spot() -> String {
+    format!("{}:{}", file!(), line!())
+}
+
+pub fn named() -> String {
+    format!("{} {}", std::any::type_name_of_val(&named), kind())
+}
+
+fn kind() -> &'static str {
+    std::any::type_name_of_val(&kind)
+}
+"""
+# Enums whose derived `eq`s are written alike, moved to another file and back with what calls them:
+# only the impl each is of tells them apart.
+TWINS = """
+#[derive(PartialEq)]
+pub enum Dir {
+    Up,
+    Down,
+}
+
+#[derive(PartialEq)]
+pub enum Mode {
+    Fast,
+    Slow,
+}
+
+pub fn same() -> u32 {
+    u32::from(Dir::Up == Dir::Down) + 2 * u32::from(Mode::Slow == Mode::Slow)
+}
+"""
+# A trait's impl, which a call through `dyn` takes too, moved to another file and back.
+AREA = "impl crate::Area for crate::shapes::Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n"
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "lib"]\nresolver = "2"\n',
     "lib/Cargo.toml": '[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n',
     "lib/src/lib.rs": LIB,
     "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n\nmacro_rules! tag {\n    () => {\n        20\n    };\n}\npub(crate) use tag;\n",
-    "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n",
+    "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n" + MOVED + TWINS,
     "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
-    "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Sides for Sq {}\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
+    "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Sides for Sq {}\n\n" + AREA,
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
-    "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n}\n',
+    "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n    println!("{} {} {}", lib::here(), lib::named(), lib::same());\n}\n',
 }
 LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs", "lib/src/shapes.rs"
-C_RS, D_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/f.rs"
+C_RS, D_RS, E_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/e.rs", "lib/src/f.rs"
+TO_SHAPES = (LIB_RS, "pub use e::{here, named};", "pub use shapes::{here, named};")
+TO_E = (LIB_RS, "pub use shapes::{here, named};", "pub use e::{here, named};")
 # A file of the crate's directory that no module is written in, which the crate doesn't build.
 STRAY = "lib/src/stray.rs"
+# A line of `here` written over two, as a formatter does.
+AT_SPLIT = "    let at =\n        std::panic::Location::caller();\n"
 # An edit whose file the daemon sees empty first, as a write that truncates it shows it.
 EMPTY_FIRST = "empty first"
 SIDES = "\nimpl Sq {\n    pub const SIDES: u32 = 40;\n}\n"
@@ -110,9 +161,39 @@ STEPS = [
     ("inherent impl taken away", [(F_RS, None, lambda _: "")]),
     ("a file no module is written in", [(STRAY, None, lambda _: "pub fn pick() -> u32 {\n    9\n}\n")]),
     ("it written again", [(STRAY, "9", "90")]),
+    ("functions moved to another file", [(E_RS, MOVED, ""), (SHAPES_RS, None, lambda t: t + MOVED), TO_SHAPES]),
+    ("an edit after a move", [(B_RS, "x * 3", "x * 5")]),
+    ("moved back", [(SHAPES_RS, MOVED, ""), (E_RS, None, lambda t: t + MOVED), TO_E]),
+    ("moved with a callee changed", [
+        (E_RS, MOVED, ""),
+        (SHAPES_RS, None, lambda t: t + MOVED.replace("    5\n", "    6\n")),
+        TO_SHAPES,
+    ]),
+    ("a trait's impl moved to another file", [(SHAPES_RS, AREA, ""), (E_RS, None, lambda t: t + AREA)]),
+    ("it moved back", [(E_RS, AREA, ""), (SHAPES_RS, None, lambda t: t + AREA)]),
+    ("twins moved to another file", [
+        (E_RS, TWINS, ""),
+        (SHAPES_RS, None, lambda t: t + TWINS),
+        (LIB_RS, "pub use e::same;", "pub use shapes::same;"),
+    ]),
+    ("twins moved back", [
+        (SHAPES_RS, TWINS, ""),
+        (E_RS, None, lambda t: t + TWINS),
+        (LIB_RS, "pub use shapes::same;", "pub use e::same;"),
+    ]),
     ("a constant shadowed, its file seen empty first", [(SHAPES_RS, None, lambda text: text + SIDES, EMPTY_FIRST)]),
     ("it taken away, its file seen empty first", [(SHAPES_RS, SIDES, "", EMPTY_FIRST)]),
+    ("a function written over more lines, above others", [(E_RS, "u32 {\n    line!()", "u32 {\n\n    line!()")]),
+    ("a line above functions that tell where they are", [(SHAPES_RS, "Sq(pub u32);\n", "Sq(pub u32);\n\n")]),
+    ("one written over more lines within", [(SHAPES_RS, "    let at = std::panic::Location::caller();\n", AT_SPLIT)]),
+    ("all written as they were", [
+        (E_RS, "u32 {\n\n    line!()", "u32 {\n    line!()"),
+        (SHAPES_RS, "Sq(pub u32);\n\n", "Sq(pub u32);\n"),
+        (SHAPES_RS, AT_SPLIT, "    let at = std::panic::Location::caller();\n"),
+    ]),
 ]
+# Steps whose moved functions keep their code from before the edit, which items find.
+RELOCATES = {"functions moved to another file", "twins moved to another file"}
 
 
 def logs(home):
@@ -163,20 +244,28 @@ def steps(check_all):
             raise SystemExit(f"the daemon did not get ready: {states}")
         for step, edits in STEPS:
             wait_items(home)
+            seen = len(logs(home))
+            # Every file is written as one change, one right after another: a daemon that
+            # noticed the first alone would take a move as an item gone and, later, one added.
+            texts, empty_first = {}, []
             for path, old, new, *how in edits:
                 path = os.path.join(ws, path)
-                text = open(path).read() if os.path.exists(path) else ""
+                text = texts[path] if path in texts else open(path).read() if os.path.exists(path) else ""
                 if old is None:
                     text = new(text)
                 elif old not in text:
                     raise SystemExit(f"{step}: {old!r} is not in {path}")
                 else:
                     text = text.replace(old, new, 1)
+                texts[path] = text
                 if EMPTY_FIRST in how:
-                    open(path, "w").close()
-                    time.sleep(0.5)
+                    empty_first.append(path)
+            for path in empty_first:
+                open(path, "w").close()
+            if empty_first:
+                time.sleep(0.5)
+            for path, text in texts.items():
                 open(path, "w").write(text)
-            seen = len(logs(home))
             _, ours = side.cargo("build")
             _, theirs = reference.cargo("build")
             said = ours.stdout + ours.stderr
@@ -192,12 +281,18 @@ def steps(check_all):
             right &= not missed
             how = re.findall(r"^items: (whole crates: .*|\d+ written, \d+ changed, \d+ names, .*?) in \d+ us$", log, re.M)
             pushed += any(not it.startswith("whole") for it in how)
+            relocated = re.findall(r"^relocated: (\d+) instances, (\d+) moved now by their code.*$", log, re.M)
+            if step in RELOCATES and not check_all:
+                right &= any(int(kept) > 0 for _, kept in relocated)
             detail = f"cargo exit {theirs.returncode}, ours {ours.returncode}{outputs}; items {how}"
+            if relocated:
+                detail += f"; relocated {relocated}"
             if missed:
                 detail += f"; {missed[:3]}"
             print(f"{mode:9} {step:27} {'ok' if right else 'WRONG':6} {detail}")
             if not right:
-                wrong.append(f"{mode} {step}: {detail}\n{said[-1500:]}")
+                items = "\n".join(re.findall(r"^(?:items-\w+|relocat\w+|patch-made): .*$", log, re.M))
+                wrong.append(f"{mode} {step}: {detail}\n{items}\n{said[-1500:]}")
     finally:
         side.cargo("stop")
     # A run where no edit was pushed by its items tests nothing of them.

@@ -1431,18 +1431,25 @@ fn interface_names(
 /// Whether writing `text` over `file` adds or takes away a trait or a macro as written, which
 /// no move lets through [`Index::push`]: told by the text alone, before the edit.
 pub fn unmovable_written(db: &dyn HirDatabase, file: FileId, text: &str) -> bool {
-    use SyntaxKind::{MACRO_DEF, MACRO_RULES, TRAIT};
+    use SyntaxKind::{BANG, IDENT, MACRO_KW, TRAIT_KW};
+    // Lexed, not parsed: each file of an edit is read twice before it.
     let written = |text: &str| {
-        let tree = syntax::ast::SourceFile::parse(text, syntax::Edition::CURRENT).syntax_node();
-        let mut names: Vec<(SyntaxKind, String)> = (tree.descendants())
-            .filter(|it| matches!(it.kind(), TRAIT | MACRO_RULES | MACRO_DEF))
-            .filter_map(|it| {
-                let name = it.children().find(|it| it.kind() == SyntaxKind::NAME)?;
-                Some((it.kind(), name.text().to_string()))
+        let lexed = syntax::LexedStr::new(syntax::Edition::CURRENT, text);
+        let tokens: Vec<(SyntaxKind, &str)> = (0..lexed.len())
+            .map(|at| (lexed.kind(at), lexed.text(at)))
+            .filter(|(kind, _)| !kind.is_trivia())
+            .collect();
+        let mut names: Vec<(&str, &str)> = (0..tokens.len())
+            .filter_map(|at| match (tokens[at], tokens.get(at + 1), tokens.get(at + 2)) {
+                ((TRAIT_KW | MACRO_KW, kind), Some(&(IDENT, name)), _) => Some((kind, name)),
+                ((IDENT, "macro_rules"), Some(&(BANG, _)), Some(&(IDENT, name))) => {
+                    Some(("macro_rules", name))
+                }
+                _ => None,
             })
             .collect();
         names.sort_unstable();
-        names
+        names.into_iter().map(|(kind, name)| format!("{kind} {name}")).collect::<Vec<_>>()
     };
     written(db.file_text(file).text(db)) != written(text)
 }

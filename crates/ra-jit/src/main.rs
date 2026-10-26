@@ -1309,7 +1309,13 @@ impl SymbolResolver for Resolver<'_> {
 
     fn when_idle(&self, db: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
         let at = salsa::plumbing::current_revision(db);
-        IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((at, work));
+        IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((at, Instant::now(), work));
+        if let Some(wake) = lock(&IDLE_WAKE).clone() {
+            _ = std::thread::Builder::new().name("idle".to_owned()).spawn(move || {
+                std::thread::sleep(IDLE_WORK_AFTER);
+                _ = wake.send(Event::Idle);
+            });
+        }
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
@@ -3689,33 +3695,39 @@ fn start_from_rustc(
     Ok(())
 }
 
-/// Has each program whose edits are patches of what rustc linked take in what rustc compiled
-/// of `files`, which are about to change: the functions written in them and the statics
-/// their bodies declare. A static declared outside a body is no edit of bodies alone.
-/// Runs `each` for each of `0..count` on as many threads as there are, each with a clone of
-/// `db`. What a thread does not get to, as an edit cancelled it or it panicked, is left: the
-/// caller does it.
 /// What [`SymbolResolver::when_idle`] was handed, by the revision it is of.
-static IDLE_WORK: Mutex<Vec<(salsa::Revision, hir_ty_codegen::Background)>> =
+static IDLE_WORK: Mutex<Vec<(salsa::Revision, Instant, hir_ty_codegen::Background)>> =
     Mutex::new(Vec::new());
+
+/// What wakes the loop that starts [`IDLE_WORK`] once some is due.
+static IDLE_WAKE: Mutex<Option<std::sync::mpsc::Sender<Event>>> = Mutex::new(None);
 
 /// How long nothing is asked before [`IDLE_WORK`] starts: an edit that follows sooner finds
 /// the threads its own.
 const IDLE_WORK_AFTER: Duration = Duration::from_millis(1000);
 
-/// Starts the work of [`IDLE_WORK`] that is of the revision `db` is at, and drops the rest.
+/// Starts the work of [`IDLE_WORK`] handed over [`IDLE_WORK_AFTER`] ago of the revision `db`
+/// is at, which no edit came after, and drops what is of another revision.
 fn start_idle_work(db: &RootDatabase) {
     let at = salsa::plumbing::current_revision(db);
-    let work = std::mem::take(&mut *IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()));
-    for (of, work) in work {
-        if of == at {
+    let mut queued = IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    if queued.is_empty() {
+        return;
+    }
+    let (mut started, mut dropped) = (0, 0);
+    for (of, since, work) in std::mem::take(&mut *queued) {
+        if of != at {
+            dropped += 1;
+        } else if since.elapsed() >= IDLE_WORK_AFTER {
+            started += 1;
             in_background(db, work);
+        } else {
+            queued.push((of, since, work));
         }
     }
-}
-
-fn idle_work() -> bool {
-    !IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    if std::env::var_os("RA_JIT_STATS").is_some() && started + dropped > 0 {
+        eprintln!("idle-work: {started} started, {dropped} of an older revision dropped");
+    }
 }
 
 /// Runs `work` on a thread of its own over a database of its own, which the next change
@@ -3737,6 +3749,9 @@ fn in_background(db: &RootDatabase, work: hir_ty_codegen::Background) {
     _ = std::thread::Builder::new().name("items".to_owned()).spawn(run);
 }
 
+/// Runs `each` for each of `0..count` on as many threads as there are, each with a clone of
+/// `db`. What a thread does not get to, as an edit cancelled it or it panicked, is left: the
+/// caller does it.
 fn fan(
     db: &RootDatabase,
     count: usize,
@@ -3764,6 +3779,9 @@ fn fan(
     });
 }
 
+/// Has each program whose edits are patches of what rustc linked take in what rustc compiled
+/// of `files`, which are about to change: the functions written in them and the statics
+/// their bodies declare. A static declared outside a body is no edit of bodies alone.
 fn home_in_rustcs(
     db: &RootDatabase,
     listed: &Listed,
@@ -6325,6 +6343,8 @@ impl std::io::Write for &Client {
 /// What the daemon waits for.
 enum Event {
     Asked(Asked),
+    /// [`IDLE_WORK`] may be due.
+    Idle,
     /// The text of a source file as an editor has it, which it has not written yet.
     Edited(Edited),
     /// The build of a program is over, with what to tell its clients: nothing when a change
@@ -6571,7 +6591,7 @@ impl Builds {
                 self.waiting.push_back(asked);
                 return Ok(false);
             }
-            Event::Noticed => return Ok(false),
+            Event::Noticed | Event::Idle => return Ok(false),
             Event::Applied(applied) => {
                 self.applied.push(applied);
                 return Ok(false);
@@ -8038,6 +8058,7 @@ fn run_holding(
     // Requests wait here while a build is under way, and those that have come by the time it
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
+    *lock(&IDLE_WAKE) = Some(sender.clone());
     let serving = listener.is_some();
     if serving || args.watch {
         hir_ty_codegen::edits_follow();
@@ -8185,18 +8206,6 @@ fn run_holding(
                     .flatten();
                 let (mut own_base, mut interrupt) = (None, false);
                 match wants_base {
-                    _ if idle && idle_work() => match builds.events.recv_timeout(IDLE_WORK_AFTER) {
-                        Ok(event) => {
-                            if builds.take(event, &mut programs)? {
-                                let_go(&mut db, &builds);
-                                memory::served(&mut db)?;
-                            }
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => start_idle_work(&db),
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            bail!("nothing takes requests any more")
-                        }
-                    },
                     Some(at) if idle => match builds.events.recv_timeout(OWN_BASE_AFTER) {
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {
@@ -8217,6 +8226,9 @@ fn run_holding(
                         }
                     }
                     _ => {}
+                }
+                if idle {
+                    start_idle_work(&db);
                 }
                 if !builds.over_budget.is_empty() {
                     builds.settle(&mut db, &mut programs)?;
@@ -8791,6 +8803,7 @@ fn run_holding(
                 } else {
                     Duration::from_millis(5)
                 });
+                start_idle_work(&db);
             }
         }
         // The checkouts that are read from somewhere else than for the last build. Their files

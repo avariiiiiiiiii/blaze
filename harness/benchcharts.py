@@ -11,6 +11,11 @@ Every chart is the same chart (`compare`): ra-jit against cargo, as how many tim
 ra-jit is, on a log axis around a line at 1×, the same as cargo. Right of the line ra-jit is
 better, left of it worse, in every chart, and the axis says so under it.
 
+A chart is a picture, not a paragraph: a short title, the legend, the bars with their factors,
+the axis and the 1× line, and nothing else. What it shows, how to read it and on which machines
+is Markdown next to it (`says`, and benchreport.py's machine lines), so it reads as text, wraps
+on a phone and is found by search.
+
   edits     how many times faster than incremental `cargo build` an edit builds, per project and
             platform: the median over the kinds of edit, the line from the slowest kind to the fastest
   memory    the most memory the work of an edit held at once, ra-jit's (the daemon, its workers,
@@ -20,9 +25,10 @@ better, left of it worse, in every chart, and the axis says so under it.
   runtime   how long the program ra-jit's LLVM built takes against `cargo build --release`'s
 
 Each row has a bar per platform (benchplatforms.PLATFORMS, in that order), and a platform with
-no numbers for the row says so in place of its bar. The first row is each platform's geometric
-mean over the rows it measured. Each platform is its own machine, which the footer names: a bar
-is comparable with the bars of its own colour.
+no numbers for the row has a quiet dash in place of its bar. The first row is each platform's
+geometric mean over the rows it measured, its factors in words ("10× faster"); the other rows
+say the word only when the chart has bars on both sides of the line. Each platform is its own
+machine: a bar is comparable with the bars of its own colour, which the text under it says.
 
 The colours: a hue per platform, the same in every chart (blue, orange, teal: Okabe and Ito's
 palette, apart under the common colour blindnesses), each tuned for the page it is drawn on. The
@@ -44,9 +50,9 @@ SCHEMES = {
     "dark": dict(platforms=("#5aa9f5", "#f0913a", "#34c69a"), ink="#f0f6fc", dim="#9198a1", grid="#262c36",
                  rule="#9198a1", band="#151b23"),
 }
-WIDTH, PAD, BAR, GAP = 760, 16, 12, 3
-NOT_MEASURED = "not measured yet"
-MACHINES = "Each colour is a machine of its own: compare bars of one colour, not across colours."
+WIDTH, PAD, BAR, GAP, ROW_PAD = 760, 16, 12, 3, 22
+# In place of the bar of a platform that has not measured a row.
+NOT_MEASURED = "–"
 
 
 def esc(text):
@@ -57,17 +63,6 @@ def text_width(text, size):
     """About how wide `text` is in the sans-serif fonts above: enough to lay out a column."""
     narrow = sum(c in "ijlt.,:;|!' ()1" for c in text)
     return size * (0.58 * (len(text) - narrow) + 0.3 * narrow)
-
-
-def wrap(text, size, width):
-    lines, line = [], ""
-    for word in text.split():
-        if line and text_width(line + " " + word, size) > width:
-            lines.append(line)
-            line = word
-        else:
-            line = f"{line} {word}".strip()
-    return lines + [line] if line else lines
 
 
 def n(v):
@@ -110,42 +105,49 @@ def cell(better, low=None, high=None, detail="", rough=False):
     return better, low, high, detail, rough
 
 
-def compare(name, title, subtitle, rows, everything, words, same, hints, notes, digits=1):
+def compare(name, title, rows, everything, words, same, hints, digits=1):
     """Write chart `name`: `rows` is (label, {platform: cell(...)}), `everything` what the
     geometric-mean row stands for ("All projects"), `words` (better, worse) after a factor, `same`
-    what the 1× line is, `hints` (left, right) what each side of it means, `notes` the footer.
-    Returns every row in words, for the chart's alt text."""
+    what the 1× line is, `hints` (left, right) what each side of it means. A row's label is drawn
+    up to its first space ("ripgrep 15.1.0" as "ripgrep"). Returns every row in words, with its
+    whole label and each detail, for the chart's alt text."""
     measured = [k for k in NAMES if any(k in by for _, by in rows)]
     means = {k: geomean([by[k][0] for _, by in rows if k in by]) for k in measured}
+    sides = {by[k][0] > 1 for _, by in rows for k in by if round(by[k][0], digits + 1) != 1}
+    mixed = len(sides) > 1
 
-    def said(better, rough=False, detail=""):
+    def said(better, rough=False, detail="", worded=True):
         m = better if better >= 1 else 1 / better
         text = f"{m:.0f}×" if digits == 1 and m >= 9.95 else f"{m:.{digits}f}×"
-        word = "" if float(text[:-1]) == 1 else f" {words[0] if better > 1 else words[1]}"
+        word = "" if float(text[:-1]) == 1 or not worded else f" {words[0] if better > 1 else words[1]}"
         return ("≈" if rough else "") + text + word + (f" · {detail}" if detail else "")
 
-    lines = [((everything, "geometric mean"), True, [(NAMES.index(k), means[k], None, None, said(means[k])) for k in measured])]
-    lines += [((label, None), False, [(NAMES.index(k), by[k][0], by[k][1], by[k][2], said(by[k][0], by[k][4], by[k][3]))
-                                      if k in by else (NAMES.index(k), None, None, None, NOT_MEASURED) for k in measured])
+    # Each bar: (platform, value, low, high, its label on the chart, it in words for the alt text).
+    lines = [((everything, "geometric mean"), True, [(NAMES.index(k), means[k], None, None, said(means[k]), said(means[k]))
+                                                   for k in measured])]
+    lines += [((label, None), False, [(NAMES.index(k), by[k][0], by[k][1], by[k][2], said(by[k][0], by[k][4], worded=mixed),
+                                       said(by[k][0], by[k][4], by[k][3]))
+                                      if k in by else (NAMES.index(k), None, None, None, NOT_MEASURED, None) for k in measured])
               for label, by in rows]
+    shown = lambda main: main if main == everything else main.split(" ")[0]
 
-    values = [x for _, _, bars in lines for _, v, low, high, _ in bars for x in (v, low, high) if x is not None]
+    values = [x for _, _, bars in lines for _, v, low, high, *_ in bars for x in (v, low, high) if x is not None]
     lo, hi = min(min(values) / 1.2, 0.5), max(max(values) * 1.2, 2)
     marks = factors(hi / lo)
     lo, hi = 1 / next(m for m in marks if m >= round(1 / lo, 9)), next(m for m in marks if m >= round(hi, 9))
     ticks = [1 / m for m in reversed(marks) if m <= round(1 / lo, 9)] + [1] + [m for m in marks if m <= hi]
+    if hi / lo >= 30:
+        # A wide axis keeps its grid to the powers of ten: fewer lines, the same span.
+        ticks = [v for v in ticks if abs(math.log10(v) - round(math.log10(v))) < 1e-9]
 
-    label_w = max(max(text_width(main, 13), text_width(sub or "", 11)) for (main, sub), _, _ in lines)
-    value_w = max(text_width(text, 12) for _, _, bars in lines for *_, text in bars)
+    label_w = max(max(text_width(shown(main), 13.5), text_width(sub or "", 11)) for (main, sub), _, _ in lines)
+    value_w = max(text_width(text, 12.5) for _, _, bars in lines for *_, text, _ in bars)
     x0, x1 = PAD + label_w + 16, WIDTH - PAD - value_w - 16
     scale = Log(lo, hi, x0, x1)
     one = scale(1)
 
-    body, y = [f'<text x="{PAD}" y="26" font-size="17" class="b">{esc(title)}</text>'], 26
-    for line in wrap(subtitle, 13, WIDTH - 2 * PAD):
-        y += 19
-        body.append(f'<text x="{PAD}" y="{y}" font-size="13" class="d">{esc(line)}</text>')
-    at, y = PAD, y + 22
+    body, y = [f'<text x="{PAD}" y="30" font-size="19" class="b">{esc(title)}</text>'], 30
+    at, y = PAD, y + 30
     for k in measured:
         width = 18 + text_width(k, 12.5)
         if at > PAD and at + width > WIDTH - PAD:
@@ -154,8 +156,8 @@ def compare(name, title, subtitle, rows, everything, words, same, hints, notes, 
         body.append(f'<text x="{n(at + 18)}" y="{y}" font-size="12.5">{esc(k)}</text>')
         at += width + 22
 
-    top = y + 30
-    heights = [len(bars) * BAR + (len(bars) - 1) * GAP + 16 for _, _, bars in lines]
+    top = y + 40
+    heights = [len(bars) * BAR + (len(bars) - 1) * GAP + ROW_PAD for _, _, bars in lines]
     bottom = top + sum(heights)
     grid, marks_, labels = [], [], []
     for v in ticks:
@@ -171,14 +173,13 @@ def compare(name, title, subtitle, rows, everything, words, same, hints, notes, 
             grid.append(f'<line x1="{PAD}" y1="{row_y}" x2="{WIDTH - PAD}" y2="{row_y}" class="r"/>')
         weight, strong = (" b", ' class="b"') if bold else ("", "")
         mid = row_y + h / 2
-        labels.append(f'<text x="{n(x0 - 12)}" y="{n(mid + (-2 if sub else 4.5))}" font-size="13" text-anchor="end"{strong}>{esc(main)}</text>')
+        labels.append(f'<text x="{n(x0 - 12)}" y="{n(mid + (-2 if sub else 4.5))}" font-size="13.5" text-anchor="end"{strong}>{esc(shown(main))}</text>')
         if sub:
             labels.append(f'<text x="{n(x0 - 12)}" y="{n(mid + 12)}" font-size="11" text-anchor="end" class="d">{esc(sub)}</text>')
-        by = row_y + 8
-        for platform, value, low, high, text in bars:
+        by = row_y + ROW_PAD / 2
+        for platform, value, low, high, text, _ in bars:
             if value is None:
-                marks_.append(f'<rect x="{n(one + 1)}" y="{n(by + 1.5)}" width="9" height="9" rx="2" class="o w{platform}"/>')
-                labels.append(f'<text x="{n(one + 16)}" y="{n(by + BAR - 2)}" font-size="11.5" class="d">{esc(text)}</text>')
+                labels.append(f'<text x="{n(one + 6)}" y="{n(by + BAR - 2)}" font-size="12.5" class="d">{esc(text)}</text>')
                 by += BAR + GAP
                 continue
             a, b = sorted((one, scale(min(max(value, lo), hi))))
@@ -190,7 +191,7 @@ def compare(name, title, subtitle, rows, everything, words, same, hints, notes, 
                 l, r = scale(max(low, lo)), scale(min(high, hi))
                 marks_.append(f'<path d="M{n(l)} {n(by + BAR / 2)}H{n(r)}M{n(l)} {n(by + 2)}v8M{n(r)} {n(by + 2)}v8" class="o w{platform}"/>')
                 tx = max(tx, r)
-            labels.append(f'<text x="{n(tx + 6)}" y="{n(by + BAR - 2)}" font-size="12" class="v{weight}">{esc(text)}</text>')
+            labels.append(f'<text x="{n(tx + 6)}" y="{n(by + BAR - 2)}" font-size="12.5" class="v{weight}">{esc(text)}</text>')
             by += BAR + GAP
         row_y += h
     marks_.append(f'<line x1="{n(one)}" y1="{top - 8}" x2="{n(one)}" y2="{bottom}" class="r"/>')
@@ -200,13 +201,9 @@ def compare(name, title, subtitle, rows, everything, words, same, hints, notes, 
     # 1× the line is near the plot's left edge, and the two hints must not overlap there.
     lx = max(one - 8, PAD + text_width(left, 12))
     rx = max(min(one + 8, WIDTH - PAD - text_width(right, 12)), lx + 16)
-    labels.append(f'<text x="{n(lx)}" y="{bottom + 37}" font-size="12" text-anchor="end" class="d">{esc(left)}</text>')
-    labels.append(f'<text x="{n(rx)}" y="{bottom + 37}" font-size="12" class="d">{esc(right)}</text>')
-    y = bottom + 44
-    for line in wrap(notes, 11.5, WIDTH - 2 * PAD):
-        y += 17
-        labels.append(f'<text x="{PAD}" y="{y}" font-size="11.5" class="d">{esc(line)}</text>')
-    height = y + 14
+    labels.append(f'<text x="{n(lx)}" y="{bottom + 40}" font-size="12" text-anchor="end" class="d">{esc(left)}</text>')
+    labels.append(f'<text x="{n(rx)}" y="{bottom + 40}" font-size="12" class="d">{esc(right)}</text>')
+    height = bottom + 60
 
     shapes = "\n".join(body + grid + marks_ + labels)
     os.makedirs(CHARTS, exist_ok=True)
@@ -216,6 +213,27 @@ def compare(name, title, subtitle, rows, everything, words, same, hints, notes, 
                     f'role="img" aria-label="{esc(title)}">\n<title>{esc(title)}</title>\n{style(c)}\n{shapes}\n</svg>\n')
     return "; ".join(f"{main}{' (' + sub + ')' if sub else ''}: " + ", ".join(f"{NAMES[k]} {text}" for k, v, *_, text in bars if v is not None)
                      for (main, sub), _, bars in lines)
+
+
+# What each chart shows, as Markdown bullets for under it (the chart itself carries no prose).
+# `colours` is how to read its colours: which machines, or where they are named.
+SAYS = {
+    "edits": ["**Bar:** how many times faster blaze builds an edit than incremental `cargo build`, both warm. "
+              "It is the median over the kinds of edit.",
+              "**Thin line:** from the slowest kind of edit to the fastest."],
+    "memory": ["**Bar:** how many times more (left) or less (right) memory blaze held at its peak while an edit built, "
+               "against cargo.",
+               "**blaze's side:** its daemon (which keeps the project loaded between edits), its workers and the command. "
+               "**cargo's:** cargo, rustc and the linker."],
+    "disk": ["**Bar:** how many times more (left) or less (right) disk blaze keeps once the edits are done, against cargo.",
+             "**blaze's side:** its target directory, function store and home. **cargo's:** its target directory."],
+    "runtime": ["**Bar:** how long each benchmark takes built by blaze's LLVM against built by `cargo build --release`, "
+                "on the same machine."],
+}
+def says(name, colours, same="cargo"):
+    """The Markdown under chart `name`: what it shows, the 1× line (the same as `same`) and its colours."""
+    line = f"**1× line:** the same as {same}. Right of it blaze wins, left of it {same}. The scale is logarithmic."
+    return "\n".join(f"- {x}" for x in [*SAYS[name], line, f"**Colours:** {colours}"])
 
 
 def picture(name, alt, prefix="docs/benchmarks/charts"):
@@ -233,22 +251,15 @@ def median(values):
     return r[len(r) // 2] if len(r) % 2 else math.sqrt(r[len(r) // 2 - 1] * r[len(r) // 2])
 
 
-THE_LINE = "Right of the 1× line ra-jit is better, left of it worse; the scale is logarithmic."
-
-
-def edits(rows, where):
+def edits(rows):
     """`rows`: (project, {platform: [cargo seconds / ra-jit seconds of each kind of edit]}).
-    `where` names each platform's machine. The chart's alt text is its own summary."""
+    Returns the chart's alt text."""
     rows = [(p, {k: sorted(v) for k, v in by.items() if v}) for p, by in rows]
     rows = [(p, {k: cell(median(r), r[0], r[-1]) for k, r in by.items()}) for p, by in rows if by]
     if not rows:
         return None
-    return compare("edits", "How much faster an edit builds than with cargo",
-                   "A small edit to a real project, then an incremental build: cargo build's time ÷ cargo ra-jit build's, "
-                   "both warm. The bar is the median over the kinds of edit, the thin line runs from the slowest kind to "
-                   f"the fastest. {THE_LINE}",
-                   rows, "All projects", ("faster", "slower"), "as fast as cargo", ("ra-jit slower", "ra-jit faster"),
-                   f"{MACHINES} {where}")
+    return compare("edits", "How fast an edit builds, against cargo", rows, "All projects", ("faster", "slower"),
+                   "same as cargo", ("slower", "faster"))
 
 
 def against(rows):
@@ -257,42 +268,30 @@ def against(rows):
     return [(p, by) for p, by in rows if by]
 
 
-def memory(rows, where):
+def memory(rows):
     """`rows`: (project, {platform: (cargo's peak MB, ra-jit's peak MB)}) during an edit."""
     rows = against(rows)
     if not rows:
         return None
-    return compare("memory", "How much memory an edit's build takes, against cargo",
-                   "The most memory every process doing the work held at once, ra-jit's against cargo's. ra-jit's is its "
-                   "daemon, which keeps the project loaded between edits, its workers and the command; cargo's is cargo, "
-                   f"rustc and the linker. {THE_LINE}",
-                   rows, "All projects", ("less", "more"), "as much as cargo", ("ra-jit uses more", "ra-jit uses less"),
-                   f"{MACHINES} {where}")
+    return compare("memory", "Memory while an edit builds, against cargo", rows, "All projects", ("less", "more"),
+                   "same as cargo", ("more memory", "less memory"))
 
 
-def disk(rows, where):
+def disk(rows):
     """`rows`: (project, {platform: (cargo's MB on disk, ra-jit's MB on disk)}) once the edits are done."""
     rows = against(rows)
     if not rows:
         return None
-    return compare("disk", "How much disk a project's build keeps, against cargo",
-                   "What each side keeps on disk once the edits are done, ra-jit against cargo: cargo's target directory, "
-                   f"and ra-jit's target directory, function store and home. {THE_LINE}",
-                   rows, "All projects", ("less", "more"), "as much as cargo", ("ra-jit keeps more", "ra-jit keeps less"),
-                   f"{MACHINES} {where}")
+    return compare("disk", "Disk a build keeps, against cargo", rows, "All projects", ("less", "more"),
+                   "same as cargo", ("more disk", "less disk"))
 
 
-def runtime(rows, where, rough=(), rough_note=""):
+def runtime(rows, rough=()):
     """`rows`: (benchmark, {platform: ra-jit's time / release's}); `rough`: the (benchmark, platform)
     whose runs varied too much to read closely, labelled ≈."""
     rows = [(b, {k: cell(1 / v, rough=(b, k) in rough) for k, v in by.items() if v}) for b, by in rows]
     rows = [(b, by) for b, by in rows if by]
     if not rows:
         return None
-    marked = any(k in by for b, by in rows for k in by if (b, k) in rough)
-    return compare("runtime", "How fast the programs ra-jit builds run, against cargo build --release",
-                   "How long each benchmark takes built by ra-jit's LLVM against built by cargo build --release, on the "
-                   f"same machine. {THE_LINE}",
-                   rows, "All benchmarks", ("faster", "slower"), "as fast as release",
-                   ("ra-jit's program slower", "ra-jit's program faster"),
-                   f"{MACHINES} {where}" + (f" {rough_note}" if marked else ""), digits=2)
+    return compare("runtime", "How fast the built programs run, against release", rows, "All benchmarks",
+                   ("faster", "slower"), "same as release", ("slower", "faster"), digits=2)

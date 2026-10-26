@@ -22,8 +22,9 @@ any of:
     tables name is never more than a day behind main
   - `--force`
 What a result of bench.py writes: in the README, its opening numbers (the edits chart's first
-row, in words) between `<!-- benchheadline:start -->` and `<!-- benchheadline:end -->`, and a
-small table of a few projects on one platform (PICK) between `<!-- benchpick:start -->` and
+row, in words) between `<!-- benchheadline:start -->` and `<!-- benchheadline:end -->`, the edits
+chart with a line on how to read it and its machines between `<!-- benchchart:start -->` and
+`<!-- benchchart:end -->`, and a small table of a few projects on one platform (PICK) between `<!-- benchpick:start -->` and
 `<!-- benchpick:end -->`; in docs/benchmarks.md, the build table between
 `<!-- benchsummary:start -->` and `<!-- benchsummary:end -->`, memory and disk (bench.py's
 `memory`, `resident` and `disk_mb`, docs/benchmarks.md "Memory and disk") between
@@ -51,8 +52,10 @@ a platform's memory is its result's.
 Every summary table comes with its chart (benchcharts.py), written to
 docs/benchmarks/charts/ by the same call that writes the table: the edit speed-ups with the
 build table, memory and disk with the memory table, the runtime ratios with the runtime table,
-each ra-jit against cargo with a bar per platform and each platform's geometric mean. `--render` writes every table and chart again from the stored results, and
-`--charts` the charts alone.
+each ra-jit against cargo with a bar per platform and each platform's geometric mean. A chart
+holds no prose: what it shows is Markdown under it (benchcharts.says), and its machines are the
+table's machine lines (the README's, `colours`). `--render` writes every table and chart again
+from the stored results, and `--charts` the charts alone.
 
 The last line says `changed` or `unchanged`, and so does `changed=true|false` in
 $GITHUB_OUTPUT when that is set.
@@ -73,6 +76,7 @@ MEM_START, MEM_END = "<!-- benchmem:start -->", "<!-- benchmem:end -->"
 HEADLINE_START, HEADLINE_END = "<!-- benchheadline:start -->", "<!-- benchheadline:end -->"
 SUM_START, SUM_END = "<!-- benchsummary:start -->", "<!-- benchsummary:end -->"
 PICK_START, PICK_END = "<!-- benchpick:start -->", "<!-- benchpick:end -->"
+CHART_START, CHART_END = "<!-- benchchart:start -->", "<!-- benchchart:end -->"
 # The README's small table: an edit to one function of these projects, as the README names them, on
 # PICK_ON, the platform that measures every project.
 PICK = {"ripgrep": "ripgrep", "nushell": "nushell", "helix": "helix", "bun": "bun (1.25M lines of Rust)"}
@@ -291,19 +295,18 @@ def apart_lines(results, extra=lambda r: "", said=False):
     return lines
 
 
-def where(results):
-    """Each platform's machine (the start of its name) and the day it was measured, for a chart's
-    footer, then each project measured on its own; the commit is in the table's machine lines."""
+def colours(results):
+    """The README chart's colours in words: each platform's machine (the start of its name) and
+    the day it was measured, then the projects measured on their own; the commits are in
+    docs/benchmarks.md's machine lines."""
     def name(r):
         host = r.get("host") or {}
         named = re.split(r" \(|, ", host.get("name") or "")[0]
         return named or re.sub(r"( \d+-Core)? Processor$", "", host.get("cpu") or "") or "one machine"
-    said = [f"{p}: {name(r)}, {r['date'][:10]}." for p, full in results.items() if (r := own(full))]
-    for n in names():
-        on = {p: r["apart"][n] for p, r in results.items() if n in r.get("apart", {})}
-        if on:
-            said.append(f"{n}, measured on its own: " + "; ".join(f"{p}: {name(r)}, {r['date'][:10]}" for p, r in on.items()) + ".")
-    return " ".join(said)
+    said = [f"{p} on {name(r)}, {r['date'][:10]}" for p, full in results.items() if (r := own(full))]
+    apart = [n for n in names() if any(n in r.get("apart", {}) for r in results.values())]
+    return ("One machine per colour, so compare bars of one colour: " + "; ".join(said) + "."
+            + (f" {' and '.join(apart)} on machines of {'its' if len(apart) == 1 else 'their'} own." if apart else ""))
 
 
 def keys_of(results, backend):
@@ -347,7 +350,7 @@ def edit_speedups(results, backend):
 
 
 def edits_chart(results, backend="cranelift"):
-    return benchcharts.edits(edit_speedups(results, backend), where(results))
+    return benchcharts.edits(edit_speedups(results, backend))
 
 
 def headline(results, backend="cranelift"):
@@ -384,7 +387,7 @@ def memory_chart(results, backend):
               if key in r["results"] and (m := edit_memory(r["results"][key]))}
         if by:
             rows.append((label_of(results, key), by))
-    return benchcharts.memory(rows, where({p: r for p, r in results.items() if has_memory(r)}))
+    return benchcharts.memory(rows)
 
 
 def on_disk(measured):
@@ -401,8 +404,22 @@ def disk_chart(results, backend):
         by = {p: d for p, r in results.items() if key in r["results"] and (d := on_disk(r["results"][key]))}
         if by:
             rows.append((label_of(results, key), by))
-    return benchcharts.disk(rows, where({p: r for p, r in results.items()
-                                         if any(on_disk(m) for k, m in r["results"].items() if k.endswith("/" + backend))}))
+    return benchcharts.disk(rows)
+
+
+EDITS_ALT = "How much faster an edit builds under blaze than under cargo, by platform: "
+COLOURS_BELOW = "one machine each, named under the table below, so compare bars of one colour."
+
+
+def chart_section(results):
+    """The README's chart: the edits chart and, small under it, how to read it and its machines."""
+    lines = [CHART_START]
+    if summary := edits_chart(results):
+        lines += [benchcharts.picture("edits", EDITS_ALT + summary), "",
+                  "<sub>Bar: the median over the kinds of edit. Thin line: slowest kind to fastest. Log scale. "
+                  f"{colours(results)}</sub>"]
+    lines.append(CHART_END)
+    return "\n".join(lines)
 
 
 def pick_section(results, backend="cranelift"):
@@ -433,10 +450,10 @@ def summary_section(results):
     backend = "cranelift"
     lines = [SUM_START]
     if summary := edits_chart(results, backend):
-        lines += [benchcharts.picture("edits", f"How much faster an edit builds under ra-jit than under cargo, by platform: {summary}"), ""]
-    lines += ["Edit, then build, on real projects at pinned commits: incremental `cargo build` → `cargo ra-jit build`, both "
-              "warm, same linker, Cranelift, the median of each run's edits. Each platform is a machine of its "
-              "own: compare numbers within a platform, not across.", ""]
+        lines += [benchcharts.picture("edits", EDITS_ALT + summary), "",
+                  benchcharts.says("edits", COLOURS_BELOW)]
+    lines += ["- **How:** edit a real project at a pinned commit, then build: incremental `cargo build` against "
+              "`cargo ra-jit build`, both warm, same linker, Cranelift.", ""]
     fell_back = False
 
     def phase_table(result, keys):
@@ -489,13 +506,16 @@ def memory_section(results):
     if backend is None:
         return "\n".join([MEM_START, "Memory: no platform's stored run measured it yet.", MEM_END])
     if summary := memory_chart(measured, backend):
-        lines += [benchcharts.picture("memory", f"Peak memory while an edit to one function builds, ra-jit against cargo, by platform: {summary}"), ""]
+        lines += [benchcharts.picture("memory", f"Peak memory while an edit to one function builds, blaze against cargo, by platform: {summary}"), "",
+                  benchcharts.says("memory", COLOURS_BELOW), ""]
     if summary := disk_chart(measured, backend):
-        lines += [benchcharts.picture("disk", f"What a project's build keeps on disk, ra-jit against cargo, by platform: {summary}"), ""]
-    lines += [f"Memory and disk, {BACKEND_NAMES[backend]}, from the same runs as the build table. Peak: the most every process "
-              "doing the work held at once, cargo → ra-jit. For ra-jit that is the daemon, its workers and what they run, and "
-              "`cargo ra-jit build` with any cargo it ran; for plain cargo, cargo itself, rustc, build scripts and the linker. "
-              "How it is measured: [docs/benchmarks.md](docs/benchmarks.md#memory-and-disk).", "",
+        lines += [benchcharts.picture("disk", f"What a project's build keeps on disk, blaze against cargo, by platform: {summary}"), "",
+                  benchcharts.says("disk", COLOURS_BELOW), ""]
+    lines += [f"Memory and disk, {BACKEND_NAMES[backend]}, from the same runs as the build table.", "",
+              "- **Peak:** the most every process doing the work held at once, cargo → ra-jit.",
+              "- **ra-jit's processes:** the daemon, its workers and what they run, and `cargo ra-jit build` with any cargo it ran.",
+              "- **cargo's:** cargo itself, rustc, build scripts and the linker.",
+              "- **How it is measured:** [below](docs/benchmarks.md#memory-and-disk).", "",
               "Peak while an edit to one function builds, cargo → ra-jit:", "",
               "| Project | " + " | ".join(NAMES) + " |", "|---|" + "---:|" * len(NAMES)]
     pair = lambda m: f"{megabytes(m['cargo']['peak_mb'])} → **{megabytes(m['ra-jit']['peak_mb'])}**" if m else "-"
@@ -865,10 +885,7 @@ def runtime_chart(results):
     rows = [(bench, {p: b[0][bench] for p, b in best.items() if bench in b[0]}) for bench in benchmarks(results)]
     marked = {(bench, p) for p in best for pr in results[p]["runbench"]["programs"].values()
               for bench, row in pr["benches"].items() if rough(row)}
-    builds = sorted({b[2] for b in best.values()})
-    named = builds[0] if len(builds) == 1 else "; ".join(f"{p} {b[2]}" for p, b in best.items())
-    return benchcharts.runtime(rows, f"ra-jit's LLVM at {named}. " + where({p: results[p] for p in best}),
-                               marked, f"≈: that benchmark's runs varied by more than {ROUGH:g}×, so read it as rough.")
+    return benchcharts.runtime(rows, marked)
 
 
 def runtime_tables(result):
@@ -914,11 +931,13 @@ def runtime_section(results):
     times, memory and builds."""
     lines = [RUN_START]
     if summary := runtime_chart(results):
-        lines += [benchcharts.picture("runtime", f"How fast each benchmark runs built by ra-jit, against cargo build --release, by platform: {summary}"), ""]
-    lines += ["How fast the programs run. Each program is built by `cargo build --release` and by ra-jit with LLVM at `-O3`, "
-              "every crate of it compiled by ra-jit, with the release profile; each benchmark is then run several times, the "
-              "builds taking turns, median. A run is published only when every program did what the release build's did. Each "
-              "platform is a machine of its own, and each number is ra-jit's time ÷ release's on it: 1x is as fast.", "",
+        lines += [benchcharts.picture("runtime", f"How fast each benchmark runs built by blaze, against cargo build --release, by platform: {summary}"), "",
+                  benchcharts.says("runtime", COLOURS_BELOW, "`cargo build --release`"), ""]
+    lines += ["How it is measured:", "","- **Builds:** each program by `cargo build --release`, and by ra-jit with LLVM at `-O3`, every crate compiled "
+              "by ra-jit, with the release profile.",
+              "- **Runs:** each benchmark several times, the builds taking turns; the median.",
+              "- **Published** only when every program did what the release build's did.",
+              "- **Each number:** ra-jit's time ÷ release's, on that platform's machine. 1x is as fast; under 1x is faster.", "",
               "| Benchmark | " + " | ".join(NAMES) + " |", "|---|" + "---:|" * len(NAMES)]
     noisy = False
     for bench in benchmarks(results):
@@ -974,6 +993,7 @@ def write_sections(kind="", override=None, name=None):
             splice(DOC, for_docs(runtime_section(results)), RUN_START, RUN_END)
     elif results := stored_all("", override, name):
         splice(README, headline(results), HEADLINE_START, HEADLINE_END)
+        splice(README, chart_section(results), CHART_START, CHART_END)
         splice(README, pick_section(results), PICK_START, PICK_END)
         splice(DOC, for_docs(summary_section(results)), SUM_START, SUM_END)
         splice(DOC, doc_section(results))

@@ -22,7 +22,7 @@ without it, where what is asked is what the items say.
 
 Python 3, stdlib only.
 """
-import glob, os, re, subprocess, sys, tempfile
+import glob, os, re, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -68,6 +68,8 @@ LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs"
 C_RS, D_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/f.rs"
 # A file of the crate's directory that no module is written in, which the crate doesn't build.
 STRAY = "lib/src/stray.rs"
+# An edit whose file the daemon sees empty first, as a write that truncates it shows it.
+EMPTY_FIRST = "empty first"
 SIDES = "\nimpl Sq {\n    pub const SIDES: u32 = 40;\n}\n"
 INHERENT = "\nimpl Sq {\n    pub fn area(&self) -> u32 {\n        7\n    }\n}\n"
 # (step, edits); an edit is (file, old, new), with `None` for old to write the file whole.
@@ -108,11 +110,26 @@ STEPS = [
     ("inherent impl taken away", [(F_RS, None, lambda _: "")]),
     ("a file no module is written in", [(STRAY, None, lambda _: "pub fn pick() -> u32 {\n    9\n}\n")]),
     ("it written again", [(STRAY, "9", "90")]),
+    ("a constant shadowed, its file seen empty first", [(SHAPES_RS, None, lambda text: text + SIDES, EMPTY_FIRST)]),
+    ("it taken away, its file seen empty first", [(SHAPES_RS, SIDES, "", EMPTY_FIRST)]),
 ]
 
 
 def logs(home):
     return "".join(open(log, errors="replace").read() for log in sorted(glob.glob(os.path.join(home, "*", "*", "log"))))
+
+
+def wait_items(home, timeout=30):
+    """Waits until the daemon has the items of its last build: it makes them once it has been
+    idle a while, and again after an edit it couldn't push by them."""
+    began = time.time()
+    while time.time() - began < timeout:
+        log = logs(home)
+        made = log.rfind("\nitems-us: ")
+        lost = max(log.rfind("\nitems: whole crates: no items"), log.rfind("\nitems: not made"))
+        if made >= 0 and made > lost:
+            return
+        time.sleep(0.1)
 
 
 def ran(exe):
@@ -145,7 +162,8 @@ def steps(check_all):
         if states != ["ready"]:
             raise SystemExit(f"the daemon did not get ready: {states}")
         for step, edits in STEPS:
-            for path, old, new in edits:
+            wait_items(home)
+            for path, old, new, *how in edits:
                 path = os.path.join(ws, path)
                 text = open(path).read() if os.path.exists(path) else ""
                 if old is None:
@@ -154,6 +172,9 @@ def steps(check_all):
                     raise SystemExit(f"{step}: {old!r} is not in {path}")
                 else:
                     text = text.replace(old, new, 1)
+                if EMPTY_FIRST in how:
+                    open(path, "w").close()
+                    time.sleep(0.5)
                 open(path, "w").write(text)
             seen = len(logs(home))
             _, ours = side.cargo("build")

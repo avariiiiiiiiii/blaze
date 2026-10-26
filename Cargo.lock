@@ -3591,6 +3591,7 @@ dependencies = [
  "aws-smithy-http-client",
  "blaze-manifest",
  "blaze-metadata",
+ "blaze-monitor",
  "cargo-platform",
  "cargo_metadata",
  "cfg",

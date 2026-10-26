@@ -205,6 +205,21 @@ pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[File
     Some(files.into())
 }
 
+/// The bodies [`body_files`] has the files of, each with its file.
+pub(super) fn bodies_of(
+    db: &dyn HirDatabase,
+    instance: &Instance,
+) -> Option<Box<[(FileId, DefWithBodyId)]>> {
+    let mentions = Mentions::of(db, instance);
+    if mentions.opaque {
+        return None;
+    }
+    let mut bodies: Vec<_> = mentions.bodies.into_iter().map(|it| (body_file(db, it), it)).collect();
+    let mut seen = FxHashSet::default();
+    bodies.retain(|it| seen.insert(it.1));
+    Some(bodies.into())
+}
+
 /// The file a body is written in, which for one a macro makes is where the macro is called.
 pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
     let file = match body {

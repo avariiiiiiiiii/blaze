@@ -1558,17 +1558,19 @@ impl Rejections {
     }
 
     /// Notes that `files` of `crates` changed in more than the bodies of functions, and what
-    /// changed can be told by the items that did, with the threads `fan` has.
+    /// changed can be told by the items that did, with the threads `fan` has. `unchanged`
+    /// has of some of the files the functions written as they were and where they were.
     pub fn touch_items(
         &mut self,
         db: &dyn HirDatabase,
         crates: &[Crate],
         files: &[base_db::FileId],
+        unchanged: &FxHashMap<base_db::FileId, FxHashSet<FunctionId>>,
         fan: &Fan<'_>,
     ) {
         self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
         if let Some(base) = &mut self.base {
-            base.touch_items(db, crates, files, fan);
+            base.touch_items(db, crates, files, unchanged, fan);
         }
         if let Some(rustc) = &mut self.rustc {
             rustc.touch(db, Some(crates));
@@ -1601,11 +1603,17 @@ impl Rejections {
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
-    /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
+    /// items, and not handed to a macro. `unchanged` are the functions of it written as they
+    /// were and where they were, when that is known: no code of those is another.
+    pub fn touch_bodies(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: base_db::FileId,
+        unchanged: Option<FxHashSet<FunctionId>>,
+    ) {
         self.frozen.edit_bodies(file);
         for base in [&mut self.base, &mut self.rustc].into_iter().flatten() {
-            base.touch_bodies(db, file);
+            base.touch_bodies(db, file, unchanged.clone());
         }
         self.forget();
     }

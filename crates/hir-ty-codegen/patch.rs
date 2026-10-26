@@ -34,7 +34,7 @@ use super::{
     Rejections, Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
     compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
-    home::{body_file, body_files, instance_gone, mentioned_crates, type_gone, written_in},
+    home::{bodies_of, body_file, body_files, instance_gone, mentioned_crates, type_gone, written_in},
     instance_serial, is_thread_local,
     itempush::{Asked, ItemPush, Settled},
     left_to_rustc,
@@ -272,6 +272,8 @@ pub(super) struct BaseInstance {
     forwarded: bool,
     /// The files whose bodies it comes from, or `None` when any may be one.
     files: Option<Box<[FileId]>>,
+    /// Those bodies, each with its file. `None` when only `files` are known.
+    bodies: Option<Box<[(FileId, DefWithBodyId)]>>,
     /// What in the base refers to it.
     parents: Vec<Node>,
     /// The functions left to rustc reach it.
@@ -688,6 +690,11 @@ pub(super) struct Base {
     /// The crate of each of `compiled`, and the file it is written in.
     crates: Vec<Crate>,
     files: Vec<FileId>,
+    /// The bodies of the checkout other than their own whose places roots and instances have
+    /// in their code, by the index of each: the declaration of a `#[track_caller]` function
+    /// they take the address of, or a body built into them. Moving one changes the code.
+    root_places: FxHashMap<u32, Box<[(FileId, DefWithBodyId)]>>,
+    instance_places: FxHashMap<u32, Box<[(FileId, DefWithBodyId)]>>,
     touched: Touched,
     pub(super) skipped: Vec<(FunctionId, CodegenError)>,
     /// For each of `skipped` that rustc has a copy of.
@@ -1171,6 +1178,10 @@ struct Touched {
     crates: FxHashSet<Crate>,
     /// The files that changed in the bodies of functions alone.
     bodies: FxHashSet<FileId>,
+    /// Of those, the ones whose every edit since the last look told which functions of it it
+    /// left written as they were and where they were, with the functions every one left so:
+    /// no code of those can be another. Of a file not here, any function may be.
+    unchanged: FxHashMap<FileId, FxHashSet<FunctionId>>,
     /// A file changed that we can't tell the crates of.
     any: bool,
     /// The crates that see a file of which only the signatures of functions changed that
@@ -1234,6 +1245,31 @@ impl Touched {
             return false;
         }
         files.is_none_or(|files| files.iter().any(|it| self.bodies.contains(it)))
+    }
+
+    /// Notes that the bodies of `file` changed, and of which of its functions no edit since the
+    /// last look changed how or where they are written, when that is known.
+    fn touch_bodies(&mut self, file: FileId, unchanged: Option<&FxHashSet<FunctionId>>) {
+        let first = self.bodies.insert(file);
+        match unchanged {
+            Some(now) if first => _ = self.unchanged.insert(file, now.clone()),
+            Some(now) => {
+                if let Some(was) = self.unchanged.get_mut(&file) {
+                    was.retain(|it| now.contains(it));
+                }
+            }
+            None => _ = self.unchanged.remove(&file),
+        }
+    }
+
+    /// Whether an edit can have changed what the body `body` in `file` compiles to, or where
+    /// the places in it are.
+    fn reaches_body(&self, file: FileId, body: DefWithBodyId) -> bool {
+        if !self.bodies.contains(&file) {
+            return false;
+        }
+        let DefWithBodyId::FunctionId(func) = body else { return true };
+        self.unchanged.get(&file).is_none_or(|it| !it.contains(&func))
     }
 }
 
@@ -1481,7 +1517,7 @@ impl Base {
         let root_mark = |db: &dyn HirDatabase, root| Mark::of_root(db, root, debug);
         let instance_mark =
             |db: &dyn HirDatabase, (instance, env): &(Instance, StoredParamEnvAndCrate)| {
-                (Mark::of_instance(db, instance, env, debug), body_files(db, instance))
+                (Mark::of_instance(db, instance, env, debug), bodies_of(db, instance))
             };
         // The marks are a hash of each function's code and of its lines, which every thread
         // works out: the object waits for this.
@@ -1509,13 +1545,20 @@ impl Base {
             .map(|(of, mark)| {
                 let (instance, env) = of;
                 let id = *cg.instances.get(instance)?;
-                let (mark, files) = mark.into_inner().unwrap_or_else(|| instance_mark(db, of));
+                let (mark, bodies) = mark.into_inner().unwrap_or_else(|| instance_mark(db, of));
+                let files = bodies.as_ref().map(|bodies| {
+                    let mut files: Vec<FileId> = bodies.iter().map(|it| it.0).collect();
+                    files.sort_unstable();
+                    files.dedup();
+                    files.into_boxed_slice()
+                });
                 let known = BaseInstance {
                     env: env.clone(),
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
                     mark,
                     forwarded: cg.forwarded.contains(instance),
                     files,
+                    bodies,
                     parents: Vec::new(),
                     theirs: false,
                 };
@@ -1564,14 +1607,38 @@ impl Base {
                 if from_store.untracked { ", some untracked" } else { "" },
             );
         }
+        let places = |compiled: &CompiledFunction, own: &dyn Fn(DefWithBodyId) -> bool| {
+            let requests = compiled.requests.datas.iter().filter_map(|it| match it {
+                DataRequest::Location(Some((owner, _))) => Some(*owner),
+                DataRequest::Declaration(func) => Some((*func).into()),
+                _ => None,
+            });
+            let lines = compiled.source.as_ref().map(|it| it.0);
+            let mut seen = FxHashSet::default();
+            let found: Box<[(FileId, DefWithBodyId)]> = (requests.chain(lines))
+                .filter(|&it| !own(it) && seen.insert(it))
+                .filter(|it| it.module(db).krate(db).data(db).origin.is_local())
+                .map(|it| (body_file(db, it), it))
+                .collect();
+            (!found.is_empty()).then_some(found)
+        };
+        let mut root_places = FxHashMap::default();
         for (i, &(root, _)) in compiled.iter().enumerate() {
             if !stored(i) {
-                note(Node::Root(root), &compiled_root(db, root).as_ref().ok()?.requests);
+                let compiled = compiled_root(db, root).as_ref().ok()?;
+                note(Node::Root(root), &compiled.requests);
+                let own = |it: DefWithBodyId| it == root.into();
+                root_places.extend(places(compiled, &own).map(|it| (i as u32, it)));
             }
         }
-        for (instance, known) in &instances {
+        let mut instance_places = FxHashMap::default();
+        for (i, (instance, known)) in instances.iter().enumerate() {
             if let Ok(compiled) = compiled_instance(db, instance.clone(), known.env.clone()) {
                 note(Node::Instance(instance.clone()), &compiled.requests);
+                let bodies = known.bodies.as_deref();
+                let own =
+                    |it: DefWithBodyId| bodies.is_some_and(|all| all.iter().any(|b| b.1 == it));
+                instance_places.extend(places(compiled, &own).map(|it| (i as u32, it)));
             }
         }
         for &id in statics.keys() {
@@ -1645,6 +1712,8 @@ impl Base {
             },
             crates,
             files,
+            root_places,
+            instance_places,
             touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
@@ -1747,6 +1816,8 @@ impl Base {
             marks: Vec::new(),
             crates: Vec::new(),
             files: Vec::new(),
+            root_places: FxHashMap::default(),
+            instance_places: FxHashMap::default(),
             touched: Touched::default(),
             skipped: Vec::new(),
             left: Vec::new(),
@@ -1961,6 +2032,7 @@ impl Base {
                 mark,
                 forwarded: false,
                 files,
+                bodies: None,
                 parents: Vec::new(),
                 theirs: false,
             };
@@ -2000,6 +2072,7 @@ impl Base {
                         mark,
                         forwarded: false,
                         files: Some(Box::new([file])),
+                        bodies: None,
                         parents: Vec::new(),
                         theirs: false,
                     };
@@ -2088,7 +2161,7 @@ impl Base {
         };
         self.bindings_edited();
         // Its bodies too, as a body edit's.
-        self.touched.bodies.insert(file);
+        self.touched.touch_bodies(file, None);
         for &krate in crates {
             if !self.touched.around.contains(&krate) {
                 self.touched.around.extend(krate.transitive_rev_deps(db));
@@ -2467,6 +2540,7 @@ impl Base {
         db: &dyn HirDatabase,
         crates: &[Crate],
         files: &[FileId],
+        unchanged: &FxHashMap<FileId, FxHashSet<FunctionId>>,
         fan: &Fan<'_>,
     ) {
         let stats = std::env::var_os("RA_JIT_STATS").is_some();
@@ -2497,7 +2571,9 @@ impl Base {
         let items = self.items.as_ref().expect("pushed through them");
         let asked = items.asked(&pushed);
         // Their bodies too, as a body edit's.
-        self.touched.bodies.extend(pushed.files.iter().copied());
+        for &file in &pushed.files {
+            self.touched.touch_bodies(file, unchanged.get(&file));
+        }
         for &krate in crates {
             if !self.touched.around.contains(&krate) {
                 self.touched.around.extend(krate.transitive_rev_deps(db));
@@ -2543,8 +2619,13 @@ impl Base {
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into.
-    pub(super) fn touch_bodies(&mut self, db: &dyn HirDatabase, file: FileId) {
-        self.touched.bodies.insert(file);
+    pub(super) fn touch_bodies(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: FileId,
+        unchanged: Option<FxHashSet<FunctionId>>,
+    ) {
+        self.touched.touch_bodies(file, unchanged.as_ref());
         if !self.homed.contains(&file) {
             self.outdate_rustc("a file whose functions were not looked at before it changed");
         }
@@ -2604,6 +2685,27 @@ impl Base {
         }
     }
 
+    /// Whether an edit of bodies can have changed the code of the root at `i`, or where the
+    /// places in it are.
+    fn root_body_touched(&self, i: usize) -> bool {
+        let touched = &self.touched;
+        let placed = self.root_places.get(&(i as u32));
+        touched.reaches_body(self.files[i], self.compiled[i].0.into())
+            || placed.is_some_and(|it| it.iter().any(|&(file, body)| touched.reaches_body(file, body)))
+    }
+
+    /// [`Self::root_body_touched`], of the instance at `i`.
+    fn instance_body_touched(&self, i: usize) -> bool {
+        let touched = &self.touched;
+        let Some((_, was)) = self.instances.get_index(i) else { return false };
+        let own = match &was.bodies {
+            Some(bodies) => bodies.iter().any(|&(file, body)| touched.reaches_body(file, body)),
+            None => touched.reaches_bodies(was.files.as_deref()),
+        };
+        let placed = self.instance_places.get(&(i as u32));
+        own || placed.is_some_and(|it| it.iter().any(|&(file, body)| touched.reaches_body(file, body)))
+    }
+
     /// The roots an edit can have changed, or all of them.
     fn roots_to_ask(&self, all: bool) -> Vec<usize> {
         let touched = &self.touched;
@@ -2613,7 +2715,10 @@ impl Base {
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
         let of_files = touched.bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
-        let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        let placed = self.root_places.keys().filter(|_| !touched.bodies.is_empty());
+        let of_bodies = (of_files.flatten().chain(placed).copied())
+            .filter(|&i| self.root_body_touched(i as usize));
+        let mut asked: Vec<u32> = of_crates.flatten().copied().chain(of_bodies).collect();
         asked.extend(touched.roots.iter().filter_map(|it| homes.root.get(it)));
         asked.extend(&touched.named_roots);
         if touched.edited() {
@@ -2631,9 +2736,13 @@ impl Base {
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
         let of_files = touched.bodies.iter().filter_map(|it| homes.instances_of_file.get(it));
-        let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        let mut asked: Vec<u32> = of_crates.flatten().copied().collect();
         if !touched.bodies.is_empty() {
-            asked.extend(&homes.instances_of_any_file);
+            let any = homes.instances_of_any_file.iter();
+            let of_bodies = (of_files.flatten().chain(self.instance_places.keys()).chain(any))
+                .copied()
+                .filter(|&i| self.instance_body_touched(i as usize));
+            asked.extend(of_bodies);
         }
         asked.extend(&touched.named_instances);
         if touched.edited() {
@@ -2885,7 +2994,7 @@ impl Base {
         for i in handout.each(Look::Roots, handout.roots.len()).map(|it| handout.roots[it]) {
             let root = self.compiled[i].0;
             let touched = self.touched.reaches(self.crates[i])
-                || self.touched.reaches_bodies(Some(&[self.files[i]]))
+                || self.root_body_touched(i)
                 || self.touched.roots.contains(&root)
                 || self.touched.named_roots.contains(&(i as u32))
                 || self.touched.edited() && self.cached_roots.binary_search(&(i as u32)).is_ok();
@@ -2984,7 +3093,7 @@ impl Base {
                 continue;
             }
             let touched = self.touched.reaches(was.env.krate)
-                || self.touched.reaches_bodies(was.files.as_deref())
+                || self.instance_body_touched(i)
                 || self.touched.instances.contains(instance)
                 || self.touched.named_instances.contains(&(i as u32))
                 || self.touched.edited()

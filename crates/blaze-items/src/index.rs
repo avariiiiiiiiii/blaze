@@ -912,15 +912,27 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
                             .take(3)
                             .map(|(a, b)| format!("{a:?}->{b:?}"))
                             .collect();
+                        let code =
+                            |it: &Entry| it.code.as_ref().map(|(hash, refs)| (*hash, refs.len()));
+                        let (was_code, now_code) = (code(was), code(now));
                         eprintln!(
-                            "items-unmoved: {} {names:?}: digest {}, refs {} and {}, {diff:?}, erred {} {}, missed {:?}",
+                            "items-unmoved: {} {names:?}: digest {}, refs {} and {}, {diff:?}, erred {} {}, missed {:?}, code {} and {} ({}), code refs {:?} and {:?}",
                             id.kind(),
                             if now.digest == was.digest { "same" } else { "other" },
                             was.refs.len(),
                             now.refs.len(),
                             was.erred,
                             now.erred,
-                            now.missed
+                            now.missed,
+                            was_code.is_some(),
+                            now_code.is_some(),
+                            if was_code.map(|it| it.0) == now_code.map(|it| it.0) {
+                                "same"
+                            } else {
+                                "other"
+                            },
+                            was_code.map(|it| it.1),
+                            now_code.map(|it| it.1),
                         );
                     }
                 }

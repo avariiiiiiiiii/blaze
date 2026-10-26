@@ -3126,35 +3126,6 @@ fn warm_impls(
 /// the first type check asks for those of every crate it sees, one crate after another, and
 /// the other threads wait for it: an impl may be written in a body, so each crate's must be
 /// verified again.
-/// Infers and lowers `bodies` on threads of their own, beside the check of the files they are
-/// written in, which looks at each file on one thread. An edit that only moved them asks
-/// nothing of them that would have.
-fn verify_bodies<'scope>(
-    scope: &'scope std::thread::Scope<'scope, '_>,
-    db: &RootDatabase,
-    bodies: Vec<hir_def::DefWithBodyId>,
-) {
-    use hir_ty::{InferBodyId, InferenceResult, db::HirDatabase};
-    let bodies: Arc<[hir_def::DefWithBodyId]> = bodies.into();
-    let next = Arc::new(AtomicUsize::new(0));
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-    for _ in 0..threads.min(bodies.len()) {
-        let (db, bodies, next) = (db.clone(), bodies.clone(), next.clone());
-        scope.spawn(move || {
-            // A query that is cancelled unwinds, and those that wait for it see that.
-            _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                hir::attach_db(&db, || {
-                    let at = || next.fetch_add(1, Ordering::Relaxed);
-                    while let Some(&body) = bodies.get(at()) {
-                        _ = InferenceResult::of(&db, body);
-                        _ = db.mir_body(InferBodyId::DefWithBodyId(body));
-                    }
-                })
-            }));
-        });
-    }
-}
-
 fn verify_impls<'scope>(
     scope: &'scope std::thread::Scope<'scope, '_>,
     db: &RootDatabase,
@@ -9970,9 +9941,6 @@ impl Program {
             if let Some(crates) = &within {
                 verify_impls(scope, db, crates);
             }
-            let whole: Vec<vfs::FileId> =
-                edited.iter().copied().filter(|it| !scoped.contains_key(it)).collect();
-            verify_bodies(scope, db, known.bodies_in(&whole));
             let check = {
                 let (db, edited, root, scoped) = (db.clone(), &edited, &args.checkout, &scoped);
                 let lints = !args.lints_capped;

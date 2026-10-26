@@ -2287,15 +2287,21 @@ impl Base {
         }
     }
 
-    /// Before an edit of `files`, of the revision before it: the code of the instances of the
-    /// base, or of what it relocated, of functions written in them, for [`Self::relocate`].
-    /// Only an edit of two files or more moves a function, and the items tell which it moved.
     /// Whether an edit that moves items between files keeps their code: the base is its own and
     /// its items are made.
     pub(super) fn keeps_moves(&self) -> bool {
         !self.rustc && self.items.is_some()
     }
 
+    /// Whether the items refuse a push of an edit of `files` before it is made: one of them
+    /// could not be hashed at the last build.
+    pub(super) fn unhashed_in(&self, files: &[FileId]) -> bool {
+        (self.items.as_ref()).is_some_and(|it| it.index.unhashed_in(files).is_some())
+    }
+
+    /// Before an edit of `files`, of the revision before it: the code of the instances of the
+    /// base, or of what it relocated, of functions written in them, for [`Self::relocate`].
+    /// Only an edit of two files or more moves a function, and the items tell which it moved.
     fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>, moves: bool) {
         let start = std::time::Instant::now();
         self.snapshots.clear();

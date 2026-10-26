@@ -408,6 +408,14 @@ impl Index {
             .collect()
     }
 
+    /// Why an item of `files` could not be hashed at the last build, if one could not: a push
+    /// that writes the files again hashes it again and refuses for it, so it refuses before.
+    pub fn unhashed_in(&self, files: &[FileId]) -> Option<&'static str> {
+        (files.iter().filter_map(|it| self.files.get(it)).flatten())
+            .filter_map(|it| self.entries.get(it))
+            .find_map(|it| it.missed)
+    }
+
     /// Notes that an edit since [`Index::before_edit`] can have changed the bindings of modules.
     pub fn bindings_edited(&mut self) {
         self.scopes_dirty = true;
@@ -451,6 +459,9 @@ impl Index {
         self.moved.clear();
         self.renamed.clear();
         self.pushes += 1;
+        if let Some(why) = self.unhashed_in(files) {
+            return Err(why);
+        }
         let mut took = Vec::new();
         let mut edited: FxHashSet<Crate> = FxHashSet::default();
         for &file in files {
@@ -638,7 +649,7 @@ impl Index {
             .filter(|it| !rewritten_files.contains(&it.file))
             .find_map(|it| it.missed.filter(|_| early.rebinds(&it.modules, &it.names)));
         bound = early.bound;
-        if let Some(why) = unhashed {
+        if let Some(why) = unhashed.or_else(|| self.unhashed_in(&rewritten)) {
             return Err(why);
         }
         took.push(start.elapsed());

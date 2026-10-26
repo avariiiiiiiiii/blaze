@@ -1434,6 +1434,12 @@ impl Rejections {
         self.base.as_ref().is_some_and(|it| it.keeps_moves())
     }
 
+    /// Whether an edit of `files` keeps the code of items it moves: the base does, and its items
+    /// do not refuse the edit's push before it is made.
+    pub fn keeps_moves_of(&self, files: &[base_db::FileId]) -> bool {
+        self.base.as_ref().is_some_and(|it| it.keeps_moves() && !it.unhashed_in(files))
+    }
+
     /// Whether a patch of what rustc linked has to know `file` before it changes.
     pub fn homes(&self) -> bool {
         self.base.is_none() && self.rustc.as_ref().is_some_and(|it| !it.outdated())

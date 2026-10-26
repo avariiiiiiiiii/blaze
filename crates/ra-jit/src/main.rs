@@ -9095,12 +9095,13 @@ fn run_holding(
         let outlined = read.elapsed();
         let mut checked = Duration::ZERO;
         // What moves would be found by is kept from before an edit only when its texts can move
-        // an item between its files: a file gone is written empty.
+        // an item between its files, and its push is not refused already: a file gone is
+        // written empty.
         let written: Vec<_> = (texts.iter().map(|(file, text)| (*file, text.as_str())))
             .chain(emptied.iter().map(|&file| (file, "")))
             .collect();
         let moves = editing.len() >= 2
-            && programs.iter().any(|it| it.known.keeps_moves())
+            && programs.iter().any(|it| it.known.keeps_moves_of(&editing))
             && blaze_items::moves_written(&db, &written);
         for program in &mut programs {
             let at = Instant::now();

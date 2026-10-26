@@ -51,7 +51,7 @@ pub(crate) struct Outlines {
     /// [`Outlines::adding`] found them.
     adding: FxHashMap<FileId, Adding>,
     /// Of each file of the edit about to be applied, its functions as [`placed`] has them.
-    placed: FxHashMap<FileId, Option<FxHashMap<FunctionId, (u64, u64)>>>,
+    placed: FxHashMap<FileId, Option<FxHashMap<FunctionId, u64>>>,
 }
 
 /// An edit about to be applied that adds functions to a file, or takes them away, and changes
@@ -255,19 +255,7 @@ impl Outlines {
                 };
                 let unchanged = match (self.placed.remove(&file).flatten(), off) {
                     (Some(was), false) => placed(db, listed, file).map(|now| {
-                        let same = |(func, hash): (&FunctionId, &(u64, u64))| {
-                            was.get(func).map(|it| it.0) == Some(hash.0)
-                        };
-                        if std::env::var_os("RA_JIT_STATS").is_some() {
-                            let alike = |(func, hash): (&FunctionId, &(u64, u64))| {
-                                was.get(func).is_some_and(|it| it.0 != hash.0 && it.1 == hash.1)
-                            };
-                            let alike = now.iter().filter(|&it| alike(it)).count();
-                            eprintln!(
-                                "placed: {file:?}, {alike} of {} functions laid out otherwise alone",
-                                now.len()
-                            );
-                        }
+                        let same = |(func, hash): (&FunctionId, &u64)| was.get(func) == Some(hash);
                         now.iter().filter(|&it| same(it)).map(|it| *it.0).collect()
                     }),
                     _ => None,
@@ -711,11 +699,7 @@ fn added_alone(func: &ast::Fn) -> bool {
 /// line and column it starts at. One with the same hash after an edit has the same code, and
 /// everything in it is where it was: its lines, its panics and its `line!()`. `None` when
 /// the functions of the file are not listed.
-fn placed(
-    db: &RootDatabase,
-    listed: &Listed,
-    file: FileId,
-) -> Option<FxHashMap<FunctionId, (u64, u64)>> {
+fn placed(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<FxHashMap<FunctionId, u64>> {
     let functions = listed.in_files(db, &[file]).pop().flatten()?;
     let text = ide_db::base_db::SourceDatabase::file_text(db, file).text(db);
     let line_starts: Vec<usize> =
@@ -736,16 +720,7 @@ fn placed(
                 let column = text[line_starts[line]..start].chars().count();
                 let mut hasher = FxHasher::default();
                 (line, column, written).hash(&mut hasher);
-                // How it is written but for its layout and comments: one with the same tokens
-                // compiles to the same code at other places.
-                let mut tokens = FxHasher::default();
-                let node = at.to_node(db);
-                for token in node.syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
-                    if !token.kind().is_trivia() {
-                        token.text().hash(&mut tokens);
-                    }
-                }
-                Some((func, (hasher.finish(), tokens.finish())))
+                Some((func, hasher.finish()))
             })
             .collect()
     });

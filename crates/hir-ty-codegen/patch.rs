@@ -1700,6 +1700,16 @@ impl Base {
                 let symbol = decls.get_data_decl(id).linkage_name(id).into_owned();
                 (key, symbol, linked.into_inner().unwrap_or_else(|| at(db, i)))
             });
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!(
+                    "places-base: {} named{}, {} roots and {} instances placed of {} bodies",
+                    named.len(),
+                    if cg.places.is_none() { " (none kept)" } else { "" },
+                    placed_roots.len(),
+                    placed_instances.len(),
+                    placed_of_owner.len()
+                );
+            }
             Places::new(db, places, placed_of_owner.keys())
         };
         let cached = |func| super::fncache::cached_closure(db, func).is_some();

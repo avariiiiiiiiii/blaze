@@ -469,6 +469,21 @@ impl Index {
                 return Err("an edit of a crate's own attributes");
             }
         }
+        // An item of a kind no move lets through, added to the files or taken out of them,
+        // refuses the push before the bindings are taken.
+        for (file, now) in self.declared(db, fan, files) {
+            let now_set: FxHashSet<ItemId> = now.iter().copied().collect();
+            let was = self.files.get(&file).into_iter().flatten();
+            for &id in was.filter(|it| !now_set.contains(it)) {
+                if let Some(gone) = self.entries.get(&id) {
+                    unmovable(gone.kind).map_err(|why| refused(db, id, why, "gone"))?;
+                }
+            }
+            for &id in now.iter().filter(|it| !self.entries.contains_key(it)) {
+                unmovable(changed_kind(db, id)).map_err(|why| refused(db, id, why, "added"))?;
+            }
+        }
+        self.parts.push(("kinds", start.elapsed()));
         let mut around: FxHashSet<Crate> = edited.clone();
         for &krate in &edited {
             around
@@ -623,22 +638,19 @@ impl Index {
             return Err(why);
         }
         let now: FxHashSet<ItemId> = ids.iter().copied().collect();
-        // And so does a kind of item added, gone or changed that no move lets through.
-        let movable = |kind: Result<(), &'static str>| match kind {
-            Err("an impl of a trait" | "an item of an impl of a trait") => Ok(()),
-            other => other,
-        };
+        // And so does a kind of item added, gone or changed that no move lets through, of the
+        // files of modules added or taken away too.
         for (file, _) in &declared {
             for &id in self.files.get(file).into_iter().flatten().filter(|it| !now.contains(it)) {
                 if let Some(gone) = self.entries.get(&id) {
-                    movable(gone.kind).map_err(|why| refused(db, id, why, "gone"))?;
+                    unmovable(gone.kind).map_err(|why| refused(db, id, why, "gone"))?;
                 }
             }
         }
         for (&id, entry) in ids.iter().zip(&entries) {
             let Some(entry) = entry else { continue };
             match self.entries.get(&id) {
-                None => movable(entry.kind).map_err(|why| refused(db, id, why, "added"))?,
+                None => unmovable(entry.kind).map_err(|why| refused(db, id, why, "added"))?,
                 Some(was)
                     if was.erred
                         || entry.erred
@@ -651,7 +663,7 @@ impl Index {
                 Some(_) => {}
             }
         }
-        self.parts.push(("kinds", start.elapsed()));
+        self.parts.push(("changed kinds", start.elapsed()));
         // The code of an added function is written when a gone one is written alike, with its
         // code known from before the edit.
         let alike: FxHashSet<(form::Hash, &[Symbol])> = (declared.iter())
@@ -1122,6 +1134,15 @@ fn refused(db: &dyn HirDatabase, id: ItemId, why: &'static str, how: &str) -> &'
         eprintln!("items-refused: {why}, {how}: {id:?} {name:?} in {file:?}");
     }
     why
+}
+
+/// What of `kind` refuses an item added or taken away even when it moved: an impl of a trait
+/// written as it was elsewhere selects what it did.
+fn unmovable(kind: Result<(), &'static str>) -> Result<(), &'static str> {
+    match kind {
+        Err("an impl of a trait" | "an item of an impl of a trait") => Ok(()),
+        other => other,
+    }
 }
 
 fn changed_kind(db: &dyn HirDatabase, id: ItemId) -> Result<(), &'static str> {

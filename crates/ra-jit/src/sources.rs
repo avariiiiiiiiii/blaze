@@ -179,22 +179,24 @@ impl Notices {
     }
 
     /// Waits up to `timeout` for a change: whether one came. Without a watcher it sleeps and
-    /// says one may have. An event that is no change (inotify's open and close of a file
-    /// written, the daemon's own reads) waits on for the rest of the time.
+    /// says one may have.
     pub(crate) fn wait(&mut self, timeout: Duration) -> bool {
         self.gather();
         if self.watcher.is_none() {
             std::thread::sleep(timeout);
             return true;
         }
-        let deadline = std::time::Instant::now() + timeout;
-        while self.pending.is_empty() {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            let Ok(event) = self.events.recv_timeout(left) else { return false };
-            self.note(event);
-            self.gather();
+        if !self.pending.is_empty() {
+            return true;
         }
-        true
+        match self.events.recv_timeout(timeout) {
+            Ok(event) => {
+                self.note(event);
+                self.gather();
+                !self.pending.is_empty()
+            }
+            Err(_) => false,
+        }
     }
 
     fn gather(&mut self) {

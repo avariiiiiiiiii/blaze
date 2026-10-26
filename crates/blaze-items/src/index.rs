@@ -1428,30 +1428,55 @@ fn interface_names(
     Some(())
 }
 
-/// Whether writing `text` over `file` adds or takes away a trait or a macro as written, which
-/// no move lets through [`Index::push`]: told by the text alone, before the edit.
-pub fn unmovable_written(db: &dyn HirDatabase, file: FileId, text: &str) -> bool {
-    use SyntaxKind::{BANG, IDENT, MACRO_KW, TRAIT_KW};
-    // Lexed, not parsed: each file of an edit is read twice before it.
-    let written = |text: &str| {
-        let lexed = syntax::LexedStr::new(syntax::Edition::CURRENT, text);
-        let tokens: Vec<(SyntaxKind, &str)> = (0..lexed.len())
-            .map(|at| (lexed.kind(at), lexed.text(at)))
-            .filter(|(kind, _)| !kind.is_trivia())
-            .collect();
-        let mut names: Vec<(&str, &str)> = (0..tokens.len())
-            .filter_map(|at| match (tokens[at], tokens.get(at + 1), tokens.get(at + 2)) {
-                ((TRAIT_KW | MACRO_KW, kind), Some(&(IDENT, name)), _) => Some((kind, name)),
-                ((IDENT, "macro_rules"), Some(&(BANG, _)), Some(&(IDENT, name))) => {
-                    Some(("macro_rules", name))
-                }
-                _ => None,
-            })
-            .collect();
-        names.sort_unstable();
-        names.into_iter().map(|(kind, name)| format!("{kind} {name}")).collect::<Vec<_>>()
-    };
-    written(db.file_text(file).text(db)) != written(text)
+/// Whether an edit that writes each `(file, text)` can move an item between its files through
+/// [`Index::push`], as the texts alone tell before it: a name declared is gone from one file
+/// and one is declared anew in another, and no trait or macro is added or taken away, which
+/// no move lets through.
+pub fn moves_written(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
+    let (mut gone, mut added) = (FxHashSet::default(), FxHashSet::default());
+    for &(file, text) in written {
+        let mut was = names_declared(db.file_text(file).text(db));
+        let now = names_declared(text);
+        let unmovable = |it: &&(&str, &str)| matches!(it.0, "trait" | "macro" | "macro_rules");
+        if was.iter().filter(unmovable).ne(now.iter().filter(unmovable)) {
+            return false;
+        }
+        for it in &now {
+            match was.binary_search(it) {
+                Ok(at) => _ = was.remove(at),
+                Err(_) => _ = added.insert(file),
+            }
+        }
+        if !was.is_empty() {
+            gone.insert(file);
+        }
+    }
+    gone.iter().any(|from| added.iter().any(|to| to != from))
+}
+
+/// The names `text` declares, each after its keyword and sorted: lexed, not parsed, as each
+/// file of an edit is read twice before it.
+fn names_declared(text: &str) -> Vec<(&str, &str)> {
+    use SyntaxKind::*;
+    let lexed = syntax::LexedStr::new(syntax::Edition::CURRENT, text);
+    let tokens: Vec<(SyntaxKind, &str)> = (0..lexed.len())
+        .map(|at| (lexed.kind(at), &text[lexed.text_range(at)]))
+        .filter(|(kind, _)| !kind.is_trivia())
+        .collect();
+    let mut names: Vec<(&str, &str)> = (0..tokens.len())
+        .filter_map(|at| match (tokens[at], tokens.get(at + 1), tokens.get(at + 2)) {
+            ((FN_KW | STRUCT_KW | ENUM_KW | TYPE_KW | CONST_KW, kind), Some(&(IDENT, name)), _)
+            | ((STATIC_KW | TRAIT_KW | MOD_KW | MACRO_KW, kind), Some(&(IDENT, name)), _)
+            | ((STATIC_KW, kind), Some(&(MUT_KW, _)), Some(&(IDENT, name))) => Some((kind, name)),
+            ((IDENT, "union"), Some(&(IDENT, name)), _) => Some(("union", name)),
+            ((IDENT, "macro_rules"), Some(&(BANG, _)), Some(&(IDENT, name))) => {
+                Some(("macro_rules", name))
+            }
+            _ => None,
+        })
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 /// The names a body's code is written with: those of its source, and of the paths and method

@@ -9081,12 +9081,12 @@ fn run_holding(
         outlines.before_edit(&db, &listed, &editing);
         let outlined = read.elapsed();
         let mut checked = Duration::ZERO;
-        // An edit that adds or takes away a trait or a macro is not pushed through the items, so
-        // what moves would be found by is not kept from before it.
-        let moves = editing.len() >= 2
-            && !(texts.iter().map(|(file, text)| (*file, text.as_str())))
-                .chain(emptied.iter().map(|&file| (file, "")))
-                .any(|(file, text)| blaze_items::unmovable_written(&db, file, text));
+        // What moves would be found by is kept from before an edit only when its texts can move
+        // an item between its files: a file gone is written empty.
+        let written: Vec<_> = (texts.iter().map(|(file, text)| (*file, text.as_str())))
+            .chain(emptied.iter().map(|&file| (file, "")))
+            .collect();
+        let moves = editing.len() >= 2 && blaze_items::moves_written(&db, &written);
         for program in &mut programs {
             let at = Instant::now();
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);

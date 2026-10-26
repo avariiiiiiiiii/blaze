@@ -8879,6 +8879,8 @@ fn run_holding(
             changed = sources::Changed::All;
         }
         let (looking, mut looked) = (Instant::now(), 0usize);
+        // Looks in a row that found nothing new while notices kept coming.
+        let mut unchanged = 0;
         loop {
             if tree.relisted(&db, &changed) {
                 builds.settle(&mut db, &mut programs)?;
@@ -8948,9 +8950,13 @@ fn run_holding(
             switched.clear();
             // A build the daemon asks for itself waits for the rest of a save of several
             // files, as one change: a move of an item between them is seen whole.
+            // A write is several notices: a look at the rest of one file's finds nothing new,
+            // and the next file's notice can come meanwhile.
             let waited_for = clients.iter().any(|(_, (_, _, it))| !it.nobody);
             let quiet = waited_for || !notices.wait(SETTLE);
-            if (touched.len() + gone.len(), held.head()) == before || quiet {
+            let same = (touched.len() + gone.len(), held.head()) == before;
+            unchanged = if same { unchanged + 1 } else { 0 };
+            if quiet || unchanged > 2 {
                 break;
             }
             changed = notices.take();

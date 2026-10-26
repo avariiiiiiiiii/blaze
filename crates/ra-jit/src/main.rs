@@ -9086,7 +9086,9 @@ fn run_holding(
         let written: Vec<_> = (texts.iter().map(|(file, text)| (*file, text.as_str())))
             .chain(emptied.iter().map(|&file| (file, "")))
             .collect();
-        let moves = editing.len() >= 2 && blaze_items::moves_written(&db, &written);
+        let moves = editing.len() >= 2
+            && programs.iter().any(|it| it.known.keeps_moves())
+            && blaze_items::moves_written(&db, &written);
         for program in &mut programs {
             let at = Instant::now();
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);

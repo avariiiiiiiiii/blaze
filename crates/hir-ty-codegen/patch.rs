@@ -2375,11 +2375,17 @@ impl Base {
     /// Before an edit of `files`, of the revision before it: the code of the instances of the
     /// base, or of what it relocated, of functions written in them, for [`Self::relocate`].
     /// Only an edit of two files or more moves a function, and the items tell which it moved.
+    /// Whether an edit that moves items between files keeps their code: the base is its own and
+    /// its items are made.
+    pub(super) fn keeps_moves(&self) -> bool {
+        !self.rustc && self.items.is_some()
+    }
+
     fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>, moves: bool) {
         let start = std::time::Instant::now();
         self.snapshots.clear();
         let mut wanted: Vec<(Instance, Instance, StoredParamEnvAndCrate, Option<_>)> = Vec::new();
-        let moves = !self.rustc && self.items.is_some() && moves;
+        let moves = self.keeps_moves() && moves;
         let edited: FxHashSet<FileId> = files.iter().copied().collect();
         for (key, it) in &mut self.relocated {
             let code = it.code.take();

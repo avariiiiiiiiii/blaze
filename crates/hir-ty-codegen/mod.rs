@@ -1428,6 +1428,12 @@ impl Rejections {
         self.homes() && self.rustc.as_ref().is_some_and(|it| !it.homed(file))
     }
 
+    /// Whether an edit that moves items between files keeps their code: the base is its own and
+    /// its items are made.
+    pub fn keeps_moves(&self) -> bool {
+        self.base.as_ref().is_some_and(|it| it.keeps_moves())
+    }
+
     /// Whether a patch of what rustc linked has to know `file` before it changes.
     pub fn homes(&self) -> bool {
         self.base.is_none() && self.rustc.as_ref().is_some_and(|it| !it.outdated())

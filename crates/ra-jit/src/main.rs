@@ -6186,14 +6186,20 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
+    /// Whether it is [`Client::nobody`]: no one waits for its answer.
+    nobody: bool,
 }
 
 impl Client {
+    fn new(stream: UnixStream, env: ide_db::base_db::Env) -> Client {
+        Client { stream, env, nobody: false }
+    }
+
     /// A client that hears nothing: the one a build the daemon asks for itself answers.
     #[cfg(unix)]
     fn nobody() -> Option<Client> {
         let (stream, _) = UnixStream::pair().ok()?;
-        Some(Client { stream, env: ide_db::base_db::Env::default() })
+        Some(Client { stream, env: ide_db::base_db::Env::default(), nobody: true })
     }
 
     #[cfg(not(unix))]
@@ -6831,7 +6837,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
     {
         let path = PathBuf::from(ra_jit_live::format::unescape(path));
         let text = ra_jit_live::format::unescape(text);
-        let client = Client { stream, env: process::decode(&env) };
+        let client = Client::new(stream, process::decode(&env));
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
     }
     if name == "apply" {
@@ -6839,7 +6845,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
             let _ = writeln!(&stream, "failed: an apply that can't be read");
             return None;
         };
-        let client = Client { stream, env: process::decode(&env) };
+        let client = Client::new(stream, process::decode(&env));
         return Some(Event::Applied(Applied { files, build, disk, client }));
     }
     let fields: Vec<&str> = request.split('\t').collect();
@@ -6847,7 +6853,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
     {
-        let client = Client { stream, env: process::decode(&env) };
+        let client = Client::new(stream, process::decode(&env));
         return Some(Event::Asked((request, target, client)));
     }
     let _ = writeln!(&stream, "failed: unknown request {request:?}");
@@ -8623,7 +8629,7 @@ fn run_holding(
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = edited.client.stream.try_clone() {
-                            let client = Client { stream, env: edited.client.env.clone() };
+                            let client = Client::new(stream, edited.client.env.clone());
                             clients.push((at, (Request::Edit, target(at), client)));
                         }
                     }
@@ -8752,7 +8758,7 @@ fn run_holding(
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = applied.client.stream.try_clone() {
-                            let client = Client { stream, env: applied.client.env.clone() };
+                            let client = Client::new(stream, applied.client.env.clone());
                             clients.push((at, (Request::Sync, target(at), client)));
                         }
                     }
@@ -8940,7 +8946,10 @@ fn run_holding(
                 }
             }
             switched.clear();
-            let quiet = !clients.is_empty() || !notices.wait(SETTLE);
+            // A build the daemon asks for itself waits for the rest of a save of several
+            // files, as one change: a move of an item between them is seen whole.
+            let waited_for = clients.iter().any(|(_, (_, _, it))| !it.nobody);
+            let quiet = waited_for || !notices.wait(SETTLE);
             if (touched.len() + gone.len(), held.head()) == before || quiet {
                 break;
             }

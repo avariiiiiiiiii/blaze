@@ -619,6 +619,10 @@ impl Index {
         let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
         let mut entries = entries_of(db, fan, &ids);
         self.parts.push(("entries", start.elapsed()));
+        // One whose hash can't be told refuses the push, before the moves are looked for.
+        if let Some(why) = entries.iter().flatten().find_map(|it| it.missed) {
+            return Err(why);
+        }
         let now: FxHashSet<ItemId> = ids.iter().copied().collect();
         // The code of an added function is written when a gone one is written alike, with its
         // code known from before the edit.

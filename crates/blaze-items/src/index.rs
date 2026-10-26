@@ -49,6 +49,8 @@ pub struct Index {
     live: Arc<FxHashSet<ItemId>>,
     /// What the last push found moved: each item gone with the one added in its place.
     moved: FxHashMap<ItemId, ItemId>,
+    /// Those of `moved` written with other code, by the gone one: see [`moves`].
+    renamed: FxHashSet<ItemId>,
     /// How many edits were pushed, which an entry is written after.
     pushes: u64,
 }
@@ -263,6 +265,7 @@ impl Index {
             scopes_dirty: false,
             live: Arc::default(),
             moved: FxHashMap::default(),
+            renamed: FxHashSet::default(),
             pushes: 0,
         };
         for Entries(part) in entries {
@@ -284,6 +287,12 @@ impl Index {
     /// [`moves`] of the last edit pushed, which a push refused after finding them keeps.
     pub fn moved(&self) -> &FxHashMap<ItemId, ItemId> {
         &self.moved
+    }
+
+    /// Those of [`Self::moved`] written elsewhere with other code, by the gone one: an item of
+    /// the same interface and names, which what called the gone one calls as it did.
+    pub fn renamed(&self) -> &FxHashSet<ItemId> {
+        &self.renamed
     }
 
     /// The functions whose code is not written yet, and how many edits were pushed before:
@@ -425,6 +434,7 @@ impl Index {
     ) -> Result<Pushed, &'static str> {
         let start = std::time::Instant::now();
         self.moved.clear();
+        self.renamed.clear();
         self.pushes += 1;
         let mut took = Vec::new();
         let mut edited: FxHashSet<Crate> = FxHashSet::default();
@@ -630,15 +640,17 @@ impl Index {
             .filter(|(id, _)| !self.entries.contains_key(id))
             .filter_map(|(id, entry)| Some((*id, entry.as_ref()?)))
             .collect();
-        let moved = moves(&gone, &added);
+        let (moved, renamed) = moves(&gone, &added);
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
-                "items-moved: {} of {} gone and {} added",
+                "items-moved: {} of {} gone and {} added, {} of them renamed",
                 moved.len(),
                 gone.len(),
-                added.len()
+                added.len(),
+                renamed.len()
             );
         }
+        self.renamed = renamed;
         // An impl of a trait written as it was elsewhere selects what it did: what called its
         // items calls those where they are now, and its trait's items are asked about.
         let of_moves: FxHashSet<ItemId> = moved.iter().flat_map(|(a, b)| [*a, *b]).collect();
@@ -812,8 +824,12 @@ impl Index {
 
 /// The items an edit moved: each gone with the one added that is written the same and refers
 /// to the same items in the same places, or to ones moved with it. Only a gone item and an added
-/// one that are each the only one written so are taken for one moved.
-fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<ItemId, ItemId> {
+/// one that are each the only one written so are taken for one moved. With them, the functions
+/// renamed (the second): see [`Index::renamed`].
+fn moves(
+    gone: &[(ItemId, &Entry)],
+    added: &[(ItemId, &Entry)],
+) -> (FxHashMap<ItemId, ItemId>, FxHashSet<ItemId>) {
     let whole = |it: &&(ItemId, &Entry)| {
         !it.1.erred
             && it.1.missed.is_none()
@@ -853,7 +869,36 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
             _ => None,
         })
         .collect();
+    // Of the functions left, a gone one and an added one alone in their interface and names
+    // are one renamed: written elsewhere with other code, which is compiled again, and called
+    // as the gone one was.
+    let mut renamed: FxHashSet<ItemId> = FxHashSet::default();
+    let mut named: FxHashMap<(form::Hash, &[Symbol]), (Vec<ItemId>, Vec<ItemId>)> =
+        FxHashMap::default();
+    let moved_to: FxHashSet<ItemId> = moved.values().copied().collect();
+    for (side, all) in [(0, gone), (1, added)] {
+        for (id, entry) in all {
+            if !matches!(id, ItemId::Function(_))
+                || entry.erred
+                || entry.missed.is_some()
+                || moved.contains_key(id)
+                || moved_to.contains(id)
+            {
+                continue;
+            }
+            let it = named.entry((entry.digest, &entry.names[..])).or_default();
+            if side == 0 { it.0.push(*id) } else { it.1.push(*id) }
+        }
+    }
+    for it in named.into_values() {
+        if let (&[was], &[now]) = (&it.0[..], &it.1[..]) {
+            moved.insert(was, now);
+            renamed.insert(was);
+        }
+    }
     let paired = moved.len();
+    let interface: FxHashMap<ItemId, &[ItemId]> =
+        (gone.iter().chain(added)).map(|(id, entry)| (*id, &entry.refs[..])).collect();
     let refs: FxHashMap<ItemId, Vec<ItemId>> = (gone.iter().chain(added))
         .map(|(id, entry)| {
             let code = entry.code.iter().flat_map(|it| it.1.iter());
@@ -865,7 +910,10 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
     loop {
         let wrong: Vec<ItemId> = (moved.iter())
             .filter(|&(was, now)| {
-                let (was, now) = (&refs[was], &refs[now]);
+                let (was, now): (&[ItemId], &[ItemId]) = match renamed.contains(was) {
+                    true => (interface[was], interface[now]),
+                    false => (&refs[was], &refs[now]),
+                };
                 was.len() != now.len()
                     || was.iter().zip(now).any(|(a, b)| a != b && moved.get(a) != Some(b))
             })
@@ -958,7 +1006,8 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
                     "items-unmoved: twins by name with another digest {digest}, with the digest {refs}, with other code {other}"
                 );
             }
-            return moved;
+            renamed.retain(|it| moved.contains_key(it));
+            return (moved, renamed);
         }
         for it in wrong {
             moved.remove(&it);

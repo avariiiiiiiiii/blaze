@@ -2291,7 +2291,8 @@ impl Base {
                 continue;
             }
             let at = self.instances.get_index_of(key).expect("a key of the base") as u32;
-            let unasked = asked.as_ref().is_some_and(|it| !it.contains(&at));
+            let renamed = items.index.renamed().contains(&ItemId::Function(*was));
+            let unasked = !renamed && asked.as_ref().is_some_and(|it| !it.contains(&at));
             let relocate = || hir_ty::attach_db(db, || relocated(db, code, &moved, &live));
             let code = unasked.then(|| probe(relocate)).flatten().flatten().map(Arc::new);
             if code.is_some() {
@@ -3159,6 +3160,7 @@ impl Base {
                     let known = self.instances.get(instance);
                     if known.is_some_and(|it| it.env == *env && it.mark.is_some() && !it.forwarded)
                         && !changed_instances.contains(instance)
+                        && !self.relocated.contains_key(instance)
                     {
                         changed_instances.push(instance.clone());
                     }

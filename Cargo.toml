@@ -85,6 +85,7 @@ ra-jit-expand = { path = "crates/ra-jit-expand" }
 ra-jit-store = { path = "crates/ra-jit-store" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-metadata = { path = "crates/blaze-metadata" }
+blaze-monitor = { path = "crates/blaze-monitor" }
 ra-jit-fuzz = { path = "crates/ra-jit-fuzz" }
 hir-ide = { path = "vendor/rust-analyzer/crates/hir-ide", version = "0.0.0" }
 ide = { path = "vendor/rust-analyzer/crates/ide", version = "0.0.0" }
@@ -137,6 +138,11 @@ bitflags = "2.9.1"
 cargo_metadata = "0.23.1"
 camino = "1.2.2"
 crossbeam-channel = "0.5.15"
+# The daemon's monitoring mirror (crates/blaze-monitor, docs/monitor.md); MIT.
+flecs_ecs = { version = "0.2.2", default-features = false, features = [
+  "flecs_base", "flecs_meta", "flecs_json", "flecs_rest", "flecs_http", "flecs_doc",
+  "flecs_stats", "flecs_app", "flecs_alerts", "flecs_metrics", "flecs_units",
+] }
 dissimilar = "1.0.10"
 dot = "0.1.4"
 either = "1.15.0"

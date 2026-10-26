@@ -1,0 +1,22 @@
+[package]
+name = "blaze-monitor"
+description = "The daemon's monitoring mirror: builds, patches, live edits and tests as entities of a Flecs world, served over Flecs REST on localhost"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+crossbeam-channel.workspace = true
+flecs_ecs.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

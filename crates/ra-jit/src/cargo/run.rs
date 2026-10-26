@@ -8,7 +8,10 @@ use std::{
 
 use anyhow::Context as _;
 
-use crate::plan::Selection;
+use crate::{
+    monitor::event::{self, Event, Outcome, Picked},
+    plan::Selection,
+};
 
 use super::{
     affected::{self, Pick},
@@ -81,7 +84,7 @@ fn listing_failures(
     command: &mut Command,
     held: Option<Held>,
     state: &State,
-) -> std::io::Result<(ExitStatus, Option<Vec<String>>)> {
+) -> std::io::Result<(ExitStatus, Option<Vec<String>>, Vec<Ended>)> {
     use std::io::{IsTerminal as _, Read as _, Write as _};
     let out = std::io::stdout();
     let colored = command.get_args().any(|it| {
@@ -96,7 +99,8 @@ fn listing_failures(
     let child = started(command);
     drop(held);
     let mut child = child?;
-    let mut printed = Vec::new();
+    let begun = std::time::Instant::now();
+    let (mut printed, mut ended, mut line) = (Vec::new(), Vec::new(), Vec::new());
     if let Some(mut from) = child.stdout.take() {
         let mut chunk = [0; 8192];
         loop {
@@ -110,13 +114,111 @@ fn listing_failures(
             let mut out = out.lock();
             _ = out.write_all(&chunk[..read]).and_then(|()| out.flush());
             printed.extend_from_slice(&chunk[..read]);
+            for &byte in &chunk[..read] {
+                if byte != b'\n' {
+                    line.push(byte);
+                    continue;
+                }
+                let at = begun.elapsed().as_micros() as u64;
+                ended.extend(ended_in(&String::from_utf8_lossy(&line), at));
+                line.clear();
+            }
             if printed.len() > PRINTED_KEPT {
                 printed.drain(..printed.len() - PRINTED_KEPT);
             }
         }
     }
     let status = child.wait()?;
-    Ok((status, failures(&String::from_utf8_lossy(&printed))))
+    Ok((status, failures(&String::from_utf8_lossy(&printed)), ended))
+}
+
+/// A test as libtest said it ended: its name, how, and when from the program's start.
+type Ended = (String, Outcome, u64);
+
+/// The test a line of libtest's says ended, `test NAME ... ok`, as it ended at `at`.
+fn ended_in(line: &str, at: u64) -> Option<Ended> {
+    let plain = without_colors(line);
+    let (name, outcome) = plain.trim_end().strip_prefix("test ")?.rsplit_once(" ... ")?;
+    let outcome = match outcome {
+        "ok" => Outcome::Passed,
+        "FAILED" => Outcome::Failed,
+        it if it.starts_with("ignored") => Outcome::Ignored,
+        _ => return None,
+    };
+    Some((name.to_owned(), outcome, at))
+}
+
+/// What the monitor is told of a run of the tests of `test`: each test, why it ran or did
+/// not, and how it ended.
+fn noted(
+    state: &State,
+    test: &Program,
+    pick: &Pick,
+    ended: &[Ended],
+    status: i32,
+    at_us: u64,
+    took_us: u64,
+) -> event::Tests {
+    let ended: std::collections::BTreeMap<&str, &Ended> =
+        ended.iter().map(|it| (it.0.as_str(), it)).collect();
+    let outcome = |name: &str, ran: bool| match ended.get(name) {
+        Some(&&(_, outcome, at)) => (outcome, at),
+        None if ran => (Outcome::Unknown, 0),
+        None => (Outcome::NotRun, 0),
+    };
+    let mut tests = Vec::new();
+    let mut one = |name: &str, picked, why: &str, path: &str, ran| {
+        let (outcome, ended_us) = outcome(name, ran);
+        let (why, path) = (why.to_owned(), path.to_owned());
+        tests.push(event::Test { name: name.to_owned(), picked, why, path, outcome, ended_us });
+    };
+    let (selection, total) = match pick {
+        Pick::Asked => {
+            for (name, outcome, at) in ended.values() {
+                let (why, path) = (String::new(), String::new());
+                tests.push(event::Test {
+                    name: name.clone(),
+                    picked: Picked::Every,
+                    why,
+                    path,
+                    outcome: *outcome,
+                    ended_us: *at,
+                });
+            }
+            ("all", ended.len())
+        }
+        Pick::Some { names, total, always, apart, passed } => {
+            let chosen: std::collections::BTreeSet<&str> =
+                names.iter().flatten().map(String::as_str).collect();
+            let apart: std::collections::BTreeMap<&str, &str> =
+                apart.iter().map(|(name, why)| (name.as_str(), why.as_str())).collect();
+            for it in always {
+                one(&it.name, Picked::Always, &it.why, it.path.as_deref().unwrap_or(""), true);
+            }
+            for name in passed.names() {
+                if let Some(why) = apart.get(name) {
+                    one(name, Picked::Sandboxed, why, "", true);
+                } else if names.is_none() || chosen.contains(name) {
+                    one(name, Picked::Changed, "", "", true);
+                } else {
+                    one(name, Picked::Skipped, "", "", false);
+                }
+            }
+            ("affected", *total)
+        }
+    };
+    event::Tests {
+        workspace: crate::monitor::shown(&state.root),
+        package: test.package.clone(),
+        kind: format!("{:?}", test.kind).to_lowercase(),
+        executable: crate::monitor::shown(&test.executable),
+        selection: selection.to_owned(),
+        total: total as u64,
+        status,
+        at_us,
+        took_us,
+        tests,
+    }
 }
 
 /// The tests libtest's summary lists as failed in what a program of tests printed: the names
@@ -194,9 +296,12 @@ pub(crate) fn tests(
         let sandbox_env = matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command));
         let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
         let pick = affected::pick(asked, state, test, identity.as_deref());
+        let (at_us, begun) = (crate::monitor::now_us(), std::time::Instant::now());
         if let Pick::Some { names: Some(names), total, .. } = &pick {
             left += total - names.len();
             if names.is_empty() {
+                let note = noted(state, test, &pick, &[], 0, at_us, 0);
+                crate::monitor::note_now(Event::Tests(note));
                 let unchanged = format!("{}, unchanged since the last pass", counted(*total));
                 say::status(asked.flags.quiet, "Skipping", &format!("{running}: {unchanged}"));
                 continue;
@@ -230,9 +335,13 @@ pub(crate) fn tests(
         command.args(asked.program_args()).args(&picked);
         let ran = match &pick {
             Pick::Some { .. } => listing_failures(&mut command, held.take(), state),
-            Pick::Asked => ended(&mut command, held.take(), state).map(|it| (it, None)),
+            Pick::Asked => ended(&mut command, held.take(), state).map(|it| (it, None, Vec::new())),
         };
-        let (status, failures) = ran.with_context(|| format!("could not execute {shown}"))?;
+        let (status, failures, said) = ran.with_context(|| format!("could not execute {shown}"))?;
+        let took_us = begun.elapsed().as_micros() as u64;
+        let code = status.code().unwrap_or(-1);
+        let note = noted(state, test, &pick, &said, code, at_us, took_us);
+        crate::monitor::note_now(Event::Tests(note));
         match pick {
             Pick::Some { passed, names, .. } if !status.success() => {
                 passed.failed(names.as_deref(), failures.as_deref())

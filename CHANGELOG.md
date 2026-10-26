@@ -8,6 +8,10 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- The daemon's monitor: a Flecs world of the builds, patches, live patches and tests the
+  daemon saw, served over Flecs REST on 127.0.0.1 from port 27870 (`cargo ra-jit status`
+  prints the address; `RA_JIT_MONITOR=off` turns it off). Agents query it; nothing reads it
+  back to decide a build: [docs/monitor.md](docs/monitor.md).
 - `RA_JIT_WHOLE_BUILD=1`: the whole build runs in the daemon. Its worker loads the workspace,
   builds and links each program, and answers once they are linked; the next build asks the
   same worker, which builds the edits since on what it has loaded and links again, with no

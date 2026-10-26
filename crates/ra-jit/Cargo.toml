@@ -69,6 +69,7 @@ ra-jit-expand.workspace = true
 ra-jit-store.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
+blaze-monitor.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true

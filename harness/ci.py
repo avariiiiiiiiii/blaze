@@ -66,6 +66,8 @@ HARNESSES = [
     ("core", ["anonstatics.py"], {}, on("linux", "macos"), 1),
     ("core", ["loadedits.py"], {}, on("linux", "macos"), 2),
     ("core", ["testselect.py"], {}, on("linux", "macos"), 2),
+    # The daemon's Flecs monitor shows an edit's patch and the tests it ran over REST.
+    ("core", ["monitor.py"], {}, on("linux"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
     ("core", ["asmedits.py"], {}, EVERYWHERE, 1),
     # The assembler of a build of ra-jit without LLVM, which is the release's.

@@ -19,6 +19,7 @@ mod live;
 mod macro_list;
 mod memory;
 mod mirdump;
+mod monitor;
 mod outline;
 mod plan;
 mod process;
@@ -9582,9 +9583,74 @@ impl Program {
             && crates(ours).is_some_and(|it| Some(it) == crates(theirs))
     }
 
+    /// Brings the program up to date with the database, as [`Program::synced`] does, and
+    /// tells the monitor what came of it.
+    fn sync(
+        &mut self,
+        db: &RootDatabase,
+        listed: &Listed,
+        paths: &Sources,
+        edit: &Edit,
+        wanted: Option<&Outputs>,
+        link_it: bool,
+        defer: bool,
+    ) -> anyhow::Result<Result<String, Refused>> {
+        let started = Instant::now();
+        let answer = self.synced(db, listed, paths, edit, wanted, link_it, defer);
+        if let Ok(answer) = &answer {
+            monitor::note(monitor::event::Event::Compiled(self.compiled(answer, started)));
+        }
+        answer
+    }
+
+    /// What the monitor is told of a build of the program that `answer` was the end of.
+    fn compiled(
+        &self,
+        answer: &Result<String, Refused>,
+        started: Instant,
+    ) -> monitor::event::Compiled {
+        let args = &self.args;
+        let binary = args.splice.as_ref().or(args.exe.as_ref()).unwrap_or(&args.out);
+        let field = |text: &str, name: &str| {
+            let value = text.split(' ').find_map(|it| it.strip_prefix(name)?.strip_prefix('='));
+            value.and_then(|it| it.parse::<u64>().ok()).unwrap_or(0)
+        };
+        let (kind, functions, files, why, took_us) = match answer {
+            Ok(text) => {
+                let text = trace::without_spans(text);
+                let kind = text.split('=').next().unwrap_or(text);
+                let kind = if kind == "patch" || kind == "object" { kind } else { "unchanged" };
+                let declined = self.known.stats.declined.filter(|_| kind == "object");
+                let took = field(text, "ms") * 1000;
+                (kind, field(text, "functions"), field(text, "files"), declined.unwrap_or(""), took)
+            }
+            Err(Refused::Error(_)) => ("error", 0, 0, "", 0),
+            Err(Refused::Cargos(_)) => ("cargo", 0, 0, "", 0),
+        };
+        let why = match answer {
+            Err(refused) => refused.to_string().lines().next().unwrap_or_default().to_owned(),
+            Ok(_) => why.to_owned(),
+        };
+        let took_us = match took_us {
+            0 => started.elapsed().as_micros() as u64,
+            took => took,
+        };
+        monitor::event::Compiled {
+            workspace: monitor::shown(&args.checkout),
+            binary: monitor::shown(binary),
+            krate: args.krate.clone(),
+            kind: kind.to_owned(),
+            functions,
+            files,
+            why,
+            at_us: monitor::now_us(),
+            took_us,
+        }
+    }
+
     /// Brings the program up to date with the database. The result is what to tell its
     /// clients: what they have to load, or why the source can't be built.
-    fn sync(
+    fn synced(
         &mut self,
         db: &RootDatabase,
         listed: &Listed,
@@ -9782,7 +9848,7 @@ impl Program {
                     true => known.start_again(),
                     false => known.forget_rustc(),
                 }
-                return self.sync(db, listed, paths, edit, wanted, link_it, defer);
+                return self.synced(db, listed, paths, edit, wanted, link_it, defer);
             }
             failed = failed.or(unlinked.map(|it| Refused::Cargos(it.to_string())));
             let unspliced = || failed.is_none() && link_it && full && args.splice.is_none();

@@ -369,7 +369,8 @@ starts its own.
 
 The daemon's directory is `$RA_JIT_HOME` if set, else `$XDG_RUNTIME_DIR/ra-jit`, else
 `~/.cache/ra-jit`. It holds `daemon.sock`, `daemon.sock.lock`, `daemon.log`,
-`workers/<id>/` with each worker's socket and log, and `states/`. The directory must belong
+`workers/<id>/` with each worker's socket and log, `states/`, and `monitor`, the address of
+the daemon's monitor ([monitor.md](monitor.md)). The directory must belong
 to you and be closed to group and others (mode 0700); otherwise the client and the daemon
 refuse to use it. The socket is 0600, and a connection from another user is refused before
 its request is read.
@@ -422,6 +423,7 @@ started it. To change one, run `cargo ra-jit stop` first.
 | `RA_JIT_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
 | `RA_JIT_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `RA_JIT_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |
+| `RA_JIT_MONITOR` | `off`, or the port on 127.0.0.1 the monitor's Flecs REST server listens on ([monitor.md](monitor.md)) | the first free port from 27870 |
 | `RA_JIT_CACHE` | directory of the disk store, or `off` for none | `ra-jit/store` in the user's cache directory ([cache.md](cache.md)) |
 | `RA_JIT_REMOTE` and the other store variables | see [cache.md](cache.md) | not set |
 

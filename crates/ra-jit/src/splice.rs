@@ -230,6 +230,11 @@ impl Parsed {
 }
 
 impl Baseline {
+    /// The executable.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Reads the executable at `path`, which was linked with `patch` ahead of `object`.
     fn parse(path: &Path, patch: &[u8], object: &Path, rustcs: bool) -> anyhow::Result<Parsed> {
         let file = File::open(path)?;

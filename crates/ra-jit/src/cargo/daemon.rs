@@ -169,6 +169,9 @@ pub(crate) enum Request {
     Check(Ahead),
     Status,
     Stop,
+    /// What a client or a worker did, for the monitor (`docs/monitor.md`). Nothing is
+    /// answered: the sender does not wait.
+    Note(Vec<crate::monitor::event::Event>),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -238,6 +241,9 @@ pub(crate) struct Status {
     #[serde(default)]
     pub(crate) memory_max: Option<u64>,
     pub(crate) workers: Vec<WorkerStatus>,
+    /// Where the monitor's Flecs REST server listens, when it does.
+    #[serde(default)]
+    pub(crate) monitor: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1093,6 +1099,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         std::process::id(),
         socket.display()
     );
+    crate::monitor::start(&daemon.home);
     {
         let daemon = daemon.clone();
         std::thread::spawn(move || daemon.reap());
@@ -1123,6 +1130,13 @@ impl Daemon {
             return Ok((&stream).write_all(format!("{}\n", reply.replace('\n', " ")).as_bytes())?);
         }
         let envelope = serde_json::from_str::<Envelope>(&line);
+        // What happened, for the monitor: of this version only, and answered with nothing.
+        if let Ok(Envelope { version, request: Request::Note(events), .. }) = envelope {
+            if version == self.version {
+                events.into_iter().for_each(crate::monitor::note);
+            }
+            return Ok(());
+        }
         // A request that can't be read is one of another version too, and of a client
         // that waits for an answer it can read: it gets none, and the daemon stays.
         let replaced = envelope.as_ref().is_ok_and(|it| it.replaces && it.version != self.version);
@@ -1154,15 +1168,27 @@ impl Daemon {
         let path = dunce::canonicalize(&path).unwrap_or(path);
         let worker = lock(&self.workers).values().find_map(|worker| {
             let checkouts = lock(&worker.checkouts);
-            let has = checkouts.values().any(|it| {
-                matches!(it.warmth, Warmth::Ready)
-                    && dunce::canonicalize(&it.root).is_ok_and(|root| path.starts_with(root))
+            let root = checkouts.values().find_map(|it| {
+                let root = dunce::canonicalize(&it.root).ok()?;
+                (matches!(it.warmth, Warmth::Ready) && path.starts_with(&root)).then_some(root)
             });
-            has.then(|| worker.clone())
+            root.map(|root| (worker.clone(), root))
         });
-        let worker = worker.with_context(|| {
+        let (worker, root) = worker.with_context(|| {
             format!("the daemon has no workspace loaded that has {}", path.display())
         })?;
+        let mut noted = crate::monitor::Build::begin("edit", &root);
+        let reply = Self::edited(line, &worker)?;
+        match reply.split_once(' ').map_or(reply.as_str(), |it| it.0) {
+            "ok" => noted.succeeded(),
+            "cargo:" => noted.by(crate::monitor::event::By::Cargo, &reply["cargo: ".len()..]),
+            _ => noted.by(crate::monitor::event::By::Error, &reply),
+        }
+        Ok(reply)
+    }
+
+    /// Has `worker` build the edit of `line`, and gives back its answer.
+    fn edited(line: &str, worker: &Worker) -> anyhow::Result<String> {
         *lock(&worker.asked) = Instant::now();
         let mut stream = socket::connect(&worker.socket)?;
         // The worker builds it for the process its last build was for.
@@ -1209,6 +1235,7 @@ impl Daemon {
                 version: self.version.clone(),
                 idle_secs: self.idle.map(|it| it.as_secs()),
                 memory_max: self.memory_max,
+                monitor: crate::monitor::url(&self.home),
                 workers: lock(&self.workers)
                     .values()
                     .map(|it| it.status())
@@ -1216,6 +1243,8 @@ impl Daemon {
                     .collect(),
             }),
             Request::Stop => Reply::Stopping,
+            // Taken before it is handled, in `answer`.
+            Request::Note(_) => Reply::Warming,
         }
     }
 

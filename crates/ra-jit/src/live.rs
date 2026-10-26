@@ -121,6 +121,10 @@ pub(crate) fn publish(baseline: &Baseline, patch: &std::path::Path) {
         Ok(laid) => laid,
         Err(why) => (Body::Restart(format!("{why:#}")), base),
     };
+    let (outcome, why, functions, statics) = match &body {
+        Body::Code(code) => ("sent", String::new(), code.redirected, code.lasting.len() as u64),
+        Body::Restart(why) => ("restart", why.clone(), 0, 0),
+    };
     let shown = match &body {
         Body::Code(code) if code.lasting.is_empty() => {
             format!("{} functions redirected", code.redirected)
@@ -140,6 +144,17 @@ pub(crate) fn publish(baseline: &Baseline, patch: &std::path::Path) {
                 start.elapsed().as_micros()
             );
             published.insert(uuid, Published { pid: process.pid, end, sequence });
+            crate::monitor::note(crate::monitor::event::Event::Live(crate::monitor::event::Live {
+                executable: crate::monitor::shown(baseline.path()),
+                pid: process.pid,
+                sequence,
+                outcome: outcome.to_owned(),
+                why,
+                functions,
+                statics,
+                at_us: crate::monitor::now_us(),
+                took_us: start.elapsed().as_micros() as u64,
+            }));
         }
         Err(why) => eprintln!("live: cannot leave the edit for process {}: {why:#}", process.pid),
     }
@@ -176,7 +191,7 @@ pub(crate) fn superseded(uuid: [u8; 16], why: String) {
 pub(crate) fn tell_superseded() {
     let superseded = std::mem::take(&mut *lock(&SUPERSEDED));
     for (uuid, why) in superseded {
-        tell_restart(uuid, &why);
+        tell_restart(uuid, &why, None);
     }
 }
 
@@ -184,11 +199,13 @@ pub(crate) fn tell_superseded() {
 /// started again to see the edit.
 pub(crate) fn restart(baseline: &Baseline, why: &str) {
     if let Some(uuid) = baseline.uuid() {
-        tell_restart(uuid, why);
+        tell_restart(uuid, why, Some(baseline.path()));
     }
 }
 
-fn tell_restart(uuid: [u8; 16], why: &str) {
+/// Tells the program that runs the executable of `uuid` (at `path`, when it is known) to
+/// restart.
+fn tell_restart(uuid: [u8; 16], why: &str, path: Option<&std::path::Path>) {
     let Some(process) = running(&uuid) else { return };
     let mut published = lock(&PUBLISHED);
     let last = published.get(&uuid).copied().filter(|it| it.pid == process.pid);
@@ -196,6 +213,19 @@ fn tell_restart(uuid: [u8; 16], why: &str) {
     let patch = Patch { uuid, sequence, body: Body::Restart(why.to_owned()) };
     if write(&uuid, &patch).is_ok() {
         eprintln!("live: process {} has to be restarted: {why}", process.pid);
+        let executable =
+            path.map_or_else(|| crate::monitor::executable_of(process.pid), crate::monitor::shown);
+        crate::monitor::note(crate::monitor::event::Event::Live(crate::monitor::event::Live {
+            executable,
+            pid: process.pid,
+            sequence,
+            outcome: "restart".to_owned(),
+            why: why.to_owned(),
+            functions: 0,
+            statics: 0,
+            at_us: crate::monitor::now_us(),
+            took_us: 0,
+        }));
         let end = last.map_or(process.next, |it| it.end);
         published.insert(uuid, Published { pid: process.pid, end, sequence });
     }

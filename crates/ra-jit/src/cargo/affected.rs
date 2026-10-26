@@ -95,6 +95,11 @@ pub(crate) struct Passed {
 }
 
 impl Passed {
+    /// The tests of the program, but for those that run every time.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.tests.keys().map(String::as_str)
+    }
+
     /// Forgets that the tests `failed` passed, or, when the program did not say which failed,
     /// all the tests `ran` (all of them when `None`): each runs until it passes again, even
     /// as its code goes back to what passed before. The others that ran passed.

@@ -1657,7 +1657,7 @@ impl<'a> Patch<'a> {
         let redirected = writes.len() as u64;
         for (address, bytes) in laid.statics {
             let pointers = (laid.restored.iter())
-                .filter(|it| (address..address + bytes.len() as u64).contains(it))
+                .filter(|it| (address..address + bytes.len() as u64).contains(*it))
                 .map(|it| it - address)
                 .collect();
             writes.push(ra_jit_live::format::Write { address, bytes, pointers });

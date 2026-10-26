@@ -26,6 +26,11 @@ Only the latest release, and `main`, get fixes.
   before its request is read. On Windows the directory and peer checks are not implemented.
   The refusal of another user is not covered by a test. See
   [docs/cargo.md](docs/cargo.md), "The daemon".
+- **The daemon's monitor is readable by every local user.** Its Flecs REST server listens on
+  127.0.0.1 (from port 27870), with no check of who connects: anyone on the machine can read
+  what the daemon built, the paths of your workspaces and programs, and your tests' names and
+  results. It changes nothing in a build, and nothing it is sent is read back. Set
+  `RA_JIT_MONITOR=off` on a machine you share. See [docs/monitor.md](docs/monitor.md).
 - **A shared store is trusted input unless you turn signing on.** Packs fetched from a
   remote are checked against the hash in their name, so storage cannot alter them. But
   whoever can write to the bucket can list a pack of their own making, and ra-jit will link

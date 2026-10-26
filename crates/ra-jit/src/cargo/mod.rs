@@ -27,6 +27,8 @@ mod whole;
 
 use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};
 
+use crate::monitor::event::By;
+
 use anyhow::Context as _;
 
 use cli::{Asked, Invocation, Subcommand};
@@ -229,6 +231,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
     let key = asked.key(&cwd);
+    let mut noted = crate::monitor::Build::begin(asked.subcommand.name(), &cwd);
     let finished = |state: &State| {
         let took = started.elapsed().as_secs_f64();
         let finished = format!("`{}` profile [ra-jit] target(s) in {took:.2}s", state.profile);
@@ -252,10 +255,12 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
         }
         Ok(Err(NotServed::Error(_, written))) => {
             eprintln!("{written}");
+            noted.by(By::Error, &written);
             return Ok(FAILED);
         }
         Ok(Err(NotServed::Cargo(ToCargo(state, reason, daemons)))) => {
             say::cargo_builds(&reason, "building with cargo", say::EDIT);
+            noted.by(By::Cargo, &reason);
             let mut counts = state.counts;
             *counts.cargo.entry(reason).or_default() += 1;
             match by_cargo(asked, &cwd, &key, counts, None, &daemons)? {
@@ -264,6 +269,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
             }
         }
         Err(unread) => {
+            noted.by(By::Cargo, unread.unwrap_or("the first build of the workspace"));
             if whole::asked_for(asked)
                 && let Some(code) = whole::build(asked)?
             {
@@ -276,12 +282,14 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                 Ok((state, settled)) => {
                     finished(&state);
                     held = Some(settled);
+                    noted.by(By::Daemon, "");
                     state
                 }
                 Err(NotStaged::Failed(code)) => return Ok(code),
                 Err(NotStaged::Cargos(why, ahead)) => {
                     if let Some(why) = why {
                         say::cargo_builds(&why, "building with cargo", say::COLD);
+                        noted.by(By::Cargo, &why);
                     }
                     let state = match by_cargo(asked, &cwd, &key, Counts::default(), ahead, &[])? {
                         Ok(state) => state,
@@ -292,14 +300,17 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
                             finished(&state);
                             served = true;
                             held = Some(settled);
+                            noted.by(By::Daemon, "");
                             state
                         }
                         Err(NotServed::Error(_, written)) => {
                             eprintln!("{written}");
+                            noted.by(By::Error, &written);
                             return Ok(FAILED);
                         }
                         Err(NotServed::Cargo(ToCargo(state, reason, _))) => {
                             say::cargo_builds(&reason, "this build is cargo's", say::COLD);
+                            noted.by(By::Cargo, &reason);
                             let mut state = *state;
                             state.count_cargo(&reason);
                             state
@@ -321,6 +332,7 @@ fn build(asked: &Invocation) -> anyhow::Result<i32> {
         note("client write state", CLIENT, writing);
         crate::trace::finish();
     }
+    noted.succeeded();
     after_build(asked, &state, &cwd, held)
 }
 
@@ -745,6 +757,11 @@ fn status() -> anyhow::Result<i32> {
                 "daemon: pid {}, version {}, exits {idle}, {most}",
                 daemon.pid, daemon.version
             );
+            let monitor = daemon.monitor.map_or_else(
+                || format!("off (`{}`)", crate::monitor::VAR),
+                |it| format!("Flecs REST on {it}"),
+            );
+            let _ = writeln!(said, "monitor: {monitor}");
             for worker in daemon.workers {
                 let holds =
                     worker.bytes.map_or(String::new(), |it| format!("holds {} MB, ", it >> 20));

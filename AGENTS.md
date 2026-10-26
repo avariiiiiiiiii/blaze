@@ -34,6 +34,12 @@ How to build, test and change ra-jit, including the vendored rust-analyzer, is
   HTTP (remote) with one documented, versioned schema in deterministic CBOR (JSON only as a
   rendering for people), and the CLI is a client of the same API:
   [docs/roadmap.md](docs/roadmap.md#8-the-agent-api).
+- **Salsa is the truth; Flecs only watches.** The daemon mirrors what it builds, patches and
+  tests into a Flecs world served over Flecs REST on localhost, for agents and tools to
+  watch. Nothing reads the mirror back to decide a build, nothing in it is on a build's
+  critical path, and a watcher (a TUI, `blaze watch`, the LSP, which is monitoring only, with
+  no keystroke `didChange` path) is a client of its REST and observers:
+  [docs/monitor.md](docs/monitor.md).
 - **Heavy work runs on a dev host, the Mac does quick checks.** Release builds, harness sweeps
   and benchmarks run on an AWS dev host claimed in the host ledger (`fleet-ops` skill), with a
   lease as long as the run, released after: [docs/contributing.md](docs/contributing.md#working-in-parallel).

@@ -50,8 +50,6 @@ pub(crate) struct Outlines {
     /// The files of the edit about to be applied that it adds functions to, as
     /// [`Outlines::adding`] found them.
     adding: FxHashMap<FileId, Adding>,
-    /// Of each file of the edit about to be applied, its functions as [`placed`] has them.
-    placed: FxHashMap<FileId, Option<FxHashMap<FunctionId, u64>>>,
 }
 
 /// An edit about to be applied that adds functions to a file, or takes them away, and changes
@@ -130,10 +128,6 @@ pub(crate) struct Changed {
     /// When the edit changed nothing but bodies and the signatures of functions that nothing
     /// else sees into ([`Signatures`]): the names of those functions.
     pub(crate) signatures: Vec<String>,
-    /// The functions of the file written as they were and where they were, whose code and
-    /// the places in it are as they were: `None` when that can't be told, and any of them
-    /// may be another.
-    pub(crate) unchanged: Option<FxHashSet<FunctionId>>,
 }
 
 impl Outlines {
@@ -142,7 +136,6 @@ impl Outlines {
         for &file in files {
             self.types.entry(file).or_insert_with(|| types(db, file));
             self.copied.entry(file).or_insert_with(|| copied(db, file));
-            self.placed.insert(file, placed(db, listed, file));
         }
         let new: Vec<_> = files.iter().copied().filter(|it| !self.files.contains_key(it)).collect();
         let outlines = outlines(db, listed, &new);
@@ -253,13 +246,6 @@ impl Outlines {
                     }
                     None => (true, Vec::new(), Vec::new()),
                 };
-                let unchanged = match (self.placed.remove(&file).flatten(), off) {
-                    (Some(was), false) => placed(db, listed, file).map(|now| {
-                        let same = |(func, hash): (&FunctionId, &u64)| was.get(func) == Some(hash);
-                        now.iter().filter(|&it| same(it)).map(|it| *it.0).collect()
-                    }),
-                    _ => None,
-                };
                 Changed {
                     file,
                     bodies_only,
@@ -268,12 +254,10 @@ impl Outlines {
                     inline,
                     added: added.map(|it| (it.crates, it.files)),
                     signatures,
-                    unchanged,
                 }
             })
             .collect();
         self.adding.clear();
-        self.placed.clear();
         // An edit to more than bodies can change which functions there are, in any file, and
         // what is kept here was found by asking the ones listed before it.
         if files.iter().any(|it| !it.bodies_only) {
@@ -693,38 +677,6 @@ fn added_alone(func: &ast::Fn) -> bool {
         && !inline
         && !declares
         && is_unseen_body(body.syntax())
-}
-
-/// Each function written in `file` that no body declares, with a hash of its text and of the
-/// line and column it starts at. One with the same hash after an edit has the same code, and
-/// everything in it is where it was: its lines, its panics and its `line!()`. `None` when
-/// the functions of the file are not listed.
-fn placed(db: &RootDatabase, listed: &Listed, file: FileId) -> Option<FxHashMap<FunctionId, u64>> {
-    let functions = listed.in_files(db, &[file]).pop().flatten()?;
-    let text = ide_db::base_db::SourceDatabase::file_text(db, file).text(db);
-    let line_starts: Vec<usize> =
-        std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1)).collect();
-    let placed = hir::attach_db(db, || {
-        functions
-            .iter()
-            .filter_map(|&func| {
-                let at = func.lookup(db).id;
-                // One a macro writes is where the macro is called, which tells nothing of it.
-                if at.file_id.is_macro() || at.file_id.original_file(db).file_id(db) != file {
-                    return None;
-                }
-                let range = at.to_range(db);
-                let (start, end) = (usize::from(range.start()), usize::from(range.end()));
-                let written = text.get(start..end)?;
-                let line = line_starts.partition_point(|&it| it <= start) - 1;
-                let column = text[line_starts[line]..start].chars().count();
-                let mut hasher = FxHasher::default();
-                (line, column, written).hash(&mut hasher);
-                Some((func, hasher.finish()))
-            })
-            .collect()
-    });
-    Some(placed)
 }
 
 /// What looking at the functions written in a file tells that how they are written does not.

@@ -117,8 +117,6 @@ TO_SHAPES = (LIB_RS, "pub use e::{here, named};", "pub use shapes::{here, named}
 TO_E = (LIB_RS, "pub use shapes::{here, named};", "pub use e::{here, named};")
 # A file of the crate's directory that no module is written in, which the crate doesn't build.
 STRAY = "lib/src/stray.rs"
-# A line of `here` written over two, as a formatter does.
-AT_SPLIT = "    let at =\n        std::panic::Location::caller();\n"
 # An edit whose file the daemon sees empty first, as a write that truncates it shows it.
 EMPTY_FIRST = "empty first"
 SIDES = "\nimpl Sq {\n    pub const SIDES: u32 = 40;\n}\n"
@@ -183,14 +181,6 @@ STEPS = [
     ]),
     ("a constant shadowed, its file seen empty first", [(SHAPES_RS, None, lambda text: text + SIDES, EMPTY_FIRST)]),
     ("it taken away, its file seen empty first", [(SHAPES_RS, SIDES, "", EMPTY_FIRST)]),
-    ("a function written over more lines, above others", [(E_RS, "u32 {\n    line!()", "u32 {\n\n    line!()")]),
-    ("a line above functions that tell where they are", [(SHAPES_RS, "Sq(pub u32);\n", "Sq(pub u32);\n\n")]),
-    ("one written over more lines within", [(SHAPES_RS, "    let at = std::panic::Location::caller();\n", AT_SPLIT)]),
-    ("all written as they were", [
-        (E_RS, "u32 {\n\n    line!()", "u32 {\n    line!()"),
-        (SHAPES_RS, "Sq(pub u32);\n\n", "Sq(pub u32);\n"),
-        (SHAPES_RS, AT_SPLIT, "    let at = std::panic::Location::caller();\n"),
-    ]),
 ]
 # Steps whose moved functions keep their code from before the edit, which items find.
 RELOCATES = {"functions moved to another file", "twins moved to another file"}

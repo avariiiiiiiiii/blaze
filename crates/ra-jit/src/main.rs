@@ -9217,19 +9217,9 @@ fn run_holding(
         // changed is told by their items, together, as an item moved from one to another is.
         let mut by_items: Vec<vfs::FileId> = Vec::new();
         let mut items_crates: Vec<ide_db::base_db::Crate> = Vec::new();
-        let mut unchanged_of: FxHashMap<vfs::FileId, FxHashSet<hir_def::FunctionId>> =
-            FxHashMap::default();
-        for changed in sources {
-            let outline::Changed {
-                file,
-                bodies_only,
-                copied,
-                generics,
-                inline,
-                added,
-                signatures,
-                unchanged,
-            } = changed;
+        for outline::Changed { file, bodies_only, copied, generics, inline, added, signatures } in
+            sources
+        {
             if copied || !generics.is_empty() || !inline.is_empty() {
                 let why = "an edit of a generic, inline or default trait function, which rustc copies into its callers";
                 let inline_unlinked = |program: &Program| {
@@ -9245,12 +9235,9 @@ fn run_holding(
             }
             if bodies_only {
                 if std::env::var_os("RA_JIT_STATS").is_some() {
-                    let told = unchanged.as_ref().map(|it| it.len());
-                    eprintln!("bodies only: {file:?}, {told:?} functions as they were");
+                    eprintln!("bodies only: {file:?}");
                 }
-                for program in &mut programs {
-                    program.known.touch_bodies(&db, file, unchanged.clone());
-                }
+                programs.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
                 continue;
             }
             if let Some((crates, files)) = added {
@@ -9278,7 +9265,6 @@ fn run_holding(
             match crates {
                 Some(crates) => {
                     by_items.push(file);
-                    unchanged_of.extend(unchanged.map(|it| (file, it)));
                     for &krate in crates {
                         if !items_crates.contains(&krate) {
                             items_crates.push(krate);
@@ -9294,9 +9280,7 @@ fn run_holding(
         if !by_items.is_empty() {
             let crates = &items_crates;
             let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
-            for program in &mut programs {
-                program.known.touch_items(&db, crates, &by_items, &unchanged_of, fan);
-            }
+            programs.iter_mut().for_each(|it| it.known.touch_items(&db, crates, &by_items, fan));
             listed.touch(&db, Some(crates));
         }
         if !moved.is_empty() {

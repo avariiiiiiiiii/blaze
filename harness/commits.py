@@ -39,6 +39,20 @@ def wait_items(daemon, timeout=300):
     return None
 
 
+def wait_laid_out(daemon, timeout=10):
+    """Seconds until the debug info of the last linked program is where splices write it
+    (`laid out: `), which the daemon does on a thread of its own after the link and the next
+    link waits for. `None` if nothing is said in `timeout`: a program with no debug info to move."""
+    began = time.time()
+    while time.time() - began < timeout:
+        text = logs(daemon)
+        at = text.rfind("edit-to-binary: ")
+        if at >= 0 and "laid out: " in text[at:]:
+            return round(time.time() - began, 1)
+        time.sleep(0.1)
+    return None
+
+
 def git(repo, *args, text=True):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=text, check=True).stdout
 
@@ -95,6 +109,7 @@ def one(name, spec, repo, commit, work, rounds, extra_env, keep):
         row["cold_s"] = round(time.monotonic() - began, 1)
         wait_own_base(daemon, None)
         row["items_s"] = wait_items(daemon)
+        row["laid_out_s"] = wait_laid_out(daemon)
         walls, said = [], []
         row["base_said"] = [line[:200] for line in daemon.said().splitlines() if SAID.match(line)][-20:]
         for n in range(rounds):

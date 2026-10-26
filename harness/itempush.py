@@ -244,6 +244,7 @@ def steps(check_all):
             raise SystemExit(f"the daemon did not get ready: {states}")
         for step, edits in STEPS:
             wait_items(home)
+            seen = len(logs(home))
             for path, old, new, *how in edits:
                 path = os.path.join(ws, path)
                 text = open(path).read() if os.path.exists(path) else ""
@@ -257,7 +258,6 @@ def steps(check_all):
                     open(path, "w").close()
                     time.sleep(0.5)
                 open(path, "w").write(text)
-            seen = len(logs(home))
             _, ours = side.cargo("build")
             _, theirs = reference.cargo("build")
             said = ours.stdout + ours.stderr

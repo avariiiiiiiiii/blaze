@@ -8982,14 +8982,27 @@ fn run_holding(
             }
             switched.clear();
             // A build the daemon asks for itself waits for the rest of a save of several
-            // files, as one change: a move of an item between them is seen whole.
-            // A write is several notices: a look at the rest of one file's finds nothing new,
-            // and the next file's notice can come meanwhile.
+            // files that takes names out of one and puts them in no other yet, as one change:
+            // a move of an item between them is seen whole. A write is several notices: a look
+            // at the rest of one file's finds nothing new, and the next file's notice can come
+            // meanwhile.
             let waited_for = clients.iter().any(|(_, (_, _, it))| !it.nobody);
             let quiet = waited_for || !notices.wait(SETTLE);
             let same = (touched.len() + gone.len(), held.head()) == before;
             unchanged = if same { unchanged + 1 } else { 0 };
-            if quiet || unchanged > 2 {
+            let moving = || {
+                let texts: Vec<(vfs::FileId, String)> = (touched.iter().chain(&gone))
+                    .filter_map(|&index| {
+                        let Watched::Source(id) = files[index].file else { return None };
+                        let held = held.read(&files[index].path).filter(|_| !gone.contains(&index));
+                        let text = String::from_utf8_lossy(held.as_deref().unwrap_or_default());
+                        Some((id, text.into_owned()))
+                    })
+                    .collect();
+                let written: Vec<_> = texts.iter().map(|(id, text)| (*id, text.as_str())).collect();
+                blaze_items::moved_out(&db, &written)
+            };
+            if quiet || unchanged > 2 || same && !moving() {
                 break;
             }
             changed = notices.take();

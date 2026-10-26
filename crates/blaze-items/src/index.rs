@@ -1454,6 +1454,25 @@ pub fn moves_written(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
     gone.iter().any(|from| added.iter().any(|to| to != from))
 }
 
+/// Whether a name declared is gone from a file of `written` and declared anew in none of the
+/// others: half of a move, whose other half is still to be written.
+pub fn moved_out(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
+    let (mut gone, mut added) = (FxHashSet::default(), FxHashSet::default());
+    for &(file, text) in written {
+        let mut was = names_declared(db.file_text(file).text(db));
+        for it in names_declared(text) {
+            match was.binary_search(&it) {
+                Ok(at) => _ = was.remove(at),
+                Err(_) => _ = added.insert(file),
+            }
+        }
+        if !was.is_empty() {
+            gone.insert(file);
+        }
+    }
+    gone.iter().any(|from| !added.iter().any(|to| to != from))
+}
+
 /// The names `text` declares, each after its keyword and sorted: lexed, not parsed, as each
 /// file of an edit is read twice before it.
 fn names_declared(text: &str) -> Vec<(&str, &str)> {

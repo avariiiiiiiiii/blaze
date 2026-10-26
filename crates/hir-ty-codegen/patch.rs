@@ -2372,10 +2372,7 @@ impl Base {
         let start = std::time::Instant::now();
         self.snapshots.clear();
         let mut wanted: Vec<(Instance, Instance, StoredParamEnvAndCrate, Option<_>)> = Vec::new();
-        let moves = !self.rustc
-            && self.items.is_some()
-            && files.len() >= 2
-            && std::env::var_os("RA_JIT_NO_SNAPSHOT").is_none();
+        let moves = !self.rustc && self.items.is_some() && files.len() >= 2;
         let edited: FxHashSet<FileId> = files.iter().copied().collect();
         for (key, it) in &mut self.relocated {
             let code = it.code.take();

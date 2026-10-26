@@ -609,7 +609,6 @@ impl Index {
         took.push(start.elapsed());
         self.parts.push(("bindings", start.elapsed()));
         // The files written again, beside their entries.
-        let cx = form::Cx::new(db);
         let mut changed: FxHashSet<ItemId> = FxHashSet::default();
         let mut counterparts: FxHashMap<ItemId, ItemId> = FxHashMap::default();
         let mut written = 0;
@@ -624,6 +623,35 @@ impl Index {
             return Err(why);
         }
         let now: FxHashSet<ItemId> = ids.iter().copied().collect();
+        // And so does a kind of item added, gone or changed that no move lets through.
+        let movable = |kind: Result<(), &'static str>| match kind {
+            Err("an impl of a trait" | "an item of an impl of a trait") => Ok(()),
+            other => other,
+        };
+        for (file, _) in &declared {
+            for &id in self.files.get(file).into_iter().flatten().filter(|it| !now.contains(it)) {
+                if let Some(gone) = self.entries.get(&id) {
+                    movable(gone.kind).map_err(|why| refused(db, id, why, "gone"))?;
+                }
+            }
+        }
+        for (&id, entry) in ids.iter().zip(&entries) {
+            let Some(entry) = entry else { continue };
+            match self.entries.get(&id) {
+                None => movable(entry.kind).map_err(|why| refused(db, id, why, "added"))?,
+                Some(was)
+                    if was.erred
+                        || entry.erred
+                        || was.digest != entry.digest
+                        || was.refs != entry.refs =>
+                {
+                    was.kind.map_err(|why| refused(db, id, why, "changed"))?;
+                    entry.kind.map_err(|why| refused(db, id, why, "changed"))?;
+                }
+                Some(_) => {}
+            }
+        }
+        self.parts.push(("kinds", start.elapsed()));
         // The code of an added function is written when a gone one is written alike, with its
         // code known from before the edit.
         let alike: FxHashSet<(form::Hash, &[Symbol])> = (declared.iter())
@@ -753,9 +781,11 @@ impl Index {
             .collect();
         again.sort_unstable_by_key(|it| format!("{it:?}"));
         again.dedup();
-        for id in again {
+        let again_entries = entries_of(db, fan, &again);
+        self.parts.push(("again", start.elapsed()));
+        for (id, entry) in again.into_iter().zip(again_entries) {
             written += 1;
-            let entry = entry(db, &cx, id).ok_or("an item gone with no edit of its file")?;
+            let entry = entry.ok_or("an item gone with no edit of its file")?;
             if let Some(why) = entry.missed {
                 return Err(why);
             }

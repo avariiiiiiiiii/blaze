@@ -1452,14 +1452,12 @@ pub fn moves_written(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
         && files(|it| it.gone).any(|from| files(|it| it.added).any(|to| to != from))
 }
 
-/// Whether a name declared is gone from a file of `written` and declared anew in none of the
-/// others: half of a move, whose other half is still to be written.
+/// Whether names declared are gone from a file of `written` that declares none anew, and no
+/// file declares one anew: half of a move, whose other half is still to be written. A file
+/// that takes names away and declares others renames them.
 pub fn moved_out(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
     let changes = declared_changes(db, written);
-    let files = |pick: fn(&Declared) -> bool| {
-        (written.iter().zip(&changes)).filter(move |it| pick(it.1)).map(|it| it.0.0)
-    };
-    files(|it| it.gone).any(|from| !files(|it| it.added).any(|to| to != from))
+    !changes.iter().any(|it| it.added) && changes.iter().any(|it| it.gone)
 }
 
 /// How writing a file changes the names it declares.

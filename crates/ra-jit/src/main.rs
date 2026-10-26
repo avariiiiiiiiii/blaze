@@ -8233,7 +8233,9 @@ fn run_holding(
                     }
                     _ => {}
                 }
-                if idle {
+                // Nor while a build runs, the daemon's own of its base too: the work would share
+                // the threads with it, and what the build's end lets go of stops it.
+                if idle && builds.running.is_empty() {
                     start_idle_work(&db);
                 }
                 if !builds.over_budget.is_empty() {
@@ -8809,7 +8811,9 @@ fn run_holding(
                 } else {
                     Duration::from_millis(5)
                 });
-                start_idle_work(&db);
+                if builds.running.is_empty() {
+                    start_idle_work(&db);
+                }
             }
         }
         // The checkouts that are read from somewhere else than for the last build. Their files

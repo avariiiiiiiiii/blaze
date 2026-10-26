@@ -245,18 +245,26 @@ def steps(check_all):
         for step, edits in STEPS:
             wait_items(home)
             seen = len(logs(home))
+            # Every file is written as one change, one right after another: a daemon that
+            # noticed the first alone would take a move as an item gone and, later, one added.
+            texts, empty_first = {}, []
             for path, old, new, *how in edits:
                 path = os.path.join(ws, path)
-                text = open(path).read() if os.path.exists(path) else ""
+                text = texts[path] if path in texts else open(path).read() if os.path.exists(path) else ""
                 if old is None:
                     text = new(text)
                 elif old not in text:
                     raise SystemExit(f"{step}: {old!r} is not in {path}")
                 else:
                     text = text.replace(old, new, 1)
+                texts[path] = text
                 if EMPTY_FIRST in how:
-                    open(path, "w").close()
-                    time.sleep(0.5)
+                    empty_first.append(path)
+            for path in empty_first:
+                open(path, "w").close()
+            if empty_first:
+                time.sleep(0.5)
+            for path, text in texts.items():
                 open(path, "w").write(text)
             _, ours = side.cargo("build")
             _, theirs = reference.cargo("build")

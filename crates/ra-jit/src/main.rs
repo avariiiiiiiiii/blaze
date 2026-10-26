@@ -9042,6 +9042,12 @@ fn run_holding(
             Watched::Included(_) => None,
         });
         let editing: Vec<_> = editing.collect();
+        let emptied: Vec<_> = (gone.iter())
+            .filter_map(|&index| match files[index].file {
+                Watched::Source(id) => Some(id),
+                Watched::Included(_) => None,
+            })
+            .collect();
         let mut texts = Vec::new();
         for index in touched {
             let WatchedFile { file, path, .. } = &files[index];
@@ -9078,7 +9084,9 @@ fn run_holding(
         // An edit that adds or takes away a trait or a macro is not pushed through the items, so
         // what moves would be found by is not kept from before it.
         let moves = editing.len() >= 2
-            && !texts.iter().any(|(file, text)| blaze_items::unmovable_written(&db, *file, text));
+            && !(texts.iter().map(|(file, text)| (*file, text.as_str())))
+                .chain(emptied.iter().map(|&file| (file, "")))
+                .any(|(file, text)| blaze_items::unmovable_written(&db, file, text));
         for program in &mut programs {
             let at = Instant::now();
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);

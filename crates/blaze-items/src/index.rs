@@ -1433,44 +1433,73 @@ fn interface_names(
 /// and one is declared anew in another, and no trait or macro is added or taken away, which
 /// no move lets through.
 pub fn moves_written(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
-    let (mut gone, mut added) = (FxHashSet::default(), FxHashSet::default());
-    for &(file, text) in written {
-        let mut was = names_declared(db.file_text(file).text(db));
-        let now = names_declared(text);
-        let unmovable = |it: &&(&str, &str)| matches!(it.0, "trait" | "macro" | "macro_rules");
-        if was.iter().filter(unmovable).ne(now.iter().filter(unmovable)) {
-            return false;
-        }
-        for it in &now {
-            match was.binary_search(it) {
-                Ok(at) => _ = was.remove(at),
-                Err(_) => _ = added.insert(file),
-            }
-        }
-        if !was.is_empty() {
-            gone.insert(file);
-        }
-    }
-    gone.iter().any(|from| added.iter().any(|to| to != from))
+    let changes = declared_changes(db, written);
+    let files = |pick: fn(&Declared) -> bool| {
+        (written.iter().zip(&changes)).filter(move |it| pick(it.1)).map(|it| it.0.0)
+    };
+    !changes.iter().any(|it| it.unmovable)
+        && files(|it| it.gone).any(|from| files(|it| it.added).any(|to| to != from))
 }
 
 /// Whether a name declared is gone from a file of `written` and declared anew in none of the
 /// others: half of a move, whose other half is still to be written.
 pub fn moved_out(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
-    let (mut gone, mut added) = (FxHashSet::default(), FxHashSet::default());
-    for &(file, text) in written {
-        let mut was = names_declared(db.file_text(file).text(db));
-        for it in names_declared(text) {
-            match was.binary_search(&it) {
+    let changes = declared_changes(db, written);
+    let files = |pick: fn(&Declared) -> bool| {
+        (written.iter().zip(&changes)).filter(move |it| pick(it.1)).map(|it| it.0.0)
+    };
+    files(|it| it.gone).any(|from| !files(|it| it.added).any(|to| to != from))
+}
+
+/// How writing a file changes the names it declares.
+#[derive(Clone, Copy, Default)]
+struct Declared {
+    /// A trait or a macro is added or taken away.
+    unmovable: bool,
+    /// A name is no longer declared.
+    gone: bool,
+    /// A name is declared anew.
+    added: bool,
+}
+
+/// Of each `(file, text)` written, how the names it declares change: each file lexed on a
+/// thread of its own, as a save can be of many.
+fn declared_changes(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> Vec<Declared> {
+    let was: Vec<&str> = written.iter().map(|&(file, _)| &**db.file_text(file).text(db)).collect();
+    let one = |at: usize| {
+        let mut was = names_declared(was[at]);
+        let now = names_declared(written[at].1);
+        let unmovable = |it: &&(&str, &str)| matches!(it.0, "trait" | "macro" | "macro_rules");
+        let unmovable = was.iter().filter(unmovable).ne(now.iter().filter(unmovable));
+        let mut added = false;
+        for it in &now {
+            match was.binary_search(it) {
                 Ok(at) => _ = was.remove(at),
-                Err(_) => _ = added.insert(file),
+                Err(_) => added = true,
             }
         }
-        if !was.is_empty() {
-            gone.insert(file);
+        Declared { unmovable, gone: !was.is_empty(), added }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let threads = threads.min(written.len()).max(1);
+    let one = &one;
+    let mut changes = vec![Declared::default(); written.len()];
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads)
+            .map(|part| {
+                scope.spawn(move || {
+                    let ats = (part..written.len()).step_by(threads);
+                    ats.map(|at| (at, one(at))).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for part in parts {
+            for (at, it) in part.join().unwrap_or_default() {
+                changes[at] = it;
+            }
         }
-    }
-    gone.iter().any(|from| !added.iter().any(|to| to != from))
+    });
+    changes
 }
 
 /// The names `text` declares, each after its keyword and sorted: lexed, not parsed, as each

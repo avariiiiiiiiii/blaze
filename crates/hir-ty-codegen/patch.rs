@@ -176,6 +176,15 @@ impl Mark {
         Some(Mark::of_function(db, serial, compiled, false))
     }
 
+    /// What of `other` is not as here: 0 its code, 1 the places it reports, 2 its lines.
+    fn why_not(self, other: Mark) -> usize {
+        match () {
+            _ if self.serial != other.serial => 0,
+            _ if self.locations != other.locations => 1,
+            _ => 2,
+        }
+    }
+
     /// Whether the code is the same, wherever in the file it is: a copy of rustc's that no
     /// patch reaches does what it did, and only a debugger is told the lines it was at.
     fn same_code(self, other: Mark) -> bool {
@@ -1290,6 +1299,9 @@ pub struct Stale {
     gone: Vec<FunctionId>,
     /// Why no patch can hold the change.
     declined: Option<&'static str>,
+    /// Of the roots and then the instances found changed, how many in their code, in the
+    /// places they report and in their lines alone, as [`Mark::why_not`] tells.
+    why: [usize; 6],
     /// Something the functions left to rustc reach changed, so what they reach may have.
     their_walk_changed: bool,
     pub steps: StaleSteps,
@@ -2974,6 +2986,7 @@ impl Base {
         handout: &Handout<'_>,
     ) -> Stale {
         let start = stdx::time::Instant::now();
+        let stats = std::env::var_os("RA_JIT_STATS").is_some();
         let mut stale = Stale::default();
         let names = symbols.filter(|_| !self.ids.is_empty()).map(|symbols| {
             StableNames::new(db, symbols, self.owned.clone(), true).frozen(self.ids.clone())
@@ -3025,7 +3038,13 @@ impl Base {
                     eprintln!("check-all: MISSED root {root:?} `{name}` of {crate_of:?}");
                     continue;
                 }
-                Some(Some(false)) => stale.roots.push(root),
+                Some(Some(false)) => {
+                    if stats {
+                        let now = probe(|| Mark::of_root(db, root, self.debug)).flatten();
+                        stale.why[now.map_or(0, |it| self.marks[i].why_not(it))] += 1;
+                    }
+                    stale.roots.push(root)
+                }
                 Some(None) => return stale.declined("a root of the base no longer compiles"),
                 None => stale.gone.push(root),
             }
@@ -3128,7 +3147,12 @@ impl Base {
                     eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
                     continue;
                 }
-                Some(Some(_)) if !was.forwarded => stale.instances.push(instance.clone()),
+                Some(Some(now)) if !was.forwarded => {
+                    if let Some(was) = was.mark.filter(|_| stats) {
+                        stale.why[3 + was.why_not(now)] += 1;
+                    }
+                    stale.instances.push(instance.clone())
+                }
                 // One that had no code of its own might have now.
                 _ => stale.broken.push((
                     Node::Instance(instance.clone()),
@@ -3228,6 +3252,12 @@ impl Base {
         }
         stale.steps.left =
             start.elapsed() - stale.steps.roots - stale.steps.instances - stale.steps.statics;
+        if stats && stale.why.iter().any(|&it| it > 0) {
+            let [code, places, lines, i_code, i_places, i_lines] = stale.why;
+            eprintln!(
+                "stale-why: roots code={code} places={places} lines={lines}; instances code={i_code} places={i_places} lines={i_lines}"
+            );
+        }
         stale
     }
 

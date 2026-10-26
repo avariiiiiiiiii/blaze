@@ -37,7 +37,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 pub use form::Hash;
 pub use index::{
     Code, Entries, Index, Live, Pushed, code_names, codes_of, entries_in, file_of, modules_in,
-    modules_of,
+    modules_of, moved_out, moves_written,
 };
 
 /// Runs the work for each of `0..count`, on as many threads as there are, each with a

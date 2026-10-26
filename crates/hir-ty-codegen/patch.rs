@@ -2216,14 +2216,21 @@ impl Base {
 
     /// Before an edit of `files`: what the edits before it left of the items is taken in, of
     /// the revision they left.
-    pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+    pub(super) fn before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[FileId],
+        fan: &Fan<'_>,
+        moves: bool,
+    ) {
         let start = std::time::Instant::now();
         self.take_made(db);
         // Nothing changes: what the last edit asked about is taken before one that does.
         if files.is_empty() {
             return;
         }
-        self.snapshot(db, files, fan);
+        let moves = moves && files.len() >= 2;
+        self.snapshot(db, files, fan, moves);
         let now = salsa::plumbing::current_revision(db);
         let settled = (self.settling.take().filter(|_| self.items.is_some()))
             .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
@@ -2258,7 +2265,7 @@ impl Base {
         let rewritten = start.elapsed();
         // What a move out of the files is found by, when the threads writing it were stopped.
         let coded = match written {
-            Some(()) if files.len() >= 2 => {
+            Some(()) if moves => {
                 probe(|| hir_ty::attach_db(db, || items.index.write_codes(db, fan, files)))
             }
             _ => Some(0),
@@ -2280,14 +2287,26 @@ impl Base {
         }
     }
 
+    /// Whether an edit that moves items between files keeps their code: the base is its own and
+    /// its items are made.
+    pub(super) fn keeps_moves(&self) -> bool {
+        !self.rustc && self.items.is_some()
+    }
+
+    /// Whether the items refuse a push of an edit of `files` before it is made: one of them
+    /// could not be hashed at the last build.
+    pub(super) fn unhashed_in(&self, files: &[FileId]) -> bool {
+        (self.items.as_ref()).is_some_and(|it| it.index.unhashed_in(files).is_some())
+    }
+
     /// Before an edit of `files`, of the revision before it: the code of the instances of the
     /// base, or of what it relocated, of functions written in them, for [`Self::relocate`].
     /// Only an edit of two files or more moves a function, and the items tell which it moved.
-    fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+    fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>, moves: bool) {
         let start = std::time::Instant::now();
         self.snapshots.clear();
         let mut wanted: Vec<(Instance, Instance, StoredParamEnvAndCrate, Option<_>)> = Vec::new();
-        let moves = !self.rustc && self.items.is_some() && files.len() >= 2;
+        let moves = self.keeps_moves() && moves;
         let edited: FxHashSet<FileId> = files.iter().copied().collect();
         for (key, it) in &mut self.relocated {
             let code = it.code.take();
@@ -2315,15 +2334,20 @@ impl Base {
         }
         let found: Vec<std::sync::OnceLock<Option<Arc<CompiledFunction>>>> =
             wanted.iter().map(|_| std::sync::OnceLock::new()).collect();
+        let slowest = std::sync::atomic::AtomicU64::new(0);
         let work = |db: &dyn HirDatabase, at: usize| {
             found[at].get_or_init(|| {
                 let (_, now, env, code) = &wanted[at];
                 if let Some(code) = code {
                     return Some(Arc::clone(code));
                 }
+                let one = std::time::Instant::now();
                 let compiled =
                     || compiled_instance(db, now.clone(), env.clone()).as_ref().ok().cloned();
-                probe(|| hir_ty::attach_db(db, compiled)).flatten().map(Arc::new)
+                let compiled = probe(|| hir_ty::attach_db(db, compiled)).flatten().map(Arc::new);
+                let took = one.elapsed().as_micros() as u64;
+                slowest.fetch_max(took, std::sync::atomic::Ordering::Relaxed);
+                compiled
             });
         };
         fan(wanted.len(), &work);
@@ -2336,9 +2360,10 @@ impl Base {
         }
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
-                "relocate-snapshot: {} of {asked} instances in {} us",
+                "relocate-snapshot: {} of {asked} instances in {} us, the slowest {} us",
                 self.snapshots.len(),
-                start.elapsed().as_micros()
+                start.elapsed().as_micros(),
+                slowest.into_inner()
             );
         }
     }
@@ -2489,8 +2514,17 @@ impl Base {
                 if stats {
                     eprintln!("items: whole crates: {why}");
                 }
+                let refused = start.elapsed();
                 self.relocate(db, None);
-                return self.touch(db, Some(crates));
+                self.touch(db, Some(crates));
+                if stats {
+                    eprintln!(
+                        "items-whole-us: refused at {}, all touched at {}",
+                        refused.as_micros(),
+                        start.elapsed().as_micros()
+                    );
+                }
+                return;
             }
         };
         self.relocate(db, Some(&pushed));

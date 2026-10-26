@@ -39,15 +39,16 @@ def wait_items(daemon, timeout=300):
     return None
 
 
-def wait_laid_out(daemon, timeout=10):
-    """Seconds until the debug info of the last linked program is where splices write it
-    (`laid out: `), which the daemon does on a thread of its own after the link and the next
-    link waits for. `None` if nothing is said in `timeout`: a program with no debug info to move."""
+def wait_said(daemon, said, timeout=10):
+    """Seconds until the daemon says `said` after the last build: what it does on threads of
+    its own once the build is over, which the next edit would wait for, as the debug info of
+    the program laid out where splices write it (`laid out: `). `None` if it isn't said in
+    `timeout`."""
     began = time.time()
     while time.time() - began < timeout:
         text = logs(daemon)
         at = text.rfind("edit-to-binary: ")
-        if at >= 0 and "laid out: " in text[at:]:
+        if at >= 0 and said in text[at:]:
             return round(time.time() - began, 1)
         time.sleep(0.1)
     return None
@@ -109,7 +110,7 @@ def one(name, spec, repo, commit, work, rounds, extra_env, keep):
         row["cold_s"] = round(time.monotonic() - began, 1)
         wait_own_base(daemon, None)
         row["items_s"] = wait_items(daemon)
-        row["laid_out_s"] = wait_laid_out(daemon)
+        row["laid_out_s"] = wait_said(daemon, "laid out: ")
         walls, said = [], []
         row["base_said"] = [line[:200] for line in daemon.said().splitlines() if SAID.match(line)][-20:]
         for n in range(rounds):

@@ -53,6 +53,8 @@ pub struct Index {
     renamed: FxHashSet<ItemId>,
     /// How many edits were pushed, which an entry is written after.
     pushes: u64,
+    /// When each part of the last push was over, said when it is refused.
+    parts: Vec<(&'static str, std::time::Duration)>,
 }
 
 /// The items an index has, which a thread of its own can ask of an item without asking salsa
@@ -267,6 +269,7 @@ impl Index {
             moved: FxHashMap::default(),
             renamed: FxHashSet::default(),
             pushes: 0,
+            parts: Vec::new(),
         };
         for Entries(part) in entries {
             for (id, entry) in part {
@@ -405,6 +408,14 @@ impl Index {
             .collect()
     }
 
+    /// Why an item of `files` could not be hashed at the last build, if one could not: a push
+    /// that writes the files again hashes it again and refuses for it, so it refuses before.
+    pub fn unhashed_in(&self, files: &[FileId]) -> Option<&'static str> {
+        (files.iter().filter_map(|it| self.files.get(it)).flatten())
+            .filter_map(|it| self.entries.get(it))
+            .find_map(|it| it.missed)
+    }
+
     /// Notes that an edit since [`Index::before_edit`] can have changed the bindings of modules.
     pub fn bindings_edited(&mut self) {
         self.scopes_dirty = true;
@@ -419,9 +430,21 @@ impl Index {
         files: &[FileId],
         fan: &Fan<'_>,
     ) -> Result<Pushed, &'static str> {
+        self.parts.clear();
+        let start = std::time::Instant::now();
         let pushed = self.push_inner(db, files, fan);
         if pushed.is_err() {
             self.scopes_dirty = true;
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                let parts: Vec<String> = (self.parts.iter())
+                    .map(|(part, at)| format!("{part} {}", at.as_micros()))
+                    .collect();
+                eprintln!(
+                    "items-refused-us: {} at {} us",
+                    parts.join(", "),
+                    start.elapsed().as_micros()
+                );
+            }
         }
         pushed
     }
@@ -436,6 +459,9 @@ impl Index {
         self.moved.clear();
         self.renamed.clear();
         self.pushes += 1;
+        if let Some(why) = self.unhashed_in(files) {
+            return Err(why);
+        }
         let mut took = Vec::new();
         let mut edited: FxHashSet<Crate> = FxHashSet::default();
         for &file in files {
@@ -454,6 +480,21 @@ impl Index {
                 return Err("an edit of a crate's own attributes");
             }
         }
+        // An item of a kind no move lets through, added to the files or taken out of them,
+        // refuses the push before the bindings are taken.
+        for (file, now) in self.declared(db, fan, files) {
+            let now_set: FxHashSet<ItemId> = now.iter().copied().collect();
+            let was = self.files.get(&file).into_iter().flatten();
+            for &id in was.filter(|it| !now_set.contains(it)) {
+                if let Some(gone) = self.entries.get(&id) {
+                    unmovable(gone.kind).map_err(|why| refused(db, id, why, "gone"))?;
+                }
+            }
+            for &id in now.iter().filter(|it| !self.entries.contains_key(it)) {
+                unmovable(changed_kind(db, id)).map_err(|why| refused(db, id, why, "added"))?;
+            }
+        }
+        self.parts.push(("kinds", start.elapsed()));
         let mut around: FxHashSet<Crate> = edited.clone();
         for &krate in &edited {
             around
@@ -471,6 +512,7 @@ impl Index {
             Some(())
         };
         took.push(start.elapsed());
+        self.parts.push(("crates", start.elapsed()));
         let mut rewritten: Vec<FileId> = files.to_vec();
         let mut scopes = Vec::new();
         let around: Vec<Crate> = around.into_iter().collect();
@@ -590,17 +632,71 @@ impl Index {
             }
         }
 
+        // One written with a name bound anew that could not be hashed before the edit refuses
+        // the push before the files are written again: it is written again below.
+        let rewritten_files: FxHashSet<FileId> = rewritten.iter().copied().collect();
+        let early = Pushed {
+            changed: FxHashSet::default(),
+            bound: std::mem::take(&mut bound),
+            methods: FxHashSet::default(),
+            files: Vec::new(),
+            written: 0,
+        };
+        let unhashed = (early.bound.keys())
+            .filter_map(|it| self.named.get(it))
+            .flatten()
+            .filter_map(|it| self.entries.get(it))
+            .filter(|it| !rewritten_files.contains(&it.file))
+            .find_map(|it| it.missed.filter(|_| early.rebinds(&it.modules, &it.names)));
+        bound = early.bound;
+        if let Some(why) = unhashed.or_else(|| self.unhashed_in(&rewritten)) {
+            return Err(why);
+        }
         took.push(start.elapsed());
+        self.parts.push(("bindings", start.elapsed()));
         // The files written again, beside their entries.
-        let cx = form::Cx::new(db);
         let mut changed: FxHashSet<ItemId> = FxHashSet::default();
         let mut counterparts: FxHashMap<ItemId, ItemId> = FxHashMap::default();
         let mut written = 0;
         let declared = self.declared(db, fan, &rewritten);
         let declared_at = start.elapsed();
+        self.parts.push(("declared", declared_at));
         let ids: Vec<ItemId> = declared.iter().flat_map(|it| it.1.iter().copied()).collect();
         let mut entries = entries_of(db, fan, &ids);
+        self.parts.push(("entries", start.elapsed()));
+        // One whose hash can't be told refuses the push, before the moves are looked for.
+        let unhashed =
+            (ids.iter().zip(&entries)).find_map(|(&id, it)| Some((id, it.as_ref()?.missed?)));
+        if let Some((id, why)) = unhashed {
+            return Err(refused(db, id, why, "now"));
+        }
         let now: FxHashSet<ItemId> = ids.iter().copied().collect();
+        // And so does a kind of item added, gone or changed that no move lets through, of the
+        // files of modules added or taken away too.
+        for (file, _) in &declared {
+            for &id in self.files.get(file).into_iter().flatten().filter(|it| !now.contains(it)) {
+                if let Some(gone) = self.entries.get(&id) {
+                    unmovable(gone.kind).map_err(|why| refused(db, id, why, "gone"))?;
+                }
+            }
+        }
+        for (&id, entry) in ids.iter().zip(&entries) {
+            let Some(entry) = entry else { continue };
+            match self.entries.get(&id) {
+                None => unmovable(entry.kind).map_err(|why| refused(db, id, why, "added"))?,
+                Some(was)
+                    if was.erred
+                        || entry.erred
+                        || was.digest != entry.digest
+                        || was.refs != entry.refs =>
+                {
+                    was.kind.map_err(|why| refused(db, id, why, "changed"))?;
+                    entry.kind.map_err(|why| refused(db, id, why, "changed"))?;
+                }
+                Some(_) => {}
+            }
+        }
+        self.parts.push(("changed kinds", start.elapsed()));
         // The code of an added function is written when a gone one is written alike, with its
         // code known from before the edit.
         let alike: FxHashSet<(form::Hash, &[Symbol])> = (declared.iter())
@@ -640,7 +736,9 @@ impl Index {
             .filter(|(id, _)| !self.entries.contains_key(id))
             .filter_map(|(id, entry)| Some((*id, entry.as_ref()?)))
             .collect();
+        self.parts.push(("codes", start.elapsed()));
         let (moved, renamed) = moves(&gone, &added);
+        self.parts.push(("moves", start.elapsed()));
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
                 "items-moved: {} of {} gone and {} added, {} of them renamed",
@@ -712,7 +810,6 @@ impl Index {
         // What is written with a name bound to something else now, written again.
         let pushed =
             Pushed { changed: FxHashSet::default(), bound, methods, files: Vec::new(), written: 0 };
-        let rewritten_files: FxHashSet<FileId> = rewritten.iter().copied().collect();
         let mut again: Vec<ItemId> = pushed
             .bound
             .keys()
@@ -728,9 +825,11 @@ impl Index {
             .collect();
         again.sort_unstable_by_key(|it| format!("{it:?}"));
         again.dedup();
-        for id in again {
+        let again_entries = entries_of(db, fan, &again);
+        self.parts.push(("again", start.elapsed()));
+        for (id, entry) in again.into_iter().zip(again_entries) {
             written += 1;
-            let entry = entry(db, &cx, id).ok_or("an item gone with no edit of its file")?;
+            let entry = entry.ok_or("an item gone with no edit of its file")?;
             if let Some(why) = entry.missed {
                 return Err(why);
             }
@@ -1069,6 +1168,15 @@ fn refused(db: &dyn HirDatabase, id: ItemId, why: &'static str, how: &str) -> &'
     why
 }
 
+/// What of `kind` refuses an item added or taken away even when it moved: an impl of a trait
+/// written as it was elsewhere selects what it did.
+fn unmovable(kind: Result<(), &'static str>) -> Result<(), &'static str> {
+    match kind {
+        Err("an impl of a trait" | "an item of an impl of a trait") => Ok(()),
+        other => other,
+    }
+}
+
 fn changed_kind(db: &dyn HirDatabase, id: ItemId) -> Result<(), &'static str> {
     let container = |container| match container {
         ItemContainerId::TraitId(_) => Err("an item of a trait"),
@@ -1331,6 +1439,103 @@ fn interface_names(
         store_names(&Body::of(db, func.into()), out);
     }
     Some(())
+}
+
+/// Whether an edit that writes each `(file, text)` can move an item between its files through
+/// [`Index::push`], as the texts alone tell before it: a name declared is gone from one file
+/// and one is declared anew in another, and no trait or macro is added or taken away, which
+/// no move lets through.
+pub fn moves_written(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
+    let changes = declared_changes(db, written);
+    let files = |pick: fn(&Declared) -> bool| {
+        (written.iter().zip(&changes)).filter(move |it| pick(it.1)).map(|it| it.0.0)
+    };
+    !changes.iter().any(|it| it.unmovable)
+        && files(|it| it.gone).any(|from| files(|it| it.added).any(|to| to != from))
+}
+
+/// Whether names declared are gone from a file of `written` that declares none anew, and no
+/// file declares one anew: half of a move, whose other half is still to be written. A file
+/// that takes names away and declares others renames them.
+pub fn moved_out(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> bool {
+    let changes = declared_changes(db, written);
+    !changes.iter().any(|it| it.added) && changes.iter().any(|it| it.gone)
+}
+
+/// How writing a file changes the names it declares.
+#[derive(Clone, Copy, Default)]
+struct Declared {
+    /// A trait or a macro is added or taken away.
+    unmovable: bool,
+    /// A name is no longer declared.
+    gone: bool,
+    /// A name is declared anew.
+    added: bool,
+}
+
+/// Of each `(file, text)` written, how the names it declares change: each file lexed on a
+/// thread of its own, as a save can be of many.
+fn declared_changes(db: &dyn HirDatabase, written: &[(FileId, &str)]) -> Vec<Declared> {
+    let was: Vec<&str> = written.iter().map(|&(file, _)| &**db.file_text(file).text(db)).collect();
+    let one = |at: usize| {
+        let mut was = names_declared(was[at]);
+        let now = names_declared(written[at].1);
+        let unmovable = |it: &&(&str, &str)| matches!(it.0, "trait" | "macro" | "macro_rules");
+        let unmovable = was.iter().filter(unmovable).ne(now.iter().filter(unmovable));
+        let mut added = false;
+        for it in &now {
+            match was.binary_search(it) {
+                Ok(at) => _ = was.remove(at),
+                Err(_) => added = true,
+            }
+        }
+        Declared { unmovable, gone: !was.is_empty(), added }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let threads = threads.min(written.len()).max(1);
+    let one = &one;
+    let mut changes = vec![Declared::default(); written.len()];
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads)
+            .map(|part| {
+                scope.spawn(move || {
+                    let ats = (part..written.len()).step_by(threads);
+                    ats.map(|at| (at, one(at))).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for part in parts {
+            for (at, it) in part.join().unwrap_or_default() {
+                changes[at] = it;
+            }
+        }
+    });
+    changes
+}
+
+/// The names `text` declares, each after its keyword and sorted: lexed, not parsed, as each
+/// file of an edit is read twice before it.
+fn names_declared(text: &str) -> Vec<(&str, &str)> {
+    use SyntaxKind::*;
+    let lexed = syntax::LexedStr::new(syntax::Edition::CURRENT, text);
+    let tokens: Vec<(SyntaxKind, &str)> = (0..lexed.len())
+        .map(|at| (lexed.kind(at), &text[lexed.text_range(at)]))
+        .filter(|(kind, _)| !kind.is_trivia())
+        .collect();
+    let mut names: Vec<(&str, &str)> = (0..tokens.len())
+        .filter_map(|at| match (tokens[at], tokens.get(at + 1), tokens.get(at + 2)) {
+            ((FN_KW | STRUCT_KW | ENUM_KW | TYPE_KW | CONST_KW, kind), Some(&(IDENT, name)), _)
+            | ((STATIC_KW | TRAIT_KW | MOD_KW | MACRO_KW, kind), Some(&(IDENT, name)), _)
+            | ((STATIC_KW, kind), Some(&(MUT_KW, _)), Some(&(IDENT, name))) => Some((kind, name)),
+            ((IDENT, "union"), Some(&(IDENT, name)), _) => Some(("union", name)),
+            ((IDENT, "macro_rules"), Some(&(BANG, _)), Some(&(IDENT, name))) => {
+                Some(("macro_rules", name))
+            }
+            _ => None,
+        })
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 /// The names a body's code is written with: those of its source, and of the paths and method

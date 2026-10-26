@@ -621,6 +621,26 @@ impl Index {
             }
         }
 
+        // One written with a name bound anew that could not be hashed before the edit refuses
+        // the push before the files are written again: it is written again below.
+        let rewritten_files: FxHashSet<FileId> = rewritten.iter().copied().collect();
+        let early = Pushed {
+            changed: FxHashSet::default(),
+            bound: std::mem::take(&mut bound),
+            methods: FxHashSet::default(),
+            files: Vec::new(),
+            written: 0,
+        };
+        let unhashed = (early.bound.keys())
+            .filter_map(|it| self.named.get(it))
+            .flatten()
+            .filter_map(|it| self.entries.get(it))
+            .filter(|it| !rewritten_files.contains(&it.file))
+            .find_map(|it| it.missed.filter(|_| early.rebinds(&it.modules, &it.names)));
+        bound = early.bound;
+        if let Some(why) = unhashed {
+            return Err(why);
+        }
         took.push(start.elapsed());
         self.parts.push(("bindings", start.elapsed()));
         // The files written again, beside their entries.
@@ -777,7 +797,6 @@ impl Index {
         // What is written with a name bound to something else now, written again.
         let pushed =
             Pushed { changed: FxHashSet::default(), bound, methods, files: Vec::new(), written: 0 };
-        let rewritten_files: FxHashSet<FileId> = rewritten.iter().copied().collect();
         let mut again: Vec<ItemId> = pushed
             .bound
             .keys()

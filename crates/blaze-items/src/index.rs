@@ -895,18 +895,20 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
                 for (_, entry) in added.iter().filter(|it| !now.contains(&it.0)) {
                     twins.entry(&entry.names[..]).or_default().push(entry);
                 }
-                let (mut digest, mut refs, mut shown) = (0, 0, 0);
+                let (mut digest, mut refs, mut shown, mut other) = (0, 0, 0, 0);
                 for (id, was) in gone.iter().filter(|it| !moved.contains_key(&it.0)) {
                     let Some([now]) = twins.get(&was.names[..]).map(|it| &it[..]) else { continue };
+                    let other_code =
+                        was.code.as_ref().map(|it| it.0) != now.code.as_ref().map(|it| it.0);
                     if now.digest != was.digest {
                         digest += 1;
                     } else {
                         refs += 1;
                     }
-                    if shown < 6 {
+                    other += usize::from(other_code);
+                    if shown < 12 && other_code {
                         shown += 1;
-                        let names: Vec<&str> =
-                            was.names.iter().take(6).map(|it| it.as_str()).collect();
+                        let names: Vec<&str> = was.names.iter().map(|it| it.as_str()).collect();
                         let diff: Vec<String> = (was.refs.iter().zip(&now.refs))
                             .filter(|(a, b)| a != b && moved.get(a) != Some(b))
                             .take(3)
@@ -953,7 +955,7 @@ fn moves(gone: &[(ItemId, &Entry)], added: &[(ItemId, &Entry)]) -> FxHashMap<Ite
                     }
                 }
                 eprintln!(
-                    "items-unmoved: twins by name with another digest {digest}, with the digest {refs}"
+                    "items-unmoved: twins by name with another digest {digest}, with the digest {refs}, with other code {other}"
                 );
             }
             return moved;

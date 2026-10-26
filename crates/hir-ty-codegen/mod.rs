@@ -1428,6 +1428,11 @@ impl Rejections {
         self.homes() && self.rustc.as_ref().is_some_and(|it| !it.homed(file))
     }
 
+    /// The bodies the base's code is compiled from that are written in `files`.
+    pub fn bodies_in(&self, files: &[base_db::FileId]) -> Vec<DefWithBodyId> {
+        self.base.as_ref().map(|it| it.bodies_in(files)).unwrap_or_default()
+    }
+
     /// Whether an edit that moves items between files keeps their code: the base is its own and
     /// its items are made.
     pub fn keeps_moves(&self) -> bool {

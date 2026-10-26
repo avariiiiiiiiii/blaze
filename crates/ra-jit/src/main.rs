@@ -9075,11 +9075,15 @@ fn run_holding(
         outlines.before_edit(&db, &listed, &editing);
         let outlined = read.elapsed();
         let mut checked = Duration::ZERO;
+        // An edit that adds or takes away a trait or a macro is not pushed through the items, so
+        // what moves would be found by is not kept from before it.
+        let moves = editing.len() >= 2
+            && !texts.iter().any(|(file, text)| blaze_items::unmovable_written(&db, *file, text));
         for program in &mut programs {
             let at = Instant::now();
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);
             checked += at.elapsed();
-            program.known.before_edit(&db, &editing, &|count, each| fan(&db, count, each));
+            program.known.before_edit(&db, &editing, &|count, each| fan(&db, count, each), moves);
         }
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
@@ -9131,7 +9135,12 @@ fn run_holding(
             outlines.before_edit(&db, &listed, &untouched);
             for program in &mut programs {
                 program.checked.before_edit(&db, &listed, &untouched, &program.unbuilt.edited);
-                program.known.before_edit(&db, &untouched, &|count, each| fan(&db, count, each));
+                program.known.before_edit(
+                    &db,
+                    &untouched,
+                    &|count, each| fan(&db, count, each),
+                    true,
+                );
             }
             for file in write_harnesses(&mut db, texts) {
                 if !sources.contains(&file) {

@@ -1428,6 +1428,25 @@ fn interface_names(
     Some(())
 }
 
+/// Whether writing `text` over `file` adds or takes away a trait or a macro as written, which
+/// no move lets through [`Index::push`]: told by the text alone, before the edit.
+pub fn unmovable_written(db: &dyn HirDatabase, file: FileId, text: &str) -> bool {
+    use SyntaxKind::{MACRO_DEF, MACRO_RULES, TRAIT};
+    let written = |text: &str| {
+        let tree = syntax::ast::SourceFile::parse(text, syntax::Edition::CURRENT).syntax_node();
+        let mut names: Vec<(SyntaxKind, String)> = (tree.descendants())
+            .filter(|it| matches!(it.kind(), TRAIT | MACRO_RULES | MACRO_DEF))
+            .filter_map(|it| {
+                let name = it.children().find(|it| it.kind() == SyntaxKind::NAME)?;
+                Some((it.kind(), name.text().to_string()))
+            })
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    written(db.file_text(file).text(db)) != written(text)
+}
+
 /// The names a body's code is written with: those of its source, and of the paths and method
 /// calls macros wrote into it; `None` for a body its file no longer has.
 pub fn code_names(db: &dyn HirDatabase, body: DefWithBodyId) -> Option<Vec<Symbol>> {

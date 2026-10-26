@@ -2301,14 +2301,21 @@ impl Base {
 
     /// Before an edit of `files`: what the edits before it left of the items is taken in, of
     /// the revision they left.
-    pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+    pub(super) fn before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[FileId],
+        fan: &Fan<'_>,
+        moves: bool,
+    ) {
         let start = std::time::Instant::now();
         self.take_made(db);
         // Nothing changes: what the last edit asked about is taken before one that does.
         if files.is_empty() {
             return;
         }
-        self.snapshot(db, files, fan);
+        let moves = moves && files.len() >= 2;
+        self.snapshot(db, files, fan, moves);
         let now = salsa::plumbing::current_revision(db);
         let settled = (self.settling.take().filter(|_| self.items.is_some()))
             .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
@@ -2343,7 +2350,7 @@ impl Base {
         let rewritten = start.elapsed();
         // What a move out of the files is found by, when the threads writing it were stopped.
         let coded = match written {
-            Some(()) if files.len() >= 2 => {
+            Some(()) if moves => {
                 probe(|| hir_ty::attach_db(db, || items.index.write_codes(db, fan, files)))
             }
             _ => Some(0),
@@ -2368,11 +2375,11 @@ impl Base {
     /// Before an edit of `files`, of the revision before it: the code of the instances of the
     /// base, or of what it relocated, of functions written in them, for [`Self::relocate`].
     /// Only an edit of two files or more moves a function, and the items tell which it moved.
-    fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+    fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>, moves: bool) {
         let start = std::time::Instant::now();
         self.snapshots.clear();
         let mut wanted: Vec<(Instance, Instance, StoredParamEnvAndCrate, Option<_>)> = Vec::new();
-        let moves = !self.rustc && self.items.is_some() && files.len() >= 2;
+        let moves = !self.rustc && self.items.is_some() && moves;
         let edited: FxHashSet<FileId> = files.iter().copied().collect();
         for (key, it) in &mut self.relocated {
             let code = it.code.take();

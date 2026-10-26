@@ -1551,9 +1551,17 @@ impl Rejections {
     }
 
     /// Before an edit of `files`, of the revision before it, with the threads `fan` has.
-    pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[base_db::FileId], fan: &Fan<'_>) {
+    /// `moves` is whether the edit can move items between the files, which what they are
+    /// before it is kept for.
+    pub fn before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[base_db::FileId],
+        fan: &Fan<'_>,
+        moves: bool,
+    ) {
         if let Some(base) = &mut self.base {
-            base.before_edit(db, files, fan);
+            base.before_edit(db, files, fan, moves);
         }
     }
 

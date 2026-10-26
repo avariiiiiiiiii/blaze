@@ -1311,7 +1311,12 @@ impl SymbolResolver for Resolver<'_> {
                     fan(&db, count, each)
                 };
             let work = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, || work(&db, &fan)));
-            _ = std::panic::catch_unwind(work);
+            if let Err(why) = std::panic::catch_unwind(work)
+                && std::env::var_os("RA_JIT_STATS").is_some()
+            {
+                let by = if why.is::<salsa::Cancelled>() { "a new revision" } else { "a panic" };
+                eprintln!("background: stopped by {by}");
+            }
         };
         _ = std::thread::Builder::new().name("items".to_owned()).spawn(run);
     }

@@ -870,12 +870,22 @@ fn write_codes(
     if stats {
         eprintln!("items-coding: {} functions", funcs.len());
     }
-    let codes = blaze_items::codes_of(db, fan, &funcs, Some(&live));
+    // A revision the daemon goes to meanwhile, taking in a file, stops the queries: each
+    // function's code is the same at the next, and is written again there.
+    let mut stopped = 0;
+    let codes = loop {
+        let write = || blaze_items::codes_of(db, fan, &funcs, Some(&live));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)) {
+            Ok(codes) => break codes,
+            Err(why) if why.is::<salsa::Cancelled>() && stopped < 8 => stopped += 1,
+            Err(why) => std::panic::resume_unwind(why),
+        }
+    };
     drop(live);
     if stats {
         let written = codes.iter().filter(|it| it.is_some()).count();
         eprintln!(
-            "items-codes: {written} of {} functions in {} us",
+            "items-codes: {written} of {} functions in {} us, stopped {stopped} times",
             funcs.len(),
             start.elapsed().as_micros()
         );
@@ -2273,10 +2283,15 @@ impl Base {
             let now = Instance { def: InstanceDef::Fn(*now), ..key.clone() };
             self.relocated.insert(key.clone(), Relocated { now, code });
         }
-        self.relocated.retain(|_, it| match it.now.def {
-            InstanceDef::Fn(func) => probe(|| live.has(db, ItemId::Function(func))) == Some(true),
-            _ => false,
-        });
+        // A push refused leaves the index as it was, and a patch finds one gone uncalled.
+        if pushed.is_some() {
+            self.relocated.retain(|_, it| match it.now.def {
+                InstanceDef::Fn(func) => {
+                    probe(|| live.has(db, ItemId::Function(func))) == Some(true)
+                }
+                _ => false,
+            });
+        }
         self.relocated_now =
             self.relocated.iter().map(|(key, it)| (it.now.clone(), key.clone())).collect();
         self.relocated_funcs = (self.relocated.iter())

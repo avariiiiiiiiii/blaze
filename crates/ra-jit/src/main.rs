@@ -8962,19 +8962,29 @@ fn run_holding(
             let same = (touched.len() + gone.len(), held.head()) == before;
             unchanged = if same { unchanged + 1 } else { 0 };
             let moving = || {
-                let texts: Vec<(vfs::FileId, String)> = (touched.iter().chain(&gone))
-                    .filter_map(|&index| {
-                        let Watched::Source(id) = files[index].file else { return None };
-                        let held = held.read(&files[index].path).filter(|_| !gone.contains(&index));
-                        let text = String::from_utf8_lossy(held.as_deref().unwrap_or_default());
-                        Some((id, text.into_owned()))
+                let by_path: FxHashMap<&Path, vfs::FileId> = (files.iter())
+                    .filter_map(|it| match it.file {
+                        Watched::Source(id) => Some((&*it.path, id)),
+                        Watched::Included(_) => None,
+                    })
+                    .collect();
+                let changes = held.changed();
+                let texts: Vec<(vfs::FileId, String)> = (changes.iter())
+                    .filter_map(|(path, bytes)| {
+                        let text = String::from_utf8_lossy(bytes.as_deref().unwrap_or_default());
+                        Some((*by_path.get(&**path)?, text.into_owned()))
                     })
                     .collect();
                 let written: Vec<_> = texts.iter().map(|(id, text)| (*id, text.as_str())).collect();
                 blaze_items::moved_out(&db, &written)
             };
-            if quiet || unchanged > 2 || same && !moving() {
+            // A client comes once its files are written; the daemon's own build waits a while
+            // for the other half of a move, even past a quiet look.
+            if waited_for || unchanged > 2 || (quiet || same) && !moving() {
                 break;
+            }
+            if quiet {
+                notices.wait(SETTLE);
             }
             changed = notices.take();
         }

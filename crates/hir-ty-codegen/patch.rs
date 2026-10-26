@@ -1731,7 +1731,7 @@ impl Base {
             *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
             write_codes(db, fan, wanting, live, &codes);
         };
-        symbols.in_background(db, Box::new(work));
+        symbols.when_idle(db, Box::new(work));
         self.making = Some(making);
         self.coding = Some(coding);
     }
@@ -2203,7 +2203,7 @@ impl Base {
         let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
             write_codes(db, fan, wanting, live, &codes);
         };
-        symbols.in_background(db, Box::new(work));
+        symbols.when_idle(db, Box::new(work));
         self.coding = Some(coding);
     }
 

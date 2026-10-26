@@ -1304,21 +1304,12 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn in_background(&self, _: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
-        let db = self.db.clone();
-        let run = move || {
-            let fan =
-                |count: usize, each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync)| {
-                    fan(&db, count, each)
-                };
-            let work = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, || work(&db, &fan)));
-            if let Err(why) = std::panic::catch_unwind(work)
-                && std::env::var_os("RA_JIT_STATS").is_some()
-            {
-                let by = if why.is::<salsa::Cancelled>() { "a new revision" } else { "a panic" };
-                eprintln!("background: stopped by {by}");
-            }
-        };
-        _ = std::thread::Builder::new().name("items".to_owned()).spawn(run);
+        in_background(self.db, work);
+    }
+
+    fn when_idle(&self, db: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
+        let at = salsa::plumbing::current_revision(db);
+        IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((at, work));
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
@@ -3704,6 +3695,48 @@ fn start_from_rustc(
 /// Runs `each` for each of `0..count` on as many threads as there are, each with a clone of
 /// `db`. What a thread does not get to, as an edit cancelled it or it panicked, is left: the
 /// caller does it.
+/// What [`SymbolResolver::when_idle`] was handed, by the revision it is of.
+static IDLE_WORK: Mutex<Vec<(salsa::Revision, hir_ty_codegen::Background)>> =
+    Mutex::new(Vec::new());
+
+/// How long nothing is asked before [`IDLE_WORK`] starts: an edit that follows sooner finds
+/// the threads its own.
+const IDLE_WORK_AFTER: Duration = Duration::from_millis(1000);
+
+/// Starts the work of [`IDLE_WORK`] that is of the revision `db` is at, and drops the rest.
+fn start_idle_work(db: &RootDatabase) {
+    let at = salsa::plumbing::current_revision(db);
+    let work = std::mem::take(&mut *IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()));
+    for (of, work) in work {
+        if of == at {
+            in_background(db, work);
+        }
+    }
+}
+
+fn idle_work() -> bool {
+    !IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Runs `work` on a thread of its own over a database of its own, which the next change
+/// cancels.
+fn in_background(db: &RootDatabase, work: hir_ty_codegen::Background) {
+    let db = db.clone();
+    let run = move || {
+        let fan = |count: usize, each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync)| {
+            fan(&db, count, each)
+        };
+        let work = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, || work(&db, &fan)));
+        if let Err(why) = std::panic::catch_unwind(work)
+            && std::env::var_os("RA_JIT_STATS").is_some()
+        {
+            let by = if why.is::<salsa::Cancelled>() { "a new revision" } else { "a panic" };
+            eprintln!("background: stopped by {by}");
+        }
+    };
+    _ = std::thread::Builder::new().name("items".to_owned()).spawn(run);
+}
+
 fn fan(
     db: &RootDatabase,
     count: usize,
@@ -8152,6 +8185,18 @@ fn run_holding(
                     .flatten();
                 let (mut own_base, mut interrupt) = (None, false);
                 match wants_base {
+                    _ if idle && idle_work() => match builds.events.recv_timeout(IDLE_WORK_AFTER) {
+                        Ok(event) => {
+                            if builds.take(event, &mut programs)? {
+                                let_go(&mut db, &builds);
+                                memory::served(&mut db)?;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => start_idle_work(&db),
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            bail!("nothing takes requests any more")
+                        }
+                    },
                     Some(at) if idle => match builds.events.recv_timeout(OWN_BASE_AFTER) {
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {

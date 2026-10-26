@@ -391,6 +391,12 @@ pub trait SymbolResolver {
     fn in_background(&self, db: &dyn HirDatabase, work: Background) {
         work(db, &|count, each| self.in_parallel(count, &|db, _, at| each(db, at)));
     }
+    /// [`Self::in_background`] once nothing has been asked for a while, and not at all when
+    /// the database has changed by then: work no edit waits on, which would take the threads
+    /// of the edits that come one after another.
+    fn when_idle(&self, db: &dyn HirDatabase, work: Background) {
+        self.in_background(db, work);
+    }
 }
 
 static EDITS_FOLLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

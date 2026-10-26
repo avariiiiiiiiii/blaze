@@ -777,6 +777,12 @@ impl DefMap {
         self.data.recursion_limit.unwrap_or(128)
     }
 
+    /// What the crate's own attributes and the derives it exports say, written out: equal for
+    /// two revisions when none of that changed between them.
+    pub fn crate_data_print(&self) -> String {
+        format!("{:?}", self.data)
+    }
+
     // FIXME: this can use some more human-readable format (ideally, an IR
     // even), as this should be a great debugging aid.
     pub fn dump(&self, db: &dyn SourceDatabase) -> String {

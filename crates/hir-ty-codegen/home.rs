@@ -7,7 +7,8 @@
 //! per crate that does.
 
 use base_db::{Crate, FileId};
-use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
+use blaze_items::{ItemId, Live};
+use hir_def::{AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     TypeSuperVisitable, TypeVisitable, TypeVisitor,
@@ -26,8 +27,12 @@ use hir_ty::{
 use super::{Instance, InstanceDef};
 
 /// The crates the name of an instance mentions.
-struct Mentions<'db> {
+struct Mentions<'db, 'a> {
     db: &'db dyn HirDatabase,
+    /// What is gone is not asked of, when it is told.
+    live: Option<&'a Live>,
+    /// It mentions an item `live` doesn't have.
+    gone: bool,
     crates: FxHashSet<Crate>,
     /// The bodies it has the code of or mentions a type of.
     bodies: Vec<DefWithBodyId>,
@@ -38,10 +43,20 @@ struct Mentions<'db> {
     seen: FxHashSet<Ty<'db>>,
 }
 
-impl<'db> Mentions<'db> {
-    fn of(db: &'db dyn HirDatabase, instance: &Instance) -> Mentions<'db> {
+impl<'db, 'a> Mentions<'db, 'a> {
+    fn of(db: &'db dyn HirDatabase, instance: &Instance) -> Mentions<'db, 'a> {
+        Mentions::of_live(db, instance, None)
+    }
+
+    fn of_live(
+        db: &'db dyn HirDatabase,
+        instance: &Instance,
+        live: Option<&'a Live>,
+    ) -> Mentions<'db, 'a> {
         let mut mentions = Mentions {
             db,
+            live,
+            gone: false,
             crates: FxHashSet::default(),
             bodies: Vec::new(),
             opaque: false,
@@ -49,6 +64,9 @@ impl<'db> Mentions<'db> {
         };
         match instance.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => {
+                if mentions.gone(ItemId::Function(func)) {
+                    return mentions;
+                }
                 mentions.crates.insert(func.krate(db));
                 mentions.bodies.push(func.into());
             }
@@ -69,11 +87,20 @@ impl<'db> Mentions<'db> {
         mentions
     }
 
+    fn gone(&mut self, id: ItemId) -> bool {
+        self.gone |= self.live.is_some_and(|it| !it.has(self.db, id));
+        self.gone
+    }
+
     fn owner(&mut self, owner: InferBodyId<'_>) {
         let InferBodyId::DefWithBodyId(owner) = owner else {
             self.opaque = true;
             return;
         };
+        if self.live.is_some_and(|it| !it.has_body(self.db, owner)) {
+            self.gone = true;
+            return;
+        }
         let krate = match owner {
             DefWithBodyId::FunctionId(it) => it.krate(self.db),
             DefWithBodyId::ConstId(it) => it.krate(self.db),
@@ -103,6 +130,20 @@ pub(super) fn mentioned_bodies(
 ) -> Option<Vec<DefWithBodyId>> {
     let mentions = Mentions::of(db, instance);
     (!mentions.opaque).then_some(mentions.bodies)
+}
+
+/// [`mentioned_bodies`] of an instance that can mention what an edit took away: `Err(true)`
+/// when it mentions an item `live` doesn't have, and `Err(false)` when its bodies can't be told.
+pub(super) fn live_bodies(
+    db: &dyn HirDatabase,
+    instance: &Instance,
+    live: &Live,
+) -> Result<Vec<DefWithBodyId>, bool> {
+    let mentions = Mentions::of_live(db, instance, Some(live));
+    if mentions.gone {
+        return Err(true);
+    }
+    (!mentions.opaque).then_some(mentions.bodies).ok_or(false)
 }
 
 /// The function the code of an instance is written in: its own, or the one a closure or an
@@ -151,11 +192,28 @@ pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
     file.original_file_respecting_includes(db).file_id(db)
 }
 
-impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
+impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db, '_> {
     type Result = ();
 
     fn visit_ty(&mut self, ty: Ty<'db>) {
-        if !self.seen.insert(ty) {
+        if self.gone || !self.seen.insert(ty) {
+            return;
+        }
+        let item = match ty.kind() {
+            TyKind::Adt(adt, _) => Some(ItemId::Adt(adt.def_id())),
+            TyKind::FnDef(def, _) => Some(match def.0 {
+                CallableDefId::FunctionId(it) => ItemId::Function(it),
+                CallableDefId::StructId(it) => ItemId::Adt(AdtId::StructId(it)),
+                CallableDefId::EnumVariantId(it) => {
+                    ItemId::Adt(AdtId::EnumId(it.lookup(self.db).parent))
+                }
+            }),
+            TyKind::Dynamic(bounds, _) => {
+                bounds.principal().map(|it| ItemId::Trait(it.skip_binder().def_id.0))
+            }
+            _ => None,
+        };
+        if item.is_some_and(|it| self.gone(it)) {
             return;
         }
         match ty.kind() {

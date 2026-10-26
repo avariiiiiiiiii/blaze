@@ -22,12 +22,14 @@ use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use intern::Symbol;
 
 use super::{
-    CodegenError, ContentId, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases, Rejections,
-    Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks, compiled_instance,
-    compiled_root, compiled_static, declaration_location,
+    CodegenError, ContentId, Fan, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases,
+    Rejections, Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
+    compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
     home::{body_file, body_files, mentioned_crates, written_in},
-    instance_serial, is_thread_local, left_to_rustc,
+    instance_serial, is_thread_local,
+    itempush::{Asked, ItemPush, Settled},
+    left_to_rustc,
     naming::Naming,
     root_serial, row_location, source_location,
     stable::StableNames,
@@ -221,7 +223,7 @@ impl Node {
 /// taken away what the base knew it by, and only looking tells. A build that is interrupted
 /// goes on unwinding: that says nothing about the base. One that waited for a thread whose
 /// own look panicked has found what that thread found.
-fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
+pub(super) fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
         Ok(found) => Some(found),
         Err(stopped) => match stopped.downcast_ref::<salsa::Cancelled>() {
@@ -744,7 +746,31 @@ pub(super) struct Base {
     /// rustc's copies of those of the name is an instance of the base, which a patch replaces
     /// under rustc's symbol.
     copies_homed: FxHashMap<FileId, FxHashMap<String, bool>>,
+    /// What the roots and instances refer to by item, for an edit that changes items: `None`
+    /// for a base of rustc's, and once an edit left it unable to tell.
+    items: Option<Box<ItemPush>>,
+    /// Where a thread of its own puts [`Self::items`] once it made them, of the revision the
+    /// base is of: they are taken before the next edit, and none are when they aren't ready.
+    making: Option<Making>,
+    /// Those an edit asked about by a name bound to another thing, whose items are to be
+    /// taken again before the next edit.
+    reitem: Option<Asked>,
+    /// Where threads of their own put what [`Self::reitem`] refers to once the patch of the
+    /// edit is made: the next edit waits for it, and asks itself when it is of another
+    /// revision or the threads were stopped.
+    settling: Option<Settling>,
+    /// The revisions the database went through since the last edit by taking in files it did
+    /// not have, each from one to the next: the edit they are of pushes them, so what was made
+    /// of the items at one of them is of the next too.
+    went: Vec<(salsa::Revision, salsa::Revision)>,
 }
+
+/// See [`Base::making`].
+type Making = Arc<std::sync::Mutex<Option<(salsa::Revision, Box<ItemPush>)>>>;
+
+/// See [`Base::settling`].
+type Settling =
+    Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(salsa::Revision, Settled)>>>>;
 
 /// A function of the checkout the base has from the store: no build here compiled it, so
 /// nothing but its name says what it is an instance of. A look finds that out from the code
@@ -969,6 +995,9 @@ impl Touched {
         *self = Touched::default();
         for stale in found {
             self.roots.extend(&stale.roots);
+            // One taken away differs from the base until an edit brings it back, which a look
+            // tells only by asking again.
+            self.roots.extend(&stale.gone);
             self.instances.extend(stale.instances.iter().cloned());
             self.statics.extend(&stale.statics);
             self.hydrated.extend(stale.hydrated.iter().map(|(at, ..)| *at));
@@ -1438,7 +1467,45 @@ impl Base {
             unnamed: Vec::new(),
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
+            items: None,
+            making: None,
+            reitem: None,
+            settling: None,
+            went: Vec::new(),
         })
+        .map(|mut base| {
+            base.make_items(db, cg.symbols);
+            base
+        })
+    }
+
+    /// Has [`Self::items`] made on threads of their own, of the revision the database is at,
+    /// when edits are to follow.
+    fn make_items(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        if self.rustc
+            || !super::do_edits_follow()
+            || std::env::var_os("RA_JIT_ITEM_PUSH").is_some_and(|it| it == "0")
+        {
+            return;
+        }
+        let making = Making::default();
+        let (made, at) = (making.clone(), salsa::plumbing::current_revision(db));
+        let (compiled, instances) =
+            (self.compiled.clone(), self.instances.keys().cloned().collect::<Vec<_>>());
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
+            let start = std::time::Instant::now();
+            let items = ItemPush::new(db, fan, &compiled, &instances);
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!(
+                    "items-us: {} for {} items",
+                    start.elapsed().as_micros(),
+                    items.index.items()
+                );
+            }
+            *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
+        };
+        symbols.when_idle(db, Box::new(work));
+        self.making = Some(making);
     }
 
     /// The executable rustc linked as a base, before anything of it is known: `home` takes
@@ -1483,6 +1550,11 @@ impl Base {
             unnamed: Vec::new(),
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
+            items: None,
+            making: None,
+            reitem: None,
+            settling: None,
+            went: Vec::new(),
         }
     }
 
@@ -1733,6 +1805,10 @@ impl Base {
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         // rustc's copies of what sees the file are of before, and nothing here says which.
         self.outdate_rustc("an edit that is more than the bodies of functions");
+        match crates {
+            Some(_) => self.bindings_edited(),
+            None => (self.items, self.making) = (None, None),
+        }
         let Some(crates) = crates else {
             self.touched.any = true;
             self.outdated |= self.untracked;
@@ -1756,6 +1832,7 @@ impl Base {
         if !files.iter().all(|it| self.homed.contains(it)) {
             return self.touch(db, Some(crates));
         }
+        self.bindings_edited();
         self.touched.crates.extend(crates.iter().copied());
         self.outdated |=
             self.untracked && self.crates.iter().any(|it| self.touched.crates.contains(it));
@@ -1776,6 +1853,7 @@ impl Base {
         let Some(reached) = reached.filter(|_| !self.rustc) else {
             return self.touch(db, Some(crates));
         };
+        self.bindings_edited();
         // Its bodies too, as a body edit's.
         self.touched.bodies.insert(file);
         for &krate in crates {
@@ -1807,6 +1885,209 @@ impl Base {
                 self.touched.named_instances.len()
             );
         }
+        self.outdated |=
+            self.untracked && self.crates.iter().any(|it| self.touched.around.contains(it));
+    }
+
+    /// The items [`Self::making`] has, when they are of the revision the database is at.
+    fn take_made(&mut self, db: &dyn HirDatabase) {
+        let Some(making) = self.making.take() else { return };
+        let made = making.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let now = salsa::plumbing::current_revision(db);
+        let why = match &made {
+            None => "not made before the edit",
+            Some(_) => "made of another revision",
+        };
+        self.items = made.filter(|(at, _)| self.of_now(*at, now)).map(|(_, items)| items);
+        if self.items.is_none() && std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!("items: {why}");
+        }
+    }
+
+    /// Whether what was made at revision `at` is of `now`: the database went from one to the
+    /// other by taking in files alone, which the next edit pushes.
+    fn of_now(&self, mut at: salsa::Revision, now: salsa::Revision) -> bool {
+        while at != now {
+            match self.went.iter().find(|(from, _)| *from == at) {
+                Some(&(_, to)) => at = to,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Notes that the database went from revision `from` to `to` by taking in files it did
+    /// not have, which the next edit is of.
+    pub(super) fn files_added(&mut self, from: salsa::Revision, to: salsa::Revision) {
+        self.went.push((from, to));
+    }
+
+    /// Once the patch of an edit is made: what the edit asked about refers to now is asked on
+    /// threads of their own, of the revision the patch is of, for the next edit to take; with
+    /// no items, those are made again, as an edit stopped the threads making them or left
+    /// them unable to tell.
+    pub(super) fn after_patch(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        if self.items.is_none() {
+            self.reitem = None;
+            return self.make_items(db, symbols);
+        }
+        let Some(asked) = &self.reitem else { return };
+        let (roots, instances) = Settled::asked(asked, &self.compiled, &self.instances);
+        let live = self.items.as_ref().map(|it| it.index.live());
+        let (send, settling) = std::sync::mpsc::channel();
+        let at = salsa::plumbing::current_revision(db);
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
+            let start = std::time::Instant::now();
+            let Some(live) = live else { return };
+            let settled = Settled::new(db, fan, &roots, &instances, &live);
+            // The index is written again at the next edit, which needn't copy what it has.
+            drop(live);
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!(
+                    "items-settled: {} roots and {} instances in {} us",
+                    roots.len(),
+                    instances.len(),
+                    start.elapsed().as_micros()
+                );
+            }
+            _ = send.send((at, settled));
+        };
+        symbols.in_background(db, Box::new(work));
+        self.settling = Some(Arc::new(std::sync::Mutex::new(Some(settling))));
+    }
+
+    fn bindings_edited(&mut self) {
+        self.making = None;
+        if let Some(items) = &mut self.items {
+            items.index.bindings_edited();
+        }
+    }
+
+    /// Before an edit of `files`: what the edits before it left of the items is taken in, of
+    /// the revision they left.
+    pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+        let start = std::time::Instant::now();
+        self.take_made(db);
+        // Nothing changes: what the last edit asked about is taken before one that does.
+        if files.is_empty() {
+            return;
+        }
+        let now = salsa::plumbing::current_revision(db);
+        let settled = (self.settling.take().filter(|_| self.items.is_some()))
+            .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .and_then(|it| it.recv().ok())
+            .filter(|(at, _)| self.of_now(*at, now));
+        self.went.clear();
+        let Some(items) = &mut self.items else { return };
+        let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
+        let took = start.elapsed();
+        let asked = reitem.clone();
+        let settling = probe(|| {
+            hir_ty::attach_db(db, || match (reitem, settled) {
+                (Some(_), Some((_, settled))) => items.take_settled(settled),
+                (Some(asked), None) => items.settle(db, fan, &asked, compiled, instances),
+                (None, _) => {}
+            })
+        });
+        // What could not be settled is asked about at every edit until it is: the threads
+        // building the last patch, stopped by this edit, can have left what it reads unasked.
+        if settling.is_none()
+            && let Some(asked) = &asked
+        {
+            items.forget(asked);
+        }
+        let settled = start.elapsed();
+        let written = probe(|| hir_ty::attach_db(db, || items.index.before_edit(db, files, fan)));
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "items-before: taken {} us, settled {} us{}, written {} us",
+                took.as_micros(),
+                (settled - took).as_micros(),
+                if settling.is_none() { " (unsettled)" } else { "" },
+                (start.elapsed() - settled).as_micros()
+            );
+        }
+        if written.is_none() {
+            self.items = None;
+        }
+    }
+
+    /// Notes that `files` of `crates` changed in their items: what can have changed is what
+    /// refers to an item that changed, through its interface, or calls something by a name
+    /// bound to another thing now. All of what sees the files when that can't be told.
+    pub(super) fn touch_items(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        files: &[FileId],
+        fan: &Fan<'_>,
+    ) {
+        let stats = std::env::var_os("RA_JIT_STATS").is_some();
+        let start = std::time::Instant::now();
+        let pushed = match &mut self.items {
+            Some(items) if !self.rustc => {
+                let push = || hir_ty::attach_db(db, || items.index.push(db, files, fan));
+                probe(push).unwrap_or(Err("a query that panicked"))
+            }
+            Some(_) => Err("a base of rustc's"),
+            None => Err("no items"),
+        };
+        let pushed = match pushed {
+            Ok(it) => it,
+            Err(why) => {
+                // What a panic left of the index is of no revision.
+                if why == "a query that panicked" {
+                    self.items = None;
+                }
+                if stats {
+                    eprintln!("items: whole crates: {why}");
+                }
+                return self.touch(db, Some(crates));
+            }
+        };
+        let items = self.items.as_ref().expect("pushed through them");
+        let asked = items.asked(&pushed);
+        // Their bodies too, as a body edit's.
+        self.touched.bodies.extend(pushed.files.iter().copied());
+        for &krate in crates {
+            if !self.touched.around.contains(&krate) {
+                self.touched.around.extend(krate.transitive_rev_deps(db));
+            }
+        }
+        let around = &self.touched.around;
+        let roots =
+            asked.roots.iter().copied().filter(|&i| around.contains(&self.crates[i as usize]));
+        self.touched.named_roots.extend(roots);
+        let instances = asked.instances.iter().copied().filter(|&i| {
+            self.instances
+                .get_index(i as usize)
+                .is_some_and(|(_, was)| around.contains(&was.env.krate))
+        });
+        self.touched.named_instances.extend(instances);
+        // What came from the store is not in `items`: all of it that can see them is asked.
+        let hydrated = self.hydrated.iter().enumerate().filter_map(|(i, was)| {
+            was.krate.is_none_or(|it| around.contains(&it)).then_some(i as u32)
+        });
+        self.touched.hydrated.extend(hydrated.collect::<Vec<_>>());
+        if stats {
+            eprintln!(
+                "items: {} written, {} changed, {} names, {} roots and {} instances asked in {} us",
+                pushed.written,
+                pushed.changed.len(),
+                pushed.names(),
+                asked.roots.len(),
+                asked.instances.len(),
+                start.elapsed().as_micros()
+            );
+        }
+        self.reitem = Some(match self.reitem.take() {
+            Some(mut was) => {
+                was.roots.extend(asked.roots);
+                was.instances.extend(asked.instances);
+                was
+            }
+            None => asked,
+        });
         self.outdated |=
             self.untracked && self.crates.iter().any(|it| self.touched.around.contains(it));
     }
@@ -2175,7 +2456,8 @@ impl Base {
             match same {
                 Some(Some(true)) => {}
                 _ if !touched => {
-                    eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
+                    let (crate_of, name) = (self.crates[i], &self.compiled[i].1);
+                    eprintln!("check-all: MISSED root {root:?} `{name}` of {crate_of:?}");
                     continue;
                 }
                 Some(Some(false)) => stale.roots.push(root),
@@ -2186,8 +2468,9 @@ impl Base {
         for (root, was, file) in
             handout.each(Look::Unnamed, self.unnamed.len()).map(|it| &self.unnamed[it])
         {
-            let touched = self.touched.reaches_around(root.krate(db))
-                || self.touched.reaches_bodies(Some(&[*file]));
+            let touched = probe(|| root.krate(db)).is_none_or(|it| self.touched.reaches_around(it))
+                || self.touched.reaches_bodies(Some(&[*file]))
+                || self.touched.roots.contains(root);
             if !touched {
                 continue;
             }
@@ -2203,8 +2486,10 @@ impl Base {
         }
         for homed in handout.each(Look::Closures, self.closures.len()).map(|it| &self.closures[it])
         {
-            let touched = self.touched.reaches_around(homed.root.krate(db))
-                || self.touched.reaches_bodies(Some(&[homed.file]));
+            let krate = probe(|| homed.root.krate(db));
+            let touched = krate.is_none_or(|it| self.touched.reaches_around(it))
+                || self.touched.reaches_bodies(Some(&[homed.file]))
+                || self.touched.roots.contains(&homed.root);
             if !touched {
                 continue;
             }
@@ -2310,8 +2595,10 @@ impl Base {
         for i in handout.each(Look::Skipped, self.skipped.len()) {
             let Some(was) = &self.left[i] else { continue };
             let root = self.skipped[i].0;
-            let touched = self.touched.reaches_around(root.krate(db))
-                || self.touched.reaches_bodies(Some(&[body_file(db, root.into())]));
+            let at = probe(|| (root.krate(db), body_file(db, root.into())));
+            let touched = at.is_none_or(|(krate, file)| {
+                self.touched.reaches_around(krate) || self.touched.reaches_bodies(Some(&[file]))
+            }) || self.touched.roots.contains(&root);
             if !touched && !check_all {
                 continue;
             }

@@ -109,6 +109,7 @@ mod home;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod imports;
+mod itempush;
 #[cfg(feature = "llvm")]
 mod llvm;
 mod naming;
@@ -385,7 +386,40 @@ pub trait SymbolResolver {
         _ = (count, work);
         beside();
     }
+    /// Runs `work` on a thread of its own, with a database of its own that the next change
+    /// cancels, and a [`Fan`] over databases of their own; here, on this thread over `db`.
+    fn in_background(&self, db: &dyn HirDatabase, work: Background) {
+        work(db, &|count, each| self.in_parallel(count, &|db, _, at| each(db, at)));
+    }
+    /// [`Self::in_background`] once nothing has been asked for a while, and not at all when
+    /// the database has changed by then: work no edit waits on, which would take the threads
+    /// of the edits that come one after another.
+    fn when_idle(&self, db: &dyn HirDatabase, work: Background) {
+        self.in_background(db, work);
+    }
 }
+
+static EDITS_FOLLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says that edits follow the builds of this process, which a base keeps what tells them
+/// apart for: a daemon's.
+pub fn edits_follow() {
+    EDITS_FOLLOW.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn do_edits_follow() -> bool {
+    EDITS_FOLLOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub use blaze_items::Fan;
+
+/// The revision the database is at, which [`Rejections::files_added`] is told of.
+pub fn revision(db: &dyn HirDatabase) -> salsa::Revision {
+    salsa::plumbing::current_revision(db)
+}
+
+/// See [`SymbolResolver::in_background`].
+pub type Background = Box<dyn FnOnce(&dyn HirDatabase, &Fan<'_>) + Send>;
 
 /// What an instance is called in every run of the daemon, if anything.
 type StableName = std::sync::Arc<str>;
@@ -670,7 +704,7 @@ impl CodegenUnit {
         let forgot = known.forgot_rustc.take().filter(|_| replaced.is_none());
         let mut declined =
             replaced.as_ref().filter(|it| it.rustc).and_then(|it| it.why_outdated()).or(forgot);
-        if let Some(base) = replaced.take_if(|it| !it.outdated()) {
+        if let Some(mut base) = replaced.take_if(|it| !it.outdated()) {
             let start = stdx::time::Instant::now();
             // Every static is rustc's, which rustc's code reads.
             let own_statics = match base.rustc {
@@ -735,6 +769,7 @@ impl CodegenUnit {
                     skipped: base.skipped.clone(),
                     instances: base.instances.len(),
                 };
+                base.after_patch(db, symbols);
                 known.put_base(base);
                 return Ok(Some(unit));
             }
@@ -1503,6 +1538,40 @@ impl Rejections {
         }
         if let Some(rustc) = &mut self.rustc {
             rustc.touch_added(db, crates, files);
+        }
+        self.forget();
+    }
+
+    /// Notes that the database went from revision `from` to `to` by taking in files it did not
+    /// have, which the next edit is of: see [`revision`].
+    pub fn files_added(&mut self, from: salsa::Revision, to: salsa::Revision) {
+        if let Some(base) = &mut self.base {
+            base.files_added(from, to);
+        }
+    }
+
+    /// Before an edit of `files`, of the revision before it, with the threads `fan` has.
+    pub fn before_edit(&mut self, db: &dyn HirDatabase, files: &[base_db::FileId], fan: &Fan<'_>) {
+        if let Some(base) = &mut self.base {
+            base.before_edit(db, files, fan);
+        }
+    }
+
+    /// Notes that `files` of `crates` changed in more than the bodies of functions, and what
+    /// changed can be told by the items that did, with the threads `fan` has.
+    pub fn touch_items(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        files: &[base_db::FileId],
+        fan: &Fan<'_>,
+    ) {
+        self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
+        if let Some(base) = &mut self.base {
+            base.touch_items(db, crates, files, fan);
+        }
+        if let Some(rustc) = &mut self.rustc {
+            rustc.touch(db, Some(crates));
         }
         self.forget();
     }

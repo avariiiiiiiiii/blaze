@@ -2,7 +2,8 @@
 """commits.py PROJECT REPO COMMIT... [--work DIR] [--rounds N] [--keep]: edit-to-result of real commits.
 
 For each commit, a checkout of its parent (no `.git`, as leanprof.py copies one) is built with
-`cargo ra-jit build` and left until the daemon has built its own base; then the commit's files
+`cargo ra-jit build` and left until the daemon has built its own base and made its items
+(`items_s` in the JSON, the seconds that took after the base); then the commit's files
 are written into it (removed files removed) and `cargo ra-jit build` is timed, then the parent's
 are written back and it is timed again, `--rounds` times (default 2). The project's build
 arguments and environment are bench.py's; REPO is a full clone with the commits. Prints a line
@@ -15,10 +16,24 @@ import json, os, re, shutil, subprocess, sys, time
 
 import bench, cargo_ra_jit
 from cargo_ra_jit import Side, wait_warm
-from memsplit import wait_own_base
+from memsplit import logs, wait_own_base
 
 # What the daemon says of an edit with RA_JIT_STATS: how it took the change and what it looked at.
-SAID = re.compile(r"(bodies only|signatures only|functions added|items|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
+SAID = re.compile(r"(bodies only|signatures only|functions added|items|items-us|items-made|items-before|items-pushed|items-refused|items-settled|read-us|check-all|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
+
+
+def wait_items(daemon, timeout=120):
+    """Seconds until the base's items are made (`items-us:`), which an edit that changes items
+    is pushed through: a daemon makes them on threads of its own once its base is built, and an
+    edit before then asks about all of each crate the edit's files are of. `None` if not made."""
+    began = time.time()
+    while time.time() - began < timeout:
+        text = logs(daemon)
+        at = text.rfind("compiling the program for edits to patch")
+        if at >= 0 and "items-us: " in text[at:]:
+            return round(time.time() - began, 1)
+        time.sleep(0.5)
+    return None
 
 
 def git(repo, *args, text=True):
@@ -76,8 +91,9 @@ def one(name, spec, repo, commit, work, rounds, extra_env, keep):
         wait_warm(ours, ws)
         row["cold_s"] = round(time.monotonic() - began, 1)
         wait_own_base(daemon, None)
+        row["items_s"] = wait_items(daemon)
         walls, said = [], []
-        daemon.said()
+        row["base_said"] = [line[:200] for line in daemon.said().splitlines() if SAID.match(line)][-20:]
         for n in range(rounds):
             for label, files in (("commit", after), ("back", before)):
                 write(ws, files)

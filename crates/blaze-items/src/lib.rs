@@ -22,6 +22,7 @@
 extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 
 mod form;
+mod index;
 
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,51 @@ use hir_ty::db::HirDatabase;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use form::Hash;
+pub use index::{
+    Entries, Index, Live, Pushed, code_names, entries_in, file_of, modules_in, modules_of,
+};
+
+/// Runs the work for each of `0..count`, on as many threads as there are, each with a
+/// database of its own.
+pub type Fan<'a> = dyn Fn(usize, &(dyn Fn(&dyn HirDatabase, usize) + Sync)) + 'a;
+
+/// What items refer to, for many of them in turn.
+pub struct Refs<'db>(form::Cx<'db>);
+
+impl<'db> Refs<'db> {
+    pub fn new(db: &'db dyn HirDatabase) -> Refs<'db> {
+        Refs(form::Cx::refs_only(db))
+    }
+
+    /// What an item's interface refers to, and its code, with the coroutines written in it, or
+    /// why part of it could not be written.
+    pub fn of_code(
+        &self,
+        id: ItemId,
+        body: Option<DefWithBodyId>,
+    ) -> Result<Vec<ItemId>, &'static str> {
+        let node = self.0.node_with(id, false);
+        node.interface.missed.map_or(Ok(()), Err)?;
+        let mut refs = node.interface.refs;
+        if let Some(body) = body {
+            let code = self.0.code(body);
+            code.missed.map_or(Ok(()), Err)?;
+            refs.extend(code.refs);
+        }
+        let mut unique = FxHashSet::default();
+        refs.retain(|it| unique.insert(*it));
+        Ok(refs)
+    }
+
+    /// What generic arguments refer to, or why part of them could not be written.
+    pub fn of_args(
+        &self,
+        args: hir_ty::next_solver::GenericArgs<'db>,
+    ) -> Result<Vec<ItemId>, &'static str> {
+        let sub = self.0.of_args(args);
+        sub.missed.map_or(Ok(sub.refs), Err)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ItemId {
@@ -377,6 +423,11 @@ fn declared(db: &dyn HirDatabase, krate: Crate, out: &mut Vec<ItemId>) {
         let id = hir_def::ModuleId::from(module);
         in_scope(db, id.def_map(db).module(db, id).scope(db), out, &mut bodies);
     }
+    in_bodies(db, bodies, out);
+}
+
+/// The items declared in `bodies`, and in the bodies of those.
+fn in_bodies(db: &dyn HirDatabase, mut bodies: Vec<DefWithBodyId>, out: &mut Vec<ItemId>) {
     while let Some(body) = bodies.pop() {
         for (_, def_map) in Body::of(db, body).blocks(db) {
             for (_, module) in def_map.modules(db) {

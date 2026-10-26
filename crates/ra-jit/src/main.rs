@@ -1303,6 +1303,15 @@ impl SymbolResolver for Resolver<'_> {
         });
     }
 
+    fn in_background(&self, _: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
+        in_background(self.db, work);
+    }
+
+    fn when_idle(&self, db: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
+        let at = salsa::plumbing::current_revision(db);
+        IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((at, work));
+    }
+
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
         source_path(self.db, &self.root, self.base.as_deref(), file)
     }
@@ -3683,6 +3692,78 @@ fn start_from_rustc(
 /// Has each program whose edits are patches of what rustc linked take in what rustc compiled
 /// of `files`, which are about to change: the functions written in them and the statics
 /// their bodies declare. A static declared outside a body is no edit of bodies alone.
+/// Runs `each` for each of `0..count` on as many threads as there are, each with a clone of
+/// `db`. What a thread does not get to, as an edit cancelled it or it panicked, is left: the
+/// caller does it.
+/// What [`SymbolResolver::when_idle`] was handed, by the revision it is of.
+static IDLE_WORK: Mutex<Vec<(salsa::Revision, hir_ty_codegen::Background)>> =
+    Mutex::new(Vec::new());
+
+/// How long nothing is asked before [`IDLE_WORK`] starts: an edit that follows sooner finds
+/// the threads its own.
+const IDLE_WORK_AFTER: Duration = Duration::from_millis(1000);
+
+/// Starts the work of [`IDLE_WORK`] that is of the revision `db` is at, and drops the rest.
+fn start_idle_work(db: &RootDatabase) {
+    let at = salsa::plumbing::current_revision(db);
+    let work = std::mem::take(&mut *IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()));
+    for (of, work) in work {
+        if of == at {
+            in_background(db, work);
+        }
+    }
+}
+
+fn idle_work() -> bool {
+    !IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Runs `work` on a thread of its own over a database of its own, which the next change
+/// cancels.
+fn in_background(db: &RootDatabase, work: hir_ty_codegen::Background) {
+    let db = db.clone();
+    let run = move || {
+        let fan = |count: usize, each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync)| {
+            fan(&db, count, each)
+        };
+        let work = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, || work(&db, &fan)));
+        if let Err(why) = std::panic::catch_unwind(work)
+            && std::env::var_os("RA_JIT_STATS").is_some()
+        {
+            let by = if why.is::<salsa::Cancelled>() { "a new revision" } else { "a panic" };
+            eprintln!("background: stopped by {by}");
+        }
+    };
+    _ = std::thread::Builder::new().name("items".to_owned()).spawn(run);
+}
+
+fn fan(
+    db: &RootDatabase,
+    count: usize,
+    each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync),
+) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..cores().min(count) {
+            let (db, next) = (db.clone(), &next);
+            scope.spawn(move || {
+                let each = std::panic::AssertUnwindSafe(|| {
+                    hir::attach_db(&db, || {
+                        loop {
+                            let at = next.fetch_add(1, Ordering::Relaxed);
+                            if at >= count {
+                                break;
+                            }
+                            each(&db, at);
+                        }
+                    })
+                });
+                _ = std::panic::catch_unwind(each);
+            });
+        }
+    });
+}
+
 fn home_in_rustcs(
     db: &RootDatabase,
     listed: &Listed,
@@ -7958,6 +8039,9 @@ fn run_holding(
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
     let serving = listener.is_some();
+    if serving || args.watch {
+        hir_ty_codegen::edits_follow();
+    }
     if let Some(served) = listener {
         let sender = sender.clone();
         // Each connection is read by a thread of its own: one that sends nothing, or
@@ -8101,6 +8185,18 @@ fn run_holding(
                     .flatten();
                 let (mut own_base, mut interrupt) = (None, false);
                 match wants_base {
+                    _ if idle && idle_work() => match builds.events.recv_timeout(IDLE_WORK_AFTER) {
+                        Ok(event) => {
+                            if builds.take(event, &mut programs)? {
+                                let_go(&mut db, &builds);
+                                memory::served(&mut db)?;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => start_idle_work(&db),
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            bail!("nothing takes requests any more")
+                        }
+                    },
                     Some(at) if idle => match builds.events.recv_timeout(OWN_BASE_AFTER) {
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {
@@ -8769,7 +8865,13 @@ fn run_holding(
                 builds.settle(&mut db, &mut programs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
-            for (file, path) in tree.added(&mut db, &changed).added {
+            let from = hir_ty_codegen::revision(&db);
+            let added = tree.added(&mut db, &changed).added;
+            if !added.is_empty() {
+                let to = hir_ty_codegen::revision(&db);
+                programs.iter_mut().for_each(|it| it.known.files_added(from, to));
+            }
+            for (file, path) in added {
                 files.push(WatchedFile {
                     file: Watched::Source(file),
                     path,
@@ -8935,10 +9037,27 @@ fn run_holding(
         homed.extend(&editing);
         homed.sort_unstable();
         homed.dedup();
+        let homes = read.elapsed();
         home_in_rustcs(&db, &listed, &mut programs, &homed);
+        let homed_in = read.elapsed();
         outlines.before_edit(&db, &listed, &editing);
+        let outlined = read.elapsed();
+        let mut checked = Duration::ZERO;
         for program in &mut programs {
+            let at = Instant::now();
             program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);
+            checked += at.elapsed();
+            program.known.before_edit(&db, &editing, &|count, each| fan(&db, count, each));
+        }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "read-us: texts={} homes={} outlines={} checked={} known={}",
+                homes.as_micros(),
+                (homed_in - homes).as_micros(),
+                (outlined - homed_in).as_micros(),
+                checked.as_micros(),
+                (read.elapsed() - outlined - checked).as_micros()
+            );
         }
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
@@ -8980,6 +9099,7 @@ fn run_holding(
             outlines.before_edit(&db, &listed, &untouched);
             for program in &mut programs {
                 program.checked.before_edit(&db, &listed, &untouched, &program.unbuilt.edited);
+                program.known.before_edit(&db, &untouched, &|count, each| fan(&db, count, each));
             }
             for file in write_harnesses(&mut db, texts) {
                 if !sources.contains(&file) {
@@ -9029,6 +9149,10 @@ fn run_holding(
         let before_outlines = start.elapsed();
         let sources = outlines.after_edit(&db, &listed, sources);
         let outlined = start.elapsed();
+        // The files that changed in more than what the outline tells, and their crates: what
+        // changed is told by their items, together, as an item moved from one to another is.
+        let mut by_items: Vec<vfs::FileId> = Vec::new();
+        let mut items_crates: Vec<ide_db::base_db::Crate> = Vec::new();
         for outline::Changed { file, bodies_only, copied, generics, inline, added, signatures } in
             sources
         {
@@ -9074,8 +9198,26 @@ fn run_holding(
                 // they were.
                 continue;
             }
-            programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
-            listed.touch(&db, crates);
+            match crates {
+                Some(crates) => {
+                    by_items.push(file);
+                    for &krate in crates {
+                        if !items_crates.contains(&krate) {
+                            items_crates.push(krate);
+                        }
+                    }
+                }
+                None => {
+                    programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+                    listed.touch(&db, None);
+                }
+            }
+        }
+        if !by_items.is_empty() {
+            let crates = &items_crates;
+            let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
+            programs.iter_mut().for_each(|it| it.known.touch_items(&db, crates, &by_items, fan));
+            listed.touch(&db, Some(crates));
         }
         if !moved.is_empty() {
             programs.iter_mut().for_each(|it| {

@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""itempush.py: an edit that changes items asks again about what refers to what changed, and
+what the program does is still what cargo's build of it does (#344).
+
+usage: itempush.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+
+A toy workspace of a library and a program is built and loaded, and then edited step by step
+in the ways that move what a name is bound to: imports reordered, a glob import shadowed and
+the shadow taken away, a re-export bound to another function, a function moved to another
+module, a function made private so that the glob no longer brings it, an inherent method that
+takes a call from a trait's, a trait's default method called directly and through `dyn`, and
+a file written again with nothing changed, a module added that imports a macro a module that
+stays binds as well, and a `#[macro_use]` module added whose `macro_rules!` a call in a file
+that is not edited now names instead of std's, and then not, and the import of a macro taken
+away from a module that is edited, an inherent constant that a path to the trait's now names,
+moved to a new file and taken away. After each step
+the program the daemon built prints what cargo's prints, or both builds fail.
+
+The steps run twice, each time in a workspace of its own: with RA_JIT_CHECK_ALL=1, where a
+patch asks about everything and says `check-all: MISSED` for what the items left out, and
+without it, where what is asked is what the items say.
+
+Python 3, stdlib only.
+"""
+import glob, os, re, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import cargo_ra_jit
+from cargo_ra_jit import Side, wait_warm
+
+LIB = """mod a;
+mod b;
+pub mod shapes;
+
+use a::*;
+pub use b::scale;
+
+pub fn pick() -> u32 {
+    value() + tag!() + e::at() + shapes::Sq::SIDES
+}
+
+pub trait Sides {
+    const SIDES: u32 = 4;
+}
+
+pub trait Area {
+    fn area(&self) -> u32;
+    fn twice(&self) -> u32 {
+        self.area() * 2
+    }
+}
+
+mod e;
+"""
+FILES = {
+    "Cargo.toml": '[workspace]\nmembers = ["app", "lib"]\nresolver = "2"\n',
+    "lib/Cargo.toml": '[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n',
+    "lib/src/lib.rs": LIB,
+    "lib/src/a.rs": "pub fn value() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    10\n}\n\nmacro_rules! tag {\n    () => {\n        20\n    };\n}\npub(crate) use tag;\n",
+    "lib/src/e.rs": "pub fn at() -> u32 {\n    line!()\n}\n",
+    "lib/src/b.rs": "pub fn scale(x: u32) -> u32 {\n    x * 3\n}\n\npub fn value() -> u32 {\n    2\n}\n",
+    "lib/src/shapes.rs": "pub struct Sq(pub u32);\n\nimpl crate::Sides for Sq {}\n\nimpl crate::Area for Sq {\n    fn area(&self) -> u32 {\n        self.0 * self.0\n    }\n}\n",
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlib = { path = "../lib" }\n',
+    "app/src/main.rs": 'use lib::shapes::Sq;\nuse lib::{pick, scale, Area};\n\nfn main() {\n    let dynamic: &dyn Area = &Sq(3);\n    println!("{} {} {} {} {}", pick(), scale(2), Sq(3).area(), Sq(3).twice(), dynamic.twice());\n}\n',
+}
+LIB_RS, A_RS, B_RS, SHAPES_RS = "lib/src/lib.rs", "lib/src/a.rs", "lib/src/b.rs", "lib/src/shapes.rs"
+C_RS, D_RS, F_RS = "lib/src/c.rs", "lib/src/d.rs", "lib/src/f.rs"
+# A file of the crate's directory that no module is written in, which the crate doesn't build.
+STRAY = "lib/src/stray.rs"
+SIDES = "\nimpl Sq {\n    pub const SIDES: u32 = 40;\n}\n"
+INHERENT = "\nimpl Sq {\n    pub fn area(&self) -> u32 {\n        7\n    }\n}\n"
+# (step, edits); an edit is (file, old, new), with `None` for old to write the file whole.
+STEPS = [
+    ("imports reordered", [(LIB_RS, "use a::*;\npub use b::scale;\n", "pub use b::scale;\nuse a::*;\n")]),
+    ("glob shadowed", [(LIB_RS, "use a::*;\n", "use a::*;\nuse b::value;\n")]),
+    ("shadow taken away", [(LIB_RS, "use a::*;\nuse b::value;\n", "use a::*;\n")]),
+    ("re-export bound to another", [
+        (A_RS, "pub fn other", "pub fn scale(x: u32) -> u32 {\n    x + 100\n}\n\npub fn other"),
+        (LIB_RS, "pub use b::scale;\n", "pub use a::scale;\n"),
+    ]),
+    ("moved to another module", [
+        (A_RS, "pub fn value() -> u32 {\n    1\n}\n", "pub use crate::shapes::value;\n"),
+        (SHAPES_RS, "pub struct Sq", "pub fn value() -> u32 {\n    1\n}\n\npub struct Sq"),
+    ]),
+    ("made private", [(SHAPES_RS, "pub fn value", "fn value")]),
+    ("made public again", [(SHAPES_RS, "fn value() -> u32 {\n    1\n}\n\npub struct", "pub fn value() -> u32 {\n    1\n}\n\npub struct")]),
+    ("inherent method", [(SHAPES_RS, None, lambda text: text + INHERENT)]),
+    ("inherent method taken away", [(SHAPES_RS, INHERENT, "")]),
+    ("trait default", [(LIB_RS, "self.area() * 2", "self.area() * 4")]),
+    ("written again", [(LIB_RS, None, lambda text: text)]),
+    ("module added importing a macro", [
+        (C_RS, None, lambda _: "use crate::a::tag;\n\npub fn more() -> u32 {\n    tag!() + 40\n}\n"),
+        (LIB_RS, "mod b;\n", "mod b;\nmod c;\n"),
+    ]),
+    ("`#[macro_use]` module added", [
+        (D_RS, None, lambda _: "macro_rules! line {\n    () => {\n        500\n    };\n}\n"),
+        (LIB_RS, "pub fn pick", "#[macro_use]\nmod d;\n\npub fn pick"),
+    ]),
+    ("`#[macro_use]` taken off", [(LIB_RS, "#[macro_use]\nmod d;", "mod d;")]),
+    ("a macro's import taken away", [(C_RS, "use crate::a::tag;\n\n", ""), (C_RS, "tag!()", "crate::a::tag!()")]),
+    ("inherent const shadows the trait's", [(SHAPES_RS, None, lambda text: text + SIDES)]),
+    ("inherent impl moved to a new file", [
+        (SHAPES_RS, SIDES, ""),
+        (F_RS, None, lambda _: SIDES.replace("impl Sq", "impl crate::shapes::Sq").lstrip()),
+        (LIB_RS, "mod e;\n", "mod e;\nmod f;\n"),
+    ]),
+    ("inherent impl taken away", [(F_RS, None, lambda _: "")]),
+    ("a file no module is written in", [(STRAY, None, lambda _: "pub fn pick() -> u32 {\n    9\n}\n")]),
+    ("it written again", [(STRAY, "9", "90")]),
+]
+
+
+def logs(home):
+    return "".join(open(log, errors="replace").read() for log in sorted(glob.glob(os.path.join(home, "*", "*", "log"))))
+
+
+def ran(exe):
+    return subprocess.run([exe], capture_output=True, text=True, timeout=60).stdout.strip()
+
+
+def steps(check_all):
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-itempush-", dir="/tmp"))
+    ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+    for path, text in FILES.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        open(os.path.join(ws, path), "w").write(text)
+    env = cargo_ra_jit.base_env(home)
+    env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+    for name in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL", "RA_JIT_SPARE"):
+        env.pop(name, None)
+    env["RA_JIT_STATS"] = "1"
+    if check_all:
+        env["RA_JIT_CHECK_ALL"] = "1"
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    ours_exe, theirs_exe = (os.path.join(ws, it, "debug", "app") for it in ("target", "target-ref"))
+    mode = "check-all" if check_all else "items"
+    wrong, pushed = [], 0
+    try:
+        _, built = side.cargo("build")
+        if built.returncode != 0:
+            raise SystemExit(f"the cold build failed:\n{(built.stdout + built.stderr)[-3000:]}")
+        took, states = wait_warm(side, ws)
+        if states != ["ready"]:
+            raise SystemExit(f"the daemon did not get ready: {states}")
+        for step, edits in STEPS:
+            for path, old, new in edits:
+                path = os.path.join(ws, path)
+                text = open(path).read() if os.path.exists(path) else ""
+                if old is None:
+                    text = new(text)
+                elif old not in text:
+                    raise SystemExit(f"{step}: {old!r} is not in {path}")
+                else:
+                    text = text.replace(old, new, 1)
+                open(path, "w").write(text)
+            seen = len(logs(home))
+            _, ours = side.cargo("build")
+            _, theirs = reference.cargo("build")
+            said = ours.stdout + ours.stderr
+            log = logs(home)[seen:]
+            right = (ours.returncode == 0) == (theirs.returncode == 0)
+            outputs = ""
+            if ours.returncode == 0 and theirs.returncode == 0:
+                right &= side.how_built(ours.stderr) == "daemon"
+                mine, cargo = ran(ours_exe), ran(theirs_exe)
+                right &= mine == cargo
+                outputs = f"; printed {mine!r}, cargo's {cargo!r}"
+            missed = re.findall(r"^check-all: MISSED .*$", log, re.M)
+            right &= not missed
+            how = re.findall(r"^items: (whole crates: .*|\d+ written, \d+ changed, \d+ names, .*?) in \d+ us$", log, re.M)
+            pushed += any(not it.startswith("whole") for it in how)
+            detail = f"cargo exit {theirs.returncode}, ours {ours.returncode}{outputs}; items {how}"
+            if missed:
+                detail += f"; {missed[:3]}"
+            print(f"{mode:9} {step:27} {'ok' if right else 'WRONG':6} {detail}")
+            if not right:
+                wrong.append(f"{mode} {step}: {detail}\n{said[-1500:]}")
+    finally:
+        side.cargo("stop")
+    # A run where no edit was pushed by its items tests nothing of them.
+    if not pushed:
+        wrong.append(f"{mode}: no step was pushed by its items")
+    return wrong
+
+
+def main():
+    wrong = steps(True) + steps(False)
+    if wrong:
+        raise SystemExit("\n".join(wrong))
+
+
+if __name__ == "__main__":
+    main()

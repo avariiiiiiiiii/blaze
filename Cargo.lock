@@ -688,6 +688,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "intern",
  "ra-ap-rustc_type_ir",
  "rustc-hash 2.1.2",
  "syntax",
@@ -2037,6 +2038,7 @@ name = "hir-ty-codegen"
 version = "0.1.0"
 dependencies = [
  "base-db",
+ "blaze-items",
  "cfg",
  "cranelift-codegen",
  "cranelift-frontend",

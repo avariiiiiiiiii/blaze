@@ -14,14 +14,20 @@ use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
-    DefWithBodyId, FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature,
+    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, StaticId,
+    signatures::FunctionSignature,
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 pub(super) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
-use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
+use hir_ty::{
+    db::HirDatabase,
+    next_solver::{DbInterner, Ty, TyKind},
+    traits::StoredParamEnvAndCrate,
+};
 use intern::Symbol;
+use rustc_type_ir::{TypeFoldable, TypeFolder, TypeSuperFoldable, inherent::IntoKind as _};
 
 use super::{
     CodegenError, ContentId, Fan, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases,
@@ -793,11 +799,14 @@ struct Relocated {
 
 /// `code` from before an edit, of the function where the edit moved it, with what else of it
 /// the edit moved (`moved`) where that is now. `None` when it refers to anything else the
-/// edit took away, or is generic over anything.
+/// edit took away, is generic over anything, or has where something is written in it: `named`
+/// has each item moved as a path ends in it.
 fn relocated(
     db: &dyn HirDatabase,
     code: &CompiledFunction,
     moved: &FxHashMap<FunctionId, FunctionId>,
+    adts: &FxHashMap<AdtId, AdtId>,
+    named: &[Vec<u8>],
     live: &blaze_items::Live,
 ) -> Option<CompiledFunction> {
     use blaze_items::ItemId;
@@ -813,6 +822,17 @@ fn relocated(
         let param_env = hir_ty::next_solver::ParamEnv::empty();
         *env == hir_ty::traits::ParamEnvAndCrate { param_env, krate: env.krate }.store()
     };
+    // A constant can have the path of an item in it, as `type_name` writes it in a `const`
+    // block: one that has the name of an item moved anywhere in it is compiled again.
+    let names = |bytes: &[u8]| named.iter().any(|it| bytes.windows(it.len()).any(|w| w == &it[..]));
+    let blob_named = code.requests.datas.iter().any(|it| match it {
+        DataRequest::Blob { blob, .. } => names(&blob.bytes),
+        _ => false,
+    });
+    if code.requests.placed || blob_named {
+        return None;
+    }
+    let mut types = Moves { interner: DbInterner::new_no_crate(db), funcs: moved, adts };
     let mut now = code.clone();
     for request in &mut now.requests.funcs {
         let FuncTarget::Instance(instance, env) = &mut request.target else { continue };
@@ -820,6 +840,7 @@ fn relocated(
             InstanceDef::Fn(it) | InstanceDef::VtableShim(it) => *it = func(*it)?,
             _ => {}
         }
+        instance.args = instance.args.as_ref().fold_with(&mut types).store();
         if !plain(env) || instance_gone(db, instance, live) {
             return None;
         }
@@ -827,6 +848,10 @@ fn relocated(
     for request in &mut now.requests.datas {
         match request {
             DataRequest::Vtable { ty, trait_ref, .. } => {
+                *ty = ty.as_ref().fold_with(&mut types).store();
+                if let Some((_, args)) = trait_ref {
+                    *args = args.as_ref().fold_with(&mut types).store();
+                }
                 let trait_gone = trait_ref.as_ref().is_some_and(|(id, args)| {
                     !live.has(db, ItemId::Trait(*id)) || type_gone(db, &args.as_ref(), live)
                 });
@@ -843,12 +868,72 @@ fn relocated(
     if let Some((owner, _)) = &mut now.source {
         *owner = body(*owner)?;
     }
-    if let Some((env, variables)) = &now.variables
-        && (!plain(env) || variables.iter().any(|it| type_gone(db, &it.ty.as_ref(), live)))
-    {
-        return None;
+    if let Some((env, variables)) = &mut now.variables {
+        for it in variables.iter_mut() {
+            it.ty = it.ty.as_ref().fold_with(&mut types).store();
+        }
+        if !plain(env) || variables.iter().any(|it| type_gone(db, &it.ty.as_ref(), live)) {
+            return None;
+        }
     }
     Some(now)
+}
+
+/// The name an item is written with, which a path to it ends in.
+fn item_name(db: &dyn HirDatabase, id: blaze_items::ItemId) -> Option<String> {
+    use blaze_items::ItemId;
+    use hir_def::signatures::{
+        ConstSignature, EnumSignature, StaticSignature, StructSignature, TraitSignature,
+        TypeAliasSignature, UnionSignature,
+    };
+    let name = match id {
+        ItemId::Function(it) => FunctionSignature::of(db, it).name.clone(),
+        ItemId::Adt(AdtId::StructId(it)) => StructSignature::of(db, it).name.clone(),
+        ItemId::Adt(AdtId::EnumId(it)) => EnumSignature::of(db, it).name.clone(),
+        ItemId::Adt(AdtId::UnionId(it)) => UnionSignature::of(db, it).name.clone(),
+        ItemId::Trait(it) => TraitSignature::of(db, it).name.clone(),
+        ItemId::Const(it) => ConstSignature::of(db, it).name.clone()?,
+        ItemId::Static(it) => StaticSignature::of(db, it).name.clone(),
+        ItemId::Alias(it) => TypeAliasSignature::of(db, it).name.clone(),
+        ItemId::Impl(_) | ItemId::Macro(_) => return None,
+    };
+    Some(name.as_str().to_owned())
+}
+
+/// Types with what an edit moved of them where that is now: each is written as it was, so
+/// is laid out as it was.
+struct Moves<'db, 'a> {
+    interner: DbInterner<'db>,
+    funcs: &'a FxHashMap<FunctionId, FunctionId>,
+    adts: &'a FxHashMap<AdtId, AdtId>,
+}
+
+impl<'db> TypeFolder<DbInterner<'db>> for Moves<'db, '_> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.interner
+    }
+
+    fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        match ty.kind() {
+            TyKind::Adt(adt, args) if let Some(&now) = self.adts.get(&adt.def_id()) => {
+                Ty::new_adt(self.interner, now, args.fold_with(self))
+            }
+            TyKind::FnDef(def, args) => {
+                let def = match def.0 {
+                    CallableDefId::FunctionId(it) => {
+                        CallableDefId::FunctionId(*self.funcs.get(&it).unwrap_or(&it))
+                    }
+                    CallableDefId::StructId(it) => match self.adts.get(&AdtId::StructId(it)) {
+                        Some(&AdtId::StructId(now)) => CallableDefId::StructId(now),
+                        _ => def.0,
+                    },
+                    other => other,
+                };
+                Ty::new(self.interner, TyKind::FnDef(def.into(), args.fold_with(self)))
+            }
+            _ => ty.super_fold_with(self),
+        }
+    }
 }
 
 /// See [`Base::making`].
@@ -2280,9 +2365,20 @@ impl Base {
                 _ => None,
             })
             .collect();
+        let adts: FxHashMap<AdtId, AdtId> = (index_moved.iter())
+            .filter_map(|it| match it {
+                (ItemId::Adt(was), ItemId::Adt(now)) => Some((*was, *now)),
+                _ => None,
+            })
+            .collect();
+        let named: Vec<Vec<u8>> = (index_moved.values())
+            .filter_map(|it| probe(|| item_name(db, *it)).flatten())
+            .map(|it| format!("::{it}").into_bytes())
+            .collect();
         let asked: Option<FxHashSet<u32>> =
             pushed.map(|it| items.asked(&it.unmoved(index_moved)).instances.into_iter().collect());
         let (mut kept, mut compiled) = (0, 0);
+        let mut why: FxHashMap<&'static str, usize> = FxHashMap::default();
         for (was, now) in &moved {
             let Some((key, code)) = snapshots.get(was) else { continue };
             let base = &self.instances[key];
@@ -2293,12 +2389,20 @@ impl Base {
             let at = self.instances.get_index_of(key).expect("a key of the base") as u32;
             let renamed = items.index.renamed().contains(&ItemId::Function(*was));
             let unasked = !renamed && asked.as_ref().is_some_and(|it| !it.contains(&at));
-            let relocate = || hir_ty::attach_db(db, || relocated(db, code, &moved, &live));
+            let relocate =
+                || hir_ty::attach_db(db, || relocated(db, code, &moved, &adts, &named, &live));
             let code = unasked.then(|| probe(relocate)).flatten().flatten().map(Arc::new);
             if code.is_some() {
                 kept += 1;
             } else {
                 compiled += 1;
+                let reason = match () {
+                    _ if renamed => "renamed",
+                    _ if asked.is_none() => "refused",
+                    _ if !unasked => items.instance_unknown(at).unwrap_or("asked"),
+                    _ => "not remapped",
+                };
+                *why.entry(reason).or_default() += 1;
             }
             let now = Instance { def: InstanceDef::Fn(*now), ..key.clone() };
             self.relocated.insert(key.clone(), Relocated { now, code });
@@ -2322,7 +2426,7 @@ impl Base {
             .collect();
         if std::env::var_os("RA_JIT_STATS").is_some() && !moved.is_empty() {
             eprintln!(
-                "relocated: {} instances, {kept} moved now by their code and {compiled} to compile, of {} functions moved, in {} us",
+                "relocated: {} instances, {kept} moved now by their code and {compiled} to compile {why:?}, of {} functions moved, in {} us",
                 self.relocated.len(),
                 moved.len(),
                 start.elapsed().as_micros()

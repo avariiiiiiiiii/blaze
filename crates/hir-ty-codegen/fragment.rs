@@ -95,6 +95,10 @@ pub(super) enum TextPart {
 pub(super) struct Requests {
     pub(super) funcs: Vec<FuncRequest>,
     pub(super) datas: Vec<DataRequest>,
+    /// Whether the code has where something is written in it, which moving that changes and
+    /// no request stands for: the value of a `line!()`, `column!()` or `file!()`, or the path
+    /// of a type `type_name` is of.
+    pub(super) placed: bool,
 }
 
 #[derive(Clone)]
@@ -507,8 +511,7 @@ impl Wants {
     #[cfg(feature = "llvm")]
     pub(super) fn referenced(&self, code: &mut Code) -> Requests {
         let Some(kept) = self.kept(code) else {
-            let Requests { funcs, datas } = &self.requests;
-            return Requests { funcs: funcs.clone(), datas: datas.clone() };
+            return self.requests.clone();
         };
         let funcs = iter::zip(&self.requests.funcs, &kept.funcs);
         let funcs = funcs.filter(|it| it.1.is_some()).map(|it| it.0.clone()).collect();
@@ -521,7 +524,7 @@ impl Wants {
             }
             request
         });
-        Requests { funcs, datas: datas.collect() }
+        Requests { funcs, datas: datas.collect(), placed: self.requests.placed }
     }
 
     pub(super) fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {
@@ -762,11 +765,18 @@ impl<'db> Recorder<'db> {
     }
 
     pub(super) fn file_path(&mut self, file: FileId) -> DataId {
+        self.requests.placed = true;
         self.data(DataRequest::FilePath(file))
     }
 
     pub(super) fn text(&mut self, parts: Vec<TextPart>) -> DataId {
+        self.requests.placed = true;
         self.data(DataRequest::Text(parts))
+    }
+
+    /// Notes that the code has where something is written in it: see [`Requests::placed`].
+    pub(super) fn placed(&mut self) {
+        self.requests.placed = true;
     }
 
     pub(super) fn target_config(&self) -> cranelift_codegen::isa::TargetFrontendConfig {
@@ -802,7 +812,7 @@ impl<'db> Recorder<'db> {
     #[cfg(feature = "llvm")]
     pub(super) fn keep_referenced(&mut self, code: &mut Code) {
         let Some(kept) = self.wants.kept(code) else { return };
-        let Requests { funcs: all_funcs, datas: all_datas } =
+        let Requests { funcs: all_funcs, datas: all_datas, placed } =
             std::mem::take(&mut self.wants.requests);
         let kept_funcs: Vec<FuncRequest> =
             iter::zip(all_funcs, &kept.funcs).filter(|it| it.1.is_some()).map(|it| it.0).collect();
@@ -830,13 +840,14 @@ impl<'db> Recorder<'db> {
         let still = |id: &mut DataId| kept.data(*id).map(|it| *id = it).is_some();
         self.statics.retain(|_, id| still(id));
         self.vtables.retain(|_, id| still(id));
-        wants.requests = Requests { funcs: kept_funcs, datas: kept_datas };
+        wants.requests = Requests { funcs: kept_funcs, datas: kept_datas, placed };
     }
 
     /// Puts `requests`, another function's, among what this function asks for: what each
     /// of them is here. Each blob of `requests` points only at what came before it
     /// ([`Inlinable::of`]).
     pub(super) fn moved_requests(&mut self, requests: &Requests) -> (Vec<FuncId>, Vec<DataId>) {
+        self.requests.placed |= requests.placed;
         let funcs: Vec<FuncId> =
             requests.funcs.iter().map(|it| self.func(it.target.clone(), &it.sig)).collect();
         let mut datas: Vec<DataId> = Vec::with_capacity(requests.datas.len());

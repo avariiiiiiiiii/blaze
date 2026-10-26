@@ -861,6 +861,10 @@ fn moves(
     }
     let alike = written.values().filter(|it| it.0.len() > 1 || it.1.len() > 1).count();
     let unlike = written.values().filter(|it| it.0.is_empty() || it.1.is_empty()).count();
+    let twins: Vec<(Vec<ItemId>, Vec<ItemId>)> = (written.values())
+        .filter(|it| (it.0.len() > 1 || it.1.len() > 1) && !it.0.is_empty() && !it.1.is_empty())
+        .cloned()
+        .collect();
     let mut moved: FxHashMap<ItemId, ItemId> = (written.into_values())
         .filter_map(|it| match (&it.0[..], &it.1[..]) {
             (&[was], &[now]) if std::mem::discriminant(&was) == std::mem::discriminant(&now) => {
@@ -896,7 +900,6 @@ fn moves(
             renamed.insert(was);
         }
     }
-    let paired = moved.len();
     let interface: FxHashMap<ItemId, &[ItemId]> =
         (gone.iter().chain(added)).map(|(id, entry)| (*id, &entry.refs[..])).collect();
     let refs: FxHashMap<ItemId, Vec<ItemId>> = (gone.iter().chain(added))
@@ -905,6 +908,39 @@ fn moves(
             (*id, entry.refs.iter().chain(code).copied().collect())
         })
         .collect();
+    // Of several written alike, a gone one and an added one that alone refer to the same items,
+    // or to ones moved with them: an item's impl or the type it is of tells twins apart, such as
+    // the methods of the impls a derive writes. Each pair can tell more, until none is found.
+    let mut twins = twins;
+    let mut twinned = 0;
+    loop {
+        let mut found = Vec::new();
+        for (was, now) in &mut twins {
+            let mut by: FxHashMap<Vec<ItemId>, (Vec<ItemId>, Vec<ItemId>)> = FxHashMap::default();
+            for it in was.iter() {
+                let to = refs[it].iter().map(|it| *moved.get(it).unwrap_or(it)).collect();
+                by.entry(to).or_default().0.push(*it);
+            }
+            for it in now.iter() {
+                by.entry(refs[it].clone()).or_default().1.push(*it);
+            }
+            for (a, b) in by.into_values() {
+                if let (&[a], &[b]) = (&a[..], &b[..])
+                    && std::mem::discriminant(&a) == std::mem::discriminant(&b)
+                {
+                    found.push((a, b));
+                    was.retain(|it| *it != a);
+                    now.retain(|it| *it != b);
+                }
+            }
+        }
+        if found.is_empty() {
+            break;
+        }
+        twinned += found.len();
+        moved.extend(found);
+    }
+    let paired = moved.len();
     // What one refers to has to have moved with it: those that don't are dropped until none
     // is left that refers to one dropped.
     loop {
@@ -932,7 +968,7 @@ fn moves(
                     kinds
                 };
                 eprintln!(
-                    "items-unmoved: {erred} of the gone with errors, {} digests of several, {} of one side, {} paired and dropped for their refs; unmoved gone {:?}",
+                    "items-unmoved: {erred} of the gone with errors, {} digests of several ({twinned} twins paired by their refs), {} of one side, {} paired and dropped for their refs; unmoved gone {:?}",
                     alike,
                     unlike,
                     paired - moved.len(),

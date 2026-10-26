@@ -11195,6 +11195,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(ty.kind(), TyKind::Uint(UintTy::U32)) {
             return Ok(None);
         }
+        self.cg.placed();
         let layout = self.layout(ty)?;
         let addr = self.stack_slot(&layout);
         let value = self.builder.ins().iconst(types::I32, number as i64);
@@ -13202,6 +13203,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(name) = hir_ty::mir::type_name::rustc_type_name(self.cg.db, ty) else {
                     unsupported!("`type_name` of `{ty:?}`");
                 };
+                self.cg.placed();
                 let len = self.builder.ins().iconst(ptr(), name.len() as i64);
                 let data = self.cg.define_const(ConstBlob {
                     bytes: name.into_bytes(),

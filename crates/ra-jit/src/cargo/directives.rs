@@ -170,29 +170,29 @@ fn allowed_args() -> String {
 }
 
 /// Whether cargo or rustc gives a crate the variable `name` itself, which a script's
-/// `rustc-env` may not set over: the package's, the manifest's, the crate's, the target's
-/// configuration and the toolchain's. `CARGO_COMMIT_HASH`, which cargo's build sets for
-/// cargo, is not one.
+/// `rustc-env` may not set over: what cargo sets for a crate's compilation (cargo's
+/// "Environment variables Cargo sets for crates") and what the toolchain reads from its own
+/// environment (`RUSTC_BOOTSTRAP`, the jobserver's `CARGO_MAKEFLAGS`). What cargo gives only
+/// build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`,
+/// `CARGO_MANIFEST_LINKS`) is not one: a crate has it only when its script forwards it, as
+/// rav1e's does. Nor is `CARGO_COMMIT_HASH`, which cargo's build sets for cargo.
 pub(crate) fn given_by_cargo(name: &str) -> bool {
-    const NAMES: [&str; 15] = [
+    const NAMES: [&str; 13] = [
         "CARGO",
         "CARGO_MANIFEST_DIR",
         "CARGO_MANIFEST_PATH",
-        "CARGO_MANIFEST_LINKS",
         "CARGO_CRATE_NAME",
         "CARGO_BIN_NAME",
         "CARGO_PRIMARY_PACKAGE",
         "CARGO_TARGET_TMPDIR",
         "CARGO_RUSTC_CURRENT_DIR",
-        "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_MAKEFLAGS",
         "OUT_DIR",
         "RUSTC",
         "RUSTDOC",
         "RUSTFLAGS",
     ];
-    const PREFIXES: [&str; 6] =
-        ["CARGO_PKG_", "CARGO_CFG_", "CARGO_BIN_EXE_", "CARGO_FEATURE_", "RUSTC_", "RUSTDOC_"];
+    const PREFIXES: [&str; 4] = ["CARGO_PKG_", "CARGO_BIN_EXE_", "RUSTC_", "RUSTDOC_"];
     NAMES.contains(&name) || PREFIXES.iter().any(|it| name.starts_with(it))
 }
 
@@ -360,12 +360,26 @@ mod tests {
                       cargo:rustc-env=GIT_HASH=abc\n\
                       cargo:rustc-env=CARGO_PKG_VERSION=9.9.9\n\
                       cargo::rustc-env=RUSTC_BOOTSTRAP=1\n\
+                      cargo:rustc-env=CARGO_MAKEFLAGS=-j1\n\
                       cargo:rustc-env-like=CARGO_PKG_NAME\n\
                       cargo:CARGO_PKG_NAME=metadata, not a directive\n";
         assert_eq!(
             refused_lines(stdout),
-            ["cargo:rustc-env=CARGO_PKG_VERSION=9.9.9", "cargo::rustc-env=RUSTC_BOOTSTRAP=1"]
+            [
+                "cargo:rustc-env=CARGO_PKG_VERSION=9.9.9",
+                "cargo::rustc-env=RUSTC_BOOTSTRAP=1",
+                "cargo:rustc-env=CARGO_MAKEFLAGS=-j1",
+            ]
         );
+    }
+
+    #[test]
+    fn rustc_env_may_forward_what_cargo_gives_only_scripts() {
+        let stdout = "cargo:rustc-env=CARGO_CFG_TARGET_FEATURE=aes,crc,neon\n\
+                      cargo:rustc-env=CARGO_ENCODED_RUSTFLAGS=\n\
+                      cargo::rustc-env=CARGO_FEATURE_ASM=1\n\
+                      cargo:rustc-env=CARGO_MANIFEST_LINKS=z\n";
+        assert_eq!(refused_lines(stdout), Vec::<String>::new());
     }
 
     #[test]

@@ -110,7 +110,10 @@ async def rustc_profile_mode(name, spec, mode, args, gate):
             flags = f"-Zself-profile={prof} -Zself-profile-events=default"
             if mode == "polonius":
                 flags += " -Zpolonius=next"
-            env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=os.path.join(args.work, f"target-{name}.{mode}"))
+            # A fresh target dir: a crate cargo finds fresh is not compiled, so not profiled.
+            target = os.path.join(args.work, f"target-{name}.{mode}")
+            shutil.rmtree(target, ignore_errors=True)
+            env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=target)
             argv = ["cargo", f"+{args.rustc}", "check", "--workspace", "--all-targets", "--quiet"]
             code, _, err = await borrowck_apps.run(argv, ws, args.timeout, env)
             if code != 0:
@@ -130,9 +133,11 @@ async def rustc_profile_mode(name, spec, mode, args, gate):
                 with open(data.removesuffix(".mm_profdata") + ".json") as f:
                     summary = json.load(f)
                 for q in summary["query_data"]:
-                    if q["label"] in totals:
+                    # Newer nightlies call `typeck` `typeck_root`.
+                    label = "typeck" if q["label"] == "typeck_root" else q["label"]
+                    if label in totals:
                         t = q["self_time"]
-                        totals[q["label"]] += t["secs"] + t["nanos"] / 1e9
+                        totals[label] += t["secs"] + t["nanos"] / 1e9
         except borrowck_apps.StepError as e:
             return {"failed": str(e)}
         result = {"crates": crates, "mir_borrowck_ms": totals["mir_borrowck"] * 1000,

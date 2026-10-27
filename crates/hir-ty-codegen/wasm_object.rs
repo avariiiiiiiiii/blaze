@@ -106,10 +106,12 @@ struct Writer {
 }
 
 /// Writes as a wasm object what the ELF object `elf` holds. `signatures` has the signature
-/// of every function the object names and does not define.
+/// of every function the object names and does not define, and `modules` the module of those
+/// imported from one other than `env`.
 pub(super) fn from_elf(
     elf: &[u8],
     signatures: &FxHashMap<String, WasmSignature>,
+    modules: &FxHashMap<String, intern::Symbol>,
 ) -> Result<Vec<u8>, String> {
     let file = object::File::parse(elf).map_err(|e| format!("wasm object: {e}"))?;
     let mut writer = Writer::default();
@@ -173,7 +175,8 @@ pub(super) fn from_elf(
             (_, None) => match signatures.get(name) {
                 Some(signature) => {
                     let ty = writer.ty(signature);
-                    imports.import(ENV, name, EntityType::Function(ty));
+                    let module = modules.get(name).map_or(ENV, |it| it.as_str());
+                    imports.import(module, name, EntityType::Function(ty));
                     let flags = flags(&symbol) | UNDEFINED;
                     let index = writer.symbol(SymbolType::Function, flags, |entry| {
                         imported.encode(entry);

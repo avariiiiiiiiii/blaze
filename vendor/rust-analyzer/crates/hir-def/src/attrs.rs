@@ -733,6 +733,24 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
     named.then_some((lib, cfg))
 }
 
+/// The `wasm_import_module = "..."` of a `link(...)`.
+fn link_wasm_import_module(tt: &ast::TokenTree) -> Option<String> {
+    let mut children = TokenTreeChildren::new(tt);
+    while let Some(child) = children.next() {
+        let NodeOrToken::Token(key) = child else { continue };
+        if key.kind() != SyntaxKind::IDENT || key.text() != "wasm_import_module" {
+            continue;
+        }
+        let Some(NodeOrToken::Token(eq)) = children.next() else { return None };
+        if eq.kind() != T![=] {
+            return None;
+        }
+        let Some(NodeOrToken::Token(value)) = children.next() else { return None };
+        return Some(ast::String::cast(value)?.value().ok()?.into_owned());
+    }
+    None
+}
+
 /// The `cfg(...)` of a `link(...)`, the group after `cfg`: read as the predicate of a
 /// `#[cfg]` with that group.
 fn link_cfg(group: &ast::TokenTree) -> Option<CfgExpr> {
@@ -918,6 +936,22 @@ impl AttrFlags {
             ControlFlow::Continue(())
         });
         libs.into_boxed_slice()
+    }
+
+    /// The module of the wasm imports an `extern` block declares, from its
+    /// `#[link(wasm_import_module = "...")]`.
+    #[salsa::tracked(returns(clone))]
+    pub fn wasm_import_module(db: &dyn SourceDatabase, owner: ExternBlockId) -> Option<Symbol> {
+        collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = &attr
+                && attr.path().is1("link")
+                && let Some(tt) = attr.token_tree()
+                && let Some(module) = link_wasm_import_module(&tt)
+            {
+                return ControlFlow::Break(Symbol::intern(&module));
+            }
+            ControlFlow::Continue(())
+        })
     }
 
     /// The section `#[link_section]` puts an item in.

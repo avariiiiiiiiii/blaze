@@ -2234,6 +2234,9 @@ struct ObjectCodegen<'a, 'db> {
     unstitched: FxHashSet<FuncId>,
     /// Functions `finish` hides from other objects: see [`ObjectCodegen::define_refused`].
     hidden: Vec<FuncId>,
+    /// The module each foreign function a wasm object imports is imported from, where its
+    /// `extern` block names one other than `env`.
+    import_modules: FxHashMap<String, intern::Symbol>,
     /// The messages of the stand-ins, which `finish` puts in [`stand_in_section`].
     stand_ins: Vec<(DataId, Box<[u8]>)>,
     statics: FxHashMap<StaticId, DataId>,
@@ -5228,6 +5231,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             weak_imports: Vec::new(),
             unstitched: FxHashSet::default(),
             hidden: Vec::new(),
+            import_modules: FxHashMap::default(),
             stand_ins: Vec::new(),
             tiers: None,
             found_instances: FxHashMap::default(),
@@ -5293,10 +5297,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 wasm::WasmSignature::of(&declared.signature).map_err(CodegenError::Backend)?;
             signatures.insert(name.clone(), signature);
         }
+        let modules = self.import_modules;
         let mut product = self.module.finish();
         place_stand_ins(&mut product, self.stand_ins);
         let elf = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
-        wasm_object::from_elf(&elf, &signatures).map_err(CodegenError::Backend)
+        wasm_object::from_elf(&elf, &signatures, &modules).map_err(CodegenError::Backend)
     }
 
     fn want(&mut self, func: FunctionId) {
@@ -7166,6 +7171,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 && let Some(symbol) = link_name(self.db, func)
                 && !symbol.starts_with("llvm.")
             {
+                if let ItemContainerId::ExternBlockId(block) = func.lookup(self.db).container
+                    && let Some(module) = AttrFlags::wasm_import_module(self.db, block)
+                {
+                    self.import_modules.insert(symbol.clone(), module);
+                }
                 return self.import(&symbol, sig);
             }
             if let InstanceDef::Fn(func) = def

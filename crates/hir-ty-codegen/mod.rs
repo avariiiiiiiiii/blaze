@@ -4670,7 +4670,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             imported_statics: FxHashMap::default(),
             consts: FxHashMap::default(),
             places: (base.is_none()
-                && backend::edits_follow()
+                && do_edits_follow()
                 && !Target::current().writes_wasm_objects())
             .then(FxHashMap::default),
             source_paths: FxHashMap::default(),

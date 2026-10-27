@@ -5576,6 +5576,11 @@ fn broken_in(
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let refuse_borrowck = std::env::var_os("RA_JIT_BORROWCK_REFUSE").is_none_or(|it| it != "0");
+    let whole: Vec<vfs::FileId> =
+        edited.iter().copied().filter(|it| !scoped.contains_key(it)).collect();
+    if edited.len() < threads {
+        infer_bodies(db, &whole, threads);
+    }
     let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
@@ -5663,6 +5668,65 @@ fn broken_in(
         })
         .collect();
     Some(errors::Said(said))
+}
+
+/// Infers and borrow-checks the bodies of `files` on `threads` threads, for their diagnostics,
+/// which a thread a file asks of one body after another. A build that asks few of them leaves
+/// them to the check.
+fn infer_bodies(db: &RootDatabase, files: &[vfs::FileId], threads: usize) {
+    if files.is_empty() {
+        return;
+    }
+    let bodies: Vec<hir_def::DefWithBodyId> = hir::attach_db(db, || {
+        let sema = hir::Semantics::new(db);
+        let mut modules: Vec<hir::Module> =
+            files.iter().flat_map(|&file| sema.file_to_module_defs(file)).collect();
+        let mut bodies: Vec<hir::DefWithBody> = Vec::new();
+        let items = |items: Vec<hir::AssocItem>, bodies: &mut Vec<hir::DefWithBody>| {
+            bodies.extend(items.into_iter().filter_map(|it| match it {
+                hir::AssocItem::Function(it) => Some(hir::DefWithBody::from(it)),
+                hir::AssocItem::Const(it) => Some(hir::DefWithBody::from(it)),
+                hir::AssocItem::TypeAlias(_) => None,
+            }))
+        };
+        while let Some(module) = modules.pop() {
+            for def in module.declarations(db) {
+                match def {
+                    hir::ModuleDef::Function(it) => bodies.push(it.into()),
+                    hir::ModuleDef::Const(it) => bodies.push(it.into()),
+                    hir::ModuleDef::Static(it) => bodies.push(it.into()),
+                    hir::ModuleDef::Trait(it) => items(it.items(db), &mut bodies),
+                    hir::ModuleDef::Module(it) if it.as_source_file_id(db).is_none() => {
+                        modules.push(it)
+                    }
+                    _ => {}
+                }
+            }
+            for imp in module.impl_defs(db) {
+                items(imp.items(db), &mut bodies);
+            }
+        }
+        bodies.into_iter().filter_map(|it| it.try_into().ok()).collect()
+    });
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(bodies.len()) {
+            let (db, bodies, next) = (db.clone(), &bodies, &next);
+            scope.spawn(move || {
+                hir::attach_db(&db, || {
+                    while let Some(&def) =
+                        bodies.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        // One that panics panics again where its diagnostics are asked.
+                        _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            hir_ty::InferenceResult::of(&db, def);
+                            hir_ty_borrowck::borrowck(&db, def);
+                        }));
+                    }
+                })
+            });
+        }
+    });
 }
 
 /// The files `texts` respace ([`outline::respace`]), with where their code is written now,

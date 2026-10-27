@@ -3464,6 +3464,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-borrowck",
  "hir-ty-codegen",
  "http-body-util",
  "hyper",

@@ -66,6 +66,7 @@ hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+hir-ty-borrowck.workspace = true
 hir-ty-codegen.workspace = true
 ra-jit-expand.workspace = true
 ra-jit-store.workspace = true

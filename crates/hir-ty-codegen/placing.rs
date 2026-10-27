@@ -433,7 +433,8 @@ impl Places {
 }
 
 /// Each of `owners` lowered, on the threads `fan` has: `None` for one whose syntax is gone.
-/// Whether the file of `owner` still has it: one an edit took away has no body to lower.
+/// Whether the file of `owner` still has it: one an edit took away has no body to lower. For
+/// an owner a macro wrote, this expands the macro, which panics once its item is gone.
 fn written(db: &dyn HirDatabase, owner: DefWithBodyId) -> bool {
     fn has<N: syntax::AstNode>(db: &dyn HirDatabase, id: hir_expand::AstId<N>) -> bool {
         id.file_id.ast_id_map(db).try_get_erased(id.value.erase()).is_some()
@@ -453,13 +454,13 @@ fn lowered_all(
     fan: &Fan<'_>,
 ) -> Vec<Option<triomphe::Arc<Body>>> {
     let lowered = |db: &dyn HirDatabase, owner: DefWithBodyId| {
-        if !written(db, owner) {
-            return None;
-        }
-        probe(|| match Body::relative(db, owner) {
-            Some((body, _)) => body.clone(),
-            None => Body::with_source_map(db, owner).0.clone(),
+        probe(|| {
+            written(db, owner).then(|| match Body::relative(db, owner) {
+                Some((body, _)) => body.clone(),
+                None => Body::with_source_map(db, owner).0.clone(),
+            })
         })
+        .flatten()
     };
     let found: Vec<std::sync::OnceLock<Option<triomphe::Arc<Body>>>> =
         owners.iter().map(|_| std::sync::OnceLock::new()).collect();

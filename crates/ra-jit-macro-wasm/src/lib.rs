@@ -895,7 +895,11 @@ pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), S
     let wasm = Wasm::known(path, known, Some(&bytes), store)?;
     list(path, &wasm, &wasm.list()?);
     if std::env::var_os("RA_JIT_STATS").is_some() {
-        eprintln!("blaze: the proc-macro module {} ready in {:.1?}", path.display(), start.elapsed());
+        eprintln!(
+            "blaze: the proc-macro module {} ready in {:.1?}",
+            path.display(),
+            start.elapsed()
+        );
     }
     Ok(())
 }
@@ -903,7 +907,10 @@ pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), S
 /// As [`prepare`], but a module that carries its list of macros ([`exports::LIST_SECTION`]) is
 /// compiled on a thread of its own: its list is written now, and the first of its macros to
 /// expand in this process waits for the compile.
-pub fn prepare_soon(path: &Path, store: Option<&'static ra_jit_store::Store>) -> Result<(), String> {
+pub fn prepare_soon(
+    path: &Path,
+    store: Option<&'static ra_jit_store::Store>,
+) -> Result<(), String> {
     if let Some((known, _)) = listing(path)
         && code_file(path, &code_key(&known.digest)).is_file()
     {
@@ -921,7 +928,11 @@ pub fn prepare_soon(path: &Path, store: Option<&'static ra_jit_store::Store>) ->
         let done = Wasm::known(&path, known, Some(&bytes), store);
         if std::env::var_os("RA_JIT_STATS").is_some() {
             let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
-            eprintln!("ra-jit: the proc-macro module {} {how} in {:.1?}", path.display(), start.elapsed());
+            eprintln!(
+                "blaze: the proc-macro module {} {how} in {:.1?}",
+                path.display(),
+                start.elapsed()
+            );
         }
     });
     Ok(())
@@ -1260,11 +1271,9 @@ impl ProcMacroExpander for Expander {
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any)
-            .downcast_ref::<Expander>()
-            .is_some_and(|other| {
-                self.wasm.known.digest == other.wasm.known.digest && self.index == other.index
-            })
+        (other as &dyn Any).downcast_ref::<Expander>().is_some_and(|other| {
+            self.wasm.known.digest == other.wasm.known.digest && self.index == other.index
+        })
     }
 }
 
@@ -1406,6 +1415,7 @@ mod tests {
         Wasm::known(&path, known, None, Some(store)).unwrap();
         let key = code_key(&known.digest);
         assert!(code_file(&path, &key).is_file());
+        store.seal();
         assert!(store.get_lasting(&key).is_some());
         // Another write of the module, even of the same bytes, is listed again.
         std::fs::write(&path, &module).unwrap();

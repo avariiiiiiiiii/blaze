@@ -145,6 +145,7 @@ fn resolved(read: &Read, manifest_path: Option<&Path>) -> anyhow::Result<String>
         platform,
         offline: read.has("--offline") || read.has("--frozen"),
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     blaze_metadata::metadata(&asked)
 }
@@ -304,6 +305,7 @@ pub(super) fn pkgid(args: Args<'_>) -> anyhow::Result<i32> {
             platform: None,
             offline: true,
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let locked = blaze_metadata::locked(&asked)?;
         let locked = locked.context("a Cargo.lock must exist for this command")?;
@@ -358,6 +360,7 @@ pub(super) fn fetch(args: Args<'_>) -> anyhow::Result<i32> {
             platform: None,
             offline: read.has("--offline") || read.has("--frozen"),
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         blaze_metadata::fetch_locked(&asked)?.context(
             "there is no Cargo.lock, and blaze does not choose the versions to write one yet (#321)",

@@ -5665,23 +5665,38 @@ fn broken_in(
     Some(errors::Said(said))
 }
 
-/// The files `texts` respace ([`outline::respaced`]), of those no proc macro has asked the
-/// text or the positions of. Asked before the texts are the database's.
-fn respaced(db: &RootDatabase, texts: &[(vfs::FileId, String)]) -> Vec<vfs::FileId> {
-    let one = |db: &RootDatabase, (file, text): &(vfs::FileId, String)| {
-        if load_cargo::places_read(*file) {
-            return None;
-        }
+/// The files `texts` respace ([`outline::respace`]), with where their code is written now,
+/// of those that every program can leave the text of to the database: no proc macro has asked
+/// the text or the positions of one, and nothing compiled has a line or a column of it as a
+/// value. Asked before the texts are the database's.
+fn respaced(
+    db: &RootDatabase,
+    programs: &[Program],
+    texts: &[(vfs::FileId, String)],
+) -> Vec<(vfs::FileId, std::sync::Arc<hir_ty_codegen::Respace>)> {
+    use std::sync::Arc;
+    let texts: Vec<&(vfs::FileId, String)> = (texts.iter())
+        .filter(|(file, _)| {
+            !load_cargo::places_read(*file)
+                && !hir_ty::mir::location::placed_in(*file)
+                && programs.iter().all(|it| it.known.respaces(*file))
+        })
+        .collect();
+    let texts = &texts[..];
+    let one = |db: &RootDatabase, &&(file, ref text): &&(vfs::FileId, String)| {
+        let file = &file;
         let crates = ide_db::base_db::relevant_crates(db, *file);
         let edition = crates.first().map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
         let was = db.file_text(*file).text(db);
-        outline::respaced(edition, was, text).then_some(*file)
+        let moves = outline::respace(edition, was, text)?;
+        let respace = hir_ty_codegen::Respace::new(Arc::from(&**was), Arc::from(&**text), moves);
+        Some((*file, Arc::new(respace)))
     };
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(texts.len());
     if threads <= 1 {
         return texts.iter().filter_map(|it| one(db, it)).collect();
     }
-    let mut respaced: Vec<vfs::FileId> = std::thread::scope(|scope| {
+    let mut respaced: Vec<_> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
                 let db = db.clone();
@@ -5694,7 +5709,7 @@ fn respaced(db: &RootDatabase, texts: &[(vfs::FileId, String)]) -> Vec<vfs::File
             .collect();
         parts.into_iter().flat_map(|it| it.join().unwrap_or_default()).collect()
     });
-    respaced.sort_unstable();
+    respaced.sort_unstable_by_key(|it| it.0);
     respaced
 }
 
@@ -7915,6 +7930,10 @@ fn run_holding(
     let mut known = Rejections::default();
     known.patching = args.patch.is_some();
     let mut outlines = outline::Outlines::default();
+    // The files the database keeps an earlier text of, saying the same: where their code is
+    // written now.
+    let mut respacing_now: FxHashMap<vfs::FileId, std::sync::Arc<hir_ty_codegen::Respace>> =
+        FxHashMap::default();
     // Beside cargo the symbols were read as cargo wrote them, and are there a moment after
     // the names are resolved: a compile started now would hold up readiness past that.
     if !beside {
@@ -9125,7 +9144,20 @@ fn run_holding(
             }
         }
         let respacing = Instant::now();
-        let respaced = respaced(&db, &texts);
+        let respaced_maps = respaced(&db, &programs, &texts);
+        let respaced: Vec<vfs::FileId> = respaced_maps.iter().map(|it| it.0).collect();
+        for (file, text) in &texts {
+            match respaced_maps.binary_search_by_key(file, |it| it.0) {
+                Ok(at) if !respaced_maps[at].1.moves_nothing() => {
+                    _ = text;
+                    respacing_now.insert(*file, respaced_maps[at].1.clone());
+                }
+                _ => _ = respacing_now.remove(file),
+            }
+        }
+        for file in &emptied {
+            respacing_now.remove(file);
+        }
         let respacing = respacing.elapsed();
         let looked: Vec<vfs::FileId> =
             editing.iter().copied().filter(|it| !respaced.contains(it)).collect();
@@ -9144,7 +9176,6 @@ fn run_holding(
         home_in_rustcs(&db, &listed, &mut programs, &homed);
         let homed_in = read.elapsed();
         outlines.before_edit(&db, &listed, &looked);
-        outlines.before_respace(&db, &respaced);
         let outlined = read.elapsed();
         let mut checked = Duration::ZERO;
         // What moves would be found by is kept from before an edit only when its texts can move
@@ -9187,7 +9218,12 @@ fn run_holding(
                 removed.push(id);
             }
         }
+        // A file respaced keeps the text the database has, and all compiled of it.
+        let rewrites = texts.len() - respaced.len() + gone.len() + included.len();
         for (id, text) in texts {
+            if respaced.contains(&id) {
+                continue;
+            }
             change.change_file(id, Some(text));
             sources.push(id);
         }
@@ -9195,7 +9231,7 @@ fn run_holding(
         eprintln!("change: {changed} files");
         let start = Instant::now();
         // A write stops the builds under way, so nothing is written when nothing changed.
-        if changed != 0 || !background {
+        if rewrites != 0 && changed != 0 || changed == 0 && !background {
             db.apply_change(change);
         }
         held.built_head();
@@ -9204,6 +9240,7 @@ fn run_holding(
         // as it was before its harness is written.
         let mut wanted: FxHashSet<Crate> = editing
             .iter()
+            .filter(|it| !respaced.contains(it))
             .flat_map(|&file| ide_db::base_db::relevant_crates(&db, file).iter().copied())
             .map(Crate::from)
             .collect();
@@ -9279,8 +9316,7 @@ fn run_holding(
         let sources: Vec<vfs::FileId> =
             sources.into_iter().filter(|it| !respaced.contains(it)).collect();
         let edited_sources = sources.clone();
-        let mut sources = outlines.after_edit(&db, &listed, sources);
-        sources.extend(outlines.respaced(&db, &respaced));
+        let sources = outlines.after_edit(&db, &listed, sources);
         let outlined = start.elapsed();
         // The files that changed in more than what the outline tells, and their crates: what
         // changed is told by their items, together, as an item moved from one to another is.
@@ -9355,7 +9391,7 @@ fn run_holding(
         {
             let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
             for program in &mut programs {
-                program.known.after_edit(&db, &edited_sources, &respaced, fan);
+                program.known.after_edit(&db, &edited_sources, &respaced_maps, fan);
             }
         }
         if !moved.is_empty() {

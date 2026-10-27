@@ -27,7 +27,7 @@ use hir_ty::{db::HirDatabase, mir::MirSpan};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    Fan, declaration_location,
+    Fan, Respace, declaration_location,
     fragment::{CompiledFunction, DataRequest},
     home::body_file,
     patch::probe,
@@ -147,6 +147,11 @@ impl Placing {
         &self.owners
     }
 
+    /// Whether where something is written is a value in the code, which only its code tells.
+    pub(super) fn writes_places(&self) -> bool {
+        self.placed
+    }
+
     pub(super) fn set_rows(&mut self, rows: Arc<Rows>) {
         self.rows = Some(rows);
     }
@@ -238,6 +243,8 @@ pub(super) struct Places {
     /// The files of `edited` that no edit since the base changed a token of: their bodies
     /// lower as the base has them, and are taken in before the first edit that changes more.
     unread: FxHashSet<FileId>,
+    /// The files written otherwise whose text the database keeps: where their places are now.
+    respace: FxHashMap<FileId, Arc<Respace>>,
     /// Each body of `edited` lowered as the spans of its places are of: the base's, or those
     /// the last look that asked its code found. `None` for one that a file edited without
     /// being looked at first has, or whose syntax is gone.
@@ -303,13 +310,14 @@ impl Places {
         self.edited.extend(new);
     }
 
-    /// After an edit that changed no token of `files`, only where they are: their places are
-    /// found again for every patch.
-    pub(super) fn respaced(&mut self, files: &[FileId]) {
-        for &file in files {
-            if self.edited.insert(file) {
-                self.unread.insert(file);
+    /// After an edit that changed no token of `files`, only where they are, which the
+    /// database keeps the text of: their places are found again for every patch, and moved.
+    pub(super) fn respaced(&mut self, files: &[(FileId, Arc<Respace>)]) {
+        for (file, respace) in files {
+            if self.edited.insert(*file) {
+                self.unread.insert(*file);
             }
+            self.respace.insert(*file, respace.clone());
         }
     }
 
@@ -318,6 +326,7 @@ impl Places {
     /// base's spans.
     pub(super) fn after_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
         for file in files {
+            self.respace.remove(file);
             if self.edited.insert(*file) {
                 for owner in self.owners_of_file.get(file).into_iter().flatten() {
                     self.written.insert(*owner, None);
@@ -389,6 +398,13 @@ impl Places {
         for key in keys {
             let Some(now) = self.current(key) else { continue };
             let Some(at) = probe(|| now.location(db)) else { continue };
+            let at = at.map(|(file, line, column)| match self.respace.get(&file) {
+                Some(respace) => {
+                    let (line, column) = respace.place(line, column);
+                    (file, line, column)
+                }
+                None => (file, line, column),
+            });
             let (symbol, was) = &self.of[&key];
             if at == *was {
                 continue;

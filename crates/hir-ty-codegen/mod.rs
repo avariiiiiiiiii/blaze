@@ -117,6 +117,8 @@ mod patch;
 pub use patch::Handout;
 mod places;
 mod placing;
+mod respace;
+pub use respace::Respace;
 #[cfg(feature = "llvm")]
 mod units;
 use self::places::{row_location, source_location};
@@ -1578,14 +1580,20 @@ impl Rejections {
         }
     }
 
+    /// Whether an edit that writes `file` otherwise, saying the same, can leave its text to
+    /// the database, the base moving where its code says it is.
+    pub fn respaces(&self, file: base_db::FileId) -> bool {
+        self.base.as_ref().is_some_and(|it| it.respaces(file))
+    }
+
     /// After an edit of `files`, once what changed in them is noted: which bodies the base
     /// finds the places of apart from their code lower otherwise now. Of `respaced` the edit
-    /// changed no token, and their bodies lower as they did.
+    /// changed no token, and the database keeps their text: where they are now is beside.
     pub fn after_edit(
         &mut self,
         db: &dyn HirDatabase,
         files: &[base_db::FileId],
-        respaced: &[base_db::FileId],
+        respaced: &[(base_db::FileId, std::sync::Arc<Respace>)],
         fan: &Fan<'_>,
     ) {
         if let Some(base) = &mut self.base {
@@ -11245,6 +11253,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let Some((file, line, col)) = location_of(db, call.file_id, range) else {
                         unsupported!("`concat!` of a place that is not in a file");
                     };
+                    if expander != BuiltinFnLikeExpander::File {
+                        self.cg.placed();
+                        hir_ty::mir::location::note_placed(file);
+                    }
                     match expander {
                         BuiltinFnLikeExpander::Line => TextPart::Text(line.to_string()),
                         BuiltinFnLikeExpander::Column => TextPart::Text(col.to_string()),
@@ -11289,6 +11301,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(None);
         }
         self.cg.placed();
+        hir_ty::mir::location::note_placed(file);
         let layout = self.layout(ty)?;
         let addr = self.stack_slot(&layout);
         let value = self.builder.ins().iconst(types::I32, number as i64);

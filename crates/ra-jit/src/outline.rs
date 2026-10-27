@@ -142,49 +142,6 @@ impl Outlines {
         self.files.extend(new.into_iter().zip(outlines));
     }
 
-    /// Takes note of the files about to be [`respaced`], as rustc compiled them.
-    pub(crate) fn before_respace(&mut self, db: &RootDatabase, files: &[FileId]) {
-        for &file in files {
-            self.copied.entry(file).or_insert_with(|| copied(db, file));
-        }
-    }
-
-    /// What the edit just applied changed of files it [`respaced`]: their bodies alone, as
-    /// nothing else of them changed but where it is. Their outlines are found again when an
-    /// edit changes more of them: an outline can tell blank space in what a macro is handed.
-    pub(crate) fn respaced(&mut self, db: &RootDatabase, files: &[FileId]) -> Vec<Changed> {
-        let changed = |was: &FxHashMap<String, u64>, now: &FxHashMap<String, u64>| {
-            let mut changed: Vec<String> = (was.keys().chain(now.keys()))
-                .filter(|it| was.get(*it) != now.get(*it))
-                .cloned()
-                .collect();
-            changed.sort_unstable();
-            changed.dedup();
-            changed
-        };
-        let respaced = files.iter().map(|&file| {
-            self.files.remove(&file);
-            let (copied, generics, inline) = match self.copied.get(&file) {
-                Some(was) => {
-                    let now = copied(db, file);
-                    let generics = changed(&was.generics, &now.generics);
-                    (was.others != now.others, generics, changed(&was.inline, &now.inline))
-                }
-                None => (true, Vec::new(), Vec::new()),
-            };
-            Changed {
-                file,
-                bodies_only: true,
-                copied,
-                generics,
-                inline,
-                added: None,
-                signatures: Vec::new(),
-            }
-        });
-        respaced.collect()
-    }
-
     /// The files of the crates of each file the edit about to give them `texts` adds functions
     /// to, when it changes nothing else of it but bodies that nothing else sees into, no other
     /// crate depends on those, and no file of them names any of the new functions yet. Only
@@ -1433,27 +1390,43 @@ fn key_of(func: &ast::Fn) -> Option<(String, bool)> {
 /// where a macro or the parser can tell, and the doc comments, which are attributes, are as
 /// they were. What is compiled of it is the same but for where it is: the ids of its items
 /// are of their names, and an import's of what it says.
-pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
+///
+/// With where each token of `was` begins in `now`, how far into it a place can be, by where
+/// it begins in `was`: a token of imports in another order is had where they begin, with
+/// nothing in it.
+pub(crate) fn respace(edition: Edition, was: &str, now: &str) -> Option<Vec<(u32, u32, u32)>> {
     let (was, now) = (syntax::LexedStr::new(edition, was), syntax::LexedStr::new(edition, now));
     if was.errors().next().is_some() || now.errors().next().is_some() {
-        return false;
+        return None;
     }
     let (was, now) = (Tokens::of(&was), Tokens::of(&now));
     if was.0 == now.0 {
-        return true;
+        let moves = (was.1.iter().zip(&now.1).zip(&was.0))
+            .map(|((&a, &b), token)| (a, b, token.1.len() as u32))
+            .collect();
+        return Some(moves);
     }
     // What a `macro` is handed is not told from the tokens before its body, nor its imports.
     let macros = |tokens: &Tokens<'_>| tokens.0.iter().any(|it| it.0 == T![macro]);
     if macros(&was) || macros(&now) {
-        return false;
+        return None;
     }
-    let (was, now) = (was.said(), now.said());
-    if was == now {
-        return true;
+    let (said_was, said_now) = (was.said(), now.said());
+    if said_was.len() == said_now.len() && said_was.iter().zip(&said_now).all(|(a, b)| a.0 == b.0) {
+        let mut moves = Vec::with_capacity(was.0.len());
+        for ((said, a), (_, b)) in said_was.iter().zip(&said_now) {
+            match said {
+                Said::Token(token) => moves.push((was.1[a.start], now.1[b.start], token.1.len() as u32)),
+                Said::Uses(_) => moves.extend(a.clone().map(|k| (was.1[k], now.1[b.start], 0))),
+            }
+        }
+        return Some(moves);
     }
     if std::env::var_os("RA_JIT_RESPACED_WHY").is_some() {
+        let (was, now): (Vec<&Said<'_>>, Vec<&Said<'_>>) =
+            (said_was.iter().map(|it| &it.0).collect(), said_now.iter().map(|it| &it.0).collect());
         let at = was.iter().zip(&now).position(|(a, b)| a != b).unwrap_or(was.len().min(now.len()));
-        let near = |said: &[Said<'_>]| -> String {
+        let near = |said: &[&Said<'_>]| -> String {
             (said[at.saturating_sub(3)..(at + 3).min(said.len())].iter())
                 .map(|it| match it {
                     Said::Token((_, text, joint)) => format!("{text}{}", if *joint { "~" } else { "" }),
@@ -1464,13 +1437,13 @@ pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
         };
         eprintln!("respaced-why: was `{}`, now `{}`", near(&was), near(&now));
     }
-    false
+    None
 }
 
 /// The tokens of a text that say something: neither blank space nor a comment but a doc
 /// comment, with whether each is punctuation joined to the next (the spacing a token tree
-/// has of it).
-struct Tokens<'a>(Vec<(SyntaxKind, &'a str, bool)>);
+/// has of it), and where each begins.
+struct Tokens<'a>(Vec<(SyntaxKind, &'a str, bool)>, Vec<u32>);
 
 /// A part of what a text says: a token, or imports one after the other, in an order of
 /// their own.
@@ -1483,6 +1456,7 @@ enum Said<'a> {
 impl<'a> Tokens<'a> {
     fn of(lexed: &'a syntax::LexedStr<'_>) -> Tokens<'a> {
         let mut tokens = Vec::with_capacity(lexed.len());
+        let mut starts = Vec::with_capacity(lexed.len());
         for at in 0..lexed.len() {
             let (kind, text) = (lexed.kind(at), lexed.text(at));
             match kind {
@@ -1491,8 +1465,9 @@ impl<'a> Tokens<'a> {
             }
             let joint = spaced(kind) && at + 1 < lexed.len() && joins(lexed.kind(at + 1));
             tokens.push((kind, text, joint));
+            starts.push(lexed.text_start(at) as u32);
         }
-        Tokens(tokens)
+        Tokens(tokens, starts)
     }
 
     fn kind(&self, at: usize) -> Option<SyntaxKind> {
@@ -1602,8 +1577,8 @@ impl<'a> Tokens<'a> {
     }
 
     /// What the text says, its imports one after the other in an order of their own but in
-    /// what a macro is handed, which can tell.
-    fn said(&self) -> Vec<Said<'a>> {
+    /// what a macro is handed, which can tell, each with the tokens it is.
+    fn said(&self) -> Vec<(Said<'a>, std::ops::Range<usize>)> {
         let mut said = Vec::with_capacity(self.0.len());
         // Whether each delimiter open is of what a macro is handed.
         let mut handed: Vec<bool> = Vec::new();
@@ -1619,7 +1594,7 @@ impl<'a> Tokens<'a> {
                     next = end;
                 }
                 uses.sort_unstable();
-                said.push(Said::Uses(uses));
+                said.push((Said::Uses(uses), at..next));
                 at = next;
                 continue;
             }
@@ -1637,7 +1612,7 @@ impl<'a> Tokens<'a> {
                 T![')'] | T![']'] | T!['}'] => _ = handed.pop(),
                 _ => {}
             }
-            said.push(Said::Token(token));
+            said.push((Said::Token(token), at..at + 1));
             at += 1;
         }
         said
@@ -1662,7 +1637,7 @@ mod tests {
 
     #[test]
     fn respacing_is_told_from_what_a_token_tree_has() {
-        let same = |was: &str, now: &str| respaced(Edition::CURRENT, was, now);
+        let same = |was: &str, now: &str| respace(Edition::CURRENT, was, now).is_some();
         assert!(same("fn f(){ g(a,b) }", "fn f() {\n    g(a, b)\n}\n"));
         assert!(same("fn f() { 1 } // one", "// none\nfn f() {\n    1\n}"));
         assert!(same("fn f() { m!(a + b) }", "fn f() { m!(a+b) }"));

@@ -802,6 +802,10 @@ pub(super) struct Base {
     /// Those of them by the bodies they come from.
     placed_of_owner: FxHashMap<DefWithBodyId, (Vec<u32>, Vec<u32>)>,
     places: Places,
+    /// Whether the base named its places, which a patch can move.
+    places_named: bool,
+    /// The files of the bodies of code where something is written is a value in.
+    placed_files: FxHashSet<FileId>,
 }
 
 /// An instance of the base whose function an edit moved.
@@ -1714,6 +1718,13 @@ impl Base {
             }
             Places::new(db, places, placed_of_owner.keys())
         };
+        let places_named = cg.places.is_some();
+        let placed_files: FxHashSet<FileId> = (placed_roots.values())
+            .chain(placed_instances.values())
+            .filter(|it| it.writes_places())
+            .flat_map(|it| it.owners().iter())
+            .map(|&owner| super::home::body_file(db, owner))
+            .collect();
         let cached = |func| super::fncache::cached_closure(db, func).is_some();
         let cached_roots =
             (0..compiled.len() as u32).filter(|&i| cached(compiled[i as usize].0)).collect();
@@ -1794,6 +1805,8 @@ impl Base {
             placed_instances,
             placed_of_owner,
             places,
+            places_named,
+            placed_files,
         })
         .map(|mut base| {
             base.make_items(db, cg.symbols);
@@ -1891,6 +1904,8 @@ impl Base {
             placed_instances: FxHashMap::default(),
             placed_of_owner: FxHashMap::default(),
             places: Places::default(),
+            places_named: false,
+            placed_files: FxHashSet::default(),
         }
     }
 
@@ -2393,11 +2408,17 @@ impl Base {
 
     /// After an edit of `files`: which bodies of the code whose places are found apart from it
     /// lower otherwise now.
+    /// Whether an edit that writes `file` otherwise, saying the same, can leave its text to
+    /// the database: what is compiled of it is the same, and a patch moves its places.
+    pub(super) fn respaces(&self, file: FileId) -> bool {
+        self.places_named && !self.placed_files.contains(&file)
+    }
+
     pub(super) fn after_edit(
         &mut self,
         db: &dyn HirDatabase,
         files: &[FileId],
-        respaced: &[FileId],
+        respaced: &[(FileId, Arc<super::Respace>)],
         fan: &Fan<'_>,
     ) {
         let start = std::time::Instant::now();

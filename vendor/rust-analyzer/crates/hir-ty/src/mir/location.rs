@@ -94,6 +94,23 @@ pub fn name_sources(
     *SOURCE_PATHS.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(paths));
 }
 
+/// The files a constant was evaluated with a line or column of, or code compiled with one
+/// written in it: a file of them that is written otherwise has other values in its code.
+static PLACED_IN: std::sync::Mutex<Option<rustc_hash::FxHashSet<base_db::FileId>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes that a line or a column of `file` is a value in what is compiled.
+pub fn note_placed(file: base_db::FileId) {
+    let mut placed = PLACED_IN.lock().unwrap_or_else(|e| e.into_inner());
+    placed.get_or_insert_default().insert(file);
+}
+
+/// Whether a line or a column of `file` is a value in what was compiled ([`note_placed`]).
+pub fn placed_in(file: base_db::FileId) -> bool {
+    let placed = PLACED_IN.lock().unwrap_or_else(|e| e.into_inner());
+    placed.as_ref().is_some_and(|it| it.contains(&file))
+}
+
 /// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
 /// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
 /// and a constant is evaluated from what it expanded them to.
@@ -110,6 +127,7 @@ pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Optio
                 ConcatPart::Text(part) => text.push_str(&part),
                 ConcatPart::Location(expander, range) => {
                     let (file, line, col) = location_of(db, call.file_id, range)?;
+                    note_placed(file);
                     match expander {
                         BuiltinFnLikeExpander::Line => text.push_str(&line.to_string()),
                         BuiltinFnLikeExpander::Column => text.push_str(&col.to_string()),
@@ -125,6 +143,9 @@ pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Optio
     let range = InFile::new(site.file_id, written_range(&site.value));
     let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
     let (file, line, col) = location_of(db, file_id.into(), range)?;
+    if expander != BuiltinFnLikeExpander::File {
+        note_placed(file);
+    }
     Some(match expander {
         BuiltinFnLikeExpander::Line => Placed::Number(line),
         BuiltinFnLikeExpander::Column => Placed::Number(col),

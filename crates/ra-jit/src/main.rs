@@ -1396,6 +1396,22 @@ fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String
     (!identity.is_empty()).then(|| identity.join(" "))
 }
 
+/// What [`toolchain_identity`] will say of a build with nothing of rustc's in the checkout at
+/// `project`, before it is loaded: the toolchain the load finds, as it finds it.
+fn toolchain_ahead(project: &Path, cargo_config: &CargoConfig) -> Option<String> {
+    let root = match &cargo_config.sysroot {
+        Some(RustLibSource::Path(toolchain)) => toolchain.clone(),
+        _ => {
+            let dir = AbsPathBuf::assert_utf8(std::env::current_dir().ok()?.join(project));
+            let sysroot = project_model::Sysroot::discover(&dir, &cargo_config.extra_env);
+            sysroot.root()?.to_owned()
+        }
+    };
+    let mut identity = installed_identity(&format!("{root}/"));
+    identity.sort_unstable();
+    (!identity.is_empty()).then(|| identity.join(" "))
+}
+
 /// The rlibs of the standard library whose metadata [`toolchain_identity`] reads. rustc's link
 /// line has all of them, and a build told ahead of cargo's finds the same in the toolchain
 /// ([`built_library`]): one toolchain is then one identity whichever way a daemon starts, and
@@ -8932,6 +8948,18 @@ fn run_holding(
         Ok::<_, anyhow::Error>((table, whole))
     });
 
+    // The store keeps the first toolchain it is told of, and the build scripts the load runs
+    // in this process tell it a name of their own: a build with nothing of rustc's tells it
+    // the toolchain whose library it loads before then, or its store is not that toolchain's
+    // and the standard library a release ships is never found (#775).
+    let cargo_config = cargo_config(&args);
+    if !ahead
+        && args.symbol_files.is_empty()
+        && let Some(toolchain) = toolchain_ahead(&args.project, &cargo_config)
+    {
+        ra_jit_store::compiles_against(&toolchain);
+    }
+
     // What other machines compiled is fetched next to the workspace too.
     let shared = std::thread::spawn(|| {
         let shared = remote::Shared::from_env()?;
@@ -8942,7 +8970,6 @@ fn run_holding(
     });
 
     let start = Instant::now();
-    let cargo_config = cargo_config(&args);
     let selection = args.selection.clone();
     ra_jit_store::identify_ahead();
     let projects: Vec<&Path> =
@@ -8989,6 +9016,9 @@ fn run_holding(
     match toolchain_identity(&vfs, library.as_ref().unwrap_or(&args.symbol_files)) {
         Some(toolchain) => {
             ra_jit_store::compiles_against(&toolchain);
+            if let Some(told) = ra_jit_store::toolchain().filter(|it| *it != toolchain) {
+                eprintln!("store: of `{told}`, not of the toolchain loaded, `{toolchain}`");
+            }
             std::thread::spawn(ra_jit_store::check_packs);
         }
         None => eprintln!("store: the toolchain of the library cannot be told from another"),

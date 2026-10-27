@@ -712,10 +712,10 @@ impl<'a> Driver<'a> {
             dep_info: deps.join(format!("{stem}.d")),
         };
         let mut compiled = self.compile(&crates, &made, &deps.join(&stem));
-        // Compiled for this host here, beside the other units, rather than in the load, which
-        // loads one module after another.
+        // Compiled for this host from here, beside the other units, rather than in the load,
+        // which loads one module after another.
         if wasm && compiled.is_ok() {
-            compiled = ra_jit_macro_wasm::prepare(&made.exe, own_script::store())
+            compiled = ra_jit_macro_wasm::prepare_soon(&made.exe, own_script::store())
                 .map_err(anyhow::Error::msg);
         }
         if let (true, Err(why)) = (wasm, &compiled) {

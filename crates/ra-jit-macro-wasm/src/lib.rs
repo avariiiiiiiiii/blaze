@@ -63,6 +63,9 @@ pub mod exports {
     pub const LIST: &str = "blaze_proc_macro_list";
     /// `(index, attr_ptr, attr_len, ptr, len)`: expands the macro at `index` of the list.
     pub const EXPAND: &str = "blaze_proc_macro_expand";
+    /// The custom section that holds what [`LIST`] gives, for the host to read without
+    /// compiling the module.
+    pub const LIST_SECTION: &str = "blaze_proc_macros";
 }
 
 /// The host's functions the module imports.
@@ -561,13 +564,16 @@ impl Wasm {
         bytes: Option<&[u8]>,
         store: Option<&ra_jit_store::Store>,
     ) -> Result<Arc<Wasm>, String> {
-        static COMPILED: Mutex<Option<FxHashMap<[u8; 32], Arc<Wasm>>>> = Mutex::new(None);
-        if let Some(found) = COMPILED.lock().unwrap().get_or_insert_default().get(&known.digest) {
-            found.keep_code(store);
-            return Ok(found.clone());
-        }
-        let wasm = Arc::new(Wasm::compile(path, known, bytes, store)?);
-        COMPILED.lock().unwrap().get_or_insert_default().insert(known.digest, wasm.clone());
+        // A module being compiled (`prepare_soon`) is waited for, not compiled again.
+        type Once = Arc<OnceLock<Result<Arc<Wasm>, String>>>;
+        static COMPILED: Mutex<Option<FxHashMap<[u8; 32], Once>>> = Mutex::new(None);
+        let once = {
+            let mut compiled = COMPILED.lock().unwrap();
+            compiled.get_or_insert_default().entry(known.digest).or_default().clone()
+        };
+        let compiled = once.get_or_init(|| Wasm::compile(path, known, bytes, store).map(Arc::new));
+        let wasm = compiled.clone()?;
+        wasm.keep_code(store);
         Ok(wasm)
     }
 
@@ -894,6 +900,70 @@ pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), S
     Ok(())
 }
 
+/// As [`prepare`], but a module that carries its list of macros ([`exports::LIST_SECTION`]) is
+/// compiled on a thread of its own: its list is written now, and the first of its macros to
+/// expand in this process waits for the compile.
+pub fn prepare_soon(path: &Path, store: Option<&'static ra_jit_store::Store>) -> Result<(), String> {
+    if let Some((known, _)) = listing(path)
+        && code_file(path, &code_key(&known.digest)).is_file()
+    {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let Some(text) = carried_list(&bytes) else { return prepare(path, store) };
+    let digest = keyed::sha256(&bytes);
+    let identity = made_of(path, &bytes).unwrap_or(digest);
+    list_known(path, &digest, &identity, &text);
+    let path = path.to_owned();
+    let known = Known { digest, identity: Some(identity) };
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let done = Wasm::known(&path, known, Some(&bytes), store);
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
+            eprintln!("ra-jit: the proc-macro module {} {how} in {:.1?}", path.display(), start.elapsed());
+        }
+    });
+    Ok(())
+}
+
+/// What the module of `bytes` carries in its [`exports::LIST_SECTION`] custom section, read
+/// without compiling it: `None` for a module built before modules carried one.
+fn carried_list(bytes: &[u8]) -> Option<String> {
+    fn leb(bytes: &[u8], at: &mut usize) -> Option<usize> {
+        let mut value = 0usize;
+        for shift in (0..35).step_by(7) {
+            let byte = *bytes.get(*at)?;
+            *at += 1;
+            value |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+    if bytes.get(..4)? != b"\0asm" {
+        return None;
+    }
+    let mut at = 8;
+    while at < bytes.len() {
+        let id = bytes[at];
+        at += 1;
+        let size = leb(bytes, &mut at)?;
+        let end = at.checked_add(size).filter(|it| *it <= bytes.len())?;
+        if id == 0 {
+            let mut named = at;
+            let len = leb(bytes, &mut named)?;
+            let name = bytes.get(named..named.checked_add(len)?)?;
+            if name == exports::LIST_SECTION.as_bytes() {
+                return String::from_utf8(bytes.get(named + len..end)?.to_vec()).ok();
+            }
+        }
+        at = end;
+    }
+    None
+}
+
 /// What is known of a module without reading it: its digest, and what its expansions are kept
 /// under ([`Wasm`]'s `identity`) when the file beside it says.
 #[derive(Clone, Copy)]
@@ -954,8 +1024,12 @@ fn listing(path: &Path) -> Option<(Known, String)> {
 
 /// Writes the list file of the module at `path`, compiled as `wasm`, whose macros `text` lists.
 fn list(path: &Path, wasm: &Wasm, text: &str) {
+    list_known(path, &wasm.digest, &wasm.identity, text);
+}
+
+fn list_known(path: &Path, digest: &[u8; 32], identity: &[u8; 32], text: &str) {
     let Some(stamp) = stamp(path) else { return };
-    let (digest, identity) = (hex(&wasm.digest), hex(&wasm.identity));
+    let (digest, identity) = (hex(digest), hex(identity));
     write_whole(&list_file(path), format!("{digest}\n@ {identity} {stamp}\n{text}").as_bytes());
 }
 
@@ -1286,6 +1360,27 @@ mod tests {
         let bytes = writer.out;
         let trees = Reader::new(&bytes, &spans).stream().unwrap();
         assert_eq!(wire::top_subtree(trees, span(3, 9)).to_string(), top.to_string());
+    }
+
+    #[test]
+    fn a_module_carries_its_list_in_a_custom_section() {
+        let custom = |name: &str, payload: &[u8]| {
+            let mut body = vec![name.len() as u8];
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(payload);
+            let mut section = vec![0, body.len() as u8];
+            section.extend(body);
+            section
+        };
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        // A type section of no types, then a custom section of another name.
+        module.extend_from_slice(&[1, 1, 0]);
+        module.extend(custom("name", b"\0\0"));
+        assert_eq!(carried_list(&module), None);
+        module.extend(custom(exports::LIST_SECTION, b"0\tSerialize\tserde\n"));
+        assert_eq!(carried_list(&module).as_deref(), Some("0\tSerialize\tserde\n"));
+        module.truncate(module.len() - 1);
+        assert_eq!(carried_list(&module), None, "a section that runs past the end");
     }
 
     #[test]

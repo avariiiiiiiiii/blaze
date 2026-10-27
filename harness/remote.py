@@ -605,7 +605,7 @@ def stored(top, remote):
     _, counted, _ = c.cache("stats", env=limit)
     whole, _, _ = c.cache("verify")
     check("a pull into a store with a limit fetches what fits and says what does not",
-          out.returncode == 0 and "3 left that do not fit under RA_JIT_CACHE_MAX" in out.stdout and whole
+          out.returncode == 0 and "3 left that do not fit under BLAZE_CACHE_MAX" in out.stdout and whole
           and counted.get("packs") == 3 and counted.get("pack bytes") <= 3 * MIB + 4096
           and packs_fetched(remote) in (3, None), out.stdout.strip()[:90])
 

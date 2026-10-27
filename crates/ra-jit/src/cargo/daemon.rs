@@ -56,7 +56,7 @@ fn memory_max() -> Result<Option<u64>, String> {
         Ok(text) if text == "off" => Ok(None),
         Ok(text) => ra_jit_store::parse_size(&text)
             .map(Some)
-            .ok_or_else(|| format!("RA_JIT_MEMORY_MAX=`{text}` is neither a size nor `off`")),
+            .ok_or_else(|| format!("BLAZE_MEMORY_MAX=`{text}` is neither a size nor `off`")),
     }
 }
 
@@ -82,7 +82,7 @@ fn spares() -> Result<Spares, String> {
         Err(_) => Ok(Spares::Asked),
         Ok(text) if text == "0" => Ok(Spares::Never),
         Ok(text) if text == "ready" => Ok(Spares::Ready),
-        Ok(text) => Err(format!("RA_JIT_SPARE=`{text}` is neither `0` nor `ready`")),
+        Ok(text) => Err(format!("BLAZE_SPARE=`{text}` is neither `0` nor `ready`")),
     }
 }
 
@@ -145,25 +145,11 @@ pub(crate) struct Envelope {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Request {
-    /// Bring the programs of a checkout up to date with its source, if the daemon is warm
-    /// for it.
-    Sync(Checkout),
     /// Load a checkout that cargo has just built, for the builds to come.
     Warm(Checkout),
     /// Load a checkout cargo has just built what stands in for the crates of, and answer
     /// when its programs are built.
     Build(Checkout),
-    /// A workspace cargo is about to build what stands in for the crates of: a worker
-    /// loads it meanwhile, for the [`Request::Build`] that follows.
-    Ahead(Ahead),
-    /// A line cargo printed of a build script it ran or a proc macro it built, for the
-    /// worker of the [`Request::Ahead`] of this [`WorkerConfig::id`].
-    Said {
-        id: String,
-        line: String,
-    },
-    /// No build follows the [`Request::Ahead`] of this [`WorkerConfig::id`].
-    Forget(String),
     /// `cargo ra-jit check` of a build the daemon has no programs of: what a checker that
     /// loaded the workspace as it would finds in its crates, with no rustc.
     Check(Ahead),
@@ -178,10 +164,10 @@ impl Request {
     /// The request, with the variables of this command its build's scripts are given
     /// ([`WorkerConfig::command_env`]): set as it is sent, so that no state on disk keeps them.
     pub(crate) fn of_this_command(mut self) -> Request {
-        if let Request::Sync(it) | Request::Warm(it) | Request::Build(it) = &mut self {
+        if let Request::Warm(it) | Request::Build(it) = &mut self {
             it.config.command_env = super::cli::command_env();
         }
-        if let Request::Ahead(it) | Request::Check(it) | Request::Lint(it, _) = &mut self {
+        if let Request::Check(it) | Request::Lint(it, _) = &mut self {
             it.config.command_env = super::cli::command_env();
         }
         self
@@ -557,7 +543,7 @@ impl Worker {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         started.extend(config.builds_env());
-        let told = spare.and_then(|it| it.told(&args, &started, &checkout.root, false));
+        let told = spare.and_then(|it| it.told(&args, &started, &checkout.root));
         let child = match told {
             Some(spare) => {
                 log = spare.log;
@@ -892,19 +878,17 @@ impl Spare {
 
     /// Tells it to be the worker `args` start, with the variables `env`. `None` when it
     /// can't be told: it has ended, or a path of the build is not text.
-    /// One told a build `ahead` has what cargo has not built yet left out of `args`, and
-    /// is told them whole afterwards.
     fn told(
         mut self,
         args: &[OsString],
         env: &BTreeMap<String, String>,
         cwd: &Path,
-        ahead: bool,
     ) -> Option<Spare> {
         let told = || {
             let args: Option<Vec<String>> =
                 args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
-            let told = crate::Told { args: args?, env: env.clone(), cwd: cwd.to_owned(), ahead };
+            let told =
+                crate::Told { args: args?, env: env.clone(), cwd: cwd.to_owned(), ahead: false };
             let mut line = serde_json::to_string(&told).ok()?;
             line.push('\n');
             Some(line)
@@ -920,16 +904,6 @@ impl Spare {
             return None;
         }
         Some(self)
-    }
-
-    /// Passes on what cargo said of a script or a proc macro. One that has ended is found
-    /// out when it is told its build.
-    fn said(&mut self, line: String) {
-        let Ok(mut line) = serde_json::to_string(&crate::Line::Said { said: line }) else { return };
-        line.push('\n');
-        if let Some(input) = self.child.stdin.as_mut() {
-            let _ = input.write_all(line.as_bytes());
-        }
     }
 
     fn stop(&mut self) {
@@ -1063,8 +1037,6 @@ struct Daemon {
     /// The worker the next workspace is loaded by, when there is one.
     spare: Mutex<Option<Spare>>,
     spare_when: Spares,
-    /// The workers told a build ahead of cargo's, by [`WorkerConfig::id`].
-    ahead: Mutex<FxHashMap<String, Spare>>,
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
     /// The checkers of the last [`Request::Check`]s, each of another build and loaded for
@@ -1082,7 +1054,7 @@ pub(crate) fn home() -> anyhow::Result<PathBuf> {
         return Ok(Path::new(&runtime).join("ra-jit"));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    Ok(Path::new(&home.context("no RA_JIT_HOME, XDG_RUNTIME_DIR or HOME")?).join(".cache/ra-jit"))
+    Ok(Path::new(&home.context("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME")?).join(".cache/ra-jit"))
 }
 
 /// The disk store of the user's builds: the directory `RA_JIT_CACHE` names, none when it
@@ -1158,7 +1130,6 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         workers: Mutex::default(),
         spare: Mutex::default(),
         spare_when,
-        ahead: Mutex::default(),
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
@@ -1257,27 +1228,10 @@ impl Daemon {
     fn handle(&self, request: Request) -> Reply {
         *lock(&self.asked) = Instant::now();
         match request {
-            Request::Sync(checkout) => self.sync(&checkout),
             Request::Warm(checkout) => match self.warm(checkout) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
-            Request::Ahead(ahead) => {
-                self.ahead(ahead);
-                Reply::Warming
-            }
-            Request::Said { id, line } => {
-                if let Some(spare) = lock(&self.ahead).get_mut(&id) {
-                    spare.said(line);
-                }
-                Reply::Warming
-            }
-            Request::Forget(id) => {
-                if let Some(mut spare) = lock(&self.ahead).remove(&id) {
-                    spare.stop();
-                }
-                Reply::Warming
-            }
             Request::Build(checkout) => match self.warm(checkout.clone()) {
                 Ok(()) => self.built(&checkout),
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
@@ -1402,12 +1356,11 @@ impl Daemon {
         if let Some(old) = workers.remove(&id) {
             old.stop();
         }
-        let ahead = lock(&self.ahead).remove(&id);
         // A spare loads its library before it is told the build, which a whole build that
         // asks at once would wait for.
         let spare = match checkout.config.whole {
-            true => ahead,
-            false => ahead.or_else(|| lock(&self.spare).take()),
+            true => None,
+            false => lock(&self.spare).take(),
         };
         let worker =
             Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare)?);
@@ -1434,7 +1387,7 @@ impl Daemon {
             // The next spare starts when the worker that was one has loaded its workspace.
             if self.spare_when == Spares::Ready {
                 let loading = lock(&self.workers).values().any(|it| it.loading());
-                if !loading && lock(&self.ahead).is_empty() {
+                if !loading {
                     self.spare();
                 }
             }
@@ -1494,7 +1447,7 @@ impl Daemon {
             let Some(worker) = workers.remove(&id) else { continue };
             eprintln!(
                 "worker {id} of {} stopped: the workers hold {} MB, over the {} MB of \
-                 RA_JIT_MEMORY_MAX, and it was asked longest ago",
+                 BLAZE_MEMORY_MAX, and it was asked longest ago",
                 worker.project.display(),
                 all >> 20,
                 most >> 20
@@ -1557,23 +1510,6 @@ impl Daemon {
         }
     }
 
-    /// Has the spare worker load the workspace of a build cargo has only started.
-    fn ahead(&self, ahead: Ahead) {
-        let id = ahead.config.id();
-        if lock(&self.workers).contains_key(&id) {
-            return;
-        }
-        let waiting = lock(&self.spare).take();
-        let Some(spare) = waiting.or_else(|| self.new_spare()) else { return };
-        let mut args = ahead.config.args(&ahead.root, &ahead.crates);
-        args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config.builds_env(), &ahead.root, true)
-            && let Some(mut other) = lock(&self.ahead).insert(id, spare)
-        {
-            other.stop();
-        }
-    }
-
     /// Starts a spare worker when there is none.
     fn spare(&self) {
         let mut spare = lock(&self.spare);
@@ -1605,16 +1541,12 @@ impl Daemon {
         // these are stopped: one started then would write in the home and outlive the daemon.
         // In the order a worker that loads a workspace takes them.
         let workers = lock(&self.workers);
-        let mut ahead = lock(&self.ahead);
         let mut spare = lock(&self.spare);
         if let Some(spare) = spare.as_mut() {
             spare.stop();
         }
         for checker in lock(&self.checkers).iter_mut() {
             checker.stop();
-        }
-        for spare in ahead.values_mut() {
-            spare.stop();
         }
         for worker in workers.values() {
             worker.let_go();
@@ -1648,8 +1580,33 @@ fn last_words(log: &Path) -> String {
         let message = lines.get(at + 1).copied().unwrap_or_default();
         return format!("panicked at {place} {message}");
     }
-    let last = lines.iter().rev().find(|it| it.starts_with("Error"));
-    last.or(lines.last()).copied().unwrap_or("no output").to_owned()
+    match last_error(&log) {
+        Some(error) => format!("Error: {}", error.replace('\n', "; ")),
+        None => lines.last().copied().unwrap_or("no output").to_owned(),
+    }
+}
+
+/// The last error a worker's log has, with what caused it, each cause on a line of its own:
+/// the outermost error says what blaze was doing, and the innermost why it could not, which
+/// is what the user acts on.
+pub(crate) fn last_error(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let at = lines.iter().rposition(|it| it.starts_with("Error"))?;
+    let mut said = lines[at].strip_prefix("Error: ").unwrap_or(lines[at]).to_owned();
+    let mut rest = lines[at + 1..].iter().skip_while(|it| it.trim().is_empty());
+    if rest.next().is_some_and(|it| it.trim() == "Caused by:") {
+        for line in rest.take_while(|it| it.starts_with("    ")) {
+            let line = line.trim();
+            // `0: what`, or a line more of the cause before it.
+            let numbered = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            match line.split_once(": ").filter(|(n, _)| numbered(n)) {
+                Some((_, cause)) => said.push_str(&format!("\n{cause}")),
+                None if said.contains('\n') => said.push_str(&format!("\n  {line}")),
+                None => said.push_str(&format!("\n{line}")),
+            }
+        }
+    }
+    Some(said)
 }
 
 /// The end of a worker's log, for the daemon's: where it panicked and with what, then its
@@ -1711,5 +1668,26 @@ mod tests {
         assert_eq!(over(&holding, 8), ["oldest", "old"]);
         // The busy one and the one asked last stay, whatever they hold.
         assert_eq!(over(&holding, 0), ["oldest", "old"]);
+    }
+
+    #[test]
+    fn a_workers_last_error_is_said_with_what_caused_it() {
+        let log = "symbols: 0 in 138.9µs\n\
+            Error: Failed to build the build scripts of /w\n\
+            \n\
+            Caused by:\n    \
+            0: blaze could not link the proc macro of `clap_derive v4.6.7` for the load\n    \
+            1: the proc macro `clap_derive` cannot run as WebAssembly: no wasm32-wasip1 target\n         \
+            name its package in `native-proc-macros` to expand it natively\n";
+        assert_eq!(
+            last_error(log).unwrap(),
+            "Failed to build the build scripts of /w\n\
+             blaze could not link the proc macro of `clap_derive v4.6.7` for the load\n\
+             the proc macro `clap_derive` cannot run as WebAssembly: no wasm32-wasip1 target\n  \
+             name its package in `native-proc-macros` to expand it natively"
+        );
+        assert_eq!(last_error("Error: one\n\nCaused by:\n    two\n").unwrap(), "one\ntwo");
+        assert_eq!(last_error("Error: alone\n").unwrap(), "alone");
+        assert_eq!(last_error("nothing wrong\n"), None);
     }
 }

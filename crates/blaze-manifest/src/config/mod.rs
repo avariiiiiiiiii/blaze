@@ -320,6 +320,15 @@ impl Config {
         Ok(self.values.get_or_init(|| values))
     }
 
+    /// The same configuration read again, for a thread of its own to read: what reading the
+    /// files warns of is this one's to say, not the copy's.
+    pub fn reload(&self) -> anyhow::Result<Config> {
+        let copy = Config::load(&self.cwd, self.env.clone(), &self.cli)?;
+        _ = copy.values();
+        copy.warnings.take();
+        Ok(copy)
+    }
+
     /// The configuration this process sees: its current directory and environment.
     pub fn from_process() -> anyhow::Result<Config> {
         let cwd =

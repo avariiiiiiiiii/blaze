@@ -10,6 +10,11 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Added
 
+- Nightly's `#[derive(From)]` (`#![feature(derive_from)]`, `std::from::From`) expands, as
+  rustc's does: `From` of the type of a struct's one field, keeping the struct's generics.
+  Every use of the conversion was refused ("no impl of the trait was selected for it"). On an
+  enum, a union, or a struct without exactly one field it is an error, as in rustc (#600).
+
 - `blaze lock --fetches [--target <triple>]...` pins what build scripts download, as Nix pins a
   fixed-output derivation: each download by its sha256 in `Cargo.fetches.lock` beside
   `Cargo.lock`, kept by the package's name, version and `Cargo.lock` checksum, the bytes in
@@ -560,6 +565,17 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Changed
 
+- Sandboxed tests are an experiment a workspace opts into: `experimental = ["sandboxed-tests"]`
+  under `[workspace.metadata.blaze]` in its root manifest, or `tests = true` under
+  `[package.metadata.blaze.sandbox]` in a package's. Elsewhere `cargo blaze test` runs tests as
+  `cargo test` does, so a test that writes `$HOME` passes where it failed with the sandbox's
+  denial. A test outside the sandbox has no record of what it read, so `RA_JIT_TESTS=affected`
+  keeps no pass of it and it runs on every commit; when no test of the command is sandboxed, a
+  note says what to add and to which manifest. `experimental` is the one list of opt-in
+  features: an unknown name, or a value that is not a list of names, is an error naming the
+  manifest and the known names. `tests = false`, `unsandboxed-tests` and `RA_JIT_SANDBOX=off`
+  work as before; build scripts stay sandboxed and proc macros WebAssembly. blaze's own
+  workspace opts in (docs/cargo.md, "Sandboxed tests (an experiment, opt-in)").
 - The programs print `blaze`, not `ra-jit` (#270, "What the programs print"): the `blaze:`
   prefix of their notes, `Finished ... profile [blaze]`, `blaze is enabled`, `plain cargo:
   through blaze`, `blaze could not compile`, `blaze cache gc` and the other errors and notes.
@@ -1031,6 +1047,24 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- A build after `cargo blaze clean`, `cargo clean` or `rm -rf target` while the daemon runs
+  builds, by the same worker (#721, reported by @maddada). The worker read the standard
+  library's unit it had written under `target/ra-jit/whole/` again, and every build until
+  `blaze stop` failed "a build of src/main.rs panicked: the standard library blaze built:
+  reading .../<name>.std.o: No such file or directory". Before each build the worker now
+  writes the unit again when it is gone or another file than it wrote (from the store when it
+  has it), and builds a program in full when its object is gone; a unit it can't read is an
+  error, not a panic (`harness/cargo_ra_jit.py`, `cleaned`).
+- blaze finds the toolchain behind Homebrew's rustup. Homebrew installs `rustc` as a script
+  that starts rustup, beside no toolchain, and blaze took a proxy only by the name `rustup`,
+  so the script's directory was read as a toolchain with no standard library: every build
+  script failed with "the toolchain has no source of the standard library". A `rustc` that is
+  not in the `bin` of a sysroot with `lib/rustlib` is now a proxy, whatever it is called.
+- A crate blaze builds itself (a proc macro, a build script, or what either links) reads the
+  variables its build script set with `cargo:rustc-env`: `mime_guess`'s
+  `MIME_TYPES_GENERATED_PATH`, so `rust-embed-impl` builds. blaze kept only cargo's own
+  `CARGO_*` and `OUT_DIR`; it now reads the names from the script's output, `output` in cargo's
+  layout of `target` and `run/stdout` in the build-dir layout.
 - An integration test that names a program (`env!("CARGO_BIN_EXE_app")`) builds when its
   build starts the daemon's worker: the worker was started with the variables of its build
   but not the places cargo set, so its load, which compiles before the first request is read,

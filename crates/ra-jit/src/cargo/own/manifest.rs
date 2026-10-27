@@ -154,7 +154,7 @@ fn resolved(read: &Read, manifest_path: Option<&Path>) -> anyhow::Result<String>
 fn own_rustc(args: &[&str]) -> anyhow::Result<Option<String>> {
     use super::super::toolchain::Chosen;
     let (Chosen::Given(sysroot) | Chosen::Rustup(sysroot) | Chosen::Own(sysroot)) =
-        super::super::toolchain::settle().map_err(anyhow::Error::msg)?;
+        super::super::toolchain::settle(false).map_err(anyhow::Error::msg)?;
     let rustc = format!("rustc{}", std::env::consts::EXE_SUFFIX);
     let mut asked = Command::new(sysroot.join("bin").join(rustc));
     asked.args(args);

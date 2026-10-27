@@ -22,7 +22,8 @@ its own, built with RUSTC_BOOTSTRAP=1), and with `RA_JIT_TESTS=all` every test. 
 output says why the one that reads a file runs, by the calls from it to the file system, and
 how many tests run every time.
 
-Every test runs sandboxed (Linux and macOS, unless `RA_JIT_SANDBOX=off`): the one that reads a
+The workspace opts into sandboxed tests (`experimental = ["sandboxed-tests"]`), so every test
+runs sandboxed (Linux and macOS, unless `RA_JIT_SANDBOX=off`): the one that reads a
 file runs again only when the file changed, `-v` says which file, a test that writes into the
 package changes nothing of it outside its run, a test that writes outside fails and the command
 says what the sandbox denied it and how to take it out, a test its package takes out of the
@@ -30,7 +31,8 @@ sandbox (`unsandboxed-tests`) runs outside and writes there, every time, with
 `RA_JIT_SANDBOX=off` every test runs every time, `RA_JIT_TESTS=verify` runs the tests kept as
 passed and says they passed again, a store pushed to a remote and pulled into an empty one
 skips every test that passed, and so does the store under a fresh target and daemon, as on a CI
-runner.
+runner. A package that has not opted in runs every test under `affected`, and is told what to add
+to its manifest.
 
 Python 3, stdlib only.
 """
@@ -145,7 +147,8 @@ fn offset() -> u32 {
 """
 FILES = {
     "Cargo.toml": '[package]\nname = "tsel"\nversion = "0.1.0"\nedition = "2021"\n\n'
-                  '[dependencies]\ntbase = { path = "tbase" }\n\n[workspace]\nmembers = ["tbase"]\n',
+                  '[dependencies]\ntbase = { path = "tbase" }\n\n[workspace]\nmembers = ["tbase"]\n\n'
+                  '[workspace.metadata.blaze]\nexperimental = ["sandboxed-tests"]\n',
     "src/lib.rs": LIB,
     "data.txt": "tsel\n",
     # What the test that writes into the package overwrites: not `data.txt`, which the test
@@ -282,7 +285,7 @@ KEPT_FROM = re.escape(kept_from())
 if SANDBOXED:
     SAYS = {
         "outside the sandbox": [
-            r"Always tests::reads_a_file: it runs outside the sandbox: `RA_JIT_SANDBOX=off`$",
+            r"Always tests::reads_a_file: it runs outside the sandbox: `BLAZE_SANDBOX=off`$",
             r"\d+ tests outside the sandbox, run every time and never kept: ",
         ],
         "the file a test reads edited": [
@@ -371,6 +374,18 @@ def benched(root, env):
         return "NOT SERVED BY THE DAEMON"
     if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
         return f"ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
+    if not SANDBOXED:
+        return "ok"
+    # It has not opted into sandboxed tests: nothing is kept, and the note says how to opt in.
+    code, said = test(ws, env, "affected")
+    ran = {name for name, _ in RAN.findall(said)}
+    note = (r"note: no test is sandboxed, so none is kept as passed and every test runs: .*"
+            r'`experimental = \["sandboxed-tests"\]` under `\[workspace\.metadata\.blaze\]` in '
+            r"\S*/benched/Cargo\.toml$")
+    if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
+        return f"NOT OPTED IN, ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
+    if not re.search(note, said, re.M):
+        return f"NOT OPTED IN, DID NOT SAY {note}"
     return "ok"
 
 

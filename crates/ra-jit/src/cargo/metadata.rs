@@ -36,8 +36,9 @@ fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata
 }
 
 /// How the daemon's loads read a workspace for the build `selection` names: blaze's own
-/// reading and resolution, the graph that of the build, its features not unified over the
-/// other members. `RA_JIT_OWN_RESOLVE=0` leaves both to cargo.
+/// reading and resolution, the graph that of the build, its features unified over the other
+/// members only as `resolver.feature-unification` says. `RA_JIT_OWN_RESOLVE=0` leaves both to
+/// cargo.
 pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::OwnMetadata> {
     if std::env::var_os("RA_JIT_OWN_RESOLVE").is_some_and(|it| it == "0") {
         return None;
@@ -419,5 +420,110 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&scratch);
         assert!(read >= 3, "{read} fixtures read");
+    }
+
+    /// The features of `shared` in the build of `packages` of #596's workspace, where only
+    /// `other` asks for `shared/extra`, with `config` as its `.cargo/config.toml`; or why
+    /// blaze refuses the build.
+    fn shared_features(config: &str, packages: &[&str]) -> Result<Vec<String>, String> {
+        let root = std::env::temp_dir().join(format!(
+            "ra-jit-unification-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let package = |name: &str, deps: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{deps}")
+        };
+        let files = [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\", \"other\", \"shared\"]\nresolver = \"2\"\n"
+                    .to_owned(),
+            ),
+            (".cargo/config.toml", config.to_owned()),
+            ("shared/Cargo.toml", package("shared", "\n[features]\nextra = []\n")),
+            (
+                "shared/src/lib.rs",
+                "pub fn extra() -> bool { cfg!(feature = \"extra\") }\n".to_owned(),
+            ),
+            (
+                "app/Cargo.toml",
+                package("app", "\n[dependencies]\nshared = { path = \"../shared\" }\n"),
+            ),
+            (
+                "app/src/main.rs",
+                "fn main() { println!(\"extra = {}\", shared::extra()); }\n".to_owned(),
+            ),
+            (
+                "other/Cargo.toml",
+                package(
+                    "other",
+                    "\n[dependencies]\nshared = { path = \"../shared\", features = [\"extra\"] }\n",
+                ),
+            ),
+            ("other/src/lib.rs", "pub fn f() -> bool { shared::extra() }\n".to_owned()),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let home = root.join("cargo-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let packages: Vec<String> = packages.iter().map(|it| it.to_string()).collect();
+        let asked = blaze_metadata::Asked {
+            cwd: &root,
+            env: vec![("CARGO_HOME".to_owned(), home.display().to_string())],
+            manifest_path: None,
+            config: &[],
+            features: &[],
+            all_features: false,
+            no_default_features: false,
+            build: Some(blaze_metadata::Build {
+                packages: &packages,
+                workspace: false,
+                excludes: &[],
+                dev_units: false,
+            }),
+            platform: Some(blaze_metadata::TargetPlatform {
+                triple: "x86_64-unknown-linux-gnu",
+                cfg: &[],
+            }),
+            offline: true,
+            store: None,
+        };
+        let made = blaze_metadata::metadata(&asked);
+        let _ = std::fs::remove_dir_all(&root);
+        let metadata: serde_json::Value =
+            serde_json::from_str(&made.map_err(|err| format!("{err:#}"))?).unwrap();
+        let nodes = metadata["resolve"]["nodes"].as_array().unwrap();
+        let shared =
+            nodes.iter().find(|it| it["id"].as_str().unwrap().contains("shared#")).unwrap();
+        let features = shared["features"].as_array().unwrap().iter();
+        Ok(features.map(|it| it.as_str().unwrap().to_owned()).collect())
+    }
+
+    /// `resolver.feature-unification`, as nightly cargo reads it (#596): `workspace` resolves
+    /// the features of every member, `selected` (and the setting without
+    /// `-Zfeature-unification`) of those built, `package` of each package built alone.
+    #[test]
+    fn feature_unification_is_cargo_s() {
+        let mode = |mode: &str| {
+            format!(
+                "[unstable]\nfeature-unification = true\n\n[resolver]\nfeature-unification = \"{mode}\"\n"
+            )
+        };
+        let extra = Ok(vec!["extra".to_owned()]);
+        assert_eq!(shared_features(&mode("workspace"), &["app"]), extra);
+        assert_eq!(shared_features(&mode("selected"), &["app"]), Ok(vec![]));
+        assert_eq!(shared_features(&mode("package"), &["app"]), Ok(vec![]));
+        assert_eq!(shared_features(&mode("package"), &["other"]), extra);
+        assert_eq!(shared_features(&mode("selected"), &["app", "other"]), extra);
+        assert_eq!(shared_features("", &["app"]), Ok(vec![]));
+        let unflagged = "[resolver]\nfeature-unification = \"workspace\"\n";
+        assert_eq!(shared_features(unflagged, &["app"]), Ok(vec![]));
+        let refused = shared_features(&mode("package"), &["app", "other"]).unwrap_err();
+        assert!(refused.contains("resolver.feature-unification = \"package\""), "{refused}");
     }
 }

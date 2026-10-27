@@ -7762,12 +7762,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         Ok(data)
     }
 
-    /// Defines `id` as `blob`, in a section of its own named `section` when there is one.
     /// Writes rustc's hash of each type in `blob.type_ids` at its place in the bytes.
     fn hash_type_ids(&self, blob: &mut ConstBlob) -> Result<()> {
         hash_type_ids(self.db, self.symbols, &self.own_statics.crates, blob)
     }
 
+    /// Defines `id` as `blob`, in the section named `section` when there is one.
     fn fill_data(&mut self, id: DataId, mut blob: ConstBlob, section: Option<&str>) -> Result<()> {
         self.hash_type_ids(&mut blob)?;
         let mut data = DataDescription::new();
@@ -19185,5 +19185,151 @@ mod tests {
         let afresh = places(false);
         assert_eq!(afresh.slots.len(), 1);
         assert_eq!(places(true), afresh);
+    }
+
+    /// An object with `count` statics of a `u32` in `section` and as many pointers to a
+    /// function in `pointers`, as `#[link_section]` and `inventory::submit!` give.
+    fn object_of_statics(
+        triple: target_lexicon::Triple,
+        data_sections: bool,
+        used: bool,
+        (section, pointers): (&str, &str),
+        count: u32,
+    ) -> Vec<u8> {
+        use cranelift_codegen::settings::{self, Configurable};
+        use cranelift_module::{DataDescription, Linkage, Module, default_libcall_names};
+        use cranelift_object::{ObjectBuilder, ObjectModule};
+
+        let mut flags = settings::builder();
+        flags.set("is_pic", "true").unwrap();
+        let isa = cranelift_codegen::isa::lookup(triple)
+            .unwrap()
+            .finish(settings::Flags::new(flags))
+            .unwrap();
+        let mut builder = ObjectBuilder::new(isa, "statics", default_libcall_names()).unwrap();
+        builder.per_data_object_section(data_sections);
+        let mut module = ObjectModule::new(builder);
+        let sig = module.make_signature();
+        let init = module.declare_function("init", Linkage::Local, &sig).unwrap();
+        // `ret` on aarch64.
+        module.define_function_bytes(init, 4, &[0xc0, 0x03, 0x5f, 0xd6], &[]).unwrap();
+        for i in 0..count {
+            let entry =
+                module.declare_data(&format!("ENTRY_{i}"), Linkage::Local, false, false).unwrap();
+            let mut data = DataDescription::new();
+            match i {
+                0 => data.define_zeroinit(4),
+                _ => data.define(Box::new(i.to_le_bytes())),
+            }
+            data.set_align(4);
+            data.set_custom_section(section);
+            data.set_used(used);
+            module.define_data(entry, &data).unwrap();
+
+            let ctor =
+                module.declare_data(&format!("CTOR_{i}"), Linkage::Local, false, false).unwrap();
+            let mut data = DataDescription::new();
+            data.define(Box::new([0; 8]));
+            data.set_align(8);
+            data.set_custom_section(pointers);
+            data.set_used(used);
+            let func = module.declare_func_in_data(init, &mut data);
+            data.write_function_addr(0, func);
+            module.define_data(ctor, &data).unwrap();
+        }
+        module.finish().emit().unwrap()
+    }
+
+    /// Statics that name one section share it, as in LLVM's objects: a Mach-O object has room
+    /// for 255 sections, and blaze writes a program as one (#724).
+    #[test]
+    fn statics_of_one_section_share_it_in_a_mach_o_object() {
+        use object::macho;
+        use object::read::macho::{MachOFile64, Nlist, Section as _};
+        use object::{Endianness, Object, ObjectSection, ObjectSymbol};
+
+        let count = 300;
+        let names = ("__DATA,__blaze_many", "__DATA,__mod_init_func,mod_init_funcs");
+        let triple = target_lexicon::triple!("aarch64-apple-darwin");
+        let bytes = object_of_statics(triple, false, true, names, count);
+        let file = MachOFile64::<Endianness>::parse(&*bytes).unwrap();
+        assert!(file.sections().count() < 255);
+        let named = |name: &str| {
+            let mut found = file.sections().filter(|it| it.name() == Ok(name));
+            let section = found.next().unwrap();
+            assert!(found.next().is_none(), "two sections named `{name}`");
+            section
+        };
+
+        let many = named("__blaze_many");
+        assert_eq!(many.segment_name(), Ok(Some("__DATA")));
+        assert_eq!(many.align(), 4);
+        let values: Vec<u32> = many
+            .data()
+            .unwrap()
+            .chunks(4)
+            .map(|it| u32::from_le_bytes(it.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, (0..count).collect::<Vec<_>>());
+        let ctors = named("__mod_init_func");
+        assert_eq!(ctors.size(), 8 * u64::from(count));
+        assert_eq!(
+            ctors.macho_section().flags(Endianness::Little),
+            macho::S_MOD_INIT_FUNC_POINTERS
+        );
+        let mut at: Vec<u64> = ctors.relocations().map(|(offset, _)| offset).collect();
+        at.sort_unstable();
+        assert_eq!(at, (0..u64::from(count)).map(|i| 8 * i).collect::<Vec<_>>());
+
+        // Each keeps its own symbol, which Apple's linker keeps or strips on its own.
+        for (prefix, section, size) in [("_ENTRY_", &many, 4), ("_CTOR_", &ctors, 8)] {
+            let mut offsets: Vec<u64> = file
+                .symbols()
+                .filter(|it| it.name().is_ok_and(|name| name.starts_with(prefix)))
+                .map(|it| {
+                    assert_eq!(it.section_index(), Some(section.index()));
+                    let n_desc = it.macho_symbol().n_desc(Endianness::Little);
+                    assert_ne!(n_desc & macho::N_NO_DEAD_STRIP, 0);
+                    it.address() - section.address()
+                })
+                .collect();
+            offsets.sort_unstable();
+            assert_eq!(offsets, (0..u64::from(count)).map(|i| size * i).collect::<Vec<_>>());
+        }
+    }
+
+    /// In an ELF object the section is what the linker keeps or drops: one asked for each piece
+    /// of data, or one `#[used]` keeps (`SHF_GNU_RETAIN`), stays one per static, which the
+    /// linker merges by name; otherwise the statics of a section share it.
+    #[test]
+    fn statics_of_one_section_in_an_elf_object_share_it_unless_each_is_kept_alone() {
+        use object::{Object, ObjectSection, SectionFlags, elf};
+
+        let count = 300;
+        let names = ("blaze_many", ".init_array");
+        let sections = |data_sections: bool, used: bool| {
+            let triple = target_lexicon::triple!("aarch64-unknown-linux-gnu");
+            let bytes = object_of_statics(triple, data_sections, used, names, count);
+            let file = object::File::parse(&*bytes).unwrap();
+            let of = |name: &str| {
+                let found: Vec<_> = file
+                    .sections()
+                    .filter(|it| it.name() == Ok(name))
+                    .map(|it| it.flags())
+                    .collect();
+                let retained = found.iter().filter(|flags| match flags {
+                    SectionFlags::Elf { sh_flags } => {
+                        sh_flags & u64::from(elf::SHF_GNU_RETAIN) != 0
+                    }
+                    _ => unreachable!(),
+                });
+                (found.len(), retained.count())
+            };
+            (of(names.0), of(names.1))
+        };
+        let count = count as usize;
+        assert_eq!(sections(false, false), ((1, 0), (1, 0)));
+        assert_eq!(sections(true, false), ((count, 0), (count, 0)));
+        assert_eq!(sections(false, true), ((count, count), (count, count)));
     }
 }

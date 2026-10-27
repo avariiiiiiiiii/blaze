@@ -783,6 +783,9 @@
    {
     "dependencies": [
      "anyhow",
+     "blaze-manifest",
+     "blaze-resolve",
+     "blaze-source",
      "cargo-platform",
      "filetime",
      "flate2",
@@ -794,7 +797,6 @@
      "percent-encoding",
      "ra-jit-store",
      "rustc-hash 2.1.2",
-     "rustc-stable-hash",
      "semver",
      "serde",
      "serde_derive",
@@ -811,6 +813,7 @@
    {
     "dependencies": [
      "anyhow",
+     "blaze-source",
      "cargo-platform",
      "im-rc",
      "rustc-hash 2.1.2",
@@ -823,6 +826,18 @@
      "url"
     ],
     "name": "blaze-resolve",
+    "version": "0.1.0"
+   },
+   {
+    "dependencies": [
+     "anyhow",
+     "rustc-hash 2.1.2",
+     "rustc-stable-hash",
+     "semver",
+     "serde",
+     "url"
+    ],
+    "name": "blaze-source",
     "version": "0.1.0"
    },
    {
@@ -6463,6 +6478,9 @@
     "blaze-new": {
      "path": "crates/blaze-new"
     },
+    "blaze-source": {
+     "path": "crates/blaze-source"
+    },
     "blaze-tree": {
      "path": "crates/blaze-tree"
     },
@@ -7844,6 +7862,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-resolve",
+    "kind": "path"
+   },
+   "version": "0.1.0"
+  },
+  "blaze-source@0.1.0": {
+   "authors": "blaze contributors",
+   "description": "where a package comes from, as cargo 1.99 names it: SourceId and the names of the directories cargo keeps a source in, with no I/O",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-source",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-source",
     "kind": "path"
    },
    "version": "0.1.0"
@@ -19043,6 +19078,18 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.1.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.1.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -19085,10 +19132,6 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
-      },
-      {
-       "name": "rustc_stable_hash",
-       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
       },
       {
        "name": "semver",
@@ -19152,6 +19195,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -19204,6 +19251,51 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_resolve"
+    },
+    "blaze-source@0.1.0 lib blaze_source build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_stable_hash",
+       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
+      },
+      {
+       "name": "semver",
+       "unit": "semver@1.0.28 lib semver build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "url",
+       "unit": "url@2.5.8 lib url build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-source@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_source"
     },
     "blaze-tree@0.1.0 lib blaze_tree build": {
      "crate_type": "lib",
@@ -40748,6 +40840,18 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.1.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.1.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -40790,10 +40894,6 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
-      },
-      {
-       "name": "rustc_stable_hash",
-       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
       },
       {
        "name": "semver",
@@ -40857,6 +40957,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -40909,6 +41013,51 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_resolve"
+    },
+    "blaze-source@0.1.0 lib blaze_source build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_stable_hash",
+       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
+      },
+      {
+       "name": "semver",
+       "unit": "semver@1.0.28 lib semver build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "url",
+       "unit": "url@2.5.8 lib url build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-source@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_source"
     },
     "blaze-tree@0.1.0 lib blaze_tree build": {
      "crate_type": "lib",
@@ -62326,6 +62475,18 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.1.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.1.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -62368,10 +62529,6 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
-      },
-      {
-       "name": "rustc_stable_hash",
-       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
       },
       {
        "name": "semver",
@@ -62435,6 +62592,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -62487,6 +62648,51 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_resolve"
+    },
+    "blaze-source@0.1.0 lib blaze_source build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_stable_hash",
+       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
+      },
+      {
+       "name": "semver",
+       "unit": "semver@1.0.28 lib semver build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "url",
+       "unit": "url@2.5.8 lib url build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-source@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_source"
     },
     "blaze-tree@0.1.0 lib blaze_tree build": {
      "crate_type": "lib",
@@ -84058,6 +84264,18 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_manifest",
+       "unit": "blaze-manifest@0.1.0 lib blaze_manifest build"
+      },
+      {
+       "name": "blaze_resolve",
+       "unit": "blaze-resolve@0.1.0 lib blaze_resolve build"
+      },
+      {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -84100,10 +84318,6 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
-      },
-      {
-       "name": "rustc_stable_hash",
-       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
       },
       {
        "name": "semver",
@@ -84167,6 +84381,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "blaze_source",
+       "unit": "blaze-source@0.1.0 lib blaze_source build"
+      },
+      {
        "name": "cargo_platform",
        "unit": "cargo-platform@0.3.3 lib cargo_platform build"
       },
@@ -84219,6 +84437,51 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_resolve"
+    },
+    "blaze-source@0.1.0 lib blaze_source build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_stable_hash",
+       "unit": "rustc-stable-hash@0.1.2 lib rustc_stable_hash build"
+      },
+      {
+       "name": "semver",
+       "unit": "semver@1.0.28 lib semver build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "url",
+       "unit": "url@2.5.8 lib url build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-source@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_source"
     },
     "blaze-tree@0.1.0 lib blaze_tree build": {
      "crate_type": "lib",

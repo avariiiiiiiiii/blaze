@@ -9,9 +9,11 @@ There are also Rust unit tests in `crates/ra-jit` and in the code generator; the
 are what carries the weight.
 
 `checktargets.py` compares plain and explicit-test checks with cargo, using workspace and
-registry dev-dependencies (#634). Errors in unselected tests, examples and benches must not
-fail a plain check; errors in libraries and binaries must, and an all-targets check must
-report the dev targets' errors.
+registry dev-dependencies (#634, #632). Errors in unselected tests, examples and benches must
+not fail a plain check; errors in libraries and binaries must, and an all-targets check must
+report the dev targets' errors. Each target flag must pick what cargo's does: `--tests` no
+example or bench, `--test NAME` the one test, `--lib` no unit tests, and a member only
+depended on its library alone.
 
 ## Running them
 

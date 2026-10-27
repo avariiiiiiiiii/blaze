@@ -335,13 +335,18 @@ impl<'db> FunctionCx<'_, 'db> {
                 let vector = lanes.vector();
                 for chunk in 0..chunks {
                     let at = chunk * 16;
-                    let [x, y, z] = [a, b, c].map(|it| self.builder.ins().load(vector, MEM, it, at));
+                    let [x, y] = [a, b].map(|it| self.builder.ins().load(vector, MEM, it, at));
                     let value = match madd {
-                        Some(madd) => self
-                            .wasm_instruction(madd, &[x, y, z], Some(vector))
-                            .expect("`relaxed_madd` leaves a value"),
+                        Some(madd) => {
+                            let z = self.builder.ins().load(vector, MEM, c, at);
+                            self.wasm_instruction(madd, &[x, y, z], Some(vector))
+                                .expect("`relaxed_madd` leaves a value")
+                        }
                         None => {
+                            // The addend is read after the product is made, as LLVM orders them:
+                            // which NaN an add of two passes on is up to the wasm compiler.
                             let product = self.builder.ins().fmul(x, y);
+                            let z = self.builder.ins().load(vector, MEM, c, at);
                             self.builder.ins().fadd(product, z)
                         }
                     };

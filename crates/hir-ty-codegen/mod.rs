@@ -14958,13 +14958,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let lanes: Vec<Value> = (0..count)
                     .map(|i| {
                         let offset = (i * lane.ty.bytes() as u64) as i32;
-                        let [x, y, z] =
-                            [a, b, c].map(|v| self.builder.ins().load(lane.ty, MEM, v, offset));
-                        Ok(if wasm && name == "simd_fma" {
-                            self.float_libcall(libm, lane.ty, &[x, y, z])?
-                        } else if wasm {
+                        let [x, y] = [a, b].map(|v| self.builder.ins().load(lane.ty, MEM, v, offset));
+                        if wasm && name == "simd_relaxed_fma" {
+                            // The addend is read after the product is made, as LLVM orders them:
+                            // which NaN an add of two passes on is up to the wasm compiler.
                             let product = self.builder.ins().fmul(x, y);
-                            self.builder.ins().fadd(product, z)
+                            let z = self.builder.ins().load(lane.ty, MEM, c, offset);
+                            return Ok(self.builder.ins().fadd(product, z));
+                        }
+                        let z = self.builder.ins().load(lane.ty, MEM, c, offset);
+                        Ok(if wasm {
+                            self.float_libcall(libm, lane.ty, &[x, y, z])?
                         } else if swapped {
                             self.builder.ins().fma(y, x, z)
                         } else {

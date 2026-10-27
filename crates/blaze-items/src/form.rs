@@ -42,6 +42,9 @@ pub(crate) struct Sub {
     /// Whether all it missed is a type or constant with an error, which is written again
     /// with the items the error is of.
     pub(crate) erred: bool,
+    /// Why a body in it has no MIR, if one has none: it is written as having none, which is
+    /// what it is in every build, as the program has none of it.
+    pub(crate) unlowered: Option<&'static str>,
     /// The places in its body its code is of, in the order of the code: two written alike
     /// with these alike have their places at the same nodes of their bodies.
     pub(crate) spans: Hash,
@@ -56,6 +59,7 @@ pub(crate) struct Form {
     slots: FxHashMap<ItemId, u32>,
     missed: Option<&'static str>,
     erred: bool,
+    unlowered: Option<&'static str>,
 }
 
 impl Form {
@@ -67,6 +71,7 @@ impl Form {
             slots: FxHashMap::default(),
             missed: None,
             erred: true,
+            unlowered: None,
         };
         form.str(tag);
         form
@@ -125,6 +130,13 @@ impl Form {
         self.u32(slot);
     }
 
+    /// A body with no MIR, which the program can't have: what can be told of it alone.
+    fn unlowered(&mut self, why: &'static str) {
+        self.unlowered.get_or_insert(why);
+        self.u8(0xfe);
+        self.str(why);
+    }
+
     fn miss(&mut self, why: &'static str) {
         self.error(why);
         self.erred = false;
@@ -158,6 +170,9 @@ impl Form {
         for &id in &sub.refs {
             self.item(id);
         }
+        if let Some(why) = sub.unlowered {
+            self.unlowered.get_or_insert(why);
+        }
         if let Some(why) = sub.missed {
             self.missed.get_or_insert(why);
             self.erred &= sub.erred;
@@ -173,6 +188,7 @@ impl Form {
             refs: self.refs,
             missed: self.missed,
             erred: self.missed.is_some() && self.erred,
+            unlowered: self.unlowered,
         }
     }
 }
@@ -368,7 +384,7 @@ impl<'db> Cx<'db> {
         let mut form = self.form("body");
         match self.db.mir_body(InferBodyId::DefWithBodyId(def)) {
             Ok(body) => self.mir(&mut form, body),
-            Err(_) => form.miss("no MIR"),
+            Err(_) => form.unlowered("no MIR"),
         }
         form.finish()
     }
@@ -395,7 +411,7 @@ impl<'db> Cx<'db> {
             };
             match db.mir_body_for_coroutine(id) {
                 Ok(body) => self.mir(&mut form, body),
-                Err(_) => form.miss("no MIR for a coroutine"),
+                Err(_) => form.unlowered("no MIR for a coroutine"),
             }
         }
         form.finish()
@@ -677,7 +693,7 @@ impl<'db> Cx<'db> {
                     GeneralConstId::AnonConstId(it) => {
                         match self.db.mir_body(InferBodyId::AnonConstId(it)) {
                             Ok(body) => self.mir(f, body),
-                            Err(_) => f.miss("no MIR for an anonymous constant"),
+                            Err(_) => f.unlowered("no MIR for an anonymous constant"),
                         }
                     }
                 }
@@ -778,7 +794,7 @@ impl<'db> Cx<'db> {
         for &closure in &body.closures {
             match self.db.mir_body_for_closure(closure) {
                 Ok(closure) => self.mir(f, closure),
-                Err(_) => f.miss("no MIR for a closure"),
+                Err(_) => f.unlowered("no MIR for a closure"),
             }
         }
     }

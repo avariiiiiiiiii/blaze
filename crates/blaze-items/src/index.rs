@@ -109,11 +109,21 @@ struct Entry {
     /// Whether it is written with an error, so that it is told changed whenever it is
     /// written again.
     erred: bool,
+    /// Whether it has a body with no MIR, written as having none: told changed when that
+    /// changes, and moved nowhere, as nothing tells two such apart.
+    unlowered: bool,
     /// What [`changed_kind`], [`method_name`] and [`trait_counterpart`] say of it, kept for
     /// when it is gone and nothing can be asked of it.
     kind: Result<(), &'static str>,
     method: Option<Symbol>,
     counterpart: Option<ItemId>,
+}
+
+impl Entry {
+    /// Whether its digest says all it is, as one moved must.
+    fn whole(&self) -> bool {
+        !self.erred && self.missed.is_none() && !self.unlowered
+    }
 }
 
 /// The bindings of a crate's modules, each name's by namespace: types and values, and macros.
@@ -302,7 +312,7 @@ impl Index {
     /// what [`codes_of`] writes of them is for [`Self::take_codes`].
     pub fn wanting_code(&self) -> (u64, Vec<FunctionId>) {
         let funcs = (self.entries.iter())
-            .filter(|it| it.1.code.is_none() && !it.1.erred && it.1.missed.is_none())
+            .filter(|it| it.1.code.is_none() && it.1.whole())
             .filter_map(|it| match it.0 {
                 ItemId::Function(func) => Some(*func),
                 _ => None,
@@ -331,7 +341,7 @@ impl Index {
             .flat_map(|it| self.files.get(it).into_iter().flatten())
             .filter_map(|id| match (id, self.entries.get(id)) {
                 (ItemId::Function(func), Some(entry))
-                    if entry.code.is_none() && !entry.erred && entry.missed.is_none() =>
+                    if entry.code.is_none() && entry.whole() =>
                 {
                     Some(*func)
                 }
@@ -930,8 +940,7 @@ fn moves(
     added: &[(ItemId, &Entry)],
 ) -> (FxHashMap<ItemId, ItemId>, FxHashSet<ItemId>) {
     let whole = |it: &&(ItemId, &Entry)| {
-        !it.1.erred
-            && it.1.missed.is_none()
+        it.1.whole()
             && (it.1.code.is_some() || !matches!(it.0, ItemId::Function(_)))
     };
     type Key<'a> = (form::Hash, Option<form::Hash>, Option<&'a [Symbol]>);
@@ -982,8 +991,7 @@ fn moves(
     for (side, all) in [(0, gone), (1, added)] {
         for (id, entry) in all {
             if !matches!(id, ItemId::Function(_))
-                || entry.erred
-                || entry.missed.is_some()
+                || !entry.whole()
                 || moved.contains_key(id)
                 || moved_to.contains(id)
             {
@@ -1254,7 +1262,7 @@ pub type Code = Option<(form::Hash, Box<[ItemId]>)>;
 fn written_code(code: form::Sub) -> Code {
     let digest =
         *blake3::Hasher::new().update(&code.digest).update(&code.spans).finalize().as_bytes();
-    code.missed.is_none().then(|| (digest, code.refs.into()))
+    (code.missed.is_none() && code.unlowered.is_none()).then(|| (digest, code.refs.into()))
 }
 
 /// [`Code`] of each of `ids`, on the threads `fan` has; `None` of one `live` doesn't have.
@@ -1331,12 +1339,14 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
     hasher.update(&node.interface.digest);
     let mut refs = node.interface.refs;
     let (mut missed, mut erred) = (node.interface.missed, node.interface.erred);
+    let mut unlowered = node.interface.unlowered.is_some();
     let seen = seen_into(db, id, &refs);
     let mut whole_code = None;
     if let (true, ItemId::Function(func)) = (seen, id) {
         let code = cx.code(func.into());
         hasher.update(&code.digest);
         refs.extend(code.refs.iter().copied());
+        unlowered |= code.unlowered.is_some();
         if code.missed.is_some() {
             erred = (missed.is_none() || erred) && code.erred;
             missed = missed.or(code.missed);
@@ -1361,6 +1371,7 @@ fn entry(db: &dyn HirDatabase, cx: &form::Cx<'_>, id: ItemId) -> Option<Entry> {
         names: names.into(),
         missed,
         erred,
+        unlowered,
         kind: changed_kind(db, id),
         method: method_name(db, id),
         counterpart: trait_counterpart(db, id),

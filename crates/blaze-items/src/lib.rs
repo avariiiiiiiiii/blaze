@@ -60,11 +60,11 @@ impl<'db> Refs<'db> {
         body: Option<DefWithBodyId>,
     ) -> Result<Vec<ItemId>, &'static str> {
         let node = self.0.node_with(id, false);
-        node.interface.missed.map_or(Ok(()), Err)?;
+        node.interface.missed.or(node.interface.unlowered).map_or(Ok(()), Err)?;
         let mut refs = node.interface.refs;
         if let Some(body) = body {
             let code = self.0.code(body);
-            code.missed.map_or(Ok(()), Err)?;
+            code.missed.or(code.unlowered).map_or(Ok(()), Err)?;
             refs.extend(code.refs);
         }
         let mut unique = FxHashSet::default();
@@ -78,7 +78,7 @@ impl<'db> Refs<'db> {
         args: hir_ty::next_solver::GenericArgs<'db>,
     ) -> Result<Vec<ItemId>, &'static str> {
         let sub = self.0.of_args(args);
-        sub.missed.map_or(Ok(sub.refs), Err)
+        sub.missed.or(sub.unlowered).map_or(Ok(sub.refs), Err)
     }
 }
 
@@ -174,7 +174,7 @@ pub fn of_crates(
         // What a form could not write could differ between two items whose forms are the
         // same: such a form is this item's alone, by where it is written.
         for sub in std::iter::once(&mut node.interface).chain(node.body.as_mut()) {
-            if sub.missed.is_some() {
+            if sub.missed.is_some() || sub.unlowered.is_some() {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&sub.digest).update(b"missed").update(external(id).as_bytes());
                 sub.digest = *hasher.finalize().as_bytes();
@@ -256,10 +256,8 @@ pub fn of_crates(
                 }
                 *hasher.finalize().as_bytes()
             });
-            let missed = nodes[at]
-                .interface
-                .missed
-                .or_else(|| nodes[at].body.as_ref().and_then(|it| it.missed));
+            let missed = (std::iter::once(&nodes[at].interface).chain(&nodes[at].body))
+                .find_map(|it| it.missed.or(it.unlowered));
             let refs = nodes[at]
                 .interface
                 .refs

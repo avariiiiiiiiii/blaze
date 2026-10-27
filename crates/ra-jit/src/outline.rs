@@ -1447,7 +1447,24 @@ pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
     if macros(&was) || macros(&now) {
         return false;
     }
-    was.said() == now.said()
+    let (was, now) = (was.said(), now.said());
+    if was == now {
+        return true;
+    }
+    if std::env::var_os("RA_JIT_RESPACED_WHY").is_some() {
+        let at = was.iter().zip(&now).position(|(a, b)| a != b).unwrap_or(was.len().min(now.len()));
+        let near = |said: &[Said<'_>]| -> String {
+            (said[at.saturating_sub(3)..(at + 3).min(said.len())].iter())
+                .map(|it| match it {
+                    Said::Token((_, text, joint)) => format!("{text}{}", if *joint { "~" } else { "" }),
+                    Said::Uses(uses) => format!("[{} uses]", uses.len()),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        eprintln!("respaced-why: was `{}`, now `{}`", near(&was), near(&now));
+    }
+    false
 }
 
 /// The tokens of a text that say something: neither blank space nor a comment but a doc

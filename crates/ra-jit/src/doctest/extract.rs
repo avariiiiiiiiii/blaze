@@ -193,13 +193,18 @@ impl Found<'_> {
     fn documented(&mut self, item: impl HasAttrs, path: &str) {
         let Some(docs) = item.hir_docs(self.db) else { return };
         let text = docs.docs();
-        // rustdoc counts the lines of the text from the line the documentation starts on. That
-        // is not always the line the block is written on: the first line of a `/** */` that
-        // has nothing is not in the text, nor is a `doc` of a `cfg_attr` that is off.
+        // Where rustdoc does not find the fence of a block, it counts the lines of the text from
+        // the line the documentation starts on. That is not always the line the block is
+        // written on: the first line of a `/** */` that has nothing is not in the text, nor is
+        // a `doc` of a `cfg_attr` that is off.
         let Some((file, first)) = self.start(docs) else { return };
+        let mut all_comments = None;
         for block in blocks(text) {
             let Some(marks) = Marks::parse(&block.lang) else { continue };
-            let place = (file.clone(), first + text[..block.start].matches('\n').count());
+            let all_comments = *all_comments.get_or_insert_with(|| self.all_comments(docs));
+            let line = self.fence_line(docs, &block, all_comments);
+            let line = line.unwrap_or_else(|| first + text[..block.start].matches('\n').count());
+            let place = (file.clone(), line);
             if !self.seen.insert((place.0.clone(), place.1, path.to_owned())) {
                 continue;
             }
@@ -211,6 +216,69 @@ impl Found<'_> {
                 code: with_hidden_lines(&block.code),
             });
         }
+    }
+
+    /// The line the fence that opens `block` is written on, when rustdoc finds it (rustdoc of
+    /// nightly-2026-10-27, rust-lang/rust 5bee8ffb73): in documentation that is all comments,
+    /// always; otherwise only where the text of the fence's line is in the comment, string or
+    /// included file it is written in once. `None` has rustdoc count from where the
+    /// documentation starts.
+    fn fence_line(&self, docs: &hir::Docs, block: &Block, all_comments: bool) -> Option<usize> {
+        let text = docs.docs();
+        let line_end = text.get(block.start..block.end)?.find('\n').unwrap_or(3);
+        let pat = text.get(block.start..block.start + line_end).filter(|it| !it.is_empty())?;
+        let range = TextRange::at(TextSize::new(block.start as u32), TextSize::of(pat));
+        let Some((range, _)) = docs.find_ast_range(range) else {
+            return self.included_line(docs, block.start, pat);
+        };
+        let db = self.db;
+        let tree = range.file_id.parse_or_expand(db);
+        let token = tree.token_at_offset(range.value.start()).right_biased()?;
+        // What rustdoc looks in: the comment or string as it is written, where a macro is used
+        // for what a macro wrote.
+        let written = hir::InFile::new(range.file_id, token).original_file_range(db);
+        let source = db.file_text(written.file_id.file_id(db)).text(db);
+        let snippet = source.get(std::ops::Range::<usize>::from(written.range))?;
+        let at = if !all_comments {
+            written.range.start() + TextSize::new(found_once(snippet, pat)? as u32)
+        } else if range.file_id.is_macro() {
+            written.range.start() + TextSize::new(snippet.find(pat).unwrap_or(0) as u32)
+        } else {
+            range.value.start()
+        };
+        self.line_of(written.file_id, at).map(|(_, line)| line)
+    }
+
+    /// The line in the file of the documentation's `include_str!`, its only macro, of the block
+    /// at `start` whose fence's line is `pat`: rustdoc finds it when the file is all of the
+    /// documentation, or when `pat` is in the file once.
+    fn included_line(&self, docs: &hir::Docs, start: usize, pat: &str) -> Option<usize> {
+        let mut calls = docs.macro_calls();
+        let (call, id) = calls.next()?;
+        if calls.next().is_some() || included(&call.to_in_file_node(self.db).value).is_none() {
+            return None;
+        }
+        let expansion = hir::HirFileId::from(id).parse_or_expand(self.db);
+        let mut tokens = expansion.descendants_with_tokens().filter_map(|it| it.into_token());
+        let file = tokens.find_map(<syntax::ast::String as syntax::AstToken>::cast)?;
+        let file = file.value().ok()?;
+        let text = docs.docs();
+        let at = if text.trim_end() == file.trim_end() { start } else { found_once(&file, pat)? };
+        Some(1 + file.get(..at)?.matches('\n').count())
+    }
+
+    /// Whether every line of the documentation is written in a comment: rustdoc finds the
+    /// fence of a block of such documentation wherever it is.
+    fn all_comments(&self, docs: &hir::Docs) -> bool {
+        let text = docs.docs();
+        let starts = std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1));
+        starts.into_iter().all(|at| {
+            let at = TextRange::empty(TextSize::new(at as u32));
+            let Some((range, _)) = docs.find_ast_range(at) else { return false };
+            let tree = range.file_id.parse_or_expand(self.db);
+            let comment = [SyntaxKind::OUTER_DOC_COMMENT, SyntaxKind::INNER_DOC_COMMENT];
+            tree.token_at_offset(range.value.start()).any(|it| comment.contains(&it.kind()))
+        })
     }
 
     fn path(&self, file: ide_db::base_db::FileId) -> Option<PathBuf> {
@@ -281,6 +349,13 @@ impl Found<'_> {
     }
 }
 
+/// Where `pat` is in `text`, when it is there once (counting ones that overlap).
+fn found_once(text: &str, pat: &str) -> Option<usize> {
+    let found = text.find(pat)?;
+    let again = text.as_bytes()[found + 1..].windows(pat.len()).any(|it| it == pat.as_bytes());
+    (!again).then_some(found)
+}
+
 /// The file an `include_str!("file")` names, as it is written.
 fn included(call: &syntax::ast::MacroCall) -> Option<String> {
     let includes = call.path()?.segment()?.name_ref().is_some_and(|it| it.text() == "include_str");
@@ -344,8 +419,9 @@ fn shown_type(ty: &syntax::ast::Type) -> String {
 
 /// A code block of a Markdown text.
 struct Block {
-    /// Where in the text it starts.
+    /// Where in the text it starts and ends.
     start: usize,
+    end: usize,
     /// What follows the fence that opens it: nothing for an indented block.
     lang: String,
     code: String,
@@ -366,7 +442,8 @@ fn blocks(markdown: &str) -> Vec<Block> {
                     CodeBlockKind::Fenced(lang) => lang.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                open = Some(Block { start: range.start, lang, code: String::new() });
+                let (start, end) = (range.start, range.end);
+                open = Some(Block { start, end, lang, code: String::new() });
             }
             Event::Text(text) => {
                 if let Some(block) = &mut open {

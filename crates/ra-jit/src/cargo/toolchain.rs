@@ -16,6 +16,8 @@
 
 mod own;
 
+pub(crate) use own::home;
+
 use std::{
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
@@ -27,8 +29,9 @@ use super::state::rustc_says;
 /// The toolchain blaze compiles, as rustup names it: `nightly-2026-10-25`.
 pub(crate) const OURS: &str = include_str!("../../../../harness/toolchain");
 
-/// blaze's toolchain as blaze names it: `blaze-2026-10-25`, after the date of the Rust nightly
-/// it is (`harness/toolchain`). rustup knows it by this name when the installer linked it.
+/// blaze's toolchain as blaze names it in what it prints: `blaze-2026-10-25`, after the date of
+/// the Rust nightly it is (`harness/toolchain`), so it moves with every bump. rustup knows the
+/// toolchain by the nightly's name, not this one.
 pub(crate) fn name() -> String {
     let ours = OURS.trim();
     format!("blaze-{}", ours.strip_prefix("nightly-").unwrap_or(ours))

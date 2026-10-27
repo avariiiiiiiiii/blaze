@@ -601,6 +601,10 @@ pub(crate) struct Frozen {
     reached: FxHashMap<(Node, StoredParamEnvAndCrate), Option<Option<Mark>>>,
     /// The crates that have seen an edit since.
     edited: FxHashSet<Crate>,
+    /// Those of `edited` whose first values of statics an edit can have changed: of a change
+    /// to an included file, only the crates that include it and what depends on them
+    /// ([`Frozen::edit_apart`]).
+    edited_values: FxHashSet<Crate>,
     /// The files that have seen an edit to the bodies of functions alone, which can change
     /// no function written elsewhere.
     edited_bodies: FxHashSet<FileId>,
@@ -610,13 +614,16 @@ pub(crate) struct Frozen {
     /// The first value rustc gave each static with state that a build asked about
     /// ([`RustcValues`]).
     statics: Arc<std::sync::Mutex<FxHashMap<StaticId, Option<Mark>>>>,
+    /// The crates whose statics [`Frozen::take_values`] took.
+    taken: FxHashSet<Crate>,
 }
 
 /// The first value rustc gave each static with state (a thread-local, or one written at run
 /// time), as rustc compiled it: such a static stays rustc's copy only while its first value
-/// is still that one (`docs/live.md#statics`). Taken the first time a build asks, when no
-/// edit since the daemon started can have reached the static; `None` when one had, and
-/// rustc's value is not known.
+/// is still that one (`docs/live.md#statics`). Taken the first time a build asks, or before
+/// the first edit of its crate or one it depends on ([`Frozen::take_values`]), when no edit
+/// since the daemon started can have reached the static; `None` when one had, and rustc's
+/// value is not known.
 #[derive(Clone, Default)]
 pub(crate) struct RustcValues {
     known: Arc<std::sync::Mutex<FxHashMap<StaticId, Option<Mark>>>>,
@@ -645,7 +652,7 @@ impl Frozen {
     /// What a build asks of [`RustcValues`]: the values taken so far, shared with it, and the
     /// edits as they are now.
     pub(crate) fn rustc_values(&self) -> RustcValues {
-        let touched = self.edited.iter().chain(&self.distrusted).copied().collect();
+        let touched = self.edited_values.iter().chain(&self.distrusted).copied().collect();
         RustcValues { known: self.statics.clone(), touched: Arc::new(touched) }
     }
 
@@ -658,7 +665,47 @@ impl Frozen {
     }
 
     pub(crate) fn edit(&mut self, crates: impl IntoIterator<Item = Crate>) {
+        let crates: Vec<Crate> = crates.into_iter().collect();
+        self.edited.extend(crates.iter().copied());
+        self.edited_values.extend(crates);
+    }
+
+    /// [`Frozen::edit`] of `crates`, where the first values of statics an edit can have
+    /// changed are only those of `values`.
+    pub(crate) fn edit_apart(
+        &mut self,
+        crates: impl IntoIterator<Item = Crate>,
+        values: impl IntoIterator<Item = Crate>,
+    ) {
         self.edited.extend(crates);
+        self.edited_values.extend(values);
+    }
+
+    /// Takes the first value of each static with state that `crates` declare, of those no
+    /// edit has reached: asked before an edit reaches them, so that a build that first asks
+    /// about one after it, as a build in full of code no build compiled before does, still
+    /// knows rustc's ([`RustcValues`]).
+    pub(crate) fn take_values(&mut self, db: &dyn HirDatabase, crates: FxHashSet<Crate>) {
+        let untouched =
+            |it: &Crate| !self.edited_values.contains(it) && !self.distrusted.contains(it);
+        let fresh: Vec<Crate> =
+            crates.into_iter().filter(|it| untouched(it) && !self.taken.contains(it)).collect();
+        if fresh.is_empty() {
+            return;
+        }
+        self.taken.extend(fresh.iter().copied());
+        let statics = super::stable::declared_statics(db, &fresh);
+        let mut known = self.statics.lock().unwrap_or_else(|e| e.into_inner());
+        for id in statics {
+            if known.contains_key(&id) {
+                continue;
+            }
+            let Ok(compiled) = compiled_static(db, id).as_ref() else { continue };
+            if is_thread_local(db, id) || compiled.writable {
+                let mark = Mark::new(db, static_serial(db, id), &compiled.requests);
+                known.insert(id, Some(mark));
+            }
+        }
     }
 
     /// Whether an edit since the daemon started can have changed what the root is.
@@ -1113,6 +1160,11 @@ pub(super) struct Unchanged {
     pub(super) broken: FxHashSet<Node>,
     /// The roots the edit took away, which refer to nothing any more.
     pub(super) gone: FxHashSet<FunctionId>,
+    /// What changed (or is broken) that nothing the edit left reaches any more, by each
+    /// unchanged instance or static of the base whose code still refers to it: the patch
+    /// compiles none of it, and code that refers to one of those again would reach the base's
+    /// copy, which is of the source before.
+    pub(super) behind: FxHashMap<Node, Vec<Node>>,
 }
 
 pub(super) struct Patch {
@@ -1130,7 +1182,7 @@ pub(super) fn empty_object() -> Result<Vec<u8>> {
         .emit()
         .map_err(|e| CodegenError::Backend(e.to_string()))?;
     if super::Target::current().writes_wasm_objects() {
-        return super::wasm_object::from_elf(&object, &Default::default())
+        return super::wasm_object::from_elf(&object, &Default::default(), &[])
             .map_err(CodegenError::Backend);
     }
     Ok(object)
@@ -2492,6 +2544,35 @@ impl Base {
         false
     }
 
+    /// Each of `dropped` by the instances and statics of the base above it that the edit left
+    /// as they were, up to what it changed: what refers to one of those reaches the base's
+    /// copy of the dropped one through it.
+    fn behind(&self, dropped: &[Node], unchanged: &Unchanged) -> FxHashMap<Node, Vec<Node>> {
+        let mut behind: FxHashMap<Node, Vec<Node>> = FxHashMap::default();
+        for node in dropped {
+            let mut seen = FxHashSet::default();
+            let mut stack = vec![node];
+            while let Some(below) = stack.pop() {
+                let parents = match below {
+                    Node::Root(_) => None,
+                    Node::Instance(instance) => self.instances.get(instance).map(|it| &it.parents),
+                    Node::Static(id) => self.statics.get(id).map(|it| &it.parents),
+                };
+                for parent in parents.into_iter().flatten() {
+                    if matches!(parent, Node::Root(_))
+                        || unchanged.changed.contains(parent)
+                        || !seen.insert(parent)
+                    {
+                        continue;
+                    }
+                    behind.entry(parent.clone()).or_default().push(node.clone());
+                    stack.push(parent);
+                }
+            }
+        }
+        behind
+    }
+
     /// Whether what referred to the node in the base does so after the edit.
     fn still_asks_for(
         &self,
@@ -2627,6 +2708,7 @@ impl Base {
                 .collect(),
             broken: broken.iter().map(|it| it.0.clone()).collect(),
             gone,
+            behind: FxHashMap::default(),
         };
         // Nothing tells what in rustc's code refers to what.
         if let Some((_, why)) =
@@ -2634,12 +2716,26 @@ impl Base {
         {
             return Ok(Err(why));
         }
+        let mut dropped: Vec<Node> = broken.iter().map(|it| it.0.clone()).collect();
         // rustc's code may call any of them still.
         if !self.rustc {
-            changed_instances
-                .retain(|it| self.reaches(db, &Node::Instance(it.clone()), &unchanged));
-            changed_statics.retain(|&it| self.reaches(db, &Node::Static(it), &unchanged));
+            changed_instances.retain(|it| {
+                let node = Node::Instance(it.clone());
+                let reached = self.reaches(db, &node, &unchanged);
+                if !reached {
+                    dropped.push(node);
+                }
+                reached
+            });
+            changed_statics.retain(|&it| {
+                let reached = self.reaches(db, &Node::Static(it), &unchanged);
+                if !reached {
+                    dropped.push(Node::Static(it));
+                }
+                reached
+            });
         }
+        let behind = self.behind(&dropped, &unchanged);
         let verify = start.elapsed();
 
         let mut cg = ObjectCodegen::new(
@@ -2657,7 +2753,7 @@ impl Base {
         cg.rustc_values = known.frozen.rustc_values();
         cg.tiers = Some(&known.tiers);
         // What nothing reached any more can be reached again by the code compiled now.
-        cg.replaced = unchanged;
+        cg.replaced = Unchanged { behind, ..unchanged };
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
             let was = &self.instances[instance];
@@ -2701,6 +2797,10 @@ impl Base {
         // calling or polling rustc's code for that type, which is of the source before.
         if self.rustc && changed_roots.iter().any(|&root| super::hands_out_opaque(db, root)) {
             return Ok(Err("a function that hands rustc's code an `impl Trait` changed or moved"));
+        }
+        if self.rustc {
+            let crates = changed_roots.iter().map(|it| it.krate(db)).collect();
+            cg.define_rustc_allocator_entries(&crates)?;
         }
         let mut queued: FxHashSet<FunctionId> = known_roots().collect();
         let mut queue = changed_roots;

@@ -17,8 +17,11 @@ Change a function and run `blaze run` again: the `Finished` line now says `[ra-j
 ## What you need
 
 - **macOS on Apple silicon, or Linux on x86-64 or ARM64.** On Windows x86-64 (MSVC) blaze
-  installs and builds through its engine, but live edits of a running program are not there
-  yet. Intel Macs are not supported.
+  builds through its engine and takes live edits of a running program, but has no release
+  build and the installer refuses Windows: install it [from crates.io](#from-cratesio). There
+  is no sandbox there yet, so a build with build scripts or proc macros needs
+  `BLAZE_SANDBOX=off` ([platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not
+  supported.
 - **On Linux, glibc 2.34 or newer**: RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Each
   is checked by installing there in a container with no Rust. Alpine and other musl systems are
   not supported; the installer says so.

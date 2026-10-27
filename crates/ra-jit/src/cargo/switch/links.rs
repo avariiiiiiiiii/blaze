@@ -25,11 +25,14 @@ pub(crate) struct Link {
     pub(crate) path: PathBuf,
     /// Where the file that was there is kept, when there was one.
     kept: Option<PathBuf>,
+    /// Whether `enable` made the directory the link is in, which `disable` then removes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    made_dir: bool,
 }
 
 /// `cargo-blaze`, installed next to this ra-jit.
 fn target() -> anyhow::Result<PathBuf> {
-    let this = std::env::current_exe().context("ra-jit does not know where it is installed")?;
+    let this = std::env::current_exe().context("blaze does not know where it is installed")?;
     Ok(this.with_file_name(format!("cargo-blaze{}", std::env::consts::EXE_SUFFIX)))
 }
 
@@ -100,6 +103,7 @@ fn make_in(
             }
             Err(_) => None,
         };
+        let made_dir = !bin.exists();
         std::fs::create_dir_all(&bin)?;
         if !ours(&path) {
             if let Err(error) = link(target, &path) {
@@ -117,7 +121,7 @@ fn make_in(
             ),
             None => format!("`cargo {name}` is blaze's: {} links to it", path.display()),
         });
-        made.push(Link { path, kept });
+        made.push(Link { path, kept, made_dir });
     }
     Ok(lines)
 }
@@ -136,7 +140,7 @@ fn link(_: &Path, _: &Path) -> std::io::Result<()> {
 /// back, is left as it is, and the file kept for it goes.
 pub(crate) fn undo(links: &[Link]) -> anyhow::Result<Vec<String>> {
     let mut lines = Vec::new();
-    for Link { path, kept } in links {
+    for Link { path, kept, .. } in links {
         let name = command(path);
         if ours(path) {
             std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
@@ -159,6 +163,10 @@ pub(crate) fn undo(links: &[Link]) -> anyhow::Result<Vec<String>> {
         }
     }
     if let Some(dir) = links.iter().find_map(|it| it.kept.as_deref()?.parent()) {
+        let _ = std::fs::remove_dir(dir);
+    }
+    // The directory `enable` made for its links goes too, when nothing else was put in it.
+    if let Some(dir) = links.iter().find(|it| it.made_dir).and_then(|it| it.path.parent()) {
         let _ = std::fs::remove_dir(dir);
     }
     Ok(lines)

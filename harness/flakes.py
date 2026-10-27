@@ -27,7 +27,7 @@ def runs_of(checkout, count, ra_jit, env):
         if keep:
             with open(os.path.join(keep, f"{'ra-jit' if ra_jit else 'cargo'}-{run}.log"), "w") as kept:
                 kept.write(ran.stdout + ran.stderr)
-        built["daemon" if "[ra-jit]" in ran.stderr else "cargo"] += 1
+        built["daemon" if "[blaze]" in ran.stderr else "cargo"] += 1
     return failed, built
 
 

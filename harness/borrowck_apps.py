@@ -5,10 +5,11 @@ usage: borrowck_apps.py [NAME...] [--bin ra-jit] [--apps-dir dir] [--jobs N] [--
 
 Every application there is code rustc accepts, so each borrow-check error the checker reports
 in one is a false one, and a file it panics on has none of its errors reported. Each app is
-cloned at its `rev` (or taken from `apps/<source>`), checked, and its errors and panics
-printed by app. Exits 1 when any app has one, or could not be checked.
+cloned at its `rev` (or taken from `apps/<source>`), given what `cargo metadata` needs that the
+clone lacks (its `prepare` module's `sources`), checked, and its errors and panics printed by
+app; `ra-jit borrowck --project` refuses a workspace `cargo metadata` fails on. Exits 1 when any app has one, or could not be checked.
 """
-import argparse, asyncio, collections, json, os, sys, time
+import argparse, asyncio, collections, importlib, json, os, sys, time
 from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,10 @@ async def checkout(name, spec, apps_dir):
     if have != spec["rev"]:
         await checked(["git", "fetch", "-q", "--depth", "1", "origin", spec["rev"]], ws, 600)
         await checked(["git", "checkout", "-q", "FETCH_HEAD"], ws, 120)
+    # What `cargo metadata` needs that the clone lacks (bun's vendored crates), without the
+    # build its `prepare` makes for building it: the checker builds nothing.
+    if "prepare" in spec:
+        await asyncio.to_thread(importlib.import_module(spec["prepare"]).sources, ws)
     return ws
 
 
@@ -92,7 +97,7 @@ async def main():
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--json")
-    ap.add_argument("--skip", action="append", default=["bun"], help="apps left out (bun needs bunprep)")
+    ap.add_argument("--skip", action="append", default=[], help="apps left out")
     args = ap.parse_args()
     args.bin = os.path.abspath(args.bin) if os.sep in args.bin else args.bin
     specs = json.load(open(SPECS))

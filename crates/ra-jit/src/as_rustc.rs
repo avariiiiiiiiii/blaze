@@ -71,7 +71,7 @@ fn run(args: &[OsString]) -> anyhow::Result<i32> {
     }
     if crate::answers::is_question(args) {
         let answer = crate::answers::own_answer_of(&rustc, args, &stdin)
-            .context("ra-jit has no answer of its own to this question")?;
+            .context("blaze has no answer of its own to this question")?;
         std::io::stdout().write_all(&answer)?;
         return Ok(0);
     }
@@ -137,7 +137,7 @@ impl<'a> Probe<'a> {
                             None => (kind, None),
                         };
                         if !EMITTED.contains(&kind) {
-                            bail!("ra-jit checks a probe, and `--emit={kind}` asks for more");
+                            bail!("blaze checks a probe, and `--emit={kind}` asks for more");
                         }
                         probe.emit.push((kind, path));
                     }
@@ -145,7 +145,7 @@ impl<'a> Probe<'a> {
                 "--crate-type" => {
                     for kind in value()?.split(',') {
                         if !matches!(kind, "lib" | "rlib") {
-                            bail!("ra-jit checks a library, not a `--crate-type {kind}`");
+                            bail!("blaze checks a library, not a `--crate-type {kind}`");
                         }
                     }
                 }
@@ -164,14 +164,14 @@ impl<'a> Probe<'a> {
                 "-Z" => probe.cfg_flags.extend(["-Z", value()?]),
                 _ if IGNORED_VALUED.contains(&flag) => _ = value()?,
                 "-D" | "-F" | "--deny" | "--forbid" | "--force-warn" => {
-                    bail!("ra-jit can't tell which lints rustc would find, which `{flag}` denies")
+                    bail!("blaze can't tell which lints rustc would find, which `{flag}` denies")
                 }
                 _ if !flag.starts_with('-') => probe.input_is(Some(word))?,
-                _ => bail!("ra-jit does not know rustc's `{flag}`"),
+                _ => bail!("blaze does not know rustc's `{flag}`"),
             }
         }
         if probe.emit.is_empty() {
-            bail!("rustc would link the crate, and ra-jit checks it");
+            bail!("rustc would link the crate, and blaze checks it");
         }
         if probe.output.is_some() && probe.emit.len() > 1 {
             bail!("`-o` with more than one `--emit`");
@@ -212,7 +212,7 @@ impl<'a> Probe<'a> {
         let mut asked: Vec<OsString> = self.cfg_flags.iter().map(OsString::from).collect();
         asked.extend(["--print", "cfg"].map(OsString::from));
         crate::answers::own_answer_of(rustc, &asked, &[])
-            .context("ra-jit can't tell the cfgs rustc would check the crate with")?;
+            .context("blaze can't tell the cfgs rustc would check the crate with")?;
         let cfg_args: Vec<String> = self.cfg_flags.iter().map(|it| (*it).to_owned()).collect();
         let cfg = crate::cargo::own_script::cfg_of(&cfg_args);
         let target = self.cfg_flags.windows(2).find(|it| it[0] == "--target").map(|it| it[1]);
@@ -233,7 +233,7 @@ impl<'a> Probe<'a> {
             .with_context(|| format!("reading {}", root.display()))?;
         let edition = self.edition.unwrap_or("2015");
         if let Some(unknown) = features(&text, edition).into_iter().find(|it| !known_feature(it)) {
-            bail!("ra-jit does not know whether the toolchain has the feature `{unknown}`");
+            bail!("blaze does not know whether the toolchain has the feature `{unknown}`");
         }
         let project = dir.path().join("rust-project.json");
         let described = serde_json::json!({
@@ -276,6 +276,11 @@ impl<'a> Probe<'a> {
                 }
                 _ => String::new(),
             };
+            // `-o -` is standard output to rustc (rustix's probes), not a file named `-`.
+            if path == Path::new("-") {
+                std::io::stdout().write_all(text.as_bytes())?;
+                continue;
+            }
             std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         }
         Ok(0)

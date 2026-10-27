@@ -21,7 +21,7 @@ pub fn main() -> ExitCode {
         Err(error) => format!("ra-jit-rustc does not know where it is installed ({error})"),
     };
     // The build is the user's, with ra-jit or without.
-    eprintln!("ra-jit: {why}; rustc compiles");
+    eprintln!("blaze: {why}; rustc compiles");
     let Some(rustc) = asked.next() else { return ExitCode::FAILURE };
     match Command::new(rustc).args(asked).status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),

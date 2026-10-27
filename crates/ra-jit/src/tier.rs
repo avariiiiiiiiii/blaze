@@ -217,10 +217,21 @@ fn now_ms() -> u64 {
 }
 
 /// The name a function is shown by: demangled, without the hash. An instance the daemon
-/// named itself (`ra-jit::<name>::<number>`) is shown by its name.
+/// named itself (`ra-jit::<name>::<number>`) is shown by its name, and a function of a crate
+/// rustc built nothing of (`ra-jit.<crate id>.<path>`) by its path, the crate written without
+/// its id.
 fn shown(symbol: &str) -> String {
     let symbol = symbol.strip_prefix('_').unwrap_or(symbol);
-    if let Some(own) = symbol.strip_prefix("ra-jit::").or_else(|| symbol.strip_prefix("ra_jit::")) {
+    let hex = |it: &str| !it.is_empty() && it.bytes().all(|b| b.is_ascii_hexdigit());
+    if let Some((id, path)) = symbol.strip_prefix("ra-jit.").and_then(|it| it.split_once('.'))
+        && hex(id)
+    {
+        let path = path.rsplit_once('.').filter(|it| hex(it.1)).map_or(path, |it| it.0);
+        return path.replace(&format!("[{id}]"), "");
+    }
+    let own =
+        ["ra-jit::", "ra_jit::", "ra-jit.patch::"].iter().find_map(|it| symbol.strip_prefix(it));
+    if let Some(own) = own {
         let numbered = |it: &(&str, &str)| {
             let number = it.1.strip_prefix('n').unwrap_or(it.1);
             !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
@@ -667,4 +678,21 @@ pub(crate) fn placed(uuid: [u8; 16], pid: u32, mut moved: Vec<(u64, u64)>, end: 
     program.placed.append(&mut moved);
     program.placed.sort_unstable();
     program.placed_end = program.placed_end.max(end);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shown;
+
+    #[test]
+    fn a_function_is_shown_by_its_path_without_ids_or_hashes() {
+        let own = "_ra-jit.607a16ec818c5cec.lifebench[607a16ec818c5cec]::next_age";
+        assert_eq!(shown(own), "lifebench::next_age");
+        let method = "ra-jit.607a16ec818c5cec.<lifebench[607a16ec818c5cec]::Life>::step";
+        assert_eq!(shown(method), "<lifebench::Life>::step");
+        assert_eq!(shown("ra-jit.1f.app[1f]::main::helper.9c0e"), "app::main::helper");
+        assert_eq!(shown("ra-jit.1f.helper.9c0e"), "helper");
+        assert_eq!(shown("_ra-jit::next_age::12"), "next_age");
+        assert_eq!(shown("ra-jit.patch::next_age::3"), "next_age");
+    }
 }

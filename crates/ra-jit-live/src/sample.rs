@@ -253,7 +253,7 @@ fn write(dir: &Path, profile: &Profile) {
     if let Err(why) =
         std::fs::write(&partial, profile.encode()).and_then(|()| std::fs::rename(&partial, &path))
     {
-        eprintln!("ra-jit: {}: {why}", path.display());
+        eprintln!("blaze: {}: {why}", path.display());
     }
 }
 

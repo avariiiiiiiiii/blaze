@@ -12,41 +12,13 @@ use anyhow::Context as _;
 use super::{
     affected::{self, Pick},
     cli::Invocation,
+    results::Results,
     sandboxed, say,
     state::{Held, Kind, Program, State, as_built},
 };
 
 /// The exit status of cargo when a test fails or a program can't be run.
 const FAILED: i32 = 101;
-
-/// Runs the program `asked` names, and ends as it ended. `None` when cargo has to say
-/// which program that is: there are several, or none.
-pub(crate) fn program(
-    asked: &Invocation,
-    state: &State,
-    cwd: &Path,
-    held: Option<Held>,
-) -> anyhow::Result<Option<i32>> {
-    let runnable = |it: &&Program| !it.test && matches!(it.kind, Kind::Bin | Kind::Example);
-    let mut programs: Vec<&Program> = state.programs.iter().filter(runnable).collect();
-    if let Some(name) = asked.flags.bin.as_ref().or(asked.flags.example.as_ref()) {
-        programs.retain(|it| it.name == *name);
-    } else if let [default] = programs.iter().filter(|it| it.default_run).collect::<Vec<_>>()[..] {
-        // Cargo runs a `default-run` when one package it builds has one.
-        programs = vec![*default];
-    }
-    let &[program] = programs.as_slice() else { return Ok(None) };
-    let shown = shown_path(&program.executable, cwd);
-    let args = asked.program_args().map(|it| format!(" {it}")).collect::<String>();
-    say::status(asked.flags.quiet, "Running", &format!("`{shown}{args}`"));
-    let mut command = Command::new(&program.executable);
-    configured(&mut command, state);
-    command.args(asked.program_args()).envs(program.env.iter().cloned());
-    as_built(&mut command)?;
-    let status =
-        ended(&mut command, held, state).with_context(|| format!("could not execute {shown}"))?;
-    Ok(Some(exit_code(status)))
-}
 
 /// Sets for `command` what the `[env]` of cargo's configuration sets, as cargo does: what
 /// cargo sets for the program itself goes over it.
@@ -81,7 +53,7 @@ fn listing_failures(
     program: &Path,
     held: Option<Held>,
     state: &State,
-) -> std::io::Result<(ExitStatus, Option<Vec<String>>)> {
+) -> std::io::Result<(ExitStatus, Summary)> {
     use std::io::{IsTerminal as _, Read as _, Write as _};
     let out = std::io::stdout();
     let colored = command.get_args().any(|it| {
@@ -116,7 +88,37 @@ fn listing_failures(
         }
     }
     let status = child.wait()?;
-    Ok((status, failures(&String::from_utf8_lossy(&printed))))
+    let printed = String::from_utf8_lossy(&printed);
+    Ok((status, Summary { failures: failures(&printed), counted: tests_counted(&printed) }))
+}
+
+/// What libtest's summaries at the end of a run say.
+struct Summary {
+    /// The tests listed as failed, `None` when none are.
+    failures: Option<Vec<String>>,
+    /// How many tests the summaries count as passed, failed or ignored, `None` without one.
+    counted: Option<usize>,
+}
+
+/// How many tests the `test result:` lines of what a program of tests printed count as passed,
+/// failed or ignored: those it ran or knew of, but not those it filtered out.
+fn tests_counted(printed: &str) -> Option<usize> {
+    let plain = without_colors(printed);
+    let mut total = None;
+    for line in plain.lines().filter_map(|it| it.strip_prefix("test result: ")) {
+        let mut sum = 0;
+        for part in line.split(';') {
+            let mut words = part.split_whitespace().rev();
+            let (Some(what), Some(count)) = (words.next(), words.next()) else { continue };
+            if matches!(what, "passed" | "failed" | "ignored")
+                && let Ok(count) = count.parse::<usize>()
+            {
+                sum += count;
+            }
+        }
+        *total.get_or_insert(0) += sum;
+    }
+    total
 }
 
 /// The tests libtest's summary lists as failed in what a program of tests printed: the names
@@ -172,8 +174,9 @@ fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std
 /// Runs the test executables one after another, each in the directory of its package and in
 /// a sandbox ([`sandboxed`]) unless its package or the command takes it out, and stops at the
 /// first that fails unless told not to. The result is cargo's exit status. Under
-/// `RA_JIT_TESTS=affected` each runs only the tests an edit reached since they passed
-/// ([`affected`]).
+/// `RA_JIT_TESTS=affected` each runs only the tests that have not passed with what they are a
+/// function of as it is now, as the store keeps them ([`results`]); `verify` runs those too and
+/// says whether they passed again ([`affected`]).
 pub(crate) fn tests(
     asked: &Invocation,
     state: &State,
@@ -181,7 +184,7 @@ pub(crate) fn tests(
     mut held: Option<Held>,
 ) -> anyhow::Result<i32> {
     let mut failed = Vec::new();
-    let (mut left, mut always_run) = (0, 0);
+    let mut tally = Tally::default();
     let programs: Vec<&Program> = state.programs.iter().filter(|it| it.test).collect();
     let mut opt_outs: BTreeMap<&Path, sandboxed::OptOut> = BTreeMap::new();
     for test in &programs {
@@ -201,6 +204,14 @@ pub(crate) fn tests(
         ));
         return Ok(FAILED);
     }
+    let mut results = affected::on().then(Results::open).flatten();
+    if affected::on() && results.is_none() {
+        say::note(
+            "no store (`RA_JIT_CACHE=off`): no test's pass is kept, and every test the daemon \
+             built runs",
+        );
+    }
+    let run = affected::run_identity(asked);
     let mut scratch = sandboxed::Scratch::new();
     let no_test = BTreeSet::new();
     for test in programs {
@@ -224,19 +235,37 @@ pub(crate) fn tests(
             (true, false) => Some(sandboxed::whole_env(&bare()?)),
         };
         let identity = env.as_deref().filter(|_| affected::on()).map(sandboxed::identity_of);
+        let manifest = opt_out.manifest.display();
+        let why_outside = match sandboxing {
+            true => format!("`tests = false` under `{}` in {manifest}", sandboxed::TABLE),
+            false => format!("`{}=off`", sandboxed::VAR),
+        };
+        let sandbox = identity.as_deref().ok_or(why_outside.as_str());
         let outside = if sandboxed_here { &opt_out.tests } else { &no_test };
-        let pick =
-            affected::pick(asked, state, test, identity.as_deref(), outside, &opt_out.manifest);
+        let pick = affected::pick(
+            asked,
+            state,
+            test,
+            results.as_mut(),
+            &run,
+            sandbox,
+            outside,
+            &opt_out.manifest,
+        );
         let mut picked = None;
-        if let Pick::Some { names: Some(names), total, .. } = &pick {
-            left += total - names.len();
-            if names.is_empty() {
-                let unchanged = format!("{}, unchanged since the last pass", counted(*total));
-                say::status(asked.flags.quiet, "Skipping", &format!("{running}: {unchanged}"));
-                continue;
+        if let Pick::Some { names, total, cached, .. } = &pick {
+            for from in cached.values() {
+                *tally.cached.entry(from.clone()).or_default() += 1;
             }
-            running.push_str(&format!(": {} of {}", names.len(), counted(*total)));
-            picked = Some(names.as_slice());
+            if let Some(names) = names {
+                if names.is_empty() {
+                    let passed = format!("{}, passed before as they are now", counted(*total));
+                    say::status(asked.flags.quiet, "Cached", &format!("{running}: {passed}"));
+                    continue;
+                }
+                running.push_str(&format!(": {} of {}", names.len(), counted(*total)));
+                picked = Some(names.as_slice());
+            }
         }
         say::status(asked.flags.quiet, "Running", &running);
         let verbose = |word: &str, rest: &str| {
@@ -245,24 +274,33 @@ pub(crate) fn tests(
             }
         };
         let mut reads = false;
-        if let Pick::Some { always, reaching, .. } = &pick {
-            always_run += always.len();
+        if let Pick::Some { always, reaching, flaky, .. } = &pick {
             for test in always {
                 let by = test.path.as_ref().map(|it| format!(", by {it}")).unwrap_or_default();
                 verbose("Always", &format!("{}: {}{by}", test.name, test.why));
+                match test.outside {
+                    true => tally.outside.push(test.name.clone()),
+                    false => tally.always += 1,
+                }
             }
             for (name, why) in reaching {
                 verbose("Sandboxed", &format!("{name}: {why}"));
             }
+            for (name, from) in flaky {
+                say::warning(&format!(
+                    "{name} is flaky: it passed and failed with what it is a function of the \
+                     same (found in {from}), so it runs every time and is never kept"
+                ));
+            }
             reads = !reaching.is_empty();
         }
-        let manifest = opt_out.manifest.display();
         if sandboxing && opt_out.all {
             let why = format!("`tests = false` under `{}` in {manifest}", sandboxed::TABLE);
             verbose("Unsandboxed", &format!("every test of {}: {why}", test.package));
         }
         let parts = parts(asked, test, sandboxed_here, outside, picked, &bare, &running)?;
-        let (mut status, mut failures, mut record) = (None, Some(Vec::new()), None);
+        let (mut ended_badly, mut failures, mut record, mut counts) =
+            (false, Some(Vec::new()), None, Some(0));
         for part in parts {
             for name in &part.outside {
                 verbose("Unsandboxed", &format!("{name}: taken out of the sandbox in {manifest}"));
@@ -280,51 +318,77 @@ pub(crate) fn tests(
             command.args(&part.args);
             let ran = match part.sandboxed || matches!(pick, Pick::Some { .. }) {
                 true => listing_failures(&mut command, &test.executable, held.take(), state),
-                false => ended(&mut command, held.take(), state).map(|it| (it, None)),
+                false => ended(&mut command, held.take(), state)
+                    .map(|it| (it, Summary { failures: None, counted: None })),
             };
-            let (ended, ended_failures) =
-                ran.with_context(|| format!("could not execute {shown}"))?;
+            let (ended, summary) = ran.with_context(|| format!("could not execute {shown}"))?;
+            let (mut these, mut failed_here) = (summary.failures, !ended.success());
             if let Some(sandbox) = &sandbox {
                 record = sandbox.record();
-                if let (false, Some(lines)) = (ended.success(), &record) {
-                    sandboxed::diagnose(lines, ended_failures.as_deref(), &shown, opt_out);
+                if let Some(lines) = &record {
+                    let denied = sandboxed::denied(lines, &shown, opt_out);
+                    if denied.unknown {
+                        (failed_here, these) = (true, None);
+                    } else if !denied.tests.is_empty() {
+                        let mut all: BTreeSet<String> =
+                            these.unwrap_or_default().into_iter().collect();
+                        all.extend(denied.tests);
+                        (failed_here, these) = (true, Some(all.into_iter().collect()));
+                    }
                 }
             }
-            if !ended.success() {
-                status = status.or(Some(ended));
-                match (&mut failures, ended_failures) {
+            counts = counts.zip(summary.counted).map(|(a, b)| a + b);
+            if failed_here {
+                ended_badly = true;
+                match (&mut failures, these) {
                     (Some(all), Some(these)) => all.extend(these),
                     _ => failures = None,
                 }
             }
         }
-        match pick {
-            Pick::Some { passed, names, .. } if status.is_some() => {
-                passed.failed(names.as_deref(), failures.as_deref(), record.as_deref())
+        if let (Pick::Some { names, total, keys, cached, .. }, Some(results)) =
+            (&pick, results.as_mut())
+        {
+            let flaky = keys.settle(
+                results,
+                &affected::Ended {
+                    ran: names.as_deref(),
+                    total: *total,
+                    failed: ended_badly,
+                    failures: failures.as_deref(),
+                    counted: counts,
+                    record: record.as_deref(),
+                },
+            );
+            for name in &flaky {
+                say::warning(&format!(
+                    "{name} is flaky: it ended otherwise before with what it is a function of \
+                     the same, so it is never kept and runs every time"
+                ));
             }
-            Pick::Some { passed, .. } => passed.passed(record.as_deref()),
-            Pick::Asked => {}
+            if affected::verifying() {
+                let failed: BTreeSet<&str> =
+                    failures.iter().flatten().map(String::as_str).collect();
+                for (name, from) in cached {
+                    match (ended_badly, failures.is_some(), failed.contains(name.as_str())) {
+                        (true, false, _) => tally.unverified += 1,
+                        (_, _, true) => tally.wrong.push(format!("{name} (passed in {from})")),
+                        _ => tally.verified += 1,
+                    }
+                }
+            }
         }
-        if status.is_some() {
+        if ended_badly {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
                 break;
             }
         }
     }
-    let why = if asked.flags.verbose { "said above" } else { "`-v` says why" };
-    let always = format!("{} run every time ({why})", counted(always_run));
-    if left > 0 {
-        let all = format!("`{}=all` runs every test", affected::VAR);
-        let unchanged = format!("{}, unchanged since the last pass", counted(left));
-        let unchanged = match always_run {
-            0 => format!("{unchanged}; {all}"),
-            _ => format!("{unchanged}; {always}; {all}"),
-        };
-        say::status(asked.flags.quiet, "Skipped", &unchanged);
-    } else if always_run > 0 {
-        say::status(asked.flags.quiet, "Skipped", &format!("no test; {always}"));
+    if let Some(results) = &results {
+        results.seal();
     }
+    tally.say(asked);
     match failed.as_slice() {
         [] => Ok(0),
         [one] => {
@@ -335,6 +399,84 @@ pub(crate) fn tests(
             say::error(&format!("{} targets failed:", several.len()));
             several.iter().for_each(|it| eprintln!("    `{it}`"));
             Ok(FAILED)
+        }
+    }
+}
+
+/// What a command's test executables came to, said at its end.
+#[derive(Default)]
+struct Tally {
+    /// The tests not run for having passed as they are now, by where they passed.
+    cached: BTreeMap<String, usize>,
+    /// The tests run every time: benchmarks and those that reach what ra-jit can't compile.
+    always: usize,
+    /// The tests run outside the sandbox, every time.
+    outside: Vec<String>,
+    /// Under `verify`, the tests that passed again, those that failed, and those of a run
+    /// that ended without saying how each did.
+    verified: usize,
+    wrong: Vec<String>,
+    unverified: usize,
+}
+
+impl Tally {
+    fn say(&self, asked: &Invocation) {
+        let quiet = asked.flags.quiet;
+        let why = if asked.flags.verbose { "said above" } else { "`-v` says why" };
+        let all = format!("`{}=all` runs every test", affected::VAR);
+        let mut rest = Vec::new();
+        if self.always > 0 {
+            rest.push(format!("{} run every time ({why})", counted(self.always)));
+        }
+        if !self.outside.is_empty() {
+            const SHOWN: usize = 5;
+            let mut names = self.outside[..self.outside.len().min(SHOWN)].join(", ");
+            if self.outside.len() > SHOWN {
+                names.push_str(&format!(" and {} more", self.outside.len() - SHOWN));
+            }
+            rest.push(format!(
+                "{} outside the sandbox, run every time and never kept: {names}",
+                counted(self.outside.len())
+            ));
+        }
+        let verifying = affected::verifying();
+        if !self.cached.is_empty() && !verifying {
+            let mut from: Vec<(&String, &usize)> = self.cached.iter().collect();
+            from.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let from: Vec<String> = from
+                .iter()
+                .enumerate()
+                .map(|(at, (from, count))| match at {
+                    0 => format!("{} from {from}", counted(**count)),
+                    _ => format!("{count} from {from}"),
+                })
+                .collect();
+            rest.insert(0, from.join(", "));
+            rest.push(all);
+            say::status(quiet, "Cached", &rest.join("; "));
+        } else if !rest.is_empty() {
+            say::status(quiet, "Tests", &rest.join("; "));
+        }
+        if !verifying {
+            return;
+        }
+        let verified =
+            format!("{} of {} passed again", self.verified, counted(self.cached.values().sum()));
+        match (self.wrong.as_slice(), self.unverified) {
+            ([], 0) => say::status(quiet, "Verified", &format!("the passes kept: {verified}")),
+            ([], unverified) => say::status(
+                quiet,
+                "Verified",
+                &format!(
+                    "the passes kept: {verified}; {unverified} not told, their run ended without a summary"
+                ),
+            ),
+            (wrong, _) => say::error(&format!(
+                "{} kept as passed failed now, so each is flaky or its key misses what it is a \
+                 function of (a bug in blaze): {}",
+                counted(wrong.len()),
+                wrong.join(", ")
+            )),
         }
     }
 }

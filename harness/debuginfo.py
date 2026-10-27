@@ -1142,7 +1142,11 @@ def printed_by(debugger, binary, cwd, place, names):
     enum, whose variant it works out from the value, it fails to read memory at address 0, and
     the pretty-printer of a `&str` fails with "value has been optimized out" and leaves the
     value blank. rustc's optimized builds get the same. Where gdb printed no value and said
-    the value is optimized out, or `info address` says the symbol is, the name is optimized out."""
+    the value is optimized out, or `info address` says the symbol is, the name is optimized out.
+    A value of which only a part has a location is printed up to the part that has none: a
+    slice whose length is kept and whose pointer is not is `&[i32](size=2)`, and the printer
+    of its elements fails with "value has been optimized out", or gdb says `<error reading
+    variable: ...>` in its place. Such a value is what was printed, then ` <optimized out>`."""
     def mark(name):
         """A line that starts what is said of the name, on both of gdb's streams."""
         return (f"echo @@{name}@@\\n", f"python gdb.write('@@{name}@@\\n', gdb.STDERR)")
@@ -1159,10 +1163,22 @@ def printed_by(debugger, binary, cwd, place, names):
         out = said(ran.stdout, name)
         value = re.search(r"^\$\d+ = (.*)", out, re.M)
         value = value.group(1) if value else None
-        if not value and ("value has been optimized out" in said(ran.stderr, name) or f'Symbol "{name}" is optimized out.' in out):
+        told = "value has been optimized out" in said(ran.stderr, name)
+        if not value and (told or f'Symbol "{name}" is optimized out.' in out):
             value = OPTIMIZED_OUT
+        elif value and (told or "<error reading variable: value has been optimized out>" in value):
+            value = f"{value.split('<error reading variable')[0].rstrip()} {OPTIMIZED_OUT}".lstrip()
         printed[name] = re.sub(r"0x[0-9a-f]+", "0x..", value) if value is not None else None
     return printed
+
+
+def optimized_out(ours, theirs):
+    """Whether gdb has no whole value for a name, and shows what part it has as it shows that of
+    rustc's build: the start of a value printed in part has to be the start of rustc's."""
+    if not ours or OPTIMIZED_OUT not in ours:
+        return False
+    part = ours.removesuffix(f" {OPTIMIZED_OUT}")
+    return part == ours or theirs is not None and theirs.startswith(part)
 
 
 def kept_by_rustc(ws, asked):
@@ -1229,9 +1245,9 @@ def agreement(names, theirs, ours, lost=()):
     value for or only part of one, and which it shows otherwise. The names are returned with
     what is said. `lost` are names known to have no whole value, for a debugger that does not
     say so itself."""
-    partly = (OPTIMIZED_OUT, "<synthetic pointer>", "not available")
+    partly = ("<synthetic pointer>", "not available")
     gone = [name for name in names if ours[name] != theirs[name]
-            and (name in lost or ours[name] and any(it in ours[name] for it in partly))]
+            and (name in lost or optimized_out(ours[name], theirs[name]) or ours[name] and any(it in ours[name] for it in partly))]
     wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in names if ours[name] != theirs[name] and name not in gone]
     unknown = [name for name in names if theirs[name] is None]
     return (not wrong and not unknown, gone,
@@ -1297,11 +1313,11 @@ def shapes(tally):
     theirs = printed_by(debugger, os.path.join(ws, "target", "debug", "sline"), ws, place, TYPES)
     ours = printed_by(debugger, fx.binary, ws, place, TYPES)
     unknown = [name for name in TYPES if theirs[name] is None]
-    gone = [name for name in TYPES if ours[name] and OPTIMIZED_OUT in ours[name]]
-    wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in TYPES if ours[name] != theirs[name] and name not in gone]
-    fine, said = lost(gone, kept_by_rustc(ws, {place: gone} if gone else {}))
+    out = [name for name in TYPES if optimized_out(ours[name], theirs[name])]
+    wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in TYPES if ours[name] != theirs[name] and name not in out]
+    fine, said = lost(out, kept_by_rustc(ws, {place: out} if out else {}))
     tally.say("types: the debugger shows them", "NOT AS RUSTC'S" if wrong or unknown else "as rustc's" if fine else BEHIND,
-              f"{len(TYPES) - len(wrong) - len(gone)} of {len(TYPES)}, {len(gone)} optimized out"
+              f"{len(TYPES) - len(wrong) - len(out)} of {len(TYPES)}, {len(out)} optimized out"
               + (f", but {wrong[0][:90]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else "") + said)
 
 
@@ -1331,7 +1347,7 @@ def scopes(tally):
             if ours[name] == theirs[name]:
                 right += 1
                 unknown += theirs[name] is None
-            elif ours[name] and OPTIMIZED_OUT in ours[name]:
+            elif optimized_out(ours[name], theirs[name]):
                 gone.setdefault(f"{MAIN}:{line}", []).append(name)
             else:
                 wrong.append(f"{name} at line {line} = {ours[name]}, not {theirs[name]}")
@@ -1456,23 +1472,33 @@ def cost(tally):
         tally.say(name, "not run", "it counts DWARF's variables")
     else:
         def variables(settings, store):
+            """Builds at each of `settings` from one store, and the variables of the object and
+            what ra-jit's units of the binary tell of after each."""
             before = os.environ.pop("RA_JIT_CACHE", None)
             if store:
                 os.environ["RA_JIT_CACHE"] = tempfile.mkdtemp(prefix="debuginfo-store-")
+            told = []
             try:
                 for setting in settings:
                     os.environ["CARGO_PROFILE_DEV_DEBUG"] = setting
                     fx.ra_jit_build()
+                    dump = subprocess.run([DWARFDUMP, "--debug-info", fx.objects[0]], capture_output=True, text=True).stdout
+                    told.append((dump.count("DW_TAG_variable"), described(fx.binary)))
             finally:
                 if store:
                     shutil.rmtree(os.environ.pop("RA_JIT_CACHE"), ignore_errors=True)
                 if before is not None:
                     os.environ["RA_JIT_CACHE"] = before
-            dump = subprocess.run([DWARFDUMP, "--debug-info", fx.objects[0]], capture_output=True, text=True).stdout
-            return dump.count("DW_TAG_variable")
+            return told
         # Against a build at `true` from a store a build at `true` filled.
-        same, after = variables(["true", "true"], True), variables(["line-tables-only", "true"], True)
+        (_, first), (same, again) = variables(["true", "true"], True)
+        after = variables(["line-tables-only", "true"], True)[-1][0]
         tally.say(name, "described" if after == same else "VARIABLES LOST", f"{after} variables, {same} after one at true")
+        # What a build takes from the store is what it would have compiled: Cranelift's cache
+        # of code kept a frame without its last slots, and a root refused when compiled was
+        # taken from the store (#242).
+        tally.say("cost: debug = true from the store a build at true filled", "described" if again == first else "NOT THE SAME",
+                  f"{again[0]} functions and {again[1]} variables, {first[0]} and {first[1]} from an empty store")
     os.environ["CARGO_PROFILE_DEV_DEBUG"] = "true"
 
 

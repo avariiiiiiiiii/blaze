@@ -429,7 +429,9 @@ impl<'db> Keeper<'_, 'db> {
                 // rustc's copy of a function of the checkout is of the checkout as rustc
                 // built it, and uses rustc's copies of the statics.
                 let symbol = decl.linkage_name(id).into_owned();
-                let checked = self.symbols.defines(&symbol);
+                // Checked too when it is one of an object ra-jit built before, the standard
+                // library's unit: a build that compiles std's crates itself has no such symbol.
+                let checked = self.symbols.provides(&symbol);
                 // An item of an `extern` block is the symbol it links to, whoever declares it.
                 let foreign = |callee: &Instance| match callee.def {
                     InstanceDef::Fn(func) => link_name(db, func).is_some(),
@@ -486,10 +488,13 @@ impl<'db> Keeper<'_, 'db> {
                 let Some(name) = self.stable_name(callee) else {
                     return self.kept.unkept("unnamed callee");
                 };
-                // A function the program is built from has no entry: it is compiled anew.
+                // A function the program is built from has no entry: it is compiled anew. One
+                // that is never a root calls the copy it called, the store's (#242).
                 if stable::StableNames::of_checkout(&name)
                     && as_its_crate_compiles(db, self.symbols, callee)
                     && self.root_named(&name).is_some()
+                    && !matches!(callee.def, InstanceDef::Fn(func)
+                        if rustcs_callers_pass_scalable(db, self.symbols, func))
                 {
                     CachedTarget::Root(name.as_ref().to_owned())
                 } else {

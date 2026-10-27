@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""testselect.py: `cargo ra-jit test` with `RA_JIT_TESTS=affected` runs the tests an edit
-reached since they last passed, and no others.
+"""testselect.py: `cargo ra-jit test` with `RA_JIT_TESTS=affected` runs the tests that have not
+passed as they are now, and no others: a pass is kept in the store under what the test is a
+function of, and travels with it through a remote.
 
 usage: testselect.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
@@ -15,18 +16,21 @@ one that reads a file, one that calls nothing. It is tested until the daemon ser
 then edited a step at a time, and after each the tests that ran have to be the ones the step
 names: those whose code or what it calls changed, those added or given other attributes, the
 one that reads a file every time, the one that failed until it passes (and not the others that
-ran and passed beside it), one added to a program with an `ignore` with a list, one added to a library with a bench (in
-a package of its own, built with RUSTC_BOOTSTRAP=1), and with
-`RA_JIT_TESTS=all` every test. A test that ran has to end as its source says. With `-v` the
+ran and passed beside it; once fixed back to code that passed, it is not run again), one added
+to a program with an `ignore` with a list, one added to a library with a bench (in a package of
+its own, built with RUSTC_BOOTSTRAP=1), and with `RA_JIT_TESTS=all` every test. A test that ran has to end as its source says. With `-v` the
 output says why the one that reads a file runs, by the calls from it to the file system, and
 how many tests run every time.
 
 Every test runs sandboxed (Linux and macOS, unless `RA_JIT_SANDBOX=off`): the one that reads a
 file runs again only when the file changed, `-v` says which file, a test that writes into the
 package changes nothing of it outside its run, a test that writes outside fails and the command
-says what the sandbox refused it and how to take it out, a test its package takes out of the
-sandbox (`unsandboxed-tests`) runs outside and writes there, every time, and with
-`RA_JIT_SANDBOX=off` the one that reads a file runs every time again.
+says what the sandbox denied it and how to take it out, a test its package takes out of the
+sandbox (`unsandboxed-tests`) runs outside and writes there, every time, with
+`RA_JIT_SANDBOX=off` every test runs every time, `RA_JIT_TESTS=verify` runs the tests kept as
+passed and says they passed again, a store pushed to a remote and pulled into an empty one
+skips every test that passed, and so does the store under a fresh target and daemon, as on a CI
+runner.
 
 Python 3, stdlib only.
 """
@@ -211,8 +215,8 @@ STEPS = [
     ("a test that fails", [("src/lib.rs", "other(2), 4", "other(2), 5")], "affected",
      {"tests::uses_other"} | F, False),
     ("nothing edited after it failed", [], "affected", {"tests::uses_other"} | F, False),
-    ("the test fixed", [("src/lib.rs", "other(2), 5", "other(2), 4")], "affected",
-     {"tests::uses_other"} | F, True),
+    # Back to code it passed with: that pass stands.
+    ("the test fixed", [("src/lib.rs", "other(2), 5", "other(2), 4")], "affected", F, True),
     # The unit tests fail, so cargo runs no integration test after them.
     ("one of several reached failing", [("src/lib.rs", "x + 2 - 1", "x + 3 - 2"),
                                          ("src/lib.rs", "assert_eq!(helper(1), 2);", "assert_eq!(helper(1), 3);")],
@@ -226,9 +230,8 @@ STEPS = [
 ]
 if SANDBOXED:
     STEPS += [
-        # Outside the sandbox a test that reads a file runs every time, as it does where there
-        # is none.
-        ("outside the sandbox", [], "affected -v RA_JIT_SANDBOX=off", {FILE}, True),
+        # Outside the sandbox no test is hermetic, and every test runs every time.
+        ("outside the sandbox", [], "affected -v RA_JIT_SANDBOX=off", ALL | {"tests::added", "it_added"}, True),
         ("the file a test reads edited", [("data.txt", "tsel", "tsel tsel")], "affected -v", {FILE}, True),
         ("nothing edited after the file", [], "affected", set(), True),
         ("a test that writes into the package", [
@@ -249,6 +252,9 @@ if SANDBOXED:
              f'[package.metadata.blaze.sandbox]\nunsandboxed-tests = ["{OUTSIDE_TEST}"]\n\n[workspace]')],
          "affected", None, True),
         ("nothing edited after it ran outside", [], "affected -v", {OUTSIDE_TEST}, True),
+        ("every pass kept verified", [], "verify", None, True),
+        ("passes pulled from a remote", [], "remote", {OUTSIDE_TEST}, True),
+        ("a fresh target and daemon with the store", [], "fresh", {OUTSIDE_TEST}, True),
     ]
 # What a step's output has to say, beside the tests it runs.
 SAYS = {} if SANDBOXED else {
@@ -258,16 +264,43 @@ SAYS = {} if SANDBOXED else {
         r"Skipped \d+ tests, unchanged since the last pass; 1 test run every time \(said above\);",
     ],
 }
+
+
+def kept_from():
+    """Where the passes this run keeps say they come from, as results.rs `from` names it: the
+    harness's earlier steps are a run of this same CI job when GitHub Actions says so."""
+    var = lambda name: os.environ.get(name) or None
+    sha, run = var("GITHUB_SHA"), var("GITHUB_RUN_ID")
+    if var("RA_JIT_TESTS_FROM"):
+        return var("RA_JIT_TESTS_FROM")
+    if sha:
+        return f"commit {sha[:10]}" + (f" (run {run})" if run else "")
+    return "an earlier run on this machine"
+
+
+KEPT_FROM = re.escape(kept_from())
 if SANDBOXED:
     SAYS = {
-        "outside the sandbox": [r"Always tests::reads_a_file: it reaches `\w+`, which reads or writes files"],
+        "outside the sandbox": [
+            r"Always tests::reads_a_file: it runs outside the sandbox: `RA_JIT_SANDBOX=off`$",
+            r"\d+ tests outside the sandbox, run every time and never kept: ",
+        ],
         "the file a test reads edited": [
             r"Sandboxed tests::reads_a_file: it read `[^`]*/data\.txt`, which changed$",
         ],
         "a test that writes outside": [
-            rf"note: {OUTSIDE_TEST} failed in the sandbox, which refused it writing `[^`]*/written\.txt` "
-            r"\(the machine is read-only in a sandbox\); if it needs that, run it outside: "
+            rf"{OUTSIDE_TEST} fails: the sandbox denied it writing `[^`]*/written\.txt` "
+            r"\(the machine is read-only in a sandbox\); tests are hermetic, so if it needs that, take "
+            r"it out of the sandbox, where it runs every time and is never cached: "
             rf'`unsandboxed-tests = \["{OUTSIDE_TEST}"\]` under `\[package\.metadata\.blaze\.sandbox\]`',
+        ],
+        "every pass kept verified": [r"Verified the passes kept: (\d+) of \1 tests passed again$"],
+        "passes pulled from a remote": [
+            rf"Cached \d+ tests from {KEPT_FROM}",
+            r"1 test outside the sandbox, run every time and never kept: " + re.escape(OUTSIDE_TEST),
+        ],
+        "a fresh target and daemon with the store": [
+            rf"Cached \d+ tests from {KEPT_FROM}",
         ],
         "nothing edited after it ran outside": [
             rf"Unsandboxed {OUTSIDE_TEST}: taken out of the sandbox in \S*Cargo\.toml$",
@@ -325,7 +358,7 @@ def benched(root, env):
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
     deadline = time.monotonic() + 300
-    while "[ra-jit]" not in test(ws, env, "all")[1]:
+    while "[blaze]" not in test(ws, env, "all")[1]:
         if time.monotonic() > deadline:
             return "NEVER SERVED BY THE DAEMON"
         time.sleep(0.5)
@@ -334,7 +367,7 @@ def benched(root, env):
     open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
     code, said = test(ws, env, "all")
     ran = {name for name, _ in RAN.findall(said)}
-    if "[ra-jit]" not in said:
+    if "[blaze]" not in said:
         return "NOT SERVED BY THE DAEMON"
     if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
         return f"ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
@@ -343,7 +376,22 @@ def benched(root, env):
 
 def test(ws, env, mode):
     """`mode` is RA_JIT_TESTS's value, then `cargo ra-jit test`'s arguments and NAME=VALUE for the
-    environment."""
+    environment. `remote` pushes the store to a directory, pulls that into an empty store and
+    runs `affected` with it."""
+    if mode == "remote":
+        remote, pulled = os.path.join(ws, "..", "remote"), os.path.join(ws, "..", "pulled-store")
+        for verb, store in (("push", env["RA_JIT_CACHE"]), ("pull", pulled)):
+            moved = subprocess.run([os.environ["RA_JIT_BIN"], "cache", verb, remote, "tsel"], cwd=ws,
+                                   env=dict(env, RA_JIT_CACHE=store, RA_JIT_REMOTE_UNSIGNED="1"),
+                                   capture_output=True, text=True,
+                                   timeout=TIMEOUT)
+            if moved.returncode != 0:
+                return moved.returncode, f"cache {verb} failed:\n{moved.stdout}{moved.stderr}"
+        return test(ws, dict(env, RA_JIT_CACHE=pulled), "affected")
+    if mode == "fresh":
+        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=TIMEOUT)
+        shutil.rmtree(os.path.join(ws, "target"))
+        return test(ws, env, "affected")
     mode, *args = mode.split()
     more = dict(it.split("=", 1) for it in args if "=" in it)
     args = [it for it in args if "=" not in it]
@@ -368,8 +416,9 @@ def main():
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
+    # A store of its own: the passes it keeps are what the steps are about.
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-               RUST_BACKTRACE="0")
+               RUST_BACKTRACE="0", RA_JIT_CACHE=os.path.join(root, "store"))
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RA_JIT_TESTS"):
         env.pop(name, None)
     wrong = 0
@@ -380,11 +429,11 @@ def main():
             code, said = test(ws, env, "affected")
             if code != 0:
                 raise SystemExit(f"the tests failed {when}:\n{said[-3000:]}")
-            if "[ra-jit]" in said:
+            if "[blaze]" in said:
                 break
             time.sleep(0.5)
         else:
-            raise SystemExit(f"no build said `[ra-jit]` {when}; the daemon's log is in {home}")
+            raise SystemExit(f"no build said `[blaze]` {when}; the daemon's log is in {home}")
         # The daemon's first build of the tests: each is new to it, and runs.
         test(ws, env, "affected")
 
@@ -401,7 +450,7 @@ def main():
             verdict = "ok"
             # An edit of the manifest is cargo's to build, and the daemon's again after it.
             manifest = any(path == "Cargo.toml" for path, _, _ in edits)
-            if "[ra-jit]" not in said and not manifest:
+            if "[blaze]" not in said and not manifest:
                 verdict = "NOT SERVED BY THE DAEMON"
             elif expected is not None and ran != expected:
                 extra, missing = sorted(ran - expected), sorted(expected - ran)

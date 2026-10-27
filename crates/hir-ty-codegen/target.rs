@@ -60,6 +60,9 @@ pub enum VariableArguments {
     Homed,
     /// On the stack, eight bytes each, whatever registers are left: Apple's AArch64.
     Stack,
+    /// In memory the caller writes them to, each at its own alignment right after the one
+    /// before, whose address is one more argument after the named ones: WebAssembly's C.
+    Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +153,7 @@ impl Target {
             Some("x86_64") => Arch::X86_64,
             Some("aarch64") => Arch::Aarch64,
             Some("wasm32") => Arch::Wasm32,
-            _ => return Err(format!("ra-jit emits no code for the architecture of {triple}")),
+            _ => return Err(format!("blaze emits no code for the architecture of {triple}")),
         };
         let system = parts.find(|part| matches!(*part, "linux" | "darwin" | "windows"));
         // Cranelift's names for the C convention: `SystemV` is the psABI's on x86-64 and
@@ -167,7 +170,7 @@ impl Target {
             }
             // FIXME: x86-64 Mach-O and AArch64 PE have no splice written for them, and the
             // GNU flavour of Windows unwinds another way than the tables of `unwind::seh`.
-            _ => return Err(format!("ra-jit emits no code for the system of {triple}")),
+            _ => return Err(format!("blaze emits no code for the system of {triple}")),
         };
         Ok(Target { triple: triple.to_owned(), arch, object_format, call_conv, unwind })
     }
@@ -210,6 +213,25 @@ impl Target {
         &self.triple
     }
 
+    /// The symbol of the `main` the C runtime calls, and whether it takes the count and the
+    /// arguments: rustc's `entry-name` and `main-needs-argc-argv` of the target. WASI's
+    /// `_start` calls `__main_void`, and std reads the arguments from WASI itself; elsewhere
+    /// on wasm a C `main(argc, argv)` is `__main_argc_argv`, as LLVM names the `main` rustc
+    /// gives it.
+    pub fn entry(&self) -> (&'static str, bool) {
+        match self.arch {
+            Arch::Wasm32 if self.triple.contains("-wasi") => ("__main_void", false),
+            Arch::Wasm32 => ("__main_argc_argv", true),
+            Arch::X86_64 | Arch::Aarch64 => ("main", true),
+        }
+    }
+
+    /// Whether the program is linked with a C library, for `write` and `abort`: not on a wasm
+    /// that is not WASI's, as wasm32-unknown-unknown has nothing to link but the program.
+    pub fn has_libc(&self) -> bool {
+        self.arch != Arch::Wasm32 || self.triple.contains("-wasi")
+    }
+
     /// Whether a call can name its landing pad and the pad is entered with the exception in a
     /// register, as Cranelift has it for the calling conventions it knows the register of.
     pub fn exception_in_register(&self) -> bool {
@@ -220,6 +242,7 @@ impl Target {
     /// definition of one is compiled for.
     pub fn variable_arguments(&self) -> Option<VariableArguments> {
         match (self.call_conv, self.arch) {
+            (_, Arch::Wasm32) => Some(VariableArguments::Buffer),
             (CallConv::SystemV, Arch::X86_64 | Arch::Aarch64) => Some(VariableArguments::Registers),
             (CallConv::WindowsFastcall, Arch::X86_64) => Some(VariableArguments::Homed),
             (CallConv::AppleAarch64, Arch::Aarch64) => Some(VariableArguments::Stack),

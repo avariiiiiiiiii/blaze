@@ -313,7 +313,7 @@ pub(crate) fn finish() {
         let written = write_trace(Path::new(&trace), &spans, start, end);
         if let Err(why) = written {
             eprintln!(
-                "ra-jit: the trace is not written to {}: {why:#}",
+                "blaze: the trace is not written to {}: {why:#}",
                 Path::new(&trace).display()
             );
         }
@@ -333,12 +333,12 @@ pub(crate) fn table(spans: &[Span], start: u64, end: u64) -> String {
         .take(6)
         .map(|(name, us)| format!("{name} {:.1} ({:.0}%)", ms(*us), pct(*us)))
         .collect();
-    let mut out = format!("ra-jit time: {:.1} ms: {}\n", ms(total), top.join(", "));
-    out.push_str("ra-jit where the time went:\n");
+    let mut out = format!("blaze time: {:.1} ms: {}\n", ms(total), top.join(", "));
+    out.push_str("blaze where the time went:\n");
     for (name, us) in &rows {
-        let _ = writeln!(out, "ra-jit   {name:<28} {:>9.1} ms {:>5.1}%", ms(*us), pct(*us));
+        let _ = writeln!(out, "blaze    {name:<28} {:>9.1} ms {:>5.1}%", ms(*us), pct(*us));
     }
-    let _ = writeln!(out, "ra-jit   {:<28} {:>9.1} ms {:>5.1}%", "total", ms(total), 100.0);
+    let _ = writeln!(out, "blaze    {:<28} {:>9.1} ms {:>5.1}%", "total", ms(total), 100.0);
     out
 }
 
@@ -353,7 +353,7 @@ fn write_trace(path: &Path, spans: &[Span], start: u64, end: u64) -> anyhow::Res
         path.join(format!("ra-jit-{now}-{}.json", std::process::id()))
     };
     std::fs::write(&path, chrome(spans, start, end))?;
-    eprintln!("ra-jit: trace written to {}", path.display());
+    eprintln!("blaze: trace written to {}", path.display());
     Ok(())
 }
 

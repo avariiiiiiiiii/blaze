@@ -13,7 +13,7 @@ depend on the host rustc was built for (x86-64 Linux's links with its own lld): 
 those of the other hosts and writes this host's, so it is run on each host CI has (Linux
 x86-64 and AArch64, macOS arm64).
 """
-import json, os, shutil, subprocess, sys, tempfile
+import concurrent.futures, json, os, shutil, subprocess, sys, tempfile
 
 import norustc
 
@@ -69,6 +69,69 @@ def said(rust, args, extra=None, stdin=""):
     return out
 
 
+def target_features(printed):
+    """The `target_feature` cfgs of what `--print cfg` printed, sorted."""
+    return sorted(line[len('target_feature="'):-1] for line in printed.splitlines() if line.startswith('target_feature="'))
+
+
+def features_of(rust, t, base):
+    """What `-C target-cpu` and `-C target-feature` do to a target's `target_feature` cfgs, on the
+    nightly: each CPU's, by the index of the set it has; each feature rustc names (+f, without a
+    warning) and each feature only LLVM names (for `target-cpu=native`'s host features), by those
+    it turns on beside the target's own. A CPU or feature rustc warns of is left out: ra-jit refuses it."""
+    nightly = {"RUSTC_BOOTSTRAP": "1"}
+    listed = ask([rust, "--print", "target-features", *t], nightly)[1]
+    rustcs, llvms, section = [], [], None
+    for line in listed.splitlines():
+        if line.startswith("Features supported by rustc"):
+            section = rustcs
+        elif line.startswith("Code-generation features"):
+            section = llvms
+        elif section is not None and line.startswith("    ") and line.split():
+            section.append(line.split()[0])
+    cfg = lambda flag: ask([rust, "--print", "cfg", "-C", flag, *t], nightly)
+    others_of = lambda printed: {line for line in printed.splitlines() if not line.startswith("target_feature=")}
+    plain = others_of(ask([rust, "--print", "cfg", *t], nightly)[1])
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+        asked = lambda flags: list(pool.map(cfg, flags))
+        features, llvm, feature_cfgs = {}, {}, {}
+        for name, (code, out, err) in zip(rustcs, asked([f"target-feature=+{it}" for it in rustcs])):
+            if code == 0 and not err.strip():
+                features[name] = sorted(set(target_features(out)) - set(base))
+                # The other cfgs a feature has (wasm's atomics, `target_has_threads`).
+                if others_of(out) - plain:
+                    feature_cfgs[name] = sorted(others_of(out) - plain)
+        only_llvm = [it for it in llvms if it not in rustcs]
+        for name, (code, out, _) in zip(only_llvm, asked([f"target-feature=+{it}" for it in only_llvm])):
+            added = sorted(set(target_features(out)) - set(base))
+            if code == 0 and added:
+                llvm[name] = added
+        # What turning off a feature the target has turns off with it: those of the target's,
+        # and each feature that needs it.
+        off = {}
+        for name in base:
+            code, out, err = cfg(f"target-feature=-{name}")
+            if code != 0 or err.strip():
+                continue
+            others = [it for it, on in features.items() if it in on]
+            both = asked([f"target-feature=+{it},-{name}" for it in others])
+            gone = set(base) - set(target_features(out))
+            gone |= {it for it, (_, out, _) in zip(others, both) if it not in target_features(out)}
+            off[name] = sorted(gone)
+        sets, cpus = [], {}
+        names = [line.split()[0] for line in ask([rust, "--print", "target-cpus", *t])[1].splitlines()[1:]
+                 if line.split() and line.split()[0] != "native"]
+        for name, (code, out, err) in zip(names, asked([f"target-cpu={it}" for it in names])):
+            if code != 0 or err.strip():
+                continue
+            have = target_features(out)
+            if have not in sets:
+                sets.append(have)
+            cpus[name] = sets.index(have)
+    return {"features": features, "llvm_features": llvm, "features_off": off, "feature_cfgs": feature_cfgs,
+            "cpus": cpus, "cpu_features": sets}
+
+
 def write():
     rust = rustc()
     verbose = said(rust, ["-vV"])
@@ -97,6 +160,7 @@ def write():
             "panic": panic.split("=", 1)[1].strip('"'),
             "split_debuginfo": said(rust, ["--print", "split-debuginfo", *t]).splitlines(),
             "file_names": files,
+            **features_of(rust, t, target_features("\n".join(more))),
             "target_spec_json": {
                 **old["targets"].get(target, {}).get("target_spec_json", {}),
                 host: said(rust, ["-Z", "unstable-options", "--print", "target-spec-json", *t], nightly),
@@ -109,17 +173,15 @@ def write():
     print(f"wrote what rustc {data['version']} on {host} answers for {len(TARGETS)} targets to {DATA}")
 
 
-def questions():
+def questions(work):
     """(rustc's executable, arguments, variables, standard input) for every question compared:
-    of the toolchain rustup installed, and of a copy laid out as norustc.py lays its out."""
+    of the toolchain rustup installed, and of a copy laid out in `work` as norustc.py lays its out."""
     rust = rustc()
     for args, variables, stdin in about_rustc():
         yield rust, args, variables, stdin
-    work = tempfile.mkdtemp(prefix="ra-jit-answers-", dir="/tmp" if sys.platform == "darwin" else None)
     copy = os.path.join(norustc.counted_toolchain(work, os.path.join(work, "runs.log")), "bin", "rustc")
     for args in (["--print", "sysroot"], ["--print=target-libdir"], ["-vV"], PROBE):
         yield copy, args, {}, ""
-    shutil.rmtree(work, ignore_errors=True)
 
 
 def about_rustc():
@@ -153,6 +215,34 @@ def about_rustc():
         yield [*PROBE[:4], *flags, *t, *PROBE[4:]], {}, ""
         yield ["-", "--crate-name", "x", "--print=file-names", "--crate-type", "lib", "--crate-type", "bin",
                "--crate-type", "lib", "--print=crate-name", *t], {}, ""
+    for args in features_asked(rustc()):
+        yield args, nightly, ""
+
+
+def features_asked(rust):
+    """`--print cfg` with each CPU and each feature rustc has of each target, and some of them
+    together, turned off and on; `target-cpu=native` of the host."""
+    nightly = {"RUSTC_BOOTSTRAP": "1"}
+    combined = {
+        "x86_64": ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+avx512f,-avx2"],
+        "aarch64": ["-C", "target-cpu=neoverse-n1", "-C", "target-feature=-aes,+sve2"],
+        "wasm32": ["-C", "target-feature=+simd128,+relaxed-simd", "-C", "target-feature=-simd128"],
+    }
+    yield ["--print", "cfg", "-C", "target-cpu=native"]
+    yield ["--print", "cfg", "-C", "target-cpu=native", "-C", "target-feature=-neon,+avx2"]
+    for target in TARGETS:
+        t = ["--target", target]
+        for name in ask([rust, "--print", "target-cpus", *t])[1].splitlines()[1:]:
+            if name.split():
+                yield ["--print", "cfg", "-C", f"target-cpu={name.split()[0]}", *t]
+        listed = ask([rust, "--print", "target-features", *t], nightly)[1].split("Code-generation features")[0]
+        names = [line.split()[0] for line in listed.splitlines() if line.startswith("    ") and line.split()]
+        for name in names:
+            yield ["--print", "cfg", "-C", f"target-feature=+{name}", *t]
+        for name in names[::7]:
+            yield ["--print", "cfg", "-C", f"target-feature=-{name}", *t]
+            yield ["--print", "cfg", "-C", "opt-level=3", "-C", f"target-feature=+{name},-{names[0]}", *t]
+        yield ["--print", "cfg", *combined[target.split("-")[0]], *t]
 
 
 def check():
@@ -164,21 +254,34 @@ def check():
     host = next(line.split(": ", 1)[1] for line in said(rust, ["-vV"]).splitlines() if line.startswith("host: "))
     home = tempfile.mkdtemp(prefix="ra-jit-answers-")
     wrong, answered, unknown = [], 0, {}
-    for rust, args, variables, stdin in questions():
+
+    def compared(question):
+        rust, args, variables, stdin = question
         want = ask([rust, *args], variables, stdin)
         if want[0] != 0 or want[2].strip():
-            continue
+            return None
         if "target-spec-json" in args:
             target = args[args.index("--target") + 1] if "--target" in args else host
             if host not in data["targets"].get(target, {}).get("target_spec_json", {}):
                 # rustc is asked, once per toolchain.
-                unknown[target] = want[1]
-                continue
+                return "unknown", target, want[1]
         got = ask([RA_JIT, "rustc-wrapper", rust, *args],
                   {**variables, "RA_JIT_HOME": home, "RA_JIT_ANSWERS": "own"}, stdin)
+        return "asked", (args, variables, want[1], got), got[:2] == want[:2]
+
+    work = tempfile.mkdtemp(prefix="ra-jit-answers-", dir="/tmp" if sys.platform == "darwin" else None)
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+        results = list(pool.map(compared, questions(work)))
+    shutil.rmtree(work, ignore_errors=True)
+    for result in results:
+        if result is None:
+            continue
+        if result[0] == "unknown":
+            unknown[result[1]] = result[2]
+            continue
         answered += 1
-        if got[:2] != want[:2]:
-            wrong.append((args, variables, want[1], got))
+        if not result[2]:
+            wrong.append(result[1])
     for args, variables, want, (code, out, err) in wrong:
         print(f"DIFFERS: {' '.join(args)} {variables or ''}: exit {code}\n  rustc:  {want!r}\n  ra-jit: {out!r} {err.strip()}")
     print(f"{answered - len(wrong)} of {answered} questions answered by ra-jit as rustc {TOOLCHAIN} answers them")

@@ -22,8 +22,10 @@ from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, BINUTILS, toolchain
 
 # How many of the steps are spliced, by target: the rest link in full for the reasons printed,
 # or not at all where nothing was edited, and one more of them is a splice that got worse. A
-# target that is not here is held to none.
-SPLICED = {"x86_64-pc-windows-msvc": 60}
+# target that is not here is held to none. Once "a thread-local's initial value" is edited the
+# build has a copy of its own of that thread-local (docs/live.md#statics), so the five steps
+# after it carry thread-local data and link in full, as on Linux and macOS.
+SPLICED = {"x86_64-pc-windows-msvc": 57}
 
 TOML = """[package]
 name = "sedge"

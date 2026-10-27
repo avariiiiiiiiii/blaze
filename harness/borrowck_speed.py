@@ -8,7 +8,9 @@ Runs `ra-jit borrowck --project WS --timings OUT` on each app (those of apps/app
 harness's corpus, and EXTRA below), which checks every body in both modes, and reports for each:
 the bodies, type inference's total, the checker's total with and without MIR lowering, the
 checker's time per body (p50, p99, max), where it goes by phase, and the slowest bodies with
-the sizes they had. Each run is one thread, every body inferred and then checked cold.
+the sizes they had. Each run is one thread. Each body is inferred and checked once cold, paying
+for the queries it is the first to need, and then inferred and checked in each mode as an edit
+in the daemon pays it: the rest answered, the trait solver's cache empty ("edit" columns).
 
 `--rustc TOOLCHAIN` measures rustc instead, as the baseline: `cargo +TOOLCHAIN check
 --workspace --all-targets` with `-Zself-profile` (and `-Zpolonius=next` for polonius), and the
@@ -48,18 +50,23 @@ def summarize(rows, mode, top):
         for k, v in r["phases_us"].items():
             phases[k] = phases.get(k, 0) + v
     infer = sum(r["infer_us"] for r in rows)
+    # As an edit in the daemon pays it, where the run measured that; else cold, as the check.
+    warm = sum(r.get("infer_warm_us", r["infer_us"]) for r in rows)
+    first = sum(r.get("first_us", 0) for r in rows)
     total = sum(r["borrowck_us"] for r in rows)
     excl = sum(checked)
     slowest = sorted(rows, key=own, reverse=True)[:top]
     return {
         "bodies": len(rows),
         "infer_ms": infer / 1000,
+        "infer_warm_ms": warm / 1000,
+        "first_check_ms": first / 1000,
         "borrowck_ms": total / 1000,
         "borrowck_excl_mir_ms": excl / 1000,
-        "ratio_to_infer": excl / infer if infer else None,
+        "ratio_to_infer": excl / warm if warm else None,
         "per_body_us": {"p50": pct(checked, 0.5), "p99": pct(checked, 0.99), "max": checked[-1] if checked else 0},
         "phases_ms": {k: v / 1000 for k, v in phases.items()},
-        "slowest": [{"name": r["name"], "path": r["path"], "us": own(r), "infer_us": r["infer_us"],
+        "slowest": [{"name": r["name"], "path": r["path"], "us": own(r), "infer_us": r.get("infer_warm_us", r["infer_us"]),
                      "phases_us": r["phases_us"], "counts": r["counts"]} for r in slowest],
     }
 
@@ -110,7 +117,10 @@ async def rustc_profile_mode(name, spec, mode, args, gate):
             flags = f"-Zself-profile={prof} -Zself-profile-events=default"
             if mode == "polonius":
                 flags += " -Zpolonius=next"
-            env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=os.path.join(args.work, f"target-{name}.{mode}"))
+            # A fresh target dir: a crate cargo finds fresh is not compiled, so not profiled.
+            target = os.path.join(args.work, f"target-{name}.{mode}")
+            shutil.rmtree(target, ignore_errors=True)
+            env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=target)
             argv = ["cargo", f"+{args.rustc}", "check", "--workspace", "--all-targets", "--quiet"]
             code, _, err = await borrowck_apps.run(argv, ws, args.timeout, env)
             if code != 0:
@@ -130,9 +140,11 @@ async def rustc_profile_mode(name, spec, mode, args, gate):
                 with open(data.removesuffix(".mm_profdata") + ".json") as f:
                     summary = json.load(f)
                 for q in summary["query_data"]:
-                    if q["label"] in totals:
+                    # Newer nightlies call `typeck` `typeck_root`.
+                    label = "typeck" if q["label"] == "typeck_root" else q["label"]
+                    if label in totals:
                         t = q["self_time"]
-                        totals[q["label"]] += t["secs"] + t["nanos"] / 1e9
+                        totals[label] += t["secs"] + t["nanos"] / 1e9
         except borrowck_apps.StepError as e:
             return {"failed": str(e)}
         result = {"crates": crates, "mir_borrowck_ms": totals["mir_borrowck"] * 1000,
@@ -155,17 +167,19 @@ def rustc_markdown(results, modes):
 
 
 def markdown(results, modes, top):
-    lines = ["| App | Mode | Bodies | Infer ms | Borrowck ms (excl. MIR) | MIR ms | Borrowck / infer | p50 us | p99 us | max us |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| App | Mode | Bodies | Infer ms (cold) | Infer ms (edit) | Borrowck ms (edit, excl. MIR) | MIR ms | "
+             "Borrowck / infer (edit) | First check ms (cold) | p50 us | p99 us | max us |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for name, by_mode in results.items():
         for mode in modes:
             r = by_mode.get(mode, {})
             if "failed" in r or not r:
-                lines.append(f"| {name} | {mode} | failed | | | | | | | |")
+                lines.append(f"| {name} | {mode} | failed | | | | | | | | | |")
                 continue
             p = r["per_body_us"]
-            lines.append(f"| {name} | {mode} | {r['bodies']} | {r['infer_ms']:.0f} | {r['borrowck_excl_mir_ms']:.0f} | "
-                         f"{r['phases_ms'].get('mir', 0):.0f} | {r['ratio_to_infer']:.1%} | {p['p50']} | {p['p99']} | {p['max']} |")
+            lines.append(f"| {name} | {mode} | {r['bodies']} | {r['infer_ms']:.0f} | {r.get('infer_warm_ms', 0):.0f} | "
+                         f"{r['borrowck_excl_mir_ms']:.0f} | {r['phases_ms'].get('mir', 0):.0f} | {r['ratio_to_infer']:.1%} | "
+                         f"{r.get('first_check_ms', 0):.0f} | {p['p50']} | {p['p99']} | {p['max']} |")
     phases = None
     for by_mode in results.values():
         for r in by_mode.values():

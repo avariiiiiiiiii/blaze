@@ -426,10 +426,13 @@ A test's verdict is kept under the hash of: the ra-jit identity and target; the 
 from `tests-reach` (its code and every function it reaches, by code identity); its attributes;
 the fixed environment; the content (not the size and time) of each `CARGO_BIN_EXE_*` program it
 runs; and the digests of every path its sandbox recorded, including paths found absent. A pass is
-kept in the store's results table, beside the packs and as content-keyed as they are, so a test
-that passed on main is skipped on every branch whose code and inputs for it are the same. A
-failure is never a reason to skip; a failing test runs until it passes. Today's `tests-passed` and
-`tests-reach` move from the target directory into that table (slice R2).
+an ordinary entry of the store, beside the compiled functions and as content-keyed as they are,
+so it travels in the same packs through the remote, and a test that passed on main is skipped on
+every branch whose code and inputs for it are the same. A failure is never a reason to skip; a
+failing test runs until it passes. Done in `cargo/results.rs`
+([cargo.md](cargo.md#running-only-the-tests-that-have-not-passed)): the key is found in two steps
+(the paths a passing run read are kept under the rest of the key, the pass under those paths with
+their contents), and `tests-reach` stays beside the program, written by the daemon at each build.
 
 ### Nondeterminism and flakes
 
@@ -441,10 +444,11 @@ difference. It does not remove the clock, threads or, by default, randomness (#2
   `RA_JIT_TEST_SEED` per test), so a rerun of the same key sees the same randomness and the seed
   is printed on failure.
 - **A flake is defined by the key.** Two different verdicts under one key are nondeterminism, by
-  construction, since everything the sandbox can see was the same. When a test fails under a key
-  that has a recorded pass, the job reruns it three times in fresh sandboxes. Any pass makes it a
-  flake: the check says "flaky: passed 2 of 3 under this key; passed on main at abc1234", and the
-  key is marked so main's issue tracker gets a report.
+  construction, since everything the sandbox can see was the same. The store keeps a mark beside
+  a pass for a failure under the same key; a test with both is marked flaky, never skipped again,
+  and the command warns with where it passed (done). `RA_JIT_TESTS=verify` runs the tests kept as
+  passed and names each that failed (done). Not done: rerunning a failure three times in fresh
+  sandboxes before calling it, and a report on main's issue tracker.
 - **Who it blocks.** A flaky test whose key the pull request did not change does not fail the pull
   request; it is main's bug, reported on main. A flaky test whose key the pull request changed
   fails it.

@@ -387,6 +387,24 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         self
     }
 
+    /// The lifetime of a trait object written without one where `region` would be its
+    /// default. In a body a lifetime left to inference (`&dyn Trait`, `Ref<'_, dyn Trait>`)
+    /// resolves to nothing, so rustc's `resolve_object_lifetime_default` gives the object a
+    /// lifetime inferred on its own, not the reference's.
+    fn object_default(&mut self, region: Region<'db>) -> Region<'db> {
+        if self.infers_object_lifetimes() && matches!(region.kind(), RegionKind::ReVar(_)) {
+            return self.next_region_var(Span::Dummy);
+        }
+        region
+    }
+
+    /// Lowering a type written in a body with region variables, where a trait object no
+    /// enclosing type gives a lifetime (`Box<dyn Trait>`, `*const dyn Trait`) has an inferred
+    /// one, not `'static`.
+    fn infers_object_lifetimes(&self) -> bool {
+        self.elided_region_vars && matches!(self.def, ExpressionStoreOwnerId::Body(_))
+    }
+
     fn push_infer_vars_not_allowed(&mut self, span: Span) {
         if !span.is_dummy() {
             self.push_diagnostic(TyLoweringDiagnostic::InferVarsNotAllowed { source: span });
@@ -808,7 +826,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 let inner_ty = match &self.store[ref_.ty] {
                     // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
                     TypeRef::DynTrait(bounds) if !lifetime.is_error() || self.impl_header => {
-                        self.lower_dyn_trait(bounds, lifetime)
+                        let object = self.object_default(lifetime);
+                        self.lower_dyn_trait(bounds, object)
                     }
                     _ => self.lower_ty(ref_.ty),
                 };
@@ -816,7 +835,14 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             TypeRef::Placeholder => self.next_ty_var(type_ref_id.into()),
             TypeRef::Fn(fn_) => self.lower_fn_ptr(fn_),
-            TypeRef::DynTrait(bounds) => self.lower_dyn_trait(bounds, Region::new_static(interner)),
+            TypeRef::DynTrait(bounds) => {
+                let object = if self.infers_object_lifetimes() {
+                    self.next_region_var(Span::Dummy)
+                } else {
+                    Region::new_static(interner)
+                };
+                self.lower_dyn_trait(bounds, object)
+            }
             TypeRef::ImplTrait(bounds) => {
                 match self.impl_trait_mode.mode {
                     ImplTraitLoweringMode::Opaque => {
@@ -3643,52 +3669,79 @@ fn input_lifetimes(
         }
         TypeRef::Array(it) => input_lifetimes(db, resolver, store, it.ty, found, self_references),
         TypeRef::Never | TypeRef::TypeParam(_) => Some(()),
-        TypeRef::Path(path) => {
-            if path.type_anchor().is_some() {
-                return None;
-            }
-            let params = match resolver.resolve_path_in_type_ns_fully(db, path)? {
-                TypeNs::AdtId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
-                TypeNs::TypeAliasId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
-                TypeNs::BuiltinType(_)
-                | TypeNs::GenericParam(_)
-                | TypeNs::SelfType(_)
-                | TypeNs::AdtSelfType(_) => 0,
-                _ => return None,
-            };
-            let args: Vec<_> = path.generic_args().into_iter().flatten().flatten().collect();
-            if args.iter().any(|it| {
-                !it.bindings.is_empty()
-                    || !matches!(
-                        it.parenthesized,
-                        hir_def::expr_store::path::GenericArgsParentheses::No
-                    )
-            }) {
-                return None;
-            }
-            let args = || args.iter().flat_map(|it| it.args.iter());
-            let written: Vec<_> = args()
-                .filter_map(|it| match it {
-                    hir_def::expr_store::path::GenericArg::Lifetime(it) => Some(*it),
-                    _ => None,
-                })
-                .collect();
-            if written.is_empty() {
-                found.extend(iter::repeat_n(None, params));
-            } else {
-                for it in written {
-                    found.push(lifetime(Some(it))?);
+        TypeRef::Path(path) => path_lifetimes(db, resolver, store, path, found, self_references),
+        // What the bounds write, not the object lifetime `dyn Trait` leaves out: that is its
+        // default, which rustc's elision does not count.
+        TypeRef::DynTrait(bounds) => {
+            for bound in bounds {
+                match bound {
+                    TypeBound::Lifetime(it) => found.push(lifetime(Some(*it))?),
+                    TypeBound::Path(path, _) => {
+                        path_lifetimes(db, resolver, store, &store[*path], found, self_references)?
+                    }
+                    _ => return None,
                 }
             }
-            args().try_for_each(|it| match it {
-                hir_def::expr_store::path::GenericArg::Type(it) => {
-                    input_lifetimes(db, resolver, store, *it, found, self_references)
-                }
-                _ => Some(()),
-            })
+            Some(())
         }
         _ => None,
     }
+}
+
+/// [`input_lifetimes`] of the type or trait `path` names.
+fn path_lifetimes(
+    db: &dyn HirDatabase,
+    resolver: &Resolver<'_>,
+    store: &ExpressionStore,
+    path: &Path,
+    found: &mut Vec<Option<LifetimeRefId>>,
+    self_references: &mut Vec<usize>,
+) -> Option<()> {
+    let lifetime = |it: Option<LifetimeRefId>| match it.map(|it| (it, &store[it])) {
+        None | Some((_, LifetimeRef::Placeholder)) => Some(None),
+        Some((_, LifetimeRef::Error)) => None,
+        Some((it, _)) => Some(Some(it)),
+    };
+    if path.type_anchor().is_some() {
+        return None;
+    }
+    let params = match resolver.resolve_path_in_type_ns_fully(db, path)? {
+        TypeNs::AdtId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+        TypeNs::TypeAliasId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+        TypeNs::TraitId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+        TypeNs::BuiltinType(_)
+        | TypeNs::GenericParam(_)
+        | TypeNs::SelfType(_)
+        | TypeNs::AdtSelfType(_) => 0,
+        _ => return None,
+    };
+    let args: Vec<_> = path.generic_args().into_iter().flatten().flatten().collect();
+    if args.iter().any(|it| {
+        !it.bindings.is_empty()
+            || !matches!(it.parenthesized, hir_def::expr_store::path::GenericArgsParentheses::No)
+    }) {
+        return None;
+    }
+    let args = || args.iter().flat_map(|it| it.args.iter());
+    let written: Vec<_> = args()
+        .filter_map(|it| match it {
+            hir_def::expr_store::path::GenericArg::Lifetime(it) => Some(*it),
+            _ => None,
+        })
+        .collect();
+    if written.is_empty() {
+        found.extend(iter::repeat_n(None, params));
+    } else {
+        for it in written {
+            found.push(lifetime(Some(it))?);
+        }
+    }
+    args().try_for_each(|it| match it {
+        hir_def::expr_store::path::GenericArg::Type(it) => {
+            input_lifetimes(db, resolver, store, *it, found, self_references)
+        }
+        _ => Some(()),
+    })
 }
 
 /// The lifetime parameter of the `impl Trait` `function` returns for the `index`th lifetime its

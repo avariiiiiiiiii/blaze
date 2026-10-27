@@ -60,6 +60,13 @@ In the splice and in a live patch, a call or an address taken of a function the 
 already has goes to its original entry, never to a copy a previous splice appended. The entry
 is where the jump is written, so a later edit of that function reaches every caller.
 
+rustc's allocator entries (`__rustc::__rust_alloc` and the rest) are the one place rustc's
+code calls the `#[global_allocator]`'s methods, which it has inlined into them from opt-level 1
+up, so no copy of those methods is left for a patch to replace. A build over rustc's code
+(a patch of rustc's executable, or a build in full linked with rustc's objects) defines those
+entries itself, as calls of the functions rust-analyzer's expansion of the attribute exports
+(`__ra_jit_global_alloc` and the rest), so an edit of the allocator reaches them (#386).
+
 ## Statics
 
 A program the daemon links mixes its code with rustc's: functions it left to rustc, rustc's
@@ -70,19 +77,25 @@ reads as never set in ours, and a counter the allocator bumps reads zero. So:
 
 - a thread-local, or a static written at run time, stays rustc's wherever rustc linked it
   under a symbol, as long as its first value is the one rustc gave it. The daemon keeps that
-  value (`patch::RustcValues`), taken the first time a build asks, when no edit since the
+  value (`patch::RustcValues`), taken the first time a build asks, or just before the first
+  edit of a file of the static's crate or a crate it depends on, when no edit since the
   daemon started can have reached any crate the static's crate is or depends on (an edit of
   function bodies alone changes no first value), and a patch's base records which copy it
-  has, which its patches keep.
+  has, which its patches keep. Taken before the edit, it is known for a static no build
+  reached until after it, as a build in full after the edit reaches all of a crate
+  (`harness/programs.py`, "the calls braced"). A change to a file that `include_str!` or
+  `include_bytes!` reads reaches the first values of the crates that include it alone.
   An edit to the first value of a shared static is not a patch: rustc's copy holds what the
   program wrote from the old value, and no copy beside it can start from the new one. The
   build is in full, the program is told to restart, and the full build has its own copy with
   the new value, which rustc's code does not share until cargo builds again (`harness/stress.py`
   steps 58 and 84, `harness/splices.py` "a thread-local's initial value"). A static whose
   value rustc's copy can't be told for (one an edit reached before the daemon first asked) is
-  ours, as before. Not yet handled: one ours can't replace (`#[no_mangle]`, `#[export_name]`,
-  or one a function left to rustc refers to) stays rustc's after an edit to its first value,
-  in the full build too, with the old value, as any such static of rustc's does;
+  ours, as before. One ours can't replace (`#[no_mangle]`, `#[export_name]`, or one a
+  function left to rustc refers to) would stay rustc's after an edit to its first value, with
+  the old value: the build stops with an error naming it (``static `X` of crate `c` with
+  state, whose first value is not the one rustc built it with ...``, `CodegenError::Refused`,
+  [#392](https://github.com/indexable-inc/blaze/issues/392));
 - a static rustc keeps to the one codegen unit whose code uses it (rustc internalises it) has
   no symbol of the name rustc gave it, and at opt-level 1 and up LLVM renames it as it
   optimizes: its global optimizer splits a static of one field into that field (`SERVING` in

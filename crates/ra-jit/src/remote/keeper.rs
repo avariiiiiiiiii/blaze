@@ -156,7 +156,7 @@ impl Shared {
         if now.is_some() && self.asked.see(now) {
             eprintln!("remote: the manifest of `{}` has changed", self.project);
             let done = self.pull_as_set().await;
-            self.report(done, start);
+            _ = self.report(done, start);
         }
     }
 
@@ -179,9 +179,9 @@ impl Shared {
             if ours {
                 self.asked.see(self.manifest_now().await);
             }
-            self.report(done, start);
+            _ = self.report(done, start);
         } else if let Err(e) = done {
-            eprintln!("remote: {e:#}");
+            _ = self.failed(e);
         }
     }
 }

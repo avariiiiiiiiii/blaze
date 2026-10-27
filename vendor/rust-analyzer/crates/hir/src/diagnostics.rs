@@ -136,6 +136,7 @@ diagnostics![AnyDiagnostic<'db> ->
     BreakOutsideOfLoop,
     CannotBeDereferenced<'db>,
     UnaryOperatorCannotBeApplied<'db>,
+    BinaryOperatorCannotBeApplied<'db>,
     CannotImplicitlyDerefTraitObject<'db>,
     CannotIndexInto<'db>,
     CastToUnsized<'db>,
@@ -208,6 +209,7 @@ diagnostics![AnyDiagnostic<'db> ->
     UnionPatMustHaveExactlyOneField,
     UnionPatHasRest,
     UnimplementedTrait<'db>,
+    ClosureKindMismatch,
     YieldOutsideCoroutine,
     ReturnOutsideFunction,
 ];
@@ -375,6 +377,14 @@ pub struct UnaryOperatorCannotBeApplied<'db> {
     pub expr: InFile<ExprOrPatPtr>,
     pub op: ast::UnaryOp,
     pub found: Type<'db>,
+}
+
+#[derive(Debug)]
+pub struct BinaryOperatorCannotBeApplied<'db> {
+    pub expr: InFile<ExprOrPatPtr>,
+    pub op: ast::BinaryOp,
+    pub lhs: Type<'db>,
+    pub rhs: Type<'db>,
 }
 
 #[derive(Debug)]
@@ -718,6 +728,13 @@ pub struct UnimplementedTrait<'db> {
     pub span: SpanSyntax,
     pub trait_predicate: crate::TraitPredicate<'db>,
     pub parent_trait_predicates: Vec<crate::TraitPredicate<'db>>,
+}
+
+#[derive(Debug)]
+pub struct ClosureKindMismatch {
+    pub span: SpanSyntax,
+    pub expected: crate::FnTrait,
+    pub found: crate::FnTrait,
 }
 
 #[derive(Debug)]
@@ -1529,6 +1546,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         use hir_ty_wfcheck::Site;
         let db = self.db;
         for diagnostic in &hir_ty_wfcheck::wfcheck(db, def).diagnostics {
+            let mut self_param = None;
             let source = match diagnostic.site {
                 Site::Field(variant, field) => {
                     let (fields, source_map) = variant.fields_with_source_map(db);
@@ -1563,10 +1581,21 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 }
                 Site::Param(function, index) => {
                     let (signature, source_map) = FunctionSignature::with_source_map(db, function);
-                    signature
+                    let typed = signature
                         .params
                         .get(index as usize)
-                        .and_then(|&ty| source_map.type_syntax(ty).ok())
+                        .and_then(|&ty| source_map.type_syntax(ty).ok());
+                    // `&'a mut self` has no type written: rustc points at the parameter.
+                    if typed.is_none() && index == 0 && signature.has_self_param() {
+                        let source = hir_def::src::HasSource::source(function.lookup(db), db);
+                        if let Some(param) =
+                            source.value.param_list().and_then(|it| it.self_param())
+                        {
+                            self_param =
+                                Some(source.with_value(SyntaxNodePtr::new(param.syntax())));
+                        }
+                    }
+                    typed
                 }
                 Site::Output(function) => {
                     let (signature, source_map) = FunctionSignature::with_source_map(db, function);
@@ -1616,10 +1645,13 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     })
                 }
             };
-            let Some(source) = source else { continue };
+            let Some(node) = source.map(|it| it.map(|it| it.syntax_node_ptr())).or(self_param)
+            else {
+                continue;
+            };
             self.acc.push(
                 BorrowckError {
-                    node: source.map(|it| it.syntax_node_ptr()),
+                    node,
                     at_end: false,
                     code: diagnostic.code,
                     message: diagnostic.message.clone(),
@@ -2022,6 +2054,11 @@ impl<'db> AnyDiagnostic<'db> {
                 let expr = expr_syntax(*expr)?;
                 UnaryOperatorCannotBeApplied { expr, op: *op, found: new_ty(found.as_ref()) }.into()
             }
+            InferenceDiagnostic::BinaryOperatorCannotBeApplied { expr, op, lhs, rhs } => {
+                let expr = expr_syntax(*expr)?;
+                let (lhs, rhs) = (new_ty(lhs.as_ref()), new_ty(rhs.as_ref()));
+                BinaryOperatorCannotBeApplied { expr, op: *op, lhs, rhs }.into()
+            }
             InferenceDiagnostic::MutRefInImmRefPat { pat } => {
                 let pat = pat_syntax(*pat)?.map(Into::into);
                 MutRefInImmRefPat { pat }.into()
@@ -2235,6 +2272,18 @@ impl<'db> AnyDiagnostic<'db> {
                     })
                     .collect();
                 UnimplementedTrait { span, trait_predicate, parent_trait_predicates }.into()
+            }
+            &SolverDiagnosticKind::ClosureKindMismatch { expected, found, is_async } => {
+                let fn_trait = |kind| match (kind, is_async) {
+                    (rustc_type_ir::ClosureKind::Fn, false) => crate::FnTrait::Fn,
+                    (rustc_type_ir::ClosureKind::FnMut, false) => crate::FnTrait::FnMut,
+                    (rustc_type_ir::ClosureKind::FnOnce, false) => crate::FnTrait::FnOnce,
+                    (rustc_type_ir::ClosureKind::Fn, true) => crate::FnTrait::AsyncFn,
+                    (rustc_type_ir::ClosureKind::FnMut, true) => crate::FnTrait::AsyncFnMut,
+                    (rustc_type_ir::ClosureKind::FnOnce, true) => crate::FnTrait::AsyncFnOnce,
+                };
+                ClosureKindMismatch { span, expected: fn_trait(expected), found: fn_trait(found) }
+                    .into()
             }
         })
     }

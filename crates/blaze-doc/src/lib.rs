@@ -32,14 +32,6 @@ pub use crate::places::Documented;
 /// links: `(crate, dependency)`.
 pub type TestOnly = FxHashSet<(Crate, Crate)>;
 
-/// Readies this process for the load the docs are made from: rust-analyzer stores no macro
-/// expansion longer than a limit, which rustc has none of (biome_wasm's `#[wasm_bindgen]`
-/// block of 2271 types expands past it). Called before the load, as the limit is not
-/// looked at again for an expansion already made.
-pub fn before_load() {
-    hir_expand::set_token_limit(usize::MAX);
-}
-
 /// A crate the user asked to document.
 #[derive(Debug, Clone, Copy)]
 pub struct Asked {

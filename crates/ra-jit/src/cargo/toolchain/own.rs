@@ -247,7 +247,44 @@ fn fetch_from(
         });
     }
     eprintln!("Downloaded Rust {} for blaze in {:.1?}.", release.version, start.elapsed());
+    for (old, name) in superseded(release, parent) {
+        match remove_dir(&old) {
+            Ok(()) => {
+                _ = std::fs::remove_file(parent.join(format!(".{name}.lock")));
+                eprintln!("Removed {name}, which an older release of blaze built with.");
+            }
+            Err(e) => {
+                eprintln!("blaze could not remove {name}, which it no longer builds with: {e}")
+            }
+        }
+    }
     Ok(())
+}
+
+/// blaze's own copies of older nightlies than `release`, for its host, beside it in `parent`.
+/// The pin moves every day (docs/toolchain.md, "The daily bump"), and each release of blaze
+/// downloads its own once: what an older release downloaded is not used again. A newer one, one
+/// of another host and a directory that is not a whole toolchain are left alone.
+fn superseded(release: &Release, parent: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(parent) else { return Vec::new() };
+    let (prefix, suffix) = (format!("{}-", release.channel), format!("-{}", release.host));
+    let mut old = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Some(date) = name.strip_prefix(&prefix).and_then(|it| it.strip_suffix(&suffix)) else {
+            continue;
+        };
+        let dated = date.len() == 10
+            && date
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
+        if dated && date < release.date && complete(&entry.path()) {
+            old.push((entry.path(), name));
+        }
+    }
+    old.sort();
+    old
 }
 
 fn remove_dir(dir: &Path) -> io::Result<()> {
@@ -748,6 +785,46 @@ mod tests {
         // Whole, it is not downloaded again: the files it came from can be gone.
         std::fs::remove_dir_all(&dist).unwrap();
         fetched(&dist, &release, &dir).unwrap();
+    }
+
+    #[test]
+    fn an_older_nightly_blaze_downloaded_goes_once_the_new_one_is_there() {
+        let work = tempfile::tempdir().unwrap();
+        let dist = work.path().join("dist");
+        let release = release(&dist, &rustc());
+        let toolchains = work.path().join("toolchains");
+        let whole = |name: &str| {
+            let dir = toolchains.join(name);
+            for path in [exe("cargo"), exe("rustc"), "lib/rustlib/multirust-channel-manifest.toml"]
+            {
+                std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+                std::fs::write(dir.join(path), "").unwrap();
+            }
+            std::fs::create_dir_all(dir.join("lib/rustlib/src/rust/library")).unwrap();
+        };
+        // The test release is channel 9.9.9 of 2000-01-01.
+        whole("9.9.9-1999-12-31-test-host");
+        whole("9.9.9-2000-01-02-test-host");
+        whole("9.9.9-1999-12-31-other-host");
+        std::fs::create_dir_all(toolchains.join("9.9.9-1999-12-30-test-host/bin")).unwrap();
+        std::fs::write(toolchains.join(".9.9.9-1999-12-31-test-host.lock"), "").unwrap();
+        fetched(&dist, &release, &toolchains.join("9.9.9-test-host")).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&toolchains)
+            .unwrap()
+            .map(|it| it.unwrap().file_name().into_string().unwrap())
+            .filter(|it| !it.ends_with(".lock") || it.contains("1999-12-31"))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "9.9.9-1999-12-30-test-host",
+                "9.9.9-1999-12-31-other-host",
+                "9.9.9-2000-01-02-test-host",
+                "9.9.9-test-host"
+            ],
+            "the older whole toolchain of this host and its lock are gone"
+        );
     }
 
     #[test]

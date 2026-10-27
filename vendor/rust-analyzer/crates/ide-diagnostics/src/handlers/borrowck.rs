@@ -517,6 +517,44 @@ fn f<'a, 'db>(g: &dyn Fn() -> &'a G<'db>) { need(g()) }
         );
     }
 
+    // core's `fmt::rt::Argument::new_display`: the `'_` of `Formatter<'_>` is late-bound in
+    // `Display::fmt`, so the item reifies to the `for<'a, 'b, 'c> fn` it is given as.
+    #[test]
+    fn a_fn_items_elided_lifetime_is_late_bound_when_reified() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+struct Formatter<'a>(&'a ());
+trait Display {
+    fn fmt(&self, f: &mut Formatter<'_>);
+}
+fn new<T>(_: &T, _: fn(&T, &mut Formatter<'_>)) {}
+fn new_display<T: Display>(x: &T) {
+    new(x, Display::fmt)
+}
+"#,
+        );
+    }
+
+    // ruff's `OptionSet::of`: `record: T::record` of `fn record(visit: &mut dyn Visit)` into a
+    // `fn(&mut dyn Visit)`. The item's elided `&mut dyn Visit` is `&'r mut (dyn Visit + 'r)`.
+    #[test]
+    fn a_fn_items_elided_trait_object_has_its_references_lifetime_when_reified() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Visit {}
+trait Options { fn record(visit: &mut dyn Visit); }
+struct Set { record: fn(&mut dyn Visit), shared: fn(&dyn Visit) }
+fn free(_: &mut dyn Visit) {}
+fn shared(_: &dyn Visit) {}
+fn of<T: Options>() -> Set { Set { record: T::record, shared } }
+fn local() { let _f: fn(&mut dyn Visit) = free; }
+fn named<'a>() { let _f: fn(&'a mut dyn Visit) = free; }
+"#,
+        );
+    }
+
     // hir-def's `module_for_assoc_item_loc`: `dyn 'db + Database` implies `'db: 'static`
     // where a supertrait of `Database` is `'static`.
     #[test]
@@ -528,6 +566,29 @@ trait Base: 'static {}
 trait Database: Base {}
 fn take(_: &dyn Database) {}
 fn f<'db>(db: &(dyn 'db + Database)) { take(db) }
+"#,
+        );
+    }
+
+    #[test]
+    fn a_failed_guard_ends_what_its_pattern_binds() {
+        check_diagnostics(
+            r#"
+//- minicore: copy
+fn p(_: &u8) -> bool { false }
+fn f(v: (u8, u8)) -> u8 {
+    let mut n = 0;
+    loop {
+        n += match v {
+            (ref a, 1) | (2, ref a) if p(a) => *a,
+            (ref a, _) if p(a) => *a,
+            _ => 1,
+        };
+        if n > 2 {
+            return n;
+        }
+    }
+}
 "#,
         );
     }

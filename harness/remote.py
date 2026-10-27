@@ -47,6 +47,11 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def transferred(out):
+    """What `cache push` or `cache pull` said it did, after its line of objects, bytes and MiB/s."""
+    return re.sub(r"\A(push|pull): \d+ objects, [^\n]*\n", "", out.stdout)
+
+
 def packed(data):
     """`data` compressed the way ra-jit sends a pack."""
     return subprocess.run(["zstd", "-3", "-c"], input=data, capture_output=True, check=True).stdout
@@ -286,7 +291,7 @@ def round_trip(top, remote, name, crates, target, workspace):
           all(digest(unpacked(bucket.get(it)) if it.endswith(".zst") else bucket.get(it)) == it.split("/")[1].split(".")[0]
               for it in objects if not it.startswith("manifests/")))
     out = a.ra_jit("cache", "push", address)
-    check("a second push sends nothing", out.returncode == 0 and out.stdout.startswith("0 packs added"), out.stdout.strip())
+    check("a second push sends nothing", out.returncode == 0 and transferred(out).startswith("0 packs added"), out.stdout.strip())
 
     log, _ = b.build(crates, env={"RA_JIT_REMOTE": address})
     check("B fetches and compiles nothing", compiled(log) == 0 and all(b.packs().values()) and set(a.packs()) <= set(b.packs()),
@@ -627,7 +632,7 @@ def stored(top, remote):
     out = g.ra_jit("cache", "pull", address)
     whole, verified, _ = g.cache("verify")
     check("packs the store made one of are not fetched again", first.returncode == 0 and ok and len(g.packs()) < 24
-          and out.returncode == 0 and out.stdout.startswith("0 packs") and "in other packs of the store passed over" in out.stdout
+          and out.returncode == 0 and transferred(out).startswith("0 packs") and "in other packs of the store passed over" in out.stdout
           and packs_fetched(remote) in (0, None) and whole and verified.get("records") == 24,
           f"{out.stdout.strip()[:100]}; first exit {first.returncode}, {first.stdout.strip()[:120]} {first.stderr.strip()[-600:]}; merged {collected.get('merged packs')}, "
           f"{len(g.packs())} packs, {verified.get('records')} records; {out.stderr.strip()[:300]}")
@@ -738,7 +743,7 @@ def collected(top, remote):
     out = a.ra_jit("cache", "push", address)
     d = Machine(top, f"g-{remote.name}-d", remote)
     pulled = d.ra_jit("cache", "pull", address)
-    check("what was taken out is pushed again by a machine that has it", out.returncode == 0 and out.stdout.startswith("3 packs")
+    check("what was taken out is pushed again by a machine that has it", out.returncode == 0 and transferred(out).startswith("3 packs")
           and pulled.returncode == 0 and sorted(d.packs()) == sorted(sent), out.stdout.strip()[:80])
 
     # A store that made one pack of its small ones pushes that one too: the remote has them twice.
@@ -816,7 +821,7 @@ def kept(top, remote, crates, target, workspace):
     ok, counted, _ = a.cache("stats")
     out = a.ra_jit("cache", "push", address)
     check("told to end, the daemon ends as it was told, with nothing left to send", ended == TOLD_TO_END and ok
-          and counted.get("open packs") == 0 and out.returncode == 0 and out.stdout.startswith("0 packs added"),
+          and counted.get("open packs") == 0 and out.returncode == 0 and transferred(out).startswith("0 packs added"),
           f"exit {ended}; {out.stdout.strip()[:40]}")
 
     daemon, socket = a.daemon(crates, {"RA_JIT_REMOTE": address, "RA_JIT_REMOTE_PUSH_EVERY": "off"})

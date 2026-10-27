@@ -6,10 +6,26 @@
 // toolchain only.
 #![cfg_attr(
     feature = "nightly",
-    feature(deref_patterns, c_variadic_int128, portable_simd, core_intrinsics, f16, f128, f16b)
+    feature(deref_patterns, c_variadic_int128, portable_simd, core_intrinsics, f16, f128, f16b, unsized_fn_params)
 )]
 #![cfg_attr(all(feature = "nightly", target_arch = "aarch64"), feature(stdarch_aarch64_sve))]
+// The intrinsics `simd_wasm_lowered` and `x86_lowered` call directly, so that ra-jit compiles
+// them rather than linking `core::arch`'s functions of rustc's.
+#![cfg_attr(
+    all(feature = "nightly", any(target_arch = "wasm32", target_arch = "x86_64")),
+    feature(link_llvm_intrinsics, simd_ffi)
+)]
 #![cfg_attr(feature = "nightly", allow(incomplete_features, internal_features))]
+#![cfg_attr(
+    all(feature = "nightly", target_arch = "x86_64"),
+    feature(
+        stdarch_x86_avx512vp2intersect,
+        stdarch_x86_avx512_f16,
+        stdarch_x86_avx512_bf16,
+        simd_x86_clflushopt,
+        clflushopt_target_feature
+    )
+)]
 // The `core::arch::aarch64` functions `neon_intrinsics` calls that are not stable yet.
 #![cfg_attr(
     all(feature = "nightly", target_arch = "aarch64"),
@@ -19,11 +35,19 @@
         stdarch_neon_fcma,
         stdarch_arm_barrier,
         stdarch_arm_hints,
-        stdarch_aarch64_rand
+        stdarch_aarch64_rand,
+        stdarch_neon_f16
     )
 )]
 
 pub mod stabilized;
+
+#[cfg(all(feature = "nightly", target_arch = "x86_64"))]
+pub mod avx512;
+#[cfg(all(feature = "nightly", target_arch = "x86_64"))]
+pub mod x86_halves;
+#[cfg(all(feature = "nightly", target_arch = "x86_64"))]
+pub mod x86_lowered;
 
 pub mod scalars {
     pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {
@@ -370,6 +394,17 @@ pub mod consts {
     }
     pub fn repeat(v: u16) -> [u16; 5] {
         [v; 5]
+    }
+    // A slice matched from its end in a constant: its length is the target's `usize`.
+    const FROM_END: (u8, usize) = {
+        let primes: &[u8] = &[3, 5, 7, 11];
+        match primes {
+            [.., before, last] => (*before + *last, primes.len()),
+            _ => (0, 0),
+        }
+    };
+    pub fn from_end(n: u8) -> (u8, usize) {
+        (FROM_END.0 + n, FROM_END.1)
     }
 }
 
@@ -1210,12 +1245,289 @@ pub mod simd_lanes {
     }
 }
 
-/// `f16` and `f128`, which AArch64 has no arithmetic for without its half-precision extension:
-/// an `f16` is worked on as an `f32` and rounded back, an `f128` by compiler-builtins and C's
-/// `long double` functions. The values are at the edges of each format: signed zeros, the
-/// least and greatest subnormals, ties of the rounding back, the greatest finite values and
-/// what rounds past them, infinities, quiet and signalling NaNs with payloads.
-#[cfg(all(feature = "nightly", target_arch = "aarch64", target_os = "linux"))]
+/// Fused multiply-adds of `f32`s and `f64`s with each operand a number, a quiet NaN or a
+/// signalling NaN, every NaN with a payload of its own and the second operand's negative. The
+/// NaN that comes out is the one the instruction picks from its operands in their order, so
+/// it shows which operand each form puts where: scalar `mul_add` and `intrinsics::fma`,
+/// `simd_fma` and `simd_relaxed_fma` of vectors of one register and of two, and the NEON
+/// `vfma*` and `vfms*` forms on whole vectors, broadcast scalars and lanes.
+#[cfg(feature = "nightly")]
+pub mod fma_nans {
+    use core::intrinsics::simd::{simd_fma, simd_relaxed_fma};
+    use std::simd::{Simd, StdFloat};
+
+    const SINGLES: [[u32; 3]; 3] = [
+        [0x3fc0_0000, 0x7fc0_0001, 0x7f80_0011],
+        [0xc020_0000, 0xffc0_0002, 0xff80_0022],
+        [0x4080_0000, 0x7fc0_0003, 0x7f80_0033],
+    ];
+    const DOUBLES: [[u64; 3]; 3] = [
+        [0x3ff8_0000_0000_0000, 0x7ff8_0000_0000_0001, 0x7ff0_0000_0000_0011],
+        [0xc004_0000_0000_0000, 0xfff8_0000_0000_0002, 0xfff0_0000_0000_0022],
+        [0x4010_0000_0000_0000, 0x7ff8_0000_0000_0003, 0x7ff0_0000_0000_0033],
+    ];
+
+    pub fn scalars(a: f32, b: f32, c: f32, x: f64, y: f64, z: f64) -> [u64; 4] {
+        [
+            a.mul_add(b, c).to_bits() as u64,
+            core::intrinsics::fma(a, b, c).to_bits() as u64,
+            x.mul_add(y, z).to_bits(),
+            core::intrinsics::fma(x, y, z).to_bits(),
+        ]
+    }
+
+    pub fn vectors(a: f32, b: f32, c: f32, x: f64, y: f64, z: f64) -> Vec<u64> {
+        let [a, b, c] = [a, b, c].map(Simd::<f32, 4>::splat);
+        let [wide_a, wide_b, wide_c] = [a, b, c].map(|it| Simd::<f32, 8>::splat(it[0]));
+        let [x, y, z] = [x, y, z].map(Simd::<f64, 2>::splat);
+        let [wide_x, wide_y, wide_z] = [x, y, z].map(|it| Simd::<f64, 4>::splat(it[0]));
+        unsafe {
+            let mut out: Vec<u64> = Vec::new();
+            for v in [simd_fma(a, b, c), simd_relaxed_fma(a, b, c), a.mul_add(b, c)] {
+                out.extend(v.to_array().map(|it| it.to_bits() as u64));
+            }
+            for v in [simd_fma(wide_a, wide_b, wide_c), simd_relaxed_fma(wide_a, wide_b, wide_c)] {
+                out.extend(v.to_array().map(|it| it.to_bits() as u64));
+            }
+            for v in [simd_fma(x, y, z), simd_relaxed_fma(x, y, z), x.mul_add(y, z)] {
+                out.extend(v.to_array().map(f64::to_bits));
+            }
+            for v in [simd_fma(wide_x, wide_y, wide_z), simd_relaxed_fma(wide_x, wide_y, wide_z)] {
+                out.extend(v.to_array().map(f64::to_bits));
+            }
+            out
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn neon(a: f32, b: f32, c: f32, x: f64, y: f64, z: f64) -> Vec<u64> {
+        use core::arch::aarch64::*;
+        use core::mem::transmute;
+        unsafe {
+            let [qa, qb, qc] = [a, b, c].map(|it| vsetq_lane_f32::<3>(it, vdupq_n_f32(1.0)));
+            let [da, db, dc] = [a, b, c].map(|it| vset_lane_f32::<1>(it, vdup_n_f32(1.0)));
+            let [qx, qy, qz] = [x, y, z].map(|it| vsetq_lane_f64::<1>(it, vdupq_n_f64(1.0)));
+            let [dx, dy, dz] = [x, y, z].map(|it| vdup_n_f64(it));
+            let mut out: Vec<u64> = Vec::new();
+            for v in [
+                vfmaq_f32(qa, qb, qc),
+                vfmsq_f32(qa, qb, qc),
+                vfmaq_n_f32(qa, qb, c),
+                vfmsq_n_f32(qa, qb, c),
+                vfmaq_laneq_f32::<3>(qa, qb, qc),
+                vfmsq_laneq_f32::<3>(qa, qb, qc),
+                vfmaq_lane_f32::<1>(qa, qb, dc),
+            ] {
+                out.extend(transmute::<_, [u32; 4]>(v).map(u64::from));
+            }
+            for v in [
+                vfma_f32(da, db, dc),
+                vfms_f32(da, db, dc),
+                vfma_n_f32(da, db, c),
+                vfma_lane_f32::<1>(da, db, dc),
+                vfms_laneq_f32::<3>(da, db, qc),
+            ] {
+                out.extend(transmute::<_, [u32; 2]>(v).map(u64::from));
+            }
+            for v in [
+                vfmas_lane_f32::<1>(a, b, dc),
+                vfmas_laneq_f32::<3>(a, b, qc),
+                vfmss_lane_f32::<1>(a, b, dc),
+            ] {
+                out.push(v.to_bits() as u64);
+            }
+            for v in [
+                vfmaq_f64(qx, qy, qz),
+                vfmsq_f64(qx, qy, qz),
+                vfmaq_n_f64(qx, qy, z),
+                vfmaq_laneq_f64::<1>(qx, qy, qz),
+                vfmsq_laneq_f64::<1>(qx, qy, qz),
+                vfmaq_lane_f64::<0>(qx, qy, dz),
+            ] {
+                out.extend(transmute::<_, [u64; 2]>(v));
+            }
+            for v in [vfma_f64(dx, dy, dz), vfms_f64(dx, dy, dz), vfma_n_f64(dx, dy, z)] {
+                out.push(transmute::<_, u64>(v));
+            }
+            for v in [
+                vfmad_lane_f64::<0>(x, y, dz),
+                vfmad_laneq_f64::<1>(x, y, qz),
+                vfmsd_lane_f64::<0>(x, y, dz),
+            ] {
+                out.push(v.to_bits());
+            }
+            out
+        }
+    }
+
+    /// Every choice of number, quiet NaN or signalling NaN for each of the three operands.
+    pub fn run() -> String {
+        let mut out = String::new();
+        for i in 0..27 {
+            let pick = [i % 3, i / 3 % 3, i / 9];
+            let [a, b, c] = [0, 1, 2].map(|k| f32::from_bits(SINGLES[k][pick[k]]));
+            let [x, y, z] = [0, 1, 2].map(|k| f64::from_bits(DOUBLES[k][pick[k]]));
+            let mut results = scalars(a, b, c, x, y, z).to_vec();
+            results.extend(vectors(a, b, c, x, y, z));
+            #[cfg(target_arch = "aarch64")]
+            results.extend(neon(a, b, c, x, y, z));
+            out += &format!("{pick:?}");
+            for it in results {
+                out += &format!(" {it:x}");
+            }
+            out += ";";
+        }
+        out
+    }
+}
+
+/// Unsized values taken by value (`unsized_fn_params`), which rustc passes as the address of
+/// the value and its metadata: slices, `str`, `dyn Trait` and a struct with an unsized tail,
+/// of several lengths, moved out of a `Box`, passed on, through a trait and a vtable, and
+/// dropped by the callee.
+#[cfg(feature = "nightly")]
+pub mod unsized_params {
+    use std::cell::Cell;
+    use std::fmt::Display;
+
+    thread_local! {
+        static DROPS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub struct Noisy(pub u32);
+    impl Drop for Noisy {
+        fn drop(&mut self) {
+            DROPS.with(|it| it.set(it.get() * 10 + self.0));
+        }
+    }
+
+    pub struct Tail<T: ?Sized> {
+        pub n: u8,
+        pub rest: T,
+    }
+
+    #[inline(never)]
+    pub fn sum(x: [u64]) -> u64 {
+        let mut total = x.len() as u64 * 1000;
+        for v in &x {
+            total = total.wrapping_mul(31).wrapping_add(*v);
+        }
+        total
+    }
+    #[inline(never)]
+    pub fn passed_on(x: [u64], bias: u64) -> u64 {
+        sum(x) ^ bias
+    }
+    #[inline(never)]
+    pub fn bumped(mut x: [u32]) -> Vec<u32> {
+        if let Some(first) = x.first_mut() {
+            *first += 1;
+        }
+        x.to_vec()
+    }
+    #[inline(never)]
+    pub fn shout(s: str) -> String {
+        format!("{}:{}", s.len(), s.to_uppercase())
+    }
+    #[inline(never)]
+    pub fn show(x: dyn Display, width: usize) -> String {
+        format!("[{:>width$}]", &x)
+    }
+    #[inline(never)]
+    pub fn joined(x: [String]) -> String {
+        x.join("+")
+    }
+    #[inline(never)]
+    pub fn counted(x: [Noisy]) -> usize {
+        x.len()
+    }
+    #[inline(never)]
+    pub fn tail(x: Tail<[u16]>) -> (u8, usize, u32) {
+        (x.n, x.rest.len(), x.rest.iter().map(|&it| u32::from(it)).sum())
+    }
+
+    pub trait Total {
+        fn total(self) -> u64;
+    }
+    impl Total for [u64] {
+        fn total(self) -> u64 {
+            passed_on(self, 7)
+        }
+    }
+
+    pub trait Consume {
+        fn consume(self) -> String;
+    }
+    impl Consume for String {
+        fn consume(self) -> String {
+            self + "!"
+        }
+    }
+    impl Consume for (u8, u64, [u16; 3]) {
+        fn consume(self) -> String {
+            format!("{:?}", self)
+        }
+    }
+    impl Consume for Noisy {
+        fn consume(self) -> String {
+            format!("noisy {}", self.0)
+        }
+    }
+
+    pub fn run() -> String {
+        let mut out = Vec::new();
+        for len in [0usize, 1, 3, 17] {
+            let values: Vec<u64> = (0..len as u64).map(|it| it * it + 5).collect();
+            out.push(sum(*values.clone().into_boxed_slice()).to_string());
+            out.push(values.clone().into_boxed_slice().total().to_string());
+            let small: Vec<u32> = (0..len as u32).collect();
+            out.push(format!("{:?}", bumped(*small.into_boxed_slice())));
+            let strings: Vec<String> = (0..len).map(|it| "ab".repeat(it)).collect();
+            out.push(joined(*strings.into_boxed_slice()));
+        }
+        for s in ["", "a", "héllo wörld", "ß"] {
+            let boxed: Box<str> = s.into();
+            out.push(shout(*boxed));
+        }
+        let shown: [Box<dyn Display>; 3] = [Box::new(42u8), Box::new("text"), Box::new(-1.5f64)];
+        for (width, it) in shown.into_iter().enumerate() {
+            out.push(show(*it, width * 3));
+        }
+        DROPS.with(|it| it.set(0));
+        let noisy: Box<[Noisy]> = vec![Noisy(1), Noisy(2), Noisy(3)].into_boxed_slice();
+        out.push(format!("{} {}", counted(*noisy), DROPS.with(Cell::get)));
+        let empty: Box<[Noisy]> = Vec::new().into_boxed_slice();
+        out.push(format!("{} {}", counted(*empty), DROPS.with(Cell::get)));
+        let tails: [Box<Tail<[u16]>>; 3] = [
+            Box::new(Tail { n: 1, rest: [0u16; 0] }),
+            Box::new(Tail { n: 2, rest: [7] }),
+            Box::new(Tail { n: 3, rest: [1, 2, 65535, 9] }),
+        ];
+        for it in tails {
+            out.push(format!("{:?}", tail(*it)));
+        }
+        DROPS.with(|it| it.set(0));
+        let consumed: [Box<dyn Consume>; 3] =
+            [Box::new(String::from("owned")), Box::new((9, u64::MAX, [1, 2, 3])), Box::new(Noisy(4))];
+        for it in consumed {
+            out.push(it.consume());
+        }
+        out.push(DROPS.with(Cell::get).to_string());
+        out.join(" | ")
+    }
+}
+
+/// `f16` and `f128`, which AArch64 and x86-64 have no arithmetic for without their
+/// half-precision extensions: an `f16` is worked on as an `f32` and rounded back, an `f128` by
+/// compiler-builtins and C's functions of it (`long double`'s on AArch64, `_Float128`'s on
+/// x86-64). The values are at the edges of each format: signed zeros, the least and greatest
+/// subnormals, ties of the rounding back, the greatest finite values and what rounds past
+/// them, infinities, quiet and signalling NaNs with payloads.
+#[cfg(all(
+    feature = "nightly",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "linux"
+))]
 pub mod soft_floats {
     use core::intrinsics as i;
 
@@ -1251,12 +1563,18 @@ pub mod soft_floats {
     pub fn half_widened(a: f16) -> (u32, u64, u128) {
         ((a as f32).to_bits(), (a as f64).to_bits(), (a as f128).to_bits())
     }
-    // Not to 128-bit integers: rustc at `opt-level=0` (LLVM's GlobalISel) converts an `f16` to
-    // one as to a 64-bit integer and leaves the upper half zero, so `-1.0 as i128` is 2^64 - 1
-    // there, and saturates as `as` should only optimized.
+    // To 128-bit integers only on x86-64: AArch64's rustc at `opt-level=0` (LLVM's GlobalISel)
+    // converts an `f16` to one as to a 64-bit integer and leaves the upper half zero, so
+    // `-1.0 as i128` is 2^64 - 1 there, and saturates as `as` should only optimized.
     pub fn half_to_ints(a: f16) -> (i8, u8, i16, u16, i32, u32, i64, u64) {
         (a as i8, a as u8, a as i16, a as u16, a as i32, a as u32, a as i64, a as u64)
     }
+    #[cfg(target_arch = "x86_64")]
+    pub fn half_to_wide_ints(a: f16) -> (i128, u128) {
+        (a as i128, a as u128)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn half_to_wide_ints(_: f16) {}
     pub fn halves_of(a: f32, b: f64) -> (u16, u16) {
         ((a as f16).to_bits(), (b as f16).to_bits())
     }
@@ -1264,10 +1582,41 @@ pub mod soft_floats {
         [a as f16, b as f16, c as f16, d as f16, e as f16, f as f16].map(f16::to_bits)
     }
     /// `f16b` moves as an `f16` does, and is compared and widened as the `f32` it is the top
-    /// half of.
+    /// half of. Not on x86-64, whose LLVM narrows it from `f32` wherever it moves, which
+    /// quiets a signalling NaN.
+    #[cfg(target_arch = "aarch64")]
     pub fn brain(a: u16, b: u16) -> (u16, bool, Option<core::cmp::Ordering>, u32, String) {
         let (a, b) = (core::num::f16b::from_bits(a), core::num::f16b::from_bits(b));
         (b.to_bits(), a == b, a.partial_cmp(&b), f32::from(a).to_bits(), format!("{a:?}"))
+    }
+    /// x86-64's LLVM receives an `f16b` parameter as the `f32` it widens to and narrows it
+    /// back by `__truncsfbf2`, which quiets a signalling NaN; one made and moved within a block
+    /// keeps its bits. The `f16b`s are parameters here, or made and used in one block.
+    #[cfg(target_arch = "x86_64")]
+    pub fn brain_received(
+        a: core::num::f16b,
+        b: core::num::f16b,
+    ) -> (u16, bool, Option<core::cmp::Ordering>, u32, String, String, String) {
+        let formatted = (format!("{a:?}"), format!("{a:e}"), format!("{b:E}"));
+        (b.to_bits(), a == b, a.partial_cmp(&b), f32::from(a).to_bits(), formatted.0, formatted.1, formatted.2)
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn brain_of(a: u16, b: u16) -> (u16, bool, Option<core::cmp::Ordering>, u32, String, String, String) {
+        brain_received(core::num::f16b::from_bits(a), core::num::f16b::from_bits(b))
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn passed(a: core::num::f16b) -> core::num::f16b {
+        a
+    }
+    /// The bits of an `f16b` made, cloned, defaulted, and passed through a call (a parameter,
+    /// rounded there).
+    #[cfg(target_arch = "x86_64")]
+    pub fn brain_moves(bits: u16) -> [u16; 4] {
+        use core::mem::transmute;
+        let made = core::num::f16b::from_bits(bits);
+        unsafe {
+            [transmute(made), transmute(made.clone()), transmute(core::num::f16b::default()), transmute(passed(made))]
+        }
     }
     pub fn pair(a: f16, b: f128) -> (f16, f128, Option<f16>) {
         (b as f16, a as f128, if a > 0.0 { Some(-a) } else { None })
@@ -1332,15 +1681,27 @@ pub mod soft_floats {
                 out += &format!("{:x?}{:?}", half_ops(a, b), half_compares(a, b));
             }
             out += &format!(
-                "\n{:x?} {:x?} {:?} {:?}\n",
+                "\n{:x?} {:x?} {:?} {:?} {:?}\n",
                 half_rounding(a),
                 half_widened(a),
                 half_to_ints(a),
+                half_to_wide_ints(a),
                 pair(a, a as f128)
             );
         }
+        #[cfg(target_arch = "aarch64")]
         for (&a, &b) in HALVES.iter().zip(HALVES.iter().rev()) {
             out += &format!("{:?} ", brain(a, b));
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            const BRAINS: [u16; 14] = [
+                0x7f81, 0xff81, 0x7fa0, 0x7fbf, 0x7fc1, 0xffc0, 0x7f80, 0xff80, 0x0001, 0x8000, 0x3f80,
+                0x7f7f, 0x4148, 0x0000,
+            ];
+            for (&a, &b) in BRAINS.iter().chain(&HALVES).zip(BRAINS.iter().chain(&HALVES).rev()) {
+                out += &format!("{:?} {:x?} ", brain_of(a, b), brain_moves(a));
+            }
         }
         for (single, double) in SINGLES.iter().zip(DOUBLES.iter().cycle()) {
             out += &format!("{:x?} ", halves_of(f32::from_bits(*single), f64::from_bits(*double)));
@@ -1944,6 +2305,45 @@ pub mod const_pointers {
     }
 }
 
+/// Constants whose raw pointer, of a type that says nothing of the pointee, points at
+/// pointers: std's `io::Error` of a message is a `NonNull<()>` to a `&str` and a kind.
+pub mod const_behind_raw {
+    use std::ptr::NonNull;
+
+    struct Message {
+        text: &'static str,
+        kind: u8,
+    }
+    struct Erased(NonNull<()>);
+    unsafe impl Sync for Erased {}
+
+    const fn erase(message: &'static Message) -> Erased {
+        Erased(NonNull::from_ref(message).cast())
+    }
+    const PROMOTED: Erased =
+        erase(const { &Message { text: "failed to fill whole buffer", kind: 3 } });
+    const NAMED: &Message = &Message { text: "a named one", kind: 4 };
+    const OF_NAMED: Erased = erase(NAMED);
+    static WORDS: [&str; 2] = ["two", "words"];
+    struct Raw<T>(*const T);
+    unsafe impl<T> Sync for Raw<T> {}
+    static OF_STATIC: Raw<[&'static str; 2]> = Raw(&raw const WORDS);
+    static TWICE: Raw<Raw<[&'static str; 2]>> = Raw(&raw const OF_STATIC);
+
+    fn shown(erased: &Erased) -> String {
+        let message = unsafe { erased.0.cast::<Message>().as_ref() };
+        format!("{}/{}", message.text, message.kind)
+    }
+
+    pub fn run() -> String {
+        use std::io::Read;
+        let eof = (&b""[..]).read_exact(&mut [0; 1]).unwrap_err();
+        let words = unsafe { &*(*TWICE.0).0 };
+        let (promoted, named) = (shown(&PROMOTED), shown(&OF_NAMED));
+        format!("{promoted} {named} {} {eof} {:?}", words.join(" "), eof.kind())
+    }
+}
+
 pub mod const_unsized_struct {
     #[repr(transparent)]
     pub struct Bytes {
@@ -2189,6 +2589,22 @@ pub mod packed_drop {
         drop(w);
         drop(m.1.1.a);
         ODD.with(|it| it.get())
+    }
+}
+
+/// `offset_of!` of a field of a packed struct takes no reference to it. The struct is never laid
+/// out by ra-jit, and --layouts compares types by their names without paths: named `Header`, it
+/// was compared with std's Windows allocator `Header(*mut u8)`, which ra-jit lays out.
+pub mod packed_offset_of {
+    #[repr(C, packed)]
+    pub struct PackedHeader {
+        pub magic: u16,
+        pub version: u8,
+        pub checksum: u32,
+    }
+
+    pub fn run(base: usize) -> usize {
+        base + core::mem::offset_of!(PackedHeader, checksum)
     }
 }
 
@@ -2485,6 +2901,36 @@ pub mod async_frames {
         let second = leaf(first as u8).await;
         let third = leaf(second as u8).await;
         first + second + third + checksum(view)
+    }
+
+    /// Runs a closure on its second poll, as `spawn_blocking`'s handle does, scribbling over
+    /// itself on the first.
+    struct Later<F> {
+        scratch: [u64; 8],
+        run: Option<F>,
+    }
+    impl<F: FnOnce() -> u64 + Unpin> Future for Later<F> {
+        type Output = u64;
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<u64> {
+            if self.scratch[0] == 0 {
+                self.scratch = [u64::MAX - 1; 8];
+                return Poll::Pending;
+            }
+            Poll::Ready(self.run.take().unwrap()())
+        }
+    }
+
+    /// A `move` closure copies `size` and leaves it live across the await of the closure.
+    async fn captured(n: u64) -> u64 {
+        let size = n;
+        let more = Later { scratch: [0; 8], run: Some(move || size + 1) }.await;
+        let label = format!("{size}");
+        Twice(false).await;
+        more * 1000 + size + label.len() as u64
+    }
+
+    pub fn captured_copy() -> (u64, u64) {
+        (block_on(captured(1181)), block_on(captured(7)))
     }
 
     pub fn shared() -> (Vec<u64>, bool) {
@@ -3884,6 +4330,64 @@ pub mod promoted_assoc_const {
     }
 }
 
+pub mod promoted_value_qualifs {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// rustc promotes a constant by what its value holds, not its type: no variant built here
+    /// has a cell or anything to drop, as ruff's printer's `&[OPEN_PAREN, INDENT]` and
+    /// nushell's `&Signals::EMPTY`.
+    pub enum Element {
+        Token(&'static str),
+        Group(Cell<u8>),
+        Text(Box<str>),
+    }
+    pub struct Queue<'a>(Vec<&'a [Element]>);
+    impl<'a> Queue<'a> {
+        fn extend(&mut self, it: &'a [Element]) {
+            self.0.push(it)
+        }
+    }
+    pub struct Signals(Option<std::sync::Arc<AtomicBool>>);
+    impl Signals {
+        const EMPTY: Self = Signals(None);
+    }
+    fn empty() -> &'static Signals {
+        &Signals::EMPTY
+    }
+
+    /// In a static's value a static is borrowed in a promoted constant, as nushell's test
+    /// harness lists its experimental options.
+    pub struct Opt(AtomicBool);
+    pub static ON: Opt = Opt(AtomicBool::new(true));
+    pub struct Meta {
+        opts: &'static [(&'static Opt, bool)],
+    }
+    impl Meta {
+        const fn new(opts: &'static [(&'static Opt, bool)]) -> Self {
+            Meta { opts }
+        }
+    }
+    static META: Meta = Meta::new(&[(&ON, true)]);
+
+    pub fn run() -> (usize, usize, bool, bool) {
+        const OPEN: Element = Element::Token("(");
+        const CLOSE: Element = Element::Token(")");
+        let mut queue = Queue(Vec::new());
+        queue.extend(&[OPEN, CLOSE]);
+        let tokens = queue.0[0]
+            .iter()
+            .map(|it| match it {
+                Element::Token(text) => text.len(),
+                Element::Group(cell) => cell.get() as usize,
+                Element::Text(text) => text.len(),
+            })
+            .sum();
+        let (opt, on) = META.opts[0];
+        (tokens, META.opts.len(), empty().0.is_none(), opt.0.load(Ordering::Relaxed) && on)
+    }
+}
+
 pub mod offsets {
     use std::mem::offset_of;
 
@@ -4691,6 +5195,22 @@ pub mod promoted_slices {
     }
 }
 
+/// `&mut [][..]` borrows an empty array mutably to index it, and rustc promotes a mutable
+/// borrow of an empty array, so the slice outlives the function (bun's `copies!`).
+pub mod promoted_empty_mut {
+    fn pick(v: &mut [u32], all: bool) -> &mut [u32] {
+        match all {
+            true => v,
+            false => &mut [][..],
+        }
+    }
+
+    pub fn run() -> (usize, usize) {
+        let mut v = [1, 2, 3];
+        (pick(&mut v, true).len(), pick(&mut v, false).len())
+    }
+}
+
 pub mod reified {
     #[derive(Debug)]
     pub struct W(u8, String);
@@ -5224,6 +5744,495 @@ pub mod simd_x86 {
         if is_x86_feature_detected!("avx512f") { out += &format!(" {:?}", unsafe { blend(a, b) }); }
         if is_x86_feature_detected!("avx512bw") { out += &format!(" {:?}", unsafe { permute16(a, b) }); }
         if is_x86_feature_detected!("avx512vbmi") { out += &format!(" {:?}", unsafe { permute8(a, b) }); }
+        out
+    }
+}
+
+/// x86's intrinsics that LLVM selects one instruction for, at the edges of their inputs: NaN
+/// and both zeros for the minimum and maximum, halves and values past the integer's range for
+/// the conversions (in two rounding modes of MXCSR), counts past the lane's width for the
+/// shifts, the least integer for the rounded high product, flags that hold, that do not and
+/// that are unordered; the crypto instructions; and those on the machine's state, whose
+/// values are not the same twice (random numbers, the time stamp counter, what XSAVE saves),
+/// checked by their shape: the flag and the value agreeing, the counter not going back, the
+/// saved MXCSR being the one `stmxcsr` reads.
+#[cfg(target_arch = "x86_64")]
+#[allow(deprecated)]
+pub mod x86_instructions {
+    use core::arch::x86_64::*;
+    use std::mem::transmute;
+
+    fn ps(v: __m128) -> [u32; 4] { unsafe { transmute(v) } }
+    fn pd(v: __m128d) -> [u64; 2] { unsafe { transmute(v) } }
+    fn epi(v: __m128i) -> [u16; 8] { unsafe { transmute(v) } }
+
+    pub fn min_max() -> Vec<[u32; 4]> {
+        unsafe {
+            let a = _mm_set_ps(f32::NAN, -0.0, 0.0, 1.0);
+            let b = _mm_set_ps(1.0, 0.0, -0.0, f32::NAN);
+            vec![
+                ps(_mm_max_ps(a, b)), ps(_mm_max_ps(b, a)), ps(_mm_min_ps(a, b)), ps(_mm_min_ps(b, a)),
+                ps(_mm_max_ss(a, b)), ps(_mm_min_ss(b, a)),
+            ]
+        }
+    }
+    pub fn min_max_double() -> Vec<[u64; 2]> {
+        unsafe {
+            let a = _mm_set_pd(f64::NAN, -0.0);
+            let b = _mm_set_pd(1.0, 0.0);
+            let c = _mm_set_pd(3.0, f64::NAN);
+            vec![
+                pd(_mm_max_pd(a, b)), pd(_mm_max_pd(b, a)), pd(_mm_min_pd(a, b)), pd(_mm_min_pd(b, a)),
+                pd(_mm_max_sd(b, c)), pd(_mm_min_sd(c, b)), pd(_mm_max_sd(a, b)), pd(_mm_min_sd(a, b)),
+            ]
+        }
+    }
+    /// The estimates, whose bits only the hardware's tables say.
+    pub fn estimates() -> Vec<[u32; 4]> {
+        unsafe {
+            let a = _mm_set_ps(4.0, -0.0, f32::INFINITY, 3.0e-39);
+            let b = _mm_set_ps(9.0, 7.0, 1.0e-3, 0.0);
+            vec![ps(_mm_rcp_ps(a)), ps(_mm_rsqrt_ps(b)), ps(_mm_rcp_ss(b)), ps(_mm_rsqrt_ss(a))]
+        }
+    }
+    /// The conversions, which round as MXCSR says unless they truncate.
+    fn conversions() -> (Vec<i64>, Vec<[u32; 4]>) {
+        unsafe {
+            let mut ints = Vec::new();
+            let mut vectors = Vec::new();
+            for x in [2.5f32, -2.5, 3.5, -0.0, 1.0e10, -3.0e9, f32::NAN, f32::INFINITY] {
+                let s = _mm_set_ss(x);
+                let d = _mm_set_sd(f64::from(x) * 1e9);
+                ints.extend([
+                    i64::from(_mm_cvtss_si32(s)), i64::from(_mm_cvttss_si32(s)), _mm_cvtss_si64(s), _mm_cvttss_si64(s),
+                    i64::from(_mm_cvtsd_si32(d)), i64::from(_mm_cvttsd_si32(d)), _mm_cvtsd_si64(d), _mm_cvttsd_si64(d),
+                ]);
+            }
+            let singles = _mm_set_ps(2.5, -1.5, 3.0e9, f32::NAN);
+            let doubles = _mm_set_pd(-2.5, 2147483647.5);
+            vectors.extend([
+                ps(transmute(_mm_cvtps_epi32(singles))), ps(transmute(_mm_cvttps_epi32(singles))),
+                ps(transmute(_mm_cvtpd_epi32(doubles))), ps(transmute(_mm_cvttpd_epi32(doubles))),
+                ps(_mm_cvtsd_ss(singles, _mm_set_sd(1.0 + f64::EPSILON * 3.0))),
+                ps(_mm_cvtsd_ss(singles, _mm_set_sd(1.0e300))),
+            ]);
+            (ints, vectors)
+        }
+    }
+    /// The conversions as MXCSR rounds by default, then rounding down, then back.
+    pub fn rounding_modes() -> (u32, (Vec<i64>, Vec<[u32; 4]>), u32, (Vec<i64>, Vec<[u32; 4]>), u32) {
+        let csr = unsafe { _mm_getcsr() };
+        let nearest = conversions();
+        unsafe { _mm_setcsr((csr & !_MM_ROUND_MASK) | _MM_ROUND_DOWN) };
+        let down_csr = unsafe { _mm_getcsr() };
+        let down = conversions();
+        unsafe { _mm_setcsr(csr) };
+        (csr, nearest, down_csr, down, unsafe { _mm_getcsr() })
+    }
+    pub fn comparisons() -> Vec<i32> {
+        unsafe {
+            let mut out = Vec::new();
+            for (l, r) in [(1.0, 2.0), (2.0, 1.0), (1.0, 1.0), (-0.0, 0.0), (f32::NAN, 1.0), (1.0, f32::NAN)] {
+                let (a, b) = (_mm_set_ss(l), _mm_set_ss(r));
+                out.extend([
+                    _mm_comieq_ss(a, b), _mm_comineq_ss(a, b), _mm_comilt_ss(a, b), _mm_comile_ss(a, b),
+                    _mm_comigt_ss(a, b), _mm_comige_ss(a, b), _mm_ucomieq_ss(a, b), _mm_ucomineq_ss(a, b),
+                    _mm_ucomilt_ss(a, b), _mm_ucomile_ss(a, b), _mm_ucomigt_ss(a, b), _mm_ucomige_ss(a, b),
+                ]);
+                let (a, b) = (_mm_set_sd(f64::from(l)), _mm_set_sd(f64::from(r)));
+                out.extend([
+                    _mm_comieq_sd(a, b), _mm_comineq_sd(a, b), _mm_comilt_sd(a, b), _mm_comile_sd(a, b),
+                    _mm_comigt_sd(a, b), _mm_comige_sd(a, b), _mm_ucomieq_sd(a, b), _mm_ucomineq_sd(a, b),
+                    _mm_ucomilt_sd(a, b), _mm_ucomile_sd(a, b), _mm_ucomigt_sd(a, b), _mm_ucomige_sd(a, b),
+                ]);
+            }
+            out
+        }
+    }
+    /// The shifts by the count in the low 64 bits of a vector: 0, within the lane, its width
+    /// less one, its width, and past 32 bits.
+    pub fn shifts() -> Vec<[u16; 8]> {
+        unsafe {
+            let v = _mm_set_epi16(i16::MIN, -1, 0x1234, 1, -0x5678, 0x7fff, 2, -3);
+            let mut out = Vec::new();
+            for count in [0i64, 3, 15, 16, 31, 63, 64, 1 << 40] {
+                let c = _mm_set_epi64x(-1, count);
+                out.extend([
+                    epi(_mm_sll_epi16(v, c)), epi(_mm_srl_epi16(v, c)), epi(_mm_sra_epi16(v, c)),
+                    epi(_mm_sll_epi32(v, c)), epi(_mm_srl_epi32(v, c)), epi(_mm_sra_epi32(v, c)),
+                    epi(_mm_sll_epi64(v, c)), epi(_mm_srl_epi64(v, c)),
+                ]);
+            }
+            out
+        }
+    }
+    /// The fences, the flush of a line, and the store of the bytes a mask selects.
+    pub fn memory() -> [u8; 16] {
+        unsafe {
+            let mut bytes = [0xeeu8; 16];
+            _mm_sfence();
+            _mm_lfence();
+            _mm_mfence();
+            _mm_clflush(bytes.as_ptr());
+            let v = _mm_set_epi8(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+            let mask = _mm_set_epi8(-1, 0, 0x7f, -128, 1, -2, 0, 0, -1, -1, 0, 0, 0x40, -64, 0, -1);
+            _mm_maskmoveu_si128(v, mask, bytes.as_mut_ptr().cast());
+            _mm_sfence();
+            bytes
+        }
+    }
+    #[cfg(feature = "nightly")]
+    #[target_feature(enable = "clflushopt")]
+    pub unsafe fn flushed(x: &u64) -> u64 {
+        unsafe { _mm_clflushopt((x as *const u64).cast()) };
+        *x
+    }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn signs() -> Vec<[u16; 8]> {
+        unsafe {
+            let a = _mm_set_epi16(i16::MIN, -1, 0x1234, 1, -0x5678, 0x7fff, 0, -3);
+            let b = _mm_set_epi16(-1, 0, 1, i16::MIN, 0x7fff, -2, 5, 0);
+            let c = _mm_set_epi16(i16::MIN, i16::MIN, 0x4000, -0x4000, 0x7fff, 1, -1, 0x2000);
+            vec![
+                epi(_mm_sign_epi8(a, b)), epi(_mm_sign_epi16(a, b)), epi(_mm_sign_epi32(a, b)),
+                epi(_mm_mulhrs_epi16(a, c)), epi(_mm_mulhrs_epi16(c, c)),
+            ]
+        }
+    }
+    #[target_feature(enable = "sse4.1")]
+    pub unsafe fn rounds() -> (Vec<i32>, Vec<[u32; 4]>, Vec<[u64; 2]>) {
+        unsafe {
+            let ones = _mm_set1_epi8(-1);
+            let v = _mm_set_epi64x(0x00ff, 0x0f00);
+            let tests = vec![
+                _mm_testnzc_si128(v, ones), _mm_testnzc_si128(v, v), _mm_testnzc_si128(v, _mm_setzero_si128()),
+                _mm_testnzc_si128(ones, v),
+            ];
+            let a = _mm_set_ps(9.0, 8.0, 7.0, 6.0);
+            let singles = [-2.5f32, 2.5, -0.4, f32::NAN].map(|x| {
+                let b = _mm_set_ss(x);
+                ps(_mm_floor_ss(a, b))[0] as u64 | (ps(_mm_ceil_ss(a, b))[0] as u64) << 32
+            });
+            let floors = vec![
+                ps(_mm_floor_ss(a, _mm_set_ss(-2.5))), ps(_mm_ceil_ss(a, _mm_set_ss(-0.4))),
+                ps(_mm_round_ss::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(a, _mm_set_ss(2.5))),
+                [singles[0] as u32, singles[1] as u32, singles[2] as u32, singles[3] as u32],
+            ];
+            let d = _mm_set_pd(5.0, 4.0);
+            let doubles = vec![
+                pd(_mm_floor_sd(d, _mm_set_sd(-2.5))), pd(_mm_ceil_sd(d, _mm_set_sd(-0.5))),
+                pd(_mm_floor_sd(d, _mm_set_sd(f64::NAN))), pd(_mm_ceil_sd(d, _mm_set_sd(1e300))),
+                pd(_mm_round_sd::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(d, _mm_set_sd(-7.75))),
+            ];
+            (tests, floors, doubles)
+        }
+    }
+    /// AMD's bit field extraction and insertion: the field's length and place from the low
+    /// bytes of the second operand, a length of 0 being 64.
+    #[target_feature(enable = "sse4a")]
+    pub unsafe fn fields() -> Vec<[u64; 2]> {
+        unsafe {
+            let x = _mm_set_epi64x(0x1111_2222_3333_4444, 0x0123_4567_89ab_cdef);
+            let y = _mm_set_epi64x(0x5555_6666_7777_8888, 0x7edc_ba98_7654_3210);
+            let mut out = Vec::new();
+            for (length, index) in [(8i64, 4i64), (0, 0), (16, 48), (63, 1), (4, 60)] {
+                let control = _mm_set_epi64x(0, length | index << 8);
+                out.push(transmute(_mm_extract_si64(x, control)));
+                let inserted = _mm_set_epi64x(length | index << 8, _mm_cvtsi128_si64(y));
+                out.push(transmute(_mm_insert_si64(x, inserted)));
+            }
+            out
+        }
+    }
+    #[target_feature(enable = "avx")]
+    pub unsafe fn avx() -> (Vec<[u32; 8]>, Vec<[u32; 4]>, Vec<i32>) {
+        unsafe {
+            let wide = |v: __m256| transmute::<_, [u32; 8]>(v);
+            let a = _mm256_set_ps(f32::NAN, -0.0, 0.0, 1.0, 2.5, -2.5, 3.0e9, 4.0);
+            let b = _mm256_set_ps(1.0, 0.0, -0.0, f32::NAN, -1.5, 0.5, 2.0, f32::INFINITY);
+            let c = _mm256_set_pd(f64::NAN, -0.0, 2.5, -3.5);
+            let d = _mm256_set_pd(1.0, 0.0, f64::NAN, 1e300);
+            let indices = _mm256_set_epi32(3, 2, 1, 0, -1, 6, 5, 0x7fff_fffd);
+            let selectors = _mm256_set_epi64x(2, 0, -1, 3);
+            let vectors = vec![
+                wide(_mm256_max_ps(a, b)), wide(_mm256_min_ps(a, b)), wide(transmute(_mm256_max_pd(c, d))),
+                wide(transmute(_mm256_min_pd(d, c))), wide(transmute(_mm256_cvtps_epi32(a))),
+                wide(transmute(_mm256_cvttps_epi32(a))), wide(_mm256_rcp_ps(a)), wide(_mm256_rsqrt_ps(b)),
+                wide(_mm256_permutevar_ps(a, indices)), wide(transmute(_mm256_permutevar_pd(c, selectors))),
+            ];
+            let halves = vec![
+                ps(transmute(_mm256_cvtpd_epi32(c))), ps(transmute(_mm256_cvttpd_epi32(d))),
+                ps(_mm_permutevar_ps(_mm256_castps256_ps128(a), _mm256_castsi256_si128(indices))),
+                ps(transmute(_mm_permutevar_pd(_mm256_castpd256_pd128(c), _mm_set_epi64x(0, 2)))),
+            ];
+            let neg = _mm256_set_ps(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+            let pos = _mm256_set1_ps(1.0);
+            let negd = _mm256_set_pd(-1.0, 1.0, -1.0, 1.0);
+            let ones = _mm256_set1_epi8(-1);
+            let some = _mm256_set_epi64x(0, 1, 0, 0);
+            let mut tests = Vec::new();
+            for (x, y) in [(neg, neg), (neg, pos), (pos, neg), (neg, _mm256_set1_ps(-1.0))] {
+                tests.extend([_mm256_testz_ps(x, y), _mm256_testc_ps(x, y), _mm256_testnzc_ps(x, y)]);
+                let (x, y) = (_mm256_castps256_ps128(x), _mm256_castps256_ps128(y));
+                tests.push(_mm_testnzc_ps(x, y));
+            }
+            for (x, y) in [(negd, negd), (negd, c), (c, negd)] {
+                tests.extend([_mm256_testz_pd(x, y), _mm256_testc_pd(x, y), _mm256_testnzc_pd(x, y)]);
+                tests.push(_mm_testnzc_pd(_mm256_castpd256_pd128(x), _mm256_castpd256_pd128(y)));
+            }
+            tests.extend([_mm256_testnzc_si256(some, ones), _mm256_testnzc_si256(ones, ones)]);
+            _mm256_zeroall();
+            (vectors, halves, tests)
+        }
+    }
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn avx2() -> Vec<[u16; 16]> {
+        unsafe {
+            let wide = |v: __m256i| transmute::<_, [u16; 16]>(v);
+            let a = _mm256_set_epi16(i16::MIN, -1, 0x1234, 1, -0x5678, 0x7fff, 0, -3, 5, 6, 7, -8, 9, 10, i16::MIN, 12);
+            let b = _mm256_set_epi16(-1, 0, 1, i16::MIN, 0x7fff, -2, 5, 0, i16::MIN, 1, 0, -1, 0x4000, -0x4000, i16::MIN, 3);
+            let mut out = vec![
+                wide(_mm256_sign_epi8(a, b)), wide(_mm256_sign_epi16(a, b)), wide(_mm256_sign_epi32(a, b)),
+                wide(_mm256_mulhrs_epi16(a, b)), wide(_mm256_mulhrs_epi16(b, b)),
+            ];
+            for count in [0i64, 7, 15, 16, 33, 64, 1 << 40] {
+                let c = _mm_set_epi64x(0x7fff, count);
+                out.extend([
+                    wide(_mm256_sll_epi16(a, c)), wide(_mm256_srl_epi16(a, c)), wide(_mm256_sra_epi16(a, c)),
+                    wide(_mm256_sll_epi32(a, c)), wide(_mm256_srl_epi32(a, c)), wide(_mm256_sra_epi32(a, c)),
+                    wide(_mm256_sll_epi64(a, c)), wide(_mm256_srl_epi64(a, c)),
+                ]);
+            }
+            out
+        }
+    }
+    fn blocks() -> (__m128i, __m128i) {
+        unsafe {
+            (
+                _mm_set_epi64x(0x0011_2233_4455_6677, -0x7766_5544_3322_1101),
+                _mm_set_epi64x(0x0f0e_0d0c_0b0a_0908, 0x0706_0504_0302_0100),
+            )
+        }
+    }
+    #[target_feature(enable = "aes")]
+    pub unsafe fn aes() -> Vec<[u16; 8]> {
+        let (a, k) = blocks();
+        unsafe {
+            vec![
+                epi(_mm_aesenc_si128(a, k)), epi(_mm_aesenclast_si128(a, k)), epi(_mm_aesdec_si128(a, k)),
+                epi(_mm_aesdeclast_si128(a, k)), epi(_mm_aesimc_si128(a)),
+            ]
+        }
+    }
+    #[target_feature(enable = "vaes,avx2")]
+    pub unsafe fn vaes() -> Vec<[u16; 16]> {
+        unsafe {
+            let (a, k) = blocks();
+            let (a, k) = (_mm256_set_m128i(k, a), _mm256_set_m128i(a, k));
+            let wide = |v: __m256i| transmute::<_, [u16; 16]>(v);
+            vec![
+                wide(_mm256_aesenc_epi128(a, k)), wide(_mm256_aesenclast_epi128(a, k)),
+                wide(_mm256_aesdec_epi128(a, k)), wide(_mm256_aesdeclast_epi128(a, k)),
+            ]
+        }
+    }
+    #[target_feature(enable = "vaes,avx512f")]
+    pub unsafe fn vaes_512() -> Vec<[u64; 8]> {
+        unsafe {
+            let (x, y) = blocks();
+            let a = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm256_set_m128i(y, x)), _mm256_set_m128i(x, x));
+            let k = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm256_set_m128i(x, y)), _mm256_set_m128i(y, y));
+            let wide = |v: __m512i| transmute::<_, [u64; 8]>(v);
+            vec![
+                wide(_mm512_aesenc_epi128(a, k)), wide(_mm512_aesenclast_epi128(a, k)),
+                wide(_mm512_aesdec_epi128(a, k)), wide(_mm512_aesdeclast_epi128(a, k)),
+            ]
+        }
+    }
+    fn bytes_of(seed: u8) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        for (i, byte) in bytes.iter_mut().enumerate() { *byte = (i as u8).wrapping_mul(seed).wrapping_add(seed ^ 0x35); }
+        bytes
+    }
+    #[target_feature(enable = "gfni")]
+    pub unsafe fn gfni() -> [u8; 16] {
+        unsafe {
+            let (a, b) = (bytes_of(7), bytes_of(29));
+            transmute(_mm_gf2p8mul_epi8(transmute::<[u8; 16], _>(a[..16].try_into().unwrap()), transmute::<[u8; 16], _>(b[..16].try_into().unwrap())))
+        }
+    }
+    #[target_feature(enable = "gfni,avx")]
+    pub unsafe fn gfni_256() -> [u8; 32] {
+        unsafe {
+            let (a, b) = (bytes_of(11), bytes_of(3));
+            transmute(_mm256_gf2p8mul_epi8(transmute::<[u8; 32], _>(a[..32].try_into().unwrap()), transmute::<[u8; 32], _>(b[..32].try_into().unwrap())))
+        }
+    }
+    #[target_feature(enable = "gfni,avx512bw")]
+    pub unsafe fn gfni_512() -> ([u8; 64], [u8; 64]) {
+        unsafe {
+            let (a, b): (__m512i, __m512i) = (transmute(bytes_of(13)), transmute(bytes_of(255)));
+            (transmute(_mm512_gf2p8mul_epi8(a, b)), transmute(_mm512_maskz_gf2p8mul_epi8(0x5555_0f0f_ffff_0001, a, b)))
+        }
+    }
+    /// BMI's: a field past the integer's width, of length 0 and past it.
+    #[target_feature(enable = "bmi1,bmi2")]
+    pub unsafe fn bits() -> Vec<u64> {
+        let x = 0xdead_beef_0123_4567u64;
+        let mut out = Vec::new();
+        for (start, length) in [(4u32, 8u32), (0, 0), (60, 8), (31, 33), (64, 1), (200, 255), (8, 64)] {
+            out.extend(unsafe { [
+                u64::from(_bextr_u32(x as u32, start, length)), _bextr_u64(x, start, length),
+                u64::from(_bextr2_u32(x as u32, start | length << 8 | 0xff00_0000)),
+                _bextr2_u64(x, u64::from(start | length << 8) | 0xffff_0000_0000_0000),
+                u64::from(_bzhi_u32(x as u32, start)), _bzhi_u64(x, start),
+            ] });
+        }
+        for mask in [0u64, u64::MAX, 0xf0f0_0f0f_8000_0001, 0x5555_5555_5555_5555] {
+            out.extend(unsafe { [
+                u64::from(_pdep_u32(x as u32, mask as u32)), _pdep_u64(x, mask),
+                u64::from(_pext_u32(x as u32, mask as u32)), _pext_u64(x, mask),
+            ] });
+        }
+        out
+    }
+    /// A carry (borrow) in of 0, of 1, and of another value, which is as 1.
+    pub fn carries() -> Vec<(u8, u64)> {
+        let mut out = Vec::new();
+        for c in [0u8, 1, 0x80] {
+            for (a, b) in [(1u64, 2u64), (u64::MAX, 1), (u64::MAX, u64::MAX), (0, u64::MAX), (0x8000_0000, 0x7fff_ffff)] {
+                let mut wide = 0;
+                let mut narrow = 0;
+                unsafe {
+                    out.push((_addcarry_u64(c, a, b, &mut wide), wide));
+                    out.push((_addcarry_u32(c, a as u32, b as u32, &mut narrow), u64::from(narrow)));
+                    out.push((_subborrow_u64(c, a, b, &mut wide), wide));
+                    out.push((_subborrow_u32(c, a as u32, b as u32, &mut narrow), u64::from(narrow)));
+                }
+            }
+        }
+        out
+    }
+    /// Whether each step's flag says 1 or says 0 with the value 0, as it has to.
+    #[target_feature(enable = "rdrand")]
+    pub unsafe fn random() -> Vec<bool> {
+        let (mut a, mut b, mut c) = (0u16, 0u32, 0u64);
+        let steps = unsafe { [_rdrand16_step(&mut a), _rdrand32_step(&mut b), _rdrand64_step(&mut c)] };
+        let values = [u64::from(a), u64::from(b), c];
+        steps.iter().zip(values).map(|(&step, value)| step == 1 || (step == 0 && value == 0)).collect()
+    }
+    #[target_feature(enable = "rdseed")]
+    pub unsafe fn seeds() -> Vec<bool> {
+        let (mut a, mut b, mut c) = (0u16, 0u32, 0u64);
+        let steps = unsafe { [_rdseed16_step(&mut a), _rdseed32_step(&mut b), _rdseed64_step(&mut c)] };
+        let values = [u64::from(a), u64::from(b), c];
+        steps.iter().zip(values).map(|(&step, value)| step == 1 || (step == 0 && value == 0)).collect()
+    }
+    /// The time stamp counter does not go back, and `rdtscp`'s is read after `rdtsc`'s.
+    pub fn counter() -> (bool, bool) {
+        unsafe {
+            let first = _rdtsc();
+            let mut processor = 0;
+            let second = __rdtscp(&mut processor);
+            let third = _rdtsc();
+            (first <= second && second <= third, first != 0)
+        }
+    }
+    #[repr(C, align(64))]
+    struct Area([u8; 4096]);
+    /// The MXCSR that each save wrote (at byte 24 of its legacy region) is the one `stmxcsr`
+    /// reads, and a restore keeps it.
+    fn saved_csr(area: &Area) -> u32 {
+        u32::from_le_bytes(area.0[24..28].try_into().unwrap())
+    }
+    pub fn fxsave() -> (bool, bool) {
+        let mut area = Area([0; 4096]);
+        let csr = unsafe { _mm_getcsr() };
+        unsafe {
+            _fxsave(area.0.as_mut_ptr());
+            let first = saved_csr(&area) == csr;
+            _fxrstor(area.0.as_ptr());
+            area.0[24..28].fill(0);
+            _fxsave64(area.0.as_mut_ptr());
+            let second = saved_csr(&area) == csr;
+            _fxrstor64(area.0.as_ptr());
+            (first, second && _mm_getcsr() == csr)
+        }
+    }
+    #[target_feature(enable = "xsave")]
+    pub unsafe fn xsave() -> Vec<bool> {
+        const X87_SSE: u64 = 3;
+        let mut area = Area([0; 4096]);
+        let csr = unsafe { _mm_getcsr() };
+        let mut out = Vec::new();
+        unsafe {
+            _xsave(area.0.as_mut_ptr(), X87_SSE);
+            out.push(saved_csr(&area) == csr);
+            _xrstor(area.0.as_ptr(), X87_SSE);
+            area = Area([0; 4096]);
+            _xsave64(area.0.as_mut_ptr(), X87_SSE);
+            out.push(saved_csr(&area) == csr);
+            _xrstor64(area.0.as_ptr(), X87_SSE);
+            out.push(_mm_getcsr() == csr);
+        }
+        out
+    }
+    #[target_feature(enable = "xsave,xsaveopt")]
+    pub unsafe fn xsaveopt() -> Vec<bool> {
+        let mut area = Area([0; 4096]);
+        let csr = unsafe { _mm_getcsr() };
+        unsafe {
+            _xsaveopt(area.0.as_mut_ptr(), 3);
+            let first = saved_csr(&area) == csr;
+            area = Area([0; 4096]);
+            _xsaveopt64(area.0.as_mut_ptr(), 3);
+            vec![first, saved_csr(&area) == csr]
+        }
+    }
+    /// The compacted form, which sets the top bit of the header's XCOMP_BV.
+    #[target_feature(enable = "xsave,xsavec")]
+    pub unsafe fn xsavec() -> Vec<bool> {
+        let mut area = Area([0; 4096]);
+        let csr = unsafe { _mm_getcsr() };
+        let compacted = |area: &Area| u64::from_le_bytes(area.0[520..528].try_into().unwrap()) >> 63 == 1;
+        unsafe {
+            _xsavec(area.0.as_mut_ptr(), 3);
+            let first = (saved_csr(&area) == csr, compacted(&area));
+            area = Area([0; 4096]);
+            _xsavec64(area.0.as_mut_ptr(), 3);
+            vec![first.0, first.1, saved_csr(&area) == csr, compacted(&area)]
+        }
+    }
+    pub fn run() -> String {
+        let absent = "absent".to_owned();
+        let mut out = format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+            min_max(), min_max_double(), estimates(), rounding_modes(), comparisons(), shifts(), memory(),
+            carries(), counter(), fxsave(),
+        );
+        let mut add = |detected: bool, it: &dyn Fn() -> String| {
+            out += " ";
+            out += &if detected { it() } else { absent.clone() };
+        };
+        #[cfg(feature = "nightly")]
+        add(is_x86_feature_detected!("clflushopt"), &|| format!("{:?}", unsafe { flushed(&7) }));
+        add(is_x86_feature_detected!("ssse3"), &|| format!("{:?}", unsafe { signs() }));
+        add(is_x86_feature_detected!("sse4.1"), &|| format!("{:?}", unsafe { rounds() }));
+        add(is_x86_feature_detected!("sse4a"), &|| format!("{:?}", unsafe { fields() }));
+        add(is_x86_feature_detected!("avx"), &|| format!("{:?}", unsafe { avx() }));
+        add(is_x86_feature_detected!("avx2"), &|| format!("{:?}", unsafe { avx2() }));
+        add(is_x86_feature_detected!("aes"), &|| format!("{:?}", unsafe { aes() }));
+        add(is_x86_feature_detected!("vaes") && is_x86_feature_detected!("avx2"), &|| format!("{:?}", unsafe { vaes() }));
+        add(is_x86_feature_detected!("vaes") && is_x86_feature_detected!("avx512f"), &|| format!("{:?}", unsafe { vaes_512() }));
+        add(is_x86_feature_detected!("gfni"), &|| format!("{:?}", unsafe { gfni() }));
+        add(is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx"), &|| format!("{:?}", unsafe { gfni_256() }));
+        add(is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx512bw"), &|| format!("{:?}", unsafe { gfni_512() }));
+        add(is_x86_feature_detected!("bmi1") && is_x86_feature_detected!("bmi2"), &|| format!("{:?}", unsafe { bits() }));
+        add(is_x86_feature_detected!("rdrand"), &|| format!("{:?}", unsafe { random() }));
+        add(is_x86_feature_detected!("rdseed"), &|| format!("{:?}", unsafe { seeds() }));
+        add(is_x86_feature_detected!("xsave"), &|| format!("{:?}", unsafe { xsave() }));
+        add(is_x86_feature_detected!("xsaveopt"), &|| format!("{:?}", unsafe { xsaveopt() }));
+        add(is_x86_feature_detected!("xsavec"), &|| format!("{:?}", unsafe { xsavec() }));
         out
     }
 }
@@ -5838,6 +6847,190 @@ pub mod neon_intrinsics {
     }
 }
 
+/// `core::arch::aarch64` functions of halves, which are AArch64's half-precision instructions
+/// in a function with them (`fp16`): arithmetic, `fma`, comparisons, conversions, rounding and
+/// lane moves, of vectors and of single halves, and `f16` arithmetic of such a function, with
+/// the edges of `f16` (signed zeros, subnormals, ties, the greatest finite values,
+/// infinities, quiet and signalling NaNs with payloads, a signalling NaN beside a quiet one).
+/// They run only where the processor has the extension, and the output says whether it did.
+#[cfg(all(target_arch = "aarch64", target_os = "linux", feature = "nightly"))]
+pub mod half_intrinsics {
+    use core::arch::aarch64::*;
+    use core::mem::transmute;
+
+    const HALVES: [u16; 24] = [
+        0x0000, 0x8000, 0x3c00, 0xbc00, 0x3800, 0x0001, 0x8001, 0x03ff, 0x0400, 0x7bff, 0xfbff,
+        0x7c00, 0xfc00, 0x7e00, 0x7c01, 0x7fff, 0xfe01, 0x3555, 0x4248, 0x6800, 0x6801, 0x5bfe,
+        0x3c01, 0xd7ff,
+    ];
+    const SINGLES: [u32; 8] = [
+        0x3f80_1000, 0x477f_f000, 0x3380_0000, 0x7fa0_0001, 0xffc1_2345, 0x8000_0000,
+        0x4f80_0000, 0x387f_e000,
+    ];
+
+    fn eight(v: float16x8_t) -> [u16; 8] {
+        unsafe { transmute(v) }
+    }
+    fn four(v: float16x4_t) -> [u16; 4] {
+        unsafe { transmute(v) }
+    }
+
+    #[target_feature(enable = "fp16")]
+    unsafe fn vectors(a: float16x8_t, b: float16x8_t, c: float16x8_t, s: float32x4_t) -> Vec<u16> {
+        let (x, y, z) = (vget_low_f16(a), vget_high_f16(b), vget_low_f16(c));
+        let mut out = Vec::new();
+        for v in [
+            vaddq_f16(a, b),
+            vsubq_f16(a, b),
+            vmulq_f16(a, b),
+            vdivq_f16(a, b),
+            vfmaq_f16(c, a, b),
+            vfmsq_f16(c, a, b),
+            vnegq_f16(a),
+            vabsq_f16(b),
+            vsqrtq_f16(a),
+            vrndmq_f16(a),
+            vrndpq_f16(b),
+            vrndaq_f16(a),
+            vpaddq_f16(a, b),
+            vabdq_f16(a, b),
+            vbslq_f16(vcgtq_f16(a, b), a, b),
+            vcvtq_f16_s16(vreinterpretq_s16_f16(a)),
+            vcvtq_f16_u16(vreinterpretq_u16_f16(b)),
+            vcvt_high_f16_f32(x, s),
+            vsetq_lane_f16::<3>(vgetq_lane_f16::<6>(b), a),
+            vzip1q_f16(a, b),
+            vuzp2q_f16(a, b),
+            vextq_f16::<3>(a, b),
+            vrev64q_f16(a),
+            vcombine_f16(vtrn1_f16(x, y), vdup_lane_f16::<2>(z)),
+            vdupq_n_f16(vget_lane_f16::<1>(y)),
+        ] {
+            out.extend(eight(v));
+        }
+        for v in [
+            vadd_f16(x, y),
+            vsub_f16(x, y),
+            vmul_f16(x, y),
+            vdiv_f16(y, x),
+            vfma_f16(z, x, y),
+            vfms_f16(z, y, x),
+            vneg_f16(y),
+            vabs_f16(x),
+            vsqrt_f16(y),
+            vrndm_f16(y),
+            vrndp_f16(x),
+            vrnd_f16(x),
+            vrndx_f16(y),
+            vcvt_f16_f32(s),
+            vcvt_f16_u16(vreinterpret_u16_f16(x)),
+            vdup_n_f16(vgetq_lane_f16::<7>(a)),
+        ] {
+            out.extend(four(v));
+        }
+        for mask in [
+            vceqq_f16(a, b),
+            vcgeq_f16(a, b),
+            vcgtq_f16(a, b),
+            vcleq_f16(a, b),
+            vcltq_f16(a, b),
+            vceqzq_f16(a),
+            vcgezq_f16(b),
+            vcgtzq_f16(a),
+            vclezq_f16(b),
+            vcltzq_f16(a),
+            vreinterpretq_u16_s16(vcvtq_s16_f16(a)),
+            vcvtq_u16_f16(b),
+        ] {
+            out.extend(transmute::<_, [u16; 8]>(mask));
+        }
+        for mask in [vceq_f16(x, y), vcle_f16(x, y), vcltz_f16(y), vcge_f16(y, z), vcgt_f16(z, x)] {
+            out.extend(transmute::<_, [u16; 4]>(mask));
+        }
+        for wide in [vcvt_f32_f16(x), vcvt_high_f32_f16(b)] {
+            let wide: [u32; 4] = transmute(wide);
+            out.extend(wide.iter().flat_map(|it| [(it >> 16) as u16, *it as u16]));
+        }
+        out
+    }
+
+    #[target_feature(enable = "fp16")]
+    unsafe fn halves(a: f16, b: f16, c: f16) -> ([u16; 22], [i64; 18]) {
+        let rounded = [
+            vaddh_f16(a, b),
+            vsubh_f16(a, b),
+            vmulh_f16(a, b),
+            vdivh_f16(a, b),
+            vfmah_f16(c, a, b),
+            vfmsh_f16(c, a, b),
+            vabdh_f16(a, b),
+            vsqrth_f16(a),
+            vrndmh_f16(a),
+            vrndph_f16(a),
+            vrndh_f16(a),
+            vrndah_f16(a),
+            vrndnh_f16(a),
+            vrndxh_f16(a),
+            vnegh_f16(a),
+            vabsh_f16(a),
+            a + b,
+            a * b - c,
+            a / b,
+            unsafe { core::intrinsics::fma(a, b, c) },
+            unsafe { core::intrinsics::sqrt(b) },
+            core::intrinsics::round_ties_even(b),
+        ];
+        let ints = [
+            vcageh_f16(a, b) as i64,
+            vcagth_f16(a, b) as i64,
+            vcaleh_f16(a, b) as i64,
+            vcvtph_s32_f16(a) as i64,
+            vcvtph_u32_f16(a) as i64,
+            vcvtph_s64_f16(a),
+            vcvtah_s64_f16(a),
+            vcvtah_u32_f16(a) as i64,
+            vcvtah_u64_f16(a) as i64,
+            vcvtmh_s32_f16(a) as i64,
+            vcvtmh_u64_f16(a) as i64,
+            vcvtnh_s32_f16(a) as i64,
+            vcvtnh_u64_f16(a) as i64,
+            vcvtah_s32_f16(b) as i64,
+            vcvtmh_s64_f16(b),
+            vcvtnh_s64_f16(b),
+            vcvtph_u64_f16(b) as i64,
+            vcvtmh_u32_f16(b) as i64,
+        ];
+        (rounded.map(f16::to_bits), ints)
+    }
+
+    pub fn run() -> String {
+        if !std::arch::is_aarch64_feature_detected!("fp16") {
+            return "no fp16".to_owned();
+        }
+        let halves_at = |at: usize| HALVES[at % HALVES.len()];
+        let mut out = String::new();
+        unsafe {
+            for k in 0..HALVES.len() {
+                let lanes = |step: usize, start: usize| -> float16x8_t {
+                    transmute(core::array::from_fn::<u16, 8, _>(|i| halves_at(start + i * step)))
+                };
+                let (a, b, c) = (lanes(1, k), lanes(5, k + 3), lanes(7, 2 * k));
+                let s = vld1q_f32(transmute::<_, [f32; 8]>(SINGLES)[k % 5..].as_ptr());
+                out += &format!("{:x?}\n", vectors(a, b, c, s));
+            }
+            for (i, &a) in HALVES.iter().enumerate() {
+                for (j, &b) in HALVES.iter().enumerate() {
+                    let c = halves_at(i * 3 + j * 7);
+                    let (a, b, c) = (f16::from_bits(a), f16::from_bits(b), f16::from_bits(c));
+                    out += &format!("{:x?}", halves(a, b, c));
+                }
+                out += "\n";
+            }
+        }
+        out + "fp16"
+    }
+}
+
 /// Portable vectors of fewer than 64 bits by value, which AArch64's LLVM passes in a vector
 /// register with their lanes widened (`<4 x u8>` as `<4 x u16>`), or after their one lane: the
 /// runner, which rustc builds, calls these and hands them back.
@@ -5938,6 +7131,55 @@ pub mod sve {
         }
         write!(out, " {stored:?} {narrow:?}").unwrap();
         out
+    }
+}
+
+/// Each function of `core::arch`'s SVE and SVE2 of an LLVM intrinsic ra-jit has a stub of,
+/// generated (`sve_ops.rs`).
+#[cfg(all(feature = "nightly", target_arch = "aarch64"))]
+pub mod sve_ops;
+
+/// rust-analyzer's `ExprCollector::new(db: &dyn SourceDatabase, module: ModuleId, ..) ->
+/// ExprCollector<'_>`: lifetime elision counts the lifetimes the parameters' types write or
+/// elide, not the `'static` of `type ModuleId = ModuleIdLt<'static>`'s expansion, nor the
+/// default of a trait object of a `'static` trait.
+pub mod elision_through_alias {
+    use std::cell::Cell;
+
+    pub trait Db: 'static {
+        fn n(&self) -> u8;
+    }
+
+    impl Db for u8 {
+        fn n(&self) -> u8 {
+            *self
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct IdLt<'db>(pub &'db u8);
+
+    pub type Id = IdLt<'static>;
+
+    pub struct Collector<'db> {
+        pub db: &'db dyn Db,
+        pub cell: Cell<&'db u8>,
+    }
+
+    impl<'db> Collector<'db> {
+        pub fn new(db: &dyn Db, id: Id) -> Collector<'_> {
+            Collector { db, cell: Cell::new(id.0) }
+        }
+    }
+
+    pub fn first(x: &u8, id: Id) -> &u8 {
+        if *id.0 > *x { x } else { x }
+    }
+
+    pub fn run() -> u8 {
+        let (n, x) = (4u8, 2u8);
+        let collector = Collector::new(&n, IdLt(&7));
+        collector.db.n() + collector.cell.get() + first(&x, IdLt(&1))
     }
 }
 
@@ -7131,6 +8373,42 @@ pub mod object_lifetime_default {
         let mut c = Container { t: Ref { r: &first }, u: Ref2 { r: &first } };
         put(Ref { r: &a }, Ref2 { r: &b }, &mut c);
         format!("{}{}", c.t.r.show(), c.u.r.show())
+    }
+}
+
+/// salsa's `cycle_fn` closures, as ruff's `ty_python_semantic` writes them: a closure's
+/// parameter `db: &'db dyn Db` of a trait bounded by `'static` (salsa's `Database` is) is
+/// `&'db (dyn Db + 'static)`, rustc's object lifetime default, as it is in a signature.
+pub mod closure_static_trait_object {
+    pub trait Db: 'static {
+        fn n(&self) -> u32;
+    }
+
+    impl Db for u32 {
+        fn n(&self) -> u32 {
+            *self
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct Ty<'db>(pub &'db u32);
+
+    impl<'db> Ty<'db> {
+        fn normalized(self, db: &'db dyn Db, previous: Ty<'db>) -> Ty<'db> {
+            if db.n() > *previous.0 { self } else { previous }
+        }
+    }
+
+    pub fn recover<'db>(db: &'db dyn Db, last: &Ty<'db>, value: Ty<'db>) -> Ty<'db> {
+        (|db: &'db dyn Db, cycle, previous: &Ty<'db>, result: Ty<'db>| {
+            let _: u32 = cycle;
+            result.normalized(db, *previous)
+        })(db, 0, last, value)
+    }
+
+    pub fn run() -> u32 {
+        let (a, b) = (1, 2);
+        *recover(&5u32, &Ty(&a), Ty(&b)).0
     }
 }
 
@@ -8908,6 +10186,41 @@ pub mod byte_compares {
     }
 }
 
+/// A trait object written in a body under a lifetime left to inference, as cargo's
+/// credential error's `source` casts: `&dyn Error` is `&'_ (dyn Error + '_)`, two lifetimes
+/// inferred apart, so it coerces to `dyn Error + 'static` behind a shorter reference.
+pub mod body_object_lifetimes {
+    use std::error::Error;
+    use std::fmt;
+
+    #[derive(Debug)]
+    pub struct Chained {
+        source: Option<Box<Chained>>,
+    }
+
+    impl fmt::Display for Chained {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("chained")
+        }
+    }
+
+    impl Error for Chained {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.source.as_ref().map(|err| err as &dyn Error)
+        }
+    }
+
+    pub fn annotated(e: &Chained) -> &(dyn Error + 'static) {
+        let object: &dyn Error = e;
+        object
+    }
+
+    pub fn boxed(e: Box<Chained>) -> Box<dyn Error> {
+        let object: Box<dyn Error> = e;
+        object
+    }
+}
+
 /// Statics of `&dyn` of other statics, read by value in another static's, as rustls's cipher
 /// suites are: each was evaluated with vtables of its own.
 pub mod dyn_static_suites {
@@ -9758,5 +11071,442 @@ pub mod async_fn_item_of_trait {
 
     pub fn run(n: u32) -> (u32, u32, u32, (u32, u32)) {
         (loaded(Doubled(n)), loaded(Ready(n)), served(&Doubled(n)), routed(n))
+    }
+}
+
+/// ruff's `ty_python_semantic` inference builder, `impl<'db> TypeInferenceBuilder<'db, '_>`:
+/// `Self` written in a trait object's bounds (`&mut dyn FnMut(&mut Self, Ty<'db>) -> Ty<'db>`)
+/// or a function pointer's signature is the impl's self type, its anonymous lifetime the
+/// impl's own, as everywhere else `Self` is written.
+pub mod self_in_object_bounds {
+    #[derive(Clone, Copy)]
+    pub struct Ty<'db>(pub &'db u32);
+
+    pub struct Builder<'db, 'ast> {
+        pub db: &'db u32,
+        pub ast: &'ast u32,
+    }
+
+    struct Guard<'db, 'ast, 'infer> {
+        f: &'infer mut dyn FnMut(&mut Builder<'db, 'ast>, Ty<'db>) -> Ty<'db>,
+    }
+
+    impl<'db, 'ast, 'infer> Guard<'db, 'ast, 'infer> {
+        fn new(f: &'infer mut dyn FnMut(&mut Builder<'db, 'ast>, Ty<'db>) -> Ty<'db>) -> Self {
+            Guard { f }
+        }
+    }
+
+    impl<'db> Builder<'db, '_> {
+        pub fn infer(&mut self, t: Ty<'db>, f: &mut dyn FnMut(&mut Self, Ty<'db>) -> Ty<'db>) -> Ty<'db> {
+            f(self, t)
+        }
+
+        pub fn guarded(&mut self, t: Ty<'db>, f: &mut dyn FnMut(&mut Self, Ty<'db>) -> Ty<'db>) -> Ty<'db> {
+            let guard = Guard::new(f);
+            (guard.f)(self, t)
+        }
+
+        pub fn pointer(&mut self, f: fn(&mut Self)) {
+            f(self)
+        }
+
+        pub fn produce(&mut self, f: &mut dyn FnMut() -> Self) {
+            *self = f()
+        }
+    }
+
+    pub fn run() -> u32 {
+        let (db, ast) = (3, 4);
+        let mut builder = Builder { db: &db, ast: &ast };
+        let t = builder.guarded(Ty(&db), &mut |b, t| Ty(if *b.ast > 0 { t.0 } else { b.db }));
+        builder.pointer(|b| b.ast = b.db);
+        *builder.infer(t, &mut |_, t| t).0 + *builder.ast
+    }
+}
+
+/// Bit operations of 128-bit integers, which 32-bit targets have no instruction of: rotations
+/// by amounts below, at and past 64, minimums and maximums of each sign, and the negated
+/// operand forms.
+pub mod wide_bits {
+    pub fn run(a: u128, b: u128) -> [u128; 53] {
+        let mut out = [0; 53];
+        let mut at = 0;
+        let mut put = |value: u128| {
+            out[at] = value;
+            at += 1;
+        };
+        for n in [0u32, 1, 31, 63, 64, 65, 100, 127, 128, 200] {
+            put(a.rotate_left(n));
+            put(a.rotate_right(n));
+            put(b.rotate_left(n));
+            put(b.rotate_right(n));
+        }
+        let (x, y) = (a as i128, b as i128);
+        for value in [a.min(b), a.max(b), b.min(a), x.min(y) as u128, x.max(y) as u128] {
+            put(value);
+        }
+        for value in [a & !b, a | !b, a ^ !b, !a, a.wrapping_neg(), 0u128.wrapping_sub(b)] {
+            put(value);
+        }
+        put(u128::MAX >> (a % 128));
+        put(0x8000_0000_0000_0000_0000_0000_0000_0001);
+        out
+    }
+}
+
+/// `core::arch::wasm32`'s 128-bit vector operations, built with `simd128`: each lane width's
+/// arithmetic, saturation, comparisons, shifts by amounts in and past the lane, shuffles and
+/// swizzles, narrowing and widening, and the float operations over NaN, both zeros, subnormals
+/// and infinities. Each result is a name and a hash of the lanes it made.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[rustfmt::skip]
+pub mod simd_wasm {
+    use core::arch::wasm32::*;
+    use core::hint::black_box;
+
+    pub(crate) fn hash(v: v128) -> u64 {
+        let bytes: [u8; 16] = unsafe { core::mem::transmute(v) };
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    }
+
+    /// What each operation made, by its name: the runner prints it, so no formatting is
+    /// compiled here.
+    pub(crate) struct Out(pub(crate) Vec<(&'static str, u64)>);
+
+    impl Out {
+        pub(crate) fn v(&mut self, name: &'static str, v: v128) {
+            self.0.push((name, hash(v)));
+        }
+        pub(crate) fn n(&mut self, name: &'static str, n: u64) {
+            self.0.push((name, n));
+        }
+    }
+
+    pub(crate) fn inputs() -> (v128, v128, v128, v128, v128, v128) {
+        black_box((
+            i8x16(0, 1, -1, 127, -128, 5, -6, 100, -100, 64, -64, 33, -34, 2, -2, 9),
+            i8x16(3, -1, -1, 1, -128, 120, 7, 100, 99, -64, 64, 0, 127, -2, -3, 15),
+            f32x4(f32::NAN, -0.0, 2.5, -1.5e-40),
+            f32x4(0.0, 0.0, f32::NEG_INFINITY, 3.0e38),
+            f64x2(-0.0, f64::NAN),
+            f64x2(0.0, -2.5),
+        ))
+    }
+
+    pub fn run() -> Vec<(&'static str, u64)> {
+        let (a, b, f, g, d, e) = inputs();
+        let ints = black_box(f32x4(1.0e10, -3.7, 2.5, -2.0e10));
+        let wide = black_box(f64x2(-3.0e9, 7.9));
+        let mut o = Out(Vec::new());
+        for s in [0u32, 3, 7, 9, 15, 17, 33, 63, 64, 70] {
+            let s = black_box(s);
+            o.v("i8x16_shl", i8x16_shl(a, s)); o.v("i8x16_shr", i8x16_shr(a, s)); o.v("u8x16_shr", u8x16_shr(a, s));
+            o.v("i16x8_shl", i16x8_shl(a, s)); o.v("i16x8_shr", i16x8_shr(a, s)); o.v("u16x8_shr", u16x8_shr(a, s));
+            o.v("i32x4_shl", i32x4_shl(a, s)); o.v("i32x4_shr", i32x4_shr(a, s)); o.v("u32x4_shr", u32x4_shr(a, s));
+            o.v("i64x2_shl", i64x2_shl(a, s)); o.v("i64x2_shr", i64x2_shr(a, s)); o.v("u64x2_shr", u64x2_shr(a, s));
+        }
+        // Bytes.
+        o.v("i8x16_add", i8x16_add(a, b)); o.v("i8x16_sub", i8x16_sub(a, b));
+        o.v("i8x16_add_sat", i8x16_add_sat(a, b)); o.v("u8x16_add_sat", u8x16_add_sat(a, b));
+        o.v("i8x16_sub_sat", i8x16_sub_sat(a, b)); o.v("u8x16_sub_sat", u8x16_sub_sat(a, b));
+        o.v("i8x16_min", i8x16_min(a, b)); o.v("u8x16_min", u8x16_min(a, b));
+        o.v("i8x16_max", i8x16_max(a, b)); o.v("u8x16_max", u8x16_max(a, b));
+        o.v("u8x16_avgr", u8x16_avgr(a, b)); o.v("i8x16_abs", i8x16_abs(a)); o.v("i8x16_neg", i8x16_neg(a));
+        o.v("i8x16_popcnt", i8x16_popcnt(a));
+        o.v("i8x16_eq", i8x16_eq(a, b)); o.v("i8x16_ne", i8x16_ne(a, b));
+        o.v("i8x16_lt", i8x16_lt(a, b)); o.v("u8x16_lt", u8x16_lt(a, b));
+        o.v("i8x16_gt", i8x16_gt(a, b)); o.v("u8x16_gt", u8x16_gt(a, b));
+        o.v("i8x16_le", i8x16_le(a, b)); o.v("u8x16_le", u8x16_le(a, b));
+        o.v("i8x16_ge", i8x16_ge(a, b)); o.v("u8x16_ge", u8x16_ge(a, b));
+        o.v("i8x16_swizzle", i8x16_swizzle(a, b));
+        o.v("i8x16_shuffle", i8x16_shuffle::<0, 17, 2, 19, 31, 30, 7, 6, 16, 16, 1, 1, 15, 14, 8, 23>(a, b));
+        o.v("i16x8_shuffle", i16x8_shuffle::<7, 8, 0, 15, 3, 3, 12, 1>(a, b));
+        o.v("i32x4_shuffle", i32x4_shuffle::<3, 4, 6, 1>(a, b));
+        o.v("i64x2_shuffle", i64x2_shuffle::<1, 2>(a, b));
+        o.v("i8x16_narrow_i16x8", i8x16_narrow_i16x8(a, b)); o.v("u8x16_narrow_i16x8", u8x16_narrow_i16x8(a, b));
+        o.v("i8x16_splat", i8x16_splat(black_box(-7))); o.v("i8x16_replace_lane", i8x16_replace_lane::<5>(a, 42));
+        o.n("i8x16_extract_lane", i8x16_extract_lane::<4>(a) as u64); o.n("u8x16_extract_lane", u64::from(u8x16_extract_lane::<4>(a)));
+        o.n("i8x16_all_true", u64::from(i8x16_all_true(a)) << 1 | u64::from(i8x16_all_true(b)));
+        o.n("v128_any_true", u64::from(v128_any_true(a)) << 1 | u64::from(v128_any_true(i8x16_splat(0))));
+        o.n("i8x16_bitmask", u64::from(i8x16_bitmask(a)));
+        o.v("v128_bitselect", v128_bitselect(a, b, f)); o.v("v128_andnot", v128_andnot(a, b)); o.v("v128_not", v128_not(a));
+        o.v("v128_and", v128_and(a, b)); o.v("v128_or", v128_or(a, b)); o.v("v128_xor", v128_xor(a, b));
+        // Halves.
+        o.v("i16x8_add", i16x8_add(a, b)); o.v("i16x8_sub", i16x8_sub(a, b)); o.v("i16x8_mul", i16x8_mul(a, b));
+        o.v("i16x8_add_sat", i16x8_add_sat(a, b)); o.v("u16x8_add_sat", u16x8_add_sat(a, b));
+        o.v("i16x8_sub_sat", i16x8_sub_sat(a, b)); o.v("u16x8_sub_sat", u16x8_sub_sat(a, b));
+        o.v("i16x8_min", i16x8_min(a, b)); o.v("u16x8_max", u16x8_max(a, b)); o.v("u16x8_avgr", u16x8_avgr(a, b));
+        o.v("i16x8_q15mulr_sat", i16x8_q15mulr_sat(a, b));
+        o.v("i16x8_extmul_low_i8x16", i16x8_extmul_low_i8x16(a, b)); o.v("u16x8_extmul_high_u8x16", u16x8_extmul_high_u8x16(a, b));
+        o.v("i16x8_extend_low_i8x16", i16x8_extend_low_i8x16(a)); o.v("i16x8_extend_high_i8x16", i16x8_extend_high_i8x16(a));
+        o.v("u16x8_extend_low_u8x16", u16x8_extend_low_u8x16(a)); o.v("u16x8_extend_high_u8x16", u16x8_extend_high_u8x16(a));
+        o.v("i16x8_extadd_pairwise_i8x16", i16x8_extadd_pairwise_i8x16(a)); o.v("u16x8_extadd_pairwise_u8x16", u16x8_extadd_pairwise_u8x16(a));
+        o.v("i16x8_narrow_i32x4", i16x8_narrow_i32x4(a, b)); o.v("u16x8_narrow_i32x4", u16x8_narrow_i32x4(a, b));
+        o.v("i16x8_lt", i16x8_lt(a, b)); o.v("u16x8_ge", u16x8_ge(a, b)); o.v("i16x8_abs", i16x8_abs(a)); o.v("i16x8_neg", i16x8_neg(a));
+        o.n("i16x8_bitmask", u64::from(i16x8_bitmask(a))); o.n("i16x8_all_true", u64::from(i16x8_all_true(a)));
+        // Words.
+        o.v("i32x4_add", i32x4_add(a, b)); o.v("i32x4_sub", i32x4_sub(a, b)); o.v("i32x4_mul", i32x4_mul(a, b));
+        o.v("i32x4_min", i32x4_min(a, b)); o.v("u32x4_min", u32x4_min(a, b)); o.v("i32x4_max", i32x4_max(a, b)); o.v("u32x4_max", u32x4_max(a, b));
+        o.v("i32x4_dot_i16x8", i32x4_dot_i16x8(a, b));
+        o.v("i32x4_extend_low_i16x8", i32x4_extend_low_i16x8(a)); o.v("u32x4_extend_high_u16x8", u32x4_extend_high_u16x8(a));
+        o.v("i32x4_extadd_pairwise_i16x8", i32x4_extadd_pairwise_i16x8(a)); o.v("u32x4_extadd_pairwise_u16x8", u32x4_extadd_pairwise_u16x8(a));
+        o.v("i32x4_extmul_high_i16x8", i32x4_extmul_high_i16x8(a, b)); o.v("u32x4_extmul_low_u16x8", u32x4_extmul_low_u16x8(a, b));
+        o.v("i32x4_trunc_sat_f32x4", i32x4_trunc_sat_f32x4(ints)); o.v("u32x4_trunc_sat_f32x4", u32x4_trunc_sat_f32x4(ints));
+        o.v("i32x4_trunc_sat_f32x4_nan", i32x4_trunc_sat_f32x4(f));
+        o.v("i32x4_trunc_sat_f64x2_zero", i32x4_trunc_sat_f64x2_zero(wide)); o.v("u32x4_trunc_sat_f64x2_zero", u32x4_trunc_sat_f64x2_zero(wide));
+        o.v("i32x4_eq", i32x4_eq(a, b)); o.v("u32x4_lt", u32x4_lt(a, b)); o.v("i32x4_gt", i32x4_gt(a, b)); o.v("i32x4_abs", i32x4_abs(a));
+        o.n("i32x4_bitmask", u64::from(i32x4_bitmask(a))); o.n("i32x4_all_true", u64::from(i32x4_all_true(a)));
+        // Doubles.
+        o.v("i64x2_add", i64x2_add(a, b)); o.v("i64x2_sub", i64x2_sub(a, b)); o.v("i64x2_mul", i64x2_mul(a, b));
+        o.v("i64x2_neg", i64x2_neg(a)); o.v("i64x2_abs", i64x2_abs(a));
+        o.v("i64x2_eq", i64x2_eq(a, b)); o.v("i64x2_ne", i64x2_ne(a, b)); o.v("i64x2_lt", i64x2_lt(a, b));
+        o.v("i64x2_gt", i64x2_gt(a, b)); o.v("i64x2_le", i64x2_le(a, b)); o.v("i64x2_ge", i64x2_ge(a, b));
+        o.v("i64x2_extend_low_i32x4", i64x2_extend_low_i32x4(a)); o.v("u64x2_extend_high_u32x4", u64x2_extend_high_u32x4(a));
+        o.v("i64x2_extmul_low_i32x4", i64x2_extmul_low_i32x4(a, b)); o.v("u64x2_extmul_high_u32x4", u64x2_extmul_high_u32x4(a, b));
+        o.n("i64x2_bitmask", u64::from(i64x2_bitmask(a))); o.n("i64x2_all_true", u64::from(i64x2_all_true(a)));
+        o.n("i64x2_extract_lane", i64x2_extract_lane::<1>(a) as u64); o.v("i64x2_replace_lane", i64x2_replace_lane::<0>(a, -1));
+        // Singles.
+        for (x, y) in [(f, g), (g, f), (f, f)] {
+            o.v("f32x4_add", f32x4_add(x, y)); o.v("f32x4_sub", f32x4_sub(x, y)); o.v("f32x4_mul", f32x4_mul(x, y)); o.v("f32x4_div", f32x4_div(x, y));
+            o.v("f32x4_min", f32x4_min(x, y)); o.v("f32x4_max", f32x4_max(x, y)); o.v("f32x4_pmin", f32x4_pmin(x, y)); o.v("f32x4_pmax", f32x4_pmax(x, y));
+            o.v("f32x4_eq", f32x4_eq(x, y)); o.v("f32x4_ne", f32x4_ne(x, y)); o.v("f32x4_lt", f32x4_lt(x, y));
+            o.v("f32x4_gt", f32x4_gt(x, y)); o.v("f32x4_le", f32x4_le(x, y)); o.v("f32x4_ge", f32x4_ge(x, y));
+        }
+        let r = black_box(f32x4(2.5, -2.5, 3.5, -0.4));
+        o.v("f32x4_sqrt", f32x4_sqrt(g)); o.v("f32x4_abs", f32x4_abs(f)); o.v("f32x4_neg", f32x4_neg(f));
+        o.v("f32x4_ceil", f32x4_ceil(r)); o.v("f32x4_floor", f32x4_floor(r)); o.v("f32x4_trunc", f32x4_trunc(r)); o.v("f32x4_nearest", f32x4_nearest(r));
+        o.v("f32x4_convert_i32x4", f32x4_convert_i32x4(a)); o.v("f32x4_convert_u32x4", f32x4_convert_u32x4(a));
+        o.v("f32x4_demote_f64x2_zero", f32x4_demote_f64x2_zero(e));
+        o.n("f32x4_extract_lane", u64::from(f32x4_extract_lane::<2>(f).to_bits())); o.v("f32x4_replace_lane", f32x4_replace_lane::<3>(f, 1.5));
+        // Doubles of floats.
+        for (x, y) in [(d, e), (e, d)] {
+            o.v("f64x2_add", f64x2_add(x, y)); o.v("f64x2_sub", f64x2_sub(x, y)); o.v("f64x2_mul", f64x2_mul(x, y)); o.v("f64x2_div", f64x2_div(x, y));
+            o.v("f64x2_min", f64x2_min(x, y)); o.v("f64x2_max", f64x2_max(x, y)); o.v("f64x2_pmin", f64x2_pmin(x, y)); o.v("f64x2_pmax", f64x2_pmax(x, y));
+            o.v("f64x2_eq", f64x2_eq(x, y)); o.v("f64x2_ne", f64x2_ne(x, y)); o.v("f64x2_lt", f64x2_lt(x, y)); o.v("f64x2_ge", f64x2_ge(x, y));
+        }
+        o.v("f64x2_sqrt", f64x2_sqrt(e)); o.v("f64x2_abs", f64x2_abs(e)); o.v("f64x2_neg", f64x2_neg(d));
+        o.v("f64x2_nearest", f64x2_nearest(wide)); o.v("f64x2_floor", f64x2_floor(wide)); o.v("f64x2_ceil", f64x2_ceil(wide)); o.v("f64x2_trunc", f64x2_trunc(wide));
+        o.v("f64x2_convert_low_i32x4", f64x2_convert_low_i32x4(a)); o.v("f64x2_convert_low_u32x4", f64x2_convert_low_u32x4(a));
+        o.v("f64x2_promote_low_f32x4", f64x2_promote_low_f32x4(f));
+        // Memory.
+        let bytes: [u8; 24] = black_box(core::array::from_fn(|i| (i as u8).wrapping_mul(37)));
+        let p = bytes.as_ptr();
+        unsafe {
+            o.v("v128_load", v128_load(p.add(3).cast())); o.v("i16x8_load_extend_i8x8", i16x8_load_extend_i8x8(p.add(1).cast()));
+            o.v("u32x4_load_extend_u16x4", u32x4_load_extend_u16x4(p.cast())); o.v("i64x2_load_extend_i32x2", i64x2_load_extend_i32x2(p.add(5).cast()));
+            o.v("v128_load16_splat", v128_load16_splat(p.add(7).cast())); o.v("v128_load64_zero", v128_load64_zero(p.add(2).cast()));
+            o.v("v128_load32_lane", v128_load32_lane::<2>(a, p.add(9).cast()));
+            let mut to = [0u8; 20];
+            v128_store(to.as_mut_ptr().add(1).cast(), b); v128_store16_lane::<3>(a, to.as_mut_ptr().add(17).cast());
+            o.n("v128_store", to.iter().fold(0u64, |h, &b| h.rotate_left(5) ^ u64::from(b)));
+        }
+        o.n("memory_grow", u64::from(memory_grow::<0>(black_box(0)) == memory_size::<0>()));
+        o.0
+    }
+}
+
+/// The relaxed-simd operations: their results are what the engine running them chooses, the
+/// same for both builds.
+#[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+#[rustfmt::skip]
+pub mod relaxed_wasm {
+    use core::arch::wasm32::*;
+    use core::hint::black_box;
+
+    use super::simd_wasm::{Out, inputs};
+
+    pub fn run() -> Vec<(&'static str, u64)> {
+        let (a, b, f, g, d, e) = inputs();
+        let ints = black_box(f32x4(1.0e10, -3.7, 2.5, -2.0e10));
+        let wide = black_box(f64x2(-3.0e9, 7.9));
+        let mut o = Out(Vec::new());
+        o.v("i8x16_relaxed_swizzle", i8x16_relaxed_swizzle(a, b));
+        o.v("i32x4_relaxed_trunc_f32x4", i32x4_relaxed_trunc_f32x4(ints)); o.v("u32x4_relaxed_trunc_f32x4", u32x4_relaxed_trunc_f32x4(ints));
+        o.v("i32x4_relaxed_trunc_f64x2_zero", i32x4_relaxed_trunc_f64x2_zero(wide)); o.v("u32x4_relaxed_trunc_f64x2_zero", u32x4_relaxed_trunc_f64x2_zero(wide));
+        o.v("f32x4_relaxed_madd", f32x4_relaxed_madd(f, g, g)); o.v("f32x4_relaxed_nmadd", f32x4_relaxed_nmadd(g, g, f));
+        o.v("f64x2_relaxed_madd", f64x2_relaxed_madd(d, e, e)); o.v("f64x2_relaxed_nmadd", f64x2_relaxed_nmadd(e, e, d));
+        o.v("i8x16_relaxed_laneselect", i8x16_relaxed_laneselect(a, b, i8x16_lt(a, b)));
+        o.v("i16x8_relaxed_laneselect", i16x8_relaxed_laneselect(a, b, i16x8_lt(a, b)));
+        o.v("i32x4_relaxed_laneselect", i32x4_relaxed_laneselect(a, b, i32x4_lt(a, b)));
+        o.v("i64x2_relaxed_laneselect", i64x2_relaxed_laneselect(a, b, i64x2_lt(a, b)));
+        o.v("f32x4_relaxed_min", f32x4_relaxed_min(g, ints)); o.v("f32x4_relaxed_max", f32x4_relaxed_max(g, ints));
+        o.v("f64x2_relaxed_min", f64x2_relaxed_min(e, wide)); o.v("f64x2_relaxed_max", f64x2_relaxed_max(e, wide));
+        o.v("i16x8_relaxed_q15mulr", i16x8_relaxed_q15mulr(a, b));
+        let sevens = v128_and(b, i8x16_splat(0x7f));
+        o.v("i16x8_relaxed_dot_i8x16_i7x16", i16x8_relaxed_dot_i8x16_i7x16(a, sevens));
+        o.v("i32x4_relaxed_dot_i8x16_i7x16_add", i32x4_relaxed_dot_i8x16_i7x16_add(a, sevens, b));
+        o.0
+    }
+}
+
+/// The vector operations of `simd_wasm` written as the intrinsics `core::arch::wasm32` is made
+/// of, so that ra-jit compiles each of them where rustc's `core::arch` functions would otherwise
+/// be linked: platform intrinsics over `Simd` types, the `llvm.wasm.*` and vector `llvm.*`
+/// functions, and 128-bit rotations, minimums and negations.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "nightly"))]
+#[rustfmt::skip]
+#[allow(improper_ctypes)]
+pub mod simd_wasm_lowered {
+    use core::hint::black_box;
+    use core::intrinsics::simd::*;
+    use core::simd::Simd;
+
+    type I8 = Simd<i8, 16>; type U8 = Simd<u8, 16>; type I16 = Simd<i16, 8>; type U16 = Simd<u16, 8>;
+    type I32 = Simd<i32, 4>; type U32 = Simd<u32, 4>; type I64 = Simd<i64, 2>; type U64 = Simd<u64, 2>;
+    type F32 = Simd<f32, 4>; type F64 = Simd<f64, 2>;
+
+    unsafe extern "llvm-intrinsic" {
+        #[link_name = "llvm.wasm.swizzle"] fn swizzle(a: I8, b: I8) -> I8;
+        #[link_name = "llvm.wasm.anytrue.v16i8"] fn any_true(a: I8) -> i32;
+        #[link_name = "llvm.wasm.alltrue.v8i16"] fn all_true(a: I16) -> i32;
+        #[link_name = "llvm.wasm.bitmask.v4i32"] fn bitmask(a: I32) -> i32;
+        #[link_name = "llvm.wasm.bitmask.v16i8"] fn bitmask8(a: I8) -> i32;
+        #[link_name = "llvm.wasm.dot"] fn dot(a: I16, b: I16) -> I32;
+        #[link_name = "llvm.wasm.extadd.pairwise.signed.v8i16"] fn extadd(a: I8) -> I16;
+        #[link_name = "llvm.wasm.extadd.pairwise.unsigned.v4i32"] fn extadd_u(a: I16) -> I32;
+        #[link_name = "llvm.wasm.avgr.unsigned.v16i8"] fn avgr(a: I8, b: I8) -> I8;
+        #[link_name = "llvm.wasm.q15mulr.sat.signed"] fn q15mulr(a: I16, b: I16) -> I16;
+        #[link_name = "llvm.wasm.bitselect.v16i8"] fn bitselect(a: I8, b: I8, c: I8) -> I8;
+        #[link_name = "llvm.nearbyint.v4f32"] fn nearest(a: F32) -> F32;
+        #[link_name = "llvm.minimum.v2f64"] fn minimum(a: F64, b: F64) -> F64;
+        #[link_name = "llvm.maximum.v4f32"] fn maximum(a: F32, b: F32) -> F32;
+    }
+
+    #[cfg(target_feature = "relaxed-simd")]
+    unsafe extern "llvm-intrinsic" {
+        #[link_name = "llvm.wasm.relaxed.swizzle"] fn relaxed_swizzle(a: I8, b: I8) -> I8;
+        #[link_name = "llvm.wasm.relaxed.trunc.signed"] fn relaxed_trunc(a: F32) -> I32;
+        #[link_name = "llvm.wasm.relaxed.trunc.unsigned.zero"] fn relaxed_trunc_zero(a: F64) -> I32;
+        #[link_name = "llvm.wasm.relaxed.madd.v4f32"] fn relaxed_madd(a: F32, b: F32, c: F32) -> F32;
+        #[link_name = "llvm.wasm.relaxed.nmadd.v2f64"] fn relaxed_nmadd(a: F64, b: F64, c: F64) -> F64;
+        #[link_name = "llvm.wasm.relaxed.laneselect.v8i16"] fn relaxed_laneselect(a: I16, b: I16, c: I16) -> I16;
+        #[link_name = "llvm.wasm.relaxed.min.v4f32"] fn relaxed_min(a: F32, b: F32) -> F32;
+        #[link_name = "llvm.wasm.relaxed.max.v2f64"] fn relaxed_max(a: F64, b: F64) -> F64;
+        #[link_name = "llvm.wasm.relaxed.q15mulr.signed"] fn relaxed_q15mulr(a: I16, b: I16) -> I16;
+        #[link_name = "llvm.wasm.relaxed.dot.i8x16.i7x16.signed"] fn relaxed_dot(a: I8, b: I8) -> I16;
+        #[link_name = "llvm.wasm.relaxed.dot.i8x16.i7x16.add.signed"] fn relaxed_dot_add(a: I8, b: I8, c: I32) -> I32;
+    }
+
+    fn bits<T>(v: T) -> u64 {
+        let bytes = unsafe { core::slice::from_raw_parts((&raw const v).cast::<u8>(), size_of::<T>()) };
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    }
+
+    fn halves<T>(v: T) -> u64 {
+        let bytes: [u8; 8] = unsafe { core::mem::transmute_copy(&v) };
+        u64::from_le_bytes(bytes)
+    }
+
+    const MIX: Simd<u32, 16> = Simd::from_array([0, 17, 2, 19, 31, 30, 7, 6, 16, 16, 1, 1, 15, 14, 8, 23]);
+    const LOW: Simd<u32, 8> = Simd::from_array([7, 8, 0, 15, 3, 3, 12, 1]);
+    const WIDE: Simd<u32, 8> = Simd::from_array([3, 4, 6, 1, 0, 7, 2, 5]);
+    const PAIR: Simd<u32, 2> = Simd::from_array([1, 2]);
+    const HALF: Simd<u32, 8> = Simd::from_array([0, 1, 2, 3, 4, 5, 6, 7]);
+
+    pub fn run() -> Vec<(&'static str, u64)> {
+        let mut o = Vec::new();
+        let mut v = |name: &'static str, value: u64| o.push((name, value));
+        let a: I8 = black_box(Simd::from_array([0, 1, -1, 127, -128, 5, -6, 100, -100, 64, -64, 33, -34, 2, -2, 9]));
+        let b: I8 = black_box(Simd::from_array([3, -1, -1, 1, -128, 120, 7, 100, 99, -64, 64, 0, 127, -2, -3, 15]));
+        let f: F32 = black_box(Simd::from_array([f32::NAN, -0.0, 2.5, -1.5e-40]));
+        let g: F32 = black_box(Simd::from_array([0.0, 0.0, f32::NEG_INFINITY, 3.0e38]));
+        let d: F64 = black_box(Simd::from_array([-0.0, f64::NAN]));
+        let e: F64 = black_box(Simd::from_array([0.0, -2.5]));
+        let ints: F32 = black_box(Simd::from_array([1.0e10, -3.7, 2.5, -2.0e10]));
+        let wide: F64 = black_box(Simd::from_array([-3.0e9, 7.9]));
+        unsafe {
+            let (ua, ub): (U8, U8) = (core::mem::transmute(a), core::mem::transmute(b));
+            let (ha, hb): (I16, I16) = (core::mem::transmute(a), core::mem::transmute(b));
+            let (uha, uhb): (U16, U16) = (core::mem::transmute(a), core::mem::transmute(b));
+            let (wa, wb): (I32, I32) = (core::mem::transmute(a), core::mem::transmute(b));
+            let (uwa, uwb): (U32, U32) = (core::mem::transmute(a), core::mem::transmute(b));
+            let (la, lb): (I64, I64) = (core::mem::transmute(a), core::mem::transmute(b));
+            let (ula, ulb): (U64, U64) = (core::mem::transmute(a), core::mem::transmute(b));
+            for n in [0i8, 3, 7] {
+                let n = black_box(n);
+                v("shl8", bits(simd_shl(a, simd_splat::<I8, i8>(n))));
+                v("shr8", bits(simd_shr(a, simd_splat::<I8, i8>(n))));
+                v("ushr8", bits(simd_shr(ua, simd_splat::<U8, u8>(n as u8))));
+                v("shl16", bits(simd_shl(ha, simd_splat::<I16, i16>(i16::from(n) * 2))));
+                v("ushr32", bits(simd_shr(uwa, simd_splat::<U32, u32>(n as u32 * 4))));
+                v("shr64", bits(simd_shr(la, simd_splat::<I64, i64>(i64::from(n) * 9))));
+            }
+            v("shr8_by_lanes", bits(simd_shr(a, Simd::from_array([0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0]))));
+            v("add8", bits(simd_add(a, b))); v("sub16", bits(simd_sub(ha, hb))); v("mul16", bits(simd_mul(ha, hb)));
+            v("mul8", bits(simd_mul(a, b))); v("mul32", bits(simd_mul(wa, wb))); v("mul64", bits(simd_mul(la, lb)));
+            v("add64", bits(simd_add(la, lb))); v("sub32", bits(simd_sub(wa, wb)));
+            v("sat_add8", bits(simd_saturating_add(a, b))); v("sat_add_u8", bits(simd_saturating_add(ua, ub)));
+            v("sat_sub16", bits(simd_saturating_sub(ha, hb))); v("sat_sub_u16", bits(simd_saturating_sub(uha, uhb)));
+            v("and", bits(simd_and(a, b))); v("or", bits(simd_or(wa, wb))); v("xor", bits(simd_xor(la, lb)));
+            v("eq8", bits(simd_eq::<I8, I8>(a, b))); v("lt8", bits(simd_lt::<I8, I8>(a, b))); v("lt_u8", bits(simd_lt::<U8, I8>(ua, ub)));
+            v("ge_u16", bits(simd_ge::<U16, I16>(uha, uhb))); v("gt32", bits(simd_gt::<I32, I32>(wa, wb))); v("le_u32", bits(simd_le::<U32, I32>(uwa, uwb)));
+            v("lt64", bits(simd_lt::<I64, I64>(la, lb))); v("ne64", bits(simd_ne::<I64, I64>(la, lb))); v("gt_u64", bits(simd_gt::<U64, I64>(ula, ulb)));
+            v("ge_u64", bits(simd_ge::<U64, I64>(ula, ulb)));
+            for (x, y) in [(f, g), (g, f), (f, f)] {
+                v("addf", bits(simd_add(x, y))); v("divf", bits(simd_div(x, y))); v("mulf", bits(simd_mul(x, y)));
+                v("eqf", bits(simd_eq::<F32, I32>(x, y))); v("nef", bits(simd_ne::<F32, I32>(x, y))); v("ltf", bits(simd_lt::<F32, I32>(x, y)));
+                v("gef", bits(simd_ge::<F32, I32>(x, y))); v("maximum", bits(maximum(x, y)));
+            }
+            for (x, y) in [(d, e), (e, d)] {
+                v("subd", bits(simd_sub(x, y))); v("divd", bits(simd_div(x, y))); v("led", bits(simd_le::<F64, I64>(x, y)));
+                v("gtd", bits(simd_gt::<F64, I64>(x, y))); v("minimum", bits(minimum(x, y)));
+            }
+            v("select8", bits(simd_select(simd_lt::<I8, I8>(a, b), a, b)));
+            v("select32", bits(simd_select(simd_gt::<I32, I32>(wa, wb), wa, wb)));
+            v("selectf", bits(simd_select(simd_lt::<F32, I32>(f, g), f, g)));
+            v("splat", bits(simd_splat::<I16, i16>(black_box(-300))));
+            v("shuffle", bits(simd_shuffle::<I8, Simd<u32, 16>, I8>(a, b, MIX)));
+            v("shuffle16", bits(simd_shuffle::<I16, Simd<u32, 8>, I16>(ha, hb, LOW)));
+            v("shuffle_wide", bits(simd_shuffle::<I32, Simd<u32, 8>, Simd<i32, 8>>(wa, wb, WIDE)));
+            v("shuffle64", bits(simd_shuffle::<I64, Simd<u32, 2>, I64>(la, lb, PAIR)));
+            let low: Simd<i8, 8> = simd_shuffle(a, a, HALF);
+            v("shuffle_half", halves(low));
+            v("widen8x8", bits(simd_cast::<Simd<i8, 8>, I16>(low)));
+            v("widen_u8x8", bits(simd_cast::<Simd<u8, 8>, U16>(core::mem::transmute(low))));
+            let widened: Simd<i32, 8> = simd_cast(ha);
+            v("widen16", bits(widened));
+            v("narrow32", halves(simd_cast::<I32, Simd<i16, 4>>(wa)));
+            v("narrow32x8", bits(simd_cast::<Simd<i32, 8>, I16>(widened)));
+            v("convert", bits(simd_cast::<I32, F32>(wa))); v("convert_u", bits(simd_cast::<U32, F32>(uwa)));
+            v("trunc_sat", bits(simd_as::<F32, I32>(ints))); v("trunc_sat_u", bits(simd_as::<F32, U32>(ints)));
+            v("convert_low", bits(simd_cast::<Simd<i32, 2>, F64>(Simd::from_array([-7, i32::MAX]))));
+            v("trunc_zero", halves(simd_as::<F64, Simd<i32, 2>>(wide)));
+            v("promote", bits(simd_cast::<Simd<f32, 2>, F64>(Simd::from_array([f32::NAN, -1.5e-40]))));
+            v("demote", halves(simd_cast::<F64, Simd<f32, 2>>(e)));
+            v("demote4", bits(simd_cast::<Simd<f64, 4>, F32>(Simd::from_array([1.0e300, -0.0, 2.5, f64::NAN]))));
+            v("neg8", bits(simd_neg(a))); v("negf", bits(simd_neg(f))); v("fabs", bits(simd_fabs(f)));
+            v("fsqrt", bits(simd_fsqrt(g))); v("floor", bits(simd_floor(ints))); v("ceil", bits(simd_ceil(wide)));
+            v("trunc", bits(simd_trunc(ints))); v("ties_even", bits(simd_round_ties_even(Simd::<f32, 4>::from_array([2.5, -2.5, 3.5, -0.4]))));
+            v("ctpop", bits(simd_ctpop(ua))); v("nearest", bits(nearest(ints)));
+            v("bitmask8", u64::from(simd_bitmask::<I8, u16>(a))); v("bitmask16", u64::from(simd_bitmask::<I16, u8>(ha)));
+            v("bitmask64", u64::from(simd_bitmask::<I64, u8>(la)));
+            v("swizzle", bits(swizzle(a, b))); v("any_true", any_true(a) as u64); v("all_true", all_true(ha) as u64);
+            v("bitmask", bitmask(wa) as u64); v("bitmask_i8", bitmask8(a) as u64);
+            v("dot", bits(dot(ha, hb))); v("extadd", bits(extadd(a))); v("extadd_u", bits(extadd_u(ha)));
+            v("avgr", bits(avgr(a, b))); v("q15mulr", bits(q15mulr(ha, hb))); v("bitselect", bits(bitselect(a, b, core::mem::transmute(f))));
+            #[cfg(target_feature = "relaxed-simd")]
+            {
+                let sevens = simd_and(b, simd_splat::<I8, i8>(0x7f));
+                v("relaxed_swizzle", bits(relaxed_swizzle(a, b))); v("relaxed_trunc", bits(relaxed_trunc(ints)));
+                v("relaxed_trunc_zero", bits(relaxed_trunc_zero(wide))); v("relaxed_madd", bits(relaxed_madd(f, g, g)));
+                v("relaxed_nmadd", bits(relaxed_nmadd(e, e, d))); v("relaxed_laneselect", bits(relaxed_laneselect(ha, hb, simd_lt::<I16, I16>(ha, hb))));
+                v("relaxed_min", bits(relaxed_min(g, ints))); v("relaxed_max", bits(relaxed_max(e, wide)));
+                v("relaxed_q15mulr", bits(relaxed_q15mulr(ha, hb))); v("relaxed_dot", bits(relaxed_dot(a, sevens)));
+                v("relaxed_dot_add", bits(relaxed_dot_add(a, sevens, wb)));
+            }
+        }
+        let (x, y) = black_box((0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128, u128::MAX - 5));
+        for n in [0u32, 1, 63, 64, 65, 127, 128, 200] {
+            let n = black_box(n);
+            v("rotl128", core::intrinsics::rotate_left(x, n) as u64); v("rotl128_high", (core::intrinsics::rotate_left(x, n) >> 64) as u64);
+            v("rotr128", core::intrinsics::rotate_right(y, n) as u64); v("rotr128_high", (core::intrinsics::rotate_right(x, n) >> 64) as u64);
+        }
+        let (sx, sy) = (x as i128 >> 1, y as i128);
+        for (name, value) in [("min128", Ord::min(x, y)), ("max128", Ord::max(x, y)), ("smin128", Ord::min(sx, sy) as u128),
+                              ("smax128", Ord::max(sx, sy) as u128), ("neg128", (-sx) as u128), ("andnot128", x & !y)] {
+            v(name, value as u64); v(name, (value >> 64) as u64);
+        }
+        o
     }
 }

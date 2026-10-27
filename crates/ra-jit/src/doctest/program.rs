@@ -53,12 +53,19 @@ impl Parts {
         let mut taken = 0;
         let mut in_attrs = true;
         for node in body.syntax().children() {
-            let end = usize::from(node.text_range().end()) - WRAP.len();
-            let text = &code[taken..end.min(code.len())];
-            taken = end.min(code.len());
+            let start = (usize::from(node.text_range().start()) - WRAP.len()).min(code.len());
+            let end = (usize::from(node.text_range().end()) - WRAP.len()).min(code.len());
             let is_inner_attr =
                 ast::Attr::cast(node.clone()).is_some_and(|it| it.excl_token().is_some());
             in_attrs &= is_inner_attr;
+            // Until the first statement of `main`, what is between the crate's attributes and
+            // a statement goes with the `extern crate`s, so a blank line there stays one.
+            if !in_attrs && parts.rest.is_empty() && !parts.crate_attrs.is_empty() {
+                parts.extern_crates.push_str(&code[taken..start]);
+                taken = start;
+            }
+            let text = &code[taken..end];
+            taken = end;
             if in_attrs {
                 parts.crate_attrs.push_str(text);
             } else if let Some(it) = ast::ExternCrate::cast(node.clone()) {
@@ -120,6 +127,7 @@ impl Program {
             }
         };
         push_lines(&mut source, &parts.crate_attrs);
+        push_lines(&mut source, &parts.extern_crates);
         let injects = !parts.names_the_crate
             && !frame.no_crate_inject
             && frame.crate_name != "std"
@@ -128,7 +136,6 @@ impl Program {
             source.push_str("#[allow(unused_extern_crates)]\n");
             source.push_str(&format!("extern crate r#{};\n", frame.crate_name));
         }
-        push_lines(&mut source, &parts.extern_crates);
         if parts.has_main || source.contains("![no_std]") {
             source.push_str(rest);
             return Program { source };
@@ -201,6 +208,34 @@ mod tests {
             "#![allow(unused)]\n#![allow(dead_code)]\n\nextern crate app as other;\n\
              fn main() { #[allow(non_snake_case)] fn _doctest_main_src_lib_rs_3_0() {\n\
              let mut c = other::Counter { n: 1 };\nc.bump();\n} _doctest_main_src_lib_rs_3_0() }"
+        );
+    }
+
+    #[test]
+    fn a_line_after_the_attributes_stays_before_the_crate() {
+        assert_eq!(
+            program("#![allow(dead_code)]\nuse app::double;\nfn main() {\n    double(1);\n}"),
+            "#![allow(unused)]\n#![allow(dead_code)]\n\n\
+             #[allow(unused_extern_crates)]\nextern crate r#app;\n\
+             use app::double;\nfn main() {\n    double(1);\n}"
+        );
+        assert_eq!(
+            program("#![allow(dead_code)]\n\nlet n = app::double(1);"),
+            "#![allow(unused)]\n#![allow(dead_code)]\n\n\n\
+             #[allow(unused_extern_crates)]\nextern crate r#app;\n\
+             fn main() { #[allow(non_snake_case)] fn _doctest_main_src_lib_rs_3_0() {\n\
+             let n = app::double(1);\n} _doctest_main_src_lib_rs_3_0() }"
+        );
+    }
+
+    #[test]
+    fn its_own_extern_crates_go_before_the_injected_one() {
+        assert_eq!(
+            program("extern crate core as c;\nlet n = app::double(1);"),
+            "#![allow(unused)]\nextern crate core as c;\n\
+             #[allow(unused_extern_crates)]\nextern crate r#app;\n\
+             fn main() { #[allow(non_snake_case)] fn _doctest_main_src_lib_rs_3_0() {\n\
+             let n = app::double(1);\n} _doctest_main_src_lib_rs_3_0() }"
         );
     }
 }

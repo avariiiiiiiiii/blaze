@@ -92,13 +92,88 @@ pub(crate) struct Spec {
     pub(crate) record_reads: bool,
     /// Paths that are not inputs of what runs: the program itself, whose code is known.
     pub(crate) not_inputs: Vec<PathBuf>,
+    /// The file system it sees in place of the machine's, when it is given one: then it sees
+    /// nothing of the machine's but what the view binds, and the overlays, the writable and
+    /// the readable directories are empty (what it sees is the view's binds alone).
+    #[serde(default)]
+    pub(crate) view: Option<View>,
+}
+
+/// A file system of a program's own, as Nix gives a build: what it binds, each where the
+/// program sees it, on a root of the sandbox's own that has nothing else but
+///
+/// - `/proc`, the PID namespace's own, which shows the sandbox's processes alone;
+/// - `/dev` with `null`, `zero`, `full`, `random`, `urandom` and `tty`, the machine's,
+///   `fd`, `stdin`, `stdout` and `stderr` linked into `/proc/self/fd`, and an empty `shm`;
+/// - an empty `/tmp`;
+/// - `/etc` with `passwd` and `group`, one line for the user it runs as and one for
+///   `nobody`, whom files of other users show as, and `hosts`, `localhost` alone: what
+///   Nix's sandbox gives, enough for `getpwuid` and a loopback name and nothing of the
+///   machine's (no `resolv.conf`, there being no network to resolve on; no `nsswitch.conf`,
+///   glibc reading the files without one).
+///
+/// The root, `/dev` and `/etc` are read-only. Everything else is not there: `/usr`, `$HOME`,
+/// the store paths that are not bound (a `/nix/store` has those bound alone), the machine's
+/// sockets. A path the program or anything it runs names outside the binds fails with
+/// `ENOENT`, as the paths outside a Nix build's closure do. On Linux the view is a mount
+/// namespace whose root replaces the machine's (`pivot_root`), the machine's tree detached
+/// from it. On macOS a view is not made (decided): the program sees the machine as it would
+/// without one.
+///
+/// A view for a build script, with a pinned compiler unpacked away from the store:
+///
+/// ```ignore
+/// let view = View {
+///     binds: vec![
+///         Bind::read("/nix/store/abc-gcc-14", "/home/me/.blaze/nix/abc-gcc-14"),
+///         Bind::read("/src/pkg", "/src/pkg"),
+///         Bind::write("/out", "/target/debug/build/pkg-1/out"),
+///     ],
+/// };
+/// ```
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct View {
+    /// What it sees, in any order: one inside another is bound after it. Two never bind the
+    /// same path, and none is `/` or below `/proc` or `/dev`, which are the view's own.
+    pub(crate) binds: Vec<Bind>,
+}
+
+/// A directory or a file of the machine's, seen in a [`View`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Bind {
+    /// Where the program sees it: a whole path, with no `..`. Inside another bind it is a
+    /// path that is there already, of the same kind (nothing is made in what is bound).
+    pub(crate) inside: PathBuf,
+    /// What it is on the machine, with the links on its way followed. One that is not there
+    /// is an error, before anything runs.
+    pub(crate) outside: PathBuf,
+    /// Whether the program writes it for real; otherwise it is read-only, with what is below
+    /// it.
+    #[serde(default)]
+    pub(crate) writable: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Bind {
+    /// `outside`, seen read-only at `inside`.
+    pub(crate) fn read(inside: impl Into<PathBuf>, outside: impl Into<PathBuf>) -> Bind {
+        Bind { inside: inside.into(), outside: outside.into(), writable: false }
+    }
+
+    /// `outside`, written for real at `inside`.
+    pub(crate) fn write(inside: impl Into<PathBuf>, outside: impl Into<PathBuf>) -> Bind {
+        Bind { inside: inside.into(), outside: outside.into(), writable: true }
+    }
 }
 
 /// What a line of a record says was reached.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum Reached {
-    /// `R`: a path opened, looked at, listed, run or read as a link.
+    /// `R`: a path opened, listed or run.
     Read,
+    /// `L`: a path only looked at (`stat`, `access`, `chdir`, `readlink`): what it is, whether
+    /// it can be run, a link's text and a file's size, but not what is in it.
+    Looked,
     /// `W`: a write the sandbox refused: outside the overlays, the writable directories and
     /// the program's own empty ones.
     Write,
@@ -112,6 +187,7 @@ impl Reached {
     fn letter(self) -> char {
         match self {
             Reached::Read => 'R',
+            Reached::Looked => 'L',
             Reached::Write => 'W',
             Reached::Net => 'N',
             Reached::Incomplete => 'X',
@@ -121,6 +197,7 @@ impl Reached {
     fn of(letter: &str) -> Option<Reached> {
         Some(match letter {
             "R" => Reached::Read,
+            "L" => Reached::Looked,
             "W" => Reached::Write,
             "N" => Reached::Net,
             "X" => Reached::Incomplete,
@@ -129,7 +206,7 @@ impl Reached {
     }
 }
 
-/// A line of a record: `R`, `W`, `N` or `X`, the test, and the path, the address or why, by
+/// A line of a record: `R`, `L`, `W`, `N` or `X`, the test, and the path, the address or why, by
 /// tabs. The test is libtest's name of the one whose thread made the call, as [`MARK`] said,
 /// or empty when that is not known (another thread, a child process, the program before or
 /// after its tests): what has an empty test is taken to be every test's of the run. A record
@@ -183,7 +260,15 @@ impl Recorder {
         let mut written = overlays.clone();
         written.extend(tidied(&spec.writable));
         written.extend(own.iter().map(|it| (*it).to_owned()));
-        let readable = tidied(&spec.readable);
+        let mut readable = tidied(&spec.readable);
+        // A view's binds are where it writes and what it reads, as the writable and readable
+        // directories are, whichever of the sandbox's own directories they are below.
+        for bind in spec.view.iter().flat_map(|it| &it.binds) {
+            match bind.writable {
+                true => written.push(tidy(&bind.inside)),
+                false => readable.push(tidy(&bind.inside)),
+            }
+        }
         // What is read there is an input, as what is read in an overlay is.
         let mut overlays = overlays;
         overlays.extend(readable.iter().cloned());
@@ -203,7 +288,8 @@ impl Recorder {
     /// that knows the test of a call itself, not by its thread. A read is kept only when reads
     /// are recorded and it is an input, as [`Recorder::read`] keeps it.
     pub(crate) fn reached(&mut self, reached: Reached, test: String, what: &str) {
-        if reached == Reached::Read && !(self.reads && self.input(what)) {
+        let read = matches!(reached, Reached::Read | Reached::Looked);
+        if read && !(self.reads && self.input(what)) {
             return;
         }
         // A tab or a line break would end the field: what has one is not recorded, and the
@@ -268,6 +354,13 @@ impl Recorder {
     /// `thread` read `path`, made whole: recorded when reads are and it is an input.
     pub(crate) fn read(&mut self, thread: u64, path: &str) {
         self.reached(Reached::Read, self.test(thread), path);
+    }
+
+    /// `thread` looked at `path`, made whole, without opening it: recorded as [`Self::read`]
+    /// records a read.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn looked(&mut self, thread: u64, path: &str) {
+        self.reached(Reached::Looked, self.test(thread), path);
     }
 
     /// Whether a write to `path` is the program's to make.
@@ -380,7 +473,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> ! {
     std::process::exit(match backend(&spec, Some(&program)) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("ra-jit: the sandbox could not be made: {error}");
+            eprintln!("blaze: the sandbox could not be made: {error}");
             COULD_NOT
         }
     })
@@ -541,6 +634,8 @@ mod tests {
         _ = std::fs::remove_dir_all(&root);
     }
 
+    // The paths a sandbox records are a Unix machine's: there is one on Linux and macOS alone.
+    #[cfg(unix)]
     #[test]
     fn a_record_is_its_lines_in_order_once() {
         let spec = Spec {

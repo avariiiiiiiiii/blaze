@@ -313,6 +313,85 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
     Ok((json, programs))
 }
 
+/// The unit graph of a build, as `cargo build --unit-graph` prints it: which of its targets
+/// and how, as [`blaze_units::Request`] says.
+pub struct Units<'a> {
+    pub intent: blaze_units::Intent,
+    pub filter: &'a blaze_units::Filter,
+    /// `--release`.
+    pub release: bool,
+    /// `--profile`.
+    pub profile: Option<&'a str>,
+    /// The host's triple and cfg.
+    pub host: &'a blaze_units::Platformed,
+    /// `--target`'s, when the build is not for the host.
+    pub target: Option<&'a blaze_units::Platformed>,
+}
+
+/// The unit graph of `asked`'s build (`asked.build` selects its members, and has to want the
+/// dev-dependencies exactly when the filter's targets do), made by blaze-units from blaze's
+/// own resolve: what `cargo <command> --unit-graph` prints.
+pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGraph> {
+    let build = asked.build.as_ref().context("a unit graph is of a build")?;
+    let has_dev_units = units.filter.need_dev_deps(units.intent);
+    anyhow::ensure!(
+        build.dev_units == has_dev_units,
+        "the build {} the dev-dependencies but its targets {}",
+        if build.dev_units { "resolves" } else { "does not resolve" },
+        if has_dev_units { "need them" } else { "do not" },
+    );
+    let requested = blaze_manifest::profiles::requested_profile(
+        units.intent.default_profile(),
+        units.release,
+        units.profile,
+    )?;
+    resolved(asked, None, |resolved| {
+        let Resolved { ws, resolve, specs, cli_features, behavior, packages: reads, .. } = resolved;
+        let profiles = blaze_manifest::profiles::Profiles::new(
+            ws.profiles(),
+            ws.unstable_features(),
+            resolved.config,
+            &requested,
+            &units.host.triple,
+        )?;
+        let host = TargetPlatform { triple: &units.host.triple, cfg: &units.host.cfg };
+        let target = units.target.map(|it| TargetPlatform { triple: &it.triple, cfg: &it.cfg });
+        let packages =
+            Packages { reads, platform: Some(target.as_ref().unwrap_or(&host)), host: Some(&host) };
+        let kinds = match units.target {
+            Some(target) => vec![CompileKind::Target(InternedString::new(&target.triple))],
+            None => vec![CompileKind::Host],
+        };
+        let member_features = members_with_features(&resolved.members, specs, cli_features)?;
+        let dev = if has_dev_units { HasDevUnits::Yes } else { HasDevUnits::No };
+        let opts = FeatureOpts::new(behavior, dev, ForceAllTargets::No);
+        let features =
+            FeatureResolver::resolve(&packages, resolve, &member_features, &kinds, opts)?;
+        let roots: Vec<PackageId> = member_features.iter().map(|(it, _)| it.package_id()).collect();
+        let mut by_id = FxHashMap::default();
+        for id in resolve.iter() {
+            let manifest = resolved
+                .manifests
+                .get(&id)
+                .with_context(|| format!("no manifest of `{id}` was read"))?;
+            let is_member = resolved.member_ids.contains(&id);
+            by_id.insert(id, blaze_units::Package { manifest, is_member });
+        }
+        blaze_units::unit_graph(&blaze_units::Request {
+            packages: &by_id,
+            resolve,
+            features: &features,
+            profiles: &profiles,
+            roots: &roots,
+            intent: units.intent,
+            filter: units.filter,
+            host: units.host,
+            target: units.target,
+            has_dev_units,
+        })
+    })
+}
+
 /// The workspace of an [`Asked`] resolved as cargo's `resolve_ws_with_opts` resolves it, before
 /// the feature resolver: what `cargo metadata` and `cargo tree` print from.
 pub struct Resolved<'a> {
@@ -328,6 +407,10 @@ pub struct Resolved<'a> {
     pub has_dev_units: HasDevUnits,
     /// What was read of every package the lock file names.
     pub packages: &'a FxHashMap<PackageId, Read>,
+    /// The manifest of every package the lock file names.
+    pub manifests: &'a FxHashMap<PackageId, &'a Manifest>,
+    /// The configuration the workspace was read with.
+    pub config: &'a Config,
 }
 
 /// The packages a command selects of the workspace, from its members' ids.
@@ -583,6 +666,13 @@ fn resolving_with<R>(
         }
     }
     let unused_patches = whole.unused_patches().to_vec();
+    let manifests: FxHashMap<PackageId, &Manifest> = ws
+        .members()
+        .map(|(_, m)| m)
+        .chain(path_packages.iter().chain(&fetched).map(|it| &*it.manifest))
+        .zip(&ids)
+        .map(|(m, id)| (*id, m))
+        .collect();
     let resolved = Resolved {
         ws: &ws,
         resolve: &targeted,
@@ -593,6 +683,8 @@ fn resolving_with<R>(
         behavior,
         has_dev_units,
         packages: &reads,
+        manifests: &manifests,
+        config: &ctx.config,
     };
     then(resolved, serialized, &ids, &unused_patches)
 }
@@ -622,7 +714,7 @@ fn described(
         Some(platform) => vec![CompileKind::Target(InternedString::new(platform.triple))],
         None => vec![CompileKind::Host],
     };
-    let packages = Packages { reads, platform: asked.platform.as_ref() };
+    let packages = Packages { reads, platform: asked.platform.as_ref(), host: None };
     let mut roots = Vec::new();
     let resolve = match &asked.build {
         None => resolve_graph(targeted, member_ids, current, &packages, &kinds)?,
@@ -678,11 +770,20 @@ struct Made {
 struct Packages<'a> {
     reads: &'a FxHashMap<PackageId, Read>,
     platform: Option<&'a TargetPlatform<'a>>,
+    /// The host's platform, for what is built for it, when it is not `platform`.
+    host: Option<&'a TargetPlatform<'a>>,
 }
 
 impl Packages<'_> {
     fn activates(&self, platform: &Platform) -> bool {
         self.platform.is_none_or(|it| it.activates(platform))
+    }
+
+    fn activates_for(&self, platform: &Platform, kind: CompileKind) -> bool {
+        match (kind, self.host) {
+            (CompileKind::Host, Some(host)) => host.activates(platform),
+            _ => self.activates(platform),
+        }
     }
 }
 
@@ -709,8 +810,8 @@ impl PackageTargets for Packages<'_> {
         self.reads.get(&package_id).is_some_and(|it| it.proc_macro_lib)
     }
 
-    fn platform_activated(&self, platform: &Platform, _kind: CompileKind) -> bool {
-        self.activates(platform)
+    fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool {
+        self.activates_for(platform, kind)
     }
 }
 

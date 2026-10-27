@@ -233,7 +233,7 @@ def median(values):
     return r[len(r) // 2] if len(r) % 2 else math.sqrt(r[len(r) // 2 - 1] * r[len(r) // 2])
 
 
-THE_LINE = "Right of the 1× line ra-jit is better, left of it worse; the scale is logarithmic."
+THE_LINE = "Right of the 1× line blaze is better, left of it worse; the scale is logarithmic."
 
 
 def edits(rows, where):
@@ -244,10 +244,10 @@ def edits(rows, where):
     if not rows:
         return None
     return compare("edits", "How much faster an edit builds than with cargo",
-                   "A small edit to a real project, then an incremental build: cargo build's time ÷ cargo ra-jit build's, "
+                   "A small edit to a real project, then an incremental build: cargo build's time ÷ cargo blaze build's, "
                    "both warm. The bar is the median over the kinds of edit, the thin line runs from the slowest kind to "
                    f"the fastest. {THE_LINE}",
-                   rows, "All projects", ("faster", "slower"), "as fast as cargo", ("ra-jit slower", "ra-jit faster"),
+                   rows, "All projects", ("faster", "slower"), "as fast as cargo", ("blaze slower", "blaze faster"),
                    f"{MACHINES} {where}")
 
 
@@ -263,10 +263,10 @@ def memory(rows, where):
     if not rows:
         return None
     return compare("memory", "How much memory an edit's build takes, against cargo",
-                   "The most memory every process doing the work held at once, ra-jit's against cargo's. ra-jit's is its "
+                   "The most memory every process doing the work held at once, blaze's against cargo's. blaze's is its "
                    "daemon, which keeps the project loaded between edits, its workers and the command; cargo's is cargo, "
                    f"rustc and the linker. {THE_LINE}",
-                   rows, "All projects", ("less", "more"), "as much as cargo", ("ra-jit uses more", "ra-jit uses less"),
+                   rows, "All projects", ("less", "more"), "as much as cargo", ("blaze uses more", "blaze uses less"),
                    f"{MACHINES} {where}")
 
 
@@ -276,9 +276,9 @@ def disk(rows, where):
     if not rows:
         return None
     return compare("disk", "How much disk a project's build keeps, against cargo",
-                   "What each side keeps on disk once the edits are done, ra-jit against cargo: cargo's target directory, "
-                   f"and ra-jit's target directory, function store and home. {THE_LINE}",
-                   rows, "All projects", ("less", "more"), "as much as cargo", ("ra-jit keeps more", "ra-jit keeps less"),
+                   "What each side keeps on disk once the edits are done, blaze against cargo: cargo's target directory, "
+                   f"and blaze's target directory, function store and home. {THE_LINE}",
+                   rows, "All projects", ("less", "more"), "as much as cargo", ("blaze keeps more", "blaze keeps less"),
                    f"{MACHINES} {where}")
 
 
@@ -290,9 +290,9 @@ def runtime(rows, where, rough=(), rough_note=""):
     if not rows:
         return None
     marked = any(k in by for b, by in rows for k in by if (b, k) in rough)
-    return compare("runtime", "How fast the programs ra-jit builds run, against cargo build --release",
-                   "How long each benchmark takes built by ra-jit's LLVM against built by cargo build --release, on the "
+    return compare("runtime", "How fast the programs blaze builds run, against cargo build --release",
+                   "How long each benchmark takes built by blaze's LLVM against built by cargo build --release, on the "
                    f"same machine. {THE_LINE}",
                    rows, "All benchmarks", ("faster", "slower"), "as fast as release",
-                   ("ra-jit's program slower", "ra-jit's program faster"),
+                   ("blaze's program slower", "blaze's program faster"),
                    f"{MACHINES} {where}" + (f" {rough_note}" if marked else ""), digits=2)

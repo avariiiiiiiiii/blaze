@@ -52,7 +52,7 @@ fn compare() -> Option<&'static Compare> {
             let server = match ProcMacroClient::spawn(&server, none, None, 1) {
                 Ok(it) => it,
                 Err(e) => {
-                    eprintln!("proc macros: ra-jit's server {server} did not start: {e}");
+                    eprintln!("proc macros: blaze's server {server} did not start: {e}");
                     return None;
                 }
             };
@@ -82,14 +82,14 @@ impl Compare {
             let path = same.unwrap_or_else(|| self.libs.join(file));
             let path = std::path::absolute(path).map_err(|e| e.to_string())?;
             if !path.exists() {
-                return Err(format!("ra-jit linked no {}", path.display()));
+                return Err(format!("blaze linked no {}", path.display()));
             }
             let path = AbsPathBuf::assert_utf8(path);
             load_cargo::load_proc_macro(&self.server, &path, &[]).map_err(|e| e.to_string())
         });
         let macros = macros.as_ref().map_err(Clone::clone)?;
         let found = macros.iter().find(|it| it.name.as_str() == name);
-        found.cloned().ok_or_else(|| format!("ra-jit's library of {dylib} lists no `{name}`"))
+        found.cloned().ok_or_else(|| format!("blaze's library of {dylib} lists no `{name}`"))
     }
 }
 
@@ -151,8 +151,8 @@ pub(crate) fn again(
             &label,
             OTHERWISE,
             &format!(
-                "ra-jit's server and library expanded otherwise than the toolchain's:\n\
-                 toolchain's: {}\nra-jit's:    {}",
+                "blaze's server and library expanded otherwise than the toolchain's:\n\
+                 toolchain's: {}\nblaze's:     {}",
                 said(toolchain),
                 said(&ours)
             ),
@@ -204,7 +204,7 @@ pub(crate) fn report() -> Option<String> {
         calls.map(|(label, calls)| format!("{label} {}", calls[which])).collect()
     };
     let mut said = format!(
-        "compared with ra-jit's server: {} calls ({}), {} expanded otherwise, {} failed by both, \
+        "compared with blaze's server: {} calls ({}), {} expanded otherwise, {} failed by both, \
          {} not compared",
         compared.iter().sum::<u64>(),
         kinds.join(", "),

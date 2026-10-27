@@ -21,7 +21,9 @@ use std::{
 use anyhow::Context as _;
 use ide_db::{ChangeWithProcMacros, RootDatabase, base_db::SourceDatabase as _};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
-use project_model::{CargoConfig, RustLibSource};
+use project_model::{
+    CargoConfig, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource,
+};
 use vfs::{AbsPathBuf, VfsPath};
 
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
@@ -160,6 +162,29 @@ const BORROWCK_CODES: &[&str] = &[
     "E0621", "E0713", "E0716", "E0793", "E0309", "E0310", "E0311", "borrowck",
 ];
 
+/// The cargo workspace at `root`, loaded as `load_cargo::load_workspace_at` loads it, but
+/// refused when `cargo metadata` fails: rust-analyzer then reads the workspace with
+/// `--no-deps`, whose crates have no dependencies, so every type of another crate is an error
+/// in the signatures that name it, which the bodies using them do not show, and the checker
+/// reports what follows from those types.
+fn load_project(
+    root: &AbsPathBuf,
+    cargo_config: &CargoConfig,
+    load_config: &LoadCargoConfig,
+) -> anyhow::Result<(RootDatabase, vfs::Vfs)> {
+    let manifest = ProjectManifest::discover_single(root)?;
+    let mut workspace = ProjectWorkspace::load(manifest, cargo_config, &|_| ())?;
+    if let ProjectWorkspaceKind::Cargo { error: Some(error), .. } = &workspace.kind {
+        anyhow::bail!("`cargo metadata` failed in {root}: {error:#}");
+    }
+    if load_config.load_out_dirs_from_check {
+        let build_scripts = workspace.run_build_scripts(cargo_config, &|_| ())?;
+        workspace.set_build_scripts(build_scripts);
+    }
+    let (db, vfs, _) = load_cargo::load_workspace(workspace, &cargo_config.extra_env, load_config)?;
+    Ok((db, vfs))
+}
+
 /// `ra-jit borrowck --project DIR`: the borrow checker's errors in the crates of the cargo
 /// workspace at `DIR`, one JSON object per line, and a last line counting files, errors,
 /// `unused_mut` warnings and files the checker panicked on, which fail it.
@@ -178,8 +203,7 @@ fn check_project(project: &str) -> anyhow::Result<()> {
         proc_macro_processes: 1,
     };
     let started = Instant::now();
-    let (db, vfs, _) =
-        load_cargo::load_workspace_at(root.as_ref(), &cargo_config, &load_config, &|_| ())?;
+    let (db, vfs) = load_project(&root, &cargo_config, &load_config)?;
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let files: Vec<vfs::FileId> = hir::attach_db(&db, || {
         let mut files = Vec::new();
@@ -255,8 +279,10 @@ fn check_project(project: &str) -> anyhow::Result<()> {
 /// `ra-jit borrowck --project DIR --timings OUT`: for each body of the workspace's crates, the
 /// time type inference takes on it and the time the borrow checker takes in each mode, by
 /// phase, with the sizes it worked on, one JSON object per line in `OUT`; the totals on
-/// standard output. Each body is inferred and then checked, one at a time on one thread, so a
-/// body's time includes the queries it is the first to need.
+/// standard output. Each body is inferred and then checked, one at a time on one thread:
+/// `infer_us` and `first_us` include the queries the body is the first to need, while
+/// `infer_warm_us` and each mode's time are what an edit of the body costs in the daemon, the
+/// rest answered and the trait solver's cache empty.
 fn time_project(project: &str, out: &str) -> anyhow::Result<()> {
     use hir::{AssocItem, DefWithBody, ModuleDef};
     use hir_ty_borrowck::{
@@ -276,13 +302,14 @@ fn time_project(project: &str, out: &str) -> anyhow::Result<()> {
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
-    let (db, vfs, _) =
-        load_cargo::load_workspace_at(root.as_ref(), &cargo_config, &load_config, &|_| ())?;
+    let (db, vfs) = load_project(&root, &cargo_config, &load_config)?;
     let mut file = std::io::BufWriter::new(std::fs::File::create(out)?);
     // By mode, as `Mode as usize`: Nll, Polonius.
     let mut totals = [[std::time::Duration::ZERO; Phase::ALL.len()]; 2];
     let mut check_totals = [std::time::Duration::ZERO; 2];
     let (mut infer_total, mut bodies) = (std::time::Duration::ZERO, 0usize);
+    let (mut infer_warm_total, mut first_total) =
+        (std::time::Duration::ZERO, std::time::Duration::ZERO);
     hir::attach_db(&db, || -> anyhow::Result<()> {
         let mut found: Vec<(DefWithBody, String)> = Vec::new();
         for krate in hir::Crate::all(&db) {
@@ -377,16 +404,27 @@ fn time_project(project: &str, out: &str) -> anyhow::Result<()> {
             if infer.is_err() {
                 continue;
             }
-            // Both modes, each body checked by one first and then the other, in turn, so the
-            // queries the first pays for cold are paid by each mode as often.
-            let modes = if bodies % 2 == 0 {
-                [Mode::Polonius, Mode::Nll]
-            } else {
-                [Mode::Nll, Mode::Polonius]
-            };
+            // What an edit in the daemon pays: the queries of the rest of the workspace answered,
+            // the trait solver's cache empty, as it is in a new revision.
+            hir::clear_tls_solver_cache();
+            let started = Instant::now();
+            let _ = hir_ty::infer_query_with_inspect(&db, id, None, hir_ty::LoweringMode::Analysis);
+            let infer_warm = started.elapsed();
+            // The first check pays for the queries the body is the first to need, as the first
+            // inference did; then each mode is timed as an edit.
+            let started = Instant::now();
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hir_ty_borrowck::borrowck_in_mode(&db, id, Mode::Polonius)
+            }));
+            let first_time = started.elapsed();
+            if first.is_err() {
+                continue;
+            }
+            let modes = [Mode::Polonius, Mode::Nll];
             let mut by_mode = serde_json::Map::new();
             let mut panicked = false;
             for mode in modes {
+                hir::clear_tls_solver_cache();
                 let started = Instant::now();
                 let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     measure(|| hir_ty_borrowck::borrowck_in_mode(&db, id, mode).skipped.is_some())
@@ -432,6 +470,8 @@ fn time_project(project: &str, out: &str) -> anyhow::Result<()> {
             }
             bodies += 1;
             infer_total += infer_time;
+            infer_warm_total += infer_warm;
+            first_total += first_time;
             writeln!(
                 file,
                 "{}",
@@ -439,7 +479,8 @@ fn time_project(project: &str, out: &str) -> anyhow::Result<()> {
                     "name": name,
                     "path": path,
                     "infer_us": infer_time.as_micros() as u64,
-                    "first": mode_name(modes[0]),
+                    "infer_warm_us": infer_warm.as_micros() as u64,
+                    "first_us": first_time.as_micros() as u64,
                     "modes": by_mode,
                 })
             )?;
@@ -467,6 +508,8 @@ fn time_project(project: &str, out: &str) -> anyhow::Result<()> {
         serde_json::json!({
             "bodies": bodies,
             "infer_secs": infer_total.as_secs_f64(),
+            "infer_warm_secs": infer_warm_total.as_secs_f64(),
+            "first_check_secs": first_total.as_secs_f64(),
             "modes": summary,
         })
     )?;
@@ -550,4 +593,39 @@ fn diagnostics(
             })
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A package depending on a path that is not there: `cargo metadata` fails, and
+    /// `--no-deps`, which rust-analyzer falls back to, does not.
+    #[test]
+    fn refuses_a_workspace_whose_metadata_failed() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("src")).unwrap();
+        std::fs::write(
+            work.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nmissing = { path = \"vendor/missing\" }\n",
+        )
+        .unwrap();
+        std::fs::write(work.path().join("src/lib.rs"), "").unwrap();
+        let load_config = LoadCargoConfig {
+            load_out_dirs_from_check: false,
+            with_proc_macro_server: ProcMacroServerChoice::None,
+            prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
+        };
+        let root = AbsPathBuf::assert_utf8(dunce::canonicalize(work.path()).unwrap());
+        let error = load_project(&root, &CargoConfig::default(), &load_config)
+            .err()
+            .expect("a workspace whose metadata failed was loaded");
+        let error = format!("{error:#}");
+        assert!(error.contains("`cargo metadata` failed"), "{error}");
+        let missing = std::path::Path::new("vendor").join("missing");
+        assert!(error.contains(&*missing.to_string_lossy()), "{error}");
+    }
 }

@@ -10,6 +10,24 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Added
 
+- `blaze lock --fetches [--target <triple>]...` pins what build scripts download, as Nix pins a
+  fixed-output derivation: each download by its sha256 in `Cargo.fetches.lock` beside
+  `Cargo.lock`, kept by the package's name, version and `Cargo.lock` checksum, the bytes in
+  blaze's store (so a remote cache carries them). A build, which has no network, hands each to
+  its build script through the crate's own variable (`RUSTY_V8_ARCHIVE` for `v8`,
+  `ORT_CACHE_DIR` for `ort-sys`, `LK_CUSTOM_WEBRTC` for `webrtc-sys`;
+  `HELIX_DISABLE_AUTO_GRAMMAR_BUILD=1` for `helix-term`, which then downloads nothing), and a
+  missing or stale entry fails naming the command. A script refused the network that blaze has
+  no override for is told which variable an override would set
+  (`bench/results/2026-10-27-bscache/fetches.md`).
+
+- `cargo blaze build` links a library's `cdylib` (#262): a package whose crate types include
+  `cdylib`, such as a napi-rs Node addon or a pyo3 extension, gets its shared library at
+  cargo's path (`target/debug/lib<name>.so`, `.dylib` on macOS), exporting its
+  `#[no_mangle]` and `#[export_name]` functions and statics, with `cargo:rustc-cdylib-link-arg`
+  honoured. Before, the build printed `Finished` and wrote no library. A build that would write
+  a `staticlib` stops with an error saying blaze does not link one yet. Reported by @bompus.
+
 - blaze is its own toolchain, named `blaze-<date>` (`blaze-2026-10-25`, today the Rust nightly
   of that date): `blaze toolchain` names it and `blaze toolchain --path` prints its directory,
   and a project that pins another toolchain is told so once, as a note, while blaze builds
@@ -542,6 +560,11 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Changed
 
+- The programs print `blaze`, not `ra-jit` (#270, "What the programs print"): the `blaze:`
+  prefix of their notes, `Finished ... profile [blaze]`, `blaze is enabled`, `plain cargo:
+  through blaze`, `blaze could not compile`, `blaze cache gc` and the other errors and notes.
+  The harnesses that read these lines read the new ones. The binaries, crates, directories,
+  `RA_JIT_*` variables and symbol names keep their names for now.
 - A build script's `RUSTC` is blaze, so its probes run no rustc: `rustc -vV` and `--print`
   are blaze's answers, and a probe compile (`autocfg`, `anyhow`, `thiserror`, `rustix`,
   `proc-macro2`) gets `cargo blaze check`'s verdict, or an error naming the command where blaze
@@ -699,7 +722,6 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   them from there (#90). `RA_JIT_PROC_MACRO_SERVER=0` goes back to rustc's libraries and the
   toolchain's server. `macroserver.py all` builds each app again over the first store: no
   library linked again, the same 3,465 calls.
-||||||| 0858e8535d
 - The first `cargo blaze build` of a workspace is blaze's, not cargo's: once cargo's build
   succeeds it waits for the daemon to load the workspace ("Waiting for blaze to load the
   workspace") and build the programs, where it handed back cargo's and the next build was the
@@ -1012,9 +1034,82 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 - `Self::Variant` in a pattern of an `impl` whose `Self` type is an alias or projection to an
   enum (`impl Deserialize<E, D> for <E as Archive>::Archived`, as `#[derive(rkyv::Deserialize)]`
   writes) resolves the variant instead of failing MIR lowering with `unresolved variant`.
+- An integration test that names a program (`env!("CARGO_BIN_EXE_app")`) builds when its
+  build starts the daemon's worker: the worker was started with the variables of its build
+  but not the places cargo set, so its load, which compiles before the first request is read,
+  failed `` `env!("CARGO_BIN_EXE_app")` in it names a variable that is not set ``. A cold
+  `cargo ra-jit test --test it` failed every time; under plain cargo after `ra-jit enable`, the
+  `cargo test` after an edit failed when the edit's load won the race (the release train's
+  plain-cargo row "`cargo test`, edited").
+- A daemon that patches what rustc linked no longer stops at the first build that reaches a
+  thread-local, or a static written at run time, of a crate edited before any build reached
+  it (``static `__RUST_STD_INTERNAL_VAL` of crate `smid` with state, whose first value is not
+  the one rustc built it with``, `harness/programs.py` on every platform since #527). The first
+  values of a crate's statics with state are noted just before the first edit reaches it, so
+  rustc's copy is still known to start from them, and a change to a file an `include_str!` or
+  `include_bytes!` reads leaves the first values of crates that do not include it known (it
+  had made `alloc`'s `STATIC_INNER_SLICE` unknown after a checkout switch,
+  `worktrees.py --join --together` on macOS).
+- A build that code generation refuses (a static whose first value is not known to be rustc's,
+  a function rustc's copy of is from before the edit) is that build's refusal, with the reason,
+  not the daemon's end: every checkout's daemon had died with it
+  (`worktrees.py --join --together`, "another edited while it is broken"). Nothing is built in
+  its place, and the next build of that program is a whole one.
+- A spliced edit no longer runs a closure's old code (#582). A closure is named by its place
+  among the closures of its body, so after an edit that moves the call of a generic function
+  such as `caught(|| ...)` from one closure into the body, the patch called the base's
+  unchanged copy of `caught::<{closure#N}>`, and through it the base's code of the closure
+  there before: nothing the patch compiled had reached that closure's new code. A patch now
+  compiles what such an unchanged copy reaches that the edit changed, and refuses when that is
+  code which gained or lost a body of its own (`harness/fuzz/found/edits/closure-called-again.rs`;
+  `fuzz/edits.py` seed `push1`, round 27, had 7 wrong checksums and has none).
+- A whole build of other features or flags no longer leaks into the next: every worker linked
+  its programs into one `target/ra-jit/whole/<name>`, so after `cargo blaze run --features
+  loud` a plain `cargo blaze run`, whose worker had nothing edited to build again, installed
+  the loud program (`HELLO WORLD`). Each worker now links in a directory of its own, named by
+  what it is loaded with (`harness/cargo_ra_jit.py`, flags group).
+- Three programs that ran differently from rustc now run the same (#73): a diverging type
+  variable falls back to `!` in every edition, as rustc at the pinned nightly does, not to `()`
+  before 2024; `if let` in a closure captures only the places its pattern moves, as `let` and
+  `match` do, not its whole scrutinee; and a value assigned through `*(&mut x)` after a `match`
+  that ruled `x` out is dropped, since a place borrowed `&mut` may hold a value from then on
+  (rust-lang/rust#90752). `tests/ui` `editions/never-type-fallback.rs`,
+  `closures/2229_closure_analysis/run_pass/if-let-capture.rs` and `drop/issue-90752.rs` are
+  pinned.
+- `cargo blaze test --doc` runs an edited library's examples again: it took an example's
+  program from the run before while the example's own text was unchanged, since blaze's run
+  names no library with `--extern` for the key to stamp, so after an edit that broke them the
+  doc tests passed where cargo's failed. The key now has the cfgs of every crate the library is
+  built from and the files of those of the workspace. `cargo blaze test --doc -q` shows the
+  results tersely, as cargo's `-q` has libtest do (`harness/cargo_ra_jit.py`, flags group).
+- The daemon's own link passes the linker what `-C link-arg` and `-C link-args` say in
+  `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or the configuration's `rustflags`, after the native
+  libraries as rustc does; it left them out. A program linked with
+  `-Wl,-no_compact_unwind` had `__unwind_info` all the same, and a `-Wl,-headerpad` was not
+  the least room the splice's header file asks for (`harness/nocompact.py`,
+  `harness/headerpad.py` on macOS).
 - A red train opens or comments on the "Release train is red" issue again: train_issue.py read
   each harness job's log with `gh api`, which the runner's gh refuses without
   `--allow-escape-sequences`, so the `train issue` job failed and no issue was opened.
+- A build that compiles the standard library's crates itself no longer takes from the store
+  code that a build over ra-jit's prebuilt unit of the library kept: such an entry's calls
+  into the unit (`ra-jit.<hash>.…` symbols) are now checked when it is taken, where its link
+  failed on them as undefined (#328). Entries written before are not read (entry format 12).
+
+- A load's proc macros with and without `RA_JIT_PROC_MACRO_SERVER=0` (#460): each mode has
+  its own target directory, `target/rust-analyzer` with ra-jit's proc macros and
+  `target/rust-analyzer-rustc` without, so flipping the variable no longer has rustc read the
+  empty libraries a load with ra-jit's proc macros gives cargo (E0786, "memory map must have a
+  non-zero length"). The variable is part of which build and which worker it is, read from
+  the command that asks, so it takes effect without `blaze stop`; a spare worker no longer
+  keeps the daemon's. A load whose proc macro has no `blaze-proc-macro-srv` beside ra-jit
+  says where it looked, the command that builds it there, and `RA_JIT_PROC_MACRO_SERVER=0`.
+- A test that runs cargo runs in the sandbox: every cargo takes its locks in its home and
+  records there what it used (`.package-cache`, `.global-cache`), which the read-only machine
+  refused, so trybuild's tests and a cargo plugin's own failed. Cargo's home (`CARGO_HOME`, else
+  `~/.cargo`) is now an overlay, as the workspace and target directory are: the test writes it
+  for itself alone, and nothing of it is kept (docs/cargo.md, "Every test runs in a sandbox").
+
 - The borrow checker: lifetime elision counts none of the impl's lifetimes in a parameter
   that writes `Self`, as rustc counts only what a parameter's type writes or elides, so
   `fn store(self, db: &dyn Db) -> &Store` in `impl Id<'_>` returns a borrow of `db`. It
@@ -1154,7 +1249,7 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   `[ra-jit]` instead of handing every build to cargo. The daemon takes COFF programs (also with
   `--target x86_64-pc-windows-msvc`), links them with the `rust-lld` the repository's cargo
   configuration names, and closes an existing directory of its own that others can enter, as
-  on Unix. Live edits of a running program are still macOS and Linux only.
+  on Unix.
 - A profile with `debug = "line-tables-only"` (or `1`, or `"limited"`) no longer has the type
   of every variable worked out. Only the lines were written, but the types were described for
   each function compiled and then thrown away. On Biome (`biome_cli`, 518 crates, whose dev
@@ -1378,6 +1473,14 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   ready at 116.2 s instead of 142.3 s (Linux x86-64, 16 cores, medians of three). Nothing is
   left to rustc for it, and `harness/norustc` counts the same functions left to rustc on
   ripgrep (53) and nushell (534) (#37, no-rustc step E).
+- A whole build (`cargo blaze build`, `run`, `test`) that the source's errors fail writes them
+  as rustc and cargo do: each error, then `error: could not compile `app` (bin "app") due to 1
+  previous error`, and the note naming blaze's toolchain when the project pins another, where
+  it said `error: could not build `app`: ` before the first error.
+- An error in code nothing reaches, written while no daemon ran, fails the first whole build:
+  with no rustc to check the source, the worker checks every file of the crates the build
+  compiles once it has loaded them (`check: N files in ...` in its log), and every build of the
+  checkout fails with the error until a source is written. It built the program before.
 - A `#[global_allocator]` in an inline `#[cfg(test)] mod test { .. }` of a library (ureq's)
   gave the library's stand-in an allocator outside the test build, whose functions nothing
   defined: every allocation of the program reached the stand-in's trap, so nushell, which links
@@ -1756,6 +1859,17 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   every event). Each crate's on-demand functions are wanted once, and each definition is
   walked once for all its closures or all its statics of a name. reth's first edit on 48 cores:
   64.4 s and 64.3 s before, 58.0 s and 57.5 s after.
+- `blaze disable` removes the `bin` directory of cargo's home that `enable` made for the links
+  of `cargo fmt` and `cargo clippy`, when nothing else is in it: the home is as it was.
+- A load refused for configuration is retried on the next build, so editing or deleting
+  `.cargo/config.toml` no longer leaves `cargo blaze run` reporting an old refusal until
+  `cargo blaze stop` (#597). Reported by @enricoschaaf.
+
+- A plain `cargo blaze check` leaves integration tests, examples and benchmarks out of its
+  diagnostics, as `cargo check` does. Those targets were checked without their
+  dev-dependencies, producing false unresolved imports and method errors; explicitly
+  selecting dev targets still checks them with their dependencies (#634, reported by
+  @om606bosch; also #632).
 
 ## [0.1.0] - 2026-10-20
 

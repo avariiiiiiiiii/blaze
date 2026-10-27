@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""land.py: lands the current branch on main through the merge queue, and waits for it.
+"""land.py: lands the current branch on main, and waits for it.
 
     python3 .github/scripts/land.py "what the branch does" [--no-wait]
     python3 .github/scripts/land.py --wait [PR]
 
 Run it in the lane's worktree, on its branch, with everything committed and the local gate
 passed. It pushes the branch, opens its pull request (titled "Merge <branch>: <what it does>",
-which with " (#N)" is the merge commit's subject) or takes the one already open, and asks for it
-to be queued once its own checks pass: the pull request's run is the merge gate, the build and
-the unit tests on Linux x86-64 (about 5 minutes). The queue then runs the gate on the branch
-merged onto main and the entries ahead of it, and merges it with a merge commit, as `git merge
---no-ff` would; every harness runs after that, in the release train (train.yaml). Main moves only to
-what it tested. land.py waits until then and exits 0 with the commit main is at, or exits 1 and
-says why the pull request was not queued or left the queue (a check that failed, a conflict
-with main). GitHub
-deletes the branch on origin once it is merged.
+which with " (#N)" is the merge commit's subject) or takes the one already open, and turns on
+auto-merge: the pull request's run is the merge gate, the build and the unit tests on Linux x86-64
+(about 5 minutes), and once it passes GitHub merges the branch with a merge commit, as `git merge
+--no-ff` would. The branch need not be up to date with main; every harness runs after the merge, in
+the release train (train.yaml). land.py waits until then and exits 0 with the commit main is at, or
+exits 1 and says why the pull request did not merge (a check that failed, a conflict with main).
+GitHub deletes the branch on origin once it is merged.
 
 The waiting is done by a process of its own, detached from the terminal and from whatever ran
 land.py, which writes what it sees to <git common dir>/land/pr-N.log; land.py follows that log.
@@ -52,8 +50,8 @@ def gh(*args):
 
 def state(number):
     query = """query($number: Int!) { repository(owner: "indexable-inc", name: "blaze") {
-      pullRequest(number: $number) { state mergeable isInMergeQueue url headRefName
-        mergeQueueEntry { position state } autoMergeRequest { enabledAt } mergeCommit { oid } } } }"""
+      pullRequest(number: $number) { state mergeable url headRefName
+        autoMergeRequest { enabledAt } mergeCommit { oid } } } }"""
     out = gh("api", "graphql", "-f", f"query={query}", "-F", f"number={number}")
     return json.loads(out)["data"]["repository"]["pullRequest"]
 
@@ -65,17 +63,6 @@ def failed_checks(number):
         return [c for c in json.loads(out or "[]") if c["bucket"] == "fail"]
     except json.JSONDecodeError:
         return []
-
-
-def queue_runs(number):
-    """The merge-queue runs of this pull request that failed, newest first."""
-    try:
-        out = gh("run", "list", "--repo", REPO, "--workflow", "ra-jit.yaml", "--event", "merge_group",
-                 "--limit", "40", "--json", "headBranch,conclusion,url")
-    except GhFailed:
-        return []
-    runs = json.loads(out or "[]")
-    return [r["url"] for r in runs if f"/pr-{number}-" in r["headBranch"] and r["conclusion"] == "failure"]
 
 
 def files(number):
@@ -123,31 +110,25 @@ def wait(number):
             end(0, f"merged: main is at {pr['mergeCommit']['oid'][:10]} or after it")
         if pr["state"] == "CLOSED":
             end(1, f"land.py: {url} was closed")
-        if pr["isInMergeQueue"]:
-            entry = pr["mergeQueueEntry"] or {}
-            now, gone = f"in the merge queue, position {entry.get('position')} ({str(entry.get('state')).lower()})", 0
-        elif pr["autoMergeRequest"]:
+        if pr["autoMergeRequest"]:
             if pr["mergeable"] == "CONFLICTING":
                 end(1, f"land.py: {branch} conflicts with main: merge origin/main into it, then run land.py again")
             failed = failed_checks(number)
             if failed:
-                end(1, "land.py: the pull request's checks failed, so it was not queued:\n"
+                end(1, "land.py: the pull request's checks failed, so it did not merge:\n"
                     + "\n".join(f"  {c['name']}: {c['link']}" for c in failed))
             now, gone = "waiting for the pull request's checks", 0
         else:
-            # Out of the queue and not waiting for it: read twice, as the entry moves between the two.
+            # Auto-merge off and not merged: read twice, as the merge lands between the two.
             gone += 1
             if gone >= 2:
-                lines = [f"land.py: {url} left the merge queue without merging."]
-                lines += [f"  failed in the queue: {u}" for u in queue_runs(number)[:1]]
-                lines += ["  Fix it on the branch, then run land.py again."]
-                end(1, "\n".join(lines))
+                end(1, f"land.py: auto-merge of {url} was turned off without merging; run land.py again")
             now = said
         if now != said:
             say(now)
             said = now
         time.sleep(POLL)
-    end(1, f"land.py: gave up waiting after {GIVE_UP // 3600} hours; pull request #{number} may still be queued")
+    end(1, f"land.py: gave up waiting after {GIVE_UP // 3600} hours; pull request #{number} may still merge")
 
 
 def detach(number, log, pid_file):
@@ -225,9 +206,9 @@ def main():
     what, wait_for_it = args[0], "--no-wait" not in sys.argv
     branch = run("git", "rev-parse", "--abbrev-ref", "HEAD")
     if branch in ("HEAD", "main"):
-        sys.exit("land.py: check out the lane's branch first; main is moved by the merge queue alone")
+        sys.exit("land.py: check out the lane's branch first; main moves only by merged pull requests")
     if run("git", "status", "--porcelain", "--untracked-files=no"):
-        sys.exit("land.py: commit or drop the changes in the worktree first; the queue lands only what is committed")
+        sys.exit("land.py: commit or drop the changes in the worktree first; only what is committed lands")
     run("git", "fetch", "-q", "origin", "main")
     if not run("git", "rev-list", "origin/main..HEAD"):
         sys.exit(f"land.py: {branch} has nothing that main does not have")
@@ -245,17 +226,12 @@ def main():
                   "--title", f"Merge {branch}: {what}", "--body", body)
         number = int(url.rstrip("/").rsplit("/", 1)[1])
     print(f"{url}")
-    queued = subprocess.run(["gh", "pr", "merge", str(number), "--repo", REPO, "--merge", "--auto"],
+    merged = subprocess.run(["gh", "pr", "merge", str(number), "--repo", REPO, "--merge", "--auto"],
                             capture_output=True, text=True)
-    # Run again on a pull request already in the queue, `gh pr merge` may refuse; the queue has it.
-    try:
-        in_queue = state(number)["isInMergeQueue"]
-    except GhFailed:
-        in_queue = False
-    if queued.returncode and not in_queue:
-        sys.exit(f"land.py: gh pr merge failed:\n{queued.stderr.strip()}")
+    if merged.returncode:
+        sys.exit(f"land.py: gh pr merge failed:\n{merged.stderr.strip()}")
     if not wait_for_it:
-        print("queued; land.py does not wait (--no-wait)")
+        print("auto-merge on; land.py does not wait (--no-wait)")
         return
     follow(number)
 

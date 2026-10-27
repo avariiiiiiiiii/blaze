@@ -16,7 +16,9 @@ run, twice: once as before, where the load's `cargo check --compile-time-deps` h
 the proc macros, and once with `RA_JIT_PROC_MACRO_SERVER` naming the server, where ra-jit links
 each of them (crates/ra-jit/src/cargo/own_macro.rs) and that server expands with them. Each
 program has to print what cargo's does, and the proc-macro libraries in the target directory
-have to be all rustc's, then all ra-jit's.
+have to be all rustc's, then all ra-jit's. Every build shares one store: the package whole,
+which names the standard library's crates, has to refuse what the server's and libraries'
+builds over the library's unit kept (#328).
 
 With the names of bench apps (`APPS`, or `all` for each of them) it holds those instead. Each
 is built whole by ra-jit into its own target directory twice, from an empty store each time:
@@ -275,7 +277,7 @@ def ra_jit(root, crates, out, *extra, env=None):
 
 
 def linked(ran, what):
-    said = re.search(r"^linked .* in (\S+), (\d+) functions in it ra-jit could not compile$",
+    said = re.search(r"^linked .* in (\S+), (\d+) functions in it blaze could not compile$",
                      ran.stderr, re.M)
     if not said:
         raise SystemExit(f"FAIL: {what}: ra-jit did not say it linked:\n{ran.stderr[-8000:]}")
@@ -320,10 +322,7 @@ def wired(work, root, meta, units, server):
     for named in (False, True):
         # A target directory of its own is seeded from cargo's, whose proc macros are rustc's.
         shutil.rmtree(os.path.join(root, "target"), ignore_errors=True)
-        # A store of its own: one the libraries were built into serves code over symbols of
-        # the standard library this build, which names its crates, does not link.
-        env = {"RA_JIT_CACHE": os.path.join(work, f"store-wired-{named}"),
-               "RA_JIT_PROC_MACRO_SERVER": server if named else "0"}
+        env = {"RA_JIT_PROC_MACRO_SERVER": server if named else "0"}
         ran, took = ra_jit(root, crates, os.path.join(work, "wired.o"), "--own-target",
                            "--exe", program, env=env)
         how = "with the server named" if named else "without it"
@@ -332,12 +331,14 @@ def wired(work, root, meta, units, server):
         if got != expected:
             raise SystemExit(f"FAIL: the package ({how}) printed otherwise than cargo's:\n"
                              f"cargo:  {expected}\nra-jit: {got}")
-        ours, theirs = built_macros(os.path.join(root, "target", "rust-analyzer"))
+        # A load without ra-jit's proc macros has a directory of its own (#460).
+        own = os.path.join(root, "target", "rust-analyzer" if named else "rust-analyzer-rustc")
+        ours, theirs = built_macros(own)
         if (ours, theirs) != ((wanted, []) if named else ([], wanted)):
             raise SystemExit(f"FAIL: the load ({how}) built the proc macros {ours} by ra-jit and "
                              f"{theirs} by rustc, not each of {wanted} by "
                              f"{'ra-jit' if named else 'rustc'}:\n{ran.stderr[-8000:]}")
-        bare = without_libc(os.path.join(root, "target", "rust-analyzer"))
+        bare = without_libc(own)
         if sys.platform == "linux" and bare:
             raise SystemExit(f"FAIL: ra-jit linked the proc macros {bare} without libc")
         lines.append(f"the package whole, its proc macros by {'ra-jit' if named else 'rustc'}: "
@@ -360,12 +361,13 @@ def app(name, work, server):
     run(["git", "clone", "-q", "--filter=blob:none", f"https://github.com/{spec['repo']}", root],
         work, f"git clone of {name}")
     run(["git", "-C", root, "checkout", "-q", "--detach", spec["rev"]], work, f"checkout of {name}")
-    own = os.path.join(root, "target", "rust-analyzer")
     libs = os.path.join(work, f"{name}-libs")
     os.makedirs(libs)
     lines, printed, counts = [], [], None
     for build in ("ours", "again", "theirs"):
         named = build != "theirs"
+        # A load without ra-jit's proc macros has a directory of its own (#460).
+        own = os.path.join(root, "target", "rust-analyzer" if named else "rust-analyzer-rustc")
         shutil.rmtree(os.path.join(root, "target"), ignore_errors=True)
         store = os.path.join(work, f"{name}-store-{'ours' if named else 'theirs'}")
         env = {**spec.get("env", {}), "RA_JIT_CACHE": store}
@@ -379,7 +381,7 @@ def app(name, work, server):
         os.makedirs(os.path.dirname(binary), exist_ok=True)
         ran, took = ra_jit(root, [crate], os.path.join(work, f"{name}.o"), "--own-target",
                            "--exe", binary, env=env)
-        left = re.search(r"(\d+) functions in it ra-jit could not compile$", ran.stderr, re.M)
+        left = re.search(r"(\d+) functions in it blaze could not compile$", ran.stderr, re.M)
         ours, theirs = built_macros(own)
         # A library the store had is written with no build of it, which leaves a log.
         linked_now = {it for it in ours if glob.glob(
@@ -425,7 +427,7 @@ def app(name, work, server):
 
 def compared(stderr):
     """What `RA_JIT_PROC_MACRO_COMPARE` found, from the build's report."""
-    said = re.findall(r"compared with ra-jit's server: (\d+) calls \((\d+) derives, "
+    said = re.findall(r"compared with blaze's server: (\d+) calls \((\d+) derives, "
                       r"(\d+) attributes, (\d+) function-like\), (\d+) expanded otherwise, "
                       r"(\d+) failed by both, (\d+) not compared"
                       r"(?: \(expanded otherwise: ([^)]*)\))?(?: \(not compared: ([^)]*)\))?",
@@ -481,6 +483,10 @@ def main():
         print("not run: ra-jit links proc-macro libraries and the server on Linux so far")
         return
     work = scratch("ra-jit-macroserver-")
+    # One store for the run: the server and the libraries are built over the standard
+    # library's unit, and the package whole, which names its crates, must not take code from
+    # the store that calls into the unit (#328). An app's builds have stores of their own.
+    os.environ["RA_JIT_CACHE"] = os.path.join(work, "store")
     passed = False
     try:
         server, said = built_server(work)

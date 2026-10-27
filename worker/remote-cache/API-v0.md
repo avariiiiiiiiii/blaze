@@ -41,7 +41,7 @@ R2 key: `v3/<tenant id>/<name>` (tenant id opaque, from KV, never reused).
 | `PUT <base>/<name>` (body ≤ 90 MiB) | 200 `{"etag": "..."}` + `ETag`. `If-Match: <etag>` / `If-None-Match: *` → 412 when not met. Content-addressed name whose body does not hash to it (or to `x-blaze-sha256` for `.pack.zst`): 422 `hash mismatch`, nothing stored. 413 over the size |
 | `POST <base>/<name>?uploads` | multipart start (packs/, units/ only): 200 `{"upload": "<id>"}` |
 | `PUT <base>/<name>?upload=<id>&part=<n>` | one part, n from 1, ≤ 90 MiB, every part but the last the same size and ≥ 5 MiB: 200 `{"etag": "..."}` |
-| `POST <base>/<name>?upload=<id>` body `{"parts":[{"part":1,"etag":"..."},...],"sha256":"<hex>"}` (+ `x-blaze-sha256` for `.pack.zst`) | completes into a staging key, hashes it in the Worker, then stores it under the name only if the hash matches: 200 `{"etag": "..."}`; 422 (staging removed) |
+| `POST <base>/<name>?upload=<id>` body `{"parts":[{"part":1,"etag":"..."},...],"sha256":"<hex>"}` (+ `x-blaze-sha256` for `.pack.zst`) | completes into a staging key, hashes it in the Worker, then stores it under the name only if the hash matches: 200 `{"etag": "..."}`; 422 (staging removed). `sha256` is the hash of the assembled body: the name's `<h>` for `packs/<h>.pack` and `units/<h>`, the same as `x-blaze-sha256` for `.pack.zst` |
 | `DELETE <base>/<name>?upload=<id>` | aborts a multipart upload: 204 |
 | anything else (DELETE of an object, listing) | 405 |
 

@@ -125,7 +125,7 @@ fn program_unit(sysroot: &Path, dir: &Path, store: &Path, profile: &str) -> anyh
     std::fs::write(dir.join(format!("ra-jit-{profile}.log")), &said)?;
     if !built.status.success() {
         let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
-        anyhow::bail!("ra-jit did not build a `{profile}` program ({}): {last}", built.status);
+        anyhow::bail!("blaze did not build a `{profile}` program ({}): {last}", built.status);
     }
     Ok(said)
 }
@@ -163,7 +163,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         return Ok(());
     }
     let start = Instant::now();
-    let built = own_script::build_nothing(sysroot, &dir.join("build"), &store);
+    let built = own_script::build_nothing(sysroot, &dir.join("build"), &store, false);
     let said = built.map_err(|e| anyhow::anyhow!("{e} (the log is in {})", dir.display()))?;
     let unit = said.lines().find(|it| it.starts_with("standard library:")).unwrap_or_default();
     eprintln!("{unit}; built in {:.1?}", start.elapsed());

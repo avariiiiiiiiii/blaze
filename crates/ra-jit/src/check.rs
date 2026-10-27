@@ -40,9 +40,16 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
         crate::load(&projects, &cargo_config, crate::load_config(), selection, None, None)?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let excludes = &args.selection.excludes;
-    let mut checker =
-        Checker::new(&db, &vfs, &checkouts, &members, excludes, read_from, root, lints_capped);
+    let mut checker = Checker::new(
+        &db,
+        &vfs,
+        &checkouts,
+        &members,
+        &args.selection,
+        read_from,
+        root,
+        lints_capped,
+    );
     let served = match crate::socket::Served::bind(&socket) {
         Ok(served) => served,
         Err(crate::socket::NotServed::Taken) => {
@@ -98,8 +105,39 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let checker = Checker::new(&db, &vfs, &checkouts, &members, &[], read_from, root, lints_capped);
-    Ok(checker.refused(&db))
+    let checker = Checker::new(
+        &db,
+        &vfs,
+        &checkouts,
+        &members,
+        &args.selection,
+        read_from,
+        root,
+        lints_capped,
+    );
+    if let Some(refused) = checker.refused(&db) {
+        return Ok(Some(refused));
+    }
+    Ok(checker.checked.iter().find_map(|&file| unresolved(&db, file)).map(|path| {
+        crate::Refused::Error(crate::errors::Said::one(crate::errors::Diagnostic {
+            code: Some("E0433".to_owned()),
+            message: format!("failed to resolve `{path}`"),
+            span: None,
+        }))
+    }))
+}
+
+/// A path of the file, outside its attributes, that names nothing: rustc's E0433, which
+/// rust-analyzer does not say of a type's path, and on which a probe of a library item
+/// turns (autocfg's `probe_trait("alloc::alloc::Allocator")` with no `extern crate alloc`).
+fn unresolved(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
+    use syntax::{AstNode as _, ast};
+    let sema = hir::Semantics::new(db);
+    let tree = sema.parse_guess_edition(file);
+    tree.syntax().descendants().filter_map(ast::Path::cast).find_map(|path| {
+        let in_attr = path.syntax().ancestors().any(|it| ast::Attr::can_cast(it.kind()));
+        (!in_attr && sema.resolve_path(&path).is_none()).then(|| path.to_string())
+    })
 }
 
 struct Checker {
@@ -133,7 +171,7 @@ impl Checker {
         vfs: &Vfs,
         checkouts: &crate::Checkouts,
         members: &FxHashSet<ide_db::base_db::Crate>,
-        excludes: &[String],
+        selection: &crate::plan::Selection,
         read_from: SystemTime,
         root: PathBuf,
         lints_capped: bool,
@@ -159,7 +197,7 @@ impl Checker {
             }
             for package in cargo.packages().filter(|it| cargo[*it].is_local) {
                 manifests.insert(cargo[package].manifest.to_path_buf().into(), None);
-                let excluded = excludes.contains(&cargo[package].name);
+                let excluded = selection.excludes.contains(&cargo[package].name);
                 for &target in &cargo[package].targets {
                     let target = &cargo[target];
                     if excluded {
@@ -191,6 +229,17 @@ impl Checker {
             for &member in members {
                 let krate = hir::Crate::from(member);
                 if !krate.origin(db).is_local() {
+                    continue;
+                }
+                // Metadata includes dev targets even when the build loads none of their
+                // dev-dependencies. A plain check leaves them alone, as cargo does. Use
+                // the crate's kind: a test and a binary can share the same root file.
+                if !selection.dev_deps
+                    && matches!(
+                        krate.target_kind(db),
+                        TargetKind::Example | TargetKind::Test | TargetKind::Bench
+                    )
+                {
                     continue;
                 }
                 let root_file = krate.root_file(db);

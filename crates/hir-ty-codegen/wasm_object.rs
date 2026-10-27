@@ -49,6 +49,8 @@ const BINDING_WEAK: u32 = 1;
 const BINDING_LOCAL: u32 = 2;
 const VISIBILITY_HIDDEN: u32 = 4;
 const UNDEFINED: u32 = 0x10;
+/// The symbol's name is not the name it is imported as.
+const EXPLICIT_NAME: u32 = 0x40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -105,11 +107,31 @@ struct Writer {
     segment_count: u32,
 }
 
+const IMPORT: &str = "ra-jit.import.";
+
+/// The symbol of the function `field` that the module imports from `module`
+/// (`wasm_import_module`), rather than from an `env` that some other object defines: the
+/// module and the field are read back from it ([`import_of`]), so what is reused from the store
+/// refers to the import as what is compiled anew does. Named for its module too, as rustc
+/// mangles the name of one: two modules may have imports of the same name.
+pub(super) fn import_symbol(module: &str, field: &str) -> String {
+    format!("{IMPORT}{}.{module}{field}", module.len())
+}
+
+fn import_of(symbol: &str) -> Option<(&str, &str)> {
+    let (len, rest) = symbol.strip_prefix(IMPORT)?.split_once('.')?;
+    let len = len.parse().ok()?;
+    Some((rest.get(..len)?, rest.get(len..)?))
+}
+
 /// Writes as a wasm object what the ELF object `elf` holds. `signatures` has the signature
-/// of every function the object names and does not define.
+/// of every function the object names and does not define. `custom` are the contents of
+/// custom sections, by name: those of one name are one section, in order, as the linker
+/// joins the ones of every object.
 pub(super) fn from_elf(
     elf: &[u8],
     signatures: &FxHashMap<String, WasmSignature>,
+    custom: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
     let file = object::File::parse(elf).map_err(|e| format!("wasm object: {e}"))?;
     let mut writer = Writer::default();
@@ -173,10 +195,16 @@ pub(super) fn from_elf(
             (_, None) => match signatures.get(name) {
                 Some(signature) => {
                     let ty = writer.ty(signature);
-                    imports.import(ENV, name, EntityType::Function(ty));
+                    let explicit = import_of(name);
+                    let (module, field) = explicit.unwrap_or((ENV, name));
+                    imports.import(module, field, EntityType::Function(ty));
                     let flags = flags(&symbol) | UNDEFINED;
+                    let flags = if explicit.is_some() { flags | EXPLICIT_NAME } else { flags };
                     let index = writer.symbol(SymbolType::Function, flags, |entry| {
                         imported.encode(entry);
+                        if explicit.is_some() {
+                            name.encode(entry);
+                        }
                     });
                     imported += 1;
                     symbol_of.insert(symbol.index(), (index, true));
@@ -262,11 +290,11 @@ pub(super) fn from_elf(
         let section_index = symbol.section_index().expect("a defined symbol");
         let (section, data) = section_data(section_index)?;
         let size = symbol.size() as usize;
-        let zeroed = matches!(
+        let uninitialized = matches!(
             section.kind(),
             SectionKind::UninitializedData | SectionKind::UninitializedTls
         );
-        let bytes = if zeroed {
+        let bytes = if uninitialized {
             std::borrow::Cow::Owned(vec![0; size])
         } else {
             let start = (symbol.address() - section.address()) as usize;
@@ -275,12 +303,19 @@ pub(super) fn from_elf(
                 .ok_or_else(|| format!("wasm object: `{name}` out of range"))?;
             std::borrow::Cow::Borrowed(bytes)
         };
-        // The symbol is where its own alignment and its section's allow, and no type is
-        // aligned to more than a power of two its size is a multiple of.
-        let align = [symbol.address(), size as u64]
-            .into_iter()
-            .filter(|&it| it != 0)
-            .fold(section.align().max(1), |align, it| align.min(1 << it.trailing_zeros()));
+        // Writable data that is all zeros, with no address written into it, is `.bss` as LLVM
+        // makes it: the linker leaves such segments out of the module, memory being zeros.
+        let zeroed = uninitialized
+            || section.kind() == SectionKind::Data
+                && section.relocations().next().is_none()
+                && bytes.iter().all(|&b| b == 0);
+        // Each piece of data is in a section of its own (`per_data_object_section`), which is
+        // aligned as the code generator asked. Its size says nothing: four bytes of a field of
+        // a value aligned to 64 are aligned to 64.
+        if section.address() != symbol.address() || section.size() > symbol.size() {
+            return Err(format!("wasm object: `{name}` shares its section"));
+        }
+        let align = section.align().max(1);
         address = address.next_multiple_of(align as u32);
         // An active segment of memory 0, at a constant address.
         0u32.encode(&mut writer.data);
@@ -292,12 +327,16 @@ pub(super) fn from_elf(
         writer.data.extend(&*bytes);
         address += size as u32;
 
-        let prefix = match section.kind() {
-            _ if zeroed => ".bss.",
-            SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => ".rodata.",
-            _ => ".data.",
+        // The messages of the stand-ins keep their section's name, which the linker merges
+        // them by into one segment of its own that the module names.
+        let (_, stand_ins) = super::stand_in_section(::object::BinaryFormat::Wasm);
+        let segment_name = match section.kind() {
+            _ if section.name() == Ok(stand_ins) => stand_ins.to_owned(),
+            _ if zeroed => format!(".bss.{name}"),
+            SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => format!(".rodata.{name}"),
+            _ => format!(".data.{name}"),
         };
-        format!("{prefix}{name}").encode(&mut writer.segments);
+        segment_name.encode(&mut writer.segments);
         align.trailing_zeros().encode(&mut writer.segments);
         0u32.encode(&mut writer.segments);
         let segment = writer.segment_count;
@@ -378,7 +417,63 @@ pub(super) fn from_elf(
         }
     }
 
-    Ok(writer.finish(imports, function_types))
+    let mut sections: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (name, bytes) in custom {
+        if matches!(name.as_str(), "linking" | "name") || name.starts_with("reloc.") {
+            return Err(format!("wasm object: a custom section may not be named `{name}`"));
+        }
+        match sections.iter_mut().find(|(it, _)| it == name) {
+            Some((_, contents)) => contents.extend(bytes),
+            None => sections.push((name, bytes.clone())),
+        }
+    }
+    Ok(writer.finish(imports, function_types, &sections))
+}
+
+/// The `target_features` section of an object compiled with `enabled` (the `target_feature`
+/// values of its crates), which says what its code may use as LLVM's does: the linker joins
+/// those of every object, and wasm-bindgen reads `reference-types` off the program's.
+pub(super) fn target_features(enabled: impl IntoIterator<Item = String>) -> (String, Vec<u8>) {
+    /// The features LLVM's wasm target knows, of the names rustc gives them too.
+    const KNOWN: &[&str] = &[
+        "atomics",
+        "bulk-memory",
+        "bulk-memory-opt",
+        "call-indirect-overlong",
+        "exception-handling",
+        "extended-const",
+        "fp16",
+        "gc",
+        "multimemory",
+        "multivalue",
+        "mutable-globals",
+        "nontrapping-fptoint",
+        "reference-types",
+        "relaxed-simd",
+        "sign-ext",
+        "simd128",
+        "tail-call",
+        "wide-arithmetic",
+    ];
+    let mut features = std::collections::BTreeSet::new();
+    for feature in enabled {
+        let implied = match feature.as_str() {
+            "bulk-memory" => Some("bulk-memory-opt"),
+            "reference-types" => Some("call-indirect-overlong"),
+            "relaxed-simd" => Some("simd128"),
+            _ => None,
+        };
+        features.extend(implied.map(str::to_owned));
+        features.insert(feature);
+    }
+    features.retain(|it| KNOWN.contains(&it.as_str()));
+    let mut contents = Vec::new();
+    (features.len() as u32).encode(&mut contents);
+    for feature in &features {
+        contents.push(b'+');
+        feature.as_str().encode(&mut contents);
+    }
+    ("target_features".to_owned(), contents)
 }
 
 impl Writer {
@@ -401,7 +496,12 @@ impl Writer {
         self.symbol_count - 1
     }
 
-    fn finish(mut self, imports: ImportSection, functions: FunctionSection) -> Vec<u8> {
+    fn finish(
+        mut self,
+        imports: ImportSection,
+        functions: FunctionSection,
+        custom: &[(&str, Vec<u8>)],
+    ) -> Vec<u8> {
         let mut types = TypeSection::new();
         for signature in &self.types {
             let values = |types: &[super::wasm::WasmType]| {
@@ -449,13 +549,24 @@ impl Writer {
         module.section(&functions);
         module.section(&RawSection { id: SectionId::Code as u8, data: &self.code });
         module.section(&RawSection { id: SectionId::Data as u8, data: &self.data });
-        let custom = |name: &'static str, data: &[u8]| CustomSection {
-            name: name.into(),
-            data: data.to_vec().into(),
-        };
-        module.section(&custom("linking", &linking));
-        module.section(&custom("reloc.CODE", &code_relocs));
-        module.section(&custom("reloc.DATA", &data_relocs));
+        fn section<'a>(name: &'a str, data: &'a [u8]) -> CustomSection<'a> {
+            CustomSection { name: name.into(), data: data.into() }
+        }
+        // After the data section: the reloc sections name the code and data sections by
+        // their place in the module. The ones the tool conventions order come after them, in
+        // that order, which the linker checks.
+        const LAST: [&str; 2] = ["producers", "target_features"];
+        for (name, data) in custom.iter().filter(|(name, _)| !LAST.contains(name)) {
+            module.section(&section(name, data));
+        }
+        module.section(&section("linking", &linking));
+        module.section(&section("reloc.CODE", &code_relocs));
+        module.section(&section("reloc.DATA", &data_relocs));
+        for last in LAST {
+            for (name, data) in custom.iter().filter(|(name, _)| *name == last) {
+                module.section(&section(name, data));
+            }
+        }
         module.finish()
     }
 }

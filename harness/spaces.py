@@ -107,11 +107,11 @@ def main():
     try:
         build(ws, env, "first build")
         for _ in range(240):
-            if "[ra-jit]" in build(ws, env, "wait for the daemon"):
+            if "[blaze]" in build(ws, env, "wait for the daemon"):
                 break
             time.sleep(0.5)
         else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {home}")
+            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         for what, edits, expected in STEPS:
             for path, old, new in edits:
                 text = open(os.path.join(ws, path)).read()
@@ -120,7 +120,7 @@ def main():
             said = build(ws, env, what)
             printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
             own = own_names(ws)
-            served = "[ra-jit]" in said
+            served = "[blaze]" in said
             verdict = "ok"
             if printed != expected:
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"

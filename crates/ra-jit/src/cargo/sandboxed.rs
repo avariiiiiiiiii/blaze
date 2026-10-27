@@ -5,22 +5,23 @@
 //! harness ra-jit writes marks each test's thread ([`crate::sandbox::MARK`]), so that what
 //! the sandbox records is each test's.
 //!
-//! What the sandbox refused a test that failed (a write, an address) is said after the run,
-//! with how to run the test outside: `[package.metadata.blaze.sandbox]` in its package's
-//! manifest, with `tests = false` for every test of the package or `unsandboxed-tests` for
-//! some, or `RA_JIT_SANDBOX=off` for every test of the command. Where no sandbox can be made
-//! the command stops before any test runs, and says why: a run that went on outside would
-//! break, unseen, the promise that a test can't change the machine or reach the network.
+//! Tests are hermetic: a test the sandbox denied something (a write outside its own
+//! directories, an address but loopback) fails, whatever it ended with, and the command says
+//! what was denied and how to take the test out: `[package.metadata.blaze.sandbox]` in its
+//! package's manifest, with `tests = false` for every test of the package or
+//! `unsandboxed-tests` for some, or `RA_JIT_SANDBOX=off` for every test of the command. A
+//! test taken out runs every time and is never kept in the store ([`super::results`]). Where
+//! no sandbox can be made the command stops before any test runs, and says why: a run that
+//! went on outside would break, unseen, the promise that a test can't change the machine or
+//! reach the network.
 //!
 //! Under `RA_JIT_TESTS=affected` the sandbox also records what each test that reaches the
-//! world outside its code read, and once it passes, what was at each of those paths is kept:
-//! the test runs again when its code changed or one of them did, and is skipped otherwise, as
-//! a test that reaches nothing outside is. What a thread no test marked read counts for every
-//! such test that ran. Its environment is cut down to what names the toolchain and the user
-//! ([`env`]), which is part of its identity.
+//! world outside its code read, which is part of the key its pass is kept under. What a thread
+//! no test marked read counts for every such test that ran. Its environment is cut down to
+//! what names the toolchain and the user ([`env`]), which is part of its key too.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -40,16 +41,10 @@ pub(crate) const VAR: &str = sandbox::VAR;
 /// commas.
 pub(crate) const PASS: &str = "RA_JIT_TEST_ENV";
 
-/// The file beside a program of tests with what each sandboxed test that passed read, and
-/// what was there when it passed: the test's name, the path, what [`stat`] said of it and
-/// what [`digest`] did, by tabs, one path a line; or the name, `X`, `-` and why what it read
-/// is not known.
-const INPUTS: &str = "tests-inputs";
-
 /// The variables of the environment a test keeps under `RA_JIT_TESTS=affected` besides those
 /// cargo and ra-jit set for it: what finds programs and the toolchain, who and where the user
 /// is, the locale, and what decides how a failure is shown.
-const KEPT: &[&str] = &[
+pub(crate) const KEPT: &[&str] = &[
     "PATH",
     "HOME",
     "USER",
@@ -148,6 +143,15 @@ pub(crate) struct WorkspaceOptOut {
     /// `unsandboxed-proc-macros`: the packages, by name, whose proc macros are expanded by a
     /// server outside.
     pub(crate) proc_macros: BTreeSet<String>,
+    /// `build-script-env`: variables of the environment given to every build script in the
+    /// sandbox besides those it is always given (`script_sandbox.rs`).
+    pub(crate) build_script_env: BTreeSet<String>,
+    /// `build-script-link-dirs`: directories of the system a build script in the sandbox may
+    /// name in `rustc-link-search` besides those it always may (`directives.rs`).
+    pub(crate) build_script_link_dirs: BTreeSet<String>,
+    /// `wasi-build-scripts`: the packages, by name (`"*"`, all), whose build scripts run under
+    /// WASI, an experiment (`wasi_script.rs`).
+    pub(crate) wasi_build_scripts: BTreeSet<String>,
 }
 
 impl WorkspaceOptOut {
@@ -177,18 +181,21 @@ pub(crate) fn workspace_opt_out(root: &Path) -> anyhow::Result<WorkspaceOptOut> 
         let into = match key.as_str() {
             "unsandboxed-build-scripts" => &mut out.build_scripts,
             "unsandboxed-proc-macros" => &mut out.proc_macros,
+            "build-script-env" => &mut out.build_script_env,
+            "build-script-link-dirs" => &mut out.build_script_link_dirs,
+            "wasi-build-scripts" => &mut out.wasi_build_scripts,
             other => {
                 return Err(wrong(&format!(
-                    "`{other}` is not known (`unsandboxed-build-scripts` and \
-                     `unsandboxed-proc-macros` are)"
+                    "`{other}` is not known (`unsandboxed-build-scripts`, \
+                     `unsandboxed-proc-macros`, `build-script-env`, \
+                     `build-script-link-dirs` and `wasi-build-scripts` are)"
                 )));
             }
         };
         let names = value.as_array().ok_or_else(|| wrong(&format!("`{key}` is a list")))?;
         for name in names {
-            let name = name
-                .as_str()
-                .ok_or_else(|| wrong(&format!("`{key}` lists packages by their names")))?;
+            let name =
+                name.as_str().ok_or_else(|| wrong(&format!("`{key}` lists names, as strings")))?;
             into.insert(name.to_owned());
         }
     }
@@ -269,6 +276,14 @@ fn target_of(executable: &Path) -> Option<&Path> {
     executable.ancestors().skip(1).find(|it| it.join("CACHEDIR.TAG").is_file())
 }
 
+/// Cargo's home in the environment `env`, as cargo finds it: `CARGO_HOME`, else `.cargo` in
+/// the home directory.
+fn cargo_home(env: &[(String, String)]) -> Option<PathBuf> {
+    let var = |name: &str| env.iter().find(|it| it.0 == name).map(|it| PathBuf::from(&it.1));
+    let home = var("CARGO_HOME").or_else(|| Some(var("HOME")?.join(".cargo")))?;
+    Some(std::fs::canonicalize(&home).unwrap_or(home))
+}
+
 /// Where this command keeps the specs and records of its sandboxes, removed when it is done.
 pub(crate) struct Scratch {
     dir: PathBuf,
@@ -300,6 +315,13 @@ impl Scratch {
         {
             overlays.push(target.to_owned());
         }
+        // Every cargo takes its locks in its home and records there what it used, so a test
+        // that runs cargo (trybuild's, a cargo plugin's) writes it, for itself alone.
+        if let Some(home) = cargo_home(&env).filter(|it| it.is_dir())
+            && !overlays.iter().any(|it| home.starts_with(it))
+        {
+            overlays.push(home);
+        }
         let mut not_inputs = vec![test.executable.clone()];
         not_inputs.extend(std::fs::canonicalize(&test.executable).ok());
         let spec = Spec {
@@ -311,6 +333,7 @@ impl Scratch {
             record: Some(record.clone()),
             record_reads: reads,
             not_inputs,
+            view: None,
         };
         std::fs::write(&spec_file, serde_json::to_string(&spec)?)
             .with_context(|| format!("writing {}", spec_file.display()))?;
@@ -344,49 +367,54 @@ impl Sandbox {
     }
 }
 
-/// Says, of a run in a sandbox that failed, what the sandbox refused each test of `failed`
-/// that it refused something, and how to run it outside: of the run as a whole when which
-/// tests failed is not known. `opt_out` is the test's package's.
-pub(crate) fn diagnose(lines: &[Line], failed: Option<&[String]>, shown: &str, opt_out: &OptOut) {
-    let refused = |test: Option<&str>| -> Vec<&Line> {
-        let mut them: Vec<&Line> = lines
-            .iter()
-            .filter(|it| matches!(it.reached, Reached::Write | Reached::Net))
-            .filter(|it| test.is_none_or(|test| it.test.is_empty() || it.test == test))
-            .collect();
+/// What the sandbox denied the tests of a run: each of them fails for it. A test is hermetic,
+/// its end a function of its code and what it read; one that wrote outside its own directories
+/// or reached the network may end as nothing it read says.
+pub(crate) struct Denied {
+    /// The tests denied something, by name.
+    pub(crate) tests: BTreeSet<String>,
+    /// Whether something was denied where no test was known (a thread of its own, a process a
+    /// test started): every test of the run fails.
+    pub(crate) unknown: bool,
+}
+
+/// What the sandbox denied the tests of the run of `shown` that recorded `lines`, each said
+/// with how to take the test out of the sandbox. `opt_out` is the test's package's.
+pub(crate) fn denied(lines: &[Line], shown: &str, opt_out: &OptOut) -> Denied {
+    let mut by_test: BTreeMap<&str, Vec<&Line>> = BTreeMap::new();
+    for line in lines.iter().filter(|it| matches!(it.reached, Reached::Write | Reached::Net)) {
+        by_test.entry(line.test.as_str()).or_default().push(line);
+    }
+    let manifest = opt_out.manifest.display();
+    let ways = |names: &str| {
+        format!(
+            "`unsandboxed-tests = [{names}]` under `{TABLE}` in {manifest} (`tests = false` for \
+             every test of the package), or `{VAR}=off` for every test of the command"
+        )
+    };
+    let mut denied = Denied { tests: BTreeSet::new(), unknown: false };
+    for (test, mut them) in by_test {
         them.sort_by(|a, b| (a.reached, &a.what).cmp(&(b.reached, &b.what)));
         them.dedup_by(|a, b| a.reached == b.reached && a.what == b.what);
-        them
-    };
-    let manifest = opt_out.manifest.display();
-    let off = format!("or `{VAR}=off` for every test of the command");
-    match failed {
-        Some(failed) => {
-            for name in failed {
-                let them = refused(Some(name));
-                if them.is_empty() {
-                    continue;
-                }
-                say::note(&format!(
-                    "{name} failed in the sandbox, which refused it {}; if it needs that, run \
-                     it outside: `unsandboxed-tests = [{name:?}]` under `{TABLE}` in {manifest} \
-                     (`tests = false` for every test of the package), {off}",
-                    what_was_refused(&them)
-                ));
-            }
+        let what = what_was_refused(&them);
+        if test.is_empty() {
+            denied.unknown = true;
+            say::error(&format!(
+                "the tests of {shown} fail: the sandbox denied {what} to a thread no test marked \
+                 or a process a test started; tests are hermetic, so if they need that, take them \
+                 out of the sandbox, where they run every time and are never cached: {}",
+                ways("...")
+            ));
+            continue;
         }
-        None => {
-            let them = refused(None);
-            if !them.is_empty() {
-                say::note(&format!(
-                    "{shown} failed in the sandbox, which refused its tests {}; if they need \
-                     that, run them outside: `unsandboxed-tests = [...]` or `tests = false` \
-                     under `{TABLE}` in {manifest}, {off}",
-                    what_was_refused(&them)
-                ));
-            }
-        }
+        denied.tests.insert(test.to_owned());
+        say::error(&format!(
+            "{test} fails: the sandbox denied it {what}; tests are hermetic, so if it needs \
+             that, take it out of the sandbox, where it runs every time and is never cached: {}",
+            ways(&format!("{test:?}"))
+        ));
     }
+    denied
 }
 
 /// `writing `a` and `b` (the machine is read-only in a sandbox) and connecting to `c` (...)`.
@@ -415,136 +443,6 @@ pub(crate) fn what_was_refused(them: &[&Line]) -> String {
         ));
     }
     parts.join(" and ")
-}
-
-/// What is kept of the sandboxed tests of a program of tests that reach the world outside
-/// their code: what each that passed read.
-pub(crate) struct Kept {
-    file: PathBuf,
-    /// Each test's paths, with what [`stat`] and [`digest`] said of each when it passed; or
-    /// why what it read is not known.
-    tests: BTreeMap<String, Result<Vec<(String, String, String)>, String>>,
-    /// The tests run in the sandbox by this command whose reads are kept.
-    pub(crate) ran: BTreeSet<String>,
-    seen: HashMap<String, (String, String)>,
-}
-
-impl Kept {
-    pub(crate) fn read(dir: &Path) -> Kept {
-        let file = dir.join(INPUTS);
-        let mut tests: BTreeMap<String, Result<Vec<_>, String>> = BTreeMap::new();
-        for line in std::fs::read_to_string(&file).unwrap_or_default().lines() {
-            let mut parts = line.splitn(4, '\t');
-            let (Some(name), Some(stat), Some(digest), Some(path)) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let paths = tests.entry(name.to_owned()).or_insert_with(|| Ok(Vec::new()));
-            match (stat, paths) {
-                ("X", paths) => *paths = Err(path.to_owned()),
-                (_, Ok(paths)) => paths.push((path.to_owned(), stat.to_owned(), digest.to_owned())),
-                (_, Err(_)) => {}
-            }
-        }
-        Kept { file, tests, ran: BTreeSet::new(), seen: HashMap::new() }
-    }
-
-    /// Why the test `name` runs although its code is as when it passed: the first path it
-    /// read then that is not what it was, or why what it read is not known. `None` when each
-    /// is as it was.
-    pub(crate) fn changed(&mut self, name: &str) -> Option<String> {
-        let paths = match self.tests.get(name) {
-            None => return Some("what it read is not known".to_owned()),
-            Some(Err(why)) => return Some(format!("what it read is not all known: {why}")),
-            Some(Ok(paths)) => paths,
-        };
-        for (path, stat_then, digest_then) in paths {
-            let (stat_now, digest_now) = match self.seen.get(path) {
-                Some(it) => it.clone(),
-                None => {
-                    let stat_now = stat(Path::new(path));
-                    let digest_now = match &stat_now == stat_then {
-                        true => digest_then.clone(),
-                        false => digest(Path::new(path)),
-                    };
-                    self.seen.insert(path.clone(), (stat_now.clone(), digest_now.clone()));
-                    (stat_now, digest_now)
-                }
-            };
-            if stat_now != *stat_then && digest_now != *digest_then {
-                return Some(format!("it read `{path}`, which changed"));
-            }
-        }
-        None
-    }
-
-    /// Keeps what each test of `passed` that ran in the sandbox read, by the `record` of its
-    /// run, and forgets the tests that are not in `passed`. A test the sandbox recorded
-    /// nothing for is taken out of `passed`, so that it runs again: what it read is not known.
-    pub(crate) fn settle(mut self, passed: &mut BTreeMap<String, String>, record: Option<&[Line]>) {
-        let mut known = std::mem::take(&mut self.seen);
-        for (path, stat, digest) in self.tests.values().filter_map(|it| it.as_ref().ok()).flatten()
-        {
-            known.entry(path.clone()).or_insert_with(|| (stat.clone(), digest.clone()));
-        }
-        let mut now = |path: &str| {
-            let stat_now = stat(Path::new(path));
-            if let Some((stat, digest)) = known.get(path).filter(|(stat, _)| *stat == stat_now) {
-                return (stat.clone(), digest.clone());
-            }
-            let digest_now = digest(Path::new(path));
-            known.insert(path.to_owned(), (stat_now.clone(), digest_now.clone()));
-            (stat_now, digest_now)
-        };
-        self.tests.retain(|name, _| passed.contains_key(name));
-        for name in &self.ran {
-            if !passed.contains_key(name) {
-                continue;
-            }
-            let Some(record) = record else {
-                passed.remove(name);
-                self.tests.remove(name);
-                continue;
-            };
-            let its = |it: &&Line| it.test.is_empty() || it.test == *name;
-            let incomplete = record.iter().filter(its).find(|it| it.reached == Reached::Incomplete);
-            let kept = match incomplete {
-                Some(line) => Err(line.what.clone()),
-                None => Ok(record
-                    .iter()
-                    .filter(its)
-                    .filter(|it| it.reached == Reached::Read)
-                    .map(|it| it.what.as_str())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(|path| {
-                        let (stat, digest) = now(path);
-                        (path.to_owned(), stat, digest)
-                    })
-                    .collect()),
-            };
-            self.tests.insert(name.clone(), kept);
-        }
-        let mut text = String::new();
-        for (name, paths) in &self.tests {
-            match paths {
-                Ok(paths) => {
-                    for (path, stat, digest) in paths {
-                        text.push_str(&format!("{name}\t{stat}\t{digest}\t{path}\n"));
-                    }
-                }
-                Err(why) => text.push_str(&format!("{name}\tX\t-\t{why}\n")),
-            }
-        }
-        let writing = self.file.with_extension("writing");
-        if std::fs::write(&writing, text)
-            .and_then(|()| std::fs::rename(&writing, &self.file))
-            .is_err()
-        {
-            _ = std::fs::remove_file(&self.file);
-        }
-    }
 }
 
 /// What is quick to tell of what is at `path`: whether it is there, its size and its last

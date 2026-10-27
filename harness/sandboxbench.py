@@ -199,7 +199,7 @@ async def main():
         deadline = time.monotonic() + 600
         while True:
             _, said = await run(test, cwd=pkg, env=env)
-            if "[ra-jit]" in said:
+            if "[blaze]" in said:
                 break
             if time.monotonic() > deadline:
                 raise Failed(f"the daemon did not serve the build in 600 s:\n{said[-2000:]}")

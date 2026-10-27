@@ -106,6 +106,13 @@ pub(crate) struct Plan {
     /// `binary` linked by blaze, with nothing of rustc's (docs/no-rustc.md, step K).
     #[serde(default)]
     pub(crate) whole: bool,
+    /// Whether `binary` is a shared library, a `cdylib`, which exports the functions and
+    /// statics its crate names with `#[no_mangle]` or `#[export_name]` (#262). It is built
+    /// again on what the worker has loaded and linked again each time, not patched: a patch
+    /// spliced into it would not export a function an edit adds or the new value of an
+    /// exported static, and the splice reads no Mach-O library.
+    #[serde(default)]
+    pub(crate) shared: bool,
 }
 
 /// The library of the workspace among `records` that wrote the file a link line names. The
@@ -155,6 +162,7 @@ impl Plan {
                 .flatten(),
             stamp: unit.stamp,
             whole: false,
+            shared: false,
         };
         // rustc's object of the names the program keeps is moved to its copy, which stays when
         // the target directory is cleaned. GNU ld takes the panic runtime by it.
@@ -233,8 +241,10 @@ fn calls_by_symbol(unit: &Record) -> bool {
 
 /// The file in a program's directory that says it is a program of tests, which the daemon
 /// starts in ra-jit's test harness. It holds why the daemon builds it only with that harness,
-/// when it does: [`harness_alone`].
-pub(crate) const TESTS: &str = "tests";
+/// when it does: [`harness_alone`]. A program's own file is never named so, as rustc takes no
+/// `.` in a crate's name: a whole build links a program of tests in the same directory, and
+/// one of an integration test `tests/tests.rs` is named `tests`.
+pub(crate) const TESTS: &str = "tests.harness";
 
 /// The file in a program of tests' directory that says `cargo ra-jit test` runs only the
 /// tests an edit reaches, for the daemon to write [`REACH`] at each build of it.
@@ -679,7 +689,7 @@ pub(crate) fn write_headerpad(binary: &Path, pad: u64) -> std::io::Result<()> {
 }
 
 /// The room an argument of the driver asks Apple's linker for, which reads it in hexadecimal.
-fn headerpad_in(arg: &str) -> Option<u64> {
+pub(crate) fn headerpad_in(arg: &str) -> Option<u64> {
     let digits = arg.strip_prefix(HEADERPAD_FLAG)?;
     let digits = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits);
     u64::from_str_radix(digits, 16).ok()
@@ -943,6 +953,7 @@ mod tests {
             stamp: 0,
             package: None,
             whole: false,
+            shared: false,
         };
         let response = dir.join("link.args");
         let link = LinkLine::parse(LINE).unwrap().present();
@@ -1014,6 +1025,7 @@ mod tests {
             package: None,
             stamp: 0,
             whole: false,
+            shared: false,
         };
         let response = dir.join("link.args");
         let command = LinkLine::parse(LINE)

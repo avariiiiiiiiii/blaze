@@ -134,11 +134,11 @@ def main():
     try:
         build(ws, env, "first build")
         for _ in range(240):
-            if "[ra-jit]" in build(ws, env, "wait for the daemon"):
+            if "[blaze]" in build(ws, env, "wait for the daemon"):
                 break
             time.sleep(0.5)
         else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {home}")
+            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         for what, (old, new), expected in STEPS:
             text = open(source).read()
             assert old in text, (what, old)
@@ -148,7 +148,7 @@ def main():
             verdict = "ok"
             if printed != expected:
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"
-            elif "[ra-jit]" not in said:
+            elif "[blaze]" not in said:
                 why = [line for line in said.splitlines() if "ra-jit" in line]
                 verdict = "NOT SERVED BY THE DAEMON: " + " | ".join(why)[-600:]
             wrong += verdict != "ok"

@@ -163,14 +163,14 @@ fn own_rustc(args: &[&str]) -> anyhow::Result<Option<String>> {
 }
 
 /// The host's triple, as blaze answers `rustc -vV` itself.
-pub(super) fn host_triple() -> anyhow::Result<String> {
+pub(in crate::cargo) fn host_triple() -> anyhow::Result<String> {
     let told = own_rustc(&["-vV"])?.context("blaze does not know the host's triple")?;
     let host = told.lines().find_map(|it| it.strip_prefix("host: "));
     Ok(host.context("rustc names no host")?.to_owned())
 }
 
 /// The `cfg` of `triple`, as blaze answers `rustc --print cfg --target <triple>` itself.
-pub(super) fn target_cfg(triple: &str) -> anyhow::Result<Vec<cargo_platform::Cfg>> {
+pub(in crate::cargo) fn target_cfg(triple: &str) -> anyhow::Result<Vec<cargo_platform::Cfg>> {
     let Some(printed) = own_rustc(&["--print", "cfg", "--target", triple])? else {
         anyhow::bail!("blaze does not know the target `{triple}`");
     };

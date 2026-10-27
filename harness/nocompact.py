@@ -84,9 +84,11 @@ def links(home):
 
 def address_of(program, name):
     """Where the code of the function `name` is, as the executable was linked: ra-jit's symbol
-    of it (rustc's is a jump there)."""
+    of it (rustc's is a jump there). The daemon's own link names it `ra-jit.<crate id>.<path>`,
+    and a splice moves that symbol to the new code."""
     listed = subprocess.run(["nm", program], capture_output=True, text=True).stdout
-    found = re.findall(rf"^([0-9a-f]+) [ts] _ra-jit::{name}::\d+$", listed, re.M)
+    own = rf"_ra-jit(?:::{name}::\d+|\.[0-9a-f]+\.\S*::{name})"
+    found = re.findall(rf"^([0-9a-f]+) [tTsS] {own}$", listed, re.M)
     return "0x" + found[0] if found else None
 
 
@@ -115,7 +117,7 @@ def edit(ws, env, home, program, step, want):
         verdict = "NO SYMBOL OF `answer`"
     elif ran.returncode != 0 or ran.stdout.strip() != f"{want} framed":
         verdict = f"PRINTED {ran.stdout.strip()!r} (exit {ran.returncode}), NOT {want} framed"
-    elif "[ra-jit]" not in said:
+    elif "[blaze]" not in said:
         verdict = "NOT SERVED BY THE DAEMON"
     elif not how.startswith("spliced"):
         verdict = "NOT SPLICED"
@@ -143,11 +145,11 @@ def main():
     try:
         build(ws, env, "first build")
         for _ in range(240):
-            if "[ra-jit]" in build(ws, env, "wait for the daemon"):
+            if "[blaze]" in build(ws, env, "wait for the daemon"):
                 break
             time.sleep(0.5)
         else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {home}")
+            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         found = sections(program)
         verdict = "ok" if found == {"__eh_frame"} else f"SECTIONS {sorted(found)}"
         print(f"{'the link':30} {verdict:12} {'__eh_frame and no __unwind_info'}")

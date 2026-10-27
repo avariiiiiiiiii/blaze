@@ -25,6 +25,14 @@
 //! `build-script = false` under [`sandboxed::TABLE`] of a package inside the workspace, and
 //! `RA_JIT_SANDBOX=off`.
 //!
+//! A sandboxed run is given only the part of cargo's environment that is the build's
+//! ([`given`]): cargo's own variables for scripts, the toolchain's and ra-jit's, the C
+//! compiler's and pkg-config's, what tests are given, and what the workspace's root manifest
+//! names in `build-script-env`, and the variables cargo has that the script says it reads
+//! (`rerun-if-env-changed`), as cargo gives them: a run that said it reads one it was not
+//! given ([`not_given`]) saw it unset, and runs again given it ([`Script::declared`]). What
+//! it is given is all of what the store keeps its run under (`script.rs`).
+//!
 //! What a sandboxed run read is recorded ([`Spec::record_reads`]), and kept beside `OUT_DIR`
 //! ([`READS`]) and with the run in the store (`script.rs`'s `Kept`). The rule that uses it,
 //! conservative on purpose: cargo runs a script again when a file it named in
@@ -67,6 +75,9 @@ pub(crate) struct Script<'a> {
     pub(crate) out_dir: &'a Path,
     /// A directory of the caller's for the sandbox's spec and record: written here, outside.
     pub(crate) scratch: &'a Path,
+    /// The variables of `env` a run of it said it reads (`rerun-if-env-changed`), given to it
+    /// in the sandbox whatever [`given`] says.
+    pub(crate) declared: &'a [String],
 }
 
 impl Script<'_> {
@@ -87,12 +98,16 @@ pub(crate) struct Ran {
 }
 
 /// Where a script runs.
+#[derive(Clone)]
 pub(crate) enum Plan {
     /// Outside, why, and the environment it runs with ([`with_own_rustc`]).
     Outside(String, Vec<(String, String)>),
     Sandboxed {
         spec: Spec,
         root_manifest: Option<PathBuf>,
+        /// The system directories its `rustc-link-search` may name besides those it always may
+        /// (`directives.rs`): `build-script-link-dirs` of the root manifest.
+        link_dirs: Vec<PathBuf>,
     },
 }
 
@@ -174,7 +189,7 @@ fn workspace_of(script: &Script<'_>) -> anyhow::Result<Option<PathBuf>> {
 }
 
 /// The target directory `out_dir` is in: what is above its `build` directory's profile.
-fn target_of(out_dir: &Path) -> Option<&Path> {
+pub(crate) fn target_of(out_dir: &Path) -> Option<&Path> {
     let build = out_dir.ancestors().find(|it| it.file_name().is_some_and(|it| it == "build"))?;
     build.parent()?.parent()
 }
@@ -197,8 +212,12 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         );
     }
     let root = workspace_of(script)?;
+    let mut also = std::collections::BTreeSet::new();
+    let mut link_dirs = Vec::new();
     if let Some(root) = &root {
         let out = sandboxed::workspace_opt_out(root)?;
+        also = out.build_script_env;
+        link_dirs = out.build_script_link_dirs.iter().map(PathBuf::from).collect();
         if out.build_scripts.contains(package) {
             let why = format!("`{package}` is in `unsandboxed-build-scripts`");
             return Ok(Plan::Outside(format!("{why} in {}", out.manifest.display()), env));
@@ -234,6 +253,9 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     readable.extend(programs.chain(path).filter(|it| {
         it.is_dir() && emptied(it) && std::fs::canonicalize(it).is_ok_and(|real| emptied(&real))
     }));
+    // What it would download, handed to it locked, as `cargo/fetches.rs` says.
+    let handed = super::fetches::hand(&env, script.out_dir, root.as_deref(), &also)?;
+    readable.extend(handed.readable);
     readable.sort();
     readable.dedup();
     // The innermost is enough: a directory is seen with what is below it.
@@ -241,6 +263,12 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     readable.retain(|it| !all.iter().any(|other| other != it && it.starts_with(other)));
     let mut not_inputs = vec![script.real.to_owned()];
     not_inputs.extend(std::fs::canonicalize(script.real).ok());
+    let declared = |name: &String| script.declared.contains(name);
+    let mut env: Vec<(String, String)> = env
+        .into_iter()
+        .filter(|(name, _)| given(name) || also.contains(name) || declared(name))
+        .collect();
+    env.extend(handed.env);
     let spec = Spec {
         cwd: script.cwd.to_owned(),
         env,
@@ -250,8 +278,142 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         record: Some(script.scratch.join("ra-jit-record")),
         record_reads: true,
         not_inputs,
+        view: None,
     };
-    Ok(Plan::Sandboxed { spec, root_manifest: root.map(|it| it.join("Cargo.toml")) })
+    Ok(Plan::Sandboxed { spec, root_manifest: root.map(|it| it.join("Cargo.toml")), link_dirs })
+}
+
+/// `plan`, a script's, for a program the script runs under WASI (`wasi_script.rs`): the same
+/// sandbox, with `env`, in `cwd`, its spec and record in `scratch`.
+#[cfg_attr(not(feature = "wasi"), allow(dead_code))]
+pub(crate) fn for_tool(
+    plan: &Plan,
+    env: Vec<(String, String)>,
+    cwd: &Path,
+    scratch: &Path,
+) -> Plan {
+    match plan {
+        Plan::Outside(why, _) => Plan::Outside(why.clone(), env),
+        Plan::Sandboxed { spec, root_manifest, link_dirs } => Plan::Sandboxed {
+            spec: Spec {
+                cwd: cwd.to_owned(),
+                env,
+                record: Some(scratch.join("ra-jit-record")),
+                ..spec.clone()
+            },
+            root_manifest: root_manifest.clone(),
+            link_dirs: link_dirs.clone(),
+        },
+    }
+}
+
+/// Whether the variable `name` of cargo's environment is given to a build script in the
+/// sandbox: cargo's own for scripts (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, the profile's),
+/// the toolchain's and ra-jit's (ra-jit is the `RUSTC` a script runs), the C compiler's, its
+/// tools' and their flags, by any target (`CC`, `CC_<target>`, `TARGET_CC`), pkg-config's and
+/// CMake's, the SDKs' of Apple's platforms, Nix's compiler wrappers', the jobserver, and what
+/// a test is given ([`sandboxed::KEPT`]).
+pub(crate) fn given(name: &str) -> bool {
+    const PREFIXES: [&str; 11] = [
+        "CARGO_",
+        "DEP_",
+        "RA_JIT_",
+        "BLAZE_",
+        "NIX_",
+        "PKG_CONFIG",
+        "CMAKE",
+        "HOST_",
+        "TARGET_",
+        "CXXSTDLIB",
+        "LC_",
+    ];
+    const NAMES: [&str; 29] = [
+        "OUT_DIR",
+        "TARGET",
+        "HOST",
+        "NUM_JOBS",
+        "OPT_LEVEL",
+        "DEBUG",
+        "PROFILE",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_LINKER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "MAKEFLAGS",
+        "MFLAGS",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "CRATE_CC_NO_DEFAULTS",
+        "RUSTC_BOOTSTRAP",
+        "SOURCE_DATE_EPOCH",
+        "SYSROOT",
+        "CPATH",
+        "C_INCLUDE_PATH",
+        "CPLUS_INCLUDE_PATH",
+        "OBJC_INCLUDE_PATH",
+        "OBJCPLUS_INCLUDE_PATH",
+        "LIBRARY_PATH",
+        "COMPILER_PATH",
+        "GCC_EXEC_PREFIX",
+    ];
+    const TOOLS: [&str; 20] = [
+        "CC",
+        "CXX",
+        "CPP",
+        "AR",
+        "AS",
+        "LD",
+        "RANLIB",
+        "NM",
+        "OBJCOPY",
+        "OBJDUMP",
+        "STRIP",
+        "READELF",
+        "WINDRES",
+        "CFLAGS",
+        "CXXFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "ARFLAGS",
+        "ASFLAGS",
+        "RANLIBFLAGS",
+    ];
+    let tool = |it: &&str| {
+        name.strip_prefix(*it).is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+    };
+    // Where cargo and Nix's shell keep what is theirs for this one run: no script's input.
+    const APART: [&str; 3] = ["CARGO_RESOLVER_LOCKFILE_PATH", "NIX_BUILD_TOP", "NIX_BUILD_CORES"];
+    if APART.contains(&name) {
+        return false;
+    }
+    sandboxed::KEPT.contains(&name)
+        || NAMES.contains(&name)
+        || PREFIXES.iter().any(|it| name.starts_with(it))
+        || TOOLS.iter().any(tool)
+        || name.ends_with("_DEPLOYMENT_TARGET")
+        || name == crate::as_rustc::TOOLCHAIN
+}
+
+/// The variables a run that printed `stdout` said it reads (`rerun-if-env-changed`) which
+/// cargo had in `env` but the run in the sandbox was not given (`plan`): it saw them unset,
+/// and a run given them ([`Script::declared`]) is the one that stands for cargo's.
+pub(crate) fn not_given(stdout: &[u8], env: &[(String, String)], plan: &Plan) -> Vec<String> {
+    let Plan::Sandboxed { spec, .. } = plan else { return Vec::new() };
+    let had = |name: &str, env: &[(String, String)]| env.iter().any(|it| it.0 == name);
+    let mut names: Vec<String> = String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.strip_prefix("cargo:")?;
+            let line = line.strip_prefix(':').unwrap_or(line);
+            line.strip_prefix("rerun-if-env-changed=").map(str::to_owned)
+        })
+        .filter(|name| had(name, env) && !had(name, &spec.env))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Whether `dir` is below a directory a sandbox starts empty: what is there is not seen unless
@@ -294,7 +456,7 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
     let (spec, root_manifest) = match plan {
         Plan::Outside(why, env) => {
             if std::env::var_os("RA_JIT_STATS").is_some() {
-                eprintln!("ra-jit: the build script of `{}` runs outside: {why}", script.package());
+                eprintln!("blaze: the build script of `{}` runs outside: {why}", script.package());
             }
             let mut command = Command::new(script.real);
             command.args(script.args).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
@@ -302,7 +464,7 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
             let output = command.output().with_context(|| running(script))?;
             return Ok(Ran { output, reads: None });
         }
-        Plan::Sandboxed { spec, root_manifest } => (spec, root_manifest),
+        Plan::Sandboxed { spec, root_manifest, .. } => (spec, root_manifest),
     };
     std::fs::create_dir_all(script.scratch)
         .with_context(|| format!("making {}", script.scratch.display()))?;
@@ -335,6 +497,11 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
         && let Some(note) = refused_note(lines, package, root_manifest.as_deref())
     {
         output.stderr.extend(format!("note: {note}\n").into_bytes());
+        let fetches =
+            super::fetches::no_override_note(package, lines, &output.stdout, &output.stderr);
+        if let Some(note) = fetches {
+            output.stderr.extend(format!("note: {note}\n").into_bytes());
+        }
     }
     let reads = lines.filter(|it| it.iter().all(|it| it.reached != Reached::Incomplete));
     let reads = reads.map(|lines| inputs(&lines, script, spec));
@@ -391,7 +558,8 @@ fn inputs(lines: &[Line], script: &Script<'_>, spec: &Spec) -> Vec<String> {
     };
     let mut paths: Vec<String> = lines
         .iter()
-        .filter(|it| it.reached == Reached::Read && input(Path::new(&it.what)))
+        .filter(|it| matches!(it.reached, Reached::Read | Reached::Looked))
+        .filter(|it| input(Path::new(&it.what)))
         .map(|it| it.what.clone())
         .collect();
     paths.sort();
@@ -516,6 +684,7 @@ mod tests {
             env: &[],
             out_dir,
             scratch: Path::new("/dev/shm/ws/target/debug/build/pkg-1"),
+            declared: &[],
         };
         let spec = Spec {
             writable: vec![out_dir.to_owned()],
@@ -523,6 +692,59 @@ mod tests {
             ..Spec::default()
         };
         assert_eq!(inputs(&lines, &script, &spec), ["/dev/shm/ws/pkg/VERSION", "/usr/lib/libc.so"]);
+    }
+
+    #[test]
+    fn a_sandboxed_script_is_given_what_cargo_and_a_c_compiler_read() {
+        for name in ["OUT_DIR", "CARGO_CFG_UNIX", "DEP_Z_INCLUDE", "CC", "CFLAGS_aarch64_linux"] {
+            assert!(given(name), "{name}");
+        }
+        for name in ["PATH", "PKG_CONFIG_PATH", "SOURCE_DATE_EPOCH", "MACOSX_DEPLOYMENT_TARGET"] {
+            assert!(given(name), "{name}");
+        }
+        for name in ["OPENSSL_DIR", "CCACHE", "RUSTC_WRAPPER", "NIX_BUILD_TOP", "SSH_AUTH_SOCK"] {
+            assert!(!given(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_script_that_says_it_reads_what_it_was_not_given_is_named() {
+        let pair = |name: &str| (name.to_owned(), "x".to_owned());
+        let spec = Spec { env: vec![pair("CC")], ..Spec::default() };
+        let plan = Plan::Sandboxed { spec, root_manifest: None, link_dirs: Vec::new() };
+        let outside = [pair("CC"), pair("OPENSSL_DIR")];
+        let stdout = b"cargo:rerun-if-env-changed=CC\ncargo::rerun-if-env-changed=OPENSSL_DIR\n\
+            cargo:rerun-if-env-changed=OPENSSL_DIR\ncargo:rerun-if-env-changed=UNSET\n";
+        assert_eq!(not_given(stdout, &outside, &plan), ["OPENSSL_DIR"]);
+    }
+
+    #[test]
+    fn a_declared_variable_is_given_and_nothing_else_of_the_shell() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-declared-{}", std::process::id()));
+        let out_dir = dir.join("target/debug/build/pkg-1/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let pair = |name: &str| (name.to_owned(), "x".to_owned());
+        let env = [pair("CARGO_PKG_NAME"), pair("BM_LEVEL"), pair("SECRET")];
+        let declared = ["BM_LEVEL".to_owned()];
+        let script = Script {
+            real: Path::new("/nonexistent/build_script_build"),
+            args: &[],
+            cwd: &dir,
+            env: &env,
+            out_dir: &out_dir,
+            scratch: out_dir.parent().unwrap(),
+            declared: &declared,
+        };
+        let names = |plan: &Plan| plan.env().iter().map(|it| it.0.clone()).collect::<Vec<_>>();
+        let stdout = b"cargo:rerun-if-env-changed=BM_LEVEL\n";
+        let given = plan(&script).unwrap();
+        assert!(matches!(given, Plan::Sandboxed { .. }));
+        assert_eq!(names(&given), ["CARGO_PKG_NAME", "BM_LEVEL"]);
+        assert!(not_given(stdout, &env, &given).is_empty());
+        let unset = plan(&Script { declared: &[], ..script }).unwrap();
+        assert_eq!(names(&unset), ["CARGO_PKG_NAME"]);
+        assert_eq!(not_given(stdout, &env, &unset), ["BM_LEVEL"]);
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

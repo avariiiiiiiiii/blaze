@@ -155,7 +155,12 @@ impl Record {
     /// the unit was one it was seeded with (`seed_own_target`), which cargo built.
     pub(crate) fn described_or_seeded(out_dir: &Path, id: &str) -> Option<(Record, PathBuf)> {
         let parts: Vec<_> = out_dir.components().collect();
-        let cargos = parts.iter().rposition(|it| it.as_os_str() == "rust-analyzer").map(|at| {
+        let own = |it: &std::path::Component<'_>| {
+            [super::own_macro::OWN_DIR, super::own_macro::BY_RUSTC_DIR]
+                .iter()
+                .any(|dir| it.as_os_str() == *dir)
+        };
+        let cargos = parts.iter().rposition(own).map(|at| {
             let parts = parts.iter().enumerate().filter(|(it, _)| *it != at);
             parts.map(|(_, it)| it).collect::<PathBuf>()
         });

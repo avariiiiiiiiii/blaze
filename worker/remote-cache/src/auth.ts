@@ -1,6 +1,6 @@
 // Tokens and tenants live in KV (API-v0.md, "Auth"):
 //   token:<sha256(token) hex> -> {"tenant": "<name>", "scope": "read"|"write", "expires": <unix s>|null}
-//   tenant:<name>             -> {"id": "<opaque>", "public": bool}
+//   tenant:<name>             -> {"id": "<opaque>", "public": bool, "root"?: {"name": "<key name>", "key": "<Ed25519 public key, hex>"}}
 
 export interface TokenRecord {
   tenant: string;
@@ -11,6 +11,8 @@ export interface TokenRecord {
 export interface TenantRecord {
   id: string;
   public: boolean;
+  /** The tenant's root key, which signs its key list (API.md, "Index"). Registered by hand. */
+  root?: { name: string; key: string };
 }
 
 export type Caller =

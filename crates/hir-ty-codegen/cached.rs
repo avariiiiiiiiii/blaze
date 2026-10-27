@@ -82,8 +82,8 @@ pub(super) struct CachedFunc {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) enum CachedTarget {
-    /// `checked` when the symbol was one of the program's rustc build, which another
-    /// program's may lack.
+    /// `checked` when the symbol was one of the program's rustc build or of an object ra-jit
+    /// built before (the standard library's unit), which another program's may lack.
     Import { symbol: String, checked: bool },
     /// The entry of this name, or whatever else the build has for the instance.
     Named(String),
@@ -435,7 +435,8 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 11");
+        // 12: an import of the standard library's unit is checked (#328).
+        field(b"ra-jit entry 12");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -449,6 +450,10 @@ impl Entry {
         // Nor code that gives the frame pointer's register to values; the keys without stay.
         if super::backend::frame_pointers() {
             field(b"frame pointers");
+        }
+        // Nor code compiled where rustc's `-C link-dead-code` decides some of it.
+        if super::backend::links_dead_code() {
+            field(b"link dead code");
         }
         field(&[(debug != Told::Nothing) as u8]);
         // The keys of the other two stay what they were.

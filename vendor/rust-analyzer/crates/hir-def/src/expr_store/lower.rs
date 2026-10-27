@@ -587,11 +587,29 @@ enum TryBlock {
     Heterogeneous { label: LabelId },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatBoundCtx {
+    Product,
+    Or,
+}
+
+/// The names a pattern binds, kept like rustc's resolver keeps them: a stack of product and
+/// or-pattern contexts, each with the bindings made in it.
+#[derive(Debug)]
 struct BindingList {
-    map: FxHashMap<(Name, HygieneId), BindingId>,
+    ctxs: Vec<(PatBoundCtx, FxHashMap<(Name, HygieneId), BindingId>)>,
     is_used: FxHashMap<BindingId, bool>,
     reject_new: bool,
+}
+
+impl Default for BindingList {
+    fn default() -> Self {
+        BindingList {
+            ctxs: vec![(PatBoundCtx::Product, FxHashMap::default())],
+            is_used: FxHashMap::default(),
+            reject_new: false,
+        }
+    }
 }
 
 impl BindingList {
@@ -602,15 +620,37 @@ impl BindingList {
         hygiene: HygieneId,
         mode: BindingAnnotation,
     ) -> BindingId {
-        let id = *self
-            .map
-            .entry((name, hygiene))
-            .or_insert_with_key(|(name, hygiene)| ec.alloc_binding(name.clone(), mode, *hygiene));
+        let key = (name, hygiene);
+        // `(a, a)` is an error, and the second `a` is a binding of its own.
+        let bound_in_product = self
+            .ctxs
+            .iter()
+            .any(|(ctx, map)| *ctx == PatBoundCtx::Product && map.contains_key(&key));
+        // The alternatives of `V1(a) | V2(a)` bind the same `a`.
+        let bound_in_or = self.ctxs.iter().find_map(|(ctx, map)| match ctx {
+            PatBoundCtx::Or => map.get(&key).copied(),
+            PatBoundCtx::Product => None,
+        });
+        let id = bound_in_or.unwrap_or_else(|| ec.alloc_binding(key.0.clone(), mode, key.1));
         if ec.store.bindings[id].mode != mode {
             ec.store.bindings[id].problems = Some(BindingProblems::BoundInconsistently);
         }
         self.check_is_used(ec, id);
+        if bound_in_product {
+            ec.store.bindings[id].problems = Some(BindingProblems::BoundMoreThanOnce);
+        }
+        self.ctxs.last_mut().expect("a pattern has a binding context").1.insert(key, id);
         id
+    }
+
+    fn push(&mut self, ctx: PatBoundCtx) {
+        self.ctxs.push((ctx, FxHashMap::default()));
+    }
+
+    /// Ends the innermost context, moving its bindings to the one around it.
+    fn pop(&mut self) {
+        let (_, bound) = self.ctxs.pop().expect("a pattern has a binding context");
+        self.ctxs.last_mut().expect("a pattern has a binding context").1.extend(bound);
     }
 
     fn check_is_used(&mut self, ec: &mut ExprCollector<'_>, id: BindingId) {
@@ -2083,11 +2123,10 @@ impl<'db> ExprCollector<'db> {
     fn collect_expr_path(&mut self, e: ast::PathExpr) -> Option<(Path, HygieneId)> {
         e.path().and_then(|path| {
             let path = self.lower_path(path, &mut Self::impl_trait_error_allocator)?;
-            // Need to enable `mod_path.len() < 1` for `self`. A longer plain path takes its
-            // hygiene too, for the items a `macro` names where it is defined.
+            // Need to enable `mod_path.len() < 1` for `self`. A longer path takes its hygiene
+            // too, whatever it starts with, for the items a `macro` names where it is defined.
             let may_be_variable = matches!(&path, Path::BarePath(mod_path) if mod_path.len() <= 1);
-            let plain = path.mod_path().is_some_and(|it| it.kind == PathKind::Plain);
-            let hygiene = if may_be_variable || plain {
+            let hygiene = if may_be_variable || path.mod_path().is_some() {
                 self.hygiene_id_for(e.syntax().text_range())
             } else {
                 HygieneId::ROOT
@@ -2803,16 +2842,22 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
+    /// `in_expr_place` is whether rustc parses a call there in parentheses or brackets as an
+    /// expression (`parse_stmt_mac`): last in a block, or last in the expansion of a call it
+    /// parses so, with no `;` after it.
     fn collect_macro_as_stmt(
         &mut self,
         statements: &mut Vec<Statement>,
         mac: ast::MacroExpr,
+        in_expr_place: bool,
     ) -> Option<ExprId> {
         if !self.check_cfg(&ast::Expr::MacroExpr(mac.clone())) {
             return None;
         }
 
         let mac_call = mac.macro_call()?;
+        let as_expr =
+            in_expr_place && mac_call.token_tree().is_some_and(|it| it.l_curly_token().is_none());
         let syntax_ptr = AstPtr::new(&ast::Expr::from(mac));
         let macro_ptr = AstPtr::new(&mac_call);
         let expansion = self.collect_macro_call(
@@ -2821,9 +2866,24 @@ impl<'db> ExprCollector<'db> {
             false,
             |this, expansion: Option<ast::MacroStmts>| match expansion {
                 Some(expansion) => {
+                    // rustc parses the expansion of such a call as one expression, and takes
+                    // one `;` after it (`ParserAnyMacro::make`, the lint
+                    // `semicolon_in_expressions_from_macros`): `e;` is the value `e`.
+                    if as_expr
+                        && expansion.expr().is_none()
+                        && let mut written = expansion.statements()
+                        && let (Some(ast::Stmt::ExprStmt(only)), None) =
+                            (written.next(), written.next())
+                        && only.semicolon_token().is_some()
+                        && let Some(expr) = only.expr()
+                    {
+                        return this.maybe_collect_expr(expr);
+                    }
                     expansion.statements().for_each(|stmt| this.collect_stmt(statements, stmt));
                     expansion.expr().and_then(|expr| match expr {
-                        ast::Expr::MacroExpr(mac) => this.collect_macro_as_stmt(statements, mac),
+                        ast::Expr::MacroExpr(mac) => {
+                            this.collect_macro_as_stmt(statements, mac, as_expr)
+                        }
                         expr => this.maybe_collect_expr(expr),
                     })
                 }
@@ -2867,7 +2927,7 @@ impl<'db> ExprCollector<'db> {
                 let has_semi = stmt.semicolon_token().is_some();
                 // Note that macro could be expanded to multiple statements
                 if let Some(ast::Expr::MacroExpr(mac)) = expr {
-                    if let Some(expr) = self.collect_macro_as_stmt(statements, mac) {
+                    if let Some(expr) = self.collect_macro_as_stmt(statements, mac, !has_semi) {
                         statements.push(Statement::Expr { expr, has_semi })
                     }
                 } else if let Some(expr) = expr.and_then(|expr| self.maybe_collect_expr(expr)) {
@@ -2966,7 +3026,7 @@ impl<'db> ExprCollector<'db> {
         let mut statements = Vec::new();
         block.statements().for_each(|s| self.collect_stmt(&mut statements, s));
         let tail = block.tail_expr().and_then(|e| match e {
-            ast::Expr::MacroExpr(mac) => self.collect_macro_as_stmt(&mut statements, mac),
+            ast::Expr::MacroExpr(mac) => self.collect_macro_as_stmt(&mut statements, mac, true),
             expr => self.maybe_collect_expr(expr),
         });
         let tail = tail.or_else(|| {
@@ -3142,13 +3202,18 @@ impl<'db> ExprCollector<'db> {
                 let Some(first) = it.next() else {
                     break 'b Pat::Or(Box::new([]));
                 };
+                binding_list.push(PatBoundCtx::Or);
+                binding_list.push(PatBoundCtx::Product);
                 pats.push(self.collect_pat(first, binding_list));
+                binding_list.pop();
                 binding_list.reject_new = true;
                 for rest in it {
                     for it in binding_list.is_used.values_mut() {
                         *it = false;
                     }
+                    binding_list.push(PatBoundCtx::Product);
                     pats.push(self.collect_pat(rest, binding_list));
+                    binding_list.pop();
                     for (&id, &is_used) in binding_list.is_used.iter() {
                         if !is_used {
                             self.store.bindings[id].problems =
@@ -3156,6 +3221,7 @@ impl<'db> ExprCollector<'db> {
                         }
                     }
                 }
+                binding_list.pop();
                 binding_list.reject_new = prev_reject_new;
                 let current_is_used = mem::replace(&mut binding_list.is_used, prev_is_used);
                 for (id, _) in current_is_used.into_iter() {

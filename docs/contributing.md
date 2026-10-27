@@ -150,7 +150,7 @@ it. The paths that remain may be fixed where they are wrong, and are otherwise o
    rust-analyzer changes inference, MIR lowering and layout queries, any of which can
    change generated code. The corpus with `--layouts`, `breakers.py` and
    `fuzz/fuzz.py smoke` are the ones that notice first.
-4. Land it on `main` through the merge queue ([Landing a change](#landing-a-change)). The
+4. Land it on `main` through a pull request ([Landing a change](#landing-a-change)). The
    `fork sync` workflow sends the merge to the fork.
 
 This was done once, on 2026-10-20, for upstream `0b21bd6596`. The merge was clean; the one
@@ -186,6 +186,10 @@ one file; everything else reads it or is written from it:
   bench nightly alike) and `Cargo.toml`'s `rust-version`.
 
 ### Moving to a newer nightly
+
+The daily workflow does this every day and opens the pull request
+([toolchain.md, "The daily bump"](toolchain.md#the-daily-bump)); by hand it is for fixing what
+a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly:
 
     python3 harness/toolchain_bump.py                    # the newest nightly blaze can use
     python3 harness/toolchain_bump.py --date 2026-11-02  # or a given one
@@ -298,7 +302,7 @@ main with all the others, so:
   can take another lane's changes. Commit work in progress to the lane's branch.
 - **Run harnesses with `RUST_BACKTRACE=0`**, so a test that panics prints its message and
   not a backtrace into what the harness compares.
-- **Land small and often, through the merge queue** ([below](#landing-a-change)). A lane that
+- **Land small and often, through a pull request** ([below](#landing-a-change)). A lane that
   waits hours for one large merge meets every other lane's changes at once. For anything the
   fast tier does not cover, run the release train on the branch first
   (`gh workflow run train.yaml --ref <branch>`: everything, without the release).
@@ -307,19 +311,20 @@ main with all the others, so:
 
 ## Landing a change
 
-Main moves only through the merge queue: nobody pushes to it or merges into it by hand. Once the
+Main moves only through pull requests: nobody pushes to it or merges into it by hand. Once the
 branch's work is committed and the local gate passed ([What a change needs](#what-a-change-needs)),
 run in the lane's worktree
 
     python3 .github/scripts/land.py "what the branch does"
 
-It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and asks for
-it to be queued. The pull request's own run is the merge gate, the build and the unit tests on
-Linux x86-64 (about five minutes); a failure there ends `land.py` with the check's link before
-anything is queued. The queue then merges it onto main and whatever is ahead of it, runs the
-gate on that ([harness.md](harness.md#ci)) and merges it with a merge commit, as
-`git merge --no-ff` would. `land.py` waits for that and prints the commit, or says why the pull
-request left the queue; then fix the branch and run it again. The waiting runs in a process of
+It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and turns
+on auto-merge. The pull request's own run is the merge gate, the build and the unit tests on
+Linux x86-64 (about five minutes, [harness.md](harness.md#ci)); a failure there ends `land.py`
+with the check's link. Once it passes, GitHub merges the branch with a merge commit, as
+`git merge --no-ff` would. There is no merge queue and the branch need not be up to date with
+main: two changes that each pass but break together are caught on main by the release train.
+`land.py` waits for the merge and prints the commit, or says why the pull request did not
+merge; then fix the branch and run it again. The waiting runs in a process of
 its own that outlives `land.py`, its terminal and a tool that ends its process group, writing to
 `.git/land/pr-N.log` in the main checkout; `land.py --wait` (or `--wait N`) follows it again, as
 does running `land.py` again on the branch, so nobody polls GitHub by hand. A branch that conflicts with main

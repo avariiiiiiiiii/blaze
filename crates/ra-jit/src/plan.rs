@@ -122,6 +122,8 @@ pub(crate) struct Built {
 pub(crate) struct Asked<'a> {
     /// The triple built for.
     pub(crate) triple: &'a str,
+    /// What `rustc --print cfg` says of the triple.
+    pub(crate) cfg: &'a [CfgAtom],
     /// The variables of the process that asks, where they are not those of this one.
     pub(crate) env: &'a FxHashMap<String, Option<String>>,
 }
@@ -129,7 +131,7 @@ pub(crate) struct Asked<'a> {
 /// cargo, run in `dir` with `env` for the variables of whoever asks.
 fn cargo_in(dir: &Path, env: &FxHashMap<String, Option<String>>) -> std::process::Command {
     let mut command = toolchain::command("cargo", dir, env);
-    // The unit graph and `cargo config get` are not stable yet.
+    // `cargo config get` is not stable yet.
     command.env("RUSTC_BOOTSTRAP", "1").stdin(Stdio::null());
     crate::answers::ready_cargo(&mut command);
     command
@@ -145,7 +147,10 @@ impl Asked<'_> {
 /// The settings of a profile that change what a program does.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(crate) struct Profile {
-    opt_level: String,
+    /// `dev`, `release`, `test`, `bench` or a custom profile's name.
+    #[serde(default)]
+    pub(crate) name: String,
+    pub(crate) opt_level: String,
     lto: String,
     pub(crate) debug_assertions: bool,
     pub(crate) overflow_checks: bool,
@@ -156,7 +161,7 @@ pub(crate) struct Profile {
     /// The profile's own `rustflags` (cargo's `-Z profile-rustflags`), which come after the
     /// others.
     #[serde(default)]
-    rustflags: Vec<String>,
+    pub(crate) rustflags: Vec<String>,
 }
 
 /// A `debug` setting as cargo passes it on: a level by its number or by its name.
@@ -246,6 +251,12 @@ impl PanicStrategy {
 }
 
 impl Profile {
+    /// Whether the profile asks for any debug info: what cargo tells a build script in `DEBUG`.
+    pub(crate) fn debuginfo(&self) -> bool {
+        !matches!(&self.debuginfo, DebugLevel::Number(0))
+            && !matches!(&self.debuginfo, DebugLevel::Named(it) if it == "none")
+    }
+
     /// The profile as rustc ends up with it once `flags` follow what cargo passes for it.
     fn with(&self, flags: &Flags) -> Profile {
         // cargo names a check only where it is not what rustc has for the level by itself, so
@@ -282,10 +293,10 @@ impl Profile {
                 "none" => Level::Nothing,
                 "line-directives-only" | "line-tables-only" | "limited" => Level::Lines,
                 "full" => Level::Full,
-                _ => anyhow::bail!("`debug = \"{name}\"`: ra-jit does not know the level"),
+                _ => anyhow::bail!("`debug = \"{name}\"`: blaze does not know the level"),
             },
             DebugLevel::Number(level) => {
-                anyhow::bail!("`debug = {level}`: ra-jit does not know the level")
+                anyhow::bail!("`debug = {level}`: blaze does not know the level")
             }
         };
         // Stripping the symbols is the linker's to do; of what ra-jit writes, what a debugger
@@ -294,7 +305,7 @@ impl Profile {
             Strip::Resolved(Stripped::Named(what)) => match what.as_str() {
                 "none" => false,
                 "debuginfo" | "symbols" => true,
-                _ => anyhow::bail!("`strip = \"{what}\"`: ra-jit does not know the setting"),
+                _ => anyhow::bail!("`strip = \"{what}\"`: blaze does not know the setting"),
             },
             Strip::Resolved(Stripped::None) | Strip::Deferred(_) => false,
         };
@@ -306,7 +317,7 @@ impl Profile {
             Some("unpacked") => Kept::Objects,
             Some("packed") => Kept::Package,
             Some(split) => {
-                anyhow::bail!("`split-debuginfo = \"{split}\"`: ra-jit does not know the setting")
+                anyhow::bail!("`split-debuginfo = \"{split}\"`: blaze does not know the setting")
             }
         };
         Ok(Described { level, kept, frame_pointers: false })
@@ -349,7 +360,11 @@ struct Flags {
     split_debuginfo: Option<String>,
     strip: Option<String>,
     frame_pointers: bool,
+    links_dead_code: bool,
     lints_capped: bool,
+    /// What `-C link-arg` and `-C link-args` give the linker, in order: rustc passes them
+    /// after the native libraries, and so does ra-jit's own link.
+    link_args: Vec<String>,
 }
 
 impl Flags {
@@ -368,7 +383,7 @@ impl Flags {
     fn parse<'a>(words: impl Iterator<Item = &'a str>) -> anyhow::Result<Flags> {
         let words: Vec<&str> = words.collect();
         if let Some(why) = crate::unstable::refusal(&words) {
-            anyhow::bail!("the flags for rustc have {why}; ra-jit does not build with it");
+            anyhow::bail!("the flags for rustc have {why}; blaze does not build with it");
         }
         let mut words = words.into_iter();
         let mut flags = Flags::default();
@@ -409,11 +424,14 @@ impl Flags {
                     });
                 }
                 "split-debuginfo" => flags.split_debuginfo = Some(value.to_owned()),
+                "link-arg" => flags.link_args.push(value.to_owned()),
+                "link-args" => flags.link_args.extend(value.split_whitespace().map(str::to_owned)),
                 "strip" => flags.strip = Some(value.to_owned()),
                 // `always` and `non-leaf` keep them too, `non-leaf` in more functions than asked.
                 "force-frame-pointers" => {
                     flags.frame_pointers = on.unwrap_or(matches!(value, "always" | "non-leaf"));
                 }
+                "link-dead-code" => flags.links_dead_code = on != Some(false),
                 _ => {}
             }
         }
@@ -426,39 +444,40 @@ pub(crate) struct Plan {
     packages: FxHashMap<String, Built>,
     lto: bool,
     frame_pointers: bool,
+    links_dead_code: bool,
     lints_capped: bool,
+    link_args: Vec<String>,
 }
 
 /// What a plan says of a program as a whole.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Whole {
     /// What the build has a debugger told of the code.
     pub(crate) debug: Described,
     /// Whether rustc links it from bitcode, with `lto`.
     pub(crate) lto: bool,
+    /// Whether rustc keeps every function, `#[inline(always)]` ones too, as one copy in one
+    /// codegen unit (`-C link-dead-code`), where LLVM inlines it only into that unit's code.
+    pub(crate) links_dead_code: bool,
     /// Whether `--cap-lints` or `--force-warn` is among the flags, so that a lint the source
     /// denies may not fail rustc's build.
     pub(crate) lints_capped: bool,
+    /// What the flags give the linker (`-C link-arg`, `-C link-args`), which the daemon's own
+    /// link passes as rustc's does.
+    pub(crate) link_args: Vec<String>,
 }
 
 impl Plan {
-    /// Asks cargo for the units of the build `selection` names of the package of `manifest`.
+    /// The units of the build `selection` names of the package of `manifest`.
     pub(crate) fn of(
         manifest: &Path,
         selection: &Selection,
         asked: &Asked<'_>,
     ) -> anyhow::Result<Plan> {
-        // The unit graph is the only place cargo says which features and which profile each
-        // package of one build has.
-        let (dir, manifest) = match &selection.asked_in {
-            Some(asked_in) if asked_in.is_dir() => (asked_in.as_path(), None),
-            Some(asked_in) => {
-                (asked_in.parent().unwrap_or(Path::new(".")), Some(asked_in.as_path()))
-            }
-            None => (manifest.parent().unwrap_or(Path::new(".")), Some(manifest)),
-        };
-        let graph = UnitGraph::of(dir, manifest, selection, asked.env)?;
-        graph.plan(&Flags::of(dir, asked)?)
+        // The unit graph says which features and which profile each package of one build has.
+        let graph = UnitGraph::asked(manifest, selection, asked)?;
+        let (dir, _) = asked_where(manifest, selection);
+        UnitGraph::plan(graph, &Flags::of(dir, asked)?)
     }
 
     /// What the build has a debugger told of the packages cargo was asked to build: the
@@ -474,7 +493,14 @@ impl Plan {
     /// What the plan says of the programs cargo was asked to build.
     pub(crate) fn whole(&self) -> anyhow::Result<Whole> {
         let debug = Described { frame_pointers: self.frame_pointers, ..self.described()? };
-        Ok(Whole { debug, lto: self.lto, lints_capped: self.lints_capped })
+        let link_args = self.link_args.clone();
+        Ok(Whole {
+            debug,
+            lto: self.lto,
+            links_dead_code: self.links_dead_code,
+            lints_capped: self.lints_capped,
+            link_args,
+        })
     }
 
     /// How the package cargo calls `id` is built, when the build has it.
@@ -491,7 +517,7 @@ impl Plan {
 /// The one name of a package for the two ways cargo spells its id: `source#name@version`,
 /// and `name version (source)` as the unit graph of an older cargo does, with the
 /// commit of a git source after it.
-fn package_named(id: &str) -> String {
+pub(crate) fn package_named(id: &str) -> String {
     let old = id.strip_suffix(')').and_then(|it| it.split_once(" ("));
     if let Some((name_version, source)) = old
         && let Some((name, version)) = name_version.split_once(' ')
@@ -510,76 +536,145 @@ fn package_named(id: &str) -> String {
     format!("{source}#{name}@{named}")
 }
 
+/// A build's units as `cargo build --unit-graph` prints them (cargo's `unit_graph.rs`, format
+/// version 1): what the build compiles and runs, each with its package, target, profile,
+/// features and the units it depends on. The build scripts and proc macros of a load are
+/// built and run from it (`cargo/compile_time.rs`).
 #[derive(Deserialize)]
-struct UnitGraph {
-    units: Vec<Unit>,
-    roots: Vec<usize>,
+pub(crate) struct UnitGraph {
+    pub(crate) units: Vec<Unit>,
+    pub(crate) roots: Vec<usize>,
 }
 
 #[derive(Deserialize)]
-struct Unit {
-    pkg_id: String,
-    target: UnitTarget,
-    profile: Profile,
-    features: Vec<String>,
-    dependencies: Vec<UnitDependency>,
-}
-
-#[derive(Deserialize)]
-struct UnitTarget {
-    kind: Vec<String>,
+pub(crate) struct Unit {
+    pub(crate) pkg_id: String,
+    pub(crate) target: UnitTarget,
+    pub(crate) profile: Profile,
+    /// The triple the unit is built for, `None` for the host.
     #[serde(default)]
-    name: String,
+    pub(crate) platform: Option<String>,
+    /// `build`, `check`, `test`, `run-custom-build`, ...
+    #[serde(default)]
+    pub(crate) mode: String,
+    pub(crate) features: Vec<String>,
+    pub(crate) dependencies: Vec<UnitDependency>,
 }
 
 #[derive(Deserialize)]
-struct UnitDependency {
-    index: usize,
+pub(crate) struct UnitTarget {
+    pub(crate) kind: Vec<String>,
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) src_path: PathBuf,
+    #[serde(default = "edition_2015")]
+    pub(crate) edition: String,
+}
+
+fn edition_2015() -> String {
+    "2015".to_owned()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct UnitDependency {
+    pub(crate) index: usize,
+    /// The name the unit links it under.
+    #[serde(default)]
+    pub(crate) extern_crate_name: String,
 }
 
 impl Unit {
     /// Whether the unit runs while building: a build script or a proc macro. What it depends
     /// on is built for the host, with features and a profile of its own.
-    fn runs_on_host(&self) -> bool {
+    pub(crate) fn runs_on_host(&self) -> bool {
         self.target.kind.iter().any(|it| it == "custom-build" || it == "proc-macro")
     }
 
-    fn is_library(&self) -> bool {
+    pub(crate) fn is_library(&self) -> bool {
         self.target.kind.iter().any(|it| it.ends_with("lib"))
     }
 }
 
+/// Where the build `selection` names of the package of `manifest` is asked for: the directory,
+/// and the manifest when one is named.
+fn asked_where<'a>(manifest: &'a Path, selection: &'a Selection) -> (&'a Path, Option<&'a Path>) {
+    match &selection.asked_in {
+        Some(asked_in) if asked_in.is_dir() => (asked_in.as_path(), None),
+        Some(asked_in) => (asked_in.parent().unwrap_or(Path::new(".")), Some(asked_in.as_path())),
+        None => (manifest.parent().unwrap_or(Path::new(".")), Some(manifest)),
+    }
+}
+
+/// The unit graphs one load was told, by what they were asked with: a load asks for its
+/// graph once for the plan and once for its build scripts (`cargo/compile_time.rs`).
+type Told = FxHashMap<String, std::sync::Arc<UnitGraph>>;
+
+std::thread_local! {
+    static TOLD: std::cell::RefCell<Option<Told>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The load of a workspace on this thread, while it lives: the unit graphs asked for in it
+/// are made once. A load after it makes them again, as the manifests may have changed since.
+pub(crate) struct Load {
+    outer: Option<Told>,
+}
+
+impl Load {
+    pub(crate) fn start() -> Load {
+        Load { outer: TOLD.with(|it| it.replace(Some(Told::default()))) }
+    }
+}
+
+impl Drop for Load {
+    fn drop(&mut self) {
+        TOLD.with(|it| *it.borrow_mut() = self.outer.take());
+    }
+}
+
 impl UnitGraph {
-    /// What `cargo build --unit-graph` says of the build `selection` names, asked in `dir` of
-    /// the package of `manifest` when there is one, with `env` for the variables of whoever
-    /// asks.
+    /// The units of the build `selection` names of the package of `manifest`, for what
+    /// `asked` says: what the load under way was told already when it asked the same.
+    pub(crate) fn asked(
+        manifest: &Path,
+        selection: &Selection,
+        asked: &Asked<'_>,
+    ) -> anyhow::Result<std::sync::Arc<UnitGraph>> {
+        let (dir, manifest) = asked_where(manifest, selection);
+        let mut vars: Vec<_> = asked.env.iter().collect();
+        vars.sort();
+        let cfg = format!("{:?}", asked.cfg);
+        let key = serde_json::to_string(&(dir, manifest, selection, vars, asked.triple, cfg))?;
+        let told = TOLD.with(|it| it.borrow().as_ref().and_then(|it| it.get(&key).cloned()));
+        if let Some(graph) = told {
+            return Ok(graph);
+        }
+        let graph = std::sync::Arc::new(UnitGraph::of(dir, manifest, selection, asked)?);
+        TOLD.with(|it| {
+            if let Some(told) = it.borrow_mut().as_mut() {
+                told.insert(key, graph.clone());
+            }
+        });
+        Ok(graph)
+    }
+
+    /// The unit graph of the build `selection` names, asked in `dir` of the package of
+    /// `manifest` when there is one: what `cargo build --unit-graph` says of it, made by
+    /// blaze-units with no cargo run (harness/resolve.py `units` holds the two equal).
     fn of(
         dir: &Path,
         manifest: Option<&Path>,
         selection: &Selection,
-        env: &FxHashMap<String, Option<String>>,
+        asked: &Asked<'_>,
     ) -> anyhow::Result<UnitGraph> {
-        let mut command = cargo_in(dir, env);
-        command.args(["build", "--unit-graph", "-Z", "unstable-options"]);
-        if let Some(manifest) = manifest {
-            command.arg("--manifest-path").arg(manifest);
-        }
-        command.args(selection.flags());
-        if selection.dev_deps {
-            command.arg("--all-targets");
-        }
-        let output = command.output().context("running `cargo build`")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "`cargo build --unit-graph` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        serde_json::from_slice(&output.stdout).context("reading cargo's unit graph")
+        let graph = crate::cargo::metadata::units(selection, dir, manifest, asked)?;
+        let json = serde_json::to_value(&graph).context("writing blaze's unit graph")?;
+        serde_json::from_value(json).context("blaze's unit graph is not cargo's form")
     }
 
     /// The units that end up in the program: those the roots reach without going through one
     /// that runs on the host.
-    fn for_target(&self) -> FxHashSet<usize> {
+    pub(crate) fn for_target(&self) -> FxHashSet<usize> {
         let mut reached = FxHashSet::default();
         let mut queue: Vec<usize> =
             self.roots.iter().copied().filter(|&it| it < self.units.len()).collect();
@@ -595,38 +690,39 @@ impl UnitGraph {
         reached
     }
 
-    fn plan(self, flags: &Flags) -> anyhow::Result<Plan> {
-        let for_target = self.for_target();
+    fn plan(graph: std::sync::Arc<UnitGraph>, flags: &Flags) -> anyhow::Result<Plan> {
+        let this = &*graph;
+        let for_target = this.for_target();
         // The flag is not cargo's to know: the libraries are then built for a link without it
         // and rustc finds no bitcode in them.
         anyhow::ensure!(
             !flags.lto,
             "`-C lto` is among the flags: rustc compiles the whole program again as it links \
-             it and leaves no library on the link line for ra-jit's functions to be linked against"
+             it and leaves no library on the link line for blaze's functions to be linked against"
         );
-        for unit in &self.units {
+        for unit in &this.units {
             if let Some(why) = crate::unstable::refusal(&unit.profile.rustflags) {
                 anyhow::bail!(
-                    "the profile's rustflags for `{}` have {why}; ra-jit does not build with it",
+                    "the profile's rustflags for `{}` have {why}; blaze does not build with it",
                     unit.target.name
                 );
             }
         }
-        let lto = for_target.iter().any(|&it| self.units[it].profile.links_from_bitcode());
+        let lto = for_target.iter().any(|&it| this.units[it].profile.links_from_bitcode());
         if lto {
             eprintln!("{LTO_ACCEPTED}");
         }
         // A package that is only built for the host, a proc macro, is as that build has it.
         let rank = |index: usize, unit: &Unit| (for_target.contains(&index), unit.is_library());
         let mut best: FxHashMap<&str, (usize, &Unit)> = FxHashMap::default();
-        for (index, unit) in self.units.iter().enumerate() {
+        for (index, unit) in this.units.iter().enumerate() {
             let chosen = best.entry(unit.pkg_id.as_str()).or_insert((index, unit));
             if rank(index, unit) > rank(chosen.0, chosen.1) {
                 *chosen = (index, unit);
             }
         }
         let roots: FxHashSet<&str> =
-            self.roots.iter().filter_map(|&it| Some(self.units.get(it)?.pkg_id.as_str())).collect();
+            this.roots.iter().filter_map(|&it| Some(this.units.get(it)?.pkg_id.as_str())).collect();
         let packages = best
             .into_iter()
             .map(|(id, (index, unit))| {
@@ -640,7 +736,9 @@ impl UnitGraph {
             packages,
             lto,
             frame_pointers: flags.frame_pointers,
+            links_dead_code: flags.links_dead_code,
             lints_capped: flags.lints_capped,
+            link_args: flags.link_args.clone(),
         })
     }
 }
@@ -661,6 +759,15 @@ mod tests {
     }
 
     #[test]
+    fn link_dead_code_is_read_in_each_spelling() {
+        let kept = |flags: &str| Flags::parse(flags.split_whitespace()).unwrap().links_dead_code;
+        assert!(kept("-C link-dead-code"));
+        assert!(kept("-Clink_dead_code=yes"));
+        assert!(!kept("-C link-dead-code -C link-dead-code=no"));
+        assert!(!kept("-C force-frame-pointers"));
+    }
+
+    #[test]
     fn the_flags_that_cap_lints_are_read() {
         let capped = |flags: &str| Flags::parse(flags.split_whitespace()).unwrap().lints_capped;
         assert!(capped("--cap-lints warn"));
@@ -668,6 +775,14 @@ mod tests {
         assert!(capped("--force-warn non_snake_case"));
         assert!(!capped("-D warnings -A dead_code"));
         assert!(!capped("--cap-lintsx"));
+    }
+
+    #[test]
+    fn link_args_are_read_in_order_in_each_spelling() {
+        let words =
+            ["-C", "link-arg=-Wl,-no_compact_unwind", "-Clink-args=-a -b", "-C", "link_arg=-c"];
+        let args = Flags::parse(words.into_iter());
+        assert_eq!(args.unwrap().link_args, ["-Wl,-no_compact_unwind", "-a", "-b", "-c"]);
     }
 
     #[test]

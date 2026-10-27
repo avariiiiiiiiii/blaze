@@ -166,7 +166,7 @@ pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> 
         return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
     }
     if given.is_some_and(|it| it == "own") {
-        return Err(io::Error::other("ra-jit has no answer of its own to this question"));
+        return Err(io::Error::other("blaze has no answer of its own to this question"));
     }
     let key = key(command, stdin);
     let file = key.as_ref().and_then(|key| Some(dir()?.join(key)));

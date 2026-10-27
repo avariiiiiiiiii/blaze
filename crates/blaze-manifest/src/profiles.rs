@@ -640,14 +640,14 @@ impl PartialEq for Strip {
 }
 
 /// What a unit is built for, as far as its profile goes: cargo's `UnitFor` less its features.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct UnitFor {
     host: bool,
     host_features: bool,
     panic_setting: PanicSetting,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 enum PanicSetting {
     AlwaysUnwind,
     ReadProfile,

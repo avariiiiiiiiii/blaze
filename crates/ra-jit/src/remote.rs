@@ -2,8 +2,9 @@
 //! `ra-jit cache pull REMOTE`, and the same done by the daemon when `RA_JIT_REMOTE` names one.
 //! The commands on the local store alone, `ra-jit cache stats|gc|verify`, are here with them.
 //!
-//! A remote is a directory, `s3://bucket/prefix`, or an `https://` address that is read from
-//! only (`https.rs`). It holds sealed packs under the hash of
+//! A remote is a directory, `s3://bucket/prefix`, an `https://` address that is read from
+//! only (`https.rs`), or a tenant of blaze's cache gateway, `blaze+https://` (`gateway.rs`).
+//! It holds sealed packs under the hash of
 //! their bytes, the keys of each pack under the hash of those, and one manifest a project:
 //! the packs its builds were served from. A push sends the packs the manifest lacks and
 //! adds them to it; a pull fetches the ones it lists that are not here. With
@@ -25,6 +26,7 @@
 //! longer is refused with nothing of it kept.
 
 mod collect;
+mod gateway;
 mod https;
 mod keeper;
 mod s3;
@@ -49,6 +51,7 @@ use rustc_hash::FxHashMap;
 use tokio::{io::AsyncSeekExt, runtime::Runtime};
 use url::Url;
 
+use gateway::Gateway;
 pub(crate) use https::{Https, next as https_next};
 use s3::{S3, Written};
 use signed::{NotRewritten, Trust, Turns, Unremembered};
@@ -89,6 +92,8 @@ enum Place {
     S3(Box<S3>),
     /// Files an HTTPS server hands out, such as a release's assets: read-only.
     Https(Box<Https>),
+    /// blaze's cache gateway, one tenant of it (`gateway.rs`).
+    Gateway(Box<Gateway>),
 }
 
 impl Remote {
@@ -104,7 +109,9 @@ impl Remote {
         };
         let traffic = Arc::new(Traffic::new(number("RA_JIT_REMOTE_JOBS", 8)? as usize));
         let patience = Duration::from_secs(number("RA_JIT_REMOTE_TIMEOUT", 30)?.max(1));
-        let place = if spec.starts_with("s3://") {
+        let place = if spec.starts_with("blaze+") {
+            Place::Gateway(Box::new(Gateway::open(spec, patience, traffic.clone())?))
+        } else if spec.starts_with("s3://") {
             let spec = Url::parse(spec).context("the address of the remote is not a URL")?;
             Place::S3(Box::new(S3::open(&spec, patience, traffic.clone()).await?))
         } else if spec.starts_with("https://") || spec.starts_with("http://") {
@@ -150,6 +157,11 @@ impl Remote {
         if self.read_only {
             bail!("RA_JIT_REMOTE_READONLY is set: nothing is sent");
         }
+        if let Place::Gateway(gateway) = &self.place
+            && let Some(why) = gateway.cannot_write()
+        {
+            bail!(why);
+        }
         match self.trust.cannot_sign() {
             Some(why) => bail!("{why}: what this machine sent would not be trusted"),
             None => Ok(()),
@@ -172,6 +184,7 @@ impl Remote {
             }
             Place::S3(s3) => Ok(s3.read_from(name, offset).await?.map(Body::S3)),
             Place::Https(https) => Ok(https.read_from(name, offset).await?.map(Body::Http)),
+            Place::Gateway(gateway) => gateway.read_from(name, offset).await,
         }
     }
 
@@ -184,7 +197,11 @@ impl Remote {
         most: u64,
     ) -> anyhow::Result<Option<(Vec<u8>, Version)>> {
         let _permit = self.traffic.permit().await?;
-        self.patiently(|| self.read_small_once(name, most)).await
+        let read = self.patiently(|| self.read_small_once(name, most)).await?;
+        if read.is_some() {
+            self.traffic.moved.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(read)
     }
 
     async fn read_small_once(
@@ -206,6 +223,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.read_small(name, most).await,
             Place::Https(https) => https.read_small(name, most).await,
+            Place::Gateway(gateway) => gateway.read_small(name, most).await,
         }
     }
 
@@ -231,6 +249,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.found(name).await,
             Place::Https(https) => https.found(name).await,
+            Place::Gateway(gateway) => gateway.found(name).await,
         }
     }
 
@@ -257,6 +276,11 @@ impl Remote {
             }
             Place::S3(s3) => s3.list(prefix).await,
             Place::Https(_) => bail!("a remote over HTTPS cannot be listed"),
+            Place::Gateway(_) => Err(transfer::Refused(format!(
+                "{} cannot be listed: its tenant's objects are collected by the gateway",
+                self.place.name()
+            ))
+            .into()),
         }
     }
 
@@ -280,6 +304,7 @@ impl Remote {
             }
             Place::S3(s3) => s3.delete(name).await,
             Place::Https(_) => bail!("a remote over HTTPS is read-only"),
+            Place::Gateway(_) => bail!("the gateway takes nothing out: {name} is left"),
         }
     }
 
@@ -293,7 +318,12 @@ impl Remote {
         self.may_write()?;
         let _permit = self.traffic.permit().await?;
         let bytes = Arc::new(bytes);
-        self.patiently(|| self.write_small_once(name, bytes.clone(), read_at)).await
+        let written =
+            self.patiently(|| self.write_small_once(name, bytes.clone(), read_at)).await?;
+        if let Written::Done = written {
+            self.traffic.moved.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(written)
     }
 
     /// A write whose answer was lost and that is made again finds its own bytes there and
@@ -313,12 +343,19 @@ impl Remote {
             }
             Place::S3(s3) => s3.write_small(name, &bytes, read_at).await,
             Place::Https(_) => bail!("a remote over HTTPS is read-only"),
+            Place::Gateway(gateway) => gateway.write_small(name, &bytes, read_at).await,
         }
     }
 
     /// Puts the file under `name`, all of it or nothing.
     async fn send_file(&self, name: &str, file: &Path, len: u64) -> anyhow::Result<()> {
         self.may_write()?;
+        self.send_file_anywhere(name, file, len).await?;
+        self.traffic.moved.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn send_file_anywhere(&self, name: &str, file: &Path, len: u64) -> anyhow::Result<()> {
         match &self.place {
             Place::Dir(dir) => {
                 let _permit = self.traffic.permit().await?;
@@ -330,6 +367,10 @@ impl Remote {
             }
             Place::S3(s3) => s3.send_file(name, file, len).await,
             Place::Https(_) => bail!("a remote over HTTPS is read-only"),
+            Place::Gateway(gateway) => {
+                let _permit = self.traffic.permit().await?;
+                self.patiently(|| gateway.send_file(name, file, len)).await
+            }
         }
     }
 
@@ -481,6 +522,7 @@ impl Place {
             Place::Dir(dir) => dir.display().to_string(),
             Place::S3(s3) => s3.place(),
             Place::Https(https) => https.place(),
+            Place::Gateway(gateway) => gateway.place(),
         }
     }
 }
@@ -788,8 +830,12 @@ pub(crate) async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow
     let local = local_packs(&claim(store, true).await?)?;
     let listed = match Manifest::fetch_to_extend(remote, project).await {
         Ok(manifest) => manifest.unwrap_or_default(),
+        Err(e) if required() => return Err(e.context("reading the manifest to add to")),
         // A list this machine does not trust is one it does not add to: see `extend_list`.
-        Err(_) => Manifest::default(),
+        Err(e) => {
+            eprintln!("remote: {e:#}: every pack is listed as if it had none");
+            Manifest::default()
+        }
     };
     let missing: Vec<Digest> = local.into_iter().filter(|it| !listed.0.contains_key(it)).collect();
     let (mut sent, mut bytes, mut failed) = (Manifest::default(), 0, Vec::new());
@@ -932,14 +978,14 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
     tally.settle(said, &remote.traffic)
 }
 
-const USAGE: &str = "usage: ra-jit cache push|pull REMOTE [PROJECT]\n       \
-                     ra-jit cache stats\n       \
-                     ra-jit cache gc [--max SIZE]\n       \
-                     ra-jit cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
+const USAGE: &str = "usage: blaze cache push|pull REMOTE [PROJECT]\n       \
+                     blaze cache stats\n       \
+                     blaze cache gc [--max SIZE]\n       \
+                     blaze cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
                      [--dry-run]\n       \
-                     ra-jit cache verify\n       \
-                     ra-jit cache keygen FILE\n       \
-                     ra-jit cache forget REMOTE";
+                     blaze cache verify\n       \
+                     blaze cache keygen FILE\n       \
+                     blaze cache forget REMOTE";
 
 /// `ra-jit cache VERB`, on the store of the user's builds.
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
@@ -970,17 +1016,56 @@ fn transfer_command(
     let Some(remote) = args.next() else { bail!(USAGE) };
     let project = project_name(args.next())?;
     let start = Instant::now();
-    let done = runtime()?.block_on(async {
+    let (done, summary) = runtime()?.block_on(async {
         let remote = Remote::open(&remote, store).await?;
         let done = match verb {
             "push" => push(store, &remote, &project).await,
             _ => pull(store, &remote, &project).await,
         };
         eprintln!("remote: {}", remote.traffic);
-        done
+        anyhow::Ok((done, remote.traffic.summary(verb, start.elapsed())))
     })?;
-    println!("{done} in {:.1?}", start.elapsed());
+    // Said whether it went through or not: CI puts it in the job's summary.
+    println!("{summary}");
+    println!("{} in {:.1?}", done?, start.elapsed());
     Ok(())
+}
+
+/// Whether a remote that fails fails what it was used for: `RA_JIT_REMOTE_REQUIRED=1`, which
+/// CI sets so that a cache that stopped working is not a slowdown nobody sees. Without it the
+/// failure is said on every build's `Finished` line and the build goes on.
+pub(crate) fn required() -> bool {
+    std::env::var_os("RA_JIT_REMOTE_REQUIRED").is_some_and(|it| it != "0" && !it.is_empty())
+}
+
+/// The file in a store's directory that says how the daemon's last exchange with its remote
+/// failed, for the builds it serves to say: their `Finished` line is not the daemon's.
+const DOWN: &str = "remote-down";
+
+/// Remembers how the last exchange with the remote `place` went: `failed` or not.
+fn note_down(store: &Path, place: &str, failed: Option<&anyhow::Error>) {
+    let file = store.join(DOWN);
+    let noted = match failed {
+        Some(e) => {
+            let why = format!("{e:#}");
+            let why = why.lines().next().unwrap_or_default();
+            write_file_whole(&file, format!("{place}: {why}").as_bytes())
+        }
+        None => match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    };
+    if let Err(e) = noted {
+        eprintln!("remote: {}: {e}", file.display());
+    }
+}
+
+/// What the build's `Finished` line says of the remote: how it failed last, if it did.
+pub(crate) fn noted_down() -> Option<String> {
+    let store = crate::cargo::daemon::store()?;
+    let said = std::fs::read_to_string(store.join(DOWN)).ok()?;
+    Some(said.trim().to_owned()).filter(|it| !it.is_empty())
 }
 
 /// `ra-jit cache forget REMOTE`: forgets the turns taken of the remote's lists, so that
@@ -1037,7 +1122,7 @@ fn format_line(format: Option<u32>) -> String {
     match format {
         None => "format: none (the directory has no store in it)".to_owned(),
         Some(STORE_FORMAT) => format!("format: {STORE_FORMAT}"),
-        Some(other) => format!("format: {other} (this ra-jit reads {STORE_FORMAT})"),
+        Some(other) => format!("format: {other} (this blaze reads {STORE_FORMAT})"),
     }
 }
 
@@ -1106,7 +1191,7 @@ fn verify(store: &Path) -> anyhow::Result<()> {
         println!("corrupt: {name} {why}");
     }
     if verified.format.is_some_and(|it| it != STORE_FORMAT) {
-        bail!("the store is not of the format this ra-jit reads");
+        bail!("the store is not of the format this blaze reads");
     }
     if !verified.corrupt.is_empty() {
         bail!("{} packs are not what was written", verified.corrupt.len());
@@ -1145,26 +1230,62 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// `None` without a store or a remote. A remote that cannot be reached is not an error
-    /// to the build: it compiles what it would have fetched.
-    pub(crate) fn from_env() -> Option<Shared> {
-        let store = PathBuf::from(std::env::var_os("RA_JIT_CACHE")?);
-        let remote = std::env::var("RA_JIT_REMOTE").ok()?;
+    /// `None` without a store or a remote, or with `RA_JIT_REMOTE=off`. A remote that
+    /// cannot be reached is not an error to the build, unless [`required`]: it compiles
+    /// what it would have fetched, and its `Finished` line says so.
+    pub(crate) fn from_env() -> anyhow::Result<Option<Shared>> {
+        let Some(store) = std::env::var_os("RA_JIT_CACHE").map(PathBuf::from) else {
+            return Ok(None);
+        };
+        let remote = match std::env::var("RA_JIT_REMOTE") {
+            Ok(remote) if !remote.is_empty() && remote != "off" => remote,
+            _ => return Ok(None),
+        };
         let opened = runtime().and_then(|runtime| {
             let project = project_name(std::env::var("RA_JIT_PROJECT").ok())?;
             let push_every = keeper::push_every_from_env()?;
             let remote = Arc::new(runtime.block_on(Remote::open(&remote, &store))?);
             let lazy = std::env::var_os("RA_JIT_REMOTE_LAZY").is_some_and(|it| it != "0");
             let (runtime, asked) = (Arc::new(runtime), Arc::default());
-            Ok(Shared { store, remote, project, runtime, lazy, push_every, asked })
+            Ok(Shared { store: store.clone(), remote, project, runtime, lazy, push_every, asked })
         });
-        opened.inspect_err(|e| eprintln!("remote: {e:#}")).ok()
+        match opened {
+            Ok(shared) => Ok(Some(shared)),
+            Err(e) => {
+                eprintln!("remote: {e:#}");
+                note_down(&store, &remote, Some(&e));
+                match required() {
+                    true => Err(e.context("RA_JIT_REMOTE_REQUIRED is set")),
+                    false => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// The remote `spec` names, for the project `project` of the store in `store`, with its
+    /// packs left there until a key of theirs is asked for: what takes a part of a project
+    /// shared by all, as `ra-jit closure materialize` takes the store paths it is asked for.
+    /// A remote that cannot be opened is an error; one that fails later is said, and what
+    /// it would have brought is missing from the store.
+    pub(crate) fn lazily(store: &Path, spec: &str, project: &str) -> anyhow::Result<Shared> {
+        let runtime = runtime()?;
+        let remote = Arc::new(runtime.block_on(Remote::open(spec, store))?);
+        Ok(Shared {
+            store: store.to_owned(),
+            remote,
+            project: project_name(Some(project.to_owned()))?,
+            runtime: Arc::new(runtime),
+            lazy: true,
+            push_every: None,
+            asked: Arc::default(),
+        })
     }
 
     /// Fetches what the project's manifest lists, or with `RA_JIT_REMOTE_LAZY` only what
     /// tells which pack holds which key, leaving each pack to the first build that asks.
-    /// From here on the store asks this remote for the keys it lacks.
-    pub(crate) fn pull(&self) {
+    /// From here on the store asks this remote for the keys it lacks. An error only when
+    /// [`required`].
+    pub(crate) fn pull(&self) -> anyhow::Result<()> {
         // An outage during one build is over by the next, or is found again.
         self.remote.traffic.try_again();
         let start = Instant::now();
@@ -1174,7 +1295,7 @@ impl Shared {
         });
         let asked = self.asked.clone();
         ra_jit_store::fetch_missing_with(Box::new(move |key| asked.fetch(key)));
-        self.report(done, start);
+        self.report(done, start)
     }
 
     /// A pull the way the daemon is set to pull: of every pack, or of what says where the
@@ -1197,22 +1318,39 @@ impl Shared {
         Some(Digest::of(&read.ok()??.0))
     }
 
-    pub(crate) fn push(&self) {
+    /// An error only when [`required`].
+    pub(crate) fn push(&self) -> anyhow::Result<()> {
         if self.remote.may_write().is_err() {
-            return;
+            return Ok(());
         }
         self.remote.traffic.try_again();
         let start = Instant::now();
         let done = self.runtime.block_on(push(&self.store, &self.remote, &self.project));
-        self.report(done, start);
+        self.report(done, start)
     }
 
-    fn report(&self, done: anyhow::Result<String>, start: Instant) {
-        match done {
-            Ok(done) => eprintln!("remote: {done} in {:.1?}", start.elapsed()),
-            Err(e) => eprintln!("remote: {e:#}"),
-        }
+    fn report(&self, done: anyhow::Result<String>, start: Instant) -> anyhow::Result<()> {
+        let done = match done {
+            Ok(done) => {
+                eprintln!("remote: {done} in {:.1?}", start.elapsed());
+                note_down(&self.store, &self.remote.place.name(), None);
+                Ok(())
+            }
+            Err(e) => self.failed(e),
+        };
         eprintln!("remote: {}", self.remote.traffic);
+        done
+    }
+
+    /// Says how an exchange with the remote failed, here and on the builds' `Finished`
+    /// line, and is that failure when [`required`].
+    fn failed(&self, e: anyhow::Error) -> anyhow::Result<()> {
+        eprintln!("remote: {e:#}");
+        note_down(&self.store, &self.remote.place.name(), Some(&e));
+        match required() {
+            true => Err(e.context("RA_JIT_REMOTE_REQUIRED is set")),
+            false => Ok(()),
+        }
     }
 }
 
@@ -1261,6 +1399,7 @@ impl Lazy {
         for fetched in fetched {
             match fetched {
                 Ok((pack, listed, keys)) => lazy.add(pack, listed, &keys),
+                Err(e) if required() => return Err(e),
                 Err(e) => eprintln!("remote: {e:#}"),
             }
         }
@@ -1289,8 +1428,11 @@ impl Lazy {
                     true
                 }
                 Ok(Fetched::Elsewhere) => false,
+                // The build compiles what the pack held; with RA_JIT_REMOTE_REQUIRED the
+                // client fails it once it is over.
                 Err(e) => {
                     eprintln!("remote: {e:#}");
+                    note_down(&self.store, &self.remote.place.name(), Some(&e));
                     false
                 }
             }
@@ -1303,11 +1445,35 @@ impl Remote {
     /// The directory `dir` as a remote, with what is taken of its lists remembered in
     /// `kept_in`.
     pub(crate) fn in_dir(dir: &Path, kept_in: &Path, trust: Trust, object_max: u64) -> Remote {
-        let place = Place::Dir(dir.to_owned());
+        let traffic = Arc::new(Traffic::new(8));
+        Remote::in_place(Place::Dir(dir.to_owned()), traffic, kept_in, trust, object_max)
+    }
+
+    /// The gateway tenant `spec` names as a remote, reached with `token`.
+    pub(crate) fn at_gateway(
+        spec: &str,
+        token: Option<&str>,
+        kept_in: &Path,
+        trust: Trust,
+    ) -> Remote {
+        let (traffic, patience) = (Arc::new(Traffic::new(8)), Duration::from_secs(5));
+        let gateway =
+            Gateway::with_token(spec, token.map(str::to_owned), patience, traffic.clone());
+        let place = Place::Gateway(Box::new(gateway.unwrap()));
+        Remote::in_place(place, traffic, kept_in, trust, OBJECT_MAX)
+    }
+
+    fn in_place(
+        place: Place,
+        traffic: Arc<Traffic>,
+        kept_in: &Path,
+        trust: Trust,
+        object_max: u64,
+    ) -> Remote {
         let turns = Turns::of(kept_in, &place.name());
         Remote {
             place,
-            traffic: Arc::new(Traffic::new(8)),
+            traffic,
             patience: Duration::from_secs(5),
             read_only: false,
             trust,

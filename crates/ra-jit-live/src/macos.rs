@@ -472,7 +472,7 @@ fn watch(dir: &std::path::Path, uuid: [u8; 16]) -> Receiver<(Patch, Instant)> {
                             return;
                         }
                     }
-                    Err(why) => eprintln!("ra-jit: {}: {why}", path.display()),
+                    Err(why) => eprintln!("blaze: {}: {why}", path.display()),
                 }
             }
         })

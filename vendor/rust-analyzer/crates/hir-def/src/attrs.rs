@@ -733,6 +733,24 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
     named.then_some((lib, cfg))
 }
 
+/// The string a `link(...)` gives `key`, as `key = "value"`.
+fn link_value(tt: &ast::TokenTree, key: &str) -> Option<String> {
+    let mut children = TokenTreeChildren::new(tt).peekable();
+    while let Some(child) = children.next() {
+        let NodeOrToken::Token(name) = child else { continue };
+        if name.kind() != SyntaxKind::IDENT || name.text() != key {
+            continue;
+        }
+        let Some(NodeOrToken::Token(eq)) = children.next() else { continue };
+        if eq.kind() != T![=] {
+            continue;
+        }
+        let Some(NodeOrToken::Token(value)) = children.next() else { continue };
+        return ast::String::cast(value).and_then(|it| Some(it.value().ok()?.into_owned()));
+    }
+    None
+}
+
 /// The `cfg(...)` of a `link(...)`, the group after `cfg`: read as the predicate of a
 /// `#[cfg]` with that group.
 fn link_cfg(group: &ast::TokenTree) -> Option<CfgExpr> {
@@ -918,6 +936,22 @@ impl AttrFlags {
             ControlFlow::Continue(())
         });
         libs.into_boxed_slice()
+    }
+
+    /// The module a wasm module imports the functions of an `extern` block from,
+    /// `#[link(wasm_import_module = "...")]`: they are its imports, not a library's.
+    #[salsa::tracked(returns(clone))]
+    pub fn wasm_import_module(db: &dyn SourceDatabase, owner: ExternBlockId) -> Option<Symbol> {
+        collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = &attr
+                && attr.path().is1("link")
+                && let Some(tt) = attr.token_tree()
+                && let Some(module) = link_value(&tt, "wasm_import_module")
+            {
+                return ControlFlow::Break(Symbol::intern(&module));
+            }
+            ControlFlow::Continue(())
+        })
     }
 
     /// The section `#[link_section]` puts an item in.
@@ -1124,6 +1158,55 @@ impl AttrFlags {
             result.shrink_to_fit();
             result
         }
+    }
+
+    /// The features `#[target_feature(enable = ..)]` names, in the order the attributes name
+    /// them, each as often as it is named: rustc's `CodegenFnAttrs::target_features` before
+    /// it adds what each implies, which its MIR inliner compares in order.
+    pub fn target_feature_list(db: &dyn SourceDatabase, owner: FunctionId) -> Vec<Symbol> {
+        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
+            return Vec::new();
+        }
+        let mut result = Vec::new();
+        collect_attrs::<Infallible>(db, owner.into(), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = attr
+                && attr.path().is1("target_feature")
+                && let Some(tt) = attr.token_tree()
+            {
+                let mut tt = TokenTreeChildren::new(&tt);
+                while let Some(NodeOrToken::Token(enable_ident)) = tt.next()
+                    && enable_ident.text() == "enable"
+                    && let Some(NodeOrToken::Token(eq_token)) = tt.next()
+                    && eq_token.kind() == T![=]
+                    && let Some(NodeOrToken::Token(features)) = tt.next()
+                    && let Some(features) = ast::String::cast(features)
+                    && let Ok(features) = features.value()
+                {
+                    result.extend(features.split(',').map(Symbol::intern));
+                    if tt
+                        .next()
+                        .and_then(NodeOrToken::into_token)
+                        .is_none_or(|it| it.kind() != T![,])
+                    {
+                        break;
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        result
+    }
+
+    /// Whether the function is `#[rustc_nounwind]`, which rustc's `fn_can_unwind` takes as
+    /// never unwinding.
+    pub fn is_rustc_nounwind(db: &dyn SourceDatabase, owner: FunctionId) -> bool {
+        collect_attrs(db, owner.into(), |attr| match attr {
+            ast::Meta::PathMeta(attr) if attr.path().is1("rustc_nounwind") => {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        })
+        .is_some()
     }
 
     #[inline]

@@ -67,12 +67,6 @@ pub(crate) fn is_wrapper(path: &Path) -> bool {
     stem.is_some_and(|it| it == "ra-jit-rustc" || it == "ra-jit-rustc-first")
 }
 
-/// The same wrapper under the path it has in the first build of a workspace.
-pub(crate) fn first_wrapper_path() -> std::io::Result<PathBuf> {
-    let this = std::env::current_exe()?;
-    Ok(this.with_file_name(format!("ra-jit-rustc-first{}", std::env::consts::EXE_SUFFIX)))
-}
-
 impl Enabled {
     fn path() -> anyhow::Result<PathBuf> {
         Ok(cargo_home().context("no CARGO_HOME or HOME")?.join("ra-jit-enabled.json"))
@@ -107,7 +101,7 @@ pub(crate) fn enable() -> anyhow::Result<i32> {
             let mut made = Vec::new();
             let lines = links::make(&home, &enabled.links, &mut made);
             if made.is_empty() && lines.as_ref().is_ok_and(Vec::is_empty) {
-                println!("ra-jit is enabled already in {}", enabled.config.display());
+                println!("blaze is enabled already in {}", enabled.config.display());
             }
             enabled.links.retain(|it| !made.iter().any(|made| made.path == it.path));
             enabled.links.extend(made);
@@ -134,7 +128,7 @@ pub(crate) fn enable() -> anyhow::Result<i32> {
     let named = named.as_str();
     let written = with_wrapper(&text, named).with_context(|| {
         format!(
-            "{} sets `{TABLE}` in a way ra-jit does not edit; add `{KEY} = \"{named}\"` to it",
+            "{} sets `{TABLE}` in a way blaze does not edit; add `{KEY} = \"{named}\"` to it",
             config.display()
         )
     })?;
@@ -146,9 +140,9 @@ pub(crate) fn enable() -> anyhow::Result<i32> {
     }
     std::fs::write(&config, &enabled.written)
         .with_context(|| format!("writing {}", config.display()))?;
-    println!("ra-jit is enabled: {} has `{TABLE}.{KEY} = \"{named}\"`", config.display());
+    println!("blaze is enabled: {} has `{TABLE}.{KEY} = \"{named}\"`", config.display());
     if let Some(chained) = &enabled.chained {
-        println!("rustc runs through `{chained}` as before, under ra-jit");
+        println!("rustc runs through `{chained}` as before, under blaze");
     }
     let mut made = Vec::new();
     let lines = links::make(&home, &[], &mut made);
@@ -167,7 +161,7 @@ pub(crate) fn enable() -> anyhow::Result<i32> {
 /// one key is put back.
 pub(crate) fn disable() -> anyhow::Result<i32> {
     let Some(enabled) = Enabled::read() else {
-        println!("ra-jit is not enabled");
+        println!("blaze is not enabled");
         return Ok(0);
     };
     links::undo(&enabled.links)?.iter().for_each(|it| println!("{it}"));
@@ -181,7 +175,7 @@ pub(crate) fn disable() -> anyhow::Result<i32> {
             let line = parsed(before).ok().and_then(|_| wrapper_line(before).map(|it| it.1));
             let text = without_wrapper(now, line.as_deref()).with_context(|| {
                 format!(
-                    "{} was changed in a way ra-jit does not edit; remove `{KEY}` from it",
+                    "{} was changed in a way blaze does not edit; remove `{KEY}` from it",
                     config.display()
                 )
             })?;
@@ -190,7 +184,7 @@ pub(crate) fn disable() -> anyhow::Result<i32> {
         (None, _) => {}
     }
     std::fs::remove_file(Enabled::path()?)?;
-    println!("ra-jit is disabled: {} is as it was", config.display());
+    println!("blaze is disabled: {} is as it was", config.display());
     Ok(0)
 }
 
@@ -198,17 +192,17 @@ pub(crate) fn disable() -> anyhow::Result<i32> {
 /// what in `cwd` has it not.
 pub(crate) fn status(cwd: &Path) -> Vec<String> {
     let Some(enabled) = Enabled::read() else {
-        return vec!["plain cargo: not through ra-jit (`ra-jit enable` turns it on)".to_owned()];
+        return vec!["plain cargo: not through blaze (`blaze enable` turns it on)".to_owned()];
     };
     let mut lines = vec![format!(
-        "plain cargo: through ra-jit, by `{TABLE}.{KEY}` in {}",
+        "plain cargo: through blaze, by `{TABLE}.{KEY}` in {}",
         enabled.config.display()
     )];
     if let Some(chained) = &enabled.chained {
         lines.push(format!("  rustc runs through `{chained}`, the wrapper there before"));
     }
     if wrapper_in(&enabled.config).as_deref() != enabled.wrapper.to_str() {
-        lines.push(format!("  but {} no longer names ra-jit", enabled.config.display()));
+        lines.push(format!("  but {} no longer names blaze", enabled.config.display()));
     }
     if let Some(home) = cargo_home() {
         lines.extend(links::status(&home, &enabled.links).into_iter().map(|it| format!("  {it}")));
@@ -233,7 +227,7 @@ fn around(dir: &Path) -> Option<String> {
         })
     };
     let outer = set.or_else(configured)?;
-    Some(format!("`{outer}` stays cargo's `{OUTER_KEY}`: it runs ra-jit's wrapper as it ran rustc"))
+    Some(format!("`{outer}` stays cargo's `{OUTER_KEY}`: it runs blaze's wrapper as it ran rustc"))
 }
 
 /// The variable `cargo ra-jit` names the workspace's own `rustc-workspace-wrapper` in, for

@@ -248,6 +248,91 @@ pub(crate) fn programs(
     }
 }
 
+/// The unit graph of the build `selection` names, asked for in `cwd` (of the package of
+/// `manifest`, when there is one): what `cargo build --unit-graph -Zunstable-options` prints
+/// for it, made by blaze-units from blaze's own resolution with no cargo run. `triple` and
+/// `cfg` are the platform built for; `env` the variables of whoever asks, where they are not
+/// this process's. A build blaze-units cannot make the graph of is an error naming why.
+pub(crate) fn units(
+    selection: &crate::plan::Selection,
+    cwd: &Path,
+    manifest: Option<&Path>,
+    asked: &crate::plan::Asked<'_>,
+) -> anyhow::Result<blaze_units::UnitGraph> {
+    if let Some(flag) = selection.unstable.first() {
+        anyhow::bail!("blaze's unit graph is not made for cargo's unstable flag `-Z {flag}`");
+    }
+    let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    for (key, value) in asked.env {
+        match value {
+            Some(value) => vars.insert(key.clone(), value.clone()),
+            None => vars.remove(key),
+        };
+    }
+    let cfg: Vec<cargo_platform::Cfg> = asked.cfg.iter().filter_map(platform_cfg).collect();
+    let built_for = blaze_units::Platformed { triple: asked.triple.to_owned(), cfg };
+    // Build scripts and proc macros are built for the host, which is the platform built for
+    // unless `--target` names another.
+    let target = selection.target.as_ref().map(|_| built_for.clone());
+    let host = match &target {
+        None => built_for,
+        Some(_) => {
+            let rustc = super::state::rustc_path();
+            let said = |args: &[&str]| {
+                let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
+                said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
+            };
+            let told = said(&["-vV"])?;
+            let host = told.lines().find_map(|it| it.strip_prefix("host: "));
+            let host = host.context("rustc names no host")?.to_owned();
+            let printed = said(&["--print", "cfg", "--target", &host])?;
+            let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {
+                use std::str::FromStr;
+                cargo_platform::Cfg::from_str(it).with_context(|| format!("the cfg {it}"))
+            });
+            blaze_units::Platformed { triple: host, cfg: cfg.collect::<anyhow::Result<_>>()? }
+        }
+    };
+    // ra-jit asks for what `cargo build --profile <profile>` builds, with `--all-targets`
+    // when the tests are built too.
+    let filter = match selection.dev_deps {
+        true => blaze_units::Filter::all_targets(),
+        false => blaze_units::Filter::Default { required_features_filterable: true },
+    };
+    let intent = blaze_units::Intent::Build;
+    let platformed = target.as_ref().unwrap_or(&host);
+    let asked = blaze_metadata::Asked {
+        cwd,
+        env: vars.into_iter().collect(),
+        manifest_path: manifest,
+        config: &selection.config,
+        features: &selection.features,
+        all_features: selection.all_features,
+        no_default_features: selection.no_default_features,
+        build: Some(blaze_metadata::Build {
+            packages: &selection.packages,
+            workspace: selection.workspace,
+            excludes: &selection.excludes,
+            dev_units: filter.need_dev_deps(intent),
+        }),
+        platform: Some(blaze_metadata::TargetPlatform {
+            triple: &platformed.triple,
+            cfg: &platformed.cfg,
+        }),
+        offline: false,
+        store: None,
+    };
+    let units = blaze_metadata::Units {
+        intent,
+        filter: &filter,
+        release: false,
+        profile: Some(&selection.profile),
+        host: &host,
+        target: target.as_ref(),
+    };
+    blaze_metadata::units(&asked, &units).context("making the build's unit graph")
+}
+
 /// A `cfg` as rust-analyzer has it, as cargo's platforms read it.
 fn platform_cfg(atom: &cfg::CfgAtom) -> Option<cargo_platform::Cfg> {
     use std::str::FromStr;

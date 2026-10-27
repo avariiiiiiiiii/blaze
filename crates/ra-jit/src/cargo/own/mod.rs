@@ -9,7 +9,7 @@ mod clippy;
 mod config;
 mod doc;
 mod fmt;
-mod manifest;
+pub(super) mod manifest;
 mod new;
 mod registry;
 mod remove;

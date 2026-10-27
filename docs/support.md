@@ -42,10 +42,10 @@ lays out, mangles and passes values as the pinned nightly does.
 |---|---|---|---|---|---|
 | Cranelift | yes (1) | yes (1) | yes (1) | yes (1) | does not apply (2) |
 | LLVM | yes (1) | yes (1) | yes (1) | yes (1) | no |
-| Full link | yes (1) | yes (1) | yes (1) | yes (1) | yes, older branch (2) |
-| Splice | yes (3) | yes (3) | yes (4) | yes, with a limit (5) | yes, older branch (2) |
+| Full link | yes (1) | yes (1) | yes (1) | yes (1) | yes, with nothing of rustc's (2) |
+| Splice | yes (3) | yes (3) | yes (4) | yes, with a limit (5) | yes (2) |
 | Debug info | yes (6) | yes (6) | lines only (7) | unverified (7) | no |
-| `cargo blaze` | yes (8) | unverified (9) | no: goes to cargo (9) | yes, by hand (9) | no |
+| `cargo blaze` | yes (8) | unverified (9) | yes, by hand (9) | yes, by hand (9) | `wasm32-wasip1` and `wasm32-unknown-unknown` cdylibs, by hand (2) |
 | Disk store | yes (10) | yes (10) | yes (10) | yes (10) | unverified |
 | Remote store | yes, not real AWS (11) | unverified | unverified | unverified | unverified |
 | Fuzzed | yes (12) | no | no | no | no |
@@ -57,18 +57,22 @@ lays out, mangles and passes values as the pinned nightly does.
    `includes`, `worktrees` and `keys` ran on every leg. Under LLVM, `backends.py` reports no
    corpus function left to Cranelift on any of the four. Local: 822 of 822 under both.
 2. wasm32 uses its own lowering from Cranelift IR, not Cranelift's or LLVM's code
-   generation. [reports/WASM32.md](reports/WASM32.md) measured `wasm32-wasip1` under
-   wasmtime on the `ra-jit-wasm32-target` branch with `nightly-2026-05-10`: corpus MATCH with
-   655 of 656 functions from ra-jit, stress 99 of 99, splices 71 of 71 with 62 spliced. wasm
-   is not in CI and nobody has recorded a run since the move to 1.99.0, nor on the pinned nightly. No unwinding is
-   emitted; the wasm targets are `panic=abort`. `wasm32-unknown-unknown` was only exercised
-   through one Dioxus page.
+   generation. `wasm32-wasip1` under wasmtime, 2026-10-27, arm64 ix VMs, pinned nightly,
+   main fdc1c53f15: corpus MATCH with 957 of 959 functions from ra-jit (964 of 966 with
+   simd128 and relaxed-simd), stress 100 of 100, splices 71 of 71. With nothing of rustc's,
+   wasip1 programs, a program over blaze-manifest and blaze-resolve, wasm-host's `no_std`
+   simd128 guests and two Cloudflare Workers (workers-rs, wasm-bindgen) build, link and answer
+   as rustc's builds ([platforms.md](platforms.md), wasm32); `cargo blaze build --target
+   wasm32-wasip1` built the second by hand, its build scripts and proc macros blaze's too,
+   and `cargo blaze build` the guest and, under worker-build, both workers. The train runs the corpus,
+   stress and `allrajit_wasm.py` on every push to main. No unwinding is emitted; the wasm
+   targets are `panic=abort`. Modules are 8 to 50 times the size of rustc's.
 3. `splices.py` 71 of 71 in CI on both Linux architectures; `farsplices.py` 6 of 6 on
    AArch64, where a branch reaches only 128 MB. Not every edit can be spliced: about 60 of
    the 71 steps are, and the rest link in full by design (an executable somebody else
    wrote, a static that grew, a running executable, and similar).
-4. [platforms.md](platforms.md), Windows: 71 of 71 with 60 spliced, 10 full links and
-   1 step with nothing edited, and the harness fails on Windows if the count is not 60.
+4. [platforms.md](platforms.md), Windows: 71 of 71 with 57 spliced, 13 full links and
+   1 step with nothing edited, and the harness fails on Windows if the count is not 57.
 5. [platforms.md](platforms.md), macOS: `splices.py` 71 of 71. The daemon links with
    `-no_fixup_chains`, so a deployment target of 12 or later splices as 11.0 does
    (`headerpad.py` builds for 14.0); an executable linked with chained fixups by a line of
@@ -84,9 +88,10 @@ lays out, mangles and passes values as the pinned nightly does.
    cargo, 66 of 66 flag steps, 11 of 11 lifecycle checks
    ([reports/CARGO.md](reports/CARGO.md)). Not in CI. Run by hand for these docs on a new
    project and on ripgrep 15.1.0.
-9. `cargo blaze` links ELF and Mach-O executables and hands any other target (Windows'
-   PE) to cargo (`unsupported_target` in `cargo/cli.rs`). On macOS arm64 it was run by hand
-   on bun 1.4.3's dev loop ([research/bun.md](research/bun.md)).
+9. `cargo blaze` links ELF, Mach-O and COFF executables (`unsupported_target` in
+   `cargo/cli.rs`). On Windows x86-64 MSVC it links with `rust-lld` and was run by hand on a
+   toy crate and `demo/life` ([platforms.md](platforms.md#windows-x86-64-msvc)). On macOS
+   arm64 it was run by hand on bun 1.4.3's dev loop ([research/bun.md](research/bun.md)).
    Nobody recorded running it on Linux AArch64.
 10. CI: `storekills.py`, `storecorrupts.py` and `storeshared.py` on all four platforms.
     `storefull.py` on Linux only. The earlier
@@ -216,7 +221,10 @@ reports it. A function with a macro call whose expansion is not what rustc makes
 refused with the reason: one that failed to expand, and a call in parentheses or brackets
 with no `;` after it whose expansion is not the one expression rustc parses it as, such as a
 call of a macro of several statements in the parentheses of another macro's call
-([#154](https://github.com/indexable-inc/blaze/issues/154)). An error
+([#154](https://github.com/indexable-inc/blaze/issues/154)). An expansion of one expression
+and a `;` is that expression, as rustc takes the `;`: `bail!(e)` last in a block, expanding to
+`return Err(e);`, is built when the macro is another crate's (rustc warns), and refused when it
+is the crate's own, where rustc's `semicolon_in_expressions_from_macros` is an error. An error
 rust-analyzer does not find is not refused, and a crate ra-jit compiles without rustc, as it
 does a whole program's, is then built and run.
 Borrow-check errors are the main case: ra-jit's borrow checker ([borrowck.md](borrowck.md)) refuses what it finds, and it
@@ -263,7 +271,7 @@ cargo, as [cargo.md](cargo.md) lists.
 | `panic = "abort"` | supported | unverified |
 | `lto = true`, `lto = "thin"` | refused: rustc recompiles the whole program at link time and leaves no library to link ra-jit's functions against | cargo |
 | `lto = "off"` | supported | unverified |
-| crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs only; a build that would write a `cdylib` or `staticlib` stops with an error, since blaze does not link one yet ([#262](https://github.com/indexable-inc/blaze/issues/262)) |
+| crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs, and a library's `cdylib`, linked as a shared library and linked again after each edit rather than spliced; a build that would write a `staticlib` stops with an error, since blaze does not link one yet ([#262](https://github.com/indexable-inc/blaze/issues/262)) |
 | proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by ra-jit | served; an edit to the proc-macro crate itself is cargo's |
 | build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; a change to a script or its inputs is cargo's, then the daemon reloads |
 | unit tests, integration tests, examples, benches | supported | served; adding or removing a `#[test]` is cargo's |

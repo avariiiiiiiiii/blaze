@@ -95,8 +95,8 @@ def main():
             want, _ = tested(ws, [], args, extra, os.path.join(scratch, "cargo"))
             got, said = tested(ws, ["ra-jit"], args, extra, os.path.join(scratch, "ra-jit"))
             loads = len(re.findall(r"(?m)^load workspace: ", said))
-            left = re.findall(r"ra-jit: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
-            built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by ra-jit", said))
+            left = re.findall(r"blaze: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
+            built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by blaze", said))
             parts = ["exit status", "results", "`Doc-tests` lines", "lines of what failed"]
             differs = [f"{part}: {first_difference(w, g)}"[:400] for part, w, g in zip(parts, want, got) if w != g]
             if loads != 1:

@@ -94,7 +94,7 @@ fn main() {
         consts::name(1),
         consts::config(3)
     );
-    case!(consts::local_array(4), consts::repeat(9));
+    case!(consts::local_array(4), consts::repeat(9), consts::from_end(2));
 
     case!(generics::picks(5, 6), generics::swaps(1, 2), generics::inline(5), generics::methods(10));
     case!(generics::statics(3, 4), generics::option_map(Some(4)), generics::option_map(None));
@@ -386,6 +386,7 @@ fn main() {
     println!("format_temporaries {}", cases::format_temporaries(4));
     println!("exclusive_ranges {:?} {:?}", cases::exclusive_ranges(7), cases::exclusive_ranges(6));
     println!("const_pointers {:?}", cases::const_pointers::run());
+    println!("const_behind_raw {}", cases::const_behind_raw::run());
     println!("const_unsized_struct {:?}", cases::const_unsized_struct::run());
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     println!("inline_asm {:?}", cases::inline_asm::run());
@@ -407,6 +408,7 @@ fn main() {
     println!("promoted_self_variant {:?}", cases::promoted_self_variant::run());
     println!("static_cycle {:?}", cases::static_cycle::run());
     println!("async_frames {:?}", cases::async_frames::run());
+    println!("async_frames captured {:?}", cases::async_frames::captured_copy());
     println!("boxed_fn_tuple {:?}", cases::boxed_fn_tuple::run());
     println!("builtin_location {:?}", cases::builtin_location::run());
     println!("builtin_location passed {:?}", cases::builtin_location::passed());
@@ -553,6 +555,7 @@ fn main() {
     #[cfg(panic = "unwind")]
     println!("async_drops {:?}", cases::async_drops::run());
     println!("promoted_assoc_const {:?}", cases::promoted_assoc_const::run());
+    println!("promoted_value_qualifs {:?}", cases::promoted_value_qualifs::run());
     println!("offsets {:?}", cases::offsets::run());
     println!("backtraces {:?}", cases::backtraces::run());
     println!("inline_const_bindings {:?}", cases::inline_const_bindings::run());
@@ -597,6 +600,7 @@ fn main() {
     println!("repeated statics in_async {:?}", cases::repeated_statics::in_async());
     println!("type_ids downcasts {:?}", cases::type_id_hashes::downcasts());
     println!("promoted_slices {:?}", cases::promoted_slices::run());
+    println!("promoted_empty_mut {:?}", cases::promoted_empty_mut::run());
     println!("reified {:?}", cases::reified::run());
     println!("overloaded_unary {}", cases::overloaded_unary::run());
     println!("closure_layout {}", cases::closure_layout::run());
@@ -611,14 +615,32 @@ fn main() {
     println!("lifetime_impl_consts {}", cases::lifetime_impl_consts::run());
     #[cfg(feature = "nightly")]
     println!("simd_lanes {}", cases::simd_lanes::run());
-    #[cfg(all(feature = "nightly", target_arch = "aarch64", target_os = "linux"))]
+    #[cfg(feature = "nightly")]
+    println!("fma_nans {}", cases::fma_nans::run());
+    #[cfg(feature = "nightly")]
+    println!("unsized_params {}", cases::unsized_params::run());
+    #[cfg(all(
+        feature = "nightly",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_os = "linux"
+    ))]
     println!("soft_floats {}", cases::soft_floats::run());
     #[cfg(target_arch = "x86_64")]
     println!("simd_x86 {}", cases::simd_x86::run());
+    #[cfg(target_arch = "x86_64")]
+    println!("x86_instructions {}", cases::x86_instructions::run());
+    #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
+    print!("avx512\n{}", cases::avx512::run());
+    #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
+    print!("x86_halves\n{}", cases::x86_halves::run());
+    #[cfg(all(feature = "nightly", target_arch = "x86_64"))]
+    print!("x86_lowered\n{}", cases::x86_lowered::run());
     #[cfg(target_arch = "aarch64")]
     println!("simd_aarch64 {}", cases::simd_aarch64::run());
     #[cfg(all(target_arch = "aarch64", feature = "nightly"))]
     println!("neon_intrinsics {}", cases::neon_intrinsics::run());
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", feature = "nightly"))]
+    println!("half_intrinsics {}", cases::half_intrinsics::run());
     #[cfg(feature = "nightly")]
     {
         use std::simd::Simd;
@@ -635,6 +657,15 @@ fn main() {
     }
     #[cfg(all(feature = "nightly", target_arch = "aarch64"))]
     println!("sve {}", cases::sve::run());
+    #[cfg(all(feature = "nightly", target_arch = "aarch64"))]
+    println!("sve_ops {}", cases::sve_ops::run());
+    println!("wide_bits {:x?}", cases::wide_bits::run(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210, u128::MAX - 5));
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    println!("simd_wasm {:x?}", cases::simd_wasm::run());
+    #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+    println!("relaxed_wasm {:x?}", cases::relaxed_wasm::run());
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "nightly"))]
+    println!("simd_wasm_lowered {:x?}", cases::simd_wasm_lowered::run());
     // Threads.
     #[cfg(not(target_family = "wasm"))]
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());

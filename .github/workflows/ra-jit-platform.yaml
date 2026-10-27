@@ -44,6 +44,10 @@ on:
         description: the reduced fixtures of what kept Bun from building
         type: boolean
         default: false
+      wasm32:
+        description: harness/wasm32.py, programs built for wasm32 and run under wasmtime against cargo's
+        type: boolean
+        default: false
 
 env:
   CARGO_INCREMENTAL: 0
@@ -247,6 +251,31 @@ jobs:
           tar -xf ra-jit.tar
           echo "RA_JIT_BIN=$PWD/ra-jit" >> "$GITHUB_ENV"
       - run: $PYTHON harness/bun_repros.py
+
+  # wasm32 with ra-jit's own wasm lowering (docs/platforms.md, "wasm32"): this build compiles for
+  # the target and the programs run under the wasmtime of the flake's `wasm` shell.
+  wasm32:
+    name: wasm32
+    if: inputs.wasm32 && (inputs.tier == 'fast' || inputs.tier == 'full')
+    needs: build
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+          targets: wasm32-wasip1 wasm32-unknown-unknown
+      - uses: actions/download-artifact@v8
+        with:
+          name: ra-jit-${{ inputs.platform }}
+          path: target/release
+      - name: ra-jit
+        working-directory: target/release
+        run: |
+          tar -xf ra-jit.tar
+          echo "RA_JIT_BIN=$PWD/ra-jit" >> "$GITHUB_ENV"
+      - run: nix develop .#wasm --command python3 harness/wasm32.py
 
   # The borrow checker against rustc's own borrow-check tests (docs/borrowck.md), at the
   # commit of the pinned toolchain whose verdicts they are scored by, with a floor under the passes.

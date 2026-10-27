@@ -39,14 +39,16 @@ agents/rules.ts --write` for AGENTS.md).
    2026-10-26 (https://github.com/indexable-inc/blaze/issues/147).
 5. **own-nightly**: blaze is its own toolchain: build every project with blaze's own pinned nightly
    (`harness/toolchain`), named and versioned as blaze's, whatever the project pins. Don't follow
-   the project's toolchain, support stable or several rustc versions, or pin stable. The nightly
-   moves only when blaze moves it, deliberately, with the corpus difftest as the gate. It is the
-   language and std definition blaze matches while rustc is still in the tree, not a dependency to
-   track; every rustc use left is removed on the way to none. Users keep their own toolchain and CI
-   as the final word: blaze says so rather than switching toolchains. See
-   [docs/no-rustc.md](docs/no-rustc.md).
+   the project's toolchain, support stable or several rustc versions, or pin stable. The pin is the
+   latest nightly: a daily workflow moves it to the newest one, gated by the merge gate and the
+   release train on the bump's branch (docs/toolchain.md, "The daily bump"), and a bump that is not
+   green is an open issue, not a skipped day. It is the language and std definition blaze matches
+   while rustc is still in the tree, not a rustc blaze maintains; every rustc use left is removed on
+   the way to none. Users keep their own toolchain and CI as the final word: blaze says so rather
+   than switching toolchains. See [docs/no-rustc.md](docs/no-rustc.md).
    Why: "You should use your own nightly that you control since you are trying to replace rustc"
-   (Andrew, 2026-10-26). We are moving off rustc entirely ("no rustc", Andrew).
+   (Andrew, 2026-10-26). "blaze should be the latest-nightly equivalent" (Andrew, 2026-10-27, #404).
+   We are moving off rustc entirely ("no rustc", Andrew).
 6. **sandbox-everything**: Every test, build script and proc macro runs in a sandbox, by default, on
    every platform. `cargo ra-jit test` runs each test executable in one sandbox (Linux namespaces
    and seccomp, macOS Seatbelt and the interposer) under `all` and `affected` alike; every build
@@ -88,14 +90,15 @@ agents/rules.ts --write` for AGENTS.md).
 11. **worktree-per-lane**: One worktree per lane, never `git stash`: a uniquely named worktree with its
     own `CARGO_TARGET_DIR`. Harnesses run with `RUST_BACKTRACE=0`.
     Why: The stash is shared by every worktree.
-12. **land-through-queue**: Land small and often, through the merge queue only. After the local gate,
-    run `python3 .github/scripts/land.py "what the branch does"` in the lane's worktree: it opens
-    the pull request, waits for its run (the merge gate: the build and the unit tests, about 5
-    minutes), queues it and waits until the gate has passed on it merged onto main and it is merged,
-    or says why not. Every harness runs after the merge, in the release train (train.yaml), whose
-    issue "Release train is red" names the commits since it was last green. Its waiting survives a
-    tool that kills it; `land.py --wait` picks it up again. Never push to main or merge into it by
-    hand. See [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
+12. **land-through-pr**: Land small and often, through a pull request only (no merge queue; the branch
+    need not be up to date with main). After the local gate, run `python3 .github/scripts/land.py
+    "what the branch does"` in the lane's worktree: it opens the pull request, turns on auto-merge,
+    waits for its run (the merge gate: the build and the unit tests, about 5 minutes) and for GitHub
+    to merge it, or says why not. Every harness runs after the merge, in the release train
+    (train.yaml), whose issue "Release train is red" names the commits since it was last green. Its
+    waiting survives a tool that kills it; `land.py --wait` picks it up again. Never push to main or
+    merge into it by hand. See
+    [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
 13. **clean-up-lane**: Delete what a lane made when it is done: its worktree, target directory and ix
     VM, and its merged branch.
 14. **credit-people**: Credit people. A commit or pull request built on someone's suggestion, diagnosis,

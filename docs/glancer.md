@@ -404,6 +404,56 @@ an empty one). The manifest skips all of it when nothing changed.
 cfg) would link the wrong program: it is keyed by everything the store key has, plus the
 crate graph.
 
+**Built (2026-10-27, `crates/ra-jit/src/manifest.rs`).** Not a list of names to look up but
+the files themselves: a full build of a program keeps what it wrote (the object, its patch
+object; the standard library's archive and the executable are made again by the link) in the
+store, each file by its content, under a key of
+- every crate loaded: name, edition, kind, attributes, cfg, environment, origin and root, the
+  files of its package (or of its build script's `OUT_DIR`) with their content, and the keys
+  of its dependencies;
+- the build asked for (`Args`: crates, profile, features, target, debug info, the outputs and
+  the checkout's paths), the target, the standard library unit it links (by its bytes) and
+  the variables that change what is compiled (`RA_JIT_*` but the log's, the store's and the
+  remote's; `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`,
+  `CARGO_TARGET_*`). The store adds the toolchain and ra-jit's own build.
+
+What only compiling finds out (variables `env!` and `option_env!` read of the process, files
+`include_bytes!` and `include_str!` read) is kept with the files and checked before they are
+used. A manifest is kept only when the key computed after the build is the one before it (a
+build that loaded more files than it started with keeps none). A start whose key matches
+writes the files and links, with nothing analysed or compiled. The manifest and its files are
+ordinary store entries, so `ra-jit cache push` and `pull` carry them.
+
+`RA_JIT_MANIFEST=check` builds in full anyway and fails the build when the program is not
+the manifest's; `off` neither reads nor writes one. Two builds of one checkout are not alike
+byte for byte: they lay functions out in the order threads finish and number what they name
+themselves (`ra-jit::<name>::<n>`) in that order, and the debug info follows. So `check`
+compares an object by what it defines: each loaded section's kind, size, bytes and
+relocations (a numbered or local target by the bytes of its section), the unwind table by
+what it covers, and the global symbols. On ripgrep it passes for a cold build against two
+fresh machines' builds from the store, and a fresh machine with `RUSTFLAGS=--cfg=…` or
+`RA_JIT_DEBUGINFO=0` misses and builds in full.
+
+Measured (`harness/freshwarm.py ripgrep`, arm64 ix VM, 32 vCPUs, 16 GB; a fresh machine is
+an empty home and store at the seed's paths, `ra-jit cache pull` from the remote the seed
+pushed to, then `cargo ra-jit build`):
+
+| fresh machine | pull | build, main | build, manifest | compiled with the manifest |
+| --- | --- | --- | --- | --- |
+| nothing changed | 1.0-2.4 s | 8.7 s | 6.9-8.9 s | none (files written in 0.35 s) |
+| one body edit | 1.3-2.7 s | 8.1 s | 9.7 s | as main; a manifest is kept |
+| one signature edit | 1.2-1.5 s | 11.1 s | 9.5 s | as main; a manifest is kept |
+
+What is left of an unchanged build on a fresh machine is the load: 5.2 s of its 6.9 s, of
+which 4.9 s is the build scripts and proc macros (`cargo check --compile-time-deps` and
+the units it loads; the `load-us:` lines under `RA_JIT_STATS`), the nocargo lane's driver.
+An edit low in the graph still misses the store for every crate that depends on it, since an
+edit renames those crates (`content.rs`): that is item 2's second half and #344's code keys
+on `blaze-next`, not this manifest. A daemon that starts from a manifest answers with its files,
+then, while nobody asks, makes the build a start without one would (the checkout's code from
+the store), which holds the patch base: its first edit is a patch, as `storetracked.py`'s
+restart on the same checkout and store checks.
+
 ### Item 4: a flat syntax tree for files nobody edits
 
 Its own lane (#42); the measurements and the design are in

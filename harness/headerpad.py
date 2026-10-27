@@ -89,11 +89,11 @@ def main():
     try:
         build(ws, env, "first build")
         for _ in range(240):
-            if "[ra-jit]" in build(ws, env, "wait for the daemon"):
+            if "[blaze]" in build(ws, env, "wait for the daemon"):
                 break
             time.sleep(0.5)
         else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {home}")
+            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         again = [it for it in links(home) if "again with -Wl,-headerpad" in it]
         print(f"{'the first link':30} {'linked again: ' + again[0] if again else 'NOT LINKED AGAIN WITH MORE ROOM'}")
         wrong += not again
@@ -108,7 +108,7 @@ def main():
             verdict = "ok"
             if printed != str(n + 1):
                 verdict = f"PRINTED {printed!r}, NOT {n + 1}"
-            elif "[ra-jit]" not in said:
+            elif "[blaze]" not in said:
                 verdict = "NOT SERVED BY THE DAEMON"
             elif n > 1 and not how.startswith("spliced"):
                 verdict = "NOT SPLICED"
@@ -120,7 +120,7 @@ def main():
         for log in glob.glob(os.path.join(home, "*", "*", "log")):
             os.rename(log, log + ".old")
         for _ in range(240):
-            if "[ra-jit]" in build(ws, env, "wait for the next daemon"):
+            if "[blaze]" in build(ws, env, "wait for the next daemon"):
                 break
             time.sleep(0.5)
         text = open(source).read()

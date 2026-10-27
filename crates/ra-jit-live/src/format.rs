@@ -186,7 +186,7 @@ impl Patch {
     pub fn decode(bytes: &[u8]) -> Result<Patch, String> {
         let mut reader = Reader(bytes);
         if reader.take(8)? != MAGIC {
-            return Err("not a patch of this version of ra-jit".to_owned());
+            return Err("not a patch of this version of blaze".to_owned());
         }
         let uuid = reader.take(16)?.try_into().map_err(|_| "a short patch")?;
         let sequence = reader.u64()?;

@@ -11,13 +11,19 @@ on apple, inotify on linux, ...) differ per target, so each nix system gets its 
 Cargo.toml, Cargo.lock or a feature set changes; nix/units.nix refuses to evaluate when units.json is
 stale against Cargo.lock / Cargo.toml.
 
+Units are keyed by `unit_key`, not by their position in cargo's list, and name their dependencies
+by key, so that a unit added or removed leaves the others' lines as they were. The staleness check
+reads `lock` and `manifest`, the parsed Cargo.lock and Cargo.toml the graph was made
+from, which units.nix compares with `builtins.fromTOML` of the files themselves. Not a hash of each file:
+two pull requests that change Cargo.lock in different places then change these in different places too,
+and git merges them as it merges the lock (#353).
+
 Python 3.13, stdlib only. Every step has its own timeout; failures name the step, command, exit code
 and stderr tail.
 """
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import sys
@@ -88,10 +94,6 @@ async def fetch_graphs(project_dir: Path, flags: list[str]) -> tuple[dict[str, d
     return {s: json.loads(t.result()) for s, t in graphs.items()}, json.loads(t_meta.result())
 
 
-def sha256(p: Path) -> str:
-    return hashlib.sha256(p.read_bytes()).hexdigest()
-
-
 def key_of(pkg_id: str) -> str:
     # `<source>#name@version` (or `<source>#version` when the name is the path's last segment).
     src, _, frag = pkg_id.partition("#")
@@ -128,12 +130,34 @@ def build_packages(meta: dict, project_dir: Path) -> dict[str, dict]:
     return packages
 
 
+def unit_key(pkg: str, u: dict) -> str:
+    """A name for a unit that stays the same when units are added or removed around it, unlike its
+    position in cargo's list: what it builds (package, target kind and name), how (mode) and for
+    which side (`host` for build scripts and proc macros)."""
+    t = u["target"]
+    return " ".join([pkg, t["kind"][0], t["name"], u["mode"], *(["host"] if u["platform"] is None else [])])
+
+
 def build_system(system: str, graph: dict, packages: dict[str, dict], triple: str) -> dict:
-    units = []
+    keys = []
     for u in graph["units"]:
         pkg = key_of(u["pkg_id"])
         if pkg not in packages:
             raise StepError(f"step 'nix': unit package {u['pkg_id']} is not in cargo metadata")
+        keys.append(unit_key(pkg, u))
+    # A package built for normal dependencies and for build dependencies with different features
+    # (resolver 2) has two build scripts, both on the host: only those keys name their features.
+    named = [k for k in keys if keys.count(k) > 1]
+    keys = [
+        f"{k} features={','.join(sorted(u['features'])) or '-'}" if k in named else k
+        for k, u in zip(keys, graph["units"])
+    ]
+    if len(set(keys)) != len(keys):
+        twice = sorted({k for k in keys if keys.count(k) > 1})
+        raise StepError(f"step 'nix {system}': two units are both named {twice}; unit_key needs to tell them apart")
+    units = {}
+    for key, u in zip(keys, graph["units"]):
+        pkg = key_of(u["pkg_id"])
         t = u["target"]
         # platform None = host unit (build script / proc-macro); otherwise the target triple. Builds are
         # native, so both are the same machine in nix.
@@ -143,7 +167,7 @@ def build_system(system: str, graph: dict, packages: dict[str, dict], triple: st
             raise StepError(f"step 'nix': unsupported unit mode {u['mode']}")
         pdir = Path(packages[pkg]["manifest_dir"])
         pr = u["profile"]
-        units.append({
+        units[key] = {
             "pkg": pkg,
             "target": t["name"],
             "kind": t["kind"][0],
@@ -153,9 +177,12 @@ def build_system(system: str, graph: dict, packages: dict[str, dict], triple: st
             "src": str(Path(t["src_path"]).relative_to(pdir)),
             "features": sorted(u["features"]),
             "profile": {k: pr[k] for k in ("name", "opt_level", "debuginfo", "debug_assertions", "overflow_checks", "panic", "codegen_units")},
-            "deps": [{"i": d["index"], "name": d["extern_crate_name"]} for d in u["dependencies"]],
-        })
-    return {"units": units, "roots": graph["roots"]}
+            "deps": sorted(
+                ({"unit": keys[d["index"]], "name": d["extern_crate_name"]} for d in u["dependencies"]),
+                key=lambda d: (d["unit"], d["name"]),
+            ),
+        }
+    return {"units": units, "roots": [keys[i] for i in graph["roots"]]}
 
 
 def write_units(project: str, project_dir: Path, graphs: dict[str, dict], meta: dict) -> None:
@@ -164,9 +191,10 @@ def write_units(project: str, project_dir: Path, graphs: dict[str, dict], meta: 
     for p in packages.values():
         del p["manifest_dir"]  # absolute, host specific
     out = {
-        "version": 3,
+        "version": 4,
         "dir": str(project_dir.relative_to(ROOT)),
-        "inputs": {n: sha256(project_dir / n) for n in ("Cargo.lock", "Cargo.toml")},
+        "lock": tomllib.loads((project_dir / "Cargo.lock").read_text()),
+        "manifest": tomllib.loads((project_dir / "Cargo.toml").read_text()),
         "packages": packages,
         "systems": systems,
     }

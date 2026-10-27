@@ -621,6 +621,8 @@ fn main() {
     println!("simd_aarch64 {}", cases::simd_aarch64::run());
     #[cfg(all(target_arch = "aarch64", feature = "nightly"))]
     println!("neon_intrinsics {}", cases::neon_intrinsics::run());
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", feature = "nightly"))]
+    println!("half_intrinsics {}", cases::half_intrinsics::run());
     #[cfg(feature = "nightly")]
     {
         use std::simd::Simd;

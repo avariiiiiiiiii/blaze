@@ -100,6 +100,7 @@ fn list(lanes: Lanes, first: u32, n: u32) -> String {
 }
 
 const SIXTEEN: Lanes = Lanes { count: 16, bits: 8, float: false };
+const HALF: Lanes = Lanes { count: 1, bits: 16, float: true };
 
 /// The instructions of the intrinsic `llvm.{name}`, or `None` for one this does not know.
 pub(super) fn lower(name: &str) -> Option<Lowered> {
@@ -143,6 +144,70 @@ fn finish(lowered: Lowered, types: &[Lanes]) -> Lowered {
 /// intrinsics rustc lowers to its `trunc`, `round` and `rint`.
 pub(super) fn rounding(mnemonic: &str, lanes: Lanes) -> Option<Lowered> {
     Some(finish(instruction_of(mnemonic, lanes, lanes)?, &[lanes]))
+}
+
+/// The generic intrinsic `op` (`simd_add`, `simd_lt`, `simd_cast`, ...) where its operands'
+/// lanes `a` or its result's `r` are halves, as AArch64's LLVM selects it in a function with
+/// the half-precision instructions: one instruction on the lanes, which rounds once and
+/// propagates a NaN as the instruction does. `signed` is whether the integers of a
+/// `simd_cast` are.
+pub(super) fn half_vector(op: &str, r: Lanes, a: Lanes, signed: bool) -> Option<Lowered> {
+    let half = |it: Lanes| it.float && it.bits == 16;
+    if r.count != a.count || !r.is_register() || !a.is_register() || !(half(r) || half(a)) {
+        return None;
+    }
+    let lowered = match op {
+        "simd_add" | "simd_sub" | "simd_mul" | "simd_div" if r == a => {
+            let text = format!("f{} {}, {}, {}", &op[5..], r.reg(0), a.reg(1), a.reg(2));
+            instruction(&[], text, [a, a], [r])
+        }
+        // A true lane is all ones. `le` and `lt` are `ge` and `gt` of the operands swapped.
+        "simd_eq" | "simd_ge" | "simd_gt" | "simd_le" | "simd_lt"
+            if r.is_int() && r.bits == 16 && half(a) =>
+        {
+            let (mnemonic, first, second) = match op {
+                "simd_eq" => ("fcmeq", 1, 2),
+                "simd_ge" => ("fcmge", 1, 2),
+                "simd_gt" => ("fcmgt", 1, 2),
+                "simd_le" => ("fcmge", 2, 1),
+                _ => ("fcmgt", 2, 1),
+            };
+            let text = format!("{mnemonic} {}, {}, {}", r.reg(0), a.reg(first), a.reg(second));
+            instruction(&[], text, [a, a], [r])
+        }
+        "simd_neg" | "simd_fabs" | "simd_fsqrt" | "simd_floor" | "simd_ceil" if r == a => {
+            let mnemonic = match op {
+                "simd_neg" => "fneg",
+                "simd_fabs" => "fabs",
+                "simd_fsqrt" => "fsqrt",
+                "simd_floor" => "frintm",
+                _ => "frintp",
+            };
+            instruction_of(mnemonic, r, a)
+        }
+        // `a * b + c`, rounded once, into the register of `c`. LLVM's pattern names the
+        // factors the other way round, which decides which NaN the instruction keeps.
+        "simd_fma" if r == a => {
+            let text = format!("mov v0.16b, v3.16b\nfmla {}, {}, {}", r.reg(0), a.reg(2), a.reg(1));
+            instruction(&[], text, [a, a, a], [r])
+        }
+        // A float out of the integer's range is undefined for `simd_cast`; the instruction
+        // saturates it and makes a NaN 0.
+        "simd_cast" => {
+            let mnemonic = match (r.float, a.float, r.bits, a.bits) {
+                (true, true, 16, 32) => "fcvtn",
+                (true, true, 32, 16) => "fcvtl",
+                (true, false, 16, 16) if signed => "scvtf",
+                (true, false, 16, 16) => "ucvtf",
+                (false, true, 16, 16) if signed => "fcvtzs",
+                (false, true, 16, 16) => "fcvtzu",
+                _ => return None,
+            };
+            instruction_of(mnemonic, r, a)
+        }
+        _ => None,
+    }?;
+    Some(finish(lowered, &[r, a]))
 }
 
 /// What `lower` builds a [`Lowered`] of.
@@ -220,6 +285,19 @@ fn neon(op: &str, types: &[Lanes]) -> Option<Lowered> {
             &[r, a],
         ) if r.is_int() && a.float && r.count == a.count && r.bits == a.bits => {
             instruction(&[], format!("{op} {}, {}", r.reg(0), a.reg(1)), [a], [r])
+        }
+        // A half to an integer of 32 or 64 bits, which LLVM converts into a general register.
+        (
+            "fcvtas" | "fcvtau" | "fcvtms" | "fcvtmu" | "fcvtns" | "fcvtnu" | "fcvtps" | "fcvtpu",
+            &[r, a],
+        ) if r.is_int() && r.count == 1 && matches!(r.bits, 32 | 64) && a == HALF => {
+            let (general, vector) = if r.bits == 32 { ('w', 's') } else { ('x', 'd') };
+            let text = format!("{op} {general}9, h1\nfmov {vector}0, {general}9");
+            instruction(&[], text, [a], [r])
+        }
+        // Of two halves, into 32 bits: the instruction writes 16 and clears the rest.
+        ("facge" | "facgt", &[r, a]) if r == Lanes::single(32) && a == HALF => {
+            instruction(&[], format!("{op} h0, h1, h2"), [a, a], [r])
         }
         // To single precision, rounded to odd.
         ("fcvtxn", &[r, a]) if r.float && a.float && r.count == a.count && a.bits == 64 => {
@@ -502,6 +580,9 @@ mod tests {
             "fptoui.sat.v1i64.v1f64",
             "roundeven.v8f16",
             "aarch64.neon.faddv.f64.v4f64",
+            "aarch64.neon.fcvtps.i64.f16",
+            "aarch64.neon.fcvtau.i32.f16",
+            "aarch64.neon.facgt.i32.f16",
         ]);
         let expected = "\
 aarch64.neon.fmaxnmv.f32.v2f32: fmaxnmp s0, v1.2s [\"neon\"]
@@ -522,7 +603,29 @@ aarch64.crypto.bcaxs.v8i16: bcax v0.16b, v1.16b, v2.16b, v3.16b [\"neon\", \"sha
 fptoui.sat.v1i64.v1f64: fcvtzu d0, d1 [\"neon\"]
 roundeven.v8f16: frintn v0.8h, v1.8h [\"neon\", \"fp16\"]
 aarch64.neon.faddv.f64.v4f64: none
+aarch64.neon.fcvtps.i64.f16: fcvtps x9, h1; fmov d0, x9 [\"neon\", \"fp16\"]
+aarch64.neon.fcvtau.i32.f16: fcvtau w9, h1; fmov s0, w9 [\"neon\", \"fp16\"]
+aarch64.neon.facgt.i32.f16: facgt h0, h1, h2 [\"neon\", \"fp16\"]
 ";
         assert_eq!(described, expected);
+    }
+
+    #[test]
+    fn a_generic_intrinsic_on_halves_is_one_instruction() {
+        let halves = Lanes::floats(16, 4);
+        let shorts = Lanes { count: 4, bits: 16, float: false };
+        let singles = Lanes::floats(32, 4);
+        let text = |op, r, a, signed| half_vector(op, r, a, signed).map(|it| it.text);
+        assert_eq!(text("simd_div", halves, halves, true).unwrap(), "fdiv v0.4h, v1.4h, v2.4h");
+        assert_eq!(text("simd_lt", shorts, halves, true).unwrap(), "fcmgt v0.4h, v2.4h, v1.4h");
+        assert_eq!(
+            text("simd_fma", Lanes::floats(16, 8), Lanes::floats(16, 8), true).unwrap(),
+            "mov v0.16b, v3.16b\nfmla v0.8h, v2.8h, v1.8h"
+        );
+        assert_eq!(text("simd_cast", halves, singles, true).unwrap(), "fcvtn v0.4h, v1.4s");
+        assert_eq!(text("simd_cast", halves, shorts, false).unwrap(), "ucvtf v0.4h, v1.4h");
+        assert_eq!(text("simd_cast", shorts, halves, true).unwrap(), "fcvtzs v0.4h, v1.4h");
+        assert_eq!(text("simd_cast", Lanes::floats(16, 8), Lanes::floats(32, 8), true), None);
+        assert_eq!(text("simd_ne", shorts, halves, true), None);
     }
 }

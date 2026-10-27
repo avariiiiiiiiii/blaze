@@ -4,7 +4,9 @@
 //!
 //! - an `f16` is widened to `f32` by AArch64's `fcvt` (to `f64` for `fma`), worked on there
 //!   and narrowed back by `fcvt`, as LLVM does without the half-precision instructions; its
-//!   sign bit is flipped or cleared in place;
+//!   sign bit is flipped or cleared in place. In a function with the half-precision
+//!   instructions (`fp16`) its arithmetic, square root, rounding and `fma` are those
+//!   instructions, as LLVM selects them there;
 //! - an `f128` is handed to compiler-builtins (`__addtf3`, `__lttf2`, `__fixtfsi`, ...) and
 //!   to C's `long double` functions (`fmodl`, `sqrtl`, ...), the calls LLVM makes.
 //!
@@ -64,6 +66,27 @@ impl<'db> FunctionCx<'_, 'db> {
         let callee = self.cg.assembly(asm::fcvt(letter(to), letter(from)), &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let call = self.builder.ins().call(callee, &[value]);
+        self.builder.inst_results(call)[0]
+    }
+
+    /// Whether the function being compiled has AArch64's half-precision instructions, which
+    /// LLVM then works on an `f16` with: in its own register, rounded once, a signalling NaN
+    /// of either operand taking precedence over a quiet one.
+    pub(super) fn half_precision(&self) -> bool {
+        self.cg.target.arch == Arch::Aarch64
+            && self.body.and_then(|it| it.owner.as_function()).is_some_and(|func| {
+                hir_ty::TargetFeatures::from_fn(self.cg.db, func).enables("fp16")
+            })
+    }
+
+    /// The half-precision `instruction` of `args`, passed from `h0` up, its result in `h0`.
+    fn half_instruction(&mut self, instruction: &str, args: &[Value]) -> Value {
+        let mut sig = self.cg.make_signature();
+        sig.params.extend(args.iter().map(|_| AbiParam::new(types::F16)));
+        sig.returns.push(AbiParam::new(types::F16));
+        let callee = self.cg.assembly(asm::half(instruction), &sig);
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        let call = self.builder.ins().call(callee, args);
         self.builder.inst_results(call)[0]
     }
 
@@ -140,6 +163,16 @@ impl<'db> FunctionCx<'_, 'db> {
     /// An operator of two `f16`s or two `f128`s.
     pub(super) fn soft_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
         if self.builder.func.dfg.value_type(l) == types::F16 {
+            let mnemonic = match op {
+                BinOp::Add => Some("fadd"),
+                BinOp::Sub => Some("fsub"),
+                BinOp::Mul => Some("fmul"),
+                BinOp::Div => Some("fdiv"),
+                _ => None,
+            };
+            if let Some(mnemonic) = mnemonic.filter(|_| self.half_precision()) {
+                return Ok(self.half_instruction(&format!("{mnemonic} h0, h0, h1"), &[l, r]));
+            }
             let (l, r) = (self.widen_half(l, types::F32), self.widen_half(r, types::F32));
             let value = self.float_binary_op(op, l, r)?;
             return Ok(match op {
@@ -289,6 +322,18 @@ impl<'db> FunctionCx<'_, 'db> {
         if op == "fabs" {
             return Ok(self.soft_abs(value));
         }
+        if ty == types::F16 && self.half_precision() {
+            let mnemonic = match op {
+                "sqrt" => "fsqrt",
+                "floor" => "frintm",
+                "ceil" => "frintp",
+                "trunc" => "frintz",
+                // `rint`, in the mode a Rust program runs in, to even.
+                "round_ties_even" => "frintx",
+                _ => "frinta",
+            };
+            return Ok(self.half_instruction(&format!("{mnemonic} h0, h0"), &[value]));
+        }
         if ty == types::F16 {
             let wide = self.widen_half(value, types::F32);
             let ins = self.builder.ins();
@@ -318,6 +363,9 @@ impl<'db> FunctionCx<'_, 'db> {
     pub(super) fn soft_fma(&mut self, a: Value, b: Value, c: Value) -> Result<Value> {
         if self.builder.func.dfg.value_type(a) == types::F128 {
             return self.float_libcall("fmal", types::F128, &[a, b, c]);
+        }
+        if self.half_precision() {
+            return Ok(self.half_instruction("fmadd h0, h0, h1, h2", &[a, b, c]));
         }
         let [a, b, c] = [a, b, c].map(|it| self.widen_half(it, types::F64));
         let value = self.builder.ins().fma(a, b, c);

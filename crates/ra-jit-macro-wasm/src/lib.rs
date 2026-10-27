@@ -80,6 +80,7 @@ fn engine() -> &'static Engine {
     ENGINE.get_or_init(|| {
         let mut config = Config::new();
         config.cranelift_nan_canonicalization(true);
+        config.parallel_compilation(true);
         Engine::new(&config).expect("Wasmtime's configuration for proc macros")
     })
 }
@@ -568,33 +569,41 @@ impl Wasm {
         let start = Instant::now();
         let failed = |e: wasmtime::Error| format!("{}: {e:#}", path.display());
         let key = code_key(&digest);
-        // SAFETY: what the store has under the key is what `serialize` wrote, checked against
-        // its checksum when read; Wasmtime refuses code of another version or configuration.
-        let kept = store
-            .and_then(|it| it.get(&key))
-            .and_then(|it| unsafe { Module::deserialize(engine(), it) }.ok());
+        let file = code_file(path, &key);
         let stats = std::env::var_os("RA_JIT_STATS").is_some();
-        let was_kept = kept.is_some();
-        let module = match kept {
-            Some(module) => {
-                if stats {
-                    eprintln!(
-                        "blaze: a proc-macro module's machine code the store kept: {}",
-                        path.display()
-                    );
+        // SAFETY: the file beside the module and what the store has under the key are what
+        // `serialize` wrote for this key, the store's checked against its checksum when read;
+        // Wasmtime refuses code of another version, configuration or CPU.
+        let beside = unsafe { Module::deserialize_file(engine(), &file) }.ok();
+        let (module, was_kept) = match beside {
+            // Written beside it by the process that compiled it, which kept it in the store.
+            Some(module) => (module, true),
+            None => match store
+                .and_then(|it| it.get_lasting(&key))
+                .and_then(|it| unsafe { Module::deserialize(engine(), &it) }.ok().map(|m| (m, it)))
+            {
+                Some((module, code)) => {
+                    write_whole(&file, &code);
+                    (module, true)
                 }
-                module
-            }
-            None => {
-                if stats {
-                    let store = if store.is_some() { "" } else { " (no store yet)" };
-                    eprintln!(
-                        "blaze: Cranelift compiles the proc-macro module {}{store}",
-                        path.display()
-                    );
+                None => {
+                    let module = Module::new(engine(), bytes).map_err(failed)?;
+                    if stats {
+                        eprintln!(
+                            "blaze: Cranelift compiled the proc-macro module {} in {:.1?}",
+                            path.display(),
+                            start.elapsed()
+                        );
+                    }
+                    let code = module.serialize().map_err(failed)?;
+                    write_whole(&file, &code);
+                    if let Some(store) = store {
+                        store.insert_lasting(&key, &code);
+                        store.flush();
+                    }
+                    (module, store.is_some())
                 }
-                Module::new(engine(), bytes).map_err(failed)?
-            }
+            },
         };
         let mut linker = Linker::new(engine());
         wasi::add(&mut linker).map_err(failed)?;
@@ -618,7 +627,7 @@ impl Wasm {
             return;
         }
         if let Ok(code) = self.pre.module().serialize() {
-            store.insert(&code_key(&self.digest), &code);
+            store.insert_lasting(&code_key(&self.digest), &code);
             store.flush();
             if std::env::var_os("RA_JIT_STATS").is_some() {
                 eprintln!("blaze: the store keeps the machine code of {}", self.path.display());
@@ -809,13 +818,75 @@ impl Wasm {
     }
 }
 
-/// The package directory of the crate a macro expands in, from its `CARGO_MANIFEST_DIR`.
-/// What the store keeps the machine code of the module of `digest` under, for this build of
-/// ra-jit (Wasmtime's version and configuration) and machine.
+/// What the store keeps the machine code of the module of `digest` under: the module's bytes
+/// and what Wasmtime says code must match to load (its version, its configuration, the
+/// target and the CPU features it compiled for), and nothing of the checkout, the build of
+/// ra-jit or the toolchain, so every checkout and every host of the same kind shares it.
 fn code_key(digest: &[u8; 32]) -> [u8; 32] {
-    let mut key = keyed::Key::new("wasmtime machine code of a proc-macro module 1");
-    key.field(digest);
+    use std::hash::Hash as _;
+    struct Fields<'a>(&'a mut keyed::Key);
+    impl std::hash::Hasher for Fields<'_> {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.field(bytes);
+        }
+        fn finish(&self) -> u64 {
+            0
+        }
+    }
+    let mut key = keyed::Key::new("wasmtime machine code of a proc-macro module 2");
+    key.field(digest).field(std::env::consts::ARCH.as_bytes());
+    engine().precompile_compatibility_hash().hash(&mut Fields(&mut key));
     key.done()
+}
+
+/// The file beside the module at `path` its machine code of `key` is kept in, for a process to
+/// map rather than read.
+fn code_file(path: &Path, key: &[u8; 32]) -> PathBuf {
+    let hex: String = key[..8].iter().map(|it| format!("{it:02x}")).collect();
+    let mut named = path.as_os_str().to_owned();
+    named.push(format!(".{hex}.cwasm"));
+    PathBuf::from(named)
+}
+
+/// Writes `bytes` to `path` whole or not at all: a process that reads it while it is written
+/// sees the old file or none.
+fn write_whole(path: &Path, bytes: &[u8]) {
+    let new = path.with_extension(format!("{}.new", std::process::id()));
+    if std::fs::write(&new, bytes).is_err() || std::fs::rename(&new, path).is_err() {
+        _ = std::fs::remove_file(&new);
+    }
+}
+
+/// Readies the module at `path` for the processes that expand with it, in the build that
+/// made it: compiles it with Cranelift (or finds its machine code in `store`), keeps the code
+/// beside it and in `store`, and writes the list of its macros beside it, so that a load
+/// compiles nothing and reads the list without running it.
+pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), String> {
+    let start = Instant::now();
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let digest = keyed::sha256(&bytes);
+    let list = list_file(path);
+    let listed = std::fs::read_to_string(&list)
+        .is_ok_and(|it| it.strip_prefix(&hex(&digest)).is_some_and(|it| it.starts_with('\n')));
+    if listed && code_file(path, &code_key(&digest)).is_file() {
+        return Ok(());
+    }
+    let wasm = Wasm::compile(path, digest, &bytes, store)?;
+    if !listed {
+        let text = wasm.list()?;
+        write_whole(&list, format!("{}\n{text}", hex(&digest)).as_bytes());
+    }
+    if let Some(store) = store {
+        store.seal();
+    }
+    if std::env::var_os("RA_JIT_STATS").is_some() {
+        eprintln!("blaze: the proc-macro module {} ready in {:.1?}", path.display(), start.elapsed());
+    }
+    Ok(())
+}
+
+fn hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|it| format!("{it:02x}")).collect()
 }
 
 /// What the module of `bytes` at `path` was built of, as the file beside it says, when that
@@ -830,6 +901,7 @@ fn made_of(path: &Path, bytes: &[u8]) -> Option<[u8; 32]> {
     (keyed::digest_bytes(bytes) == file).then(|| identity.done())
 }
 
+/// The package directory of the crate a macro expands in, from its `CARGO_MANIFEST_DIR`.
 fn package_dir(env: &Env) -> Option<PathBuf> {
     env.get("CARGO_MANIFEST_DIR").map(PathBuf::from).filter(|it| it.is_absolute())
 }
@@ -1050,7 +1122,7 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
     let path: &Path = path.as_ref();
     let bytes = std::fs::read(path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
     let digest = keyed::sha256(&bytes);
-    let hex: String = digest.iter().map(|it| format!("{it:02x}")).collect();
+    let hex = hex(&digest);
     let lazy = Arc::new(Lazy { path: path.to_owned(), digest, compiled: OnceLock::new() });
     let file = list_file(path);
     let kept = std::fs::read_to_string(&file).ok();
@@ -1060,7 +1132,7 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
             let wasm = Wasm::at(path, store()).map_err(failed)?;
             _ = lazy.compiled.set(Ok(wasm.clone()));
             let text = wasm.list().map_err(failed)?;
-            _ = std::fs::write(&file, format!("{hex}\n{text}"));
+            write_whole(&file, format!("{hex}\n{text}").as_bytes());
             text
         }
     };

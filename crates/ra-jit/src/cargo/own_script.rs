@@ -340,7 +340,7 @@ pub(crate) fn made_of(named: &Path, exe: &Path) -> Option<String> {
     (super::keyed::digest(exe.to_str()?) == digest).then(|| key.to_owned())
 }
 
-fn store() -> Option<&'static ra_jit_store::Store> {
+pub(crate) fn store() -> Option<&'static ra_jit_store::Store> {
     ra_jit_store::compiles_against(BUILDS);
     ra_jit_store::Store::global_or(super::daemon::store().as_deref())
 }

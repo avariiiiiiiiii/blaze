@@ -401,6 +401,9 @@ fn module_of(sysroot: &Path, library: &Path, described: &Path) -> Result<PathBuf
         dep_info: dir.join(format!("{stem}.d")),
     };
     own_script::compile_described(sysroot, &description, &made, dir)?;
+    // Here, as soon as it is built and beside the other modules' builds, rather than in the
+    // load, which loads one module after another.
+    ra_jit_macro_wasm::prepare(&made.exe, own_script::store())?;
     Ok(made.exe)
 }
 

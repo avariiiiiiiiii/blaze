@@ -1,9 +1,11 @@
 name: release
 
-# A pushed tag `vX.Y.Z` builds blaze for Linux (x86_64, aarch64) and macOS (aarch64) and makes
-# a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS,
-# and the tag's CHANGELOG.md section as the notes. The tag must match the workspace version.
-# A manual run builds and checks the same archives without releasing anything.
+# A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/release_notes.py) builds blaze for
+# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS, and the
+# tag's CHANGELOG.md section as the notes. The tag must match the workspace version. A tag
+# pushed by hand starts it; the release train's tags start it by dispatch on the tag (pgo.yaml's
+# pin job, .github/scripts/train_release.py), since a tag the workflow's own token makes starts
+# no workflow. A manual run on a branch builds and checks the same archives without releasing.
 on:
   push:
     tags: ["v*"]
@@ -59,16 +61,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # rust-src: blaze's proc-macro server and the standard library are compiled from it.
-      - run: rustup toolchain install 1.99.0 --profile minimal --component rust-src && rustup default 1.99.0
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component rust-src && rustup default "$tc"
       # `cargo blaze --version` names the commit, as the flake's build does.
       - run: echo "RA_JIT_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
       # A release's builds fetch the standard library from the release's assets (the step
       # `Standard library` below; crates/ra-jit/src/shipped.rs).
       - if: github.ref_type == 'tag'
         run: echo "RA_JIT_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-      # No build cache: release binaries come from a clean build. Without the `llvm` feature:
-      # that one links libLLVM dynamically, which a machine that downloads the binary lacks.
-      # The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a
+      # No build cache: release binaries come from a clean build. With the `llvm` feature, so
+      # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
+      # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a
       # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
       # since the pgo workflow last ran). On Linux the ra-jit it built then builds blaze's
       # proc-macro server (`--server`), which the archive has beside it: the server that
@@ -104,7 +106,7 @@ jobs:
       - name: Standard library
         continue-on-error: true
         run: |
-          shipped/ra-jit std "$RUNNER_TEMP/std" "$(rustc +1.99.0 --print sysroot)"
+          shipped/ra-jit std "$RUNNER_TEMP/std" "$(rustc +"$(cat harness/toolchain)" --print sysroot)"
           mkdir std-assets
           cd "$RUNNER_TEMP/std"
           find manifests packs keys -type f ! -name '*.lock' | while read -r file; do
@@ -127,7 +129,7 @@ jobs:
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       - run: python3 -I .github/scripts/publish_crates.py --publish --max-hours 5
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

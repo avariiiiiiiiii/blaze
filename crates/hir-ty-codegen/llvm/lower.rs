@@ -574,7 +574,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             function.add_attribute(AttributeLoc::Function, attribute);
         }
         // Every function gets an unwind table entry, as a panic may cross any of them.
-        let uwtable = Attribute::get_named_enum_kind_id("uwtable");
+        let uwtable = super::attribute_kind("uwtable");
         function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(uwtable, 2));
         Ok(function)
     }
@@ -938,9 +938,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         pointees: &[(u32, Pointee)],
         mut add: impl FnMut(AttributeLoc, Attribute),
     ) {
-        let attribute = |name, value| {
-            context.create_enum_attribute(Attribute::get_named_enum_kind_id(name), value)
-        };
+        let attribute =
+            |name, value| context.create_enum_attribute(super::attribute_kind(name), value);
         for &(at, pointee) in pointees {
             let loc = AttributeLoc::Param(at);
             add(loc, attribute("noundef", 0));
@@ -969,7 +968,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         side: Side,
         mut add: impl FnMut(AttributeLoc, Attribute),
     ) {
-        let kind = |name| Attribute::get_named_enum_kind_id(name);
+        let kind = super::attribute_kind;
         let extension = |extension| match extension {
             ArgumentExtension::None => None,
             ArgumentExtension::Uext => Some(context.create_enum_attribute(kind("zeroext"), 0)),
@@ -981,8 +980,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             match param.purpose {
                 ArgumentPurpose::StructReturn => {
                     add(loc, context.create_type_attribute(kind("sret"), i8.into()));
-                    // Where a value is returned to is not kept, as rustc tells LLVM.
-                    add(loc, context.create_enum_attribute(kind("nocapture"), 0));
+                    // Where a value is returned to is not kept, as rustc tells LLVM:
+                    // `captures(none)`, whose value 0 is LLVM's `CaptureInfo::none()`.
+                    add(loc, context.create_enum_attribute(kind("captures"), 0));
                 }
                 ArgumentPurpose::StructArgument(size) => {
                     let ty = i8.array_type(size);
@@ -2000,10 +2000,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             false,
         );
         let call = self.builder.build_indirect_call(ty, code, &args, "")?;
-        let nounwind = Attribute::get_named_enum_kind_id("nounwind");
+        let nounwind = super::attribute_kind("nounwind");
         call.add_attribute(AttributeLoc::Function, self.context.create_enum_attribute(nounwind, 0));
         if options.contains(AsmOptions::NOMEM) {
-            let memory = Attribute::get_named_enum_kind_id("memory");
+            let memory = super::attribute_kind("memory");
             call.add_attribute(
                 AttributeLoc::Function,
                 self.context.create_enum_attribute(memory, 0),

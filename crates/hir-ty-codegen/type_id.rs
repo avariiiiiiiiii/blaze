@@ -57,6 +57,7 @@ enum DefPathData<'a> {
     Impl,
     TypeNs(&'a str),
     ValueNs(&'a str),
+    Closure,
     Ctor,
     AnonConst,
 }
@@ -76,12 +77,15 @@ impl Fingerprint {
     fn child_at(self, data: DefPathData<'_>, earlier: u32) -> Self {
         let mut hasher = StableSipHasher128::new();
         hasher.write_u64(self.1);
+        // The variant's index in rustc's `DefPathData`, where `TestBinderConstraints` comes
+        // between `Closure` (9) and `Ctor`.
         let (discriminant, name) = match data {
             DefPathData::Impl => (1, None),
             DefPathData::TypeNs(name) => (5, Some(name)),
             DefPathData::ValueNs(name) => (6, Some(name)),
-            DefPathData::Ctor => (10, None),
-            DefPathData::AnonConst => (11, None),
+            DefPathData::Closure => (9, None),
+            DefPathData::Ctor => (11, None),
+            DefPathData::AnonConst => (12, None),
         };
         hasher.write_isize(discriminant);
         if let Some(name) = name {
@@ -122,6 +126,9 @@ pub(super) struct TypeIdHasher<'a, 'db> {
     ours: bool,
     /// Whether the type names something of a crate rustc compiled nothing of.
     unbuilt: bool,
+    /// Whether the type names a closure of a crate whose code is ours, whose `TypeId` only
+    /// code instantiated with it asks for: see [`Self::closure`].
+    own_closure: bool,
     /// The innermost type that could not be hashed.
     pub(super) stuck: Option<String>,
 }
@@ -140,25 +147,26 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             owned,
             ours: false,
             unbuilt: false,
+            own_closure: false,
             stuck: None,
         }
     }
 
     /// rustc's hash of the type, or one of our own for a type that names something of a crate
-    /// rustc compiled nothing of: only code instantiated with such a type can ask for its
-    /// `TypeId`, and that code is all ours, so there is no hash of rustc's to agree with. Ours
-    /// stands on what the type is written in rather than on where, so that it is the same in
-    /// every build.
+    /// rustc compiled nothing of, or a closure of a crate whose code is ours: only code
+    /// instantiated with such a type can ask for its `TypeId`, and that code is all ours, so
+    /// there is no hash of rustc's to agree with. Ours stands on what the type is written in
+    /// rather than on where, so that it is the same in every build.
     pub(super) fn type_id(&mut self, ty: Ty<'db>) -> Option<u128> {
         let mut hasher = StableSipHasher128::new();
         if self.ty(&mut hasher, ty).is_none() {
-            (self.ours, self.unbuilt, self.stuck) = (true, false, None);
+            (self.ours, self.unbuilt, self.own_closure, self.stuck) = (true, false, false, None);
             self.binders.clear();
             self.signatures = 0;
             hasher = StableSipHasher128::new();
             hasher.write(b"ra-jit type");
             self.ty(&mut hasher, ty)?;
-            if !self.unbuilt {
+            if !self.unbuilt && !self.own_closure {
                 return None;
             }
         }
@@ -338,6 +346,73 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         self.body_path(around)
     }
 
+    /// The `DefPathHash` rustc gives a closure of a crate it compiled, which only code rustc
+    /// compiled can have instantiated, so its `TypeId` has to be rustc's: the function's path,
+    /// then a `Closure` child for each closure it is written in and for itself, by its place
+    /// among the closures of the one before (`{closure#n}`). `None` leaves it to
+    /// [`Self::closure`], as for a closure of a crate whose code is ours.
+    fn rustc_closure_path(&mut self, closure: InternedClosure<'_>) -> Option<Fingerprint> {
+        let db = self.db;
+        let InternedClosure { owner, expr, .. } = closure;
+        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
+            return None;
+        };
+        if self.ours || self.owned.contains(&func.krate(db)) {
+            return None;
+        }
+        // An `async` closure is two definitions to rustc, the closure and its body's
+        // coroutine, where the body has one expression.
+        let body = hir_def::expr_store::Body::of(db, func.into());
+        if let hir_def::hir::Expr::Closure { closure_kind, .. } = &body[expr]
+            && let hir_def::hir::ClosureKind::Coroutine { source, .. } = closure_kind
+            && *source == hir_def::hir::CoroutineSource::Closure
+        {
+            return None;
+        }
+        let places = hir_ty::mir::type_name::rustc_closure_places(db, func.into(), expr)?;
+        let mut path = self.function_path(func)?;
+        for place in places {
+            path = path.child_at(DefPathData::Closure, u32::try_from(place).ok()?);
+        }
+        Some(path)
+    }
+
+    /// A coroutine's arguments as rustc has them. The body of an `async` block or `async fn`
+    /// is lowered to take the task's context as a `ResumeTy`, which is its resume type, where
+    /// rust-analyzer has `()`. `None` for an `async gen` one, whose yield type rustc wraps.
+    fn rustc_coroutine_args(
+        &self,
+        coroutine: InternedClosure<'_>,
+        args: GenericArgs<'db>,
+    ) -> Option<GenericArgs<'db>> {
+        use hir_def::hir::{ClosureKind, CoroutineKind, Expr};
+        let db = self.db;
+        let InternedClosure { owner, expr, .. } = coroutine;
+        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
+            return None;
+        };
+        let body = hir_def::expr_store::Body::of(db, func.into());
+        let Expr::Closure { closure_kind: ClosureKind::Coroutine { kind, .. }, .. } = &body[expr]
+        else {
+            return None;
+        };
+        match kind {
+            CoroutineKind::Gen => Some(args),
+            CoroutineKind::AsyncGen => None,
+            CoroutineKind::Async => {
+                let interner = hir_ty::next_solver::DbInterner::new_with(db, func.krate(db));
+                let resume_ty = interner.lang_items().ResumeTy?;
+                let resume_ty =
+                    Ty::new_adt(interner, resume_ty.into(), GenericArgs::new_from_slice(&[]));
+                // After the parent's: the kind, then the resume type.
+                let at = args.as_coroutine().parent_args().len() + 1;
+                let mut args: Vec<_> = args.iter().collect();
+                *args.get_mut(at)? = resume_ty.into();
+                Some(GenericArgs::new_from_slice(&args))
+            }
+        }
+    }
+
     /// A closure of a crate we compile, which is named by what only we know.
     ///
     /// rustc hashes the signature and the captures it inferred for the closure, with the
@@ -356,8 +431,12 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
             return None;
         };
-        if !self.owned.contains(&func.krate(db)) {
-            return None;
+        // One of another crate is hashed as ours are when what it is instantiated with makes
+        // the type one only our code has, as a closure of ours does.
+        match self.owned.contains(&func.krate(db)) {
+            true => self.own_closure = true,
+            false if !self.ours => return None,
+            false => {}
         }
         let loc = func.lookup(db);
         let parent = match loc.container {
@@ -472,12 +551,28 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::FnDef(def, args) => {
                 hasher.write_isize(13);
-                let CallableDefId::FunctionId(func) = def.0 else { return None };
-                // A lifetime of a function is mostly late bound, and then no argument to rustc.
-                if args.iter().any(|arg| matches!(arg.kind(), GenericArgKind::Lifetime(_))) {
-                    return None;
-                }
-                self.function_path(func)?.hash(hasher);
+                let path = match def.0 {
+                    CallableDefId::FunctionId(func) => {
+                        // A lifetime of a function is mostly late bound, and then no argument
+                        // to rustc.
+                        if args.iter().any(|arg| matches!(arg.kind(), GenericArgKind::Lifetime(_)))
+                        {
+                            return None;
+                        }
+                        self.function_path(func)?
+                    }
+                    // A constructor (`Some`, `Ok`, `Tuple`) is the `Ctor` child of its variant
+                    // or struct, with the ADT's own parameters, which are all early bound.
+                    CallableDefId::EnumVariantId(variant) => {
+                        let loc = variant.lookup(self.db);
+                        let adt = self.adt_path(loc.parent.into())?;
+                        adt.child(DefPathData::TypeNs(loc.name.as_str())).child(DefPathData::Ctor)
+                    }
+                    CallableDefId::StructId(it) => {
+                        self.adt_path(it.into())?.child(DefPathData::Ctor)
+                    }
+                };
+                path.hash(hasher);
                 // The arguments are under a binder, which binds nothing.
                 self.binder(hasher, |this, hasher| {
                     this.args(args)?.hash(hasher);
@@ -486,9 +581,17 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::Closure(id, args) => {
                 hasher.write_isize(17);
-                self.closure(hasher, id.0.loc(self.db))?;
-                let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                self.args(parent)?.hash(hasher);
+                let closure = id.0.loc(self.db);
+                if let Some(path) = self.rustc_closure_path(closure) {
+                    // rustc's: the closure's `DefPathHash`, then all of its arguments: those of
+                    // what it is written in, its kind, its signature and what it captured.
+                    path.hash(hasher);
+                    self.args(args)?.hash(hasher);
+                } else {
+                    self.closure(hasher, closure)?;
+                    let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
+                    self.args(parent)?.hash(hasher);
+                }
             }
             TyKind::CoroutineClosure(id, args) => {
                 hasher.write_isize(18);
@@ -498,13 +601,23 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::Coroutine(id, args) => {
                 hasher.write_isize(19);
-                self.closure(hasher, id.0.loc(self.db))?;
+                let coroutine = id.0.loc(self.db);
                 // The future of an `async` closure is another type when it owns what the
                 // closure captured.
                 let by_move = hir_ty::mir::is_by_move_coroutine(self.db, id.0, args.as_coroutine());
-                hasher.write_u8(by_move.into());
-                let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
-                self.args(parent)?.hash(hasher);
+                // rustc names that one apart (`SyntheticCoroutineBody`), so only the others
+                // have its `DefPath` here; its arguments are the resume, yield and return types
+                // and the captures after the parent's.
+                let rustcs = self.rustc_closure_path(coroutine).filter(|_| !by_move);
+                if let Some(path) = rustcs {
+                    path.hash(hasher);
+                    self.args(self.rustc_coroutine_args(coroutine, args)?)?.hash(hasher);
+                } else {
+                    self.closure(hasher, coroutine)?;
+                    hasher.write_u8(by_move.into());
+                    let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
+                    self.args(parent)?.hash(hasher);
+                }
             }
             TyKind::FnPtr(signature, header) => {
                 hasher.write_isize(14);
@@ -515,11 +628,16 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 });
                 self.signatures -= 1;
                 hashed?;
-                // `FnSigKind`'s flags: the ABI's index, then safe, then variadic.
+                // `FnSigKind`'s flags: the ABI's index in `ExternAbi::ALL_VARIANTS`, then safe,
+                // then variadic. The index is the vendored rustc_abi's, which is the pinned
+                // nightly's: `rust-call` moved from 21 to 22 when `Unadjusted` became
+                // `LlvmIntrinsic`, after 1.99.0.
                 let abi = match header.abi() {
-                    ExternAbi::C { unwind: false } => 0,
-                    ExternAbi::C { unwind: true } => 1,
-                    ExternAbi::Rust => 2,
+                    // A closure's signature, as its arguments hold it, is `RustCall`.
+                    abi @ (ExternAbi::C { unwind: false }
+                    | ExternAbi::C { unwind: true }
+                    | ExternAbi::Rust
+                    | ExternAbi::RustCall) => abi.as_packed(),
                     _ => return None,
                 };
                 let safe = u8::from(header.safety().is_safe()) << 6;

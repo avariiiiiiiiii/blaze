@@ -27,7 +27,9 @@ CREATE TABLE signups (
   utm_content TEXT
 );
 
--- Rate limit: every POST attempt (accepted or not) is logged here and checked per email and per minute.
+-- Rate limit: every POST that passes validation and Turnstile is logged here (the insert is skipped, and the post
+-- refused, when the email or everyone is over the per-minute cap). Posts that fail Turnstile are not logged, so they
+-- cannot use up the global cap. Rows older than a day are deleted on each signup.
 CREATE TABLE signup_attempts (
   email TEXT NOT NULL,
   at INTEGER NOT NULL                  -- unix seconds

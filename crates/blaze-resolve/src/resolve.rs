@@ -238,6 +238,56 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         self.reverse_replacements.get(&pkg).cloned()
     }
 
+    /// The name `from`'s code calls `to` by, and the name of its dependency if renamed: the
+    /// rename with `-` as `_`, else `to_crate_name`, the crate name of `to`'s target.
+    pub fn extern_crate_name_and_dep_name(
+        &self,
+        from: PackageId,
+        to: PackageId,
+        to_crate_name: &str,
+    ) -> Result<(InternedString, Option<InternedString>)> {
+        let empty_set = FxHashSet::default();
+        let deps = if from == to { &empty_set } else { self.dependencies_listed(from, to) };
+
+        let target_crate_name = || (to_crate_name.to_owned(), None);
+        let mut name_pairs = deps.iter().map(|d| {
+            d.explicit_name_in_toml()
+                .map(|s| (s.as_str().replace("-", "_"), Some(s)))
+                .unwrap_or_else(target_crate_name)
+        });
+        let (extern_crate_name, dep_name) = name_pairs.next().unwrap_or_else(target_crate_name);
+        for (n, _) in name_pairs {
+            anyhow::ensure!(
+                n == extern_crate_name,
+                "the crate `{}` depends on crate `{}` multiple times with different names",
+                from,
+                to,
+            );
+        }
+        Ok((InternedString::new(&extern_crate_name), dep_name))
+    }
+
+    fn dependencies_listed(&self, from: PackageId, to: PackageId) -> &FxHashSet<Dependency> {
+        // We've got a dependency on `from` to `to`, but this dependency edge
+        // may be affected by [replace]. If the `to` package is listed as the
+        // target of a replacement (aka the key of a reverse replacement map)
+        // then we try to find our dependency edge through that. If that fails
+        // then we go down below assuming it's not replaced.
+        //
+        // Note that we don't treat `from` as if it's been replaced because
+        // that's where the dependency originates from, and we only replace
+        // targets of dependencies not the originator.
+        if let Some(replace) = self.reverse_replacements.get(&to)
+            && let Some(deps) = self.graph.edge(&from, replace)
+        {
+            return deps;
+        }
+        match self.graph.edge(&from, &to) {
+            Some(ret) => ret,
+            None => panic!("no Dependency listed for `{}` => `{}`", from, to),
+        }
+    }
+
     /// The features the dependency resolver enabled for `pkg` (all unified, as resolver 1
     /// builds them).
     pub fn features(&self, pkg: PackageId) -> &[InternedString] {
@@ -246,6 +296,14 @@ unable to verify that `{0}` is the same as when the lockfile was generated
 
     pub fn unused_patches(&self) -> &[PackageId] {
         &self.unused_patches
+    }
+
+    /// Records the `[patch]` entries the graph did not use.
+    pub fn register_used_patches<'a>(&mut self, patches: impl Iterator<Item = &'a Summary>) {
+        self.unused_patches = patches
+            .filter(|p| !self.graph.contains(&p.package_id()))
+            .map(|p| p.package_id())
+            .collect();
     }
 
     pub fn checksums(&self) -> &FxHashMap<PackageId, Option<String>> {

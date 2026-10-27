@@ -98,7 +98,7 @@ impl Dependency {
     pub fn serialized(&self) -> SerializedDependency<'_> {
         SerializedDependency {
             name: &self.name,
-            source: &self.source_id,
+            source: (!self.source_id.is_path()).then(|| self.source_id.as_url().to_string()),
             req: match &self.req {
                 Some(req) => req.to_string(),
                 None => "*".to_owned(),
@@ -119,7 +119,7 @@ impl Dependency {
 #[derive(Serialize)]
 pub struct SerializedDependency<'a> {
     name: &'a str,
-    source: &'a SourceId,
+    pub(crate) source: Option<String>,
     req: String,
     kind: DepKind,
     rename: Option<&'a str>,

@@ -1,9 +1,11 @@
 # What is new since the fork: the flake (per-unit nix builds of the daemon and the demo), the
-# unit graphs behind them, the Game of Life demo, and live edits (ra-jit-live). It takes about
-# 40 minutes, so it runs nightly, by hand, and on a change to the flake, nix/ or the
-# dependencies (which the unit graphs are generated from); the
-# fast tier of ra-jit.yaml has live edits on every change (live_e2e.py, tiers.py). A failed
-# nightly opens an issue, or adds to the one still open.
+# unit graphs behind them, the Game of Life demo, and live edits (ra-jit-live). The builds take
+# about 40 minutes, so they run in the release train (train.yaml calls this workflow on every
+# push to main) and by hand; a pull request that changes the flake, nix/ or the dependencies
+# (which the unit graphs are generated from) checks the unit graphs alone, in two minutes. The
+# train's harnesses have live edits too (live_e2e.py, tiers.py). In the train these jobs do not
+# block it (`soft`) until they have been green a while: the unit graphs were stale for a week
+# before 2026-10-26, and nothing said so but this workflow.
 #
 #   unit graphs   nix/units/*.json are what `nix/unit_graph.py` generates from Cargo.lock now
 #   nix           `nix build` of the daemon, the demo and the per-unit builds, and the flake's apps
@@ -12,15 +14,16 @@
 #   live edits    macOS arm64: edit a running program's function, ra-jit-live applies the patch
 name: nix and live
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - "flake.nix"
-      - "flake.lock"
-      - "nix/**"
-      - "Cargo.lock"
-      - "**/Cargo.toml"
-      - ".github/workflows/nix-live.yaml"
+  workflow_call:
+    inputs:
+      full:
+        description: the builds, the demo and live edits, besides the unit graphs
+        type: boolean
+        default: true
+      soft:
+        description: a job that fails does not fail the caller
+        type: boolean
+        default: false
   pull_request:
     paths:
       - "flake.nix"
@@ -29,12 +32,12 @@ on:
       - "Cargo.lock"
       - "**/Cargo.toml"
       - ".github/workflows/nix-live.yaml"
-  schedule:
-    - cron: "11 5 * * *"
   workflow_dispatch:
 
+# A pull request's newer push cancels its run before. Called by the train, the train's own
+# concurrency group holds it.
 concurrency:
-  group: nix-live-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  group: nix-live-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}${{ inputs.full && '-train' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -46,6 +49,7 @@ jobs:
     name: nix unit graphs are current
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    continue-on-error: ${{ inputs.soft == true }}
     steps:
       - uses: actions/checkout@v7
       # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
@@ -59,6 +63,8 @@ jobs:
 
   nix:
     name: nix build (x86_64-linux)
+    if: inputs.full || github.event_name == 'workflow_dispatch'
+    continue-on-error: ${{ inputs.soft == true }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -84,6 +90,8 @@ jobs:
 
   nix-darwin:
     name: nix build (aarch64-darwin)
+    if: inputs.full || github.event_name == 'workflow_dispatch'
+    continue-on-error: ${{ inputs.soft == true }}
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -100,11 +108,13 @@ jobs:
 
   demo:
     name: demo/life and ra-jit-live (linux)
+    if: inputs.full || github.event_name == 'workflow_dispatch'
+    continue-on-error: ${{ inputs.soft == true }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -128,6 +138,7 @@ jobs:
 
   live-edits:
     name: live edits (macOS arm64)
+    if: inputs.full || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 60
     # Not required: it runs a daemon, a program and a patch between them on a hosted macOS VM,
@@ -135,7 +146,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
       - uses: Swatinem/rust-cache@v2
       # Where it is real code: the whole of macos.rs and the patch format.
       - run: cargo test --release -p ra-jit-live
@@ -151,15 +162,3 @@ jobs:
       - name: the demo builds on macOS
         run: cargo build --locked
         working-directory: demo/life
-
-  nightly:
-    name: nightly issue
-    needs: [unit-graphs, nix, nix-darwin, demo, live-edits]
-    if: always() && github.event_name == 'schedule' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      issues: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/nightly-issue

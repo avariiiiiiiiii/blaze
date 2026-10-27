@@ -53,7 +53,11 @@ use object::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
+pub(crate) use self::lasting::Lasting;
+use self::lasting::{Own, is_lasting};
+
 mod debug;
+mod lasting;
 mod macho;
 mod pe;
 mod sha256;
@@ -129,6 +133,9 @@ pub(crate) struct Baseline {
     stamp: Stamp,
     /// What the last splice of a Mach-O executable appended, with the hashes of its pages.
     appended: Option<macho::Appended>,
+    /// The statics new in each of the last splices, with when it was written: a program
+    /// started from the executable then has them where the splice put them.
+    spliced: Vec<(u64, Lasting)>,
 }
 
 /// What a splice appended that the next may find where it is.
@@ -217,6 +224,7 @@ impl Parsed {
             copies,
             stamp,
             appended: None,
+            spliced: Vec::new(),
         })
     }
 }
@@ -279,6 +287,7 @@ impl Baseline {
             copies: self.copies.clone(),
             stamp: self.stamp.clone(),
             appended: None,
+            spliced: self.spliced.clone(),
         }
     }
 
@@ -350,7 +359,7 @@ impl Baseline {
     ) -> anyhow::Result<(Spliced, Vec<(Box<[u8]>, Defined)>)> {
         self.read_again_if_signed()?;
         let start = std::time::Instant::now();
-        let (mut addition, len, pointed) = match &*self.image {
+        let (mut addition, len, pointed, lasting) = match &*self.image {
             Executable::Elf(image) => {
                 let patch = Patch::read(patch, image, whole)?;
                 if whole && std::env::var_os("RA_JIT_STATS").is_some() {
@@ -360,12 +369,13 @@ impl Baseline {
                 let addition = patch.place(image, &self.copies)?;
                 let moves = !addition.described.moved.is_empty();
                 let pointed = moves.then(|| image.described.pointed(&addition.described.copies));
-                (addition, image.len, pointed)
+                let lasting = Lasting::in_executable(patch.lasting_in(&addition.defined));
+                (addition, image.len, pointed, lasting)
             }
             Executable::Pe(image) => {
                 let patch = pe::Patch::read(patch, image)?;
                 self.has_baked(patch.defined())?;
-                (patch.place(image)?, image.len, None)
+                (patch.place(image)?, image.len, None, Lasting::default())
             }
             Executable::Wasm(module) => {
                 let (bytes, spliced) = self.rewrite(module, patch)?;
@@ -375,9 +385,10 @@ impl Baseline {
             }
             Executable::MachO(image) => {
                 let Baseline { path, baked, undo, originals, stamp, appended, .. } = self;
-                let spliced = macho::splice(
+                let (spliced, lasting) = macho::splice(
                     image, path, baked, undo, originals, stamp, appended, patch, give_up,
                 )?;
+                self.spliced_with(lasting);
                 return Ok((spliced, Vec::new()));
             }
         };
@@ -462,7 +473,25 @@ impl Baseline {
         }
         let appended = addition.appended.len();
         self.left = Left { appended: Some((addition.offset, addition.appended)) };
+        self.spliced_with(lasting);
         Ok((Spliced { redirected: addition.redirected, appended, copied }, defined))
+    }
+
+    /// Notes that a splice was just written with `lasting` in it.
+    fn spliced_with(&mut self, lasting: Lasting) {
+        const KEPT: usize = 8;
+        let now = crate::live::now();
+        self.spliced.push((now, lasting));
+        let over = self.spliced.len().saturating_sub(KEPT);
+        self.spliced.drain(..over);
+    }
+
+    /// The statics new in the splice that a program started at `started` (milliseconds since
+    /// the epoch) runs, which a patch of it keeps: none for one started from what the linker
+    /// wrote, or before the splices still known.
+    pub(crate) fn spliced_lasting(&self, started: u64) -> Lasting {
+        let last = self.spliced.iter().rev().find(|it| it.0 <= started);
+        last.map(|it| it.1.clone()).unwrap_or_default()
     }
 
     /// `patch` laid out at `base` of a program that runs the executable as the linker wrote
@@ -472,29 +501,39 @@ impl Baseline {
         &self,
         patch: &[u8],
         base: u64,
+        lasting: &mut Lasting,
     ) -> anyhow::Result<([u8; 16], ra_jit_live::format::Code, Vec<(u64, u64)>)> {
         match &*self.image {
             Executable::MachO(image) => {
                 let uuid = macho::uuid(image).context("the executable has no UUID")?;
-                let (code, moved) = macho::live(image, &self.baked, &self.originals, patch, base)?;
+                let (code, moved) =
+                    macho::live(image, &self.baked, &self.originals, patch, base, lasting)?;
                 Ok((uuid, code, moved))
             }
             Executable::Elf(image) => {
                 ensure!(image.machine == Machine::X86_64, "live edits support Linux x86-64 only");
                 let uuid = image.id.context("the executable has no GNU build ID")?;
-                let patch = Patch::read(patch, image, false)?;
+                let mut patch = Patch::read(patch, image, false)?;
                 ensure!(
                     self.baked
                         .iter()
                         .all(|it| patch.replaced.iter().any(|replaced| replaced.name == &**it)),
                     "a function the executable was linked with a patch of is as it first was"
                 );
+                lasting.place(&patch.lasting_own()?)?;
+                patch.keep_lasting(|name| lasting.address(name))?;
                 let (code, moved) =
-                    patch.place_live_simple(image, &self.copies, &self.originals, base)?;
+                    patch.place_live_simple(image, &self.copies, &self.originals, base, lasting)?;
                 Ok((uuid, code, moved))
             }
-            _ => bail!(
-                "edits are applied to running programs on macOS AArch64 and Linux x86-64 only"
+            Executable::Pe(image) => {
+                let patch = pe::Patch::read(patch, image)?;
+                self.has_baked(patch.defined())?;
+                let (code, moved) = patch.place_live(image, base)?;
+                Ok((image.guid, code, moved))
+            }
+            Executable::Wasm(_) => bail!(
+                "edits are applied to running programs on macOS AArch64, Linux x86-64 and Windows x86-64 only"
             ),
         }
     }
@@ -519,12 +558,14 @@ impl Baseline {
         })
     }
 
-    /// The `LC_UUID` of the executable, when it is one that has it.
+    /// The `LC_UUID` of the executable, when it is one that has it: the GNU build ID of an
+    /// ELF one, the GUID of the PDB of a PE one.
     pub(crate) fn uuid(&self) -> Option<[u8; 16]> {
         match &*self.image {
             Executable::MachO(image) => macho::uuid(image),
             Executable::Elf(image) => image.id,
-            _ => None,
+            Executable::Pe(image) => Some(image.guid),
+            Executable::Wasm(_) => None,
         }
     }
 
@@ -736,14 +777,17 @@ struct Writing {
 }
 
 impl Writing {
-    /// The executable at `path`, or a copy of it when a program runs it, which on Unix nothing
-    /// may write: the program runs on from the file it was started from, and the copy is put
-    /// at `path` for the next start.
+    /// The executable at `path`, or a copy of it when a program runs it, which nothing may
+    /// write: the program runs on from the file it was started from, and the copy is put at
+    /// `path` for the next start.
     fn open(path: &Path) -> std::io::Result<Writing> {
+        #[cfg(unix)]
+        const BUSY: i32 = libc::ETXTBSY;
+        #[cfg(windows)]
+        const BUSY: i32 = 32; // ERROR_SHARING_VIOLATION
         let lock = Writing::lock(path)?;
         match OpenOptions::new().read(true).write(true).open(path) {
-            #[cfg(unix)]
-            Err(busy) if busy.raw_os_error() == Some(libc::ETXTBSY) => {
+            Err(busy) if busy.raw_os_error() == Some(BUSY) => {
                 let mut copy = path.as_os_str().to_owned();
                 copy.push(".splicing");
                 let copy = PathBuf::from(copy);
@@ -761,10 +805,15 @@ impl Writing {
         }
     }
 
-    /// Puts the copy written, if it is one, in place of the executable.
+    /// Puts the copy written, if it is one, in place of the executable: on Windows, where a
+    /// file a program runs cannot be written over, behind the executable moved aside.
     fn done(mut self) -> std::io::Result<()> {
         match self.copy.take() {
-            Some((copy, path)) => std::fs::rename(copy, path),
+            Some((copy, path)) => {
+                #[cfg(windows)]
+                move_aside(&path)?;
+                std::fs::rename(copy, path)
+            }
             None => Ok(()),
         }
     }
@@ -804,6 +853,30 @@ impl Drop for Writing {
             _ = std::fs::remove_file(copy);
         }
     }
+}
+
+/// Moves the executable at `path` aside, which a program runs and Windows lets nothing write
+/// or replace: it runs on there. It is deleted once it has exited, by the first move to come
+/// after.
+#[cfg(windows)]
+pub(crate) fn move_aside(path: &Path) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let name = path.file_name().unwrap_or_default().to_owned();
+    let siblings = path.parent().map(std::fs::read_dir).transpose()?.into_iter().flatten();
+    for sibling in siblings {
+        let sibling = sibling?;
+        let is_aside = sibling.path().extension() == Some("running".as_ref())
+            && sibling.file_name().as_encoded_bytes().starts_with(name.as_encoded_bytes());
+        if is_aside {
+            // The one that still runs stays.
+            let _ = std::fs::remove_file(sibling.path());
+        }
+    }
+    static ASIDE: AtomicUsize = AtomicUsize::new(0);
+    let aside = ASIDE.fetch_add(1, Ordering::Relaxed);
+    let mut moved = path.as_os_str().to_owned();
+    moved.push(format!(".{}-{aside}.running", std::process::id()));
+    std::fs::rename(path, &moved)
 }
 
 /// Waits until the daemon is through writing the executable at `path` in place: one it
@@ -1973,6 +2046,8 @@ impl<'a> Patch<'a> {
             let section = symbol.section_index().context("a symbol in no section")?;
             let old = match image.symbols.get(name) {
                 None => None,
+                // The executable's is the same static with the same value: it is kept.
+                Some(_) if is_lasting(name) => None,
                 Some(Named::One(old))
                     if whole
                         && old.kind == SymbolKind::Text
@@ -2081,7 +2156,36 @@ impl<'a> Patch<'a> {
         for statics in patch.in_place.values_mut() {
             statics.sort_unstable_by_key(|it| it.offset);
         }
+        patch.keep_lasting(|name| match image.symbols.get(name) {
+            Some(Named::One(Defined { kind: SymbolKind::Data, address, .. })) => Some(*address),
+            _ => None,
+        })?;
         Ok(patch)
+    }
+
+    /// Has what refers to a static the patch defines anew ([`is_lasting`]) refer to the copy
+    /// `kept` finds of it instead, where it finds one: the executable's, or one an earlier
+    /// patch gave the running program. The patch's own copy is left unused.
+    fn keep_lasting(&mut self, kept: impl Fn(&[u8]) -> Option<u64>) -> anyhow::Result<()> {
+        let mut sections = FxHashSet::default();
+        for (&index, target) in &mut self.targets {
+            let Target::Ours(section, _) = *target else { continue };
+            let name = self.file.symbol_by_index(index)?.name_bytes()?;
+            if !is_lasting(name) {
+                continue;
+            }
+            if let Some(address) = kept(name) {
+                *target = Target::Theirs(address);
+                sections.insert(section);
+            }
+        }
+        // What is reached through its section and not its name would be the patch's copy.
+        let through_section = self
+            .targets
+            .values()
+            .any(|it| matches!(it, Target::Section(at) if sections.contains(at)));
+        ensure!(!through_section, "a static of the patch's own is reached through its section");
+        Ok(())
     }
 
     /// Whether a static can go where the executable has the one it replaces: what refers to
@@ -2187,8 +2291,17 @@ impl<'a> Patch<'a> {
         copies: &debug::Copies,
         originals: &FxHashMap<u64, Vec<u8>>,
         base: u64,
+        lasting: &mut Lasting,
     ) -> anyhow::Result<(ra_jit_live::format::Code, Vec<(u64, u64)>)> {
+        let own = self.lasting_own()?;
         let addition = self.place_at(image, copies, Some(base))?;
+        let copy = |name: &[u8]| {
+            let found = addition.defined.iter().find(|it| &*it.0 == name);
+            found.map(|it| it.1.address - base)
+        };
+        let first =
+            lasting.first_values(&own, copy, &addition.appended, base, &addition.live_pointers)?;
+        lasting.note(self.lasting_in(&addition.defined));
         let mut all = addition.appended;
         let data_at = addition.live_data_at as usize;
         let data = all.split_off(data_at);
@@ -2254,8 +2367,41 @@ impl<'a> Patch<'a> {
             writes,
             redirected,
             statics,
+            lasting: first,
         };
         Ok((code, moved))
+    }
+
+    /// Where each static the patch defines anew is in the program: its own copy, or the one
+    /// [`Self::keep_lasting`] kept.
+    fn lasting_in(&self, defined: &[(Box<[u8]>, Defined)]) -> Vec<(Box<[u8]>, u64)> {
+        let kept: FxHashMap<&[u8], u64> = (self.targets.iter())
+            .filter_map(|(&index, target)| match target {
+                Target::Theirs(address) => {
+                    let name = self.file.symbol_by_index(index).ok()?.name_bytes().ok()?;
+                    is_lasting(name).then_some((name, *address))
+                }
+                _ => None,
+            })
+            .collect();
+        (defined.iter())
+            .filter(|(name, _)| is_lasting(name))
+            .map(|(name, it)| (name.clone(), kept.get(&**name).copied().unwrap_or(it.address)))
+            .collect()
+    }
+
+    /// The statics the patch defines anew, with what they take.
+    fn lasting_own(&self) -> anyhow::Result<Vec<Own>> {
+        let mut own = Vec::new();
+        for replaced in self.replaced.iter().filter(|it| is_lasting(it.name)) {
+            let section = self.file.section_by_index(replaced.section)?;
+            // What a type is aligned to divides its size, and where its section has it.
+            let align = (replaced.offset | replaced.size | section.align().max(1))
+                .isolate_lowest_one()
+                .min(section.align().max(1));
+            own.push(Own { name: replaced.name.into(), size: replaced.size, align });
+        }
+        Ok(own)
     }
 
     fn place_at(

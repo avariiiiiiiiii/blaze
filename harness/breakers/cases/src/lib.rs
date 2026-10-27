@@ -18,6 +18,7 @@ cases![
     niche_eq,
     simd_cast,
     big_frame,
+    guard_page,
     big_promoted,
     future_size,
     await_left_in_generic,
@@ -151,6 +152,7 @@ cases![
     const_format_args,
     assert_long_expression,
     frame_of_array,
+    captured_frames,
     frame_of_results,
     const_black_box,
     frame_of_tables,
@@ -186,4 +188,5 @@ cases![
     type_name_of_values,
     trait_method_of_closure,
     const_float_min_max,
+    guard_nested_guard,
 ];

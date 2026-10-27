@@ -73,14 +73,14 @@ fn send_as_typed(file: PathBuf, shared: Shared) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, target_arch = "x86_64")))]
 fn send(file: &Path, text: &str) -> Result<String, String> {
     ra_jit_live::edit(file, text)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, all(windows, target_arch = "x86_64"))))]
 fn send(_: &Path, _: &str) -> Result<String, String> {
-    Err("live edits run on macOS only".to_owned())
+    Err("live edits run on macOS, Linux and Windows only".to_owned())
 }
 
 /// Writes by rename, so that nothing reads a half-written file.

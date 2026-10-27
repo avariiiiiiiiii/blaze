@@ -54,6 +54,24 @@ pub(super) struct Tracked {
     /// The files its code comes from, as [`super::stable::StableNames::file_path`] names
     /// them; `None` when any file can be one.
     pub(super) files: Option<Vec<String>>,
+    /// The items of those files its code comes from, as they were written then; `None` when
+    /// one of them can't be told. An edit of nothing but bodies that leaves each of them as
+    /// it was leaves the code as it was.
+    pub(super) items: Option<Vec<WrittenItem>>,
+}
+
+/// An item of the checkout as code compiled from it saw it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub(super) struct WrittenItem {
+    /// As [`super::stable::StableNames::file_path`] names it.
+    pub(super) file: String,
+    /// Its id in the file, which an edit of bodies alone leaves it.
+    pub(super) id: u32,
+    /// Of its text.
+    pub(super) hash: u64,
+    /// The line and column it begins on, for one whose place the code tells, or the one it is
+    /// written in when its mark has its lines; `None` for the others.
+    pub(super) at: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -75,6 +93,9 @@ pub(super) enum CachedTarget {
     TypeId(u128),
     /// The function an `asm!` block is assembled as, by its assembly.
     Asm(String),
+    /// rustc's copy `symbol` of the function of the checkout named `name`, which the build
+    /// wants compiled too, as a call of it in a build that links rustc's code has it.
+    Copy { name: String, symbol: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -222,12 +243,13 @@ impl StoredCode {
         func: &cranelift_codegen::ir::Function,
         named: impl Iterator<Item = cranelift_codegen::ir::StackSlot>,
         constants: impl Iterator<Item = (u32, &'a [u8])>,
+        asm: impl Iterator<Item = (u32, &'a str)>,
         pointees: &[(u32, super::fragment::Pointee)],
     ) -> Option<[u8; KEY]> {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"ra-jit llvm 7");
+        hasher.update(b"ra-jit llvm 9");
         // Nor what the types of the parameters say of the memory they point to.
         for (at, pointee) in pointees {
             let super::fragment::Pointee { unique, frozen, size, align } = *pointee;
@@ -238,6 +260,8 @@ impl StoredCode {
         }
         hasher.update(u32::MAX.to_le_bytes());
         hasher.update(super::Backend::Llvm(optimization).to_string());
+        // Nor LLVM's inliner threshold.
+        hasher.update(super::llvm::inline_threshold().to_le_bytes());
         hasher.update(ir.to_string());
         // Nor does it tell which statement an instruction is of, which the code's lines do.
         for block in func.layout.blocks() {
@@ -261,6 +285,15 @@ impl StoredCode {
             hasher.update(index.to_le_bytes());
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
+        }
+        hasher.update(u32::MAX.to_le_bytes());
+        // Nor which `asm!` block a call of a wrapper runs, which LLVM's code has in place of
+        // the call: two functions that each pass a `u64` through a block of their own are one
+        // IR (the corpus's `att`, `addq $7`, was the code of asmedits.py's `scale`, a `lea`).
+        for (index, text) in asm {
+            hasher.update(index.to_le_bytes());
+            hasher.update((text.len() as u64).to_le_bytes());
+            hasher.update(text);
         }
         Some(hasher.finalize().into())
     }
@@ -402,7 +435,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 10");
+        field(b"ra-jit entry 11");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -456,6 +489,7 @@ impl Entry {
     pub(super) fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
         let funcs = self.funcs.iter().all(|it| match &it.target {
             CachedTarget::Import { symbol, checked } => !checked || defines(symbol),
+            CachedTarget::Copy { symbol, .. } => defines(symbol),
             CachedTarget::Named(_)
             | CachedTarget::Root(_)
             | CachedTarget::TypeId(_)
@@ -472,6 +506,7 @@ impl Entry {
         self.funcs.iter().filter_map(|it| match &it.target {
             CachedTarget::Named(name) => Some(name.as_str()),
             CachedTarget::Import { .. }
+            | CachedTarget::Copy { .. }
             | CachedTarget::Root(_)
             | CachedTarget::TypeId(_)
             | CachedTarget::Asm(_) => None,
@@ -563,17 +598,35 @@ pub(super) struct Entries {
     /// Where cargo keeps the sources it fetched on this machine.
     cargo_home: Option<String>,
     library: Option<super::LibrarySources>,
-    known: Mutex<Known>,
-}
-
-#[derive(Default)]
-struct Known {
     /// Each read once however many threads ask for it at the same time: the callees of the
     /// functions being built are mostly the same few, and the threads come to them together.
-    entries: FxHashMap<Arc<str>, Arc<OnceLock<Option<Arc<Entry>>>>>,
+    entries: Sharded<Arc<str>, Arc<OnceLock<Option<Arc<Entry>>>>>,
     /// Whether the program can be built from an entry and everything it calls.
-    usable: FxHashMap<Arc<str>, bool>,
-    types: FxHashMap<[u8; KEY], Arc<OnceLock<Option<TypeSet>>>>,
+    usable: Sharded<Arc<str>, bool>,
+    types: Sharded<[u8; KEY], Arc<OnceLock<Option<TypeSet>>>>,
+}
+
+/// A map behind a lock for each of its shards: a restart has every thread look up the stored
+/// roots at once, an entry and each of its sets of types, and one lock had them take turns.
+struct Sharded<K, V>(Box<[Mutex<FxHashMap<K, V>>]>);
+
+impl<K: std::hash::Hash + Eq, V> Default for Sharded<K, V> {
+    fn default() -> Self {
+        Sharded((0..64).map(|_| Mutex::default()).collect())
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> Sharded<K, V> {
+    fn shard<Q: std::hash::Hash + ?Sized>(
+        &self,
+        key: &Q,
+    ) -> std::sync::MutexGuard<'_, FxHashMap<K, V>> {
+        use std::hash::BuildHasher;
+        let hash = rustc_hash::FxBuildHasher.hash_one(key);
+        // The high bits: the low ones also pick the bucket inside the shard's map.
+        let at = (hash >> 58) as usize % self.0.len();
+        self.0[at].lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// The sets of types that were given to the store, each when the first entry with a
@@ -620,7 +673,7 @@ pub(super) struct Written {
     pub(super) of_cargo: usize,
 }
 
-/// Gives the store what is compiled on a thread of its own, so that the thread that
+/// Gives the store what is compiled on threads of its own, so that the thread that
 /// compiles does not wait for an entry to be written before it stitches the next.
 pub(super) struct Writer {
     store: &'static Store,
@@ -628,7 +681,7 @@ pub(super) struct Writer {
     library: Option<super::LibrarySources>,
     types: KeptTypes,
     written: Written,
-    thread: Option<(std::sync::mpsc::Sender<Kept>, std::thread::JoinHandle<Written>)>,
+    threads: Option<(std::sync::mpsc::Sender<Kept>, Vec<std::thread::JoinHandle<Written>>)>,
     /// Whether there is no thread to be had, and the entries are written where they are kept.
     alone: bool,
 }
@@ -651,24 +704,39 @@ impl Writer {
         library: Option<super::LibrarySources>,
     ) -> Self {
         let (types, written) = Default::default();
-        Writer { store, cargo_home, library, types, written, thread: None, alone: true }
+        Writer { store, cargo_home, library, types, written, threads: None, alone: true }
     }
 
     pub(super) fn keep(&mut self, kept: Kept) {
-        if self.thread.is_none() && !self.alone {
+        if self.threads.is_none() && !self.alone {
             let (jobs, queued) = std::sync::mpsc::channel::<Kept>();
-            let mut writer =
-                Writer::alone(self.store, self.cargo_home.clone(), self.library.clone());
-            let work = move || {
-                queued.into_iter().for_each(|kept| writer.write(kept));
-                std::mem::take(&mut writer.written)
-            };
-            match std::thread::Builder::new().name("ra-jit store".to_owned()).spawn(work) {
-                Ok(thread) => self.thread = Some((jobs, thread)),
-                Err(_) => self.alone = true,
+            let queued = Arc::new(Mutex::new(queued));
+            // A whole build hands over most of its entries at once, when its last wave is
+            // compiled: one thread would write them after the link.
+            let count =
+                std::thread::available_parallelism().map_or(1, |it| it.get() / 8).clamp(1, 8);
+            let threads: Vec<_> = (0..count)
+                .map_while(|_| {
+                    let mut writer =
+                        Writer::alone(self.store, self.cargo_home.clone(), self.library.clone());
+                    let queued = queued.clone();
+                    let work = move || {
+                        loop {
+                            let next = queued.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok(kept) = next else { break };
+                            writer.write(kept);
+                        }
+                        std::mem::take(&mut writer.written)
+                    };
+                    std::thread::Builder::new().name("ra-jit store".to_owned()).spawn(work).ok()
+                })
+                .collect();
+            match threads.is_empty() {
+                true => self.alone = true,
+                false => self.threads = Some((jobs, threads)),
             }
         }
-        match &self.thread {
+        match &self.threads {
             Some((jobs, _)) => _ = jobs.send(kept),
             None => self.write(kept),
         }
@@ -705,9 +773,9 @@ impl Writer {
     /// since the last time.
     pub(super) fn finish(&mut self) -> Written {
         let mut written = std::mem::take(&mut self.written);
-        if let Some((jobs, thread)) = self.thread.take() {
+        if let Some((jobs, threads)) = self.threads.take() {
             drop(jobs);
-            if let Ok(theirs) = thread.join() {
+            for theirs in threads.into_iter().filter_map(|it| it.join().ok()) {
                 written.added += theirs.added;
                 written.of_cargo += theirs.of_cargo;
             }
@@ -743,7 +811,8 @@ impl Entries {
         cargo_home: Option<String>,
         library: Option<super::LibrarySources>,
     ) -> Entries {
-        Entries { store, debug, program, cargo_home, library, known: Mutex::default() }
+        let (entries, usable, types) = Default::default();
+        Entries { store, debug, program, cargo_home, library, entries, usable, types }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -756,24 +825,23 @@ impl Entries {
         BANNED.get_or_init(Mutex::default)
     }
 
-    fn known(&self) -> std::sync::MutexGuard<'_, Known> {
-        self.known.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub(super) fn get(&self, name: &str) -> Option<Arc<Entry>> {
         let cell = {
-            let mut known = self.known();
-            match known.entries.get(name) {
+            let mut entries = self.entries.shard(name);
+            match entries.get(name) {
                 Some(cell) => cell.clone(),
-                None => known.entries.entry(Arc::from(name)).or_default().clone(),
+                None => entries.entry(Arc::from(name)).or_default().clone(),
             }
         };
         let read = || {
             let key = Entry::key(name, self.debug, self.program.as_ref())?;
-            let mut entry = Entry::decode(&self.store.get(&key)?)?;
-            if let Some(debug) = &mut entry.debug {
-                let types = debug.stored_types.iter().map(|key| self.types(key));
-                debug.types = types.collect::<Option<_>>()?;
+            let entry = Entry::decode(&self.store.get(&key)?)?;
+            // The types are read when the function is described (`describe`), which a build
+            // whose object is the one it has already never does.
+            let stored = |key: &[u8; KEY]| self.store.has_used(key) || self.types(key).is_some();
+            let debug = entry.debug.as_ref();
+            if !debug.is_none_or(|it| it.stored_types.iter().all(stored)) {
+                return None;
             }
             entry.arrived(self.cargo_home.as_deref(), self.library.as_ref())
         };
@@ -786,10 +854,20 @@ impl Entries {
         .clone()
     }
 
+    /// Gives what an entry tells a debugger the types of its variables, which [`Entries::get`]
+    /// leaves to be read. A set the store no longer has leaves them all untold.
+    pub(super) fn describe(&self, debug: &mut FunctionDebug) {
+        if !debug.types.is_empty() || debug.stored_types.is_empty() {
+            return;
+        }
+        let types = debug.stored_types.iter().map(|key| self.types(key));
+        debug.types = types.collect::<Option<_>>().unwrap_or_default();
+    }
+
     /// The set of types kept under `key`, which every entry with a variable of the type
     /// shares.
     fn types(&self, key: &[u8; KEY]) -> Option<TypeSet> {
-        let cell = self.known().types.entry(*key).or_default().clone();
+        let cell = self.types.shard(key).entry(*key).or_default().clone();
         cell.get_or_init(|| {
             let types = self.store.get(key).and_then(|it| postcard::from_bytes::<Vec<_>>(&it).ok());
             types.map(TypeSet::from)
@@ -798,13 +876,13 @@ impl Entries {
     }
 
     fn settle(&self, name: Arc<str>, usable: bool) {
-        self.known().usable.insert(name, usable);
+        self.usable.shard(&*name).insert(name, usable);
     }
 
     /// Whether there is an entry for `name` and for everything it calls, and what they import
     /// is in the program, as `defines` tells.
     pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str) -> bool) -> bool {
-        let settled = |name: &str| self.known().usable.get(name).copied();
+        let settled = |name: &str| self.usable.shard(name).get(name).copied();
         if let Some(usable) = settled(name) {
             return usable;
         }
@@ -916,7 +994,7 @@ mod tests {
     }
 
     fn blob(relocs: Vec<(u32, DataId, i64)>, fn_relocs: Vec<(u32, FuncId)>) -> ConstBlob {
-        ConstBlob { bytes: vec![0; 24], relocs, fn_relocs, align: 8 }
+        ConstBlob { bytes: vec![0; 24], relocs, fn_relocs, align: 8, type_ids: Vec::new() }
     }
 
     /// Types each inside the one before, `depth` of them, by way of each kind of type that
@@ -966,6 +1044,10 @@ mod tests {
             CachedTarget::Root("case::edited".to_owned()),
             CachedTarget::TypeId(7 << 100),
             CachedTarget::Asm("nop".to_owned()),
+            CachedTarget::Copy {
+                name: "case::small".to_owned(),
+                symbol: "_RNvCs1_4case5small".to_owned(),
+            },
         ];
         let datas = vec![
             CachedData::Static { symbol: "ENVIRON".to_owned(), thread_local: false },
@@ -991,6 +1073,12 @@ mod tests {
                 mark: 7 << 100 | 3,
                 home: Some([5; 32]),
                 files: Some(vec!["src/lib.rs".to_owned()]),
+                items: Some(vec![WrittenItem {
+                    file: "src/lib.rs".to_owned(),
+                    id: 9,
+                    hash: 11,
+                    at: Some((3, 1)),
+                }]),
             }),
         }
     }
@@ -1127,7 +1215,7 @@ mod tests {
     #[test]
     fn an_entry_that_names_what_it_lacks_is_no_entry() {
         let broken: [fn(&mut Entry); 7] = [
-            |it| it.code.relocs.push(reloc(0, 0, 5)),
+            |it| it.code.relocs.push(reloc(0, 0, 6)),
             |it| it.code.relocs.push(reloc(0, 1, 6)),
             |it| it.code.relocs.push(reloc(32, 0, 0)),
             |it| it.code.align = 3,
@@ -1140,7 +1228,7 @@ mod tests {
             },
             |it| {
                 it.datas[1] = CachedData::Blob {
-                    blob: blob(Vec::new(), vec![(0, FuncId::from_u32(5))]),
+                    blob: blob(Vec::new(), vec![(0, FuncId::from_u32(6))]),
                     identity: DataIdentity::Own,
                 }
             },

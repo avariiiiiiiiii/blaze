@@ -443,3 +443,87 @@ why ready holds more was not looked at (**unverified**).
   to rustc (it awaits through `async` blocks whose coroutine layout it can't make), so it
   is no patch: the build in full is refused, cargo builds it, and in the same cgroup as the
   59 GB worker cargo's build was killed (**read**).
+
+## 2026-10-26: reth, and evicting the base's MIR and code (#261)
+
+For [#261](https://github.com/indexable-inc/blaze/issues/261). Measured on dev-aws-14 (AWS,
+Linux, 370 GB), blaze main at `598936fc68` and the `mem-261` branch, Cranelift, reth at
+`482366d170` (`--bin reth --no-default-features --features jemalloc,otlp,otlp-logs,js-tracer,
+keccak-cache-global,asm-keccak,gmp,min-trace-logs,portable`; the default features want LLVM
+23), each run on 6 to 24 cores of its own, a driver that does a cold `cargo ra-jit build`, waits
+for the own base's end in the worker's log, then edits: a body, a leaf body, a new function and
+a signature with its caller, each made and taken back, with the worker's `VmRSS`, `VmHWM` and
+jemalloc's live count after each.
+
+### No growth per edit
+
+- reth on main, 50 body edits after the own base: the worker 16.20-16.26 GB and 13.03 GB live
+  from the first to the fiftieth (**read**). The growth the issue saw on Tempo, 8.9 to 23.3 GB
+  over two edits after a pause, is the own base (above, 2026-10-23): it begins a second after the
+  daemon is idle, every edit interrupts it, and the pause let it finish (**unverified** on
+  Tempo: its cold build did not finish here, below).
+- reth's worker once ready 6.4 GB (5.0-5.9 GB live); after the own base 17.4 GB, its most
+  19.9-20.2 GB, the issue's "19.6 GB at load" (**read**).
+
+### What the own base keeps
+
+jemalloc's sampled live heap after the 50th edit, 12.9 GB (**read**, `heap.py`): values 6.5
+GB, salsa's records 3.0 GB, ra-jit's own 2.2 GB, interned 1.0 GB. By holder: the MIR queries
+(`runtime_mir_body`, `mir_body`, their closure, coroutine and monomorphized copies) about
+2.3 GB, `compiled_instance` 0.95 GB of code and 0.61 GB of records, `infer` 0.86 GB and 0.12
+GB, `inlinable` 0.32 GB and 0.39 GB, ra-jit's symbols of what rustc linked 1.4 GB (the symbol
+table 0.53 GB, `symbols::Linked` 0.58 GB, `symbols::Named` 0.28 GB), splice 0.38 GB, vfs 0.35
+GB, `Body::relative` 0.30 GB, layouts 0.26 GB. What the own base adds to ready is about 7.6
+GB of it. The worker's resident figure is 3.2 GB over the live count: jemalloc returns freed
+pages only as it allocates, and an idle worker does not (**read**: `dirty_decay_ms:0` held 15.3
+GB against 16.2, `background_thread:true` 15.9).
+
+### What changed
+
+- salsa's evicted-memo patch (`docs/upstream/daemon-memory/`) is applied to `vendor/salsa`.
+- The MIR queries, `compiled_instance` and `inlinable` have an `lru`, which the worker sets
+  (`RA_JIT_LRU`, [cargo.md](../cargo.md)): 2,048 lowered and runtime bodies each, 16,384
+  instances' code, 8,192 bodies to inline. Values past that are let go when the build is over
+  (`let_go`), and jemalloc is asked to purge (`memory::give_back`).
+- Nothing is let go while a program's own base is still to come (wanted, not built and not
+  given up): an edit interrupts the base, and the base built again after it takes what it had
+  computed; let go, it would compute it all again and, with edits more often than it takes,
+  never be done. Only a worker that serves sets the `lru`s, whose bookkeeping (a lock per
+  fetch) is a cost of every fetch of those queries; it is the likely cause of the own base's 70
+  → 73-74 s below (**unverified**: not profiled).
+- `compiled_root`, the code of each non-generic function under its own symbol, has no `lru`:
+  a patch reads it for every function of the program it links (**unverified** as a cost).
+- `vendor/salsa/tests/lru_cycle.rs` keeps the patch's case: a memo evicted, verified again by
+  what depends on it, then asked for. It fails without the patch (`Cancelled::PropagatedPanic`)
+  and passes with it (**read**). `vendor/salsa` is no member of the workspace, so CI does not
+  run it: copy the directory out, add `[workspace]` to its `Cargo.toml`, and run `cargo test
+  --test lru_cycle --features inventory` there.
+- `infer` was tried with an `lru` too (a free tracked function in place of the method): the
+  first edit after the own base took 11-12 s against 3.4 s, and the worker held the same, so
+  it is not in.
+
+### Memory and edits, main → branch
+
+Two runs of each at once, 6 cores each (**read**):
+
+| | ready | after the own base (most) | after 24 edits | live after 24 edits |
+|---|---|---|---|---|
+| main | 6.41, 6.43 GB | 17.36 (20.08), 17.33 (19.89) GB | 16.14, 16.14 GB | 12.84, 12.87 GB |
+| branch | 6.64, 6.50 GB | 17.89 (19.82), 17.80 (19.78) GB | 14.57, 14.61 GB | 10.59, 10.60 GB |
+
+- Edits after the first within the runs' spread: 2.1-2.7 s on main, 2.1-2.6 s on the branch.
+  The first after the own base is slower, as a value let go is computed again: the body edit
+  3.81 and 3.47 s on main, 5.55 and 6.99 s on the branch; the new function 3.8 → 4.0-4.7 s.
+  The own base took 70 s on main and 73-74 s on the branch.
+- Lower bounds (512 bodies, 2,048 instances and bodies to inline): 14.1-14.4 GB after the
+  edits, 9.9-10.1 GB live, the first body edit 6.9 s (**read**, one run each).
+- The most the worker holds is the same: the own base is built in one revision, in which salsa
+  lets nothing go. Bounding that is building it in pieces
+  ([#188](https://github.com/indexable-inc/ra-jit/issues/188)).
+
+### Tempo
+
+At `60c3923`, blaze builds with its own toolchain (`nightly-2026-10-25`) whatever the
+project's `rust-toolchain` says. rustc on `tempo_consensus` in cargo's first build held 29 GB
+after 5 minutes and 39 GB after 12; one such build was killed by the kernel at 78 GB with
+three other builds on the host (**read**). The issue's cargo build, on 1.99.0, took 74 s.

@@ -449,6 +449,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             relocs: Vec::new(),
             fn_relocs: Vec::new(),
             align: section.align().max(1),
+            type_ids: Vec::new(),
         };
         for (offset, relocation) in section.relocations() {
             let target = match Self::destination(self.file, &relocation)? {
@@ -654,6 +655,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 relocs: Vec::new(),
                 fn_relocs: Vec::new(),
                 align: section.align().max(1),
+                type_ids: Vec::new(),
             }),
             _ => Err(Unhandled::Shape("code that refers to a writable section")),
         }
@@ -674,6 +676,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             relocs: Vec::new(),
             fn_relocs: Vec::new(),
             align: section.align().max(1),
+            type_ids: Vec::new(),
         };
         const HELD: Unhandled = Unhandled::Shape("constants that hold an address of the code");
         for (offset, relocation) in section.relocations() {

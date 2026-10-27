@@ -121,15 +121,23 @@ What is specific to the port:
   Control Flow Guard, a signature, or no PDB always take the full link (inferred from the
   checks in the code; the harness links none of these).
 - A running `.exe` cannot be written, even by the linker. The daemon renames it aside and
-  links a new file.
+  links a new file, or splices a copy and puts it in its place.
+- Live edits (`ra-jit-live`): the program is named by the GUID of its PDB, reserves room
+  within 2 GB behind its image with `VirtualAlloc`, and registers each patch's `.pdata` with
+  `RtlAddFunctionTable`, so a panic unwinds through patched code. The daemon wakes it through a
+  named event where Unix has a datagram socket. A static with another value asks for a restart
+  (the splice writes it in place). `ra_jit_live::edit`, which the demo's editor sends each
+  keystroke with, talks to the daemon's AF_UNIX socket through Winsock. `harness/live_e2e.py`
+  passes, by hand, not in CI; life's latency is in [live.md](live.md#latency-under-typing).
 - The daemon's socket is an AF_UNIX socket. The check that only the user can reach it is
   not implemented on Windows.
 
 Debug info is CodeView procedures and line tables: backtraces and breakpoints by line work,
 a debugger shows no types, parameters or locals. The PDB is stale after a splice until the
-next full link. `cargo ra-jit`
-hands every build to cargo, because its link step is written for ELF, and has not been run
-on Windows. `remote.py` and the fuzzer are not run. The GNU and ARM64 Windows targets have nothing implemented.
+next full link. `cargo blaze` builds through the daemon (`[ra-jit]`) and links with `rust-lld`
+as the repository's cargo configuration names it. That was run by hand on one machine, on a toy
+crate and `demo/life`, not in CI; `harness/cargo_ra_jit.py` and the fuzzer are not run there.
+The GNU and ARM64 Windows targets have nothing implemented.
 
 ## macOS arm64
 
@@ -187,7 +195,7 @@ module again with new function bodies under the same indices.
 This was measured once, on an earlier branch with `nightly-2026-05-10`, for `wasm32-wasip1`
 under wasmtime: corpus MATCH with 655 of 656 functions from ra-jit, stress 99 of 99, splices
 71 of 71 with 62 spliced ([reports/WASM32.md](reports/WASM32.md)). It is not in CI and has
-not been rerun on Rust 1.99.0, so treat it as unverified at the current commit.
+not been rerun since, on 1.99.0 or the pinned nightly, so treat it as unverified at the current commit.
 
 Limits stated in that report: no unwinding is emitted (the wasm targets are
 `panic=abort`), threads are not supported, `v128` and some wide-integer operations are

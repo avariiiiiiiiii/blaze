@@ -16,6 +16,12 @@ pub struct InternedString {
     inner: &'static str,
 }
 
+impl serde::Serialize for InternedString {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.inner)
+    }
+}
+
 impl InternedString {
     pub fn new(s: &str) -> InternedString {
         let mut cache = STRING_CACHE.get_or_init(Default::default).lock().unwrap();

@@ -21,7 +21,7 @@ use rustc_type_ir::{
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind},
 };
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use intern::{Interned, Symbol};
 
@@ -69,9 +69,42 @@ pub(crate) fn told_type(
 /// The sets put together so far, by their keys, for every thread: a set with a type shares
 /// its set.
 #[derive(Default)]
-pub(crate) struct Sets(
-    Mutex<rustc_hash::FxHashMap<(StoredParamEnvAndCrate, Key), Option<TypeSet>>>,
-);
+pub(crate) struct Sets(ByEnv<Key, Option<TypeSet>>);
+
+/// What is known of types by the environment they are in, which every thread that compiles
+/// asks of every variable it tells of: in shards by the type, each locked apart, and looked up
+/// without a copy of the environment or the type, whose counts every thread would write to.
+pub(crate) struct ByEnv<K, V>(Box<[Mutex<FxHashMap<StoredParamEnvAndCrate, FxHashMap<K, V>>>]>);
+
+impl<K, V> Default for ByEnv<K, V> {
+    fn default() -> Self {
+        ByEnv((0..64).map(|_| Mutex::default()).collect())
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> ByEnv<K, V> {
+    fn shard(&self, key: &K) -> MutexGuard<'_, FxHashMap<StoredParamEnvAndCrate, FxHashMap<K, V>>> {
+        use std::hash::BuildHasher as _;
+        let hash = rustc_hash::FxBuildHasher.hash_one(key);
+        let shard = &self.0[(hash >> 32) as usize % self.0.len()];
+        shard.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn get(&self, env: &StoredParamEnvAndCrate, key: &K) -> Option<V> {
+        self.shard(key).get(env)?.get(key).cloned()
+    }
+
+    pub(crate) fn insert(&self, env: &StoredParamEnvAndCrate, key: &K, value: V) {
+        let mut shard = self.shard(key);
+        shard.entry(env.clone()).or_default().insert(key.clone(), value);
+    }
+
+    /// What was kept of `key` before, or else `value`, kept now.
+    pub(crate) fn or_insert(&self, env: &StoredParamEnvAndCrate, key: &K, value: V) -> V {
+        let mut shard = self.shard(key);
+        shard.entry(env.clone()).or_default().entry(key.clone()).or_insert(value).clone()
+    }
+}
 
 /// What a debugger is told of a variable of type `ty`: the type and every type it is made of,
 /// from [`told_type`] of each. `None` is a type that has no layout or no name rustc would
@@ -100,13 +133,11 @@ impl set::Found for InDatabase<'_> {
     }
 
     fn set(&mut self, key: &Key) -> Option<Option<TypeSet>> {
-        let sets = self.sets.0.lock().unwrap_or_else(|e| e.into_inner());
-        sets.get(&(self.env.clone(), key.clone())).cloned()
+        self.sets.0.get(self.env, key)
     }
 
     fn keep(&mut self, key: &Key, set: Option<TypeSet>) {
-        let mut sets = self.sets.0.lock().unwrap_or_else(|e| e.into_inner());
-        sets.insert((self.env.clone(), key.clone()), set);
+        self.sets.0.insert(self.env, key, set);
     }
 }
 

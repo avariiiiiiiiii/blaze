@@ -43,17 +43,22 @@ jobs:
           llvm: build
       - uses: Swatinem/rust-cache@v2
       - run: nix develop --command cargo build -p ra-jit --release --features llvm
-      # The tests of the tag of the stable ra-jit is pinned to.
-      - name: rust-lang/rust 1.99.0, tests only
+      # The tests from rust-lang/rust at the pinned nightly commit.
+      - name: rust-lang/rust, the pinned nightly, tests only
         run: |
-          git clone --depth 1 --branch 1.99.0 --filter=blob:none --sparse https://github.com/rust-lang/rust "$RUNNER_TEMP/rust"
-          git -C "$RUNNER_TEMP/rust" sparse-checkout set tests/ui tests/auxiliary
+          commit=$(awk '/^commit /{print $2}' crates/ra-jit/src/cargo/toolchain/pins.txt)
+          git init -q "$RUNNER_TEMP/rust-pin"
+          cd "$RUNNER_TEMP/rust-pin"
+          git remote add origin https://github.com/rust-lang/rust
+          git sparse-checkout set tests/ui tests/auxiliary
+          git fetch -q --depth 1 --filter=blob:none origin "$commit"
+          git checkout -q FETCH_HEAD
       - name: tests/ui
         working-directory: harness
         run: |
           export RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
           LIMIT="$INPUT_LIMIT"
-          python3 uitest.py "$RUNNER_TEMP/rust" ${LIMIT:+--limit "$LIMIT"} --jobs 4 --work "$RUNNER_TEMP/ui" --json "$RUNNER_TEMP/ui.json" || status=$?
+          python3 uitest.py "$RUNNER_TEMP/rust-pin" ${LIMIT:+--limit "$LIMIT"} --jobs 4 --work "$RUNNER_TEMP/ui" --json "$RUNNER_TEMP/ui.json" || status=$?
           python3 uigate.py "$RUNNER_TEMP/ui.json" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "${PIPESTATUS[0]}"
 
@@ -80,6 +85,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       issues: write
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/nightly-issue

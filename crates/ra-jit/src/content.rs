@@ -21,7 +21,9 @@ type Hash = [u8; 32];
 /// crate of the checkout that depends on it.
 #[derive(Default)]
 pub(crate) struct Contents {
-    crates: Mutex<FxHashMap<Crate, Option<ContentId>>>,
+    /// Each crate is hashed once: the threads that ask while it is wait for it, rather than
+    /// each hashing it and every crate it depends on again.
+    crates: Mutex<FxHashMap<Crate, std::sync::Arc<OnceLock<Option<ContentId>>>>>,
     /// Where the build scripts of the crates hashed so far wrote to.
     places: Mutex<FxHashSet<String>>,
     /// Where cargo keeps the sources it fetched, once the crates were asked.
@@ -41,12 +43,14 @@ impl Contents {
         stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> Option<ContentId> {
-        if let Some(&known) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
-            return known;
-        }
-        let id = self.hash(db, checkouts, krate, stable_crate_id, process_reads);
-        self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, id);
-        id
+        *self
+            .of(krate)
+            .get_or_init(|| self.hash(db, checkouts, krate, stable_crate_id, process_reads))
+    }
+
+    fn of(&self, krate: Crate) -> std::sync::Arc<OnceLock<Option<ContentId>>> {
+        let mut crates = self.crates.lock().unwrap_or_else(|e| e.into_inner());
+        crates.entry(krate).or_default().clone()
     }
 
     /// Where cargo keeps the sources it fetched, when the crates that are not of the
@@ -225,9 +229,25 @@ impl Contents {
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> ContentId {
-        if let Some(&Some(id)) = self.crates.lock().unwrap_or_else(|e| e.into_inner()).get(&krate) {
+        let hash = || self.hash_library(db, krate, root, known, process_reads);
+        if let Some(id) = *self.of(krate).get_or_init(|| Some(hash())) {
             return id;
         }
+        // A crate of no checkout hashed as one of a checkout is this from now on.
+        let id = hash();
+        let known = std::sync::Arc::new(OnceLock::from(Some(id)));
+        self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, known);
+        id
+    }
+
+    fn hash_library(
+        &self,
+        db: &RootDatabase,
+        krate: Crate,
+        root: &Path,
+        known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
+        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+    ) -> ContentId {
         let mut hasher = Sha256::new();
         let mut field = |bytes: &[u8]| {
             hasher.update((bytes.len() as u64).to_le_bytes());
@@ -256,9 +276,7 @@ impl Contents {
                 None => field(&Self::outside(db, on, None)),
             }
         }
-        let id = ContentId(hasher.finalize().into());
-        self.crates.lock().unwrap_or_else(|e| e.into_inner()).insert(krate, Some(id));
-        id
+        ContentId(hasher.finalize().into())
     }
 
     /// What stands for a crate from outside the checkout in the hash of one that is built on

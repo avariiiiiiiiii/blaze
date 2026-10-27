@@ -62,7 +62,7 @@ fn bar() -> Unit {
             ..Tools::default()
         },
         dylib_search: DylibSearch {
-            host_root: "/p/foo/target/debug".into(),
+            host_root: Some("/p/foo/target/debug".into()),
             host_deps: vec!["/p/foo/target/debug/deps".into()],
             sysroot_libdir: "/t/lib/rustlib/x86_64-unknown-linux-gnu/lib".into(),
             plugin_search: Vec::new(),
@@ -266,6 +266,14 @@ fn dynamic_libraries_on_linux() {
     let outer = "/p/foo/target/debug:/p/foo/target/debug/deps:/t/lib/rustlib/x86_64-unknown-linux-gnu/lib:/x";
     let env = super::env(&bar(), &os(&[("LD_LIBRARY_PATH", outer)])).unwrap();
     assert_eq!(var(&env, "LD_LIBRARY_PATH"), Some(outer));
+    // `cargo check` writes nothing to `target/debug`, which is then neither searched nor what
+    // the host-only dependencies' directories are kept below (found by harness/scripts.py).
+    unit.dylib_search.host_root = None;
+    let env = super::env(&unit, &os(&[("LD_LIBRARY_PATH", "/opt/lib")])).unwrap();
+    assert_eq!(
+        var(&env, "LD_LIBRARY_PATH"),
+        Some("/p/foo/target/debug/deps:/t/lib/rustlib/x86_64-unknown-linux-gnu/lib:/opt/lib")
+    );
 }
 
 /// On macOS dyld's defaults follow, since setting the variable takes them away.
@@ -290,7 +298,7 @@ fn dynamic_libraries_on_macos() {
 fn dynamic_libraries_on_windows() {
     let mut unit = bar();
     unit.host = "x86_64-pc-windows-msvc".into();
-    unit.dylib_search.host_root = r"C:\p\target\debug".into();
+    unit.dylib_search.host_root = Some(r"C:\p\target\debug".into());
     unit.dylib_search.host_deps = vec![r"C:\p\target\debug\deps".into()];
     unit.dylib_search.sysroot_libdir = r"C:\t;x\lib".into();
     let env = env(&unit, &os(&[("PATH", r#"C:\bin;"C:\a;b""#)])).unwrap();
@@ -304,7 +312,7 @@ fn dynamic_libraries_on_windows() {
 #[test]
 fn a_path_with_the_separator() {
     let mut unit = bar();
-    unit.dylib_search.host_root = "/p/a:b/target/debug".into();
+    unit.dylib_search.host_root = Some("/p/a:b/target/debug".into());
     let error = env(&unit, &[]).unwrap_err();
     assert!(
         error.0.starts_with("failed to join paths from `$LD_LIBRARY_PATH` together"),
@@ -326,4 +334,45 @@ fn jobserver_and_versions() {
     assert_eq!(var(&env, "CARGO_PKG_VERSION_PATCH"), Some("333"));
     assert_eq!(var(&env, "CARGO_PKG_VERSION_PRE"), Some("beta.1"));
     assert_eq!(var(&env, "CARGO_PKG_AUTHORS"), Some("a:b <b@x>"));
+}
+
+/// cargo on Linux gives its scripts the certificates libgit2 found for it (found by
+/// harness/scripts.py on dev-aws-8, where cargo's scripts had `SSL_CERT_FILE` and
+/// `SSL_CERT_DIR` and blaze's did not).
+#[test]
+fn certificates_libgit2_finds() {
+    let dir = std::env::temp_dir().join(format!("blaze-build-script-certs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (empty, pki, ssl) = (dir.join("empty"), dir.join("pki"), dir.join("ssl"));
+    std::fs::create_dir_all(&empty).unwrap();
+    std::fs::create_dir_all(pki.join("certs")).unwrap();
+    std::fs::write(pki.join("certs/ca-bundle.crt"), "").unwrap();
+    std::fs::create_dir_all(ssl.join("certs")).unwrap();
+    std::fs::write(ssl.join("cert.pem"), "").unwrap();
+    let dirs = [dir.join("missing"), empty, pki.clone(), ssl.clone()];
+    let dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    let linux = "x86_64-unknown-linux-gnu";
+    let started = os(&[("PATH", "/bin")]);
+
+    let env = cargo_started_in(&started, linux, &dirs);
+    let mut expected = started.clone();
+    expected.push(("SSL_CERT_FILE".into(), pki.join("certs/ca-bundle.crt").into()));
+    expected.push(("SSL_CERT_DIR".into(), pki.join("certs").into()));
+    assert_eq!(env, expected);
+
+    // What names a file and a directory that exist stays; what names none is replaced.
+    let file = ssl.join("cert.pem");
+    let started = os(&[("SSL_CERT_FILE", file.to_str().unwrap()), ("SSL_CERT_DIR", "/nowhere")]);
+    let env = cargo_started_in(&started, linux, &dirs);
+    assert_eq!(
+        env,
+        [("SSL_CERT_FILE".into(), file.into()), ("SSL_CERT_DIR".into(), pki.join("certs").into())]
+    );
+
+    for host in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+        assert_eq!(
+            cargo_started_in(&os(&[("PATH", "/bin")]), host, &dirs),
+            os(&[("PATH", "/bin")])
+        );
+    }
 }

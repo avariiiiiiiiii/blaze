@@ -63,3 +63,9 @@ macro_rules! fieldset {
         &FIELDS
     }};
 }
+
+/// A closure of this crate around one of the crate that calls it, as boa's
+/// `NativeFunction::from_copy_closure_with_captures` makes.
+pub fn wrapped<F: Fn() -> u8 + 'static>(inner: F) -> impl Fn() -> u8 + 'static {
+    move || inner() + 1
+}

@@ -19,8 +19,16 @@ A daemon builds the workspace into an empty store and stops. A second one on the
 checkout, and a third on a copy of it elsewhere with a home of its own, start on that store:
 each has to take the checkout's functions from it, compile none of them again, and splice
 every edit after: a generic function's body, whose instance is the checkout's and was found
-in the store, a closure's, a static's value, the program's own text, and all of it taken
-back. The program has to print what the source says.
+in the store, a closure's, a static's value, the program's own text, an `#[inline]` function
+whose callers from the store call rustc's copy of it in the program's crate, the closure an
+`impl Trait` is, whose drop glue from the store names none of it, and all of it taken back.
+The program has to print what the source says, and no call of rustc's copy of a function of
+the checkout may be left out of the store (#216).
+
+An edit of one body takes the other code from the store of that file as it was, by the items
+each entry names reading as they did then, without compiling it to tell: the second daemon has
+to take some so on those edits, and the third, which compiles everything to check
+(`RA_JIT_CHECK_ALL`), must find none of what it would have taken changed.
 
 Python 3, stdlib only.
 """
@@ -60,32 +68,82 @@ fn walk<F: Fn(u64) -> u64>(v: &[u64], f: &F) -> u64 {
         [x, rest @ ..] => f(*x) + walk(rest, f),
     }
 }
+
+pub struct Span {
+    pub start: u64,
+}
+
+impl Span {
+    // rustc copies it into each crate that calls it, and a generic function's instance of
+    // another crate calls that copy.
+    #[inline]
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+}
+
+pub fn starts<T: Copy + Into<u64>>(v: &[T]) -> u64 {
+    v.iter().map(|&x| Span { start: x.into() }.start()).sum()
+}
+
+// Its caller drops what it gives, whose drop glue's name says `impl Fn` and not the closure.
+pub fn label(n: u64) -> impl Fn() -> usize {
+    let s = "x".repeat(n as usize);
+    move || s.len()
+}
 """,
     "app/Cargo.toml": '[package]\nname = "tapp"\nversion = "0.1.0"\nedition = "2021"\n\n'
                       '[dependencies]\ntlib = { path = "../lib" }\n',
     APP: """fn main() {
-    println!("{} {} {} {} {}", "a", tlib::scale(2u8), tlib::each(&[1u32, 2]), tlib::BASE, tlib::total(&[1, 2]));
+    println!("{} {} {} {} {} {} {}", "a", tlib::scale(2u8), tlib::each(&[1u32, 2]), tlib::BASE,
+             tlib::total(&[1, 2]), tlib::starts(&[3u16, 4]), tlib::label(3)());
 }
 """,
 }
-FIRST = "a 6 5 10 6"
+FIRST = "a 6 5 10 6 7 3"
 # (what the step is, [(file, old, new)], what the program prints after it)
 STEPS = [
-    ("a generic function's body", [(LIB, "x.into() * 3", "x.into() * 4")], "a 8 5 10 6"),
-    # A closure is named by where in its body it is written: this one, and the instances
-    # generic over it, get new names, and the ones from the store are called no more.
-    ("a line above a closure", [(LIB, "    v.iter()", "    let _ = 0u64;\n    v.iter()")], "a 8 5 10 6"),
+    ("a generic function's body", [(LIB, "x.into() * 3", "x.into() * 4")], "a 8 5 10 6 7 3"),
+    # A closure is named by its place among the closures of its body, which a line above it
+    # leaves: the instances generic over it are the base's, from the store, as they were.
+    ("a line above a closure", [(LIB, "    v.iter()", "    let _ = 0u64;\n    v.iter()")], "a 8 5 10 6 7 3"),
     # The same of a recursive function's instance, which calls itself.
     ("a line above a closure a recursive function takes", [(LIB, "    walk(v", "    let _ = 1u64;\n    walk(v")],
-     "a 8 5 10 6"),
-    ("a closure's body", [(LIB, "x.into() + 1", "x.into() + 2")], "a 8 7 10 6"),
-    ("a static's value", [(LIB, "BASE: u64 = 10", "BASE: u64 = 12")], "a 8 7 12 6"),
-    ("the program's own text", [(APP, '"a"', '"b"')], "b 8 7 12 6"),
-    ("all of it taken back", [(LIB, "x.into() * 4", "x.into() * 3"), (LIB, "    let _ = 0u64;\n", ""),
+     "a 8 5 10 6 7 3"),
+    # A closure added above one takes its place, and is named apart from it by what is
+    # written of it: the one that was there and the instances generic over it get new names,
+    # and the ones from the store are called no more.
+    ("a closure above a closure", [(LIB, "    let _ = 0u64;\n", "    let _ = (|| 0u64)();\n")], "a 8 5 10 6 7 3"),
+    ("a closure's body", [(LIB, "x.into() + 1", "x.into() + 2")], "a 8 7 10 6 7 3"),
+    ("a static's value", [(LIB, "BASE: u64 = 10", "BASE: u64 = 12")], "a 8 7 12 6 7 3"),
+    ("the program's own text", [(APP, '"a"', '"b"')], "b 8 7 12 6 7 3"),
+    # Its callers from the store call rustc's copy of it in the program's crate (#216).
+    ("a function rustc copies into its callers", [(LIB, "        self.start\n", "        self.start + 1\n")],
+     "b 8 7 12 6 9 3"),
+    # The closure an `impl Trait` is captures more, and the drop glue that drops it from the
+    # store is not the code it was, though no name it mentions changed.
+    ("what an impl Trait is", [(LIB, "    move || s.len()\n", "    let t = s.clone();\n    move || s.len() + t.len()\n")],
+     "b 8 7 12 6 9 6"),
+    ("all of it taken back", [(LIB, "x.into() * 4", "x.into() * 3"), (LIB, "    let _ = (|| 0u64)();\n", ""),
                               (LIB, "    let _ = 1u64;\n", ""), (LIB, "x.into() + 2", "x.into() + 1"),
-                              (LIB, "BASE: u64 = 12", "BASE: u64 = 10"), (APP, '"b"', '"a"')], FIRST),
+                              (LIB, "BASE: u64 = 12", "BASE: u64 = 10"), (APP, '"b"', '"a"'),
+                              (LIB, "        self.start + 1\n", "        self.start\n"),
+                              (LIB, "    let t = s.clone();\n    move || s.len() + t.len()\n", "    move || s.len()\n")],
+     FIRST),
 ]
 REBUILT = "compiling what the store had of the checkout"
+# The steps whose patch compiles only code the base has, by the names it had, and the one
+# that renames some of it, whose patch compiles that under the new names.
+KEEPING = {"a generic function's body", "a line above a closure", "a line above a closure a recursive function takes"}
+RENAMING = {"a closure above a closure"}
+# The steps that edit one body of a file whose other code the store had: the patch takes that
+# code as it was by its items, which read as they did, and compiles none of it to tell.
+UNCHANGED = {"a generic function's body", "a closure's body"}
+# What the daemon says under RA_JIT_CHECK_ALL of code it would have taken as it was by its
+# items and that changed.
+MISSED = "its items unchanged"
+# What a call of rustc's copy of a function of the checkout was left out of the store as (#216).
+UNKEPT = "rustc's copy of a function of the checkout"
 
 
 def build(ws, env, step):
@@ -119,6 +177,20 @@ class Logs:
 
     def links(self):
         return re.findall(r"^link: \S+ \((.*)\)$", self.text(), re.M)
+
+    def full_builds(self):
+        """How many builds were in full, as a splice declined: the patch calls what blaze's
+        link took out as unreached."""
+        return len(re.findall(r"^the patch was not spliced into the program.*: built in full$", self.text(), re.M))
+
+    def anew(self):
+        """How many instances each patch compiled that the base had no code for."""
+        return [int(n) for n in re.findall(r"^patch: (\d+) instances the base has no code for$", self.text(), re.M)]
+
+    def unchanged(self):
+        """How much code each patch took as it was, its items reading as they did."""
+        return [int(r) + int(i) for r, i in
+                re.findall(r"unchanged by their items: (\d+) roots, (\d+) instances", self.text())]
 
 
 def program(ws):
@@ -155,8 +227,8 @@ def restart(ws, env, label, steps):
     wrong = 0
     took = sum(f for f, _ in found)
     roots = sum(int(n) for n in re.findall(r"^base from the store: (\d+) roots", logs.text(), re.M))
-    verdict = "ok" if took and roots and program(ws) == FIRST else \
-        f"FOUND {took}, {roots} ROOTS, PRINTED {program(ws)!r}"
+    # A start whose roots from the store call all it needs has nothing to look up.
+    verdict = "ok" if roots and program(ws) == FIRST else f"FOUND {took}, {roots} ROOTS, PRINTED {program(ws)!r}"
     wrong += verdict != "ok"
     print(f"{label + ': the start':48} {verdict:12} store {found}, {roots} roots", flush=True)
     for what, edits, expected in steps:
@@ -165,22 +237,41 @@ def restart(ws, env, label, steps):
             text = open(path).read()
             assert old in text, (what, old)
             open(path, "w").write(text.replace(old, new, 1))
-        seen = len(logs.links())
+        seen, seen_anew, seen_unchanged = len(logs.links()), len(logs.anew()), len(logs.unchanged())
+        full = logs.full_builds()
         said = build(ws, env, what)
         printed = program(ws)
         made = logs.links()[seen:]
+        anew = logs.anew()[seen_anew:]
+        unchanged = logs.unchanged()[seen_unchanged:]
         how = made[-1] if made else "no link"
+        in_full = not how.startswith("spliced") and logs.full_builds() > full
         verdict = "ok"
         if printed != expected:
             verdict = f"PRINTED {printed!r}, NOT {expected!r}"
         elif "[ra-jit]" not in said:
             verdict = "NOT SERVED BY THE DAEMON"
+        elif in_full:
+            how = f"built in full; {how}"
         elif not how.startswith("spliced"):
             verdict = "NOT SPLICED"
+        elif what in KEEPING and (not anew or anew[-1]):
+            verdict = "NEW CODE"
+        elif what in RENAMING and not (anew and anew[-1]):
+            verdict = "NOTHING RENAMED"
+        elif what in UNCHANGED and "RA_JIT_CHECK_ALL" not in env and not (unchanged and unchanged[-1]):
+            verdict = "NONE BY ITEMS"
         wrong += verdict != "ok"
-        print(f"{label + ': ' + what:48} {verdict:12} {how[:120]}", flush=True)
+        print(f"{label + ': ' + what:48} {verdict:12} {how[:100]}; {anew[-1] if anew else '?'} anew, "
+              f"{unchanged[-1] if unchanged else '?'} by items", flush=True)
     if REBUILT in logs.text():
         print(f"{label}: NOT the store's code taken as it is: the daemon said `{REBUILT}`", flush=True)
+        wrong += 1
+    if UNKEPT in logs.text():
+        print(f"{label}: NOT every call kept: the daemon said `{UNKEPT}`", flush=True)
+        wrong += 1
+    if MISSED in logs.text():
+        print(f"{label}: NOT the code taken by its items the code it was: the daemon said `{MISSED}`", flush=True)
         wrong += 1
     return wrong
 
@@ -212,7 +303,7 @@ def main():
         shutil.copytree(ws, copy, ignore=shutil.ignore_patterns("target"))
         wrong += restart(ws, here, "restart", STEPS)
         subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=here, capture_output=True, timeout=120)
-        wrong += restart(copy, there, "another checkout", STEPS[:1])
+        wrong += restart(copy, dict(there, RA_JIT_CHECK_ALL="1"), "another checkout", STEPS)
     finally:
         for at, env in ((ws, here), (copy, there)):
             if os.path.isdir(at):

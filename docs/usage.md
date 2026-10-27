@@ -42,7 +42,9 @@ same as cargo's, it lets cargo do that build and prints one line saying why
 with cargo ([#84](https://github.com/indexable-inc/ra-jit/issues/84)), and the line names the
 step of [the plan](no-rustc.md) that removes it. That happens after a change to `Cargo.toml`,
 `Cargo.lock` or what a build script reads, when a test is added or removed, and for a few flags
-such as `--message-format` and `-Z`. The full list is in [cargo.md](cargo.md#when-cargo-builds-instead).
+such as `--message-format` and cargo's own `-Z`. The full list is in [cargo.md](cargo.md#when-cargo-builds-instead).
+rustc's `-Z` flags in `RUSTFLAGS` or `rustflags`, such as `-Zthreads=8`, are another matter: rustc
+still gets them, and what blaze does with each is in [support.md](support.md#-z-flags-for-rustc).
 
 ## Rebuild on every save
 
@@ -93,16 +95,18 @@ changed, usually in under a millisecond, and prints
 holding, such as a struct's fields, can't be applied to data that already exists, so `poll` asks
 for a restart instead.
 
-Live edits work on macOS on Apple silicon. Linux x86-64 support is on `main` and comes with the
-next release. How it works, and how fast from a keystroke to the running program:
+Live edits work on macOS on Apple silicon. Linux x86-64 and Windows x86-64 support is on `main`
+and comes with the next release. How it works, and how fast from a keystroke to the running program:
 [live.md](live.md).
 
 ## What works and what doesn't yet
 
 - **Platforms.** macOS on Apple silicon, Linux x86-64 and Linux ARM64 are measured in
   [benchmarks.md](benchmarks.md). On Windows every build is cargo's. Intel Macs are not supported.
-- **One Rust version.** blaze builds with 1.99.0 whatever toolchain the project pins; code that
-  needs a nightly's features fails (see [install.md](install.md#what-you-need) and
+- **One Rust version, the latest nightly.** blaze builds with the dated nightly it pins
+  (`nightly-2026-10-25`) whatever toolchain the project pins. Stable code and `#![feature(...)]`
+  code both build; code that needs what that nightly lacks, such as a feature it removed, fails
+  with rustc's error (see [install.md](install.md#what-you-need) and
   [support.md](support.md#toolchain)).
 - **Not every build is blaze's.** The changes listed above go to cargo, and so does code blaze
   can't compile yet. `cargo blaze status` counts both; in the benchmark tables, `(c)` marks an

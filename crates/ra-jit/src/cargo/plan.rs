@@ -100,6 +100,10 @@ pub(crate) struct Plan {
     pub(crate) package: Option<PathBuf>,
     /// The newest record the plan was made from.
     pub(crate) stamp: u128,
+    /// Whether the program is built whole by the daemon, every crate of it compiled and
+    /// `binary` linked by blaze, with nothing of rustc's (docs/no-rustc.md, step K).
+    #[serde(default)]
+    pub(crate) whole: bool,
 }
 
 /// The library of the workspace among `records` that wrote the file a link line names. The
@@ -148,6 +152,7 @@ impl Plan {
                 .then(|| link.output().map(|it| package::beside(Path::new(it))))
                 .flatten(),
             stamp: unit.stamp,
+            whole: false,
         };
         // rustc's object of the names the program keeps is moved to its copy, which stays when
         // the target directory is cleaned. GNU ld takes the panic runtime by it.
@@ -276,26 +281,10 @@ fn unsupported(unit: &Record) -> Option<String> {
             return Some(format!("`{name}` is built with -C {flag}"));
         }
     }
-    if let Some(flag) = unstable_flags(&unit.args).find(|it| !changes_nothing(it)) {
-        return Some(format!("`{name}` is built with the unstable flag -Z {flag}"));
+    if let Some(why) = crate::unstable::refusal(&unit.args) {
+        return Some(format!("`{name}` is built with {why}"));
     }
     None
-}
-
-/// The values of the `-Z` flags of a rustc command line, spelled `-Z name=value` or
-/// `-Zname=value`.
-fn unstable_flags(args: &[String]) -> impl Iterator<Item = &str> {
-    args.iter().enumerate().filter_map(|(at, arg)| match arg.strip_prefix("-Z")? {
-        "" => args.get(at + 1).map(String::as_str),
-        joined => Some(joined),
-    })
-}
-
-/// An unstable flag that changes nothing ra-jit compiles or links against. Cargo on a
-/// nightly toolchain passes `-Z embed-metadata=no` to every crate by itself: the metadata goes
-/// to the `.rmeta` file and not into the rlib, whose objects are the same.
-fn changes_nothing(flag: &str) -> bool {
-    flag.split('=').next() == Some("embed-metadata")
 }
 
 /// The line rustc ran the linker with: the variables it set, the driver, the arguments.
@@ -364,15 +353,19 @@ impl LinkLine {
     }
 
     /// Has what rustc built of the workspace give way to the daemon's by being weak, where
-    /// the linker has no flag for the first definition staying: Apple's.
+    /// the linker has no flag for the first definition staying: Apple's. Either way the
+    /// statics rustc kept private to an object are made ones the daemon's code can refer to
+    /// (`symbols::StaticCopy`): on an ELF system in copies of the files that have any.
     fn give_way(&mut self, copies: &[PathBuf]) -> anyhow::Result<()> {
-        if self.flavor != Flavor::Apple {
-            return Ok(());
-        }
+        let made = match self.flavor {
+            Flavor::Apple => weaken::copy_of,
+            Flavor::Cc => weaken::shared,
+            Flavor::Msvc => return Ok(()),
+        };
         for arg in &mut self.args {
             // rustc's object of names defines none.
             if !is_symbols(arg) && copies.iter().any(|it| it == Path::new(arg)) {
-                *arg = weaken::copy_of(Path::new(arg))?.display().to_string();
+                *arg = made(Path::new(arg))?.display().to_string();
             }
         }
         Ok(())
@@ -550,9 +543,19 @@ impl LinkLine {
             let closing = arg.len() - arg.trim_end_matches('\\').len();
             format!("\"{arg}{}\"", "\\".repeat(closing))
         };
+        // lld takes its flavour from the command line, which a response file does not give it.
+        let flavor: String = match self.args.iter().position(|it| it == "-flavor") {
+            Some(at) => self.args.drain(at..at + 2).map(|it| format!("\"{it}\" ")).collect(),
+            None => String::new(),
+        };
         let quoted: Vec<String> = self.args.iter().map(quoted).collect();
         std::fs::write(response, quoted.join("\n"))?;
-        Ok(format!("\"{}\" \"@{}\"", self.linker, response.display()))
+        // rustc runs the `rust-lld` a target names from its toolchain, not from the PATH.
+        let linker = match self.linker.as_str() {
+            "rust-lld" => super::toolchain::rust_lld(),
+            _ => PathBuf::from(&self.linker),
+        };
+        Ok(format!("\"{}\" {flavor}\"@{}\"", linker.display(), response.display()))
     }
 }
 
@@ -733,7 +736,7 @@ mod tests {
     #[test]
     fn unstable_flags_that_change_nothing() {
         assert_eq!(unsupported(&unit(&["-Z", "embed-metadata=no"])), None);
-        assert_eq!(unsupported(&unit(&["-Zembed-metadata=no"])), None);
+        assert_eq!(unsupported(&unit(&["-Zembed-metadata=no", "-Zthreads=8"])), None);
         let threads = unsupported(&unit(&["-Z", "embed-metadata=no", "-Z", "share-generics=y"]));
         assert!(threads.is_some_and(|why| why.contains("-Z share-generics=y")));
         assert!(unsupported(&unit(&["-Zlocation-detail=none"])).is_some());
@@ -924,6 +927,7 @@ mod tests {
             copies: Vec::new(),
             stamp: 0,
             package: None,
+            whole: false,
         };
         let response = dir.join("link.args");
         let link = LinkLine::parse(LINE).unwrap().present();
@@ -956,6 +960,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The repository's cargo configuration links MSVC programs with `rust-lld`, which only the
+    /// toolchain has; the daemon runs it by its path.
+    #[cfg(windows)]
+    #[test]
+    fn rust_lld_is_run_from_the_toolchain() {
+        const LINE: &str = r#""rust-lld" "-flavor" "link" "/NOLOGO" "C:\\t\\rustc1\\symbols.o" "C:\\t\\a.1.rcgu.o" "/OUT:C:\\t\\a.exe""#;
+        let dir = std::env::temp_dir().join(format!("ra-jit-plan-lld-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = LinkLine::parse(LINE).unwrap().present();
+        let lld = crate::cargo::toolchain::rust_lld();
+        assert!(lld.is_file(), "{}", lld.display());
+        let command = link
+            .command(&[Path::new("P:/ra-jit.o")], Path::new("P:/bin"), &dir.join("link.args"))
+            .unwrap();
+        assert!(
+            command.starts_with(&format!(r#""{}" "-flavor" "link" "@"#, lld.display())),
+            "{command}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn ours_go_ahead_of_rustcs() {
         let dir = std::env::temp_dir().join(format!("ra-jit-plan-{}", std::process::id()));
@@ -973,6 +998,7 @@ mod tests {
             copies: Vec::new(),
             package: None,
             stamp: 0,
+            whole: false,
         };
         let response = dir.join("link.args");
         let command = LinkLine::parse(LINE)

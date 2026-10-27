@@ -1542,6 +1542,20 @@ impl Function {
         }
     }
 
+    /// Whether this function of a trait cannot be used through `impl_`: one of its where-clauses
+    /// that names only the trait's parameters cannot hold there, as `Self: DoubleEndedIterator`
+    /// of `Iterator::rev` for an iterator that is not, as far as `krate` can know.
+    pub fn is_impossible_in(self, db: &dyn HirDatabase, impl_: Impl, krate: Crate) -> bool {
+        let (AnyFunctionId::FunctionId(id), Ok(impl_id)) = (self.id, ImplId::try_from(impl_))
+        else {
+            return false;
+        };
+        if !matches!(id.lookup(db).container, ItemContainerId::TraitId(_)) {
+            return false;
+        }
+        traits::is_impossible_associated_item(db, krate.id, impl_id, id.into())
+    }
+
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         match self.id {
             AnyFunctionId::FunctionId(id) => id.module(db).into(),
@@ -3686,6 +3700,20 @@ impl TypeParam {
             .collect()
     }
 
+    /// [`TypeParam::trait_bounds`] with the bounds' generic arguments, for blaze's lints.
+    pub fn trait_refs(self, db: &dyn HirDatabase) -> Vec<TraitRef<'_>> {
+        let self_ty = self.ty(db).ty.instantiate_identity().skip_norm_wip();
+        GenericPredicates::query_explicit(db, self.id.parent())
+            .iter_identity()
+            .filter_map(|pred| match &pred.kind().skip_binder() {
+                ClauseKind::Trait(trait_ref) if trait_ref.self_ty() == self_ty => {
+                    Some(TraitRef::new(self.id.parent(), trait_ref.trait_ref))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn default(self, db: &dyn HirDatabase) -> Option<Type<'_>> {
         let ty = generic_arg_from_param(db, self.id.into())?;
         match ty.kind() {
@@ -4545,6 +4573,15 @@ impl<'db> Type<'db> {
         all_crates(db)[0]
     }
 
+    /// The type owned by no item's generics, when it names none of them, so that it can be
+    /// asked of together with the types of any item: for blaze's lints.
+    pub fn without_params(&self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+        if self.ty.skip_binder().has_param() {
+            return None;
+        }
+        Some(Type { owner: TypeOwnerId::NoParams(Self::builtin_type_crate(db)), ty: self.ty })
+    }
+
     fn from_def(db: &'db dyn HirDatabase, def: impl Into<TyDefId>) -> Self {
         let def = def.into();
         let ty = db.ty(def);
@@ -4601,6 +4638,30 @@ impl<'db> Type<'db> {
             TypeOwnerId::NoParams(krate) => (GenericArgs::empty(), TypeOwnerId::NoParams(krate)),
         };
         Type { owner, ty: EarlyBinder::bind(self.ty.instantiate(interner, args).skip_norm_wip()) }
+    }
+
+    /// The type with its type parameters filled from `args`, in order, and its lifetime and const
+    /// parameters left as its own: `Foo<'a, i32, N>` of `Foo<'a, T, const N: usize>`. Unlike
+    /// [`Type::instantiate`], which fills those with errors that every trait goal takes to hold,
+    /// trait goals on the result are solved as in the type's own crate and environment.
+    pub fn instantiate_type_params(
+        &self,
+        args: impl IntoIterator<Item: Borrow<Type<'db>>>,
+    ) -> Type<'db> {
+        let TypeOwnerId::GenericDefId(def) = self.owner else { return self.clone() };
+        let interner = DbInterner::conjure();
+        let mut args = args.into_iter();
+        let args = GenericArgs::for_item(interner, def.into(), |index, id, _, _| match id {
+            GenericParamId::TypeParamId(_) => match args.next() {
+                Some(arg) => arg.borrow().ty.skip_binder().into(),
+                None => hir_ide::next_solver::mk_param(interner, index, id),
+            },
+            _ => hir_ide::next_solver::mk_param(interner, index, id),
+        });
+        Type {
+            owner: self.owner,
+            ty: EarlyBinder::bind(self.ty.instantiate(interner, args).skip_norm_wip()),
+        }
     }
 
     /// Instantiates multiple types with infer vars, keeping the same infer vars for the same owners.
@@ -5057,6 +5118,27 @@ impl<'db> Type<'db> {
                     infcx.var_for_def(param, hir_ide::Span::Dummy)
                 }
             })
+        })
+    }
+
+    /// Whether the two types unify with each one's generic parameters as inference variables,
+    /// whatever owns them: `[u8]` and an impl's `[T]` do, `[u8]` and `[MaybeUninit<T>]` do not.
+    pub fn unifies_with_any_params(&self, db: &'db dyn HirDatabase, other: &Type<'db>) -> bool {
+        traits::could_unify_with_infcx(db, self.krate(db), &mut |infcx| {
+            let a = Self::instantiate_many_with_infer([self], infcx).next().unwrap();
+            let b = Self::instantiate_many_with_infer([other], infcx).next().unwrap();
+            (a, b)
+        })
+    }
+
+    /// Whether the trait impl may apply to the type, the type's generic parameters and the
+    /// impl's as inference variables and an ambiguous answer counting: rustdoc's test of the
+    /// blanket impls a type gets. Solved in `krate`, rustdoc's local crate, whose dependencies
+    /// may reach an impl the type's own crate cannot see.
+    pub fn may_have_impl(&self, db: &'db dyn HirDatabase, impl_: Impl, krate: Crate) -> bool {
+        let Ok(id) = ImplId::try_from(impl_) else { return false };
+        traits::impl_may_apply(db, krate.id, id, &mut |infcx| {
+            Self::instantiate_many_with_infer([self], infcx).next().unwrap()
         })
     }
 

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Live edits end to end (macOS on AArch64, Linux on x86-64): edit a function of a running
+"""Live edits end to end (macOS on AArch64, Linux and Windows on x86-64): edit a function of a running
 program, and the running program must run the new code, applied by ra-jit-live from the
 daemon's patch.
 
 usage: live_e2e.py          (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
                              are found next to it)
+       LIVE_PROGRAM=live-alloc live_e2e.py
+                            the same steps on harness/live-alloc, the program on the nightly's
+                            `allocator_api` (a bump arena through `Vec<T, A>` and `Box<T, A>`)
 
 A copy of harness/live (a program that polls ra-jit-live and prints `answer()`) is built by the
 daemon until the daemon serves the build, edited once (the first edit after a daemon starts
@@ -22,8 +25,10 @@ Python 3.13, stdlib only. Every step has a timeout; a failure names the step.
 """
 
 import asyncio
+import atexit
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -35,6 +40,8 @@ BUILD_TIMEOUT = 900
 APPLY_TIMEOUT = 60
 # How many edits the running program takes one after another.
 LIVE_EDITS = int(os.environ.get("LIVE_EDITS", "5"))
+# The program under harness/ that is edited: `live`, or another with the same `answer()`.
+PROGRAM = os.environ.get("LIVE_PROGRAM", "live")
 
 
 class StepError(Exception):
@@ -139,12 +146,13 @@ async def start(executable: Path, cwd: Path, env: dict[str, str], step: str, ans
 
 
 async def main() -> None:
+    own_home()
     bin_dir = Path(os.environ["RA_JIT_BIN"]).resolve().parent
     work = Path(tempfile.mkdtemp(prefix="ra-jit-live-e2e-"))
     started: list[Running] = []
     try:
         shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
-        shutil.copytree(HERE / "live", work / "harness" / "live", ignore=shutil.ignore_patterns("target"))
+        shutil.copytree(HERE / PROGRAM, work / "harness" / "live", ignore=shutil.ignore_patterns("target"))
         project = work / "harness" / "live"
         source = project / "src" / "main.rs"
         executable = work / "target" / "debug" / "liveprobe"
@@ -183,7 +191,7 @@ async def main() -> None:
         print(f"live edits: answer {chain} in a running program, each applied by ra-jit-live")
 
         # Another program, built and edited while this one runs, has its edits on disk.
-        shutil.copytree(HERE / "live", work / "harness" / "other", ignore=shutil.ignore_patterns("target"))
+        shutil.copytree(HERE / PROGRAM, work / "harness" / "other", ignore=shutil.ignore_patterns("target"))
         other = work / "harness" / "other"
         other_env = dict(env, CARGO_TARGET_DIR=str(work / "target-other"))
         await build("other: first build", other, other_env)
@@ -222,6 +230,25 @@ async def main() -> None:
         for running in started:
             await running.stop()
         shutil.rmtree(work, ignore_errors=True)
+
+
+def own_home() -> None:
+    """Gives this run a daemon of its own when RA_JIT_HOME names none: the default home
+    (XDG_RUNTIME_DIR/ra-jit) is one daemon and socket for every harness and lane of the user,
+    and a run that talks to another's daemon tests that daemon's binary and state, not its own."""
+    if os.environ.get("RA_JIT_HOME"):
+        return
+    # Short, under /tmp: the daemon's socket is in it, and macOS allows 104 bytes.
+    home = tempfile.mkdtemp(prefix="rj-live-", dir=None if os.name == "nt" else "/tmp")
+    os.environ["RA_JIT_HOME"] = home
+
+    def stop() -> None:
+        # The daemon of this home alone, which nothing else talks to; its logs stay for a failure.
+        cargo_ra_jit = Path(os.environ["RA_JIT_BIN"]).resolve().parent / "cargo-ra-jit"
+        subprocess.run([str(cargo_ra_jit), "ra-jit", "stop"], env=dict(os.environ, RA_JIT_HOME=home),
+                       capture_output=True, timeout=120)
+
+    atexit.register(stop)
 
 
 def daemon_home() -> Path:

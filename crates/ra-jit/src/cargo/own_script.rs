@@ -185,6 +185,9 @@ fn compile_in(
     dir: &Path,
     rustc_had: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
+    if let Some(why) = crate::unstable::refusal(asked.args) {
+        return Err(format!("it is built with {why}"));
+    }
     let library = sysroot.join("lib/rustlib/src/rust/library");
     if !library.is_dir() {
         return Err("the toolchain has no source of the standard library".to_owned());
@@ -345,10 +348,12 @@ fn add(
         .and_then(|it| it.strip_suffix(".rlib").or(it.strip_suffix(".rmeta")));
     let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
     let proc_macro = name.strip_prefix(prefix).and_then(|it| it.strip_suffix(suffix));
-    let Some(unit) = library.or(proc_macro) else {
+    let Some(stem) = library.or(proc_macro) else {
         return Err(format!("it links {name}, which is not a library ra-jit knows"));
     };
-    let dir = path.parent().map(Record::dir_for).ok_or("a library without a directory")?;
+    let parent = path.parent().ok_or("a library without a directory")?;
+    let unit = &super::layout::unit_of_file(stem, parent);
+    let dir = Record::dir_for(parent);
     let record = Record::described(&dir, unit).ok_or_else(|| {
         format!("`{unit}`, which it links, was compiled before ra-jit described it")
     })?;

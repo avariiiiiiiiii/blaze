@@ -55,6 +55,17 @@ const SEEN_BUDGET: usize = 10_000;
 /// is larger is shown to LLVM, whose own measure of each call decides, so that what a
 /// function calls first does not use up [`BUDGET`] before its loops are reached.
 const BUILT_IN: usize = 120;
+
+/// [`BUILT_IN`], or what `RA_JIT_BUILT_IN` says, to measure another: `0` builds nothing in, so
+/// that every body a build's compile has goes to LLVM to be built in by its own inliner.
+fn built_in() -> usize {
+    static ASKED: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("RA_JIT_BUILT_IN").map_or(BUILT_IN, |it| {
+            it.parse().unwrap_or_else(|_| panic!("RA_JIT_BUILT_IN={it} is not a number"))
+        })
+    });
+    *ASKED
+}
 /// How many instructions the bodies a build's compile builds in and shows LLVM may add up to
 /// for each call of the function itself, with all they call in turn, and for the whole
 /// function. It shows them at any depth: the callees of a body it built in too. Each call has
@@ -400,6 +411,9 @@ pub(super) fn inline_limit(db: &dyn HirDatabase, instance: &Instance) -> Option<
     INLINING.with(|it| {
         let mut it = it.borrow_mut();
         let inlining = it.as_mut()?;
+        if inlining.whole && built_in() == 0 {
+            return None;
+        }
         let spent = if inlining.whole { !inlining.has_room() } else { inlining.spent >= BUDGET };
         if inlining.depth >= if inlining.whole { BUILD_DEPTH } else { DEPTH } || spent {
             inlining.starved += usize::from(inlining.whole);
@@ -414,13 +428,19 @@ pub(super) fn inline_limit(db: &dyn HirDatabase, instance: &Instance) -> Option<
             return None;
         }
         Some(if inlining.whole {
-            BUILT_IN
+            built_in()
         } else if inlining.is_hot(instance) {
             HOT_INSTRUCTIONS
         } else {
             SMALL_INSTRUCTIONS
         })
     })
+}
+
+/// Whether the compile under way is a build's that builds nothing in (`RA_JIT_BUILT_IN=0`),
+/// the library's `#[inline]` and generic functions neither: LLVM's inliner has every body.
+pub(super) fn builds_in_nothing() -> bool {
+    built_in() == 0 && INLINING.with(|it| it.borrow().as_ref().is_some_and(|it| it.whole))
 }
 
 /// Whether a build may build `instance` in, or show it to LLVM: one of the standard library

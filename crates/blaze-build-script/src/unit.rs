@@ -196,8 +196,10 @@ pub struct ConfigEnv {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DylibSearch {
-    /// The directory of the host's artifacts: `target/debug`.
-    pub host_root: PathBuf,
+    /// The directory of the host's artifacts: `target/debug`. None when the build writes none
+    /// there (`cargo check` without `--timings`), and cargo then adds neither it nor
+    /// `plugin_search`.
+    pub host_root: Option<PathBuf>,
     /// Where the host's dependencies are: `target/debug/deps`.
     pub host_deps: Vec<PathBuf>,
     /// The host's library directory in the sysroot (`rustc --print target-libdir`).

@@ -49,6 +49,17 @@ pub enum DepKind {
     Build,
 }
 
+impl serde::Serialize for DepKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            DepKind::Normal => None,
+            DepKind::Development => Some("dev"),
+            DepKind::Build => Some("build"),
+        }
+        .serialize(s)
+    }
+}
+
 impl DepKind {
     pub fn kind_table(&self) -> &'static str {
         match self {

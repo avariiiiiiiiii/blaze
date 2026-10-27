@@ -5,6 +5,7 @@
 //! `CARGO_MANIFEST_DIR`) are cargo's and cargo and blaze share `$CARGO_HOME`. What is ported
 //! from where is said at the top of each module; the plan is `docs/self-contained.md`.
 
+pub mod api;
 pub mod directory;
 pub mod download;
 pub mod git;

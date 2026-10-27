@@ -27,7 +27,8 @@
 //! entry of the index of a sealed pack is the key, the block, where the value starts in the
 //! block once it is unpacked, its length and the same checksum. The key on disk is not the
 //! caller's: it is hashed together with [`Identity`], so that a value is only ever found by
-//! the build of ra-jit that wrote it, for the toolchain it wrote it for.
+//! a build of ra-jit from the sources of the one that wrote it, for the toolchain it wrote it
+//! for.
 //!
 //! # Why daemons that share a directory do not corrupt it
 //!
@@ -119,12 +120,32 @@ pub fn toolchain() -> Option<&'static str> {
     TOOLCHAIN.get().map(String::as_str)
 }
 
-/// Sixteen hex digits of what the store keys this process's values by: the bytes of its
-/// executable and the toolchain [`compiles_against`] was told of. What a process of another
-/// name stored is of no use to this one. `None` before it is told.
+/// Sixteen hex digits of what the store keys this process's values by: what it was built from
+/// and the toolchain [`compiles_against`] was told of. What a process of another name stored
+/// is of no use to this one. `None` before it is told.
 pub fn build_name() -> Option<String> {
     let identity = Identity::current().ok()?;
     Some(identity.0[..8].iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+static SOURCES: OnceLock<String> = OnceLock::new();
+
+/// Tells the store what this process was built from, when its build can say: a hash of every
+/// source of it and of the crates it was built with, its features and its target. Two builds
+/// of the same sources compile the same code, so what one stored the other finds, whoever
+/// built it and however. Without it the bytes of the executable stand for that, and every
+/// build has a store of its own.
+pub fn built_from(sources: &str) {
+    _ = SOURCES.set(sources.to_owned());
+}
+
+/// What stands for the build of this process in [`Identity`]: what it was built from, else the
+/// bytes of its executable.
+fn build() -> Option<Vec<u8>> {
+    match SOURCES.get() {
+        Some(sources) => Some([&b"sources "[..], sources.as_bytes()].concat()),
+        None => program().map(|it| it.to_vec()),
+    }
 }
 
 /// What the bytes of this process's executable come to.
@@ -139,13 +160,13 @@ fn program() -> Option<[u8; KEY]> {
 /// Reads the executable on a thread of its own, for the store that is opened once the
 /// workspace is loaded: it is tens of megabytes to hash.
 pub fn identify_ahead() {
-    if std::env::var_os("RA_JIT_CACHE").is_some_and(|it| !is_off(&it)) {
+    if SOURCES.get().is_none() && std::env::var_os("RA_JIT_CACHE").is_some_and(|it| !is_off(&it)) {
         std::thread::spawn(program);
     }
 }
 
-/// What a value depends on that its key does not say: the format it is written in, the build
-/// of ra-jit that made it and the toolchain it was made for.
+/// What a value depends on that its key does not say: the format it is written in, what the
+/// ra-jit that made it was built from and the toolchain it was made for.
 #[derive(Clone, Copy)]
 struct Identity([u8; KEY]);
 
@@ -159,13 +180,13 @@ impl Identity {
         Identity(hasher.finalize().into())
     }
 
-    /// Of this process: the bytes of its executable and the toolchain it was told of.
+    /// Of this process: what it was built from and the toolchain it was told of.
     fn current() -> io::Result<Identity> {
         let toolchain = TOOLCHAIN.get().ok_or_else(|| {
             io::Error::other("the toolchain the program was built with is not known")
         })?;
-        let program = program().ok_or_else(|| io::Error::other("the program cannot be read"))?;
-        Ok(Identity::new(&program, toolchain))
+        let build = build().ok_or_else(|| io::Error::other("the program cannot be read"))?;
+        Ok(Identity::new(&build, toolchain))
     }
 
     fn key(&self, key: &[u8; KEY]) -> [u8; KEY] {
@@ -1601,6 +1622,14 @@ impl Store {
     /// Whether a sealed pack has a value for the key.
     pub fn has(&self, key: &[u8; KEY]) -> bool {
         self.place(&self.identity.key(key)).is_some()
+    }
+
+    /// Whether a sealed pack has a value for the key, which is kept as if it were read: one
+    /// that what is read needs, and that is itself read only later or not at all.
+    pub fn has_used(&self, key: &[u8; KEY]) -> bool {
+        let Some(place) = self.place(&self.identity.key(key)) else { return false };
+        place.pack.used.store(true, Ordering::Relaxed);
+        true
     }
 
     /// The value of a key, if a sealed pack has it as it was written.

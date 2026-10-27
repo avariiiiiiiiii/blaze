@@ -12,18 +12,17 @@ use serde::Serialize;
 use crate::dependency::SerializedDependency;
 use crate::manifest::{Context, Manifest};
 use crate::paths::{ancestors, normalize_path};
-use crate::source::SourceId;
 use crate::targets::SerializedTarget;
 use crate::workspace::Workspace;
 
 const VERSION: u32 = 1;
 
 #[derive(Serialize)]
-pub struct ExportInfo<'a> {
+pub struct ExportInfo<'a, R = ()> {
     packages: Vec<SerializedPackage<'a>>,
     workspace_members: Vec<PackageIdSpec>,
     workspace_default_members: Vec<PackageIdSpec>,
-    resolve: Option<()>,
+    resolve: Option<R>,
     target_directory: PathBuf,
     build_directory: PathBuf,
     version: u32,
@@ -31,15 +30,16 @@ pub struct ExportInfo<'a> {
     metadata: Option<&'a toml::Value>,
 }
 
+/// A package as `cargo metadata` prints it.
 #[derive(Serialize)]
-struct SerializedPackage<'a> {
+pub struct SerializedPackage<'a> {
     name: &'a str,
     version: &'a semver::Version,
     id: PackageIdSpec,
     license: Option<&'a str>,
     license_file: Option<&'a str>,
     description: Option<&'a str>,
-    source: &'a SourceId,
+    source: Option<String>,
     dependencies: Vec<SerializedDependency<'a>>,
     targets: Vec<SerializedTarget<'a>>,
     features: BTreeMap<&'a str, Vec<String>>,
@@ -60,10 +60,34 @@ struct SerializedPackage<'a> {
     default_run: Option<&'a str>,
     rust_version: Option<&'a RustVersion>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    hints: Option<&'a Hints>,
+    hints: Option<SerializedHints<'a>>,
 }
 
-fn serialize_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> SerializedPackage<'a> {
+/// `[hints]` as cargo 1.101.0 prints it: every hint it knows, null when not given.
+/// cargo-util-schemas 0.14.3 reads no `min-opt-level`.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct SerializedHints<'a> {
+    min_opt_level: Option<&'a toml::Value>,
+    mostly_unused: Option<&'a toml::Value>,
+}
+
+impl SerializedPackage<'_> {
+    /// Has the package's `source` be `source`, as the lock file pins it: a git source with
+    /// its commit. Its dependencies on packages of its own source, as a path in its
+    /// repository names them, are pinned with it.
+    pub fn set_source(&mut self, source: String) {
+        for dep in &mut self.dependencies {
+            if dep.source.is_some() && dep.source == self.source {
+                dep.source = Some(source.clone());
+            }
+        }
+        self.source = Some(source);
+    }
+}
+
+/// The package of the manifest at `manifest_path` as `cargo metadata` prints it.
+pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> SerializedPackage<'a> {
     let meta = &m.metadata;
     SerializedPackage {
         name: &m.package_id.name,
@@ -72,7 +96,8 @@ fn serialize_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialized
         license: meta.license.as_deref(),
         license_file: meta.license_file.as_deref(),
         description: meta.description.as_deref(),
-        source: &m.package_id.source_id,
+        source: (!m.package_id.source_id.is_path())
+            .then(|| m.package_id.source_id.as_url().to_string()),
         dependencies: m.dependencies.iter().map(|d| d.serialized()).collect(),
         targets: m.targets.iter().filter_map(|t| t.serialized()).collect(),
         features: m
@@ -95,20 +120,33 @@ fn serialize_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialized
         metabuild: m.metabuild.as_deref(),
         default_run: m.default_run.as_deref(),
         rust_version: meta.rust_version.as_ref(),
-        hints: m.hints.as_ref(),
+        hints: m.hints.as_ref().map(|it: &Hints| SerializedHints {
+            min_opt_level: None,
+            mostly_unused: it.mostly_unused.as_ref(),
+        }),
     }
 }
 
 /// What `cargo metadata --no-deps` prints for the workspace.
 pub fn export_no_deps<'a>(ws: &'a Workspace<'_>) -> ExportInfo<'a> {
+    let packages = ws.members().map(|(path, m)| export_package(path, m)).collect();
+    export(ws, packages, None)
+}
+
+/// What `cargo metadata` prints for the workspace with `packages` and `resolve`.
+pub fn export<'a, R>(
+    ws: &'a Workspace<'_>,
+    packages: Vec<SerializedPackage<'a>>,
+    resolve: Option<R>,
+) -> ExportInfo<'a, R> {
     ExportInfo {
-        packages: ws.members().map(|(path, m)| serialize_package(path, m)).collect(),
+        packages,
         workspace_members: ws.members().map(|(_, m)| m.package_id.to_spec()).collect(),
         workspace_default_members: ws
             .default_members()
             .map(|(_, m)| m.package_id.to_spec())
             .collect(),
-        resolve: None,
+        resolve,
         target_directory: ws.target_dir(),
         build_directory: ws.build_dir(),
         version: VERSION,

@@ -390,12 +390,12 @@ pub fn into_resolve(
 
 /// How many packages of a name and version the resolve has, which decides how briefly an
 /// edge can be written.
-struct EncodeState<'a> {
+pub(crate) struct EncodeState<'a> {
     counts: Option<FxHashMap<InternedString, FxHashMap<&'a semver::Version, usize>>>,
 }
 
 impl<'a> EncodeState<'a> {
-    fn new(resolve: &'a Resolve) -> EncodeState<'a> {
+    pub(crate) fn new(resolve: &'a Resolve) -> EncodeState<'a> {
         let counts = (resolve.version() >= ResolveVersion::V2).then(|| {
             let mut map: FxHashMap<_, FxHashMap<_, usize>> = FxHashMap::default();
             for id in resolve.iter() {
@@ -446,7 +446,7 @@ fn encodable_resolve_node(
     }
 }
 
-fn encodable_package_id(
+pub(crate) fn encodable_package_id(
     id: PackageId,
     state: &EncodeState<'_>,
     resolve_version: ResolveVersion,

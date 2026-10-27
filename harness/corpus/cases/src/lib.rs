@@ -2,9 +2,10 @@
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
-// `box` patterns and 128-bit variable arguments are unstable: the cases are for a nightly
+// Deref patterns and 128-bit variable arguments are unstable: the cases are for a nightly
 // toolchain only.
-#![cfg_attr(feature = "nightly", feature(box_patterns, c_variadic_int128))]
+#![cfg_attr(feature = "nightly", feature(deref_patterns, c_variadic_int128))]
+#![cfg_attr(feature = "nightly", allow(incomplete_features))]
 
 pub mod stabilized;
 
@@ -3234,8 +3235,10 @@ pub mod array_map {
 }
 
 #[cfg(feature = "nightly")]
-pub mod box_patterns {
-    pub struct Noisy(pub &'static str, pub std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+pub mod deref_patterns {
+    use std::{cell::RefCell, rc::Rc};
+
+    pub struct Noisy(pub &'static str, pub Rc<RefCell<Vec<String>>>);
     impl Drop for Noisy {
         fn drop(&mut self) {
             self.1.borrow_mut().push(format!("drop {}", self.0));
@@ -3248,41 +3251,128 @@ pub mod box_patterns {
     fn sum(list: &List) -> u32 {
         match list {
             List::Nil => 0,
-            List::Cons(value, box rest) => *value + sum(rest),
+            List::Cons(value, deref!(rest)) => *value + sum(rest),
         }
     }
+    // Moves the first out of the box and drops the rest, in rustc's order.
     fn take(pair: Box<(Noisy, Noisy)>) -> Noisy {
-        let box (first, _second) = pair;
+        let deref!((first, _second)) = pair;
         first.1.borrow_mut().push("taken".to_owned());
         first
     }
+    fn by_value(option: Box<Option<u32>>) -> u32 {
+        match option {
+            deref!(Some(x)) => x,
+            deref!(None) => 0,
+        }
+    }
     fn by_ref(option: &Box<Option<String>>) -> usize {
         match option {
-            box Some(text) => text.len(),
-            box None => 0,
+            deref!(Some(text)) => text.len(),
+            deref!(None) => 0,
         }
     }
     fn mutate(pair: &mut Box<(u8, String)>) {
-        let box (_, ref mut text) = *pair;
+        let deref!((_, ref mut text)) = *pair;
         text.push('!');
     }
     fn nested(inner: Box<Box<Noisy>>) -> &'static str {
-        let box box noisy = inner;
+        let deref!(deref!(noisy)) = inner;
         noisy.0
+    }
+    // Without `deref!`, inference peels the box itself.
+    fn implicit(option: Box<Option<u32>>) -> u32 {
+        match option {
+            Some(x) => x + 1,
+            None => 0,
+        }
+    }
+    fn implicit_ref(option: &Box<Option<String>>) -> String {
+        match option {
+            Some(text) => text.clone() + "?",
+            None => String::new(),
+        }
+    }
+    fn implicit_moved(option: Box<Option<Noisy>>) -> &'static str {
+        match option {
+            Some(noisy) => noisy.0,
+            None => "none",
+        }
+    }
+    // Through smart pointers that are not boxes, `Deref::deref` is called on a borrow.
+    fn shared(option: &Rc<Option<String>>) -> usize {
+        match option {
+            Some(text) if text.is_empty() => 100,
+            Some(text) => text.len(),
+            None => 0,
+        }
+    }
+    fn explicit_rc(option: Rc<Option<u8>>) -> u8 {
+        match option {
+            deref!(Some(n)) => n,
+            deref!(None) => 7,
+        }
+    }
+    fn word(text: String) -> u8 {
+        match text {
+            "zero" => 0,
+            "one" => 1,
+            deref!("two") => 2,
+            _ => 3,
+        }
+    }
+    fn bytes(data: Vec<u8>) -> u8 {
+        match data {
+            deref!(b"ab") => 1,
+            deref!([b'c', ..]) => 2,
+            _ => 3,
+        }
+    }
+    // A `ref mut` inside calls `DerefMut::deref_mut`.
+    fn shout(mut text: String) -> String {
+        let deref!(ref mut inner) = text;
+        inner.make_ascii_uppercase();
+        text
+    }
+    fn first_byte(mut data: Vec<u8>) -> Vec<u8> {
+        if let [first, ..] = &mut data {
+            *first += 1;
+        }
+        data
     }
 
     pub fn run() -> Vec<String> {
-        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = Rc::new(RefCell::new(Vec::new()));
         let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
         let mut out = vec![sum(&list).to_string()];
         let kept = take(Box::new((Noisy("a", log.clone()), Noisy("b", log.clone()))));
         out.push(kept.0.to_owned());
+        out.push(by_value(Box::new(Some(5))).to_string());
+        out.push(by_value(Box::new(None)).to_string());
         out.push(by_ref(&Box::new(Some("hey".to_owned()))).to_string());
         out.push(by_ref(&Box::new(None)).to_string());
         let mut pair = Box::new((1, "x".to_owned()));
         mutate(&mut pair);
         out.push(pair.1.clone());
         out.push(nested(Box::new(Box::new(Noisy("n", log.clone())))).to_owned());
+        out.push(implicit(Box::new(Some(41))).to_string());
+        out.push(implicit(Box::new(None)).to_string());
+        out.push(implicit_ref(&Box::new(Some("why".to_owned()))));
+        out.push(implicit_ref(&Box::new(None)));
+        out.push(implicit_moved(Box::new(Some(Noisy("m", log.clone())))).to_owned());
+        out.push(shared(&Rc::new(Some("four".to_owned()))).to_string());
+        out.push(shared(&Rc::new(Some(String::new()))).to_string());
+        out.push(shared(&Rc::new(None)).to_string());
+        out.push(explicit_rc(Rc::new(Some(9))).to_string());
+        out.push(explicit_rc(Rc::new(None)).to_string());
+        for text in ["zero", "one", "two", "three"] {
+            out.push(word(text.to_owned()).to_string());
+        }
+        for data in [&b"ab"[..], b"cd", b"c", b"", b"abc"] {
+            out.push(bytes(data.to_vec()).to_string());
+        }
+        out.push(shout("loud".to_owned()));
+        out.push(format!("{:?}", first_byte(vec![1, 2])));
         drop(kept);
         out.extend(log.borrow().iter().cloned());
         out
@@ -3638,6 +3728,77 @@ pub mod closure_clone {
     }
 }
 
+/// A constant holds a `TypeId`, as the vtable boa's garbage collector keeps of each type does
+/// (`vtable_of`): rustc's hash of the type, one with a binder of its own too.
+pub mod type_id_in_constant {
+    use std::any::TypeId;
+
+    pub struct VTable {
+        pub id: TypeId,
+        pub size: usize,
+    }
+
+    trait HasVTable: Sized + 'static {
+        const VTABLE: &'static VTable;
+    }
+
+    impl<T: 'static> HasVTable for T {
+        const VTABLE: &'static VTable = &VTable { id: TypeId::of::<T>(), size: size_of::<T>() };
+    }
+
+    fn vtable_of<T: 'static>() -> &'static VTable {
+        T::VTABLE
+    }
+
+    pub fn run() -> Vec<(TypeId, usize, bool)> {
+        let of = |it: &'static VTable, runtime: TypeId| (it.id, it.size, it.id == runtime);
+        vec![
+            of(vtable_of::<u32>(), TypeId::of::<u32>()),
+            of(vtable_of::<String>(), TypeId::of::<String>()),
+            of(vtable_of::<fn(&u8) -> &u8>(), TypeId::of::<for<'a> fn(&'a u8) -> &'a u8>()),
+            of(vtable_of::<Box<dyn for<'a> Fn(&'a str)>>(), TypeId::of::<Box<dyn Fn(&str)>>()),
+        ]
+    }
+
+    const U8: TypeId = TypeId::of::<u8>();
+
+    fn own_id<T: 'static>() -> bool {
+        T::VTABLE.id == TypeId::of::<T>()
+    }
+
+    /// Read where the constant is, which a backend that knows the constant's bytes folds:
+    /// those have to be the hashes, not const eval's ids.
+    pub fn read_in_place() -> Vec<bool> {
+        let u8 = [U8 == TypeId::of::<u8>(), U8 == TypeId::of::<u16>()];
+        vec![own_id::<u32>(), own_id::<String>(), u8[0], u8[1]]
+    }
+
+    fn vtable_of_value<T: 'static>(_: &T) -> &'static VTable {
+        vtable_of::<T>()
+    }
+
+    fn type_id_of_value<T: 'static>(_: &T) -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    /// A closure's and one another crate's generic function wraps it in, as boa's
+    /// `NativeFunction::from_copy_closure_with_captures` does: rustc's hash of them is not one
+    /// to match, only the ones the program's own code computes.
+    pub fn closures() -> Vec<(usize, bool, bool)> {
+        let seed = 4u8;
+        let own = move || seed;
+        let wrapped = old_macros::wrapped(own);
+        let of = |it: &'static VTable, runtime: TypeId| {
+            (it.size, it.id == runtime, it.id == TypeId::of::<u8>())
+        };
+        vec![
+            of(vtable_of_value(&own), type_id_of_value(&own)),
+            of(vtable_of_value(&wrapped), type_id_of_value(&wrapped)),
+            (wrapped() as usize, vtable_of_value(&own).id != vtable_of_value(&wrapped).id, false),
+        ]
+    }
+}
+
 /// `TypeId`s are rustc's hash of the type, which its own code compares ours against.
 pub mod type_id_hashes {
     use std::any::{Any, TypeId};
@@ -3833,6 +3994,36 @@ pub mod type_id_hashes {
 
     fn generic_item<T, const N: usize>(_: T) {}
 
+    /// `impl`s written after ones that derives and a macro make, which rustc numbers after
+    /// the written ones.
+    pub mod derived {
+        macro_rules! made {
+            ($name:ident) => {
+                impl $name {
+                    pub fn made(&self) -> u8 {
+                        1
+                    }
+                }
+            };
+        }
+        #[derive(Clone, Debug, Default, PartialEq)]
+        pub struct Node(pub u8);
+        made!(Node);
+        impl super::Shape for Node {}
+        impl Node {
+            pub fn get(&self) -> u8 {
+                self.0
+            }
+        }
+        #[derive(Clone, Copy)]
+        pub struct Field(pub u8);
+        impl Field {
+            pub fn new() -> Field {
+                Field(0)
+            }
+        }
+    }
+
     /// Function items, which are named by their path and what they were instantiated with.
     pub fn function_items() -> Vec<TypeId> {
         vec![
@@ -3844,8 +4035,118 @@ pub mod type_id_hashes {
             of_value(&std::mem::drop::<String>),
             of_value(&<u8 as Clone>::clone),
             of_value(&<Vec<u8> as Default>::default),
+            of_value(&derived::Node::get),
+            of_value(&derived::Field::new),
             id::<Option<Generic<u8, 1>>>(),
         ]
+    }
+
+    /// Constructors used as functions (`.map(Ok)`): a `FnDef` of the variant's or the struct's
+    /// `Ctor`, with the ADT's parameters. axum's `Body::from_stream` and tonic's client ask for
+    /// the `TypeId` of a stream mapped through one (blaze #369).
+    pub fn constructors() -> Vec<TypeId> {
+        vec![
+            of_value(&Some::<u8>),
+            of_value(&Ok::<u8, String>),
+            of_value(&Err::<u8, String>),
+            of_value(&Tuple),
+            of_value(&Payload::Tuple),
+            of_value(&Generic::<u16, 2>),
+            of_value(&Borrowed),
+            any_of(std::iter::once(1u8).map(Some)),
+            any_of(std::iter::once(1u8).map(Ok::<u8, ()>)),
+        ]
+    }
+
+    fn any_of<T: 'static>(value: T) -> TypeId {
+        let value = Some(value);
+        (&value as &dyn Any).type_id()
+    }
+
+    /// Closures of a crate rustc compiled, instantiated here (blaze #369's tonic
+    /// `map_frame(|frame| ..)`): rustc's `DefPath` of the closure and all of its arguments.
+    pub fn upstream_closures() -> Vec<TypeId> {
+        use std::iter::once;
+        let (expanded, seven) = upstream::expanded(once(1u8));
+        vec![
+            of_value(&upstream::doubled(once(1u8))),
+            of_value(&upstream::doubled(vec![1u8].into_iter())),
+            of_value(&upstream::offset(once(1u8), 2)),
+            of_value(&upstream::counted(once(1u8))),
+            of_value(&upstream::once_text(String::new())),
+            of_value(&upstream::adder(1)),
+            of_value(&expanded),
+            of_value(&seven),
+            of_value(&upstream::Wrap(String::from("w")).repeat()),
+            of_value(&upstream::Wrap(3u64).repeat()),
+            of_value(&upstream::Source::source(&1u8)),
+            any_of(upstream::doubled(once(1u8))),
+            any_of(upstream::offset(once(1u8), 2)),
+            of_value(&upstream::kept(once(1u8))),
+            of_value(&upstream::after_consts()),
+        ]
+    }
+
+    /// `async` blocks and `async fn` bodies of a crate rustc compiled, and a closure written
+    /// in one: rustc's `DefPath` and the coroutine's arguments.
+    pub fn upstream_coroutines() -> Vec<TypeId> {
+        let made = std::pin::pin!(upstream::maker(2));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(times) = std::future::Future::poll(made, &mut context) else {
+            unreachable!()
+        };
+        vec![
+            of_value(&upstream::later(1)),
+            of_value(&upstream::sum(1, 2)),
+            of_value(&upstream::maker(2)),
+            of_value(&times),
+            of_value(&upstream::nested(1)),
+            any_of(upstream::sum(1, 2)),
+            any_of(Box::pin(upstream::later(3))),
+        ]
+    }
+
+    /// What rustc's code boxed downcasts in ours, and the reverse, through a type that holds
+    /// a closure of its crate.
+    pub fn upstream_downcasts() -> Vec<bool> {
+        let (value, boxed) = upstream::boxed_doubled();
+        let mapped = upstream::doubled(std::iter::once(5u8));
+        vec![
+            is(&value, &*boxed),
+            is(&mapped, &*boxed),
+            upstream::try_downcast::<u8, _>(upstream::doubled(std::iter::once(1u8))).is_ok(),
+            upstream::try_downcast::<Option<u8>, _>(mapped).is_ok(),
+            upstream::try_downcast::<Unit, _>(value).is_ok(),
+        ]
+    }
+
+    /// Constructors of a crate rustc compiled and of std, and of an enum written in a body.
+    pub fn more_constructors() -> Vec<TypeId> {
+        enum InBody {
+            One(u8),
+        }
+        let _ = InBody::One(0);
+        let _ = upstream::Shape::<u8>::Dot;
+        vec![
+            of_value(&upstream::Shape::<u8>::Line),
+            of_value(&upstream::Shape::<String>::Pair),
+            of_value(&upstream::Meters),
+            of_value(&upstream::Wrap::<u8>),
+            of_value(&std::num::Wrapping::<u8>),
+            of_value(&std::cmp::Reverse::<u8>),
+            of_value(&std::ops::ControlFlow::<u8, ()>::Break),
+            of_value(&InBody::One),
+            any_of(Some(3u8).map(Some)),
+            any_of(vec![1u8].into_iter().map(std::num::Wrapping)),
+            any_of(std::iter::once(1u8).map(upstream::Shape::Line)),
+        ]
+    }
+
+    /// A value rustc's code boxed, of a type with `Ok` used as a function, downcast in ours.
+    pub fn constructor_downcasts() -> Vec<bool> {
+        let (value, boxed) = upstream::boxed_ok();
+        let ours = std::iter::once(3u8).map(Ok::<u8, ()>);
+        vec![is(&value, &*boxed), is(&ours, &*boxed), is(&Some::<u8>, &*boxed)]
     }
 
     struct Holder<F>(F, u8);
@@ -6441,6 +6742,22 @@ pub mod inline_asm {
         out
     }
 
+    /// `ah` named in the text: a byte register beside it cannot be one that needs a REX
+    /// prefix (`sil`), which LLVM's assembler refuses to encode.
+    fn high_of(pair: &[u8; 2]) -> u16 {
+        let out: u16;
+        unsafe {
+            asm!(
+                "mov al, {low}",
+                "mov ah, {high}",
+                low = in(reg_byte) pair[0],
+                high = in(reg_byte) pair[1],
+                out("ax") out,
+            )
+        };
+        out
+    }
+
     fn floats(a: f64, b: f64) -> (f64, f32) {
         let sum: f64;
         let mut single = a as f32;
@@ -6510,6 +6827,7 @@ pub mod inline_asm {
             divide(47, 5),
             vendor().iter().all(u8::is_ascii_graphic),
             bytes(0x34, 0x12),
+            high_of(std::hint::black_box(&[0x78, 0x56])),
             floats(1.5, 2.25),
             att(35),
             kept([1, 2, 3, 4, 5, 6]),
@@ -8402,5 +8720,194 @@ pub mod higher_ranked {
         let handled = with_handler(report);
         let sorted = sorted(std::hint::black_box(true));
         (copy, first, second, trimmed, sum, handled, sorted)
+    }
+}
+
+/// The future of a trait's `async fn` handed on as a function item, to code that names it as
+/// an associated type of what the item implements, as boa's `#[dynify]` does: the solver
+/// reveals that as the trait method's coroutine, which has no code, and the impl's is the
+/// future once `Self` is known.
+pub mod async_fn_item_of_trait {
+    use std::{
+        future::Future,
+        pin::{Pin, pin},
+        task::{Context, Poll, Waker},
+    };
+
+    #[allow(async_fn_in_trait)]
+    pub trait Load {
+        async fn load(self, by: u32) -> u32;
+    }
+
+    pub struct Doubled(pub u32);
+
+    impl Load for Doubled {
+        async fn load(self, by: u32) -> u32 {
+            std::future::ready(self.0 * 2).await + by
+        }
+    }
+
+    pub struct Ready(pub u32);
+
+    impl Load for Ready {
+        fn load(self, by: u32) -> impl Future<Output = u32> {
+            std::future::ready(self.0 + by)
+        }
+    }
+
+    trait Handed<T> {
+        type Fut: Future<Output = u32>;
+        fn call(self, it: T) -> Self::Fut;
+    }
+
+    impl<T, F: FnOnce(T, u32) -> R, R: Future<Output = u32>> Handed<T> for F {
+        type Fut = R;
+        fn call(self, it: T) -> R {
+            self(it, 3)
+        }
+    }
+
+    fn handed<T, F: Handed<T>>(f: F, it: T) -> F::Fut {
+        f.call(it)
+    }
+
+    fn loaded<T: Load>(it: T) -> u32 {
+        block_on(pin!(async move { handed(T::load, it).await + 1 }))
+    }
+
+    fn block_on<F: Future + ?Sized>(mut future: Pin<&mut F>) -> F::Output {
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(it) = future.as_mut().poll(&mut cx) {
+                return it;
+            }
+        }
+    }
+
+    pub trait Serve {
+        fn serve(&self, by: u32) -> impl Future<Output = u32> + Send;
+    }
+
+    impl Serve for Doubled {
+        async fn serve(&self, by: u32) -> u32 {
+            std::future::ready(self.0 * 2).await + by
+        }
+    }
+
+    trait Method<S, P> {
+        type Future: Future<Output = u32> + Send;
+        fn invoke(&self, server: S, params: P) -> Self::Future;
+    }
+
+    impl<F, S, P, Fut> Method<S, (P,)> for F
+    where
+        F: Fn(S, P) -> Fut,
+        Fut: Future<Output = u32> + Send,
+    {
+        type Future = Fut;
+        fn invoke(&self, server: S, params: (P,)) -> Fut {
+            self(server, params.0)
+        }
+    }
+
+    fn invoked<S, P, M: Method<S, P>>(method: &M, server: S, params: P) -> u32 {
+        block_on(pin!(method.invoke(server, params)))
+    }
+
+    fn served<T: Serve>(it: &T) -> u32 {
+        invoked(&T::serve, it, (4,))
+    }
+
+    pub trait Server: Send + Sync + 'static {
+        fn hello(&self, params: u32) -> impl Future<Output = u32> + Send;
+        fn bye(&self) -> impl Future<Output = u32> + Send {
+            async { 7 }
+        }
+    }
+
+    trait Routed<S, P, R> {
+        type Future: Future<Output = R> + Send;
+        fn invoke(&self, server: S, params: P) -> Self::Future;
+    }
+
+    impl<F, S, R, Fut> Routed<S, (), R> for F
+    where
+        F: Fn(S) -> Fut,
+        Fut: Future<Output = R> + Send,
+    {
+        type Future = Fut;
+        fn invoke(&self, server: S, (): ()) -> Fut {
+            self(server)
+        }
+    }
+
+    impl<F, S, P, R, Fut> Routed<S, (P,), R> for F
+    where
+        F: Fn(S, P) -> Fut,
+        Fut: Future<Output = R> + Send,
+    {
+        type Future = Fut;
+        fn invoke(&self, server: S, params: (P,)) -> Fut {
+            self(server, params.0)
+        }
+    }
+
+    trait FromParams {
+        fn from_params(n: u32) -> Self;
+    }
+
+    impl FromParams for () {
+        fn from_params(_: u32) {}
+    }
+
+    impl FromParams for (u32,) {
+        fn from_params(n: u32) -> Self {
+            (n,)
+        }
+    }
+
+    type Handler = Box<dyn Fn(u32) -> Pin<Box<dyn Future<Output = u32> + Send>>>;
+
+    struct Router<S> {
+        server: std::sync::Arc<S>,
+        methods: Vec<Handler>,
+    }
+
+    impl<S: Send + Sync + 'static> Router<S> {
+        fn method<P, R, F>(&mut self, callback: F) -> &mut Self
+        where
+            P: FromParams + Send + 'static,
+            R: Into<u32> + 'static,
+            F: for<'a> Routed<&'a S, P, R> + Clone + Send + Sync + 'static,
+        {
+            let server = self.server.clone();
+            self.methods.push(Box::new(move |n| {
+                let (callback, server) = (callback.clone(), server.clone());
+                Box::pin(async move { callback.invoke(&*server, P::from_params(n)).await.into() })
+            }));
+            self
+        }
+    }
+
+    fn register<S: Server>(router: &mut Router<S>) {
+        router.method(S::hello).method(S::bye);
+    }
+
+    struct Lsp(u32);
+
+    impl Server for Lsp {
+        async fn hello(&self, params: u32) -> u32 {
+            std::future::ready(self.0).await + params
+        }
+    }
+
+    fn routed(n: u32) -> (u32, u32) {
+        let mut router = Router { server: std::sync::Arc::new(Lsp(n)), methods: Vec::new() };
+        register(&mut router);
+        (block_on(router.methods[0](3).as_mut()), block_on(router.methods[1](0).as_mut()))
+    }
+
+    pub fn run(n: u32) -> (u32, u32, u32, (u32, u32)) {
+        (loaded(Doubled(n)), loaded(Ready(n)), served(&Doubled(n)), routed(n))
     }
 }

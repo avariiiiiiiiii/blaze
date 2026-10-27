@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """The doctests of real crates, run by `cargo test --doc` and by `cargo ra-jit test --doc`:
 the same tests must end the same way and print the same, in ra-jit's first run and in its
-second, which reuses what rustc compiled of the examples ra-jit leaves to it. Each crate's
-line says how many examples ra-jit built and how many rustc did.
+second, which reuses the programs of the first. Each crate's line says how many examples
+ra-jit built and how many it did not: those fail, saying why, and are not compared.
 
     RA_JIT_BIN=../target/release/ra-jit python3 doctests.py [--few] [name-version ...]
 
 Each crate is unpacked by `vendor.sh` and built in a directory that is removed afterwards.
-A crate ra_jit leaves to rustdoc is counted as refused, with its reason; a difference is
-WRONG and fails the run. `--few` is the first three crates."""
+A difference is WRONG and fails the run. `--few` is the first three crates."""
 import os
 import re
 import subprocess
 import sys
 import tempfile
 
-from buildmodel import doctest_report
+from buildmodel import doctest_report, judge_doctests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RA_JIT = os.path.abspath(os.environ.get("RA_JIT_BIN", os.path.join(HERE, "..", "target", "release", "ra-jit")))
@@ -45,7 +44,7 @@ def row(spec):
     with tempfile.TemporaryDirectory(prefix="ra-jit-doctests-") as scratch:
         want = tested(crate, [], os.path.join(scratch, "cargo"))
         got = tested(crate, ["ra-jit"], os.path.join(scratch, "ra-jit"))
-        # The second run has what rustc compiled of the examples in the first, and the store.
+        # The second run has the programs of the first, and the store.
         again = tested(crate, ["ra-jit"], os.path.join(scratch, "ra-jit"))
     verdict = judged(want, got)
     if verdict[0] == "same" and want[:2] != again[:2]:
@@ -55,19 +54,12 @@ def row(spec):
 
 def judged(want, got):
     """What the two runs of a crate come to."""
-    if want[:2] != got[:2]:
-        lines = [f"cargo's `{w}`, ra-jit's `{g}`" for w, g in zip(want[1], got[1]) if w != g]
-        return "WRONG", (lines[0] if lines else f"cargo's ends with {want[0]}, ra-jit's with {got[0]}")[:300]
-    left = re.search(r"ra-jit: the doctests are left to rustdoc: (.*)", got[2])
-    if left:
-        return "refused", left.group(1)
-    built = re.findall(r"doctests: (\d+) built by ra-jit, (\d+) by rustc", got[2])
-    if not built:
-        return "WRONG", "ra-jit did not say what it built for the doctests"
-    tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])
-    if not tests:
-        return "WRONG", f"cargo ran no doctest: {want[2].strip()[-200:]}"
-    return "same", f"{tests} doctests, {sum(int(n) for n, _ in built)} built by ra-jit, {sum(int(n) for _, n in built)} by rustc"
+    verdict, said = judge_doctests(want, got)
+    if verdict == "same":
+        tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])
+        if not tests:
+            return "WRONG", f"cargo ran no doctest: {want[2].strip()[-200:]}"
+    return verdict, said
 
 
 def main():

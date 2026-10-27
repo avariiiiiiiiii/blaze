@@ -5,10 +5,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, bail};
+use cargo_util_schemas::manifest::TomlProfiles;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::features::{Edition, ResolveBehavior};
+use crate::features::{Edition, Features, ResolveBehavior};
 use crate::manifest::{
     Context, EitherManifest, Manifest, WorkspaceConfig, WorkspaceRootConfig, read_manifest,
 };
@@ -97,6 +99,7 @@ pub struct Workspace<'c> {
     default_members: Vec<PathBuf>,
     resolve_behavior: ResolveBehavior,
     custom_metadata: Option<toml::Value>,
+    warnings: Vec<String>,
 }
 
 impl<'c> Workspace<'c> {
@@ -113,6 +116,7 @@ impl<'c> Workspace<'c> {
             default_members: Vec::new(),
             resolve_behavior: ResolveBehavior::V1,
             custom_metadata: None,
+            warnings: Vec::new(),
         };
         if manifest_path.is_relative() {
             bail!(
@@ -177,6 +181,26 @@ impl<'c> Workspace<'c> {
         self.resolve_behavior
     }
 
+    /// The root manifest's `[profile]` tables, the only ones cargo reads.
+    pub fn profiles(&self) -> Option<&TomlProfiles> {
+        match self.get(self.root_manifest()) {
+            EitherManifest::Real(m) => m.normalized_toml.profile.as_ref(),
+            EitherManifest::Virtual(vm) => vm.normalized_toml.profile.as_ref(),
+        }
+    }
+
+    /// The root manifest's `cargo-features`.
+    pub fn unstable_features(&self) -> &Features {
+        match self.get(self.root_manifest()) {
+            EitherManifest::Real(m) => &m.unstable_features,
+            EitherManifest::Virtual(vm) => &vm.unstable_features,
+        }
+    }
+
+    pub fn is_member(&self, manifest_path: &Path) -> bool {
+        self.member_set.contains(manifest_path)
+    }
+
     /// The member packages with their manifest paths, in cargo's order.
     pub fn members(&self) -> impl Iterator<Item = (&Path, &Manifest)> {
         self.members.iter().filter_map(|path| match self.get(path) {
@@ -192,14 +216,33 @@ impl<'c> Workspace<'c> {
         })
     }
 
-    /// The warnings of every manifest read, by manifest path.
+    /// The warnings cargo prints of the workspace as a whole, before those of its manifests.
+    pub fn workspace_warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// The warnings of every manifest read, by manifest path relative to the root as cargo
+    /// prints them: a virtual root's first, then each package's. cargo takes the packages in
+    /// the order of a `HashMap`; here they are in path order.
     pub fn warnings(&self) -> impl Iterator<Item = (&Path, &str)> {
-        self.members.iter().flat_map(|path| {
-            let warnings = match self.get(path) {
-                EitherManifest::Real(m) => &m.warnings,
-                EitherManifest::Virtual(vm) => &vm.warnings,
-            };
-            warnings.iter().map(move |w| (path.as_path(), w.as_str()))
+        let root = self.root_manifest();
+        let virtual_root = match self.packages.get(root) {
+            Some(EitherManifest::Virtual(vm)) => Some((root, &vm.warnings)),
+            _ => None,
+        };
+        let mut packages: Vec<(&Path, &Vec<String>)> = self
+            .packages
+            .iter()
+            .filter_map(|(path, m)| match m {
+                EitherManifest::Real(m) => Some((path.as_path(), &m.warnings)),
+                EitherManifest::Virtual(_) => None,
+            })
+            .collect();
+        packages.sort_by_key(|(path, _)| *path);
+        let dir = self.root();
+        virtual_root.into_iter().chain(packages).flat_map(move |(path, warnings)| {
+            let rel = path.strip_prefix(dir).unwrap_or(path);
+            warnings.iter().map(move |w| (rel, w.as_str()))
         })
     }
 
@@ -484,7 +527,7 @@ impl<'c> Workspace<'c> {
         );
     }
 
-    /// cargo's warnings for settings only the root may have, added to the members' warnings.
+    /// cargo's warnings for settings only the root may have.
     fn validate_manifest(&mut self) {
         let Some(root_manifest) = self.root_manifest.clone() else { return };
         let resolve_behavior = self.resolve_behavior;
@@ -493,9 +536,10 @@ impl<'c> Workspace<'c> {
             if path == root_manifest {
                 continue;
             }
-            let Some(EitherManifest::Real(m)) = self.packages.get_mut(&path) else { continue };
+            let Some(EitherManifest::Real(m)) = self.packages.get(&path) else { continue };
+            let warnings = &mut self.warnings;
             let mut warn = |what: &str| {
-                m.warnings.push(format!(
+                warnings.push(format!(
                     "{what} for the non root package will be ignored, \
                      specify {what} at the workspace root:\n\
                      package:   {}\n\
@@ -520,14 +564,24 @@ impl<'c> Workspace<'c> {
                 max_member_edition = max_member_edition.max(Some(m.edition));
             }
         }
-        if let Some(EitherManifest::Virtual(vm)) = self.packages.get_mut(&root_manifest)
+        if let Some(EitherManifest::Virtual(vm)) = self.packages.get(&root_manifest)
             && vm.resolve_behavior.is_none()
             && let Some(edition) = max_member_edition
         {
             let resolver = edition.default_resolve_behavior().to_manifest();
-            vm.warnings.push(format!(
-                        "virtual workspace defaulting to `resolver = \"1\"` despite one or more workspace members being on edition {edition} which implies `resolver = \"{resolver}\"`"
-                    ));
+            let report = Level::WARNING
+                .primary_title(format!(
+                    "virtual workspace defaulting to `resolver = \"1\"` despite one or more workspace members being on edition {edition} which implies `resolver = \"{resolver}\"`"
+                ))
+                .elements([
+                    Level::NOTE.message("to keep the current resolver, specify `workspace.resolver = \"1\"` in the workspace root's manifest"),
+                    Level::NOTE.message(format!(
+                        "to use the edition {edition} resolver, specify `workspace.resolver = \"{resolver}\"` in the workspace root's manifest"
+                    )),
+                    Level::NOTE.message("for more details see https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions"),
+                ]);
+            let rendered = Renderer::plain().render(&[report]);
+            self.warnings.push(rendered.strip_prefix("warning: ").unwrap_or(&rendered).to_owned());
         }
     }
 }

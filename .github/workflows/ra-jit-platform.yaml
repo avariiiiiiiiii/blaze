@@ -1,7 +1,9 @@
 # One platform of ra-jit.yaml: its unit tests, one build of ra-jit with both producers, and the
 # harnesses of the tier against that build, split into parts (harness/ci.py) that each run on a
-# machine of their own. Each platform builds on its own kind of machine, so nothing is
-# cross-compiled or emulated but what `buildmodel.py` builds for other targets.
+# machine of their own. The tiers `gate` (the merge gate's, ra-jit.yaml) and `warm` (a push to
+# main, which writes the caches the other runs read) are the unit tests and the build alone;
+# `full` is the release train's (train.yaml). Each platform builds on its own kind of machine,
+# so nothing is cross-compiled or emulated but what `buildmodel.py` builds for other targets.
 name: ra-jit platform
 on:
   workflow_call:
@@ -15,7 +17,7 @@ on:
         type: string
         required: true
       tier:
-        description: "`fast` (the quick harnesses) or `full` (every harness), as in harness/ci.py"
+        description: "`fast` (the fast tier's harnesses), `full` (every harness), as in harness/ci.py, or `gate` and `warm` (none)"
         type: string
         required: true
       borrowck:
@@ -39,7 +41,7 @@ on:
         type: boolean
         default: false
       bun-e2e:
-        description: reduced Bun nightly blocker fixtures
+        description: the reduced fixtures of what kept Bun from building
         type: boolean
         default: false
 
@@ -47,6 +49,8 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
+  # Every test `cargo ra-jit test` runs is in a sandbox, which Windows does not have yet.
+  RA_JIT_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
   # Git Bash on Windows has `python` and no `python3`.
   PYTHON: ${{ startsWith(inputs.os, 'windows') && 'python' || 'python3' }}
   # sccache keeps what rustc compiled in the Actions cache, for the steps that set RUSTC_WRAPPER:
@@ -77,11 +81,15 @@ jobs:
         with:
           shared-key: tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - run: $PYTHON harness/unittests.py
         env:
           RUSTC_WRAPPER: sccache
       - run: sccache --show-stats
+      # On a push to main, rustc's tests into the cache for the borrowck and pinned-ui jobs of
+      # the runs after it, which then need not fetch them.
+      - if: inputs.tier == 'warm' && (inputs.borrowck || inputs.pinned-ui)
+        uses: ./.github/actions/rust-tests
 
   build:
     name: build
@@ -100,7 +108,7 @@ jobs:
         with:
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.11
       # In the flake's dev shell, against the LLVM it pins. On Windows, which has no Nix, the
       # build is against the static C runtime, and names libraries of the SDK that the linker is
       # not otherwise shown.
@@ -128,18 +136,20 @@ jobs:
           path: target/release/ra-jit.tar
           retention-days: 3
       - id: parts
+        if: (inputs.tier == 'fast' || inputs.tier == 'full')
         run: echo "parts=$($PYTHON harness/ci.py --parts ${{ inputs.tier }})" >> "$GITHUB_OUTPUT"
 
   harness:
     name: harness (${{ matrix.backend }}, ${{ matrix.part }})
+    if: (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 60
+    # A fast part is about four minutes of harnesses: one that hangs ends here, not at the hour.
+    timeout-minutes: ${{ inputs.tier == 'fast' && 25 || 60 }}
     strategy:
       fail-fast: false
-      matrix:
-        backend: [cranelift, llvm]
-        part: ${{ fromJSON(needs.build.outputs.parts) }}
+      # {"include": [{"backend", "part", "apt"}, ...]}: each backend has parts of its own.
+      matrix: ${{ fromJSON(needs.build.outputs.parts) }}
     env:
       RA_JIT_BACKEND: ${{ matrix.backend }}
       RA_JIT_OPT: 2
@@ -153,23 +163,16 @@ jobs:
           llvm: run
           # What `buildmodel.py` builds for besides the host.
           targets: ${{ matrix.part == 'buildmodel' && inputs.os == 'ubuntu-24.04' && 'aarch64-unknown-linux-gnu x86_64-unknown-linux-musl' || '' }}
+      # What ci.py says the part's harnesses use (valgrind, gdb), and the cross tools of buildmodel.
       - name: Linux tools
-        if: runner.os == 'Linux' && (matrix.part == 'core' || matrix.part == 'quick-1' || (matrix.part == 'buildmodel' && runner.arch == 'X64'))
+        if: runner.os == 'Linux' && (matrix.apt != '' || (matrix.part == 'buildmodel' && runner.arch == 'X64'))
         uses: ./.github/actions/apt
         with:
-          packages: ${{ matrix.part == 'buildmodel' && 'gcc-aarch64-linux-gnu musl-tools qemu-user' || 'valgrind gdb' }}
-      # `cargo ra-jit test` sandboxes tests in namespaces a user makes, which Ubuntu's AppArmor
-      # keeps users from making unless told otherwise (`testselect.py` needs the sandbox).
-      - name: user namespaces
-        if: runner.os == 'Linux'
-        run: |
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-          fi
+          packages: ${{ matrix.part == 'buildmodel' && 'gcc-aarch64-linux-gnu musl-tools qemu-user' || matrix.apt }}
       # `debuginfo.py` has perf unwind what ra-jit built, which it says it did not run where
       # there is no perf or the kernel does not let this user sample.
       - name: perf
-        if: runner.os == 'Linux' && matrix.part == 'core'
+        if: runner.os == 'Linux' && startsWith(matrix.part, 'core-')
         continue-on-error: true
         run: |
           sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
@@ -215,7 +218,7 @@ jobs:
 
   bun-e2e:
     name: Bun E2E fixtures
-    if: inputs.bun-e2e
+    if: inputs.bun-e2e && (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
     runs-on: ${{ inputs.os }}
     timeout-minutes: 15
@@ -224,7 +227,6 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
-          nightly: nightly-2026-09-15
       - uses: actions/download-artifact@v8
         with:
           name: ra-jit-${{ inputs.platform }}
@@ -237,10 +239,10 @@ jobs:
       - run: $PYTHON harness/bun_repros.py
 
   # The borrow checker against rustc's own borrow-check tests (docs/borrowck.md), at the
-  # commit of the nightly whose verdicts they are scored by, with a floor under the passes.
+  # commit of the pinned toolchain whose verdicts they are scored by, with a floor under the passes.
   borrowck:
     name: borrowck
-    if: inputs.borrowck
+    if: inputs.borrowck && (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
     runs-on: ${{ inputs.os }}
     timeout-minutes: 30
@@ -249,22 +251,14 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
-      - run: rustup toolchain install nightly-2026-10-09 --profile minimal
       - uses: actions/download-artifact@v8
         with:
           name: ra-jit-${{ inputs.platform }}
           path: target/release
       - run: tar -xf ra-jit.tar
         working-directory: target/release
-      - name: rustc's tests
-        run: |
-          git init -q "$RUNNER_TEMP/rust"
-          cd "$RUNNER_TEMP/rust"
-          git remote add origin https://github.com/rust-lang/rust
-          git sparse-checkout set tests/ui
-          git fetch -q --depth 1 --filter=blob:none origin a30aa9064df6a504b6a323c6884a2f4cfbfff666
-          git checkout -q FETCH_HEAD
-      - run: python3 harness/borrowck_ui.py "$RUNNER_TEMP/rust" --bin target/release/ra-jit --jobs 4 --mode both --min-pass 1538
+      - uses: ./.github/actions/rust-tests
+      - run: python3 harness/borrowck_ui.py "$RUNNER_TEMP/rust" --bin target/release/ra-jit --jobs 4 --mode both --min-pass 1538  # TODO(rjn): re-measure at the new pin
       # Crates rustc accepts: an error is a false one, and a file the checker panics on (which
       # fails `ra-jit borrowck`) would have none of its errors reported.
       - name: the corpus and mixfutures
@@ -278,13 +272,13 @@ jobs:
           sys.exit(bool(bad) or not lines or "files" not in lines[-1])' "$RUNNER_TEMP/$crate.json" $crate
           done
 
-  # The few run-pass tests of rustc's that the nightly claims run, or a run on another
+  # The few run-pass tests of rustc's that claims.yaml's full run, or a run on another
   # platform, once caught ra-jit failing (harness/ui-pinned.txt), from the tests of the pinned
   # toolchain. Their workspaces are under a link, as they are under /tmp on macOS: rustc's
   # dep-info names their files where they are, and ra-jit is given them through the link.
   pinned-ui:
     name: pinned run-pass tests
-    if: inputs.pinned-ui
+    if: inputs.pinned-ui && (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
     runs-on: ${{ inputs.os }}
     timeout-minutes: 20
@@ -299,15 +293,14 @@ jobs:
           path: target/release
       - run: tar -xf ra-jit.tar
         working-directory: target/release
+      - uses: ./.github/actions/rust-tests
       - name: pinned run-pass tests
         run: |
-          dirs=$(sed 's/#.*//' harness/ui-pinned.txt | xargs -n1 dirname | sed 's|^|tests/ui/|' | sort -u)
-          git clone -q --depth 1 --branch 1.99.0 --filter=blob:none --sparse https://github.com/rust-lang/rust "$RUNNER_TEMP/rust-1.99"
-          git -C "$RUNNER_TEMP/rust-1.99" sparse-checkout set tests/auxiliary $dirs
           mkdir "$RUNNER_TEMP/ui-real"
           ln -s "$RUNNER_TEMP/ui-real" "$RUNNER_TEMP/ui"
+          cd "$GITHUB_WORKSPACE"
           cd harness
-          RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 uitest.py "$RUNNER_TEMP/rust-1.99" --tests ui-pinned.txt --jobs 4 --work "$RUNNER_TEMP/ui"
+          RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 uitest.py "$RUNNER_TEMP/rust" --tests ui-pinned.txt --jobs 4 --work "$RUNNER_TEMP/ui"
 
   # `cargo ra-jit` in place of cargo on projects at pinned commits, and the flags, the daemon's
   # life and plain cargo after `ra-jit enable`. Incremental compilation is left to the profile,

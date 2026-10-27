@@ -13,6 +13,11 @@
 //! `check` resolves and finds as well and fails the build on any difference, `verify` writes
 //! what was read and fails on any difference, `off` neither reads nor writes.
 
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering::Relaxed},
+};
+
 use ide_db::base_db::Crate;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
@@ -92,7 +97,7 @@ fn key_of(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"ra-jit frozen def map 5");
+    field(b"ra-jit frozen def map 6");
     field(source.as_bytes());
     field(format!("{:?} {:?} {:?}", data.edition, data.target_kind, data.crate_attrs).as_bytes());
     let mut cfgs: Vec<String> =
@@ -256,26 +261,45 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
         anyhow::bail!("what was frozen differs:\n{}", differences.join("\n"));
     }
     let Some(store) = served.mode.and(ra_jit_store::Store::global()) else { return Ok(()) };
-    let mut stored = 0;
-    let mut refused: FxHashMap<String, usize> = FxHashMap::default();
+    let start = std::time::Instant::now();
+    let mut unstored = Vec::new();
     for (index, part) in Part::ALL.into_iter().enumerate() {
         for (&krate, key) in &served.keys {
             let key = part.key(key);
-            if served.served[index].contains(&krate) || store.has(&key) {
-                continue;
-            }
-            match part.encode(db, krate) {
-                Ok(bytes) => {
-                    if stored == 0 {
-                        store.settled();
-                    }
-                    store.insert(&key, &bytes);
-                    stored += 1;
-                }
-                Err(why) => *refused.entry(format!("{} with {why}", part.name())).or_default() += 1,
+            if !served.served[index].contains(&krate) && !store.has(&key) {
+                unstored.push((part, krate, key));
             }
         }
     }
+    if !unstored.is_empty() {
+        store.settled();
+    }
+    // On every core: a cold build has a thousand to write, and waits for them.
+    let (stored, refused) = (AtomicUsize::new(0), Mutex::new(FxHashMap::default()));
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(unstored.len()) {
+            let (db, unstored, next) = (db.clone(), &unstored, &next);
+            let (stored, refused) = (&stored, &refused);
+            scope.spawn(move || {
+                while let Some(&(part, krate, key)) = unstored.get(next.fetch_add(1, Relaxed)) {
+                    match part.encode(&db, krate) {
+                        Ok(bytes) => {
+                            store.insert(&key, &bytes);
+                            stored.fetch_add(1, Relaxed);
+                        }
+                        Err(why) => {
+                            let mut refused = refused.lock().unwrap_or_else(|e| e.into_inner());
+                            *refused.entry(format!("{} with {why}", part.name())).or_default() += 1;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let (stored, refused): (usize, FxHashMap<String, usize>) =
+        (stored.into_inner(), refused.into_inner().unwrap_or_else(|e| e.into_inner()));
     if stored > 0 {
         store.flush();
     }
@@ -285,9 +309,10 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
         .map(|(part, crates)| format!("{} of {}", part.name(), crates.len()))
         .collect();
     let mut said = format!(
-        "frozen, of {} crates: {} from the store, {stored} written",
+        "frozen, of {} crates: {} from the store, {stored} written in {:.1?}",
         served.keys.len(),
-        from.join(", ")
+        from.join(", "),
+        start.elapsed()
     );
     if served.unreadable > 0 {
         said += &format!(", {} naming a file not loaded", served.unreadable);

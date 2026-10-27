@@ -46,7 +46,10 @@ use object::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{Spliced, Stamp};
+use super::{
+    Spliced, Stamp,
+    lasting::{Lasting, Own, is_lasting},
+};
 
 /// What segments are aligned to on AArch64.
 const PAGE: u64 = 0x4000;
@@ -1218,6 +1221,8 @@ pub(super) struct Replaced<'a> {
     pub(super) name: &'a [u8],
     section: SectionIndex,
     offset: u64,
+    /// To the next symbol of its section, or its end: no symbol has a size.
+    size: u64,
     /// `None` for what the executable does not have.
     old: Option<Defined>,
 }
@@ -1308,13 +1313,15 @@ impl<'a> Patch<'a> {
             );
             let offset = symbol.address() - section.address();
             let code = patch.code.contains(&index);
+            let next = starts.get(starts.partition_point(|it| *it <= symbol.address()));
+            let end = section.address() + section.size();
+            let size = next.map_or(end, |next| end.min(*next)) - symbol.address();
             let old = match image.symbols.get(name) {
                 None => None,
+                // The executable's is the same static with the same value: it is kept.
+                Some(_) if is_lasting(name) => None,
                 Some(Named::One(old)) if old.kind == SymbolKind::Text && code => Some(*old),
                 Some(Named::One(old)) if old.kind == SymbolKind::Data && !code => {
-                    let next = starts.get(starts.partition_point(|it| *it <= symbol.address()));
-                    let end = section.address() + section.size();
-                    let size = next.map_or(end, |next| end.min(*next)) - symbol.address();
                     let new = InPlace { offset, size, old: *old };
                     patch
                         .fits(&new, &section, image)
@@ -1326,10 +1333,17 @@ impl<'a> Patch<'a> {
                     bail!("the patch replaces {}, which is not one function or static", shown())
                 }
             };
-            patch.replaced.push(Replaced { name, section: index, offset, old });
+            patch.replaced.push(Replaced { name, section: index, offset, size, old });
         }
 
         let (mut slots, mut stubs) = (FxHashSet::default(), FxHashSet::default());
+        // A call of a function of the patch that replaces one of the executable goes to the
+        // executable's entry of it (`lay_out`'s `entry`), which can be out of a branch's reach
+        // of where the patch is put: in a large executable, patches go on past its end.
+        let replacing: FxHashSet<(SectionIndex, u64)> = (patch.replaced.iter())
+            .filter(|it| it.old.is_some_and(|old| old.kind == SymbolKind::Text))
+            .map(|it| (it.section, it.offset))
+            .collect();
         let mut targets = FxHashMap::default();
         for relocation in patch.relocations.values().flatten() {
             let symbols = match relocation.fixup {
@@ -1364,6 +1378,13 @@ impl<'a> Patch<'a> {
                         patch.stubs.push(relocation.symbol);
                     }
                 }
+                (Fixup::Branch, Target::Ours(section, at))
+                    if relocation.addend == 0 && replacing.contains(&(section, at)) =>
+                {
+                    if stubs.insert(relocation.symbol) {
+                        patch.stubs.push(relocation.symbol);
+                    }
+                }
                 (fixup, Target::Ours(..) | Target::Theirs(_)) if fixup.through_slot() => {
                     if slots.insert(relocation.symbol) {
                         patch.slots.push(relocation.symbol);
@@ -1373,7 +1394,65 @@ impl<'a> Patch<'a> {
             }
         }
         patch.targets = targets;
+        patch.keep_lasting(|name| match image.symbols.get(name) {
+            Some(Named::One(Defined { kind: SymbolKind::Data, address, .. })) => Some(*address),
+            _ => None,
+        })?;
         Ok(patch)
+    }
+
+    /// Has what refers to a static the patch defines anew ([`is_lasting`]) refer to the copy
+    /// `kept` finds of it instead, where it finds one: the executable's, or one an earlier
+    /// patch gave the running program. The patch's own copy is left unused.
+    fn keep_lasting(&mut self, kept: impl Fn(&[u8]) -> Option<u64>) -> anyhow::Result<()> {
+        for (&index, target) in &mut self.targets {
+            if !matches!(target, Target::Ours(..)) {
+                continue;
+            }
+            let name = self.file.symbol_by_index(index)?.name_bytes()?;
+            if is_lasting(name)
+                && let Some(address) = kept(name)
+            {
+                *target = Target::Theirs(address);
+            }
+        }
+        Ok(())
+    }
+
+    /// Where each static the patch defines anew is once it is laid out at `base`: its own
+    /// copy, or the one [`Self::keep_lasting`] kept.
+    fn lasting_in(
+        &self,
+        base: u64,
+        placed: &FxHashMap<SectionIndex, u64>,
+    ) -> Vec<(Box<[u8]>, u64)> {
+        let kept: FxHashMap<&[u8], u64> = (self.targets.iter())
+            .filter_map(|(&index, target)| match target {
+                Target::Theirs(address) => {
+                    let name = self.file.symbol_by_index(index).ok()?.name_bytes().ok()?;
+                    is_lasting(name).then_some((name, *address))
+                }
+                _ => None,
+            })
+            .collect();
+        (self.replaced.iter())
+            .filter(|it| is_lasting(it.name))
+            .map(|it| {
+                let own = base + placed[&it.section] + it.offset;
+                (Box::from(it.name), kept.get(it.name).copied().unwrap_or(own))
+            })
+            .collect()
+    }
+
+    /// The statics the patch defines anew, with what they take.
+    fn lasting_own(&self) -> anyhow::Result<Vec<Own>> {
+        let mut own = Vec::new();
+        for replaced in self.replaced.iter().filter(|it| is_lasting(it.name)) {
+            let section = self.file.section_by_index(replaced.section)?.align().max(1);
+            let align = (replaced.offset | section).isolate_lowest_one();
+            own.push(Own { name: replaced.name.into(), size: replaced.size, align });
+        }
+        Ok(own)
     }
 
     /// The relocations of a section, with the two that make a distance as one.
@@ -1551,7 +1630,8 @@ impl<'a> Patch<'a> {
         }
         tables.push((0, commands));
         appended.extend_from_slice(&linkedit);
-        Ok(Addition { offset, appended, overwritten, tables, redirected })
+        let lasting = self.lasting_in(base, &placed);
+        Ok(Addition { offset, appended, overwritten, tables, redirected, lasting })
     }
 
     /// Lays the patch out at `base` of a running program, whose memory it is applied to:
@@ -1562,9 +1642,18 @@ impl<'a> Patch<'a> {
         image: &Image,
         originals: &FxHashMap<u64, Vec<u8>>,
         base: u64,
+        lasting: &mut Lasting,
     ) -> anyhow::Result<(ra_jit_live::format::Code, Vec<(u64, u64)>)> {
         ensure!(base.is_multiple_of(PAGE), "a patch laid out off a page");
         let laid = self.lay_out(base)?;
+        let own = self.lasting_own()?;
+        let copy = |name: &[u8]| {
+            let found = self.replaced.iter().find(|it| it.name == name);
+            found.map(|it| laid.placed[&it.section] + it.offset)
+        };
+        let pointers: Vec<u64> = laid.stored.iter().map(|it| it - base).collect();
+        let first = lasting.first_values(&own, copy, &laid.appended, base, &pointers)?;
+        lasting.note(self.lasting_in(base, &laid.placed));
         let frames = match self.frames {
             Some(index) => (laid.placed[&index], self.file.section_by_index(index)?.size()),
             None => (0, 0),
@@ -1608,10 +1697,11 @@ impl<'a> Patch<'a> {
             text: appended,
             data,
             frames,
-            pointers: laid.stored.iter().map(|it| it - base).collect(),
+            pointers,
             writes,
             redirected,
             statics,
+            lasting: first,
         };
         Ok((code, moved))
     }
@@ -1980,14 +2070,17 @@ pub(super) fn live(
     originals: &FxHashMap<u64, Vec<u8>>,
     patch: &[u8],
     base: u64,
+    lasting: &mut Lasting,
 ) -> anyhow::Result<(ra_jit_live::format::Code, Vec<(u64, u64)>)> {
-    let patch = Patch::read(patch, image)?;
+    let mut patch = Patch::read(patch, image)?;
     let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
     ensure!(
         baked.iter().all(|it| defined.contains(&**it)),
         "a function the executable was linked with a patch of is as it first was"
     );
-    patch.place_live(image, originals, base)
+    lasting.place(&patch.lasting_own()?)?;
+    patch.keep_lasting(|name| lasting.address(name))?;
+    patch.place_live(image, originals, base, lasting)
 }
 
 /// The `LC_UUID` of the executable, which names it to a running program.
@@ -2080,6 +2173,8 @@ struct Addition {
     /// memory says where they are.
     tables: Vec<(u64, Vec<u8>)>,
     redirected: usize,
+    /// Where the statics the patch defines anew are.
+    lasting: Vec<(Box<[u8]>, u64)>,
 }
 
 /// Brings the executable at `path` from what the linker wrote to that with `patch` in place
@@ -2094,7 +2189,7 @@ pub(super) fn splice(
     last: &mut Option<Appended>,
     patch: &[u8],
     give_up: &AtomicBool,
-) -> anyhow::Result<Spliced> {
+) -> anyhow::Result<(Spliced, Lasting)> {
     let start = std::time::Instant::now();
     let mut steps = Vec::new();
     let mut step = |name: &'static str, from: &mut std::time::Instant| {
@@ -2185,7 +2280,7 @@ pub(super) fn splice(
         *last = Some(Appended { offset, page, bytes, hashes });
     }
     *stamp = written?;
-    Ok(spliced)
+    Ok((spliced, Lasting::in_executable(addition.lasting)))
 }
 
 #[cfg(test)]

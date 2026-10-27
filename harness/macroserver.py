@@ -205,25 +205,40 @@ def lib_name(package):
     return None
 
 
-def closure(meta, name):
-    """The package called `name` and the libraries it links: its normal dependencies, all the
-    way down, but proc-macro crates, which run while it is built. Each by its crate's name."""
-    packages = {p["id"]: p for p in meta["packages"]}
-    nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
-    start = next(p["id"] for p in meta["packages"] if p["name"] == name)
-    seen, todo, crates = {start}, [start], []
+def unit_graph(root):
+    """What `cargo build` in `root` compiles, unit by unit: the graph of the build, not cargo
+    metadata's resolve, which also has an optional dependency that only a weak feature
+    (`borsh?/std`) names and so is never built: smol_str's borsh."""
+    ran, _ = run(["cargo", "build", "--unit-graph", "-Z", "unstable-options"], root,
+                 f"cargo build --unit-graph of {root}")
+    return json.loads(ran.stdout)["units"]
+
+
+def closure(meta, units, name):
+    """The package called `name` and the libraries it links in the build: its units'
+    dependencies, all the way down, but build scripts and proc-macro crates, which run while
+    it is built. Each by its crate's name."""
+    def skipped(unit):
+        kinds = set(unit["target"]["kind"])
+        return unit["mode"] == "run-custom-build" or bool({"custom-build", "proc-macro"} & kinds)
+    ids = {p["id"] for p in meta["packages"] if p["name"] == name}
+    starts = [i for i, u in enumerate(units)
+              if u["pkg_id"] in ids and "custom-build" not in u["target"]["kind"]
+              and u["mode"] != "run-custom-build"]
+    if not starts:
+        raise SystemExit(f"FAIL: the build's unit graph has no package {name}")
+    seen, todo, crates = set(starts), list(starts), []
     while todo:
-        node = nodes[todo.pop()]
-        for dep in node["deps"]:
-            if not any(kind["kind"] is None for kind in dep["dep_kinds"]):
+        unit = units[todo.pop()]
+        for dep in unit["dependencies"]:
+            index = dep["index"]
+            if index in seen or skipped(units[index]):
                 continue
-            package = packages[dep["pkg"]]
-            if any("proc-macro" in t["kind"] for t in package["targets"]):
-                continue
-            if dep["pkg"] not in seen:
-                seen.add(dep["pkg"])
-                todo.append(dep["pkg"])
-                crates.append(lib_name(package))
+            seen.add(index)
+            todo.append(index)
+            crate = units[index]["target"]["name"].replace("-", "_")
+            if crate not in crates:
+                crates.append(crate)
     return crates
 
 
@@ -269,9 +284,16 @@ def linked(ran, what):
                          f"{ran.stderr[-8000:]}")
 
 
+def libraries_in(target):
+    """The shared libraries cargo built in `target`: in `deps/`, or, in the build directory's
+    layout of cargo since nightly-2026-10-25, in each unit's `build/<package>/<hash>/out/`."""
+    return [lib for at in ("deps", "out")
+            for lib in glob.glob(os.path.join(target, "**", at, "lib*.so"), recursive=True)]
+
+
 def built_macros(target):
     """The proc-macro libraries the load's cargo built in `target`, ra-jit's ones apart."""
-    libraries = glob.glob(os.path.join(target, "**", "deps", "lib*.so"), recursive=True)
+    libraries = libraries_in(target)
     ours = {lib for lib in libraries if LIST in open(lib, "rb").read()}
     name = lambda lib: os.path.basename(lib)[3:].rsplit("-", 1)[0]
     return sorted(map(name, ours)), sorted(map(name, set(libraries) - ours))
@@ -280,13 +302,12 @@ def built_macros(target):
 def without_libc(target):
     """ra-jit's proc-macro libraries in `target` that do not name libc: glibc binds each libc
     symbol of such a library to its oldest version, a `realpath` that fails without a buffer."""
-    libraries = glob.glob(os.path.join(target, "**", "deps", "lib*.so"), recursive=True)
-    read = {lib: open(lib, "rb").read() for lib in libraries}
+    read = {lib: open(lib, "rb").read() for lib in libraries_in(target)}
     return sorted(os.path.basename(lib) for lib, data in read.items()
                   if LIST in data and b"libc.so" not in data)
 
 
-def wired(work, root, meta, server):
+def wired(work, root, meta, units, server):
     """The package built whole by ra-jit and run, its proc macros built by the load's cargo in
     ra-jit's own target directory (`--own-target`): by rustc, and then by ra-jit with the
     server named, which expands with its libraries."""
@@ -294,7 +315,7 @@ def wired(work, root, meta, server):
     cargo_target = os.path.join(work, "cargo-target")
     ran, _ = run(["cargo", "run", "-q"], root, "cargo run", env={"CARGO_TARGET_DIR": cargo_target})
     expected = ran.stdout
-    crates = with_std(["macrouse", *closure(meta, "macrouse")])
+    crates = with_std(["macrouse", *closure(meta, units, "macrouse")])
     lines, wanted = [], sorted(lib_name(p) for p in meta["packages"] if p["name"] in MACRO_CRATES)
     for named in (False, True):
         # A target directory of its own is seeded from cargo's, whose proc macros are rustc's.
@@ -369,7 +390,7 @@ def app(name, work, server):
         if build == "ours":
             # A proc macro rustc compiled again, for a crate of rustc's that links it, left
             # ra-jit's library beside its record.
-            for lib in [*glob.glob(os.path.join(own, "**", "deps", "lib*.so"), recursive=True),
+            for lib in [*libraries_in(own),
                         *glob.glob(os.path.join(own, "**", ".ra-jit-units", "*", "lib*.so"),
                                    recursive=True)]:
                 if LIST in open(lib, "rb").read():
@@ -448,7 +469,8 @@ def built_server(work):
     server_root = os.path.realpath(SERVER)
     server = os.path.join(work, SERVER_BIN)
     crates = with_std([SERVER_BIN.replace("-", "_"),
-                       *closure(metadata(server_root), SERVER_PACKAGE)])
+                       *closure(metadata(server_root), unit_graph(server_root),
+                               SERVER_PACKAGE)])
     ran, took = ra_jit(server_root, crates, os.path.join(work, "server.o"), "--exe", server)
     linked(ran, "the server")
     return server, f"the server: built and linked by ra-jit in {took:.1f} s, {len(crates)} crates"
@@ -498,6 +520,7 @@ def main():
             f.write(SOURCE)
         run(["cargo", "generate-lockfile", "-q"], root, "cargo generate-lockfile")
         meta = metadata(root)
+        units = unit_graph(root)
         libs = os.path.join(work, "libs")
         os.makedirs(libs)
         versions = []
@@ -506,7 +529,7 @@ def main():
                 continue
             name = lib_name(package)
             library = os.path.join(libs, f"lib{name}.so")
-            crates = with_std([name, *closure(meta, package["name"])])
+            crates = with_std([name, *closure(meta, units, package["name"])])
             ran, took = ra_jit(root, crates, os.path.join(work, f"{name}.o"), "--exe", library,
                                "--shared")
             linked(ran, package["name"])
@@ -533,7 +556,7 @@ def main():
         lines.append(f"the package: {calls} calls ({derives} derives, {attrs} attributes, "
                      f"{bangs} function-like) expanded by both servers, the same, "
                      f"in {took:.1f} s")
-        lines.extend(wired(work, root, meta, server))
+        lines.extend(wired(work, root, meta, units, server))
         print("\n".join(lines))
         print(f"PASS: ra-jit's server and libraries expand as the toolchain's, "
               f"{', '.join(versions)}")

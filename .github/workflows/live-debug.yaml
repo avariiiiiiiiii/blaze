@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: live-debug

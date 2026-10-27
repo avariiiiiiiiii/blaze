@@ -29,8 +29,21 @@ impl<T> Reflected<T> {
     const SECOND_NAME: &'static str = type_info::of::<T>().field(0, 1).name();
     const SECOND_OFFSET: usize = type_info::of::<T>().field(0, 1).offset();
     const FIRST_IS_U32: bool = type_info::of::<T>().field(0, 0).type_id() == type_info::of::<u32>();
-    const THIRD_IS_STR: bool = type_info::of::<T>().field(0, 2).type_id() == type_info::of::<&str>();
+    const THIRD_IS_STR: bool =
+        type_info::of::<T>().field(0, 2).type_id() == type_info::of::<&str>();
 }
+
+// What else the pinned nightly's reflection answers: a variant's name, `#[non_exhaustive]`,
+// the kind of a type, its generic args and a function pointer's signature.
+const VARIANT_NAME: &str = type_info::of::<Shape>().variant(1).name();
+const SHAPE_NON_EXHAUSTIVE: bool = type_info::of::<Shape>().non_exhaustive();
+const POINT_IS_STRUCT: bool =
+    matches!(type_info::Type::of::<Point<'static>>().kind, type_info::TypeKind::Struct);
+const POINT_GENERICS: usize = type_info::of::<Point<'static>>().generics().len();
+const FN_INPUTS: usize = match type_info::of::<fn(u8, u16) -> u32>().function_ptr() {
+    Some(f) => f.inputs().len(),
+    None => 0,
+};
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -76,7 +89,7 @@ pub fn named(point: &Point<'_>) -> (usize, usize, u32) {
 
 pub fn fields() -> String {
     format!(
-        "{} {} {} {} {} {} {} | {} {} {} | {:?}",
+        "{} {} {} {} {} {} {} | {} {} {} | {:?} | {} {} {} {} {}",
         Reflected::<Point>::VARIANTS,
         Reflected::<Point>::FIELDS,
         Reflected::<Point>::SECOND_SIZE,
@@ -88,5 +101,10 @@ pub fn fields() -> String {
         Reflected::<Shape>::FIELDS,
         Reflected::<(u8, u32)>::SECOND_SIZE,
         named(&Point { x: 4, y: 5, name: "six" }),
+        VARIANT_NAME,
+        SHAPE_NON_EXHAUSTIVE,
+        POINT_IS_STRUCT,
+        POINT_GENERICS,
+        FN_INPUTS,
     )
 }

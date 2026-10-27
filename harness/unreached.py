@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """unreached.py: an edit that calls what the program did not call when it was linked is
-spliced all the same. Linux and macOS: on Windows `cargo ra-jit` hands builds to cargo.
+spliced all the same, or the program is built in full. Linux and macOS.
 
-usage: unreached.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are
-                        found next to it)
+usage: unreached.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
 A patch calls the code of the executable by name, also code the executable's own did not
 reach when it was linked: here `<u16 as Debug>::fmt` and the formatting it calls, which a
-generic function of a library first calls for `u16` in an edit. rustc's link line has the
-linker take out what nothing reaches (`-dead_strip` on macOS, `--gc-sections` on Linux,
-`/OPT:REF` with `link.exe`), and a splice that does not find what the patch calls declines
-("... is not in the executable"), so the edit was linked in full and the running program
-started over. The daemon's link keeps all of it.
+generic function of a library first calls for `u16` in an edit. blaze's link takes out what
+nothing reaches (`-dead_strip` on macOS, `--gc-sections` on Linux), and a splice that does
+not find what the patch calls declines ("... is not in the executable"): the worker then
+builds the program in full and links it again, as the object alone does not have the edit.
 
-The program is built with `cargo ra-jit build` until the daemon serves the build, then
-edited. Every edit after the first one (which writes the whole object again) has to be
-spliced, and the program has to print what the source says. The first edits would otherwise
-go into rustc's link, which still takes out what nothing reaches, so the daemon is run with
-`RA_JIT_RUSTC_BASE=0`.
+The program is built with `cargo ra-jit build`, then edited. Every edit after the first one
+(which writes the whole object again) has to be spliced or built in full, as the worker's
+log says, and the program has to print what the source says.
 
 Python 3, stdlib only.
 """
@@ -73,6 +69,15 @@ def links(home):
     return lines
 
 
+def full_builds(home):
+    """How many builds the workers' logs say were in full, as a splice declined."""
+    found = 0
+    for log in glob.glob(os.path.join(home, "*", "*", "log")):
+        found += len(re.findall(r"^the patch was not spliced into the program.*: built in full$",
+                                open(log, errors="replace").read(), re.M))
+    return found
+
+
 def main():
     bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
     if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
@@ -84,8 +89,7 @@ def main():
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-               RA_JIT_RUSTC_BASE="0")
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home)
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "uapp"), os.path.join(ws, "app", "src", "main.rs")
@@ -104,7 +108,7 @@ def main():
                 assert old in text, (what, old)
                 text = text.replace(old, new, 1)
             open(source, "w").write(text)
-            seen = len(links(home))
+            seen, full = len(links(home)), full_builds(home)
             said = build(ws, env, what)
             printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
             made = links(home)[seen:]
@@ -114,8 +118,10 @@ def main():
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"
             elif "[ra-jit]" not in said:
                 verdict = "NOT SERVED BY THE DAEMON"
-            elif n > 0 and not how.startswith("spliced"):
+            elif n > 0 and not how.startswith("spliced") and full_builds(home) == full:
                 verdict = "NOT SPLICED"
+            if not how.startswith("spliced") and full_builds(home) > full:
+                how = f"built in full; {how}"
             wrong += verdict != "ok"
             print(f"{what:42} {verdict:12} {how[:140]}", flush=True)
     finally:

@@ -70,8 +70,10 @@ it again from scratch. A program that opts in can take the new code while it kee
 ## Good to know
 
 - **macOS on Apple silicon and Linux.** On Windows every build is cargo's.
-- **Stable Rust.** blaze builds your project with Rust 1.99.0 whatever toolchain it pins, so
-  code that needs a nightly's features isn't for blaze yet.
+- **blaze is its own toolchain.** It builds every project with its own Rust, `blaze-2026-10-25`
+  (today the nightly of that date), whatever the project pins; stable code and
+  `#![feature(...)]` code build. Your toolchain and CI stay the final word
+  ([why](docs/toolchain.md)).
 - **It trades memory for speed:** a few GB for a small project.
 - **It's young.** Keep `cargo check` or your CI as the final word, and
   [tell us](https://github.com/indexable-inc/blaze/issues) when something differs from cargo.
@@ -104,7 +106,7 @@ from source the first time.
 ## Updates
 
 <p align="center">
-  <a href="https://ra-jit.ix.dev/updates?src=readme">
+  <a href="https://ix.dev/blaze/updates?src=readme">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/brand/signup-on-dark.svg">
       <img alt="Tell us you use blaze" src="docs/brand/signup-on-light.svg" height="36">
@@ -113,6 +115,12 @@ from source the first time.
 </p>
 
 <p align="center">For release news: Watch → Custom → Releases on GitHub.</p>
+
+## Using blaze at work?
+
+We're working with a few teams on fast Rust CI and remote builds, built on blaze. If your team
+waits on Rust builds, tell us what slows you down: [andrew@ix.dev](mailto:andrew@ix.dev). Teams
+we work with get early access and a direct say in what we build next.
 
 ## Contributing
 

@@ -121,6 +121,15 @@ impl Registry {
         }
     }
 
+    /// Whether [`Registry::config`] would ask no server: a local registry, or a sparse one
+    /// whose `config.json` on disk is fresh.
+    pub fn config_is_cached(&self) -> bool {
+        match &self.files {
+            Files::Sparse(sparse) => sparse.config_is_cached(),
+            Files::Local { .. } => true,
+        }
+    }
+
     /// Asks the server about every file from now on, once, as cargo does when it updates an
     /// index; until then what is in the cache is used as it is.
     pub fn invalidate(&self) {

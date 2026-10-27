@@ -124,8 +124,10 @@ privates (read).
   hash and `vtable.rs` rustc's vtable entries, while the interpreter in `hir-ty` numbers
   `TypeId`s by the order it meets types (read: `mir/eval.rs:230`, `eval/shim.rs:785-797`) and
   keeps its own `VTableMap`. These are rustc semantics (`rustc_middle`'s `type_id_hash` and
-  `vtable_entries`) and would belong in `hir-ty` if the interpreter used them; whether a
-  constant holding a `TypeId` can reach codegen from the interpreter today is unverified.
+  `vtable_entries`) and would belong in `hir-ty` if the interpreter used them. A constant
+  holding a `TypeId` does reach codegen: its memory map keeps the type of each id it gave
+  (`ComplexMemoryMap::type_ids`), and the object's data gets `type_id.rs`'s hash of it there
+  (read: the corpus' `type_id_in_constant`).
 - **`doctest/extract.rs`** finds doc examples as rustdoc does. rust-analyzer's runnables find
   doctests for the IDE with looser rules; ra-jit needs rustdoc's exactly, so this is not a
   duplicate to remove (unverified judgment).
@@ -336,7 +338,9 @@ detection; the edits that make it build come in the commits after.
 
 The gate named below is, unless a step says otherwise:
 `cargo test --release -p hir-ty -p hir-ty-codegen -p hir-ty-borrowck -p hir-def -p parser -p syntax -p ra-jit`
-(the crates that exist at that step), `cargo test --release -p hir-ide` failing exactly the 18
+(the crates that exist at that step; since #293 the fork's crates are tested with
+in `vendor/rust-analyzer`, as `harness/unittests.py` does),
+`cargo test --release -p hir-ide` failing exactly the 18
 known tests, the corpus under Cranelift and LLVM (with `--layouts`), `mixfutures`, `growth.py`,
 `movedlines.py`, `borrowck_ui.py` at its floor, and `cargo fmt --all -- --check`
 ([harness.md](harness.md)).

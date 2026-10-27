@@ -332,6 +332,11 @@ impl SymbolResolver for Resolver<'_> {
         let mut earlier = 0;
         for other in it.module(db).impl_defs(db) {
             let other = other.source(db)?;
+            // rustc numbers what a module has written out before what its macros and derives
+            // make, which it only has once they are expanded.
+            if other.file_id.is_macro() {
+                continue;
+            }
             if other.file_id != source.file_id {
                 return None;
             }

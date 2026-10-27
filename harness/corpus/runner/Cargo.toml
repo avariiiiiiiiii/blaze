@@ -7,4 +7,6 @@ edition = "2021"
 cases = { path = "../cases" }
 
 [features]
+# ra-jit builds with a nightly only (harness/toolchain): its cases are on by default.
+default = ["nightly"]
 nightly = ["cases/nightly"]

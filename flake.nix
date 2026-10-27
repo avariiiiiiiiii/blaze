@@ -17,24 +17,45 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
-        # The one toolchain ra-jit is pinned to (harness/toolchain); rust-src is the sysroot
-        # source rust-analyzer reads `core` from.
-        rust = pkgs.rust-bin.stable."1.99.0".default.override {
+        # The one toolchain ra-jit is pinned to: the dated nightly in harness/toolchain
+        # (`nightly-YYYY-MM-DD`, moved by harness/toolchain_bump.py, which also moves the
+        # rust-overlay input to one that has it). rust-src is the sysroot source rust-analyzer
+        # reads `core` from.
+        pin = pkgs.lib.removePrefix "nightly-" (pkgs.lib.fileContents ./harness/toolchain);
+        rust = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rust-src" ];
         };
-        # The nightly of the setups bench.py compares with (`--setups`, docs/benchmarks.md):
-        # rustc_codegen_cranelift ships only with nightlies.
-        nightly = pkgs.rust-bin.nightly."2026-10-09".default.override {
+        # The same nightly with rustc_codegen_cranelift, for the setups bench.py compares with
+        # (`--setups`, docs/benchmarks.md).
+        nightly = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rust-src" "rustc-codegen-cranelift-preview" ];
         };
         # The one LLVM the `llvm` feature builds against, for every build of it: the dev shells
-        # here, CI (`.#llvm`, .github/actions/toolchain) and a release built with the feature.
-        # LLVM_SYS_201_PREFIX names the output with llvm-config, the headers and the libraries;
-        # crates/hir-ty-codegen/build.rs links what it names and refuses any other.
-        llvm = pkgs.llvmPackages_20.llvm;
-        llvmEnv = { LLVM_SYS_201_PREFIX = "${llvm.dev}"; };
+        # here, CI (`.#llvm`, .github/actions/toolchain), the flake's `dist` and the release.
+        # crates/hir-ty-codegen/llvm.json pins it: LLVM 23.1.4, built for each target by
+        # .github/scripts/llvm.py (the llvm workflow) and fetched here by its sha256. Its static libraries, headers, llvm-config,
+        # llvm-dwarfdump and llvm-pdbutil; LLVM_SYS_231_PREFIX names it, and
+        # crates/hir-ty-codegen/build.rs links it statically and refuses any other. Its tools were
+        # built on Ubuntu 22.04 with the C++ runtime linked in: on Linux they are pointed at the
+        # store's libc.
+        llvmPin = builtins.fromJSON (builtins.readFile ./crates/hir-ty-codegen/llvm.json);
+        llvm =
+          let pin = llvmPin.targets.${triple} or (throw "crates/hir-ty-codegen/llvm.json has no LLVM for ${triple}: run the llvm workflow");
+          in pkgs.stdenv.mkDerivation {
+            pname = "blaze-llvm";
+            inherit (llvmPin) version;
+            src = pkgs.fetchurl { url = "${llvmPin.release}/${pin.name}"; inherit (pin) sha256; };
+            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.stdenv.cc.cc.lib ];
+            dontConfigure = true;
+            dontBuild = true;
+            # The archives are what the release links: not stripped or rewritten.
+            dontStrip = true;
+            installPhase = "cp -r . $out";
+          };
+        llvmEnv = { LLVM_SYS_231_PREFIX = "${llvm}"; };
         # What harness/bench.py runs in on the benchmark machine (docs/benchmarks.md): the
-        # pinned toolchain, LLVM 20 for `--features llvm`, and the C side the projects' build
+        # pinned toolchain, LLVM 23 for `--features llvm`, and the C side the projects' build
         # scripts use. Nothing here wraps rustc (no sccache) or replaces the default linker:
         # mold and wild are on PATH for the setups that ask for them with `-fuse-ld`. Every
         # library directory here costs every link a `realpath` in Nix's linker wrapper, which
@@ -46,7 +67,7 @@
             pkgs.git
             pkgs.pkg-config
             pkgs.openssl
-            llvm.dev
+            llvm
             pkgs.libffi
             pkgs.libxml2
             pkgs.zlib
@@ -78,6 +99,8 @@
         # The one build of ra-jit, the release workflow's recipe (.github/scripts/build_release.py):
         # the `dist` profile optimized with the profile pgo/profiles.json pins for this system,
         # fetched by its sha256. The binaries run each other from next to themselves, unwrapped.
+        # `--nix`: they load nixpkgs' glibc, so the release's floor of RHEL 9's glibc is not theirs
+        # (build_release.py checks that instead; release.yaml keeps the floor).
         triple = {
           x86_64-linux = "x86_64-unknown-linux-gnu";
           aarch64-linux = "aarch64-unknown-linux-gnu";
@@ -87,20 +110,21 @@
         pgoProfile =
           let pin = pgo.targets.${triple} or (throw "pgo/profiles.json has no profile for ${triple}: run the pgo workflow");
           in pkgs.fetchurl { url = "${pgo.release}/${pin.name}"; inherit (pin) sha256; };
-        dist = rustPlatform.buildRustPackage {
+        dist = rustPlatform.buildRustPackage (llvmEnv // {
           pname = "ra-jit-dist";
           inherit version src;
           # `ra-jit --version` names the commit (a dirty tree has none of its own).
           RA_JIT_GIT_SHA = self.shortRev or self.dirtyShortRev or "";
           cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = [ pkgs.python3 ];
+          # otool: build_release.py checks that no binary loads libLLVM.
+          nativeBuildInputs = [ pkgs.python3 ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.cctools ];
           doCheck = false;
           # cargo-auditable wraps rustc for the workspace's crates, which changes their symbols:
           # the profile would find none of them.
           auditable = false;
           buildPhase = ''
             runHook preBuild
-            python3 -I .github/scripts/build_release.py --target ${triple} --profdata ${pgoProfile} --out shipped
+            python3 -I .github/scripts/build_release.py --target ${triple} --profdata ${pgoProfile} --out shipped --nix
             runHook postBuild
           '';
           installPhase = ''
@@ -109,7 +133,7 @@
             cp shipped/* $out/bin/
             runHook postInstall
           '';
-        };
+        });
         # What `nix profile install` puts on PATH: the same binaries, with the toolchain.
         daemon = pkgs.runCommand "ra-jit-${version}" {
           nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -187,8 +211,8 @@
           blaze = daemon;
           ra-jit = daemon;
           inherit dist daemon run life daemon-units life-bin;
-          # The pinned LLVM's tools, with the libLLVM a build of the `llvm` feature loads: what CI
-          # realises where it runs such a build.
+          # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
+          # read debug info, and the prefix a build of the `llvm` feature links.
           inherit llvm;
         };
         apps.default = {
@@ -203,11 +227,11 @@
           type = "app";
           program = "${run}/bin/blaze";
         };
-        # `nix develop`: the pinned LLVM (LLVM_SYS_201_PREFIX, its tools on PATH) and the C
-        # toolchain it was built with, so `cargo build --features llvm` links against it. Rust is
-        # rustup at the pinned toolchain: plain `cargo` is 1.99.0 and `cargo +<toolchain>` works.
+        # `nix develop`: the pinned LLVM (LLVM_SYS_231_PREFIX, its tools on PATH) and a C
+        # toolchain with libstdc++.a, so `cargo build --features llvm` links it in. Rust is
+        # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
         devShells.default = pkgs.mkShell (llvmEnv // {
-          packages = [ pkgs.rustup pkgs.python3 llvm llvm.dev ];
+          packages = [ pkgs.rustup pkgs.python3 llvm ];
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
           # As in the bench shell: the wrapper's _FORTIFY_SOURCE fails configure probes at -O0 in
           # the C code of the projects the harnesses build.
@@ -215,12 +239,12 @@
         } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # rustup's rustc links x86-64 Linux with its own rust-lld, past the wrapper of the
           # shell's linker that writes the store's libraries into the binary's RUNPATH: without
-          # this the binary finds neither libLLVM nor the store's glibc and libgcc_s when it runs.
+          # this the binary finds neither the store's glibc nor its libgcc_s when it runs.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-Clinker-features=-lld";
         });
         devShells.bench = pkgs.mkShell bench;
         # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
-        # bun's pinned nightly in place of 1.99.0 (rust-src, which ra-jit reads `core` from), and
+        # bun's own pinned nightly in place of ra-jit's (rust-src, which ra-jit reads `core` from), and
         # what bun's own build of its C and C++ needs, as its flake.nix has it: LLVM 23 as the
         # C and C++ compiler, cmake, ninja, nasm (x86), go, a bun to run its build scripts, and on Linux lld.
         # ra-jit itself is built in the bench shell.

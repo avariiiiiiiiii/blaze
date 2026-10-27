@@ -1,9 +1,12 @@
-//! The Rust release `cargo blaze` builds with: the one blaze compiles, whatever toolchain the
-//! project names. blaze lays out types, names symbols and links as that release does, so cargo,
-//! rustc and the daemon all run under it. Rust builds today what an older release built, so a
-//! project pinned to an older stable builds the same; one that needs its own toolchain (a
-//! nightly's features, a newer release's) fails with rustc's error and a line saying which
-//! release built it, and never goes to cargo for it ([#269]).
+//! blaze's own toolchain, the Rust `cargo blaze` builds with whatever toolchain the project
+//! names: `blaze-2026-10-25` ([`name`]), today the Rust nightly of that date (docs/toolchain.md).
+//! It is blaze's, not the project's: the base blaze replaces piece by piece (docs/no-rustc.md),
+//! moved on blaze's schedule with the corpus as the gate. blaze lays out types, names symbols and links as that nightly does, so cargo,
+//! rustc and the daemon all run under it. blaze supports the latest nightly only, pinned by date
+//! in `harness/toolchain` (`harness/toolchain_bump.py` moves it): a project pinned to a stable
+//! release or an older nightly builds with it, since Rust builds today what an older release
+//! built; one that needs what the pinned nightly lacks fails with rustc's error and a line saying
+//! which toolchain built it, and never goes to cargo for it ([#269]).
 //!
 //! The release comes from, in order: what `RUSTC` names, or the rustc cargo would run when it
 //! is that release; rustup's copy of it; blaze's own copy (`own.rs`), downloaded the first
@@ -21,8 +24,20 @@ use std::{
 
 use super::state::rustc_says;
 
-/// The release blaze compiles.
+/// The toolchain blaze compiles, as rustup names it: `nightly-2026-10-25`.
 pub(crate) const OURS: &str = include_str!("../../../../harness/toolchain");
+
+/// blaze's toolchain as blaze names it: `blaze-2026-10-25`, after the date of the Rust nightly
+/// it is (`harness/toolchain`). rustup knows it by this name when the installer linked it.
+pub(crate) fn name() -> String {
+    let ours = OURS.trim();
+    format!("blaze-{}", ours.strip_prefix("nightly-").unwrap_or(ours))
+}
+
+/// What that toolchain's rustc says it is after `rustc `: `1.101.0-nightly (12433c307 2026-10-24)`.
+pub(crate) fn ours_says() -> &'static str {
+    own::rustc_version()
+}
 
 /// The project's own toolchain, as a failure names it, when blaze builds with its release in
 /// its place.
@@ -36,13 +51,25 @@ pub(crate) enum Chosen {
     Own(PathBuf),
 }
 
+impl Chosen {
+    /// Where the toolchain is: its sysroot.
+    pub(crate) fn dir(&self) -> &Path {
+        match self {
+            Chosen::Given(dir) | Chosen::Rustup(dir) | Chosen::Own(dir) => dir,
+        }
+    }
+}
+
 impl std::fmt::Display for Chosen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ours = OURS.trim();
+        let (name, ours) = (name(), OURS.trim());
+        let dir = self.dir().display();
         match self {
-            Chosen::Given(dir) => write!(f, "Rust {ours}, the toolchain at {}", dir.display()),
-            Chosen::Rustup(dir) => write!(f, "Rust {ours} from rustup, at {}", dir.display()),
-            Chosen::Own(dir) => write!(f, "Rust {ours}, blaze's own copy at {}", dir.display()),
+            Chosen::Given(_) => write!(f, "{name}, blaze's toolchain (Rust {ours}), at {dir}"),
+            Chosen::Rustup(_) => {
+                write!(f, "{name}, blaze's toolchain (Rust {ours}), rustup's copy at {dir}")
+            }
+            Chosen::Own(_) => write!(f, "{name}, blaze's toolchain (Rust {ours}), at {dir}"),
         }
     }
 }
@@ -65,7 +92,7 @@ pub(crate) fn settle() -> Result<Chosen, String> {
         return Ok(Chosen::Given(sysroot));
     }
     let named = super::state::rustc_named().is_some();
-    if version.as_deref() == Some(ours) {
+    if version.as_deref() == Some(ours_says()) {
         let sysroot = sysroot_of(&rustc);
         match with_library(&sysroot, ours) {
             Ok(()) => {
@@ -84,7 +111,8 @@ pub(crate) fn settle() -> Result<Chosen, String> {
              with {shown} anyway, laying its types out as {ours} does)"
         ));
     }
-    if let Some(version) = version.filter(|it| it != ours) {
+    if let Some(version) = version.filter(|it| it != ours_says()) {
+        note_once(&version, named_by());
         let _ = IN_PLACE_OF.set((version, named_by()));
     }
     let rustup = rustup_home().and_then(|home| installed(&home, ours));
@@ -138,8 +166,8 @@ fn use_own(dir: &Path) {
     }
 }
 
-/// Names rustup's toolchain at `sysroot` one way however it was named (`1.99.0`,
-/// `1.99.0-<host>`, a path), since the name is part of which build this is.
+/// Names rustup's toolchain at `sysroot` one way however it was named (`nightly-2026-10-25`,
+/// `nightly-2026-10-25-<host>`, a path), since the name is part of which build this is.
 fn rustup_named(sysroot: &Path) {
     let home = rustup_home().and_then(|it| dunce::canonicalize(it.join("toolchains")).ok());
     let dir = dunce::canonicalize(sysroot).ok();
@@ -152,13 +180,45 @@ fn rustup_named(sysroot: &Path) {
     }
 }
 
-/// What a build that failed says after its errors: which release built it, when it was not
+/// Says, once for each project directory and toolchain it names, that blaze builds with its
+/// own toolchain and not that one: a note, not an error, and nothing is switched. The marker is
+/// in `~/.blaze/noted`; with no home directory it is said every time.
+fn note_once(version: &str, named: &str) {
+    use sha2::Digest as _;
+    let here = std::env::current_dir().unwrap_or_default();
+    let mut hash = sha2::Sha256::new();
+    hash.update(here.as_os_str().as_encoded_bytes());
+    hash.update([0]);
+    hash.update(version);
+    hash.update([0]);
+    hash.update(name());
+    let key: String = hash.finalize().iter().take(12).map(|it| format!("{it:02x}")).collect();
+    let marker = own::home().map(|home| home.join("noted").join(key));
+    if marker.as_ref().is_some_and(|it| it.exists()) {
+        return;
+    }
+    super::say::note(&format!(
+        "blaze builds with its own toolchain, {}, not rustc {version}, {named}. blaze is its own \
+         Rust toolchain whatever the project pins (docs/toolchain.md); the project's toolchain \
+         and its CI stay the final word",
+        name()
+    ));
+    if let Some(marker) = marker
+        && let Some(dir) = marker.parent()
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let _ = std::fs::write(marker, version);
+    }
+}
+
+/// What a build that failed says after its errors: which toolchain built it, when it was not
 /// the project's own, since the failure may be what one has and the other has not.
 pub(crate) fn failed_note() -> Option<String> {
     let (version, named) = IN_PLACE_OF.get()?;
     Some(format!(
-        "blaze built this with Rust {}, the release it compiles, in place of {version}, {named}; \
-         an error {version} would not give comes from that difference",
+        "blaze built this with its own toolchain, {} (Rust {}), not {version}, {named}; an error \
+         {version} would not give comes from that difference",
+        name(),
         OURS.trim()
     ))
 }
@@ -169,13 +229,23 @@ pub(crate) fn note_failed() {
     }
 }
 
-/// The release `rustc` says it is, as `1.99.0` or `1.101.0-nightly`.
+/// What `rustc` says it is after `rustc `, as `1.101.0-nightly (12433c307 2026-10-24)`: the
+/// whole line, since every nightly of a release has the same number.
 fn version_of(rustc: &OsStr) -> Option<String> {
-    rustc_says(rustc, "--version")?.split_whitespace().nth(1).map(str::to_owned)
+    let said = rustc_says(rustc, &["--version"])?;
+    said.lines().next()?.trim().strip_prefix("rustc ").map(str::to_owned)
 }
 
 fn sysroot_of(rustc: &OsStr) -> PathBuf {
-    PathBuf::from(rustc_says(rustc, "--print=sysroot").unwrap_or_default())
+    PathBuf::from(rustc_says(rustc, &["--print=sysroot"]).unwrap_or_default())
+}
+
+/// The `rust-lld` that rustc links MSVC programs with when a target says so, as the
+/// repository's `.cargo/config.toml` does: rustc finds it in the toolchain, not on the PATH.
+pub(crate) fn rust_lld() -> PathBuf {
+    let host = hir_ty_codegen::Target::host();
+    let lld = format!("rust-lld{}", std::env::consts::EXE_SUFFIX);
+    sysroot_of(&super::state::rustc_path()).join("lib/rustlib").join(host).join("bin").join(lld)
 }
 
 /// What chose the project's toolchain, as rustup tells the programs its proxies start.
@@ -198,7 +268,8 @@ fn rustup_home() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".rustup")).filter(|it| it.is_dir())
 }
 
-/// The directory rustup installed `release` for this host in: `1.99.0-aarch64-apple-darwin`.
+/// The directory rustup installed `release` for this host in:
+/// `nightly-2026-10-25-aarch64-apple-darwin`.
 fn installed(home: &Path, release: &str) -> Option<PathBuf> {
     let prefix = format!("{release}-");
     let cargo = format!("cargo{}", std::env::consts::EXE_SUFFIX);

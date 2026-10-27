@@ -10,7 +10,7 @@ one for each of the N most downloaded crates of crates.io (default 300: a projec
 its newest version, locked by cargo), one of git dependencies of every kind of reference, and
 one of a few crates from a second sparse registry,
 which this script serves on 127.0.0.1 from crates.io's index and files under a `dl` with no
-markers. cargo 1.99 fetches every lock file (`cargo fetch --locked`) into a CARGO_HOME of its
+markers. The pinned nightly's cargo fetches every lock file (`cargo fetch --locked`) into a CARGO_HOME of its
 own, and blaze-registry's `fetch` example (FETCH, or built here) into another. Every package
 either unpacked into registry/src is compared: equal when it has the same directory in both and
 the same tree (every path, its kind and mode, a file's size, sha256 and mtime, a link's target;
@@ -34,7 +34,8 @@ import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TOOLCHAIN = "1.99.0"
+PIN = open(os.path.join(HERE, "toolchain")).read().strip()
+TOOLCHAIN = PIN
 AGENT = "blaze harness/fetchdiff.py (https://github.com/indexable-inc/blaze)"
 MIRROR_PORT = 48273
 MIRROR = f"sparse+http://127.0.0.1:{MIRROR_PORT}/index/"

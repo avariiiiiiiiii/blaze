@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       - uses: Swatinem/rust-cache@v2
         with:
           key: bench

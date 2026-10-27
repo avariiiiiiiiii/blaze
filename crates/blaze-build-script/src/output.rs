@@ -7,13 +7,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde_derive::Serialize;
+
 use crate::{
     Error,
     unit::{Package, Unit},
 };
 
 /// A message a script asked cargo to show.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum Severity {
     Error,
     Warning,
@@ -21,7 +23,7 @@ pub enum Severity {
 
 /// A directory of `rustc-link-search` or `rustc-flags`' `-L`, as written (`native=/x`).
 /// cargo passes those inside the script's `OUT_DIR` first, each kind in the order printed.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum LibraryPath {
     CargoArtifact(PathBuf),
     External(PathBuf),
@@ -52,7 +54,7 @@ pub fn search_path_of(path: &Path) -> &Path {
 }
 
 /// Which of the package's targets a `rustc-link-arg*` is for.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum LinkArgTarget {
     /// `rustc-link-arg`.
     All,
@@ -71,7 +73,7 @@ pub enum LinkArgTarget {
 }
 
 /// What a script printed, as cargo keeps it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Output {
     /// `-L` for the package and everything that links it.
     pub library_paths: Vec<LibraryPath>,

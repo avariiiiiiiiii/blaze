@@ -164,7 +164,12 @@ class Case:
             command = [*self.runner, artifact, *self.spec.get("args", [])]
         # A program linked to a `dylib` finds it where cargo left it, as `cargo run` has it.
         mine, other = ("target-ref", "target") if "/target-ref/" in artifact else ("target", "target-ref")
-        libraries = [d for t in (mine, other) for d in glob.glob(os.path.join(self.ws, t, "**", "deps"), recursive=True)]
+        # `deps` in cargo's first layout of the build directory, the `out` of each unit that
+        # built one in its second.
+        libraries = [d for t in (mine, other) for d in [
+            *glob.glob(os.path.join(self.ws, t, "**", "deps"), recursive=True),
+            *sorted({os.path.dirname(lib) for lib in glob.glob(
+                os.path.join(self.ws, t, "**", "build", "*", "*", "out", "lib*.so"), recursive=True)})]]
         libraries += glob.glob(os.path.join(self.sysroot(env), "lib", "rustlib", "*", "lib"))
         env = {**env, "LD_LIBRARY_PATH": ":".join(libraries)}
         try:
@@ -308,7 +313,12 @@ class Case:
         if link is None:
             # cargo has built exactly this before and links nothing: without what it linked
             # then, it does again.
-            for linked in glob.glob(os.path.join(self.ws, "target", "**", "deps", self.artifact_name() + "-*"), recursive=True):
+            # In `deps` in cargo's first layout; in the `out` of its unit in the second, where
+            # only a test has the hash in its name.
+            name = self.artifact_name()
+            for linked in [*glob.glob(os.path.join(self.ws, "target", "**", "deps", name + "-*"), recursive=True),
+                           *glob.glob(os.path.join(self.ws, "target", "**", "build", "*", "*", "out", name), recursive=True),
+                           *glob.glob(os.path.join(self.ws, "target", "**", "build", "*", "*", "out", name + "-*"), recursive=True)]:
                 if "." not in os.path.basename(linked):
                     os.remove(linked)
             link = self.link_line(env)
@@ -415,25 +425,20 @@ class Case:
         return (step["what"], "same", f"{len(answers)} clients mid-reload: {len(answers) - new} old, {new} new")
 
     def doctests(self, env):
-        """`cargo test --doc` with rustdoc and with ra-jit in its place."""
-        def tested(target_dir, **more):
-            run = subprocess.run(["cargo", "test", "--doc", *self.select[:2], *self.cargo_args, "--", *self.spec.get("args", [])],
+        """`cargo test --doc` with rustdoc, and `cargo ra-jit test --doc`."""
+        def tested(target_dir, ra_jit=False):
+            command = ["cargo", *(["ra-jit"] if ra_jit else []), "test", "--doc"]
+            path = os.path.dirname(RA_JIT) + os.pathsep + env.get("PATH", os.environ["PATH"])
+            run = subprocess.run([*command, *self.select[:2], *self.cargo_args, "--", *self.spec.get("args", [])],
                                  cwd=self.ws, capture_output=True, text=True, timeout=900,
-                                 env={**env, "CARGO_TARGET_DIR": os.path.join(self.ws, target_dir), **more})
+                                 env={**env, "PATH": path, "CARGO_TARGET_DIR": os.path.join(self.ws, target_dir)})
             return run.returncode, doctest_report(run.stdout), run.stderr
         want = tested("target-ref")
-        got = tested("target", RUSTDOC=RA_JIT, RA_JIT_RUSTDOC="rustdoc")
-        left = re.search(r"ra-jit: the doctests are left to rustdoc: (.*)", got[2])
-        if left:
-            raise Refused(left.group(1))
-        if want[:2] != got[:2]:
-            lines = [f"cargo's `{w}`, ra-jit's `{g}`" for w, g in zip(want[1], got[1]) if w != g]
-            raise Wrong((lines[0] if lines else f"cargo's ends with {want[0]} after {len(want[1])} lines, ra-jit's with {got[0]} after {len(got[1])}")[:300])
-        built = re.findall(r"doctests: (\d+) built by ra-jit, (\d+) by rustc", got[2])
-        if not built:
-            raise Wrong("ra-jit did not say what it built for the doctests")
-        tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])
-        return ("supported", f"{tests} doctests the same, {sum(int(n) for n, _ in built)} built by ra-jit, {sum(int(n) for _, n in built)} by rustc", [])
+        got = tested("target", ra_jit=True)
+        verdict, said = judge_doctests(want, got)
+        if verdict == "WRONG":
+            raise Wrong(said)
+        return ("supported", said, [])
 
     def row(self):
         """The case's line of the table."""
@@ -493,6 +498,40 @@ def doctest_report(stdout):
     tests = sorted(l for l in lines if l.startswith("test ") and not l.startswith("test result"))
     rest = [l for l in lines if l not in tests]
     return tests + rest + sorted(b.strip("\n") for b in blocks[1:]) + ends
+
+
+def judge_doctests(want, got):
+    """What cargo's run of doctests `want` and ra-jit's `got` come to, each (exit status,
+    [`doctest_report`], standard error): ("same", what ra-jit built) or ("WRONG", the first
+    difference). An example ra-jit did not build fails saying why, and is counted rather than
+    compared."""
+    said = "blaze did not build the example: "
+    blocks = [l for l in got[1] if l.startswith("---- ") and f" stdout ----\n{said}" in l]
+    names = {l[5:l.index(" stdout ----")] for l in blocks}
+
+    def kept(report):
+        for l in report:
+            if l.startswith("test result") and names:
+                continue
+            if l.startswith("test ") and any(l.startswith(f"test {n} ") for n in names):
+                continue
+            if l.startswith("---- ") and l[5:].split(" stdout ----")[0] in names:
+                continue
+            if l.startswith("    ") and l.strip() in names:
+                continue
+            if names and l in ("failures:", ""):
+                continue
+            yield l
+
+    w, g = list(kept(want[1])), list(kept(got[1]))
+    if w != g or (not names and want[0] != got[0]):
+        lines = [f"cargo's `{a}`, ra-jit's `{b}`" for a, b in zip(w, g) if a != b]
+        return "WRONG", (lines[0] if lines else f"cargo's ends with {want[0]} after {len(w)} lines, ra-jit's with {got[0]} after {len(g)}")[:300]
+    built = re.findall(r"doctests: (\d+) built by ra-jit, (\d+) not built", got[2])
+    if not built:
+        return "WRONG", "ra-jit did not say what it built for the doctests"
+    tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])
+    return "same", f"{tests} doctests, {sum(int(n) for n, _ in built)} built by ra-jit, {len(names)} not built"
 
 
 def differ(want, got):

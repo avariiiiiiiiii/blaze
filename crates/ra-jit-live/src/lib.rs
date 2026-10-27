@@ -14,7 +14,8 @@
 //!
 //! What a patch cannot do, it says, and the program has to be started again: an edit that
 //! changes a type the rest of the program can see writes the whole object again, and a
-//! patch is for one executable, named by its `LC_UUID`.
+//! patch is for one executable, named by its `LC_UUID` (its GNU build ID on Linux, the GUID
+//! of its PDB on Windows).
 //!
 //! The daemon also tiers the program up while it runs: when it asks, a thread of this crate
 //! samples where the program's threads are, and the daemon compiles the functions they are
@@ -22,7 +23,7 @@
 //! did, for the program to show. `RA_JIT_TIER=off` in the program's environment turns the
 //! sampling off.
 //!
-//! macOS on AArch64 and Linux on x86-64; elsewhere [`Live::start`] says so.
+//! macOS on AArch64, and Linux and Windows on x86-64; elsewhere [`Live::start`] says so.
 
 use std::{fmt, path::PathBuf, sync::OnceLock, time::Duration};
 
@@ -34,6 +35,8 @@ mod linux;
 mod macos;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod sample;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod windows;
 
 /// The directory [`Live::start`] takes edits through.
 static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -85,6 +88,8 @@ pub struct Live {
     inner: macos::Live,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     inner: linux::Live,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    inner: windows::Live,
 }
 
 impl Live {
@@ -94,11 +99,14 @@ impl Live {
         return macos::Live::start().map(|inner| Live { inner });
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         return linux::Live::start().map(|inner| Live { inner });
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        return windows::Live::start().map(|inner| Live { inner });
         #[cfg(not(any(
             all(target_os = "macos", target_arch = "aarch64"),
-            all(target_os = "linux", target_arch = "x86_64")
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(windows, target_arch = "x86_64")
         )))]
-        Err("live edits run on macOS AArch64 and Linux x86-64".to_owned())
+        Err("live edits run on macOS AArch64, Linux x86-64 and Windows x86-64".to_owned())
     }
 
     /// Applies the newest patch that came in since the last call, if any.
@@ -107,9 +115,12 @@ impl Live {
         return self.inner.poll();
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         return self.inner.poll();
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        return self.inner.poll();
         #[cfg(not(any(
             all(target_os = "macos", target_arch = "aarch64"),
-            all(target_os = "linux", target_arch = "x86_64")
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(windows, target_arch = "x86_64")
         )))]
         None
     }
@@ -123,9 +134,12 @@ impl Live {
         self.inner.apply_as_they_come(told);
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         self.inner.apply_as_they_come(told);
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        self.inner.apply_as_they_come(told);
         #[cfg(not(any(
             all(target_os = "macos", target_arch = "aarch64"),
-            all(target_os = "linux", target_arch = "x86_64")
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(windows, target_arch = "x86_64")
         )))]
         drop(told);
     }
@@ -154,7 +168,7 @@ pub fn tiers() -> Option<format::Tiers> {
 /// patch. The answer is the daemon's, as `cargo ra-jit build` prints it: `ok patch=...
 /// functions=N files=N ms=N`, `ok unchanged`, or why the edit is not built. The file itself
 /// is the editor's to write when it likes; the daemon sees that it has that text already.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, target_arch = "x86_64")))]
 pub fn edit(path: &std::path::Path, text: &str) -> Result<String, String> {
     use std::io::{BufRead as _, Write as _};
     let socket = daemon_socket().ok_or("no home directory to find the daemon in")?;
@@ -166,8 +180,11 @@ pub fn edit(path: &std::path::Path, text: &str) -> Result<String, String> {
     line.push('\t');
     format::escape(text, &mut line);
     line.push('\n');
-    let mut stream = std::os::unix::net::UnixStream::connect(&socket)
-        .map_err(|it| format!("no daemon at {}: {it}", socket.display()))?;
+    #[cfg(unix)]
+    let stream = std::os::unix::net::UnixStream::connect(&socket);
+    #[cfg(windows)]
+    let stream = windows::Socket::connect(&socket);
+    let mut stream = stream.map_err(|it| format!("no daemon at {}: {it}", socket.display()))?;
     stream.write_all(line.as_bytes()).map_err(|it| format!("sending the edit: {it}"))?;
     let mut reply = String::new();
     std::io::BufReader::new(stream)
@@ -182,16 +199,8 @@ pub fn edit(path: &std::path::Path, text: &str) -> Result<String, String> {
     }
 }
 
-/// Where the daemon of this user listens, as ra-jit finds it: in `RA_JIT_HOME`, else in
-/// `XDG_RUNTIME_DIR/ra-jit`, else in `~/.cache/ra-jit`.
-#[cfg(unix)]
+/// Where the daemon of this user listens, as ra-jit finds it: beside [`format::root`].
+#[cfg(any(unix, all(windows, target_arch = "x86_64")))]
 fn daemon_socket() -> Option<std::path::PathBuf> {
-    let set = |name| std::env::var_os(name).filter(|it: &std::ffi::OsString| !it.is_empty());
-    let home = match (set("RA_JIT_HOME"), set("XDG_RUNTIME_DIR"), set("HOME")) {
-        (Some(home), _, _) => std::path::PathBuf::from(home),
-        (None, Some(runtime), _) => std::path::Path::new(&runtime).join("ra-jit"),
-        (None, None, Some(home)) => std::path::Path::new(&home).join(".cache/ra-jit"),
-        (None, None, None) => return None,
-    };
-    Some(home.join("daemon.sock"))
+    Some(format::root()?.with_file_name("daemon.sock"))
 }

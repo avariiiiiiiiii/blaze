@@ -2153,7 +2153,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "ra-ap-rustc_abi"
 version = "0.166.0"
-source = "git+https://github.com/indexable-inc/rustc_abi?branch=main#8f6db283fd604ef63978def1e13dfaaf7f3376db"
 dependencies = [
  "bitflags",
  "ra-ap-rustc_hashes",
@@ -2532,8 +2531,6 @@ dependencies = [
 [[package]]
 name = "salsa"
 version = "0.28.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27d2e6e19e39591cd99c01ac4141544b4d012cfd0831348629b8187fa9fe6d34"
 dependencies = [
  "boxcar",
  "crossbeam-queue",
@@ -2559,14 +2556,10 @@ dependencies = [
 [[package]]
 name = "salsa-macro-rules"
 version = "0.28.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baf90a551c38f25ed8489111d3d5827aa18e1b85963f5e6a298505b1d1e2cb7e"
 
 [[package]]
 name = "salsa-macros"
 version = "0.28.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69dd77f86ec10e72e314f4ddf7c44c8d349e73cdff1aad524ba9668603fb0549"
 dependencies = [
  "proc-macro2",
  "quote",

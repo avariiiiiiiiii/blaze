@@ -1,13 +1,13 @@
 [workspace]
-members = ["crates/*", "vendor/rust-analyzer/lib/rowan"]
+members = ["crates/*"]
 # `ra-jit-wasm` turns on a feature of `hir-ty-codegen` that swaps the code generator's output, which
 # must not be unified into a build of the native crates.
-exclude = ["crates/ra-jit-wasm", "demo", "harness", "vendor/proc-macro-srv"]
+exclude = ["crates/ra-jit-wasm", "demo", "harness", "vendor/proc-macro-srv", "vendor/rust-analyzer"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-rust-version = "1.99"
+rust-version = "1.101"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["blaze contributors"]
@@ -63,6 +63,8 @@ ra-ap-rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver" }
 salsa = { path = "vendor/salsa" }
 salsa-macros = { path = "vendor/salsa-macros" }
 salsa-macro-rules = { path = "vendor/salsa-macro-rules" }
+# Links the pinned LLVM statically, with a static libstdc++ on Linux (vendor/llvm-sys/SOURCE.md).
+llvm-sys = { path = "vendor/llvm-sys" }
 
 # line-index = { path = "lib/line-index" }
 # la-arena = { path = "lib/la-arena" }
@@ -91,7 +93,13 @@ blaze-core = { path = "crates/blaze-core" }
 blaze-vfs = { path = "crates/blaze-vfs" }
 blaze-items = { path = "crates/blaze-items" }
 blaze-api = { path = "crates/blaze-api" }
+blaze-doc = { path = "crates/blaze-doc" }
+blaze-fmt = { path = "crates/blaze-fmt" }
+blaze-lints = { path = "crates/blaze-lints" }
 blaze-manifest = { path = "crates/blaze-manifest" }
+blaze-metadata = { path = "crates/blaze-metadata" }
+blaze-new = { path = "crates/blaze-new" }
+blaze-tree = { path = "crates/blaze-tree" }
 ra-jit-fuzz = { path = "crates/ra-jit-fuzz" }
 hir-ide = { path = "vendor/rust-analyzer/crates/hir-ide", version = "0.0.0" }
 ide = { path = "vendor/rust-analyzer/crates/ide", version = "0.0.0" }

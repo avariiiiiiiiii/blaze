@@ -382,7 +382,7 @@ fn function_name(db: &dyn HirDatabase, func: FunctionId, args: GenericArgs<'_>) 
         .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
 
-fn crate_name(db: &dyn HirDatabase, krate: Crate) -> String {
+pub(crate) fn crate_name(db: &dyn HirDatabase, krate: Crate) -> String {
     krate.extra_data(db).display_name.as_ref().map_or_else(|| "?".to_owned(), |it| it.to_string())
 }
 
@@ -1710,6 +1710,7 @@ impl<'db> FunctionCx<'_, 'db> {
             relocs: Vec::new(),
             fn_relocs: Vec::new(),
             align: 1,
+            type_ids: Vec::new(),
         })?;
         let data = self.cg.declare_data_in_func(data, self.builder.func);
         let text = self.builder.ins().symbol_value(ptr(), data);

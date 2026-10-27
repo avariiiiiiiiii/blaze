@@ -7,8 +7,8 @@ arguments and variables cargo and rust-analyzer ask with (docs/no-rustc.md, step
     answers.py           compare ra-jit's answers with rustc's; a difference fails
     answers.py --write   write what rustc answers into ra-jit's data, after a toolchain bump
 
-ra-jit's answers are crates/ra-jit/src/answers/rustc-<release>.json. A toolchain whose release
-has none is asked once per question and its answers are kept, as before. The target specs
+ra-jit's answers are crates/ra-jit/src/answers/rustc.json, of the toolchain in harness/toolchain.
+Another toolchain is asked once per question and its answers are kept, as before. The target specs
 depend on the host rustc was built for (x86-64 Linux's links with its own lld): --write keeps
 those of the other hosts and writes this host's, so it is run on each host CI has (Linux
 x86-64 and AArch64, macOS arm64).
@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-DATA = os.path.join(ROOT, "crates/ra-jit/src/answers", f"rustc-{TOOLCHAIN}.json")
+DATA = os.path.join(ROOT, "crates/ra-jit/src/answers", "rustc.json")
 TARGETS = [
     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin",

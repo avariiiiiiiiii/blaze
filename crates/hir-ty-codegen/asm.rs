@@ -700,6 +700,21 @@ pub(super) fn inline(
             return None;
         }
     }
+    // An instruction that names a high byte register (`ah`, `{x:h}`) cannot encode one that
+    // needs a REX prefix (`sil`, `r8b`), and LLVM's assembler refuses `mov ah, sil`. rustc's
+    // `q` leaves it to the allocation: a block that gets `sil` fails to build, one that gets
+    // `cl` builds. So in such a block a `reg_byte` is one of a, b, c and d (`Q`), which always
+    // encodes; elsewhere any byte register (`q`), as rustc's.
+    let high_byte = arch == Arch::X86_64
+        && (template.iter().any(|piece| match piece {
+            AsmPiece::Operand { modifier, .. } => *modifier == Some('h'),
+            AsmPiece::Lit(lit) => lit
+                .split(|it: char| !it.is_ascii_alphanumeric())
+                .any(|word| ["ah", "bh", "ch", "dh"].contains(&word.to_ascii_lowercase().as_str())),
+        }) || operands.iter().any(|operand| {
+            matches!(operand, Operand::Reg { reg: InlineAsmRegOrRegClass::Reg(name), .. }
+                if HIGH.contains(&name.as_str().trim_matches('"')))
+        }));
     let constraint = |reg: &InlineAsmRegOrRegClass| -> Option<String> {
         match (arch, reg) {
             (Arch::X86_64, InlineAsmRegOrRegClass::Reg(name)) => {
@@ -714,6 +729,7 @@ pub(super) fn inline(
             (Arch::X86_64, InlineAsmRegOrRegClass::RegClass(class)) => match class.as_str() {
                 "reg" => Some("r".to_owned()),
                 "reg_abcd" => Some("Q".to_owned()),
+                "reg_byte" if high_byte => Some("Q".to_owned()),
                 "reg_byte" => Some("q".to_owned()),
                 _ => None,
             },

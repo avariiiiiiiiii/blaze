@@ -11,7 +11,10 @@ use anyhow::{Context, ensure};
 use ra_jit_live::format::{self, Body, Patch, Process};
 use rustc_hash::FxHashMap;
 
-use crate::{lock, splice::Baseline};
+use crate::{
+    lock,
+    splice::{Baseline, Lasting},
+};
 
 /// What was last laid out for the program that runs each executable, by its UUID.
 static PUBLISHED: LazyLock<Mutex<FxHashMap<[u8; 16], Published>>> = LazyLock::new(Default::default);
@@ -24,6 +27,12 @@ struct Published {
     end: u64,
     sequence: u64,
 }
+
+/// Where the program that runs each executable, by its UUID, has the statics that patches
+/// defined anew, with its pid and when it started: the next patch refers to those
+/// ([`Lasting`]).
+static LASTING: LazyLock<Mutex<FxHashMap<[u8; 16], ((u32, u64), Lasting)>>> =
+    LazyLock::new(Default::default);
 
 /// The program that runs the executable with `uuid` and takes edits, when one does.
 pub(crate) fn running(uuid: &[u8; 16]) -> Option<Process> {
@@ -88,9 +97,23 @@ pub(crate) fn publish(baseline: &Baseline, patch: &std::path::Path) {
         {
             return Ok((Body::Restart(why.clone()), base));
         }
-        let (_, code, moved) = baseline.live(&std::fs::read(patch)?, base)?;
+        let mut all = lock(&LASTING);
+        let lasting = match all.entry(uuid).or_default() {
+            (of, lasting) if *of == (process.pid, process.started) => lasting,
+            // A program that took no patch yet has those of the splice it was started from,
+            // and the room's end for the rest.
+            known => {
+                let of = (process.pid, process.started);
+                let lasting = baseline.spliced_lasting(process.started);
+                *known = (of, lasting.with_room(Some(process.end)));
+                &mut known.1
+            }
+        };
+        let (_, code, moved) = baseline.live(&std::fs::read(patch)?, base, lasting)?;
         let end = base + (code.text.len() + code.data.len()).next_multiple_of(0x4000) as u64;
-        ensure!(end <= process.end, "the room the program set aside for edits is used up");
+        // The statics new since the executable take the room from its end down.
+        let room = lasting.low().map_or(process.end, |it| it & !0x3fff);
+        ensure!(end <= room, "the room the program set aside for edits is used up");
         crate::tier::placed(uuid, process.pid, moved, base + code.text.len() as u64);
         Ok((Body::Code(code), end))
     })();
@@ -99,7 +122,12 @@ pub(crate) fn publish(baseline: &Baseline, patch: &std::path::Path) {
         Err(why) => (Body::Restart(format!("{why:#}")), base),
     };
     let shown = match &body {
-        Body::Code(code) => format!("{} functions redirected", code.redirected),
+        Body::Code(code) if code.lasting.is_empty() => {
+            format!("{} functions redirected", code.redirected)
+        }
+        Body::Code(code) => {
+            format!("{} functions redirected, {} new statics", code.redirected, code.lasting.len())
+        }
         Body::Restart(why) => format!("restart needed: {why}"),
     };
     let sequence = next_sequence(last);
@@ -127,7 +155,11 @@ pub(crate) fn types_changed(names: &[String]) {
         [first, rest @ ..] => format!("`{first}` and {} other types", rest.len()),
         [] => return,
     };
-    let why = format!("the edit changes {shown}, which the running program may have values of");
+    let why = format!(
+        "the edit changes the definition of {shown}, which the running program may have values \
+         of laid out as before (a type added under a name of its own, with the code moved to it, \
+         goes out as a patch)"
+    );
     *lock(&TYPES) = Some((now(), why));
 }
 
@@ -180,7 +212,7 @@ fn next_sequence(last: Option<Published>) -> u64 {
 }
 
 /// Milliseconds since the epoch, which the program counts in too.
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |it| it.as_millis() as u64)
 }
 
@@ -203,5 +235,25 @@ fn wake(dir: &std::path::Path) {
     }
 }
 
-#[cfg(not(unix))]
+/// The same on Windows, through the event the program waits on ([`format::wake_event`]).
+#[cfg(windows)]
+fn wake(dir: &std::path::Path) {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent},
+    };
+    let name: Vec<u16> = format::wake_event(dir).encode_utf16().chain([0]).collect();
+    // SAFETY: the name ends with a zero; the handle is closed below.
+    let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    if event.is_null() {
+        return;
+    }
+    // SAFETY: the handle is open and this one's.
+    unsafe {
+        SetEvent(event);
+        CloseHandle(event);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn wake(_: &std::path::Path) {}

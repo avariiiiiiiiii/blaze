@@ -1,12 +1,10 @@
-//! ra-jit as cargo's `RUSTDOC` for `cargo test --doc`: the examples in the documentation of a
-//! library are taken out as rustdoc takes them, and each is a program of its own, a crate
-//! ra-jit adds to the graph, compiles with everything it links over the standard library's
-//! unit and links itself, with nothing of rustc's. One rust-analyzer finds an error in, one
-//! marked `compile_fail` and one ra-jit cannot build whole is rustc's. What they print and
-//! how they end is told as rustdoc's test harness tells it.
-//!
-//! Anything else rustdoc is asked for, and a run of the tests that asks for what is not done
-//! here, is rustdoc's: the reason is said and rustdoc runs.
+//! The doc tests of `cargo blaze test`: the examples in the documentation of a library are
+//! taken out as rustdoc takes them, and each is a program of its own, a crate ra-jit adds to
+//! the graph, compiles with everything it links over the standard library's unit and links
+//! itself. No rustc or rustdoc runs: an example rust-analyzer finds an error in, or one blaze
+//! cannot build whole, fails and says why, and one marked `compile_fail` passes when
+//! rust-analyzer finds an error in it. What they print and how they end is told as rustdoc's
+//! test harness tells it. A run of the tests that asks for what is not done here fails.
 
 mod extract;
 mod program;
@@ -15,7 +13,7 @@ use std::{
     ffi::OsString,
     io::{IsTerminal as _, Write as _},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -31,21 +29,13 @@ use crate::plan::Selection;
 use extract::{Example, Marks};
 use program::{Frame, Program};
 
-/// The variable that makes `ra-jit` stand in for rustdoc. Its value is the rustdoc to run for
-/// what is left to it.
-pub(crate) const ENABLED: &str = "RA_JIT_RUSTDOC";
-
-/// The variable that tells ra-jit as rustdoc the build `cargo test --doc` was asked for, as
-/// JSON: cargo builds the libraries the examples link against with its features, which a
+/// The variable that tells the run of the doc tests the build `cargo blaze test` was asked
+/// for, as JSON: the libraries the examples link against are built with its features, which a
 /// package shares with the others it selects, not with those of a build of the package alone.
 pub(crate) const BUILD: &str = "RA_JIT_DOCTEST_BUILD";
 
-/// The variable that has ra-jit as rustdoc write down how cargo ran it, in the directory it
-/// names, and end there: the runs are made once cargo is done, over one load of the workspace.
-pub(crate) const RECORD: &str = "RA_JIT_DOCTEST_RECORD";
-
-/// The argument that has ra-jit make the runs written down under [`RECORD`], before a
-/// [`Replay`] as JSON.
+/// The argument that has ra-jit make the runs [`write_run`] wrote down, before a [`Replay`] as
+/// JSON.
 const REPLAY: &str = "--replay-doctests";
 
 /// The code a test harness ends with when a test failed.
@@ -291,66 +281,31 @@ impl Asked {
         in_place(as_asked(program), &self.cwd, &self.env)
     }
 
-    /// Has rustc compile `source` into a program, or finds the program it compiled of it in an
-    /// earlier run, when nothing it was compiled from has changed since. The directory with
-    /// what rustc wrote is `scratch` or the one it was remembered in.
-    fn compile(
-        &self,
-        source: &str,
-        scratch: &Path,
-        edition: &str,
-        env: &[(&str, String)],
-        links: bool,
-    ) -> anyhow::Result<(Compiled, PathBuf)> {
-        let memo = self.memo().map(|memo| memo.join(self.key(source, edition, env, links)));
-        if let Some(dir) = &memo {
-            if let Some(compiled) = Remembered::read(dir, env, self) {
-                return Ok((compiled, dir.clone()));
-            }
-            _ = std::fs::remove_dir_all(dir);
-        }
-        let memo = memo.filter(|dir| {
-            dir.parent().is_some_and(|it| std::fs::create_dir_all(it).is_ok())
-                && std::fs::create_dir(dir).is_ok()
-        });
-        let dir = memo.as_deref().unwrap_or(scratch);
-        std::fs::create_dir_all(dir)?;
-        let rustc = self.env.iter().find(|(name, _)| name == "RUSTC");
-        let mut rustc = self.command(rustc.map_or_else(|| "rustc".into(), |(_, it)| it.clone()));
-        rustc.args(&self.rustc_args).args(["--edition", edition, "--color", "never"]);
-        rustc.arg("--crate-type=bin").arg("--out-dir").arg(dir);
-        // Each output is named: with `-o` and more than one, rustc warns that it names them.
-        let (out, deps) = (dir.join("rust_out"), dir.join("rust_out.d"));
-        let emit = if links { "link" } else { "metadata" };
-        rustc.arg(format!("--emit={emit}={},dep-info={}", out.display(), deps.display()));
-        rustc.arg("-").envs(env.iter().map(|(name, value)| (name, value)));
-        rustc.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut rustc = rustc.spawn().context("running rustc")?;
-        rustc.stdin.take().context("rustc takes no input")?.write_all(source.as_bytes())?;
-        let ran = rustc.wait_with_output()?;
-        let compiled = Compiled {
-            success: ran.status.success(),
-            stderr: String::from_utf8_lossy(&ran.stderr).into_owned(),
-        };
-        if memo.is_some() {
-            Remembered::write(dir, &compiled);
-        }
-        Ok((compiled, dir.to_owned()))
-    }
-
-    /// Where rustc's programs of the examples stay from run to run: beside what cargo built
-    /// them against, in `<target>/<profile>/ra-jit-doctest`.
+    /// Where blaze's programs of the examples stay from run to run: beside the build's tests,
+    /// in `<target>/<profile>/ra-jit-doctest`. Cargo names the libraries'
+    /// directory, `deps` in its first layout and one unit's `build/<package>/<hash>/out` in
+    /// its second ([`crate::cargo::layout`]).
     fn memo(&self) -> Option<PathBuf> {
-        let deps = self.rustc_args.windows(2).find_map(|it| match it[0] == "-L" {
-            true => it[1].strip_prefix("dependency="),
+        // In cargo's second layout of the build directory a library of no dependencies is
+        // documented with no `-L dependency=`: the directory of the library itself then.
+        let dependency = self.rustc_args.windows(2).find_map(|it| match it[0] == "-L" {
+            true => it[1].strip_prefix("dependency=").map(Path::new),
             false => None,
-        })?;
-        Some(self.cwd.join(deps).parent()?.join("ra-jit-doctest"))
+        });
+        let library = || {
+            let externs = self.rustc_args.windows(2).filter(|it| it[0] == "--extern");
+            externs.filter_map(|it| Path::new(it[1].split_once('=')?.1).parent()).next()
+        };
+        let deps = self.cwd.join(dependency.or_else(library)?);
+        let profile = match crate::cargo::layout::unit_dir(&deps) {
+            Some(unit) => unit.profile()?.to_owned(),
+            None => deps.parent()?.to_owned(),
+        };
+        Some(profile.join("ra-jit-doctest"))
     }
 
-    /// What tells a program rustc compiles apart from another: everything it is given, and
-    /// the libraries named with `--extern` as they are now. Cargo builds a library again when
-    /// one it is built against changes, so those name every library the program reads.
+    /// What tells a program of an example apart from another: everything it is given, and
+    /// the libraries named with `--extern` as they are now.
     fn key(&self, source: &str, edition: &str, env: &[(&str, String)], links: bool) -> String {
         use sha2::{Digest as _, Sha256};
         let mut hasher = Sha256::new();
@@ -383,59 +338,6 @@ impl Asked {
     /// The path of `file` as rustdoc shows it: from the directory it runs in.
     fn shown(&self, file: &Path) -> String {
         file.strip_prefix(&self.cwd).unwrap_or(file).display().to_string()
-    }
-}
-
-/// What rustc said of a program it compiled.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Compiled {
-    success: bool,
-    stderr: String,
-}
-
-/// A program rustc compiled in an earlier run, in the directory it compiled it in, with what
-/// it read: its dep-info names the files and the variables of the environment.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Remembered {
-    compiled: Compiled,
-    files: Vec<(PathBuf, Option<(u64, u128)>)>,
-    env: Vec<(String, Option<String>)>,
-}
-
-impl Remembered {
-    const FILE: &str = "rustc.json";
-
-    /// What rustc said of the program in `dir`, when it read nothing since that is not as it
-    /// was. `env` is what the program is compiled with beside rustdoc's environment.
-    fn read(dir: &Path, env: &[(&str, String)], asked: &Asked) -> Option<Compiled> {
-        let text = std::fs::read(dir.join(Self::FILE)).ok()?;
-        let it: Remembered = serde_json::from_slice(&text).ok()?;
-        let same_file = |(file, was): &(PathBuf, _)| stamp(file) == *was;
-        let same_variable = |(name, was): &(String, Option<String>)| {
-            let given = env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_str());
-            given.or_else(|| asked.var(name)) == was.as_deref()
-        };
-        (it.files.iter().all(same_file) && it.env.iter().all(same_variable)).then_some(it.compiled)
-    }
-
-    /// Remembers what rustc said of the program it compiled in `dir`, when it wrote what it
-    /// read. A program it said nothing of is compiled again next time.
-    fn write(dir: &Path, compiled: &Compiled) {
-        let Ok(text) = std::fs::read_to_string(dir.join("rust_out.d")) else { return };
-        let read = crate::dep_info::DepInfo::parse(&text);
-        // The source is given on standard input, which dep-info names `-`.
-        let files = read.files.iter().filter(|it| *it != "-").map(PathBuf::from);
-        let files = files.map(|file| (stamp(&file), file)).map(|(was, file)| (file, was));
-        let it = Remembered {
-            compiled: Compiled { success: compiled.success, stderr: compiled.stderr.clone() },
-            files: files.collect(),
-            env: read.env,
-        };
-        let Ok(text) = serde_json::to_vec(&it) else { return };
-        let written = dir.join(format!("{}.{}", Self::FILE, std::process::id()));
-        if std::fs::write(&written, text).is_ok() {
-            _ = std::fs::rename(&written, dir.join(Self::FILE));
-        }
     }
 }
 
@@ -478,12 +380,6 @@ struct Recorded {
 }
 
 impl Recorded {
-    /// The run this process is.
-    fn own(args: Vec<OsString>) -> anyhow::Result<Recorded> {
-        let env = std::env::vars_os().filter(|(name, _)| name != RECORD).collect();
-        Ok(Recorded { args, cwd: std::env::current_dir()?, env })
-    }
-
     fn var(&self, name: &str) -> Option<&str> {
         var_in(&self.env, name)
     }
@@ -501,21 +397,11 @@ impl Recorded {
         ""
     }
 
-    /// Says why and has rustdoc make the run. The code it ended with.
-    fn to_rustdoc(&self, why: Option<&str>) -> i32 {
-        if let Some(why) = why {
-            eprintln!("ra-jit: the doctests are left to rustdoc: {why}");
-        }
-        let rustdoc = self.env.iter().find(|(name, _)| name == ENABLED).map(|(_, it)| it.clone());
-        let rustdoc = rustdoc.filter(|it| !it.is_empty()).unwrap_or_else(|| "rustdoc".into());
-        let mut rustdoc = in_place(as_asked(rustdoc), &self.cwd, &self.env);
-        match rustdoc.args(&self.args).status() {
-            Ok(status) => crate::cargo::run::exit_code(status),
-            Err(error) => {
-                eprintln!("error: rustdoc did not run: {error}");
-                1
-            }
-        }
+    /// Says why blaze does not run the examples of the run's library: they fail.
+    fn refused(&self, why: &str) -> i32 {
+        let name = self.crate_name();
+        crate::cargo::say::error(&format!("blaze does not run the doc tests of `{name}`: {why}"));
+        FAILED
     }
 
     /// Writes the run down in `dir`, under a name that sorts after those of the runs before.
@@ -539,20 +425,19 @@ impl Recorded {
     }
 }
 
-/// Says why and runs rustdoc as it was asked, ending as it does.
-fn leave_to_rustdoc(args: &[OsString], why: Option<&str>) -> ! {
-    let code = match Recorded::own(args.to_vec()) {
-        Ok(recorded) => recorded.to_rustdoc(why),
-        Err(error) => {
-            eprintln!("error: rustdoc did not run: {error}");
-            1
-        }
-    };
-    std::process::exit(code)
+/// Writes down in `dir`, for a [`Replay`], the run of rustdoc `cargo test --doc` would make of
+/// a library's examples: blaze plans the doc tests itself, and no cargo runs.
+pub(crate) fn write_run(
+    dir: &Path,
+    args: Vec<OsString>,
+    cwd: PathBuf,
+    env: Vec<(OsString, OsString)>,
+) -> anyhow::Result<()> {
+    Recorded { args, cwd, env }.write(dir)
 }
 
-/// The runs of rustdoc cargo had ra-jit write down in `dir`, and how cargo was asked to run
-/// them.
+/// The runs of rustdoc [`write_run`] wrote down in `dir`, and how `cargo blaze test` was asked
+/// to run them.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Replay {
     pub(crate) dir: PathBuf,
@@ -586,8 +471,8 @@ pub(crate) struct Libraries {
 
 impl Libraries {
     /// Loads the workspace of the first library ra-jit can test the examples of and tests
-    /// them all, ending as cargo would after them. Each is rustdoc's when the workspace does
-    /// not load.
+    /// them all, ending as cargo would after them. Each fails when the workspace does not
+    /// load.
     fn load(&self) -> anyhow::Result<()> {
         let first = self.runs.iter().find_map(|(_, asked)| asked.as_ref().ok());
         let loaded = match first {
@@ -603,7 +488,7 @@ impl Libraries {
         };
         self.remove_dirs();
         let code = self.each(|recorded, asked| {
-            recorded.to_rustdoc(Some(asked.err().or(why.as_deref()).unwrap_or_default()))
+            recorded.refused(asked.err().or(why.as_deref()).unwrap_or("its workspace did not load"))
         });
         std::process::exit(code)
     }
@@ -651,29 +536,7 @@ impl Libraries {
     }
 }
 
-/// ra-jit as rustdoc: runs the examples when that is what is asked and ra-jit can, and has
-/// rustdoc do as it was asked otherwise. Under [`RECORD`] the run is written down for
-/// [`replay`] instead.
-pub(crate) fn command(args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
-    let all: Vec<OsString> = args.collect();
-    if !all.iter().any(|it| it == "--test") {
-        leave_to_rustdoc(&all, None);
-    }
-    let recorded = match Recorded::own(all.clone()) {
-        Ok(recorded) => recorded,
-        Err(why) => leave_to_rustdoc(&all, Some(&format!("{why:#}"))),
-    };
-    if let Some(dir) = std::env::var_os(RECORD) {
-        if let Err(why) = recorded.write(Path::new(&dir)) {
-            std::process::exit(recorded.to_rustdoc(Some(&format!("{why:#}"))));
-        }
-        return Ok(());
-    }
-    let asked = Asked::read(&recorded);
-    Libraries { runs: vec![(recorded, asked)], replay: None }.load()
-}
-
-/// Makes the runs of rustdoc written down under [`RECORD`] when ra-jit is run with [`REPLAY`]:
+/// Makes the runs of rustdoc [`write_run`] wrote down when ra-jit is run with [`REPLAY`]:
 /// the examples of every library, over one load of their workspace.
 pub(crate) fn replay() -> Option<anyhow::Result<()>> {
     let mut args = std::env::args().skip(1);
@@ -753,12 +616,12 @@ fn split_attrs(list: &str) -> Vec<String> {
     attrs
 }
 
-/// How many examples' programs ra-jit built and how many rustc did, and how many of ra-jit's
-/// were taken from an earlier run.
+/// How many examples' programs ra-jit built and how many it could not, and how many of
+/// ra-jit's were taken from an earlier run.
 #[derive(Default)]
 struct Counted {
     ra_jit: AtomicUsize,
-    rustc: AtomicUsize,
+    refused: AtomicUsize,
     remembered: AtomicUsize,
 }
 
@@ -788,6 +651,9 @@ struct Test {
 enum Ours {
     /// Nothing, the example being only to compile, and rust-analyzer finds no error in it.
     Checked,
+    /// Nothing, the example being marked `compile_fail`, and rust-analyzer finds an error in
+    /// it. The error codes it names are not checked: rust-analyzer's are not all rustc's.
+    FailsToCompile,
     /// Its object and the standard library's unit, to link in `dir` with `line`. A `kept`
     /// directory is the memo's, where the program stays for the next run.
     Compiled { objects: [PathBuf; 2], dir: PathBuf, line: crate::link::Line, kept: bool },
@@ -801,7 +667,7 @@ impl Ours {
         let (objects, dir, line, kept) = match self {
             Ours::Compiled { objects, dir, line, kept } => (objects, dir, line, *kept),
             Ours::Linked(binary) => return Ok(binary.clone()),
-            Ours::Checked => anyhow::bail!("nothing to link"),
+            Ours::Checked | Ours::FailsToCompile => anyhow::bail!("nothing to link"),
         };
         let binary = dir.join("rust_out");
         let linked = line.link(&[&objects[0], &objects[1]], &binary).and_then(|_| {
@@ -878,13 +744,12 @@ impl Test {
         self.marks.ignore || self.marks.ignored_on.iter().any(|it| target.contains(it.as_str()))
     }
 
-    /// Links and runs what ra-jit built of the example, or has rustc build it in `dir` when
-    /// ra-jit built nothing or cannot link it, and runs that.
+    /// Links and runs what ra-jit built of the example. `ours` is why ra-jit built nothing,
+    /// for one it does not: the example fails with it.
     fn run(
         &self,
         asked: &Asked,
-        dir: &Path,
-        ours: Option<&Ours>,
+        ours: Result<&Ours, &str>,
         target: &str,
         counted: &Counted,
     ) -> anyhow::Result<Ended> {
@@ -892,29 +757,26 @@ impl Test {
             return Ok(Ended::Ignored);
         }
         let marks = &self.marks;
-        let linked = match ours {
-            Some(Ours::Checked) => {
+        let refused = |why: String| {
+            counted.refused.fetch_add(1, Ordering::Relaxed);
+            Ok(Ended::Failed(format!("blaze did not build the example: {why}")))
+        };
+        let binary = match ours {
+            Ok(Ours::Checked) => {
                 counted.ra_jit.fetch_add(1, Ordering::Relaxed);
                 return Ok(Ended::Passed);
             }
-            Some(ours) => ours.link().inspect_err(|why| {
-                eprintln!("ra-jit: {} is rustc's: {why:#}", self.name);
-            }),
-            None => Err(anyhow::anyhow!("not built")),
-        };
-        let binary = match linked {
-            Ok(binary) => {
+            Ok(Ours::FailsToCompile) => {
                 counted.ra_jit.fetch_add(1, Ordering::Relaxed);
-                binary
+                return Ok(Ended::Passed);
             }
-            Err(_) => {
-                counted.rustc.fetch_add(1, Ordering::Relaxed);
-                match self.compiled(asked, dir)? {
-                    Ok(binary) => binary,
-                    Err(ended) => return Ok(ended),
-                }
-            }
+            Ok(ours) => match ours.link() {
+                Ok(binary) => binary,
+                Err(why) => return refused(format!("{why:#}")),
+            },
+            Err(why) => return refused(why.to_owned()),
         };
+        counted.ra_jit.fetch_add(1, Ordering::Relaxed);
         let ran = match asked.command(&binary).current_dir(&asked.run_in).output() {
             Ok(ran) => ran,
             Err(error) => return Ok(Ended::Failed(format!("Couldn't run the test: {error}"))),
@@ -926,40 +788,6 @@ impl Test {
             ),
             (false, false) => Ended::Failed(failure(&ran)),
         })
-    }
-
-    /// Has rustc compile the example in `dir`: the program to run, or how the example ended
-    /// when there is none to.
-    fn compiled(&self, asked: &Asked, dir: &Path) -> anyhow::Result<Result<PathBuf, Ended>> {
-        let marks = &self.marks;
-        let edition = marks.edition.as_deref().unwrap_or(&asked.edition);
-        let line = self.line as i64 - self.program.lines_before as i64;
-        let env = [
-            ("UNSTABLE_RUSTDOC_TEST_PATH", self.shown_path.clone()),
-            ("UNSTABLE_RUSTDOC_TEST_LINE", line.to_string()),
-        ];
-        let runs = !marks.no_run && !marks.compile_fail;
-        let (built, made) = asked.compile(&self.program.source, dir, edition, &env, runs)?;
-        let errors = &built.stderr;
-        let ended = match (built.success, marks.compile_fail) {
-            (true, true) => Ended::Failed(
-                "Test compiled successfully, but it's marked `compile_fail`.".to_owned(),
-            ),
-            (false, false) => Ended::Failed(format!("{errors}Couldn't compile the test.")),
-            (false, true) => {
-                let missing: Vec<&String> =
-                    marks.error_codes.iter().filter(|it| !errors.contains(it.as_str())).collect();
-                match missing.is_empty() {
-                    true => Ended::Passed,
-                    false => Ended::Failed(format!(
-                        "{errors}Some expected error codes were not found: {missing:?}"
-                    )),
-                }
-            }
-            (true, false) if !runs => Ended::Passed,
-            (true, false) => return Ok(Ok(made.join("rust_out"))),
-        };
-        Ok(Err(ended))
     }
 }
 
@@ -1066,17 +894,18 @@ fn tests(db: &RootDatabase, asked: &Asked, krate: hir::Crate) -> (Vec<Test>, usi
 
 /// How an example is built.
 enum Plan {
-    /// By rustc.
-    Rustc,
+    /// Not at all, and why: it fails.
+    Refused(String),
     /// Not at all: it is only to compile, and rust-analyzer finds no error in it.
     Checked,
+    /// Not at all: it is marked `compile_fail`, and rust-analyzer finds an error in it.
+    FailsToCompile,
     /// By ra-jit, from its crate of this name.
     Ours(String),
 }
 
 /// How each of `tests` is built, by its place, and the standard library's unit the ones
-/// ra-jit builds link: by ra-jit when rust-analyzer finds no error in it, else by rustc, and
-/// why is said.
+/// ra-jit builds link: by ra-jit when rust-analyzer finds no error in it, else not, and why.
 fn plan(
     db: &mut RootDatabase,
     building: &Building<'_>,
@@ -1085,24 +914,17 @@ fn plan(
     tests: &[Test],
     target: &str,
 ) -> (Vec<Plan>, Option<PathBuf>) {
-    let mut plans: Vec<Plan> = tests.iter().map(|_| Plan::Rustc).collect();
-    let wanted: Vec<usize> = (0..tests.len())
-        .filter(|&at| !tests[at].is_ignored(target) && !tests[at].marks.compile_fail)
-        .collect();
+    let refused = |why: &str| tests.iter().map(|_| Plan::Refused(why.to_owned())).collect();
+    let wanted: Vec<usize> = (0..tests.len()).filter(|&at| !tests[at].is_ignored(target)).collect();
     if wanted.is_empty() {
-        return (plans, None);
+        return (refused("it is ignored"), None);
     }
     let unit = match crate::std_unit(db, building.table, building.args, building.listed) {
         Ok(Some(unit)) => unit,
-        Ok(None) => {
-            eprintln!("ra-jit: the examples are rustc's: the standard library is not built apart");
-            return (plans, None);
-        }
-        Err(error) => {
-            eprintln!("ra-jit: the examples are rustc's: {error:#}");
-            return (plans, None);
-        }
+        Ok(None) => return (refused("the standard library is not built apart"), None),
+        Err(error) => return (refused(&format!("{error:#}")), None),
     };
+    let mut plans: Vec<Plan> = refused("blaze could not add it to the workspace");
     let mixing = with_another_copy(db, krate);
     for (at, example) in add_crates(db, asked, krate, tests, &wanted) {
         let test = &tests[at];
@@ -1110,13 +932,19 @@ fn plan(
         let names = |name: &String| {
             source.contains(&format!("{name}::")) || source.contains(&format!("crate {name}"))
         };
+        let errors = || has_errors(db, example.root_file, denies_lints(source));
         if let Some(name) = mixing.iter().find(|it| names(it)) {
-            eprintln!(
-                "ra-jit: {} is rustc's: `{name}` links another copy of the library",
-                test.name
-            );
-        } else if has_errors(db, example.root_file, denies_lints(source)) {
-            eprintln!("ra-jit: {} is rustc's: rust-analyzer finds an error in it", test.name);
+            let why = format!("`{name}` links another copy of the library");
+            plans[at] = Plan::Refused(why);
+        } else if test.marks.compile_fail {
+            plans[at] = match errors() {
+                true => Plan::FailsToCompile,
+                false => Plan::Refused(
+                    "it is marked `compile_fail`, and blaze finds no error in it".to_owned(),
+                ),
+            };
+        } else if errors() {
+            plans[at] = Plan::Refused("rust-analyzer finds an error in it".to_owned());
         } else if test.marks.no_run {
             plans[at] = Plan::Checked;
         } else {
@@ -1126,8 +954,7 @@ fn plan(
     (plans, Some(unit))
 }
 
-/// Whether rust-analyzer finds an error of any kind in the example's file: rustc, which says
-/// what, compiles it then. An example rustc does not compile fails, and one that does not
+/// Whether rust-analyzer finds an error of any kind in the example's file: one that does not
 /// name what it uses compiles to a program that runs. Where the program denies lints, as
 /// `#![doc(test(attr(deny(warnings))))]` has it do, a warning or a use of something
 /// deprecated is one too: rustc has lints rust-analyzer does not.
@@ -1282,7 +1109,7 @@ fn add_crates(
 /// Compiles the example whose crate is `name` with everything it links over the standard
 /// library's `unit`, into an object in a directory of its own, to link with nothing of
 /// rustc's. The program ra-jit linked of it in an earlier run is taken again while what it
-/// was built from is unchanged, as rustc's are ([`Asked::key`]), and while ra-jit is.
+/// was built from is unchanged ([`Asked::key`]), and while ra-jit is.
 fn compile(
     db: &RootDatabase,
     building: &Building<'_>,
@@ -1361,7 +1188,7 @@ pub(crate) fn run_all(
     let code = libraries.each(|recorded, asked| {
         let asked = match asked {
             Ok(asked) => asked,
-            Err(why) => return recorded.to_rustdoc(Some(why)),
+            Err(why) => return recorded.refused(why),
         };
         let args = crate::Args {
             krate: asked.root_file(),
@@ -1379,7 +1206,7 @@ pub(crate) fn run_all(
         base_db::set_all_crates_with_durability(db, crates, Durability::MEDIUM);
         match ran {
             Ok(code) => code,
-            Err(why) => recorded.to_rustdoc(Some(&format!("{why:#}"))),
+            Err(why) => recorded.refused(&format!("{why:#}")),
         }
     });
     libraries.remove_dirs();
@@ -1397,8 +1224,7 @@ fn run(
 ) -> anyhow::Result<i32> {
     use ide_db::base_db::salsa::Setter as _;
     let start = Instant::now();
-    // The examples are taken out of the library as rustdoc reads it, and linked with it as
-    // rustc compiles it.
+    // The examples are taken out of the library as rustdoc reads it.
     let library: ide_db::base_db::Crate = krate.into();
     let cfg = library.cfg_options(db).clone();
     document(db, krate);
@@ -1415,10 +1241,10 @@ fn run(
     });
     let ended: Mutex<Vec<(usize, anyhow::Result<Ended>)>> = Mutex::new(Vec::new());
     let counted = Counted::default();
-    // The examples rustc builds run while ra-jit compiles its, a few at a time on snapshots
-    // of the database (a small program's build leaves most cores idle), and each of those is
-    // linked, run and removed as soon as it is compiled.
-    let (ready, next) = std::sync::mpsc::channel::<(usize, Option<Ours>)>();
+    // The examples are compiled a few at a time on snapshots of the database (a small
+    // program's build leaves most cores idle), and each is linked, run and removed as soon as
+    // it is compiled.
+    let (ready, next) = std::sync::mpsc::channel::<(usize, Result<Ours, String>)>();
     let next = Mutex::new(next);
     let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
     let threads = cores.min(tests.len());
@@ -1443,10 +1269,9 @@ fn run(
                     let job = next.lock().unwrap_or_else(|it| it.into_inner()).recv();
                     let Ok((at, ours)) = job else { break };
                     let test = &tests[at];
-                    let dir = asked.dir.join(at.to_string());
-                    let result = test.run(asked, &dir, ours.as_ref(), target, &counted);
-                    _ = std::fs::remove_dir_all(&dir);
-                    if let Some(dir) = ours.as_ref().and_then(Ours::scratch) {
+                    let result =
+                        test.run(asked, ours.as_ref().map_err(String::as_str), target, &counted);
+                    if let Some(dir) = ours.as_ref().ok().and_then(Ours::scratch) {
                         _ = std::fs::remove_dir_all(dir);
                     }
                     let mut progress = shown.lock().unwrap_or_else(|it| it.into_inner());
@@ -1458,8 +1283,9 @@ fn run(
         }
         for (at, plan) in plans.iter().enumerate() {
             match plan {
-                Plan::Rustc => _ = ready.send((at, None)),
-                Plan::Checked => _ = ready.send((at, Some(Ours::Checked))),
+                Plan::Refused(why) => _ = ready.send((at, Err(why.clone()))),
+                Plan::Checked => _ = ready.send((at, Ok(Ours::Checked))),
+                Plan::FailsToCompile => _ = ready.send((at, Ok(Ours::FailsToCompile))),
                 Plan::Ours(_) => {}
             }
         }
@@ -1474,13 +1300,10 @@ fn run(
                         let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();
                         let Some((at, name)) = job else { break };
                         let compiled = compile(&db, building, asked, &tests[at], name, unit);
-                        let compiled = compiled.inspect_err(|why| {
-                            eprintln!("ra-jit: {} is rustc's: {why:#}", tests[at].name);
-                        });
                         if let Ok(Ours::Linked(_)) = &compiled {
                             counted.remembered.fetch_add(1, Ordering::Relaxed);
                         }
-                        _ = ready.send((at, compiled.ok()));
+                        _ = ready.send((at, compiled.map_err(|why| format!("{why:#}"))));
                     }
                 })
             })
@@ -1497,9 +1320,9 @@ fn run(
         n => format!(" ({n} unchanged since the last run)"),
     };
     eprintln!(
-        "doctests: {} built by ra-jit, {} by rustc; compiling took {compiling:.1?}{remembered}",
+        "doctests: {} built by ra-jit, {} not built; compiling took {compiling:.1?}{remembered}",
         counted.ra_jit.load(Ordering::Relaxed),
-        counted.rustc.load(Ordering::Relaxed),
+        counted.refused.load(Ordering::Relaxed),
     );
     let mut ended = ended.into_inner().unwrap_or_else(|it| it.into_inner());
     ended.sort_by_key(|(at, _)| *at);

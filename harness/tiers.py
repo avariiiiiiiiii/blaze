@@ -36,6 +36,7 @@ BUILD_TIMEOUT = 900
 RUN_SECONDS = int(os.environ.get("TIERS_SECONDS", "30"))
 LEVEL_TIMEOUT = 20
 SIZE = os.environ.get("TIERS_SIZE", "160")
+PIN = (HERE / "toolchain").read_text().strip()
 
 
 class StepError(Exception):
@@ -154,7 +155,7 @@ async def main() -> None:
         shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
-        base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN="1.99.0")
+        base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=PIN)
         for name in ("CARGO_INCREMENTAL", "RA_JIT_TIER", "RA_JIT_BACKEND", "RA_JIT_OPT"):
             base.pop(name, None)
 

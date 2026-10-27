@@ -21,6 +21,7 @@ serde_derive.workspace = true
 serde_json.workspace = true
 semver = { workspace = true, features = ["serde"] }
 url.workspace = true
+percent-encoding = "2"
 # The parser cargo 1.99 parses a dependency's `target` with: the same crate and version.
 cargo-platform = "0.3.3"
 # The hasher cargo names a source's directories with.

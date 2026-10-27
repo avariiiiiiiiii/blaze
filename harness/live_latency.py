@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Save-to-running latency of live edits (macOS on AArch64), step by step.
+"""Save-to-running latency of live edits (macOS on AArch64, Windows on x86-64), step by step.
 
 usage: live_latency.py [--program probe|life|bevy|egui] [cargo|socket|burst|replay|restart ...]
        (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are found next to it)
@@ -108,6 +108,8 @@ BURSTS = int(os.environ.get("LATENCY_BURSTS", "3"))
 ROUNDS = int(os.environ.get("LATENCY_ROUNDS", "1"))
 REPLY_TIMEOUT = 60
 COLUMNS = ["to-worker", "worker", "delivery", "wait", "apply", "total", "reply"]
+# What an executable's name ends with where cargo writes it.
+EXE = ".exe" if os.name == "nt" else ""
 
 # A replay script: what the caret and the keys do, in order. ("at", s) puts the caret after
 # `s`, which the text has once; ("cut", s) selects `s` and deletes it, one key; ("type", s)
@@ -317,17 +319,59 @@ def escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
 
 
+def ask_edit_winsock(socket: Path, line: bytes) -> str:
+    """`ask_edit`'s exchange through Winsock's AF_UNIX, which Python's socket module has not on
+    Windows."""
+    import ctypes
+
+    ws2 = ctypes.WinDLL("ws2_32")
+    ws2.socket.restype = ctypes.c_size_t
+    ws2.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    ws2.connect.argtypes = [ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int]
+    ws2.send.argtypes = [ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    ws2.recv.argtypes = [ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    ws2.closesocket.argtypes = [ctypes.c_size_t]
+    if ws2.WSAStartup(0x202, ctypes.create_string_buffer(512)) != 0:
+        raise OSError("WSAStartup failed")
+    fd = ws2.socket(1, 1, 0)  # AF_UNIX, SOCK_STREAM
+    if fd == ctypes.c_size_t(-1).value:
+        raise OSError(f"socket: WSA error {ws2.WSAGetLastError()}")
+    try:
+        name = str(socket).encode()
+        address = (1).to_bytes(2, "little") + name + bytes(108 - len(name))
+        if ws2.connect(fd, address, len(address)) != 0:
+            raise OSError(f"connect {socket}: WSA error {ws2.WSAGetLastError()}")
+        while line:
+            sent = ws2.send(fd, line, len(line), 0)
+            if sent < 0:
+                raise OSError(f"send: WSA error {ws2.WSAGetLastError()}")
+            line = line[sent:]
+        reply, buffer = b"", ctypes.create_string_buffer(1 << 16)
+        while not reply.endswith(b"\n"):
+            got = ws2.recv(fd, buffer, len(buffer), 0)
+            if got <= 0:
+                break
+            reply += buffer.raw[:got]
+    finally:
+        ws2.closesocket(fd)
+    return reply.decode(errors="replace").strip()
+
+
 async def ask_edit(path: Path, text: str) -> str:
     """What the demo's editor does on each edit: the whole text, on one line, to the daemon.
     The answer as it came: `ok ...`, or `error: ...` for text that does not build."""
     socket = daemon_home() / "daemon.sock"
+    line = f"edit\t{escape(str(path))}\t{escape(text)}\n".encode()
     try:
         async with asyncio.timeout(REPLY_TIMEOUT):
-            reader, writer = await asyncio.open_unix_connection(str(socket))
-            writer.write(f"edit\t{path}\t{escape(text)}\n".encode())
-            await writer.drain()
-            reply = (await reader.readline()).decode(errors="replace").strip()
-            writer.close()
+            if os.name == "nt":
+                reply = await asyncio.to_thread(ask_edit_winsock, socket, line)
+            else:
+                reader, writer = await asyncio.open_unix_connection(str(socket))
+                writer.write(line)
+                await writer.drain()
+                reply = (await reader.readline()).decode(errors="replace").strip()
+                writer.close()
     except TimeoutError:
         raise StepError(f"send edit: no reply from {socket} in {REPLY_TIMEOUT}s") from None
     return reply
@@ -912,7 +956,7 @@ async def session(program: Program, live: list[Launched], env: dict[str, str], p
     """The program's session, an edit at a time: how each was taken, and the restarts (and
     the refused edits, which a launcher restarts too) timed against cargo's build and start
     of the same source."""
-    plain_binary = Path(plain_env["CARGO_TARGET_DIR"]) / "debug" / program.binary
+    plain_binary = Path(plain_env["CARGO_TARGET_DIR"]) / "debug" / (program.binary + EXE)
     print("restart: plain cargo builds the program once, untimed")
     await plain_build("plain cargo, first build", program.project, plain_env)
     edits, restarts, cargo_runs = [], [], []
@@ -1056,7 +1100,7 @@ async def main(program_name: str, modes: list[str]) -> None:
         program.source.write_text(program.edited(program.source.read_text(), program.value, program.value + 1))
         program.value += 1
         await build("edit before start", program.project, env)
-        binary = target / "debug" / program.binary
+        binary = target / "debug" / (program.binary + EXE)
         print(f"{program.name}: {binary.stat().st_size / 1e6:.1f} MB executable, {len(program.source.read_text().splitlines())}-line {program.source.name}")
         live.append(await launch(program, binary, env))
 

@@ -369,6 +369,20 @@ impl MemoHeader {
         cancellation_count: u8,
         has_value: bool,
     ) -> Option<PreviousIteration> {
+        // A memo whose value an LRU evicted is verified in this revision without a value when
+        // a query that depends on it deep-verified it here, or when it was evicted in this
+        // revision (`trigger_lru_eviction`), where only a cancellation count that wrapped
+        // round told it apart before. It is not a cycle head that panicked:
+        // the memo a panic leaves (`PoisonProvisionalIfPanicking`) is provisional and is its own
+        // cycle head, where an evicted memo is final. It comes from an earlier revision, so it is
+        // kept as the old memo for output bookkeeping, as one verified earlier would be.
+        if !has_value && !self.cycle_heads().contains(&database_key_index) {
+            return Some(PreviousIteration {
+                iteration: IterationStamp::initial(cancellation_count),
+                reuse_as_provisional: false,
+            });
+        }
+
         if self.revisions.iteration().cancellation_count() != cancellation_count {
             return None;
         }

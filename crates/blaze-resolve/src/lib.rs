@@ -24,14 +24,18 @@ mod edit_distance;
 mod graph;
 mod interning;
 pub mod lockfile;
+pub mod metadata;
 mod names;
 mod package_id;
 mod package_id_spec;
+mod poll;
 mod registry;
 mod resolve;
+pub mod resolver;
 mod source_id;
 mod summary;
 mod version;
+pub mod workspace_resolve;
 
 pub use dependency::{DepKind, Dependency};
 pub use edit_distance::{closest, closest_msg, edit_distance};

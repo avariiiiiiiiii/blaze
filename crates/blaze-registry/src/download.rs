@@ -258,11 +258,8 @@ fn is_unpacked(dst: &Path) -> anyhow::Result<bool> {
 pub fn unpack_package(tarball: &[u8], dst: &Path) -> anyhow::Result<u64> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("failed to create `{}`", dst.display()))?;
-    let written = unpack(tarball, dst)?;
-    for file in ["Cargo.lock", "Cargo.toml", ".cargo_vcs_info.json"] {
-        let time = filetime::FileTime::from_unix_time(DETERMINISTIC_TIMESTAMP, 0);
-        _ = filetime::set_file_mtime(dst.join(file), time);
-    }
+    let written = unpack(tarball, dst, &|_| true)?;
+    set_generated_mtimes(dst);
     let path = dst.join(PACKAGE_SOURCE_LOCK);
     let mut ok = OpenOptions::new()
         .create_new(true)
@@ -274,9 +271,32 @@ pub fn unpack_package(tarball: &[u8], dst: &Path) -> anyhow::Result<u64> {
     Ok(written)
 }
 
+/// Unpacks a `.crate` into `dst`, which is named `<name>-<version>`, with only the files
+/// `include` takes by their path in the package, and no mark that it is unpacked: what
+/// `cargo vendor` writes (cargo's `unpack_package_in`).
+pub fn unpack_package_in(
+    tarball: &[u8],
+    dst: &Path,
+    include: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<u64> {
+    let written = unpack(tarball, dst, include)?;
+    set_generated_mtimes(dst);
+    Ok(written)
+}
+
+/// The files `cargo package` writes, given one time whatever the tarball says
+/// (rust-lang/cargo#16237).
+fn set_generated_mtimes(dst: &Path) {
+    for file in ["Cargo.lock", "Cargo.toml", ".cargo_vcs_info.json"] {
+        let time = filetime::FileTime::from_unix_time(DETERMINISTIC_TIMESTAMP, 0);
+        _ = filetime::set_file_mtime(dst.join(file), time);
+    }
+}
+
 /// Unpacks a tarball whose every entry is under `<name>-<version>/`, files and directories
-/// only, into the directory above `dst`, with no more than cargo lets one unpack to.
-fn unpack(tarball: &[u8], dst: &Path) -> anyhow::Result<u64> {
+/// only, into the directory above `dst`, with no more than cargo lets one unpack to, but for
+/// the entries `include` leaves out.
+fn unpack(tarball: &[u8], dst: &Path, include: &dyn Fn(&Path) -> bool) -> anyhow::Result<u64> {
     let limit = MAX_UNPACK_SIZE.max(tarball.len() as u64 * MAX_COMPRESSION_RATIO);
     let gz = flate2::read::GzDecoder::new(tarball);
     let mut tar = Archive::new(LimitErrorReader { inner: gz, left: limit });
@@ -288,10 +308,12 @@ fn unpack(tarball: &[u8], dst: &Path) -> anyhow::Result<u64> {
     for entry in tar.entries()? {
         let mut entry = entry.context("failed to iterate over archive")?;
         let entry_path = entry.path().context("failed to read entry path")?.into_owned();
-        if entry_path.strip_prefix(prefix).is_err() {
-            bail!(
+        match entry_path.strip_prefix(prefix) {
+            Ok(inside) if !include(inside) => continue,
+            Ok(_) => {}
+            Err(_) => bail!(
                 "invalid tarball downloaded, contains a file at {entry_path:?} which isn't under {prefix:?}"
-            );
+            ),
         }
         match entry.header().entry_type() {
             EntryType::Regular | EntryType::Directory => {}

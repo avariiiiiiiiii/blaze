@@ -1,5 +1,5 @@
 //! The `main` of a test executable, as rustc's `--test` writes it: a description of each
-//! `#[test]` and `#[bench]` of the crate for libtest, and `test_main_static` over them. ra-jit adds it to
+//! `#[test]` and `#[bench]` of the crate for libtest, and `test_main_env_args` over them. ra-jit adds it to
 //! the root file of a crate it builds with `cfg(test)`, as a module of its own, and the
 //! program starts there instead of in rustc's: a test added, removed or marked otherwise is
 //! a build like another.
@@ -205,17 +205,14 @@ fn text(tests: &[Test], test_type: &str, tested: bool) -> String {
     text.push_str("#[doc(hidden)]\n#[allow(warnings, clippy::all)]\npub mod ");
     text.push_str(MODULE);
     text.push_str(
-        " {\n    extern crate test;\n\n    pub fn main() {\n        \
+        " {\n    extern crate test;\n\n    pub fn main() -> test::ExitCode {\n        \
          const TESTS: &[&test::TestDescAndFn] = &[",
     );
     for at in 0..tests.len() {
         _ = write!(text, "&T{at}, ");
     }
-    text.push_str(
-        "];\n        if !sandbox::ran(TESTS) {\n            test::test_main_static(TESTS)\n        \
-         }\n    }\n",
-    );
-    text.push_str(SANDBOX);
+    text.push_str("];\n        test::test_main_env_args(TESTS)\n    }\n");
+    text.push_str(MARKED);
     for (at, test) in tests.iter().enumerate() {
         let name = test.path.join("::");
         let ignore_message = match &test.ignore_message {
@@ -228,6 +225,7 @@ fn text(tests: &[Test], test_type: &str, tested: bool) -> String {
             ShouldPanic::WithMessage(it) => format!("YesWithMessage({it:?})"),
         };
         let ((start_line, start_col), (end_line, end_col)) = (test.start, test.end);
+        let mark = nul_ended(&format!("{}{name}", crate::sandbox::MARK));
         _ = write!(
             text,
             "\n    const T{at}: test::TestDescAndFn = test::TestDescAndFn {{\n        \
@@ -250,10 +248,14 @@ fn text(tests: &[Test], test_type: &str, tested: bool) -> String {
             ignore = test.ignore,
             file = test.file,
             testfn = match test.bench {
-                true =>
-                    format!("test::StaticBenchFn(|b| test::assert_test_result(crate::{name}(b)))"),
-                false =>
-                    format!("test::StaticTestFn(|| test::assert_test_result(crate::{name}()))"),
+                true => format!(
+                    "test::StaticBenchFn(|b| {{ let _marked = marked::Marked::on({mark}); \
+                     test::assert_test_result(crate::{name}(b)) }})"
+                ),
+                false => format!(
+                    "test::StaticTestFn(|| {{ let _marked = marked::Marked::on({mark}); \
+                     test::assert_test_result(crate::{name}()) }})"
+                ),
             },
         );
     }
@@ -261,236 +263,54 @@ fn text(tests: &[Test], test_type: &str, tested: bool) -> String {
     text
 }
 
-/// The variable `cargo ra-jit test` names a file in for the harness to run tests each in a
-/// sandbox of its own. Its first line is the command that runs a program in one, by its
-/// arguments joined by tabs, which the harness gives its own executable after; each line after
-/// it is the name of a test to run there ([`crate::cargo::sandboxed`]).
-pub(crate) const SANDBOXED: &str = "RA_JIT_TEST_SANDBOX";
+/// What gives the sandbox the test a thread runs ([`crate::sandbox::MARK`]): each test is
+/// called between `Marked::on` with its marker and the end of what that returns, on its
+/// thread, which look up the marker and the marker with no name (an unwinding test's too).
+/// Outside a sandbox each is one `access` that finds nothing.
+const MARKED: &str = r#"
+    mod marked {
+        pub struct Marked;
 
-/// The part of the harness that runs a test in a process of its own, in a sandbox. libtest
-/// runs in the program `cargo ra-jit test` started, as it does without one: it picks the
-/// tests, runs them on its threads, judges `#[should_panic]`, keeps their output and prints
-/// it. A test the file of [`SANDBOXED`] names is a function there that runs the program
-/// again through the sandbox's command, told the test by [`crate::sandbox::RUN`]; that
-/// process runs the test alone as libtest would, on a thread with its name and its output
-/// kept, and writes on descriptor 3 how it ended and what it printed, which the function
-/// gives libtest as its own. A test that ends its process, or crashes it, ends the program
-/// the same way, as it would have without the sandbox.
-const SANDBOX: &str = r#"
-    #[cfg(not(unix))]
-    mod sandbox {
-        pub fn ran(_: &[&super::test::TestDescAndFn]) -> bool {
-            false
-        }
-    }
-
-    #[cfg(unix)]
-    mod sandbox {
-        use super::test;
-        use ::std::io::{Read as _, Write as _};
-        use ::std::os::unix::io::{AsRawFd as _, FromRawFd as _};
-        use ::std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-
-        unsafe extern "C" {
-            fn dup(fd: i32) -> i32;
-            fn dup2(fd: i32, to: i32) -> i32;
-            fn close(fd: i32) -> i32;
-        }
-
-        const SPEC: &str = "RA_JIT_TEST_SANDBOX";
-        const ONE: &str = "__RA_JIT_TEST";
-        const CAPTURE: &str = "__RA_JIT_TEST_CAPTURE";
-
-        pub fn ran(tests: &[&test::TestDescAndFn]) -> bool {
-            if let Some(name) = ::std::env::var_os(ONE) {
-                one(tests, &name.to_string_lossy());
-            }
-            let Some(spec) = ::std::env::var_os(SPEC) else { return false };
-            unsafe { ::std::env::remove_var(SPEC) };
-            let text = ::std::fs::read_to_string(&spec).unwrap_or_default();
-            let mut lines = text.lines();
-            let command: ::std::vec::Vec<::std::string::String> = lines
-                .next()
-                .unwrap_or_default()
-                .split('\t')
-                .filter(|it| !it.is_empty())
-                .map(::std::string::String::from)
-                .collect();
-            let apart: ::std::collections::HashSet<&str> = lines.collect();
-            let exe = ::std::env::current_exe().ok().filter(|_| !command.is_empty());
-            let owned = tests
-                .iter()
-                .map(|it| {
-                    let desc = it.desc.clone();
-                    let run = match it.testfn {
-                        test::StaticTestFn(run) => run,
-                        _ => unreachable!(),
-                    };
-                    let name = desc.name.as_slice().to_owned();
-                    match &exe {
-                        Some(exe) if apart.contains(name.as_str()) => {
-                            let (command, exe) = (command.clone(), exe.clone());
-                            let testfn = test::DynTestFn(::std::boxed::Box::new(move || {
-                                apart_run(&command, &exe, &name)
-                            }));
-                            test::TestDescAndFn { desc, testfn }
-                        }
-                        _ => test::TestDescAndFn { desc, testfn: test::StaticTestFn(run) },
-                    }
-                })
-                .collect();
-            let args: ::std::vec::Vec<::std::string::String> = ::std::env::args().collect();
-            test::test_main(&args, owned, None);
-            true
-        }
-
-        fn apart_run(
-            command: &[::std::string::String],
-            exe: &::std::path::Path,
-            name: &str,
-        ) -> ::std::result::Result<(), ::std::string::String> {
-            let (mut said, to) = ::std::io::pipe().map_err(|it| it.to_string())?;
-            let mut run = ::std::process::Command::new(&command[0]);
-            run.args(&command[1..]).arg(exe).env(ONE, name);
-            // libtest keeps what a test prints on its thread unless told not to.
-            let capture = ::std::io::set_output_capture(None);
-            ::std::io::set_output_capture(capture.clone());
-            if capture.is_some() {
-                run.env(CAPTURE, "1");
-            }
-            let fd = to.as_raw_fd();
-            unsafe {
-                run.pre_exec(move || {
-                    let done = match fd {
-                        3 => {
-                            let copy = dup(3);
-                            let done = dup2(copy, 3);
-                            close(copy);
-                            done
-                        }
-                        _ => dup2(fd, 3),
-                    };
-                    match done < 0 {
-                        true => Err(::std::io::Error::last_os_error()),
-                        false => Ok(()),
-                    }
-                });
-            }
-            let mut child = run.spawn().map_err(|it| format!("the test's sandbox did not start: {it}"))?;
-            drop(run);
-            drop(to);
-            let mut bytes = ::std::vec::Vec::new();
-            _ = said.read_to_end(&mut bytes);
-            let status = child.wait().map_err(|it| it.to_string())?;
-            let mut rest = &bytes[..];
-            let ended = take_byte(&mut rest);
-            let (message, string) = match ended {
-                Some(b'e') => (take(&mut rest), true),
-                Some(b'p') => {
-                    let string = take_byte(&mut rest) == Some(1);
-                    (take(&mut rest), string)
-                }
-                _ => (None, false),
-            };
-            if let Some(sink) = &capture {
-                sink.lock().unwrap_or_else(|it| it.into_inner()).extend_from_slice(rest);
-            }
-            let message = message.map(|it| ::std::string::String::from_utf8_lossy(&it).into_owned());
-            match (ended, message) {
-                (Some(b'o'), _) => Ok(()),
-                (Some(b'e'), Some(message)) => Err(message),
-                (Some(b'p'), Some(message)) if string => ::std::panic::resume_unwind(::std::boxed::Box::new(message)),
-                (Some(b'p'), _) => ::std::panic::resume_unwind(::std::boxed::Box::new(())),
-                _ => {
-                    let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-                    ::std::process::exit(code)
-                }
+        impl Marked {
+            pub fn on(mark: &'static [u8]) -> Marked {
+                look(mark);
+                Marked
             }
         }
 
-        fn take_byte(from: &mut &[u8]) -> ::std::option::Option<u8> {
-            let (&first, rest) = from.split_first()?;
-            *from = rest;
-            Some(first)
-        }
-
-        fn take(from: &mut &[u8]) -> ::std::option::Option<::std::vec::Vec<u8>> {
-            let at = from.get(..4)?;
-            let len = u32::from_le_bytes([at[0], at[1], at[2], at[3]]) as usize;
-            let bytes = from.get(4..4 + len)?.to_vec();
-            *from = &from[4 + len..];
-            Some(bytes)
-        }
-
-        fn put(to: &mut ::std::vec::Vec<u8>, bytes: &[u8]) {
-            to.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            to.extend_from_slice(bytes);
-        }
-
-        fn one(tests: &[&test::TestDescAndFn], name: &str) -> ! {
-            let capture = ::std::env::var_os(CAPTURE).is_some();
-            unsafe {
-                ::std::env::remove_var(ONE);
-                ::std::env::remove_var(CAPTURE);
+        impl ::core::ops::Drop for Marked {
+            fn drop(&mut self) {
+                look(b"/.ra-jit-test/\0")
             }
-            // A copy that what the test starts does not get: descriptor 3 is closed.
-            let three = unsafe { ::std::fs::File::from_raw_fd(3) };
-            let to = three.try_clone();
-            drop(three);
-            let Ok(mut to) = to else { ::std::process::exit(101) };
-            let found = tests.iter().find(|it| it.desc.name.as_slice() == name);
-            let Some(run) = found.and_then(|it| match it.testfn {
-                test::StaticTestFn(run) => Some(run),
-                _ => None,
-            }) else {
-                eprintln!("ra-jit: no test is named {name:?}");
-                ::std::process::exit(101)
-            };
-            let sink = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::vec::Vec::new()));
-            let kept = sink.clone();
-            let ended = ::std::thread::Builder::new()
-                .name(name.to_owned())
-                .spawn(move || {
-                    if capture {
-                        ::std::io::set_output_capture(Some(kept));
-                    }
-                    __rust_begin_short_backtrace(run)
-                })
-                .map(|it| it.join());
-            let mut said = ::std::vec::Vec::new();
-            match ended {
-                Ok(Ok(Ok(()))) => said.push(b'o'),
-                Ok(Ok(Err(message))) => {
-                    said.push(b'e');
-                    put(&mut said, message.as_bytes());
-                }
-                Ok(Err(payload)) => {
-                    said.push(b'p');
-                    let text = payload
-                        .downcast_ref::<::std::string::String>()
-                        .cloned()
-                        .or_else(|| payload.downcast_ref::<&str>().map(|it| it.to_string()));
-                    said.push(text.is_some() as u8);
-                    put(&mut said, text.unwrap_or_default().as_bytes());
-                }
-                Err(error) => {
-                    said.push(b'e');
-                    put(&mut said, error.to_string().as_bytes());
-                }
-            }
-            said.extend_from_slice(&sink.lock().unwrap_or_else(|it| it.into_inner()));
-            _ = to.write_all(&said);
-            ::std::process::exit(0)
         }
 
-        // The frame libtest's is, below which a short backtrace leaves frames out.
-        #[inline(never)]
-        fn __rust_begin_short_backtrace<T, F: FnOnce() -> T>(f: F) -> T {
-            let result = f();
-            ::std::hint::black_box(result)
+        #[cfg(unix)]
+        fn look(path: &[u8]) {
+            unsafe extern "C" {
+                fn access(path: *const ::core::ffi::c_char, mode: ::core::ffi::c_int) -> ::core::ffi::c_int;
+            }
+            // SAFETY: `path` ends with a nul.
+            unsafe { access(path.as_ptr().cast(), 0) };
         }
+
+        #[cfg(not(unix))]
+        fn look(_: &[u8]) {}
     }
 "#;
+
+/// `text` as a byte string literal with a nul at its end, which every edition reads.
+fn nul_ended(text: &str) -> String {
+    let mut out = String::from("b\"");
+    for &byte in text.as_bytes() {
+        match byte {
+            b'"' | b'\\' => out.extend(['\\', byte as char]),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push_str("\\0\"");
+    out
+}
 
 /// The value of a string literal.
 fn string_of(expr: &ast::Expr) -> Option<String> {

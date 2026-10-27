@@ -38,10 +38,10 @@ fork VM".
   (**read**): 165,752 per-function lookups at a gRPC unary median of 112 us is 18.6 s serial,
   against about ten pack fetches for the same 64 MB (**unverified** arithmetic). REAPI stays an edge
   adapter for teams with a Bazel cache ([#226](https://github.com/indexable-inc/ra-jit/issues/226), P3); no `Execution`.
-- **Sandbox: `ra-jit sandbox` per test** ([#257](https://github.com/indexable-inc/ra-jit/issues/257),
-  [PR #263](https://github.com/indexable-inc/ra-jit/pull/263)): user, mount, network, IPC and
-  PID namespaces, read-only mounts, overlays, seccomp-notify recording of every path the test
-  touches; about 16 ms per sandboxed process (**reported**). The fork is the boundary around
+- **Sandbox: `ra-jit sandbox` per test executable** ([#257](https://github.com/indexable-inc/ra-jit/issues/257)):
+  every test, by default; user, mount, network, IPC and PID namespaces, read-only mounts,
+  overlays, seccomp-notify recording of every path each test touches, by test; about 8 ms per
+  executable on Linux x86-64 (**measured**, [cargo.md](cargo.md#every-test-runs-in-a-sandbox)). The fork is the boundary around
   the whole job. A VM fork per test is 100 times dearer and capped by account quotas; the cheap
   copy-on-write fork per test is a process fork from a loaded test program (**unverified**,
   estimated 1 to 5 ms).
@@ -362,7 +362,8 @@ The numbers that decide it:
 - **Remote execution.** A function compiles in milliseconds, so an `Execute` per function loses to
   compiling it (#226 says the same). An `Execute` per test needs the action, the command and every
   input `Directory` in the CAS first (**read**, proto) and a worker that materializes the test
-  program; the sandbox runs the test against the program already in the page cache in about 16 ms.
+  program; the sandbox runs the test executable against the program already in the page cache
+  in about 8 ms.
   ix measured that more width than one big box buys about 5% for its own CI (**reported**).
 
 So: no RPC inside the fork, ix's fork between the seed and its forks, and the existing pack remote
@@ -384,11 +385,13 @@ workspace and target directory under overlayfs with a private upper layer; fresh
 `/var/tmp` and `/dev/shm`; loopback only; a seccomp user-notification filter on every
 path-taking syscall whose supervisor, outside the sandbox, records each path and its digest when
 the test ends. ra-jit writes the test harness ([#88](https://github.com/indexable-inc/ra-jit/issues/88)),
-so the harness runs a sandboxed test as a child and replays its verdict to libtest. Its measured
-cost is about 16 ms per sandboxed process on Linux x86-64 (354 ms for 20 runs of `true` sandboxed,
-26 ms bare: **reported**). Phase 1 sandboxes the tests that reach outside their code; phase 2
-sandboxes every test. The runner wants phase 2: ripgrep's 1,098 tests at 16 ms is 17.6 s of CPU,
-under 0.2 s of wall time on 100 vCPUs (**unverified** arithmetic).
+so the harness marks, on each thread, which test it is running, and the supervisor files each
+path under that test. Every test runs sandboxed, by default, one sandbox per test executable
+with libtest's threads inside: a launch costs about 8 ms on Linux x86-64 (9 ms recording reads),
+and a 600-test library's test phase 37 ms sandboxed against 18 ms bare, where a sandbox per
+test cost ten times as much (**measured**, `harness/sandboxbench.py`;
+[cargo.md](cargo.md#every-test-runs-in-a-sandbox)). macOS has the same sandbox from Seatbelt
+and an interposer.
 
 Build scripts and proc macros go through the same `ra-jit sandbox`
 ([#147](https://github.com/indexable-inc/ra-jit/issues/147)), with what they read recorded into
@@ -399,7 +402,7 @@ their keys the same way.
 | primitive | per test | what it gives | use |
 |---|---|---|---|
 | a thread in libtest's process | about 0 | nothing beyond Rust's own rules | not in CI |
-| `ra-jit sandbox`: exec under namespaces and seccomp-notify | about 16 ms (reported) | a private file system view, no network, recorded inputs | phase 1 and 2 |
+| `ra-jit sandbox`: exec under namespaces and seccomp-notify, one per test executable | about 8 ms a launch, shared by its tests (measured) | a private file system view, no network, recorded inputs by test | every test, the default |
 | process fork from a loaded test program, into new namespaces | about 1 to 5 ms (unverified) | the same, with the program's loaded memory shared copy-on-write | a follow-up to #257 |
 | an ix VM fork per test | 250 ms at the worker to 1.7 s or more (reported) | its own kernel | tests that need root, KVM (x86 only) or kernel state; shards |
 
@@ -409,8 +412,9 @@ program, which ra-jit links and whose harness ra-jit writes, starts once, loads,
 starting any thread forks a child per test with `clone3` into fresh namespaces (pre-made network
 namespaces from a pool, since making one costs more than the rest, **unverified**). The child
 shares the parent's loaded pages copy-on-write and skips exec and dynamic loading, which is most of
-the 16 ms (**unverified**). The overlay's upper layer is the file system's copy-on-write of the
-workspace. This is worth measuring after #257's phase 2, not before.
+the 8 ms (**unverified**). The overlay's upper layer is the file system's copy-on-write of the
+workspace. With one sandbox per test executable, this matters only for a test that must be
+alone in its process.
 
 The fork itself is the sandbox around the whole job: a pull request's code runs only in a
 throwaway kernel with no credentials but a job-scoped token, and nothing it writes outlives the

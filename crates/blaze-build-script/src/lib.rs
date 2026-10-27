@@ -1,6 +1,6 @@
 //! Build scripts run as cargo 1.99 runs them, with nothing of cargo's: the environment a
-//! script is given ([`env`]), what it prints read as cargo reads it ([`output`]) and who
-//! receives what ([`apply`]), for blaze to run the scripts it compiles without cargo (no-rustc
+//! script is given ([`env`]), the run itself ([`run`]), what it prints read as cargo reads it
+//! ([`output`]) and who receives what ([`apply`]), for blaze to run the scripts it compiles without cargo (no-rustc
 //! step I, [#89]) and in its sandbox ([#147]).
 //!
 //! What a run is made from is a plain description ([`unit::Unit`]) that blaze's manifest
@@ -13,6 +13,7 @@
 pub mod apply;
 pub mod env;
 pub mod output;
+pub mod run;
 pub mod unit;
 
 pub use env::{Env, env, envify};

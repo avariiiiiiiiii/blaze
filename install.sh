@@ -22,7 +22,8 @@
 set -eu
 
 REPO="${BLAZE_REPO:-indexable-inc/blaze}"
-TOOLCHAIN="1.99.0"
+# harness/toolchain; harness/toolchain_bump.py writes it
+TOOLCHAIN="nightly-2026-10-25"
 VERSION="${BLAZE_VERSION:-}"
 NO_TOOLCHAIN="${BLAZE_NO_TOOLCHAIN:-}"
 ARCHIVE="${BLAZE_ARCHIVE:-}"
@@ -82,6 +83,21 @@ case "$os" in
             fail "blaze's Linux builds need glibc, and this system uses musl (Alpine?)." \
                 "A glibc-based distribution (Debian, Ubuntu, Fedora, ...) or a container of one works."
         fi
+        # The newest glibc blaze's Linux builds ask for (GLIBC in .github/scripts/build_release.py).
+        glibc_floor=34
+        glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc //p')
+        glibc_major=${glibc%%.*}
+        glibc_minor=${glibc#*.}
+        glibc_minor=${glibc_minor%%.*}
+        case "$glibc_major.$glibc_minor" in
+            *[!0-9.]* | .* | *.) ;;
+            *)
+                if [ "$glibc_major" -lt 2 ] || { [ "$glibc_major" -eq 2 ] && [ "$glibc_minor" -lt "$glibc_floor" ]; }; then
+                    fail "blaze's Linux builds need glibc 2.$glibc_floor or newer, and this system has glibc $glibc." \
+                        "RHEL 9, Debian 12, Ubuntu 22.04 and newer have it, as does a container of one."
+                fi
+                ;;
+        esac
         ;;
     MINGW* | MSYS* | CYGWIN* | Windows_NT)
         fail "this installer is for macOS and Linux." "On Windows, install with: cargo +$TOOLCHAIN install --locked cargo-blaze"

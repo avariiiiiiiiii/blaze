@@ -60,21 +60,123 @@ In the splice and in a live patch, a call or an address taken of a function the 
 already has goes to its original entry, never to a copy a previous splice appended. The entry
 is where the jump is written, so a later edit of that function reaches every caller.
 
+## Statics
+
+A program the daemon links mixes its code with rustc's: functions it left to rustc, rustc's
+copies of instances it could not compile (which callers of ours call instead), and rustc's
+allocator shim with the `#[global_allocator]` inlined into it. A static with state has to be
+one object for both, or each half reads its own copy: a thread-local that rustc's code sets
+reads as never set in ours, and a counter the allocator bumps reads zero. So:
+
+- a thread-local, or a static written at run time, stays rustc's wherever rustc linked it
+  under a symbol, as long as its first value is the one rustc gave it. The daemon keeps that
+  value (`patch::RustcValues`), taken the first time a build asks, when no edit since the
+  daemon started can have reached any crate the static's crate is or depends on (an edit of
+  function bodies alone changes no first value), and a patch's base records which copy it
+  has, which its patches keep.
+  An edit to the first value of a shared static is not a patch: rustc's copy holds what the
+  program wrote from the old value, and no copy beside it can start from the new one. The
+  build is in full, the program is told to restart, and the full build has its own copy with
+  the new value, which rustc's code does not share until cargo builds again (`harness/stress.py`
+  steps 58 and 84, `harness/splices.py` "a thread-local's initial value"). A static whose
+  value rustc's copy can't be told for (one an edit reached before the daemon first asked) is
+  ours, as before. Not yet handled: one ours can't replace (`#[no_mangle]`, `#[export_name]`,
+  or one a function left to rustc refers to) stays rustc's after an edit to its first value,
+  in the full build too, with the old value, as any such static of rustc's does;
+- a static rustc keeps to the one codegen unit whose code uses it (rustc internalises it) has
+  no symbol of the name rustc gave it, and at opt-level 1 and up LLVM renames it as it
+  optimizes: its global optimizer splits a static of one field into that field (`SERVING` in
+  rgb's client became `SERVING.0`), and ThinLTO gives one another unit uses `.llvm.<hash>`. The
+  code rustc inlined it into is anywhere in the crate, so rustc's copy is the program's even
+  where every function that names it is ours. `symbols::StaticCopy` reads such copies from
+  rustc's objects (a symbol of Rust's in a section the program writes, local or with a suffix
+  after the name rustc gave it) and shares one where it is the whole static: under the name
+  LLVM gave it, or `.N` alone where the object says the part is the whole (an ELF symbol by its
+  size, a Mach-O one by its debug information's place for the variable: one address and no
+  `DW_OP_piece`). On Apple's linker the copies of rustc's objects (`weaken.rs`) make a symbol
+  of a static that is private to its object a private external, so that ours can link to it;
+  on ELF, `weaken::shared` copies rustc's objects with such a symbol made a hidden global (in
+  place: the symbol table's locals are reordered and what numbers them, relocations and a
+  section group's signature, renumbered, as object's ELF builder refuses section groups). A
+  static with state whose copy can't be shared (one LLVM split into several parts or into a
+  `bool`, a part with no debug information to tell it whole, one private to its object on
+  Windows) is not copied either, and no other path stands in: the build stops with an error
+  naming it (``static `X` of crate `c` with state, whose copy in rustc's code (`...`) ...``,
+  `CodegenError::Refused`), rather than split the state or leave the function to rustc.
+  Not yet handled: what rustc's code reads of a static LLVM proved it never writes is
+  folded into that code, so an edit that adds a write to one is not seen by it.
+
 ## What is refused
 
 The program is told to start again (`Outcome::Restart`) when:
 
-- an edit changes a type the rest of the program sees: the daemon hashes each file's type
-  definitions (structs, enums, unions, aliases, traits without default bodies, and `repr`)
-  before and after, and a program started before the change can't have its live data
-  relaid;
+- an edit changes the definition of a type that keeps its name: the daemon hashes each
+  file's type definitions (structs, enums, unions, aliases, traits without default bodies,
+  and `repr`; not comments, doc comments or other attributes) before and after, and a
+  program started before the change can't have its live data relaid. The restart names the
+  type. A type added or taken away is no change, and neither is one taken away and added
+  again as it was ([Types](#types));
+- an edit changes the first value of a thread-local or a static written at run time that
+  stays rustc's ([Statics](#statics)): the build is in full, with a copy of ours that starts
+  from the new value;
 - the edit wrote the whole object again, which the daemon does when it has no compiled base
   to patch against (the first edit after it starts);
 - the executable was linked again: the daemon says so for a program it knew, and the program
   watches its own executable for another `LC_UUID`, which covers a daemon started since and a
   plain `cargo build`.
 
+A build of several programs where cargo builds one (`blaze build -p server -p client`, and an
+edit only rustc's copy of the client's code sees) links none of the others again: cargo's run
+is told which programs the daemon built (`RA_JIT_DAEMONS_BUILT`), and the wrapper asks the
+daemon for each of those as it does under plain cargo, giving cargo the daemon's executable
+where rustc would have linked one; nor is rustc's old executable put back over a running one
+first. The checkout is then `kept`: the daemon's worker loads what rustc built in place,
+keeps the programs it built by the plans it built them by, and starts over with the ones
+rustc linked, rather than start again and link every program anew. A change cargo acts on
+(a manifest, the lock, a build script) still starts a new worker.
+
 A patch that can't be applied (`Outcome::Declined`) leaves the program as it was.
+
+## Types
+
+A type is never changed in place under a running program: a new one is added beside it under
+a name of its own, the code moved to it with the values converted, and the old one deleted,
+each edit a patch. On the daemon's own base (`RA_JIT_RUSTC_BASE=0`, or once it has built one)
+an edit that adds a struct, an enum, a derive, a trait impl or a `macro_rules!` call that
+writes them, anywhere in a file with other types, is a patch of the functions it adds and the
+generic instances over the new type; taking a type away is a patch of the code that no longer
+names it. Over rustc's executable an edit that is more than bodies still takes a build in full
+and a restart ([architecture.md](architecture.md)).
+
+A static new since the base, as the `static INDEX: AtomicU32` that `#[derive(Component)]`
+writes in a function for each type, interior mutability or not, is in every patch after the
+one it is new in, since a patch holds all that differs from the base. It has to stay the one
+static: the program writes to it (a component's id, a counter, a cache), and the next patch's
+code has to read what it wrote. So the codegen names it `ra_jit::static::lasting::<print>`,
+the print of its path (a crate of the checkout by its root file, a macro call by its text,
+which an edit above it leaves alone), its declaration and its first value
+(`hir_ty_codegen::LASTING_STATIC`), the same in every patch while it stays the same. The
+daemon gives each such name, per running process, a place of its own at the top of the room
+the program set aside, below the last (`splice::Lasting`), points every patch's references at
+that place, and sends with each patch the first value of each one it refers to
+(`format::Code::lasting`). The program writes a first value only the first time it sees the
+place, mapping the page then, and never again; a patch it never took (one written over by the
+next before it read it) changes nothing, since no patch's code refers to a static in another
+patch. The program lowers the `end` it publishes below them, so a daemon started again places
+nothing over them. A static of the executable keeps its address and its value; one whose
+declaration or first value an edit changes is another static, which starts from the new value.
+A lasting name already in the executable (one a splice of the whole object left there) is
+that executable's copy. A static that points into itself is refused (its first value would
+point into a patch), and so are two statics written the same in one place.
+
+`harness/live_types.py` runs a program that keeps values in a world that erases their type,
+each type with an id handed out from a shared pool and kept in a static of its own, as
+flecs_ecs does, and gives it four edits: add `V2` with its derive, id static and trait impl;
+move the code to `V2`, converting the values, with a static new in the edit; delete `V1`;
+change a field of `V2`. The first three are patches whose answers match rustc's build of the
+same text (`V2` keeps id 1 through all three), and the fourth restarts naming `struct V2`.
+On Linux x86-64 on the daemon's own base each takes about 90 to 190 ms from the build's start
+to applied.
 
 ## Tiers
 
@@ -227,6 +329,29 @@ ms to its first answer (it reserves its patch room and reads its executable firs
   checks some 3,200 functions again, and the worker tells the program to restart ("the edit
   changes what the rest of the program sees") for texts that never build (9 to 11 times a pass). Keys queue
   behind those answers.
+
+**On Windows x86-64.** life only, one pass, on 2026-10-25 on a desktop (Intel, 24 threads,
+Windows 11, Windows Defender on as installed), at the commit that brings live edits to Windows,
+with a daemon and home of its own and no store. All times in ms; the samples are in
+[benchmarks/live/windows-life.json](benchmarks/live/windows-life.json), the run is a line in
+`benchmarks/history/windows-x86-64-live.jsonl`.
+
+| program, mode | n | p50 | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|---|
+| life, socket | 10 | 26.6 | 52.6 | 52.6 | 52.6 | 52.6 |
+| life, burst | 60 | 27.4 | 33.1 | 33.2 | 38.4 | 38.4 |
+| life, replay | 77 | 89.3 | 493 | 10,440 | 12,760 | 12,760 |
+| life, cargo | 10 | 148 | 157 | 157 | 157 | 157 |
+
+Restarts: 3 of 12 session edits, 244 (max 260) against 1,526 (1,534) for `cargo run` (the build
+138 against 1,502, the start 69 against 24); the 9 body edits were applied live, p50 34 (26
+to 36). In replay 50 of the 77 compiling keys were run by a patch (p50 30.0, p90 237) and 27 by
+one of 13 restarts (p50 390), the tail being keys queued behind restarts as on macOS.
+
+- The daemon sets a named event once it wrote a patch, which the program waits on: `delivery`
+  is 0.2. Before, the program looked every 30 ms, and socket's p50 was about 50.
+- Of socket's 26.6, about 25 is the worker building the edit.
+- In `cargo`, about 115 of the 148 are cargo starting and asking the daemon.
 
 Not measured yet: keystroke to changed pixels, and these modes on the CI runner
 (`.github/workflows/live-latency.yaml` runs `socket burst replay` on all four programs).

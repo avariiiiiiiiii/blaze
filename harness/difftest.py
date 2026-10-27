@@ -243,8 +243,8 @@ class Fixture:
             run = subprocess.run([*RUNNER, binary, *self.run_args], capture_output=True, timeout=allowed)
             if binary == self.reference:
                 self.reference_secs = time.monotonic() - start
-            # The thread id in a panic message differs from run to run.
-            stderr = re.sub(rb"' \(\d+\) panicked", b"' panicked", run.stderr)
+            # The thread id in a panic or stack overflow message differs from run to run.
+            stderr = re.sub(rb"' \(\d+\) (panicked|has overflowed)", rb"' \1", run.stderr)
             if WASM:
                 # After the program's own output the runtime says where in which file it
                 # trapped: only the kind of trap is the program's.

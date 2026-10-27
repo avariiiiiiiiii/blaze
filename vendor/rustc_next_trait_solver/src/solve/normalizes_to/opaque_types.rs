@@ -140,8 +140,12 @@ where
             }
             TypingMode::PostAnalysis => {
                 // FIXME: Add an assertion that opaque type storage is empty.
-                let actual =
-                    cx.type_of(def_id.into()).instantiate(cx, opaque_ty.args).skip_norm_wip();
+                let actual = match cx.opaque_of_impl(goal.param_env, def_id, opaque_ty.args) {
+                    Some(actual) => actual,
+                    None => {
+                        cx.type_of(def_id.into()).instantiate(cx, opaque_ty.args).skip_norm_wip()
+                    }
+                };
                 self.eq(goal.param_env, expected, actual)?;
                 self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
                     .map_err(Into::into)

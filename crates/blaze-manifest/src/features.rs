@@ -1,5 +1,7 @@
-//! Editions, resolver versions and `cargo-features`, as cargo 1.99 knows them
-//! (`src/workspace/features.rs` and `src/resolver/types.rs` there).
+//! Editions, resolver versions and `cargo-features`, as the cargo of the pinned nightly
+//! (`harness/toolchain`) knows them (`src/workspace/features.rs` and `src/resolver/types.rs`
+//! there). blaze builds with that nightly only, so its channel is `nightly`: a listed unstable
+//! feature is activated, as nightly cargo activates it.
 
 use std::fmt;
 use std::str::FromStr;
@@ -7,8 +9,9 @@ use std::str::FromStr;
 use anyhow::bail;
 use semver::Version;
 
-/// The release of cargo whose behaviour this crate has, in the form cargo prints itself.
-pub const CARGO_VERSION: &str = "1.99.0 (5f94df478 2026-08-27)";
+/// The cargo whose behaviour this crate has, the pinned nightly's, in the form cargo prints
+/// itself (`cargo -vV`; commit cad07cf8e597397fff5d0f6cb79c9f870c0b1dd2).
+pub const CARGO_VERSION: &str = "1.101.0-nightly (cad07cf8e 2026-10-23)";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Edition {
@@ -182,21 +185,84 @@ features! {
     (unstable, profile_rustflags, "", "reference/unstable.html#profile-rustflags-option"),
     (stable, workspace_inheritance, "1.64", "reference/unstable.html#workspace-inheritance"),
     (stable, edition2024, "1.85", "reference/manifest.html#the-edition-field"),
-    (unstable, trim_paths, "", "reference/unstable.html#profile-trim-paths-option"),
+    (stable, trim_paths, "1.101", "reference/profiles.html#trim-paths"),
     (unstable, open_namespaces, "", "reference/unstable.html#open-namespaces"),
     (unstable, path_bases, "", "reference/unstable.html#path-bases"),
     (unstable, unstable_editions, "", "reference/unstable.html#unstable-editions"),
     (unstable, multiple_build_scripts, "", "reference/unstable.html#multiple-build-scripts"),
     (unstable, panic_immediate_abort, "", "reference/unstable.html#panic-immediate-abort"),
+    (unstable, feature_metadata, "", "reference/unstable.html#feature_metadata"),
+    (unstable, builtin_dependencies, "", "reference/unstable.html#builtin-dependencies"),
 }
 
-const SEE_CHANNELS: &str = "See https://doc.rust-lang.org/book/appendix-07-nightly-rust.html for more information \
-     about Rust release channels.";
+/// The names of nightly cargo's `-Z` flags (`CliUnstable::help`), for the hint an unknown
+/// `cargo-features` entry gets when it names one of them.
+const CLI_UNSTABLE: &[&str] = &[
+    "allow_features",
+    "embed_metadata",
+    "print_im_a_teapot",
+    "advanced_env",
+    "any_build_script_metadata",
+    "avoid_dev_deps",
+    "binary_dep_depinfo",
+    "bindeps",
+    "build_analysis",
+    "build_dir_new_layout",
+    "build_std",
+    "build_std_features",
+    "checksum_freshness",
+    "codegen_backend",
+    "direct_minimal_versions",
+    "dual_proc_macros",
+    "feature_unification",
+    "features",
+    "fine_grain_locking",
+    "fix_edition",
+    "gc",
+    "git",
+    "gitoxide",
+    "hint_min_opt_level",
+    "hint_msrv",
+    "host_config",
+    "json_target_spec",
+    "mem_stats",
+    "minimal_versions",
+    "msrv_policy",
+    "mtime_on_use",
+    "next_lockfile_bump",
+    "no_index_update",
+    "panic_abort_tests",
+    "panic_immediate_abort",
+    "prerelease",
+    "profile_hint_mostly_unused",
+    "profile_rustflags",
+    "public_dependency",
+    "publish_timeout",
+    "root_dir",
+    "rustc_unicode",
+    "rustdoc_depinfo",
+    "rustdoc_map",
+    "rustdoc_mergeable_info",
+    "rustdoc_scrape_examples",
+    "sbom",
+    "script",
+    "section_timings",
+    "separate_nightlies",
+    "skip_rustdoc_fingerprint",
+    "target_applies_to_host",
+    "unstable_options",
+];
 
-/// The `cargo-features` of a manifest. blaze is the stable release, so no unstable feature is
-/// ever enabled: one listed is refused as stable cargo refuses it.
+/// The `cargo-features` of a manifest, as nightly cargo keeps them: each listed feature is
+/// activated, unstable ones included, since blaze's channel is `nightly`. cargo's
+/// `-Zallow-features`, which narrows that, is not read.
 #[derive(Clone, Debug, Default)]
 pub struct Features {
+    /// The entries of `cargo-features`, as written.
+    activated: Vec<String>,
+    /// The features they name.
+    enabled: Vec<&'static str>,
+    /// Whether the manifest is a local package's.
     is_local: bool,
 }
 
@@ -206,78 +272,103 @@ impl Features {
         warnings: &mut Vec<String>,
         is_local: bool,
     ) -> anyhow::Result<Features> {
-        let mut seen = Vec::new();
+        let mut ret = Features { activated: Vec::new(), enabled: Vec::new(), is_local };
         for name in features {
-            let Some(feature) = FEATURES.iter().find(|f| f.name.replace('_', "-") == *name) else {
-                let mut msg = format!("unknown Cargo.toml feature `{name}`\n\n");
-                if name.contains('_') {
-                    msg.push_str("Feature names must use '-' instead of '_'.\n");
-                } else {
-                    msg.push_str(
-                        "See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information.\n",
-                    );
-                }
-                bail!(msg)
-            };
-            if seen.contains(&name) {
-                bail!("the cargo feature `{name}` has already been activated");
-            }
-            seen.push(name);
-            let see_docs = format!(
-                "See {} for more information about using this feature.",
-                cargo_docs_link(feature.docs)
-            );
-            match feature.status {
-                Status::Stable => warnings.push(format!(
-                    "the cargo feature `{name}` has been stabilized in the {} release and is no \
-                     longer necessary to be listed in the manifest\n  {see_docs}",
-                    feature.version
-                )),
-                Status::Unstable => bail!(
-                    "the cargo feature `{name}` requires a nightly version of Cargo, but this is \
-                     the `stable` channel\n{SEE_CHANNELS}\n{see_docs}"
-                ),
-                Status::Removed => {
-                    let mut msg = format!(
-                        "the cargo feature `{name}` has been removed in the {} release\n\n",
-                        feature.version
-                    );
-                    if is_local {
-                        msg.push_str("Remove the feature from Cargo.toml to remove this error.\n");
-                    } else {
-                        msg.push_str(&format!(
-                            "This package cannot be used with this version of Cargo, as the \
-                             unstable feature `{name}` is no longer supported.\n"
-                        ));
-                    }
-                    msg.push_str(&see_docs);
-                    msg.push('\n');
-                    bail!(msg)
-                }
-            }
+            ret.add(name, warnings)?;
+            ret.activated.push(name.clone());
         }
-        Ok(Features { is_local })
+        Ok(ret)
     }
 
-    /// Fails as cargo does for a manifest that uses an unstable feature: none is enabled.
+    fn add(&mut self, name: &str, warnings: &mut Vec<String>) -> anyhow::Result<()> {
+        let Some(feature) = status(name) else {
+            let mut msg = format!("unknown Cargo.toml feature `{name}`\n\n");
+            if name.contains('_') {
+                msg.push_str("Feature names must use '-' instead of '_'.\n");
+            } else {
+                if CLI_UNSTABLE.contains(&name.replace('-', "_").as_str()) {
+                    msg.push_str(&format!(
+                        "This feature can be enabled via -Z{name} or the `[unstable]` section \
+                         in config.toml.\n"
+                    ));
+                }
+                msg.push_str(
+                    "See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information.\n",
+                );
+            }
+            bail!(msg)
+        };
+        if self.enabled.contains(&feature.name) {
+            bail!("the cargo feature `{name}` has already been activated");
+        }
+        let see_docs = format!(
+            "See {} for more information about using this feature.",
+            cargo_docs_link(feature.docs)
+        );
+        match feature.status {
+            Status::Stable => warnings.push(format!(
+                "the cargo feature `{name}` has been stabilized in the {} release and is no \
+                 longer necessary to be listed in the manifest\n  {see_docs}",
+                feature.version
+            )),
+            Status::Unstable => {}
+            Status::Removed => {
+                let mut msg = format!(
+                    "the cargo feature `{name}` has been removed in the {} release\n\n",
+                    feature.version
+                );
+                if self.is_local {
+                    msg.push_str("Remove the feature from Cargo.toml to remove this error.\n");
+                } else {
+                    msg.push_str(&format!(
+                        "This package cannot be used with this version of Cargo, as the \
+                         unstable feature `{name}` is no longer supported.\n"
+                    ));
+                }
+                msg.push_str(&see_docs);
+                msg.push('\n');
+                bail!(msg)
+            }
+        }
+        self.enabled.push(feature.name);
+        Ok(())
+    }
+
+    /// The entries of `cargo-features`, in their order.
+    pub fn activated(&self) -> &[String] {
+        &self.activated
+    }
+
+    /// Whether `feature` may be used: it is stable or the manifest activated it.
+    pub fn is_enabled(&self, feature: &Feature) -> bool {
+        feature.status == Status::Stable || self.enabled.contains(&feature.name)
+    }
+
+    /// Fails as nightly cargo does for a manifest that uses an unstable feature it did not
+    /// list in `cargo-features`.
     pub fn require(&self, feature: &Feature) -> anyhow::Result<()> {
         self.require_with_hint(feature, None)
     }
 
     pub fn require_with_hint(&self, feature: &Feature, hint: Option<&str>) -> anyhow::Result<()> {
-        if feature.status == Status::Stable {
+        if self.is_enabled(feature) {
             return Ok(());
         }
-        let _ = self.is_local;
         let name = feature.name.replace('_', "-");
         let mut msg = format!(
             "feature `{name}` is required\n\n\
              The package requires the Cargo feature called `{name}`, but that feature is not \
              stabilized in this version of Cargo ({CARGO_VERSION}).\n"
         );
-        msg.push_str(
-            "Consider trying a newer version of Cargo (this may require the nightly release).\n",
-        );
+        if self.is_local {
+            msg.push_str(&format!(
+                "Consider adding `cargo-features = [\"{name}\"]` to the top of Cargo.toml \
+                 (above the [package] table) to tell Cargo you are opting in to use this \
+                 unstable feature.\n"
+            ));
+        } else {
+            msg.push_str("Consider trying a more recent nightly release.\n");
+        }
         msg.push_str(&format!(
             "See https://doc.rust-lang.org/nightly/cargo/{} for more information about the status of this feature.\n",
             feature.docs
@@ -288,6 +379,15 @@ impl Features {
         }
         bail!("{msg}")
     }
+}
+
+/// The feature a `cargo-features` entry names: spelled with `-`, never `_`.
+fn status(name: &str) -> Option<&'static Feature> {
+    if name.contains('_') {
+        return None;
+    }
+    let name = name.replace('-', "_");
+    FEATURES.iter().find(|f| f.name == name)
 }
 
 fn cargo_docs_link(path: &str) -> String {

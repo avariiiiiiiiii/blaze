@@ -62,7 +62,7 @@ async def run_step(step: str, cmd: list[str], timeout: float, cwd: Path, env: di
 
 
 def toolchain_prefix() -> list[str]:
-    """Run cargo from the flake dev shell (pinned 1.99.0) unless we are already in it."""
+    """Run cargo from the flake dev shell (the pinned nightly) unless we are already in it."""
     if os.environ.get("IN_NIX_SHELL"):
         return []
     return ["nix", "develop", str(ROOT), "--command"]

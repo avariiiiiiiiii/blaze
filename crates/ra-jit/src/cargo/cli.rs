@@ -80,11 +80,14 @@ const BUILD_ENV: &[&str] = &[
     "RA_JIT_MIR_OPT",
     "RA_JIT_EMIT",
     "RA_JIT_SPLICE",
+    "RA_JIT_BUILT_IN",
+    "RA_JIT_LLVM_INLINE_THRESHOLD",
     "RA_JIT_OTHER_TOOLCHAIN",
 ];
 
 /// The variables a worker is started with: the ones that pick its toolchain and its backend,
-/// and the ones cargo reads flags and profiles from.
+/// what its first build is made over, and the ones cargo reads flags and profiles from. One
+/// left out reaches a worker only from whoever started the daemon.
 const WORKER_ENV: &[&str] = &[
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
@@ -99,6 +102,9 @@ const WORKER_ENV: &[&str] = &[
     "RA_JIT_MIR_OPT",
     "RA_JIT_EMIT",
     "RA_JIT_SPLICE",
+    "RA_JIT_BUILT_IN",
+    "RA_JIT_LLVM_INLINE_THRESHOLD",
+    "RA_JIT_RUSTC_BASE",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,8 +141,9 @@ impl Subcommand {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Asked {
     Build(Box<Invocation>),
-    /// A subcommand that is cargo's alone, with its arguments.
-    Cargo(Vec<String>),
+    /// A subcommand that is not a build, with its arguments: blaze's own, or one it has not
+    /// written yet, which fails saying so (`own`). None is cargo's.
+    Own(Vec<String>),
     /// `cache` and its arguments: the kept results of `#[ra_jit::cache]` functions, or the
     /// disk store.
     Cache(Vec<String>),
@@ -146,8 +153,11 @@ pub(crate) enum Asked {
     Stop,
     Enable,
     Disable,
-    /// Which Rust blaze builds with, downloaded first when it has none.
-    Toolchain,
+    /// blaze's own toolchain, downloaded first when it has none; with `--path`, its directory
+    /// alone, for the installer to link.
+    Toolchain {
+        path: bool,
+    },
     Help,
     Version,
 }
@@ -218,8 +228,8 @@ impl Asked {
             ("stop", _) => Asked::Stop,
             ("enable", _) => Asked::Enable,
             ("disable", _) => Asked::Disable,
-            ("toolchain", _) => Asked::Toolchain,
-            _ => Asked::Cargo(args),
+            ("toolchain", _) => Asked::Toolchain { path: rest.iter().any(|it| it == "--path") },
+            _ => Asked::Own(args),
         }
     }
 }
@@ -348,6 +358,42 @@ impl Invocation {
         Some(reason.to_owned())
     }
 
+    /// The first flag typed that picks targets of a kind, tests or benches: `--bin` and
+    /// `--example` name a program, `--lib` picks none or, of `cargo test`, the library's unit
+    /// tests, and `--test` names an integration test there.
+    pub(crate) fn kinds_of_targets(&self) -> Option<&str> {
+        let one: &[&str] = match self.subcommand {
+            Subcommand::Test => &["--lib", "--bin", "--example", "--test"],
+            _ => &["--lib", "--bin", "--example"],
+        };
+        let typed = self.build_args.iter().map(|it| it.split('=').next().unwrap_or(it));
+        typed.into_iter().find(|it| TARGET_SELECTION.contains(it) && !one.contains(it))
+    }
+
+    /// The values typed for `flag`, as `flag value` or `flag=value`.
+    pub(crate) fn values_of(&self, flag: &str) -> Vec<&str> {
+        let mut values = Vec::new();
+        let mut words = self.build_args.iter();
+        while let Some(word) = words.next() {
+            match word.strip_prefix(flag) {
+                Some("") => values.extend(words.next().map(String::as_str)),
+                Some(value) if value.starts_with('=') => values.push(&value[1..]),
+                _ => {}
+            }
+        }
+        values
+    }
+
+    /// Why blaze does not link programs for the target of the build.
+    pub(crate) fn target_not_linked(&self) -> Option<String> {
+        self.target().and_then(|it| unsupported_target(&it))
+    }
+
+    /// Whether `flag` was typed.
+    pub(crate) fn typed(&self, flag: &str) -> bool {
+        self.build_args.iter().any(|it| it == flag)
+    }
+
     /// The profile, as cargo's `Finished` line names it.
     pub(crate) fn profile(&self) -> &str {
         let of_command = if self.subcommand == Subcommand::Test { "test" } else { "dev" };
@@ -432,7 +478,12 @@ fn wrapper_installed() -> bool {
 fn unsupported_target(triple: &str) -> Option<String> {
     use hir_ty_codegen::{ObjectFormat, Target};
     match Target::select(triple) {
-        Ok(target) if matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::MachO) => {
+        Ok(target)
+            if matches!(
+                target.object_format,
+                ObjectFormat::Elf | ObjectFormat::MachO | ObjectFormat::Coff
+            ) =>
+        {
             None
         }
         Ok(_) => Some(format!("programs for {triple} are not linked through `cargo ra-jit` yet")),
@@ -505,7 +556,7 @@ mod tests {
 
     #[test]
     fn what_is_cargos_alone() {
-        assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Cargo(vec!["doc".to_owned()]));
+        assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Own(vec!["doc".to_owned()]));
         assert_eq!(Asked::parse(Vec::new()), Asked::Help);
         assert_eq!(Asked::parse(vec!["--help".to_owned()]), Asked::Help);
         for args in ["--message-format json", "--exclude a", "--target mips-unknown-none", "-Zx"] {
@@ -526,6 +577,14 @@ mod tests {
         }
         assert_eq!(build("test", "--release").profile(), "release");
         assert_eq!(build("test", "").profile(), "test");
+    }
+
+    /// `Target::select` keeps the one target of the process, so this is the host's only.
+    #[cfg(windows)]
+    #[test]
+    fn msvc_programs_are_linked_through_cargo_ra_jit() {
+        assert_eq!(unsupported_target("x86_64-pc-windows-msvc"), None);
+        assert!(unsupported_target("x86_64-pc-windows-gnu").is_some());
     }
 
     #[test]

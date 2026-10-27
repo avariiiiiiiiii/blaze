@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Prepares $NR_ROOT (default ~/no-rustc) on a Linux dev host for count.py: ra-jit at a
-# commit, built with the real toolchain, and copies of 1.99.0 and bun's nightly whose rustc,
-# rustdoc and cargo log every run (wrap.sh), linked as the rustup toolchains nr-stable and
-# nr-nightly. Remove with `rustup toolchain uninstall nr-stable nr-nightly` and rm -rf.
+# commit, built with the real toolchain, and a copy of the pinned nightly (harness/toolchain)
+# whose rustc, rustdoc and cargo log every run (wrap.sh), linked as the rustup toolchain nr-pin.
+# Remove with `rustup toolchain uninstall nr-pin` and rm -rf.
 set -euo pipefail
 L=${NR_ROOT:-$HOME/no-rustc}
 REV=${REV:-origin/main}
 HERE=$(cd "${0%/*}" && pwd)
+TC=$(cat "$HERE/../toolchain")
 pin=()
 [ -n "${NR_CPUS:-}" ] && pin=(taskset -c "$NR_CPUS")
 mkdir -p "$L/logs" "$L/apps"
@@ -27,10 +28,9 @@ counted() { # toolchain-dir name
   fi
   rustup toolchain link "nr-$2" "$to"
 }
-counted 1.99.0-x86_64-unknown-linux-gnu stable
-counted nightly-2026-09-15-x86_64-unknown-linux-gnu nightly
-ls "$L/tc-stable/lib/rustlib/src/rust/library" >/dev/null
+counted "$TC-x86_64-unknown-linux-gnu" pin
+ls "$L/tc-pin/lib/rustlib/src/rust/library" >/dev/null
 
 cd "$L/src"
-CARGO_TARGET_DIR=$L/target "${pin[@]}" cargo +1.99.0 build -p ra-jit --release --bins 2>&1 | tail -3
+CARGO_TARGET_DIR=$L/target "${pin[@]}" cargo "+$TC" build -p ra-jit --release --bins 2>&1 | tail -3
 ls "$L/target/release/ra-jit"

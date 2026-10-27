@@ -13,8 +13,9 @@ use std::{
 
 use serde_derive::Deserialize;
 
-/// What each release of rustc ra-jit has the answers of says.
-const RELEASES: [&str; 1] = [include_str!("rustc-1.99.0.json")];
+/// What the rustc of the toolchain in `harness/toolchain` says (`harness/answers.py --write`
+/// writes it when the toolchain moves).
+const RELEASES: [&str; 1] = [include_str!("rustc.json")];
 
 #[derive(Deserialize)]
 struct Release {
@@ -199,8 +200,10 @@ impl<'a> Given<'a> {
                         _ => return None,
                     }
                 }
-                "-Z" => match value()? {
-                    "unstable-options" => given.unstable_options = true,
+                "-Z" => match crate::unstable::flag(value()?) {
+                    flag if flag.name == "unstable-options" => given.unstable_options = true,
+                    // One that changes only how rustc works changes no answer.
+                    flag if matches!(flag.treatment(), crate::unstable::Treatment::Ignored(_)) => {}
                     _ => return None,
                 },
                 _ if LINTS.contains(&flag) || IGNORED_VALUED.contains(&flag) => {
@@ -279,11 +282,6 @@ pub(super) fn answer(
     if UNSET.iter().any(|it| var(it).is_some()) {
         return None;
     }
-    let nightly = match var("RUSTC_BOOTSTRAP") {
-        None => false,
-        Some(it) if it == "1" => true,
-        Some(_) => return None,
-    };
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
     // A driver of rustc's (clippy's) may answer otherwise.
     if rustc.file_stem()? != "rustc" {
@@ -291,6 +289,15 @@ pub(super) fn answer(
     }
     let toolchain = Toolchain::of(rustc)?;
     let release = toolchain.release;
+    // Whether unstable features are allowed: always on a nightly (the toolchain ra-jit is
+    // pinned to), unless `RUSTC_BOOTSTRAP=-1` makes it act as a stable release; a list of
+    // crates is not answered.
+    let nightly = match var("RUSTC_BOOTSTRAP") {
+        None => release.version.contains("-nightly") || release.version.contains("-dev"),
+        Some(it) if it == "1" => true,
+        Some(it) if it == "-1" => false,
+        Some(_) => return None,
+    };
     if !args.is_empty()
         && args.iter().all(|it| matches!(*it, "-V" | "-v" | "-vV" | "--version" | "--verbose"))
     {
@@ -417,5 +424,6 @@ mod tests {
         assert!(Given::of(&["-C", "target-cpu=native", "--print", "cfg"]).is_none());
         assert!(Given::of(&["-Ctarget-feature=+avx2", "--print", "cfg"]).is_none());
         assert!(Given::of(&["-Z", "ub-checks", "--print", "cfg"]).is_none());
+        assert!(Given::of(&["-Zthreads=8", "--print", "cfg"]).is_some());
     }
 }

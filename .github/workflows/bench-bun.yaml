@@ -63,6 +63,14 @@ jobs:
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v7
+      # bench.py runs the projects' tests with `cargo ra-jit test`, which sandboxes them in
+      # namespaces a user makes; Ubuntu's AppArmor keeps users from that unless told otherwise.
+      - name: user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Build ra-jit (as released, and with the llvm feature)
         run: |
           mkdir -p "$BENCH_HOME"

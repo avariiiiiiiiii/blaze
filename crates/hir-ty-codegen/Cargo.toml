@@ -55,20 +55,16 @@ target-lexicon = "0.13"
 object = { version = "0.37", default-features = false, features = ["read", "std", "elf", "macho", "coff"] }
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
 sha2 = "0.10"
-# The LLVM backend, against the LLVM 20 the flake pins: build it inside `nix develop` (build.rs).
-# That libLLVM links its own libffi, so inkwell need not.
-inkwell = { version = "0.9.0", default-features = false, features = ["llvm20-1-prefer-dynamic", "target-x86", "target-aarch64", "no-libffi-linking"], optional = true }
-
-# inkwell's llvm-sys, built without linking LLVM itself: build.rs links the pinned one. Windows has
-# no Nix, so there llvm-sys finds and links LLVM.
-[target.'cfg(not(windows))'.dependencies]
-llvm-sys = { version = "201.1.1", features = ["no-llvm-linking"], optional = true }
+# The LLVM backend, against the LLVM 23 blaze pins (llvm.json beside build.rs, checked there).
+# inkwell's llvm-sys (vendor/llvm-sys) links it statically, with libstdc++ on Linux. Nothing of
+# LLVM's calls into libffi, so inkwell need not link it.
+inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1-prefer-static", "target-x86", "target-aarch64", "no-libffi-linking"], optional = true }
 
 [dev-dependencies]
 ra-jit-fuzz.workspace = true
 
 [features]
-llvm = ["dep:inkwell", "dep:llvm-sys"]
+llvm = ["dep:inkwell"]
 # The compiler as a WebAssembly module itself: see `crates/ra-jit-wasm`.
 wasm = []
 

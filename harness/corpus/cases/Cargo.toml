@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 old_macros = { path = "../old_macros" }
+upstream = { path = "../upstream" }
 
 [features]
 nightly = []

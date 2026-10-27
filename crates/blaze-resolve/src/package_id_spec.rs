@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use url::Url;
 
 use crate::names::validate_package_name;
@@ -174,6 +174,82 @@ impl PackageIdSpec {
         }
         true
     }
+
+    /// The package of `all_ids` given by `spec`, a spec yet to be parsed: cargo's
+    /// `PackageIdSpecQuery::query_str`.
+    pub fn query_str(spec: &str, all_ids: &[PackageId]) -> Result<PackageId> {
+        let parsed = PackageIdSpec::parse(spec).with_context(|| {
+            let suggestion =
+                crate::closest_msg(spec, all_ids.iter(), |id| id.name().as_str(), "package");
+            format!("invalid package ID specification: `{spec}`{suggestion}")
+        })?;
+        parsed.query(all_ids)
+    }
+
+    /// The one of `all_ids` this spec matches, or why there is not one: cargo's
+    /// `PackageIdSpecQuery::query`.
+    pub fn query(&self, all_ids: &[PackageId]) -> Result<PackageId> {
+        let spec = self;
+        let mut ids = all_ids.iter().copied().filter(|&id| spec.matches(id));
+        let Some(ret) = ids.next() else {
+            let mut suggestion = String::new();
+            let try_spec = |tried: PackageIdSpec, suggestion: &mut String| {
+                let try_matches: Vec<PackageId> =
+                    all_ids.iter().copied().filter(|&id| tried.matches(id)).collect();
+                if !try_matches.is_empty() {
+                    suggestion.push_str("\nhelp: there are similar package ID specifications:\n");
+                    minimize(suggestion, &try_matches, spec);
+                }
+            };
+            if spec.url().is_some() {
+                let tried = PackageIdSpec::new(spec.name().to_owned());
+                let tried = match spec.partial_version().cloned() {
+                    Some(version) => tried.with_version(version),
+                    None => tried,
+                };
+                try_spec(tried, &mut suggestion);
+            }
+            if suggestion.is_empty() && spec.version().is_some() {
+                try_spec(PackageIdSpec::new(spec.name().to_owned()), &mut suggestion);
+            }
+            if suggestion.is_empty() {
+                suggestion.push_str(&crate::closest_msg(
+                    spec.name(),
+                    all_ids.iter(),
+                    |id| id.name().as_str(),
+                    "package",
+                ));
+            }
+            bail!("package ID specification `{spec}` did not match any packages{suggestion}");
+        };
+        match ids.next() {
+            Some(other) => {
+                let mut msg = format!(
+                    "specification `{spec}` is ambiguous\nhelp: re-run this command with one of the following specifications",
+                );
+                let mut all = vec![ret, other];
+                all.extend(ids);
+                minimize(&mut msg, &all, spec);
+                Err(anyhow!("{msg}"))
+            }
+            None => Ok(ret),
+        }
+    }
+}
+
+/// Of the ids `spec` matches, each by the least that tells it apart.
+fn minimize(msg: &mut String, ids: &[PackageId], spec: &PackageIdSpec) {
+    let mut version_cnt: rustc_hash::FxHashMap<&semver::Version, usize> = Default::default();
+    for id in ids {
+        *version_cnt.entry(id.version()).or_insert(0) += 1;
+    }
+    for id in ids {
+        if version_cnt[id.version()] == 1 {
+            msg.push_str(&format!("\n  {}@{}", spec.name(), id.version()));
+        } else {
+            msg.push_str(&format!("\n  {}", id.to_spec()));
+        }
+    }
 }
 
 fn parse_spec(spec: &str) -> Result<Option<(String, Option<PartialVersion>)>> {
@@ -189,6 +265,12 @@ fn strip_url_protocol(url: &Url) -> Url {
     // `Url::set_scheme` refuses to change to http or https.
     let raw = url.to_string();
     raw.split_once('+').unwrap().1.parse().unwrap()
+}
+
+impl serde::Serialize for PackageIdSpec {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.to_string().serialize(s)
+    }
 }
 
 impl fmt::Display for PackageIdSpec {

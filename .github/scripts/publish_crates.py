@@ -366,7 +366,7 @@ def copy_tree(src: Path, dest: Path, skip_dirs: set[str]) -> None:
 def fork_readme(c: Crate) -> str:
     upstream = f"rust-analyzer's `{c.orig}` crate"
     if c.orig == "ra-ap-rustc_abi":
-        upstream = "rustc's `rustc_abi` (as in Rust 1.99.0)"
+        upstream = "rustc's `rustc_abi` (as in the pinned nightly, harness/toolchain)"
     elif c.dir in REPO.upstream.values():
         upstream = (
             f"`{c.orig}` {REPO.lock[c.orig]['version']}, built on `ra-jit-rustc_abi`,"

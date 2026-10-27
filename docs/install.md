@@ -17,20 +17,27 @@ Change a function and run `blaze run` again: the `Finished` line now says `[ra-j
 
 ## What you need
 
-- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** On Windows blaze installs and runs,
-  but hands every build to cargo. Intel Macs are not supported.
+- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** On Windows x86-64 (MSVC) blaze
+  installs and builds through its engine, but live edits of a running program are not there
+  yet. Intel Macs are not supported.
+- **On Linux, glibc 2.34 or newer**: RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Each
+  is checked by installing there in a container with no Rust. Alpine and other musl systems are
+  not supported; the installer says so.
 - **A C compiler for linking**: `gcc` (or `cc`) on Linux, Apple's command line tools on macOS
   (`xcode-select --install`). The installer says so when it is missing.
 - **Memory to spare.** blaze's background process holds a few GB for a small project and tens of
   GB for the largest ([numbers](benchmarks.md#how-much-memory-and-disk-it-takes)).
 
-You do not need Rust or rustup. blaze builds with Rust 1.99.0 and only that version: it links
-its code with code rustc 1.99.0 compiled, so the two have to agree on how types are laid out and
-functions are called. It downloads its own copy once into `~/.blaze` (rustc, cargo, the standard
-library and its source from the Rust project: 97 MB on macOS, 118 to 133 MB on Linux), or uses
-rustup's 1.99.0 when rustup has it. blaze builds your project with 1.99.0 whatever its
-`rust-toolchain.toml` says, so a project on an older stable builds as it is; code that needs a
-nightly's features fails with rustc's error and a note saying so.
+You do not need Rust or rustup. blaze is its own Rust toolchain ([toolchain.md](toolchain.md)):
+`blaze-2026-10-25` today, the nightly of that date (`rustc 1.101.0-nightly (12433c307
+2026-10-24)`), moved to a newer one on blaze's schedule. It links its code with code that rustc compiled, so the two have to
+agree on how types are laid out and functions are called. It downloads its own copy once into
+`~/.blaze` (rustc, cargo, the standard library and its source from the Rust project: 97 MB on
+macOS, 118 to 133 MB on Linux), or uses rustup's `nightly-2026-10-25` when rustup has it. blaze
+builds your project with that nightly whatever its `rust-toolchain.toml` says, so a project on a
+stable release or an older nightly builds as it is, and so does code that uses nightly features
+(`#![feature(...)]`). Code the pinned nightly cannot build, such as a feature it removed, fails
+with rustc's error and a note saying which toolchain built it.
 
 ## The installer
 
@@ -47,10 +54,12 @@ blaze, it installs the newest nightly build.
 ## From crates.io
 
 ```sh
-cargo install --locked cargo-blaze
+cargo +nightly-2026-10-25 install --locked cargo-blaze
 ```
 
-This compiles blaze from source with Rust 1.99 or newer, which takes a few minutes, and puts six
+This compiles blaze from source with the nightly it is pinned to, which takes a few minutes (blaze
+is built and tested with that nightly only; `rustup toolchain install nightly-2026-10-25` gets
+it), and puts six
 programs in `~/.cargo/bin`: `blaze`, `cargo-blaze` (what `cargo blaze` runs), `ra-jit` (blaze's
 engine), `ra-jit-rustc`, `ra-jit-rustc-first` and `cargo-ra-jit` (the old name). They find each other by being in the same
 directory, so keep them together. If you installed `ra-jit` with cargo before, run

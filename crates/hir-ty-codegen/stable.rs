@@ -2,7 +2,11 @@
 //! that code compiled by one run can be found by the next. A crate of the checkout is named
 //! by what is written in it, so an edit makes other names of everything in it.
 
-use std::{cell::RefCell, fmt::Write};
+use std::{
+    cell::RefCell,
+    fmt::Write,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
@@ -24,7 +28,7 @@ use super::{Instance, InstanceDef, SymbolResolver};
 use hir_ty::{
     ImplTraitId, InferBodyId,
     consteval::try_const_usize,
-    db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
+    db::{ClosureKey, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     next_solver::{GenericArgs, Region, TermId, Ty, TyKind},
 };
 
@@ -122,6 +126,22 @@ fn declared(
     }
 }
 
+/// The crates by what a name starts with, and what the ones asked about declare, for every
+/// [`StableNames`] of a build: to list a crate is to go through every body of it.
+#[derive(Default, Clone)]
+pub(super) struct Listings(Arc<Listing>);
+
+/// Each crate is listed once, by the first to ask, while the threads that ask of the others
+/// go on: the whole build's threads ask at once when it gives the store its entries.
+#[derive(Default)]
+struct Listing {
+    crates: OnceLock<FxHashMap<String, Vec<Crate>>>,
+    listed: Mutex<FxHashMap<String, ListedCell>>,
+}
+
+/// What a crate declares, or `None` for a name of no crate the build depends on.
+type ListedCell = Arc<OnceLock<Option<Listed>>>;
+
 /// The statics and the functions without type parameters that one build of a crate declares.
 #[derive(Default)]
 struct Listed {
@@ -141,11 +161,14 @@ pub(super) struct StableNames<'a, 'db> {
     library: Option<super::LibrarySources>,
     files: RefCell<FxHashMap<HirFileId, Option<String>>>,
     /// The crates by what a name starts with, and what the ones asked about declare.
-    crates: RefCell<Option<FxHashMap<String, Vec<Crate>>>>,
-    listed: RefCell<FxHashMap<String, Listed>>,
+    listings: Listings,
+    /// Those of `listings` this has asked about, which it asks about again without a lock.
+    listed: RefCell<FxHashMap<Box<str>, ListedCell>>,
     /// How each crate and each type is written, or why it has no name.
     crate_names: RefCell<FxHashMap<Crate, Result<Box<str>, &'static str>>>,
     tys: RefCell<FxHashMap<Ty<'db>, Result<Box<str>, &'static str>>>,
+    /// What each closure asked about is written as, by a hash of its source.
+    written: RefCell<FxHashMap<InternedClosure<'db>, Option<Box<str>>>>,
     /// The ids crates of the checkout are named by in place of what is written in them now:
     /// those of a base, whose names an edit leaves to the code they are of.
     frozen: FxHashMap<Crate, super::ContentId>,
@@ -170,14 +193,26 @@ impl<'a, 'db> StableNames<'a, 'db> {
             cargo_home: symbols.cargo_home(),
             library: symbols.library_sources(),
             files: RefCell::default(),
-            crates: RefCell::default(),
+            listings: Listings::default(),
             listed: RefCell::default(),
             crate_names: RefCell::default(),
             tys: RefCell::default(),
+            written: RefCell::default(),
             frozen: FxHashMap::default(),
             missed: std::cell::Cell::new(""),
             misses: RefCell::default(),
         }
+    }
+
+    /// Lists the crates with `listings`, which other names of the build share.
+    pub(super) fn listing(mut self, listings: Listings) -> Self {
+        self.listings = listings;
+        self.listed.get_mut().clear();
+        self
+    }
+
+    pub(super) fn listings(&self) -> Listings {
+        self.listings.clone()
     }
 
     /// Names each crate of `frozen` by its id there, whatever is written in it now.
@@ -264,6 +299,25 @@ impl<'a, 'db> StableNames<'a, 'db> {
         self.listed(name, |it| it.statics.get(name).copied())
     }
 
+    /// `name` with the arguments of an instance of lifetimes alone erased, as its function
+    /// is named as a root: it is one function whatever they are.
+    pub(super) fn lifetimes_erased(name: &str) -> std::borrow::Cow<'_, str> {
+        let (bare, checked) = match name.strip_suffix(CHECKED) {
+            Some(bare) => (bare, CHECKED),
+            None => (name, ""),
+        };
+        let erased = bare.rfind('<').filter(|&at| {
+            let args = bare[at + 1..].strip_suffix('>');
+            args.is_some_and(|it| it.split(',').all(|arg| arg.is_empty() || arg == "'_"))
+        });
+        match erased {
+            Some(at) if &bare[at..] != "<>" => {
+                std::borrow::Cow::Owned(format!("{}<>{checked}", &bare[..at]))
+            }
+            _ => std::borrow::Cow::Borrowed(name),
+        }
+    }
+
     /// The functions an instance without arguments can be of: one for each crate that the
     /// one build of its crate is here.
     pub(super) fn functions_named(&self, name: &str) -> Vec<FunctionId> {
@@ -274,16 +328,12 @@ impl<'a, 'db> StableNames<'a, 'db> {
         if !of_checkout {
             return Vec::new();
         }
-        // A function with lifetime parameters alone is one function whatever they are: its
-        // instance has them all erased.
-        let erased = name.rfind('<').filter(|&at| {
-            let args = name[at + 1..].strip_suffix('>');
-            args.is_some_and(|it| it.split(',').all(|arg| arg.is_empty() || arg == "'_"))
-        });
-        let name = match erased {
-            Some(at) => std::borrow::Cow::Owned(format!("{}<>", &name[..at])),
-            None => std::borrow::Cow::Borrowed(name),
-        };
+        let name = Self::lifetimes_erased(name);
+        // An instance with types for arguments is of no function a crate lists, and listing
+        // its crate for it would go through every body there for nothing.
+        if !name.ends_with("<>") {
+            return Vec::new();
+        }
         self.listed(&name, |it| it.functions.get(&*name).cloned()).unwrap_or_default()
     }
 
@@ -292,12 +342,18 @@ impl<'a, 'db> StableNames<'a, 'db> {
     fn listed<T>(&self, name: &str, of: impl FnOnce(&Listed) -> Option<T>) -> Option<T> {
         let (_, rest) = name.split_once(' ')?;
         let krate = &rest[..=rest.find(':')?];
-        let mut listed = self.listed.borrow_mut();
-        if !listed.contains_key(krate) {
+        let cell = self.listed.borrow().get(krate).cloned();
+        let cell = cell.unwrap_or_else(|| {
+            let mut listed = self.listings.0.listed.lock().unwrap_or_else(|e| e.into_inner());
+            let cell = listed.entry(krate.to_owned()).or_default().clone();
+            drop(listed);
+            self.listed.borrow_mut().insert(krate.into(), cell.clone());
+            cell
+        });
+        let listed = cell.get_or_init(|| {
             // One build of a crate can be several crates here, which differ in what the
             // daemon is told of them and not in what they declare.
-            let mut crates = self.crates.borrow_mut();
-            let crates = crates.get_or_insert_with(|| {
+            let crates = self.listings.0.crates.get_or_init(|| {
                 let mut crates = FxHashMap::<String, Vec<Crate>>::default();
                 // What is built names only what it depends on, and to name a crate of the
                 // checkout is to go through every body of it: not of one that is not built.
@@ -312,10 +368,9 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 }
                 crates
             });
-            let found = self.list(crates.get(krate)?);
-            listed.insert(krate.to_owned(), found);
-        }
-        of(&listed[krate])
+            crates.get(krate).map(|it| self.list(it))
+        });
+        of(listed.as_ref()?)
     }
 
     fn list(&self, crates: &[Crate]) -> Listed {
@@ -346,6 +401,23 @@ impl<'a, 'db> StableNames<'a, 'db> {
         let mut out = String::from("static ");
         let at = id.lookup(self.db).id;
         self.item(&mut out, id.krate(self.db), at.file_id, at.value.erase())?;
+        Some(out)
+    }
+
+    /// A name of a static that stays the same across edits of the checkout while the
+    /// daemon runs, for [`super::LASTING_STATIC`]: [`Self::static_name`] names a crate of the
+    /// checkout by its content and a macro call by its place among the calls of its file,
+    /// which an edit above it changes. Not for the store.
+    pub(super) fn static_across_edits(&self, id: StaticId) -> Option<String> {
+        let krate = id.krate(self.db);
+        if !self.of_the_checkout(krate) {
+            return self.static_name(id);
+        }
+        let at = id.lookup(self.db).id;
+        let root = krate.data(self.db).root_file_id;
+        let mut out = format!("static {OF_CHECKOUT}{root:?}:");
+        file_across_edits(self.db, &mut out, at.file_id)?;
+        write!(out, "#{}", at.value.erase().into_raw()).ok()?;
         Some(out)
     }
 
@@ -500,7 +572,12 @@ impl<'a, 'db> StableNames<'a, 'db> {
         self.item(out, trait_.krate(self.db), id.file_id, id.value.erase())
     }
 
-    /// A closure or an `async` block by the body it is written in and where.
+    /// A closure or an `async` block by the body it is written in, its place among the
+    /// closures there, as it is interned, and what is written of it: an edit of the body
+    /// before it leaves its name, and the names of what is generic over it, as they were.
+    /// What calls a closure does not say what it takes, so one that takes the place of another
+    /// has to be named apart from it. One the body has no source for, as the coroutine of an
+    /// `async fn`, is named by the place of its expression in the body.
     fn closure(&self, out: &mut String, closure: InternedClosure<'db>) -> Option<()> {
         let db = self.db;
         let InferBodyId::DefWithBodyId(owner) = closure.owner else {
@@ -521,7 +598,27 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 self.item(out, it.krate(db), id.file_id, id.value.erase())?
             }
         }
-        write!(out, "@{}", closure.expr.into_raw().into_u32()).ok()
+        match self.written(owner, closure) {
+            Some(written) => write!(out, "@{}:{written}", ClosureKey::nth(db, closure)).ok(),
+            None => write!(out, "@x{}", closure.expr.into_raw().into_u32()).ok(),
+        }
+    }
+
+    /// A hash of the source of a closure, `None` when the body has none for it.
+    fn written(&self, owner: DefWithBodyId, closure: InternedClosure<'db>) -> Option<Box<str>> {
+        if let Some(written) = self.written.borrow().get(&closure) {
+            return written.clone();
+        }
+        let source = Body::with_source_map(self.db, owner).1.expr_syntax(closure.expr).ok();
+        let written = source.map(|source| {
+            use sha2::{Digest, Sha256};
+            let root = source.file_id.parse_or_expand(self.db);
+            let text = source.value.syntax_node_ptr().to_node(&root).text().to_string();
+            let digest = Sha256::digest(text.as_bytes());
+            digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>().into()
+        });
+        self.written.borrow_mut().insert(closure, written.clone());
+        written
     }
 
     fn args(&self, out: &mut String, args: GenericArgs<'db>) -> Option<()> {
@@ -789,6 +886,35 @@ fn file_name(
     Some(())
 }
 
+/// [`file_name`] for [`StableNames::static_across_edits`]: a file by its id, and a call of a
+/// macro written as one (`name!(...)`) by its text, the same wherever the call moves in its
+/// file. A derive's or an attribute's call is the item's, which its name stands for.
+fn file_across_edits(db: &dyn HirDatabase, out: &mut String, file: HirFileId) -> Option<()> {
+    match file {
+        HirFileId::FileId(file) => write!(out, "{:?}", file.file_id(db)).ok(),
+        HirFileId::MacroFile(call) => {
+            let loc = call.loc(db);
+            match &loc.kind {
+                MacroCallKind::FnLike { ast_id, .. } => {
+                    file_across_edits(db, out, ast_id.file_id)?;
+                    let text = loc.to_node(db).value.text().to_string();
+                    write!(out, "#{:032x}!", super::print_of(&text)).ok()
+                }
+                MacroCallKind::Derive { ast_id, derive_attr_index, derive_index, .. } => {
+                    file_across_edits(db, out, ast_id.file_id)?;
+                    let at = ast_id.value.erase().into_raw();
+                    write!(out, "#{at}!derive {derive_attr_index:?} {derive_index}").ok()
+                }
+                MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
+                    file_across_edits(db, out, ast_id.file_id)?;
+                    let at = ast_id.value.erase().into_raw();
+                    write!(out, "#{at}!attr {censored_attr_ids:?}").ok()
+                }
+            }
+        }
+    }
+}
+
 fn hashed(spelled: &str) -> String {
     use sha2::{Digest, Sha256};
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -813,6 +939,21 @@ pub fn block_place(
     func: FunctionId,
 ) -> Option<String> {
     func.module(db).block(db)?;
+    let id = func.lookup(db).id;
+    let mut out = String::new();
+    file_name(db, symbols, &mut out, id.file_id, &|path| path)?;
+    write!(out, "#{}", id.value.erase().into_raw()).ok()?;
+    Some(out)
+}
+
+/// Where any function is written, block or not: for a function whose path ra-jit cannot write
+/// (an `impl` for a type it has no name for, such as `!`, `dyn Trait` or a type taking a
+/// constant), the place names it instead.
+pub fn function_place(
+    db: &dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
+    func: FunctionId,
+) -> Option<String> {
     let id = func.lookup(db).id;
     let mut out = String::new();
     file_name(db, symbols, &mut out, id.file_id, &|path| path)?;

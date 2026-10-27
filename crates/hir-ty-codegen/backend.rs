@@ -59,6 +59,21 @@ pub(super) fn edits_follow() -> bool {
     BUILDS_EDITS.load(Ordering::Relaxed)
 }
 
+/// Whether the process links its programs into executables of their own, which no edit is
+/// spliced into: a whole build's daemon worker (docs/no-rustc.md, step K) relinks each edit.
+static LINKS_OWN: AtomicBool = AtomicBool::new(false);
+
+/// Says the process links what it builds into executables of its own. Before its first build.
+pub fn links_own() {
+    LINKS_OWN.store(true, Ordering::Relaxed);
+}
+
+/// Whether each function and static of an object is in a section of its own, for the linker
+/// to leave out what nothing reaches. The links a daemon splices edits into keep everything.
+pub fn sections_of_their_own() -> bool {
+    !edits_follow() || LINKS_OWN.load(Ordering::Relaxed)
+}
+
 /// Whether every function of the build under way keeps its frame pointer, as the program asks
 /// with `-C force-frame-pointers`: one answer for all the code a build writes, as the debug
 /// level is.
@@ -262,6 +277,7 @@ impl Backend {
             func,
             named.iter().copied(),
             recorder.constants(),
+            recorder.asm_texts(),
             &recorder.pointees,
         )) else {
             return super::llvm::emit(recorder, &named, func, optimization, None, &[]);

@@ -19,7 +19,7 @@ with a type error does; under `cargo ra-jit`, cargo then runs and rustc reports 
 `RA_JIT_BORROWCK_REFUSE=0` in the daemon's environment turns this off.
 
 This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
-fd, bat, hyperfine, just, axum or nushell: a refused build is one rustc refuses too. A
+fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
 borrow-check error ra-jit reports where rustc reports none is a bug; `RA_JIT_BORROWCK_REFUSE=0`
 works around it until it is fixed. What it does not do: it misses about a sixth of the
 errors rustc gives (it accepts code rustc rejects, listed below), so code with such an error
@@ -330,16 +330,16 @@ With no borrow checker, the 246 units rustc accepts would pass. Now:
 
 | Mode | In scope | Pass | rustc accepts, ra-jit too | rustc rejects, same errors |
 |---|---|---|---|---|
-| Polonius | 1581 | 1541 (97.5%) | 246 of 246 | 1295 of 1335 |
-| NLL | 1579 | 1537 (97.3%) | 227 of 227 | 1310 of 1352 |
+| Polonius | 1585 | 1545 (97.5%) | 246 of 246 | 1299 of 1339 |
+| NLL | 1583 | 1542 (97.4%) | 227 of 227 | 1315 of 1356 |
 
-460 units are out of scope; 344 of them need a nightly feature. CI runs the scoring on Linux
+465 units are out of scope; 344 of them need a nightly feature. CI runs the scoring on Linux
 and fails below a floor a few units under the count there, on any error in a unit rustc
 accepts, and on any unit the checker panics on, as a panic hides every error in its file.
 
 The other check is that it finds nothing in code rustc accepts.
 `ra-jit borrowck --project DIR` checks a cargo workspace; on ripgrep, fd, bat, hyperfine,
-just, axum, nushell, delta, eza, tokei, starship and cargo it finds nothing, nor on the
+just, axum, nushell, helix, biome, delta, eza, tokei, starship and cargo it finds nothing, nor on the
 harness's `corpus` and `mixfutures` crates, which CI checks too. Its last line counts the
 files, errors and files it panicked on; a panic makes it fail.
 

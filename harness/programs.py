@@ -50,6 +50,14 @@ STEPS = [
     ("the second catches up", [(TOOL, "n * 5", "n * 7")], ["stool", "sapp"], False),
     ("broken code both use", [(MID, AREA + " + 3", AREA + ' + "x"')], ["sapp", "stool", "sapp"], True),
     ("mended", [(MID, AREA + ' + "x"', AREA + " + 4")], ["stool", "sapp"], False),
+    # rustc parses a parenthesized macro call with no `;` after it as an expression, so the outer
+    # call's expansion, two calls with nothing between, does not parse (#154).
+    ("a macro of several statements in the parentheses of another's call, which rustc rejects",
+     [(MID, "        " + AREA + " + 4\n",
+       "        macro_rules! twice {\n            ($($body:tt)*) => { $($body)* $($body)* };\n        }\n"
+       "        let mut n = 0;\n        twice!(twice!(n += 1;));\n        " + AREA + " + 4 + n\n")],
+     ["sapp", "stool"], True),
+    ("the calls braced, which both accept", [(MID, "twice!(twice!(n += 1;));", "twice! { twice! { n += 1; } }")], ["stool", "sapp"], False),
     ("a function added to the second", [(TOOL, "fn main() {", "fn extra() -> u32 {\n    41\n}\n\nfn main() {\n    println!(\"extra {}\", extra());")], ["stool", "sapp"], False),
 ]
 

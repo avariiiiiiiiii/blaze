@@ -53,6 +53,12 @@ pub(crate) struct Live {
     originals: HashMap<u64, Vec<u8>>,
     written: HashMap<u64, usize>,
     sequence: u64,
+    /// The statics new since the executable that a patch gave a first value, by address, and
+    /// the pages of the room they are in.
+    lasting: std::collections::HashSet<u64>,
+    lasting_pages: std::collections::HashSet<u64>,
+    /// Where the room ends, above those statics: the `end` published is below them.
+    room_end: u64,
 }
 
 impl Live {
@@ -81,6 +87,9 @@ impl Live {
             originals: HashMap::new(),
             written: HashMap::new(),
             sequence: 0,
+            lasting: std::collections::HashSet::new(),
+            lasting_pages: std::collections::HashSet::new(),
+            room_end: end,
         };
         live.publish()?;
         Ok(live)
@@ -201,6 +210,7 @@ impl Live {
             return Err(format!("making patch data writable: {}", std::io::Error::last_os_error()));
         }
         register_frames(memory, code.frames)?;
+        self.first_values(code, end)?;
 
         let kept: std::collections::HashSet<u64> =
             code.writes.iter().map(|it| it.address).collect();
@@ -237,6 +247,59 @@ impl Live {
         }
         self.process.next = end;
         self.publish()
+    }
+
+    /// Writes the first value of each static new since the executable that the patch refers
+    /// to and no patch before gave one, in the room above the patch, which ends at `end`.
+    fn first_values(&mut self, code: &Code, end: u64) -> Result<(), String> {
+        for value in &code.lasting {
+            // Above every patch, in the room: nothing else of the program is mapped there.
+            let len = value.bytes.len() as u64;
+            if value.address < end || value.address.saturating_add(len) > self.room_end {
+                return Err(format!("a static at {:#x}, outside the room", value.address));
+            }
+            let address = value.address + self.slide;
+            if self.lasting.contains(&address) {
+                continue;
+            }
+            let last = address + len;
+            let mut page = address & !(PAGE - 1);
+            while page < last {
+                if !self.lasting_pages.contains(&page) {
+                    let result = unsafe {
+                        mmap(
+                            page as *mut c_void,
+                            PAGE as usize,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                            -1,
+                            0,
+                        )
+                    };
+                    if result == MAP_FAILED || result as u64 != page {
+                        return Err(format!(
+                            "mapping a static's page at {page:#x}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    self.lasting_pages.insert(page);
+                }
+                page += PAGE;
+            }
+            let mut bytes = value.bytes.clone();
+            for &pointer in &value.pointers {
+                slide_at(&mut bytes, pointer as usize, self.slide)?;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
+            };
+            self.lasting.insert(address);
+        }
+        // A daemon started again knows none of them, and places what it has below.
+        if let Some(&low) = self.lasting_pages.iter().min() {
+            self.process.end = self.process.end.min(low - self.slide);
+        }
+        Ok(())
     }
 
     fn write(&self, address: u64, bytes: &[u8]) -> Result<(), String> {

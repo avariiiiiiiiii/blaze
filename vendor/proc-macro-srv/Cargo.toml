@@ -1,25 +1,26 @@
 # The proc-macro server of the toolchain in `harness/toolchain`, built by ra-jit, which loads the
 # libraries ra-jit links (docs/no-rustc.md, step J1). `crates/` is `src/tools/rust-analyzer/crates`
-# and `compiler/rustc_lexer` is `compiler/rustc_lexer` of rust-lang/rust at 1.99.0 (b940084d7),
-# the crates the release's `rust-analyzer-proc-macro-srv` is built from, without their tests;
-# `Cargo.lock` is the release's. The release builds the server in rustc's tree, against rustc's
-# own crates; what is changed is what takes their place:
+# and `compiler/rustc_lexer` is `compiler/rustc_lexer` of rust-lang/rust at the toolchain's commit
+# (nightly-2026-10-25, 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0), the crates the toolchain's
+# `rust-analyzer-proc-macro-srv` is built from, without their tests; `Cargo.lock` holds the
+# toolchain's root `Cargo.lock` entries for these crates' dependencies. The toolchain builds the
+# server in rustc's tree, against rustc's own crates; what is changed is what takes their place:
 #
 # - `proc-macro-srv/src/dylib.rs` loads a library with `dlopen` and reads the list of its macros
-#   that ra-jit writes into it (`crates/ra-jit/src/macro_list.rs`), where the release reads
+#   that ra-jit writes into it (`crates/ra-jit/src/macro_list.rs`), where the toolchain's reads
 #   rustc's metadata with `rustc_metadata`; `dylib/proc_macros.rs` matches that list.
 # - `rustc_proc_macro` is the standard library's `proc_macro` (rustc's tree builds the one as the
 #   other), and `rustc_lexer` the vendored crate, not the compiler's.
-# - `RUSTC_VERSION_STRING` is the release's `rustc --version`, written down where a build script
+# - `RUSTC_VERSION_STRING` is the toolchain's `rustc --version`, written down where a build script
 #   ran rustc for it; the CLI's build script, which asks git for a commit, is gone too.
 # - `in-rust-tree` is on by default and asks for no `rustc_private` crate.
-# - This manifest is the release's root one with only these crates.
+# - This manifest is the toolchain's `src/tools/rust-analyzer/Cargo.toml` with only these crates.
 [workspace]
 members = ["crates/*", "compiler/rustc_lexer"]
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.95"
+rust-version = "1.98"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["rust-analyzer team"]
@@ -62,7 +63,7 @@ nohash-hasher = "0.2.0"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 rayon = "1.10.0"
 rowan = "0.17.0"
-salsa = { version = "0.28.2", default-features = false, features = [
+salsa = { version = "0.28.5", default-features = false, features = [
     "rayon",
     "salsa_unstable",
     "macros",
@@ -81,7 +82,6 @@ smallvec = { version = "1.15.1", features = [
     "const_generics",
 ] }
 smol_str = "0.3.2"
-temp-dir = "0.2.0"
 text-size = "1.1.1"
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
@@ -91,6 +91,13 @@ hashbrown = { version = "0.17.0", features = [
 
 # We need to freeze the version of the crate, as the raw-api feature is considered unstable
 dashmap = { version = "=6.2.1", features = ["raw-api", "inline"] }
+
+# We need to freeze this as `1.0.26` breaks the compilation of `rustc_lexer` during our in-tree
+# libraries publish
+unicode-ident = "=1.0.24"
+
+[workspace.lints.cargo]
+unused_dependencies = "allow"
 
 [workspace.lints.rust]
 elided_lifetimes_in_paths = "warn"

@@ -1,37 +1,28 @@
-# ra-jit: the daemon's own checks. The harnesses compare what ra-jit builds with what rustc
-# builds, under both producers, each platform on a machine of its own kind
-# (ra-jit-platform.yaml). What runs when, and how long it takes, is in docs/harness.md ("CI").
+# ra-jit: the merge gate. What a pull request and each entry of the merge queue has to pass,
+# kept to a few minutes so that the queue moves: one build of ra-jit and the unit tests on Linux
+# x86-64, and the checks of the harness scripts. Everything else, every harness on every
+# platform, runs after the merge, in the release train (train.yaml), which releases main when
+# it is green and opens an issue when it is not. What runs where, and how long it takes, is in
+# docs/harness.md ("CI").
 #
-#   pull request: fmt alone (under a minute), so that it can join the merge queue at once
-#   fast tier: merge queue, push to main, by hand (about 10 minutes)
-#       fmt; on Linux x86-64, Linux AArch64 and macOS arm64 the unit tests, one build and the
-#       quick harnesses (harness/ci.py --parts fast); rustc's borrow-check tests with a floor
-#       under the passes; the pinned run-pass tests (Linux x86-64, macOS); vendor/rust-analyzer
-#       on its own
-#   full tier: nightly, by hand (an hour)
-#       all of that with every harness, Windows x86-64 too, `cargo ra-jit` on small projects
-#       (Linux x86-64, macOS) and the larger ones (AArch64), and the ripgrep bench. A failed
-#       nightly opens an issue, or adds to the one still open.
+#   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux x86-64,
+#       `harness/imports.py` and `harness/rustcsites.py`. No `cargo fmt --check`: fmt.yaml
+#       formats main after each push instead.
+#   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
+#       write the caches every other run reads. They are not cancelled by the next push, as the
+#       train is, so the caches are written for every commit.
 #
-# A change to nothing but documentation or the site runs fmt alone. `ci` is the one check that
-# says whether everything that ran passed: it is the check branch rules and the merge queue
-# require. The queue tests each pull request merged onto main and whatever is ahead of it, and
-# main moves only to what it tested (docs/harness.md, "CI").
+# A change to nothing but documentation, the site or the agent rules (agents/) runs the script
+# checks alone. `ci` is the one check that says whether everything that ran passed: it is the
+# check branch rules and the merge queue require. The queue tests each pull request merged onto main and whatever is ahead
+# of it, and main moves only to what it tested.
 name: ra-jit
 on:
   push:
     branches: ["main"]
   pull_request:
   merge_group:
-  schedule:
-    - cron: "23 6 * * *"
   workflow_dispatch:
-    inputs:
-      tier:
-        description: "fast or full"
-        default: full
-        type: choice
-        options: [full, fast]
 
 concurrency:
   # A pull request's newer push cancels its run before. Every push to main and every entry of
@@ -44,10 +35,10 @@ permissions:
   contents: read
 
 jobs:
-  # Which tier runs: `none` for a pull request (the merge queue tests it merged, and testing it
-  # alone first would only make its landing wait twice) and for a change to nothing but
-  # documentation, the files of the merge queue's entry or of the push against the commit main
-  # was at before it. Anything that cannot be told counts as code.
+  # Which tier runs: `gate` for a pull request and the merge queue, `warm` for a push to main
+  # (or by hand), or `none` for a change to nothing but documentation (the pull request's files,
+  # the merge queue entry's or the push's against the commit before it). Anything that cannot
+  # be told counts as code.
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -61,44 +52,50 @@ jobs:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
           QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
           QUEUE_HEAD: ${{ github.event.merge_group.head_sha }}
-          TIER: ${{ github.event_name == 'schedule' && 'full' || inputs.tier || 'fast' }}
+          TIER: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'warm' || 'gate' }}
         run: |
           case "$EVENT" in
-            pull_request) echo "tier=none" | tee -a "$GITHUB_OUTPUT"; exit 0;;
-            push) files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$AFTER" --jq 'if (.files | length) >= 300 then "" else .files[].filename end') || files=;;
-            merge_group) files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$QUEUE_BASE...$QUEUE_HEAD" --jq 'if (.files | length) >= 300 then "" else .files[].filename end') || files=;;
-            *) files=;;
+            pull_request) range="$PR_BASE...$PR_HEAD";;
+            push) range="$BEFORE...$AFTER";;
+            merge_group) range="$QUEUE_BASE...$QUEUE_HEAD";;
+            *) range=;;
           esac
+          files=
+          if [ -n "$range" ]; then
+            files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$range" --jq 'if (.files | length) >= 300 then "" else .files[].filename end') || files=
+          fi
           code=false
           [ -n "$files" ] || code=true
           while read -r file; do
             case "$file" in
               .github/workflows/ra-jit*.yaml|.github/actions/*) code=true;;
-              *.md|docs/*|site/*|LICENSE*|.github/*) ;;
+              *.md|docs/*|site/*|agents/*|LICENSE*|.github/*) ;;
               *) code=true;;
             esac
           done <<< "$files"
           [ "$code" = true ] || TIER=none
           echo "tier=$TIER" | tee -a "$GITHUB_OUTPUT"
 
-  fmt:
-    name: fmt, harness imports
+  scripts:
+    name: harness imports, rustc sites
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
-        with:
-          components: rustfmt
       # Some scripts ask rustc for the host when imported: after the toolchain is installed.
       - run: python3 harness/imports.py
       # No new place in ra-jit's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
-      # vendor/ too: the forks' rustfmt.toml files are read for their code, and a fork's own
-      # edits are held to them like ra-jit's.
-      - run: cargo fmt --all -- --check
+      # The agent rules: agents/rules.ts type-checks, and AGENTS.md is what it generates.
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile --cwd site
+      - run: site/node_modules/.bin/tsc -p agents
+      - run: bun agents/rules.ts --check
 
   linux-x64:
     name: linux x64
@@ -111,68 +108,32 @@ jobs:
       tier: ${{ needs.changes.outputs.tier }}
       borrowck: true
       pinned-ui: true
-      cargo-ra-jit: ${{ needs.changes.outputs.tier == 'full' }}
-      bench: ${{ needs.changes.outputs.tier == 'full' }}
-      bun-e2e: true
 
+  # On a push to main alone: their caches, for the train's runs and the next push's.
   linux-arm64:
     name: linux arm64
     needs: changes
-    if: needs.changes.outputs.tier != 'none'
+    if: needs.changes.outputs.tier == 'warm'
     uses: ./.github/workflows/ra-jit-platform.yaml
     with:
       platform: linux-arm64
       os: ubuntu-24.04-arm
-      tier: ${{ needs.changes.outputs.tier }}
-      projects: ${{ needs.changes.outputs.tier == 'full' }}
+      tier: warm
 
   macos:
     name: macos arm64
     needs: changes
-    if: needs.changes.outputs.tier != 'none'
+    if: needs.changes.outputs.tier == 'warm'
     uses: ./.github/workflows/ra-jit-platform.yaml
     with:
       platform: macos-arm64
       os: macos-15
-      tier: ${{ needs.changes.outputs.tier }}
+      tier: warm
       pinned-ui: true
-      cargo-ra-jit: ${{ needs.changes.outputs.tier == 'full' }}
-
-  # Its build alone takes longer than the whole fast tier.
-  windows:
-    name: windows x64
-    needs: changes
-    if: needs.changes.outputs.tier == 'full'
-    uses: ./.github/workflows/ra-jit-platform.yaml
-    with:
-      platform: windows-x64
-      os: windows-2025
-      tier: full
-
-  # vendor/rust-analyzer as the fork has it, built and tested outside this repository, so that
-  # the subtree cannot come to depend on crates/ (docs/architecture-split.md, step 5). The
-  # tests of ide-diagnostics are the verdict's (the daemon's errors are its diagnostics), and
-  # add about 15 s to the job.
-  fork:
-    name: fork alone
-    needs: changes
-    if: needs.changes.outputs.tier != 'none'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-      - run: cp -r vendor/rust-analyzer vendor/rustc_type_ir vendor/rustc_next_trait_solver "$RUNNER_TEMP/"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ${{ runner.temp }}/rust-analyzer
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - working-directory: ${{ runner.temp }}/rust-analyzer
-        run: cargo test -p hir-ty -p hir-ty-borrowck -p hir-ty-wfcheck -p ide-diagnostics && cargo check -p hir
 
   ci:
     name: ci
-    needs: [changes, fmt, linux-x64, linux-arm64, macos, windows, fork]
+    needs: [changes, scripts, linux-x64, linux-arm64, macos]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -182,15 +143,3 @@ jobs:
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
           ! echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null
-
-  nightly:
-    name: nightly issue
-    needs: ci
-    if: always() && github.event_name == 'schedule' && needs.ci.result != 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      issues: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/nightly-issue

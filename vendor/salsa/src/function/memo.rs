@@ -234,7 +234,8 @@ impl MemoHeader {
         // assigned as output of another query
         // or those with untracked inputs
         // as their values cannot be reconstructed.
-        matches!(self.origin(), QueryOriginRef::Derived(_))
+        // Nor a provisional memo: fixpoint iteration reads its value.
+        matches!(self.origin(), QueryOriginRef::Derived(_)) && !self.may_be_provisional()
     }
 
     /// True if this may be a provisional cycle-iteration result.

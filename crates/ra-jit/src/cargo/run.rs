@@ -2,19 +2,18 @@
 //! of `cargo test`.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     process::{Command, ExitStatus},
 };
 
 use anyhow::Context as _;
 
-use crate::plan::Selection;
-
 use super::{
     affected::{self, Pick},
     cli::Invocation,
     sandboxed, say,
-    state::{Held, Kind, Program, State, as_built, cargo_path},
+    state::{Held, Kind, Program, State, as_built},
 };
 
 /// The exit status of cargo when a test fails or a program can't be run.
@@ -73,12 +72,13 @@ fn ended(command: &mut Command, held: Option<Held>, state: &State) -> std::io::R
 /// one whose list of them is longer is taken to have said none.
 const PRINTED_KEPT: usize = 4 << 20;
 
-/// Runs `command` as [`ended`] does, with what it prints passed on as it comes, and the tests
+/// Runs `command`, which runs `program`, as [`ended`] does, with what it prints passed on as it comes, and the tests
 /// libtest's summary at its end says failed: `None` when it says none, as a program that
 /// crashed, or exited in a test, does not. libtest colors its output as it would on this
 /// terminal, which it does not see through the pipe.
 fn listing_failures(
     command: &mut Command,
+    program: &Path,
     held: Option<Held>,
     state: &State,
 ) -> std::io::Result<(ExitStatus, Option<Vec<String>>)> {
@@ -93,7 +93,7 @@ fn listing_failures(
     }
     command.stdout(std::process::Stdio::piped());
     let held = held.unwrap_or_else(|| state.hold());
-    let child = started(command);
+    let child = started_running(command, program);
     drop(held);
     let mut child = child?;
     let mut printed = Vec::new();
@@ -156,13 +156,22 @@ fn without_colors(text: &str) -> String {
 /// Starts `command` once the daemon is not writing its program (`splice::unwritten`): one
 /// started while the file is open for writing is refused ("text file busy").
 pub(crate) fn started(command: &mut Command) -> std::io::Result<std::process::Child> {
+    let program = std::path::PathBuf::from(command.get_program());
+    started_running(command, &program)
+}
+
+/// Starts `command`, which runs `program` (itself, or in a sandbox), as [`started`] does.
+fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
-    let _unwritten = crate::splice::unwritten(command.get_program().as_ref());
+    let _unwritten = crate::splice::unwritten(program);
+    #[cfg(not(unix))]
+    let _ = program;
     command.spawn()
 }
 
-/// Runs the test executables one after another, each in the directory of its package, and
-/// stops at the first that fails unless told not to. The result is cargo's exit status. Under
+/// Runs the test executables one after another, each in the directory of its package and in
+/// a sandbox ([`sandboxed`]) unless its package or the command takes it out, and stops at the
+/// first that fails unless told not to. The result is cargo's exit status. Under
 /// `RA_JIT_TESTS=affected` each runs only the tests an edit reached since they passed
 /// ([`affected`]).
 pub(crate) fn tests(
@@ -173,27 +182,52 @@ pub(crate) fn tests(
 ) -> anyhow::Result<i32> {
     let mut failed = Vec::new();
     let (mut left, mut always_run) = (0, 0);
-    let sandbox = sandboxed::wanted(affected::on());
-    if let Some(Err(why)) = &sandbox {
-        say::fallback(
-            &format!("tests run outside a sandbox: {why}"),
-            "those that reach files, the environment, processes or the network run every time",
-        );
+    let programs: Vec<&Program> = state.programs.iter().filter(|it| it.test).collect();
+    let mut opt_outs: BTreeMap<&Path, sandboxed::OptOut> = BTreeMap::new();
+    for test in &programs {
+        if !opt_outs.contains_key(test.package_dir.as_path()) {
+            opt_outs.insert(&test.package_dir, sandboxed::opt_out(&test.package_dir)?);
+        }
     }
-    for test in state.programs.iter().filter(|it| it.test) {
+    let sandboxing = sandboxed::on();
+    if sandboxing
+        && opt_outs.values().any(|it| !it.all)
+        && let Err(why) = crate::sandbox::available()
+    {
+        say::error(&format!("every test runs in a sandbox, which can't be made here: {why}"));
+        say::note(&format!(
+            "`{}=off` runs the tests of this command outside a sandbox, as cargo does",
+            sandboxed::VAR
+        ));
+        return Ok(FAILED);
+    }
+    let mut scratch = sandboxed::Scratch::new();
+    let no_test = BTreeSet::new();
+    for test in programs {
+        let opt_out = &opt_outs[test.package_dir.as_path()];
+        let sandboxed_here = sandboxing && !opt_out.all;
         let source = test.source.strip_prefix(&test.package_dir).unwrap_or(&test.source);
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
         let mut running = format!("{unit}{} ({shown})", source.display());
-        let mut picked = Vec::new();
-        let mut command = Command::new(&test.executable);
-        configured(&mut command, state);
-        command.envs(test.env.iter().cloned());
-        command.current_dir(&test.package_dir);
-        as_built(&mut command)?;
-        let sandbox_env = matches!(sandbox, Some(Ok(()))).then(|| sandboxed::env(&command));
-        let identity = sandbox_env.as_deref().map(sandboxed::identity_of);
-        let pick = affected::pick(asked, state, test, identity.as_deref());
+        let bare = || -> anyhow::Result<Command> {
+            let mut command = Command::new(&test.executable);
+            configured(&mut command, state);
+            command.envs(test.env.iter().cloned());
+            command.current_dir(&test.package_dir);
+            as_built(&mut command)?;
+            Ok(command)
+        };
+        let env = match (sandboxed_here, affected::on()) {
+            (false, _) => None,
+            (true, true) => Some(sandboxed::env(&bare()?)),
+            (true, false) => Some(sandboxed::whole_env(&bare()?)),
+        };
+        let identity = env.as_deref().filter(|_| affected::on()).map(sandboxed::identity_of);
+        let outside = if sandboxed_here { &opt_out.tests } else { &no_test };
+        let pick =
+            affected::pick(asked, state, test, identity.as_deref(), outside, &opt_out.manifest);
+        let mut picked = None;
         if let Pick::Some { names: Some(names), total, .. } = &pick {
             left += total - names.len();
             if names.is_empty() {
@@ -202,45 +236,76 @@ pub(crate) fn tests(
                 continue;
             }
             running.push_str(&format!(": {} of {}", names.len(), counted(*total)));
-            picked.push("--exact".to_owned());
-            picked.extend(names.iter().cloned());
+            picked = Some(names.as_slice());
         }
         say::status(asked.flags.quiet, "Running", &running);
-        if let Pick::Some { always, apart, .. } = &pick {
+        let verbose = |word: &str, rest: &str| {
+            if asked.flags.verbose {
+                say::status(asked.flags.quiet, word, rest);
+            }
+        };
+        let mut reads = false;
+        if let Pick::Some { always, reaching, .. } = &pick {
             always_run += always.len();
-            for test in always.iter().filter(|_| asked.flags.verbose) {
+            for test in always {
                 let by = test.path.as_ref().map(|it| format!(", by {it}")).unwrap_or_default();
-                say::status(
-                    asked.flags.quiet,
-                    "Always",
-                    &format!("{}: {}{by}", test.name, test.why),
-                );
+                verbose("Always", &format!("{}: {}{by}", test.name, test.why));
             }
-            for (name, why) in apart.iter().filter(|_| asked.flags.verbose) {
-                say::status(asked.flags.quiet, "Sandboxed", &format!("{name}: {why}"));
+            for (name, why) in reaching {
+                verbose("Sandboxed", &format!("{name}: {why}"));
             }
-            let names: Vec<String> = apart.iter().map(|(name, _)| name.clone()).collect();
-            if let (Some(env), Some(dir), false) =
-                (sandbox_env, state.plan_dir(test), names.is_empty())
-            {
-                sandboxed::prepare(state, test, dir, &mut command, env, &names)
-                    .context("writing what the sandbox of the tests is")?;
+            reads = !reaching.is_empty();
+        }
+        let manifest = opt_out.manifest.display();
+        if sandboxing && opt_out.all {
+            let why = format!("`tests = false` under `{}` in {manifest}", sandboxed::TABLE);
+            verbose("Unsandboxed", &format!("every test of {}: {why}", test.package));
+        }
+        let parts = parts(asked, test, sandboxed_here, outside, picked, &bare, &running)?;
+        let (mut status, mut failures, mut record) = (None, Some(Vec::new()), None);
+        for part in parts {
+            for name in &part.outside {
+                verbose("Unsandboxed", &format!("{name}: taken out of the sandbox in {manifest}"));
+            }
+            let (mut command, sandbox) = match part.sandboxed {
+                true => {
+                    let env = env.clone().unwrap_or_default();
+                    let sandbox = scratch.sandbox(state, test, env, reads)?;
+                    let mut command = sandbox.command(&test.executable)?;
+                    command.current_dir(&test.package_dir);
+                    (command, Some(sandbox))
+                }
+                false => (bare()?, None),
+            };
+            command.args(&part.args);
+            let ran = match part.sandboxed || matches!(pick, Pick::Some { .. }) {
+                true => listing_failures(&mut command, &test.executable, held.take(), state),
+                false => ended(&mut command, held.take(), state).map(|it| (it, None)),
+            };
+            let (ended, ended_failures) =
+                ran.with_context(|| format!("could not execute {shown}"))?;
+            if let Some(sandbox) = &sandbox {
+                record = sandbox.record();
+                if let (false, Some(lines)) = (ended.success(), &record) {
+                    sandboxed::diagnose(lines, ended_failures.as_deref(), &shown, opt_out);
+                }
+            }
+            if !ended.success() {
+                status = status.or(Some(ended));
+                match (&mut failures, ended_failures) {
+                    (Some(all), Some(these)) => all.extend(these),
+                    _ => failures = None,
+                }
             }
         }
-        command.args(asked.program_args()).args(&picked);
-        let ran = match &pick {
-            Pick::Some { .. } => listing_failures(&mut command, held.take(), state),
-            Pick::Asked => ended(&mut command, held.take(), state).map(|it| (it, None)),
-        };
-        let (status, failures) = ran.with_context(|| format!("could not execute {shown}"))?;
         match pick {
-            Pick::Some { passed, names, .. } if !status.success() => {
-                passed.failed(names.as_deref(), failures.as_deref())
+            Pick::Some { passed, names, .. } if status.is_some() => {
+                passed.failed(names.as_deref(), failures.as_deref(), record.as_deref())
             }
-            Pick::Some { passed, .. } => passed.passed(),
+            Pick::Some { passed, .. } => passed.passed(record.as_deref()),
             Pick::Asked => {}
         }
-        if !status.success() {
+        if status.is_some() {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
                 break;
@@ -274,94 +339,103 @@ pub(crate) fn tests(
     }
 }
 
-/// Runs the doc tests with cargo, which hands them to ra-jit in rustdoc's place: ra-jit
-/// builds each example as its own program over its code of the library.
-pub(crate) fn doc_tests(asked: &Invocation) -> anyhow::Result<i32> {
-    let mut args = vec!["--doc".to_owned()];
-    args.extend(asked.build_args.iter().cloned());
-    if asked.flags.no_fail_fast {
-        args.push("--no-fail-fast".to_owned());
-    }
-    args.extend(asked.positional.iter().cloned());
-    args.push("--".to_owned());
-    args.extend(asked.trailing.iter().cloned());
-    only_doc_tests(asked, &args)
+/// One run of a test executable: in the sandbox or outside it, with the arguments that pick
+/// its tests, and the tests its package took out of the sandbox it runs.
+struct Part {
+    sandboxed: bool,
+    args: Vec<String>,
+    outside: Vec<String>,
 }
 
-/// Runs `cargo test` with `args`, which ask for the doc tests alone, with ra-jit in
-/// rustdoc's place. ra-jit is told the build `asked` is, whose features cargo builds the
-/// libraries with. Cargo's run of rustdoc for each library is only written down, and they are
-/// made once cargo is done, by one run of ra-jit that loads the workspace once for them all.
-pub(crate) fn only_doc_tests(asked: &Invocation, args: &[String]) -> anyhow::Result<i32> {
-    use std::io::{BufRead as _, IsTerminal as _, Write as _};
-    let rustdoc = std::env::var_os("RUSTDOC").unwrap_or_else(|| "rustdoc".into());
-    let cwd = std::env::current_dir()?;
-    let asked_in = asked.flags.manifest_path.as_ref().map_or(cwd.clone(), |it| cwd.join(it));
-    let build = Selection { asked_in: Some(asked_in), ..asked.selection() };
-    let replay = crate::doctest::Replay {
-        dir: std::env::temp_dir().join(format!("ra-jit-doctests-{}", std::process::id())),
-        no_fail_fast: asked.flags.no_fail_fast,
-        quiet: asked.flags.quiet,
+/// The runs of `test`: one, in the sandbox when `sandboxed`, unless its package takes some of
+/// its tests out (`outside`), which then run outside after the others ran inside. `picked`
+/// are the tests [`affected`] picked; `bare` makes the command that runs it outside.
+fn parts(
+    asked: &Invocation,
+    test: &Program,
+    sandboxed: bool,
+    outside: &BTreeSet<String>,
+    picked: Option<&[String]>,
+    bare: &dyn Fn() -> anyhow::Result<Command>,
+    running: &str,
+) -> anyhow::Result<Vec<Part>> {
+    let asked_args: Vec<String> = asked.program_args().cloned().collect();
+    let with = |more: &mut dyn Iterator<Item = String>| {
+        let mut args = asked_args.clone();
+        args.extend(more);
+        args
     };
-    std::fs::create_dir_all(&replay.dir)?;
-    let mut cargo = crate::doctest::as_asked(cargo_path());
-    cargo
-        .env("RUSTDOC", std::env::current_exe().context("finding ra-jit itself")?)
-        .env(crate::doctest::ENABLED, rustdoc)
-        .env(crate::doctest::BUILD, serde_json::to_string(&build)?)
-        .env(crate::doctest::RECORD, &replay.dir);
-    // The daemon's store, as its workers have it: what the examples link of the standard
-    // library is compiled once, not for each library each run.
-    match super::daemon::store() {
-        Some(store) => cargo.env("RA_JIT_CACHE", store),
-        None => cargo.env_remove("RA_JIT_CACHE"),
+    let exact = |names: &[String]| {
+        with(&mut std::iter::once("--exact".to_owned()).chain(names.iter().cloned()))
     };
-    // Cargo says `Doc-tests` of every library before any of them runs: the run that makes
-    // them says it of each as it does. Its colors stay as they are on a terminal.
-    cargo.stderr(std::process::Stdio::piped());
-    let terminal = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    if terminal && std::env::var_os("CARGO_TERM_COLOR").is_none() {
-        cargo.env("CARGO_TERM_COLOR", "always");
+    let one = |sandboxed| {
+        let args = match picked {
+            Some(names) => exact(names),
+            None => asked_args.clone(),
+        };
+        vec![Part { sandboxed, args, outside: Vec::new() }]
+    };
+    if !sandboxed || outside.is_empty() {
+        return Ok(one(sandboxed));
     }
-    cargo.arg("test").args(args);
-    as_built(&mut cargo)?;
-    let mut cargo = cargo.spawn().context("running `cargo test --doc`")?;
-    let said = cargo.stderr.take().context("cargo's standard error is not read")?;
-    let mut stderr = std::io::stderr().lock();
-    for line in std::io::BufReader::new(said).split(b'\n') {
-        let line = line?;
-        if !says_doc_tests(&line) {
-            stderr.write_all(&line)?;
-            stderr.write_all(b"\n")?;
+    // The tests outside, of those that run: libtest's `--exact` names them, and `--skip`
+    // with it leaves them out of the run inside.
+    let (inside, out): (Vec<String>, Vec<String>) = match picked {
+        Some(names) => names.iter().cloned().partition(|it| !outside.contains(it)),
+        None if asked.positional.is_empty() && affected::plain(&asked.trailing) => {
+            let out: Vec<String> = listed(bare, &test.executable)?
+                .into_iter()
+                .filter(|it| outside.contains(it))
+                .collect();
+            if out.is_empty() {
+                return Ok(one(true));
+            }
+            let skips = out.iter().flat_map(|it| ["--skip".to_owned(), it.clone()]);
+            let args = with(&mut std::iter::once("--exact".to_owned()).chain(skips));
+            let outside_args = exact(&out);
+            return Ok(vec![
+                Part { sandboxed: true, args, outside: Vec::new() },
+                Part { sandboxed: false, args: outside_args, outside: out },
+            ]);
         }
-    }
-    drop(stderr);
-    let code = exit_code(cargo.wait().context("running `cargo test --doc`")?);
-    let replayed = match code {
-        0 => replay.command().and_then(|ra_jit| {
-            ra_jit
-                .map(|mut it| Ok(exit_code(it.status().context("running the doctests")?)))
-                .transpose()
-        }),
-        _ => Ok(None),
+        None => {
+            say::status(
+                asked.flags.quiet,
+                "Unsandboxed",
+                &format!(
+                    "{running}: its package takes tests of it out of the sandbox, and the \
+                     command picks the tests itself, so all of it runs outside"
+                ),
+            );
+            return Ok(one(false));
+        }
     };
-    _ = std::fs::remove_dir_all(&replay.dir);
-    Ok(replayed?.unwrap_or(code))
+    let mut parts = Vec::new();
+    if !inside.is_empty() {
+        parts.push(Part { sandboxed: true, args: exact(&inside), outside: Vec::new() });
+    }
+    if !out.is_empty() {
+        parts.push(Part { sandboxed: false, args: exact(&out), outside: out });
+    }
+    Ok(parts)
 }
 
-/// Whether cargo's line is the `Doc-tests <crate>` it says as it runs rustdoc for a library.
-fn says_doc_tests(line: &[u8]) -> bool {
-    let (text, mut plain) = (String::from_utf8_lossy(line), String::new());
-    let mut chars = text.chars();
-    while let Some(char) = chars.next() {
-        match char {
-            // A color: `ESC [ ... m`.
-            '\x1b' => _ = chars.by_ref().find(char::is_ascii_alphabetic),
-            _ => plain.push(char),
-        }
-    }
-    let name = plain.trim().strip_prefix("Doc-tests ");
-    name.is_some_and(|it| !it.is_empty() && !it.contains(' '))
+/// The names of the tests of `executable`, by libtest's `--list`, which runs none of them.
+fn listed(
+    bare: &dyn Fn() -> anyhow::Result<Command>,
+    executable: &Path,
+) -> anyhow::Result<Vec<String>> {
+    let mut command = bare()?;
+    command.args(["--list", "--format", "terse"]).stdout(std::process::Stdio::piped());
+    let out = started_running(&mut command, executable)
+        .and_then(|it| it.wait_with_output())
+        .with_context(|| format!("listing the tests of {}", executable.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .lines()
+        .filter_map(|it| it.strip_suffix(": test").or_else(|| it.strip_suffix(": benchmark")))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn counted(count: usize) -> String {

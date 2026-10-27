@@ -7,9 +7,9 @@
 //       step_ms():  make it faster or slower
 //       step_ms():  0 runs flat out; watch the Tiers panel promote step()
 //
-// Live edits are macOS on Apple silicon only; elsewhere the
-// window runs and edits need a restart. The window and this
-// editor are the other files in src/.
+// Live edits run on macOS on Apple silicon, and Linux and
+// Windows on x86-64; elsewhere the window runs and edits need a
+// restart. The window and this editor are the other files in src/.
 mod editor;
 mod highlight;
 mod theme;

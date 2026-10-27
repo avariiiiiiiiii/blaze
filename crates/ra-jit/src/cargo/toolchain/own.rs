@@ -40,8 +40,16 @@ const PATIENCE: Duration = Duration::from_secs(60);
 const AHEAD: usize = 256;
 
 pub(crate) struct Release {
+    /// The toolchain as rustup names it, `nightly-2026-10-25`: what blaze's directory of it and
+    /// its messages are called.
     pub(crate) version: &'static str,
+    /// The channel its files are named with on the Rust project's site, `nightly`.
+    channel: &'static str,
     date: &'static str,
+    /// What its `rustc --version` says after `rustc `: `1.101.0-nightly (12433c307 2026-10-24)`.
+    /// Pins without it are refused; the daemon reads it on every host ([`rustc_version`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) rustc: &'static str,
     host: &'static str,
     manifest: Pin,
     components: Vec<Component>,
@@ -86,10 +94,15 @@ impl Release {
 
     fn read(pins: &'static str, host: &'static str) -> Option<Release> {
         let (mut release, mut manifest, mut components) = (None, None, Vec::new());
+        let mut rustc = None;
         for line in pins.lines().filter(|it| !it.starts_with('#')) {
+            if let Some(said) = line.strip_prefix("rustc ") {
+                rustc = Some(said.trim());
+                continue;
+            }
             let words: Vec<&'static str> = line.split_whitespace().collect();
             match words[..] {
-                ["release", version, date] => release = Some((version, date)),
+                ["release", version, date, channel] => release = Some((version, date, channel)),
                 ["manifest", sha256, bytes] => {
                     manifest = Some(Pin { sha256, bytes: bytes.parse().ok()? })
                 }
@@ -100,9 +113,16 @@ impl Release {
                 _ => {}
             }
         }
-        let (version, date) = release?;
-        let manifest = manifest?;
-        (!components.is_empty()).then_some(Release { version, date, host, manifest, components })
+        let ((version, date, channel), rustc, manifest) = (release?, rustc?, manifest?);
+        (!components.is_empty()).then_some(Release {
+            version,
+            channel,
+            date,
+            rustc,
+            host,
+            manifest,
+            components,
+        })
     }
 
     /// What the download comes to, in megabytes as people count them.
@@ -115,6 +135,16 @@ impl Release {
     pub(crate) fn dir(&self) -> Option<PathBuf> {
         Some(home()?.join("toolchains").join(format!("{}-{}", self.version, self.host)))
     }
+}
+
+/// What the rustc of the toolchain blaze builds with says it is after `rustc `, on every host:
+/// `1.101.0-nightly (12433c307 2026-10-24)`. A nightly's release number is shared by every
+/// nightly of six weeks, so a rustc is told for blaze's by this whole line.
+pub(crate) fn rustc_version() -> &'static str {
+    PINS.lines()
+        .find_map(|it| it.strip_prefix("rustc "))
+        .map(str::trim)
+        .expect("pins.txt has the rustc line: harness/toolchain_pins.py --write")
 }
 
 /// The host's tuple, as the Rust project names its builds.
@@ -303,7 +333,7 @@ fn download_all(
     staging: &Path,
 ) -> anyhow::Result<Vec<u8>> {
     let runtime = remote::runtime()?;
-    let manifest_file = format!("channel-rust-{}.toml", release.version);
+    let manifest_file = format!("channel-rust-{}.toml", release.channel);
     let unpacked = |at: usize| staging.join(".unpacked").join(at.to_string());
     let (manifest, fetched, unpacking) = std::thread::scope(|scope| {
         let mut downloading = Vec::new();
@@ -312,7 +342,7 @@ fn download_all(
             let (to, from) = mpsc::channel(AHEAD);
             let into = unpacked(at);
             unpacking.push(scope.spawn(move || unpack(Pieces::new(from), &into)));
-            let file = component.file(release.version);
+            let file = component.file(release.channel);
             let part = downloads.join(format!("{file}.part"));
             downloading.push(async move {
                 let sent = download(source, &file, &part, component.pin, Some(to)).await;
@@ -610,7 +640,7 @@ mod tests {
         std::fs::write(dist.join("rust-src-9.9.9.tar.xz"), &src).unwrap();
         std::fs::write(dist.join("channel-rust-9.9.9.toml"), manifest).unwrap();
         let pins = format!(
-            "# test\nrelease 9.9.9 2000-01-01\nmanifest {} {}\n\
+            "# test\nrelease 9.9.9 2000-01-01 9.9.9\nrustc 9.9.9 (abc 2000-01-01)\nmanifest {} {}\n\
              test-host rustc test-host {} {}\ntest-host rust-src * {} {}\n\
              other-host rustc other-host {} 1\n",
             sha256(manifest),
@@ -646,12 +676,11 @@ mod tests {
     fn pins_are_of_the_host_and_the_release_blaze_builds_with() {
         let ours = Release::read(PINS, "x86_64-unknown-linux-gnu").unwrap();
         assert_eq!(ours.version, super::super::OURS.trim(), "harness/toolchain_pins.py --write");
+        assert_eq!(ours.channel, "nightly");
+        assert!(ours.rustc.contains("-nightly ("), "{}", ours.rustc);
         let packages: Vec<_> = ours.components.iter().map(|it| it.package).collect();
         assert_eq!(packages, ["rustc", "cargo", "rust-std", "rust-src"]);
-        assert_eq!(
-            ours.components[3].file(ours.version),
-            format!("rust-src-{}.tar.xz", ours.version)
-        );
+        assert_eq!(ours.components[3].file(ours.channel), "rust-src-nightly.tar.xz");
         assert!(Release::read(PINS, "riscv64gc-unknown-linux-gnu").is_none());
         for host in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
         {

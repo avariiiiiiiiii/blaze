@@ -122,6 +122,15 @@ impl SparseIndex {
         !self.is_updated() || self.offline || self.fresh().contains(path)
     }
 
+    /// Whether [`Sparse::config`] would read `config.json` from disk, asking no server.
+    pub fn config_is_cached(&self) -> bool {
+        let path = self.dir.join(RegistryConfig::NAME);
+        self.is_fresh(RegistryConfig::NAME)
+            && std::fs::read(&path)
+                .ok()
+                .is_some_and(|it| serde_json::from_slice::<RegistryConfig>(&it).is_ok())
+    }
+
     /// The registry's `config.json`: the copy on disk while it is fresh, else the server's,
     /// which is then written to disk. `None` when the server has none.
     pub fn config(&self) -> anyhow::Result<Option<RegistryConfig>> {

@@ -24,6 +24,10 @@ use crate::{Args, Parts, Sources, Watched, WatchedFile};
 /// proc macro did, which run as they were built.
 pub(crate) const RELOAD: &str = "reload";
 
+/// What a lint request starts with, before its [`blaze_lints::serve::Ask`]; its answer starts
+/// with it too, before the [`blaze_lints::serve::Answer`].
+pub(crate) const LINT: &str = "lint\t";
+
 /// Loads the workspace of `args` and answers the check requests on its socket.
 pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let socket = args.socket.clone().context("--check needs --socket")?;
@@ -50,15 +54,18 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     };
     eprintln!("checking {} files of {} crates", checker.checked.len(), checker.crates);
     for (stream, _open) in served.incoming() {
-        if crate::socket::read_request(&stream).is_err() {
+        let Ok(request) = crate::socket::read_request(&stream) else {
             continue;
-        }
+        };
         let reply = match checker.refresh(&mut db) {
             Some(reload) => {
                 eprintln!("{RELOAD}: {reload}");
                 RELOAD.to_owned()
             }
-            None => checker.verdict(&db),
+            None => match (checker.verdict(&db), request.strip_prefix(LINT)) {
+                (verdict, Some(ask)) if verdict == "ok" => checker.lints(&db, ask),
+                (verdict, _) => verdict,
+            },
         };
         let _ = std::io::Write::write_all(&mut &stream, format!("{reply}\n").as_bytes());
         if reply == RELOAD {
@@ -85,6 +92,11 @@ struct Checker {
     sources: Sources,
     root: PathBuf,
     lints_capped: bool,
+    /// The crates `cargo blaze clippy` lints: the workspace's, proc macros included, build
+    /// scripts not.
+    linted: Vec<ide_db::base_db::Crate>,
+    /// Where each file loaded is, for naming them in lints.
+    located: FxHashMap<vfs::FileId, PathBuf>,
 }
 
 impl Checker {
@@ -108,6 +120,7 @@ impl Checker {
             })
             .collect();
         let mut ran_roots = FxHashSet::default();
+        let mut script_roots = FxHashSet::default();
         // The crates of a package `--exclude` names are not checked.
         let mut excluded_roots = FxHashSet::default();
         let mut manifests = FxHashMap::default();
@@ -132,6 +145,9 @@ impl Checker {
                     if runs {
                         ran_roots.insert(PathBuf::from(target.root.clone()));
                     }
+                    if target.kind == TargetKind::BuildScript {
+                        script_roots.insert(PathBuf::from(target.root.clone()));
+                    }
                 }
             }
         }
@@ -143,15 +159,19 @@ impl Checker {
         };
         let (mut checked, mut ran, mut dirs, mut crates) =
             (Vec::new(), FxHashSet::default(), Vec::new(), 0);
+        let mut linted = Vec::new();
         hir::attach_db(db, || {
-            for &krate in members {
-                let krate = hir::Crate::from(krate);
+            for &member in members {
+                let krate = hir::Crate::from(member);
                 if !krate.origin(db).is_local() {
                     continue;
                 }
                 let root_file = krate.root_file(db);
                 if path_of(root_file).is_some_and(|it| excluded_roots.contains(&it)) {
                     continue;
+                }
+                if !path_of(root_file).is_some_and(|it| script_roots.contains(&it)) {
+                    linted.push(member);
                 }
                 let runs = path_of(root_file).is_some_and(|it| ran_roots.contains(&it));
                 let mut of_it: Vec<vfs::FileId> = krate
@@ -185,6 +205,10 @@ impl Checker {
             .collect();
         let loaded =
             vfs.iter().filter_map(|(_, path)| Some(path.as_path()?.to_path_buf().into())).collect();
+        let located = vfs
+            .iter()
+            .filter_map(|(id, path)| Some((id, path.as_path()?.to_path_buf().into())))
+            .collect();
         Checker {
             files,
             checked,
@@ -196,6 +220,8 @@ impl Checker {
             sources: Sources { paths },
             root,
             lints_capped,
+            linted,
+            located,
         }
     }
 
@@ -252,6 +278,17 @@ impl Checker {
             Some(refused) => refused.reply(),
             None => "ok".to_owned(),
         }
+    }
+
+    /// The answer to the lint request `ask`: what blaze's clippy finds in the crates.
+    fn lints(&self, db: &RootDatabase, ask: &str) -> String {
+        let ask: blaze_lints::serve::Ask = match serde_json::from_str(ask) {
+            Ok(ask) => ask,
+            Err(error) => return format!("the lint request does not read: {error}"),
+        };
+        let path_of = |file: vfs::FileId| self.located.get(&file).cloned();
+        let answer = blaze_lints::serve::answer(db, &self.linted, &self.root, &path_of, &ask);
+        format!("{LINT}{}", serde_json::to_string(&answer).unwrap_or_default())
     }
 }
 

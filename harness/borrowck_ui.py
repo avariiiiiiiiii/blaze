@@ -27,6 +27,9 @@ it that rustc does not. The list of reasons is the worklist for making the scope
 """
 import argparse, collections, concurrent.futures, hashlib, json, os, re, shlex, subprocess, sys, tempfile, time
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+PIN = open(os.path.join(HERE, "toolchain")).read().strip()
+
 # Errors only a borrow checker reports.
 BORROWCK = {
     "E0373", "E0381", "E0382", "E0384", "E0499", "E0500", "E0501", "E0502", "E0503", "E0504", "E0505",
@@ -59,7 +62,7 @@ ANNOTATION = re.compile(r"//(?:\[(?P<revs>[\w,-]+)\])?~(?P<adjust>\||\^+|v+)? *(
 FEATURE = re.compile(r"#!\[(cfg_attr\(.*, *)?feature\(")
 MODULE = re.compile(r"^\s*(?:#\[path *= *\"[^\"]+\"\]\s*)?(?:pub(?:\([\w: ]+\))? )?mod \w+;", re.M)
 INCLUDE = re.compile(r"\binclude(?:_str|_bytes)?! *\(")
-DEFAULT_TOOLCHAIN = "nightly-2026-10-09"
+DEFAULT_TOOLCHAIN = PIN
 
 
 def key_of(code, message):

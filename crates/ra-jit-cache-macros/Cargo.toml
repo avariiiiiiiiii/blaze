@@ -6,7 +6,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Indexable, Inc."]
 repository = "https://github.com/indexable-inc/blaze"
-homepage = "https://ra-jit.ix.dev"
+homepage = "https://ix.dev/blaze"
 keywords = ["cache", "memoize", "jit"]
 categories = ["development-tools", "caching"]
 

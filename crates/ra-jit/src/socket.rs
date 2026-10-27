@@ -230,7 +230,13 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     }
     match std::fs::create_dir(dir) {
         Ok(()) => windows::only_the_user_opens(dir)?,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        // The user's own directory left open by what made it with the default list, as on
+        // unix: closed. A link is not followed, and another user's is refused below.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(dir)?.is_dir() && windows::owned_by_user(dir)? {
+                windows::only_the_user_opens(dir)?;
+            }
+        }
         Err(e) => return Err(e),
     }
     if !std::fs::symlink_metadata(dir)?.is_dir() {
@@ -399,8 +405,9 @@ mod windows_tests {
             .output()
             .unwrap();
         assert!(opened.status.success(), "{opened:?}");
-        let refused = private_dir(&dir).unwrap_err();
-        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        // The user's own directory that others can enter is closed, not refused.
+        private_dir(&dir).unwrap();
+        windows::the_users_alone(&dir).unwrap();
         let file = dir.join("file");
         std::fs::write(&file, "").unwrap();
         assert_eq!(private_dir(&file).unwrap_err().kind(), io::ErrorKind::AlreadyExists);

@@ -7,6 +7,7 @@ name = "cases"
 version = "0.0.0"
 dependencies = [
  "old_macros",
+ "upstream",
 ]
 
 [[package]]
@@ -23,3 +24,7 @@ version = "0.0.0"
 dependencies = [
  "cases",
 ]
+
+[[package]]
+name = "upstream"
+version = "0.0.0"

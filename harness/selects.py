@@ -52,7 +52,11 @@ def scripted(ws, name, body):
 
 
 def workspace(ws):
-    write(f"{ws}/Cargo.toml", '[workspace]\nmembers = ["app", "dep", "devdep", "devmacro", "other"]\nresolver = "2"\n')
+    # The marks are written beside the packages, which a sandbox refuses (it lets a build script
+    # write only its OUT_DIR, a proc macro nothing): the workspace runs them outside.
+    write(f"{ws}/Cargo.toml", '[workspace]\nmembers = ["app", "dep", "devdep", "devmacro", "other"]\nresolver = "2"\n\n'
+          '[workspace.metadata.blaze.sandbox]\nunsandboxed-build-scripts = ["dep", "devdep", "other"]\n'
+          'unsandboxed-proc-macros = ["devmacro"]\n')
     write(f"{ws}/app/Cargo.toml", PACKAGE % "app" + '\n[dependencies]\ndep = { path = "../dep" }\n\n'
           '[dev-dependencies]\ndevdep = { path = "../devdep" }\ndevmacro = { path = "../devmacro" }\n')
     write(f"{ws}/app/src/main.rs",

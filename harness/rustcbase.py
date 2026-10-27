@@ -17,7 +17,8 @@ in full while the program is still what rustc linked is spliced into that whole 
 The `cached-` scenarios have a program with a `#[ra_jit::cache]` function instead, whose
 results are kept in WORK/fn-cache.
 
-Exits 1 when an output differs or an edit was built another way than the scenario says.
+Exits 1 when an output differs, an edit was built another way than the scenario says, or a
+build in full of a scenario in ONE_ROUND started over.
 """
 import os, re, shutil, subprocess, sys, time
 
@@ -299,6 +300,10 @@ fn main() {
     show(&mut out, work(7));
     show(&mut out, "text");
     out.push_str(&dep::wrap(5));
+    writeln!(out, "{} {} {}", listed(&[1u8, 2]), listed(&["a", "b"]), 4u8.sides()).unwrap();
+    writeln!(out, "{}", shown_by(&Plain)).unwrap();
+    let through: &dyn Visit = std::hint::black_box(&Through(Plain));
+    writeln!(out, "{}", through.visit()).unwrap();
     print!("{out}");
     if args.first().is_some_and(|it| it == "panic") {
         boom::<u8>(1);
@@ -307,6 +312,49 @@ fn main() {
 
 fn show<W: std::fmt::Write, T: std::fmt::Display>(out: &mut W, value: T) {
     writeln!(out, "{value} at {}", line!()).unwrap();
+}
+
+fn listed<T: std::fmt::Display>(items: &[T]) -> String {
+    let around = '|';
+    items.iter().map(|it| format!("{around}{it}")).collect::<Vec<_>>().join(", ")
+}
+
+trait Sides {
+    fn sides(&self) -> u32;
+}
+
+impl Sides for u8 {
+    fn sides(&self) -> u32 {
+        u32::from(*self) + 3
+    }
+}
+
+trait Shown {
+    fn shown<T: std::fmt::Display>(&self, value: T) -> String;
+}
+
+struct Plain;
+
+impl Shown for Plain {
+    fn shown<T: std::fmt::Display>(&self, value: T) -> String {
+        format!("<{value}>")
+    }
+}
+
+fn shown_by<S: Shown>(by: &S) -> String {
+    by.shown(1u8) + &by.shown("x")
+}
+
+trait Visit {
+    fn visit(&self) -> String;
+}
+
+struct Through(Plain);
+
+impl Visit for Through {
+    fn visit(&self) -> String {
+        self.0.shown(2u16)
+    }
 }
 
 fn boom<T: Default + std::fmt::Debug>(code: u64) {
@@ -325,9 +373,19 @@ GENERIC_FILES = {
 GENERIC_SCENARIOS = {
     "generic-below": ([[edit(M, "    x * 3\n", "    let y = x * 3;\n    y\n")]], ["patch"], 0, {}),
     "generic-below-body": ([[edit(M, '"{value} at {}"', '"{value} is at {}"')]], ["patch"], 0, {}),
-    # Copied into a crate that calls it from another file, which nothing homed of `dep` knows.
+    # rustc compiled the closure of each copy of `listed` apart, under the copy's path.
+    "generic-closure": ([[edit(M, 'format!("{around}{it}")', 'format!("{around}{it}{around}")')]],
+                        ["patch"], 0, {}),
+    # The line `listed` gains moves the declaration of `Sides::sides` below it, which has no code.
+    "generic-above-declaration": ([[edit(M, "    let around = '|';\n", "    let around = '|';\n    let around = [around][0];\n")]],
+                                  ["patch"], 0, {}),
+    # A generic method of an `impl` that is not generic, called through its trait, and from
+    # a method that only a `dyn` reaches, whose copy is read off rustc's path of it.
+    "generic-method": ([[edit(M, 'format!("<{value}>")', 'format!("<{value}!>")')]], ["patch"], 0, {}),
+    # `wrap` (its `line!()` moves) is copied into a crate that calls it from another file, which
+    # a search for its callers finds.
     "generic-elsewhere": ([[edit("dep/src/lib.rs", "    x + 100\n", "    let y = x + 100;\n    y\n")]],
-                          ["full"], 0, {}),
+                          ["patch"], 0, {}),
 }
 SCENARIOS.update(GENERIC_SCENARIOS)
 
@@ -388,6 +446,194 @@ SAME_NAME_SCENARIOS = {
 }
 SCENARIOS.update(SAME_NAME_SCENARIOS)
 
+# A library whose `#[inline(always)]` and generic functions declare statics through a macro of
+# its own, which another module brings in with `pub(crate) use`, as salsa's tracing wrappers do
+# (#299): rustc copies the functions into the program and exports the statics, and a build in
+# full names rustc's statics rather than starting over without the functions. Each use of the
+# macro has a static in the function and one in a closure, used twice in a function.
+STATICS_DEP = """\
+mod trace {
+    macro_rules! counted {
+        ($x:expr) => {{
+            let seen = {
+                #[cold]
+                #[inline(never)]
+                || {
+                    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                }
+            };
+            static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            $x + seen() * 1000 + TICKS.load(std::sync::atomic::Ordering::Relaxed) * 100
+        }};
+    }
+    pub(crate) use counted;
+}
+
+#[inline(always)]
+pub fn tick(x: u64) -> u64 {
+    crate::trace::counted!(x) + crate::trace::counted!(x)
+}
+
+pub fn tick_generic<T: Into<u64>>(x: T) -> u64 {
+    crate::trace::counted!(x.into())
+}
+
+#[inline(never)]
+pub fn tick_here(x: u64) -> u64 {
+    tick(x) + tick_generic(x as u32)
+}
+"""
+STATICS_FILES = {
+    **FILES,
+    "app/src/main.rs": MAIN.replace('    println!("dep {}", dep::value(2));\n',
+                                    '    println!("dep {}", dep::value(2));\n'
+                                    '    println!("ticks {} {} {}", dep::tick(1), dep::tick_generic(2u8), dep::tick_here(3));\n'
+                                    '    println!("ticks {} {} {}", dep::tick(1), dep::tick_generic(2u8), dep::tick_here(3));\n'),
+    "dep/src/lib.rs": FILES["dep/src/lib.rs"] + "\n" + STATICS_DEP,
+}
+STATICS_SCENARIOS = {
+    "macro-statics": ([[edit(M, "    x + 1\n}\n\nfn counted", "    x + 2\n}\n\nfn counted")]], ["full"], 0,
+                      {"RA_JIT_STATS": "1"}),
+}
+SCENARIOS.update(STATICS_SCENARIOS)
+# A program with a thread-local of its own, as nearly every real one has: a build in full has
+# its own copy of it, which nothing can add to what rustc linked, so it is linked in full at
+# once rather than built for a splice that can't be made and then built again (#299).
+TLS_FILES = {
+    **FILES,
+    "app/src/main.rs": MAIN.replace('    println!("dep {}", dep::value(2));\n',
+                                    '    println!("dep {}", dep::value(2));\n'
+                                    '    println!("hits {} {}", hit(), hit());\n')
+    + "\nthread_local! {\n    static HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };\n}\n\n"
+      "fn hit() -> u32 {\n    HITS.with(|it| {\n        it.set(it.get() + 1);\n        it.get()\n    })\n}\n",
+}
+TLS_SCENARIOS = {
+    "thread-local-full": ([[edit(M, "    x + 1\n}\n\nfn counted", "    x + 2\n}\n\nfn counted")]], ["linked"], 0,
+                          {"RA_JIT_STATS": "1"}),
+}
+SCENARIOS.update(TLS_SCENARIOS)
+# Scenarios whose builds in full are one round: a line of a round that started over fails them,
+# as does a build thrown away for one that is linked in full.
+ONE_ROUND = set(STATICS_SCENARIOS) | set(TLS_SCENARIOS)
+
+# axum's `Body::from_stream` handed `stream.map(Ok)` (#369): the library, which rustc compiles,
+# asks for the `TypeId` of `Option<StreamBody<..>>` through `dyn Any` as axum-core's
+# `try_downcast` does, and the type holds an enum variant's constructor used as a function, a
+# function item and a closure and coroutine of the program. Unhashed, the edited function and so
+# `serve` were refused and the edit went to cargo. `envelope` is generic, so its first edit is built
+# in full (spliced whole on Linux) and the next one a patch of that.
+TYPEID_MAIN = """\
+use std::convert::Infallible;
+use std::future::Future;
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(it) = future.as_mut().poll(&mut cx) {
+            return it;
+        }
+    }
+}
+
+fn envelope<F>(work: F) -> dep::Body
+where
+    F: Future<Output = u64> + 'static,
+{
+    let first = 1;
+    let head = std::iter::once_with(move || Ok::<_, Infallible>(first));
+    let tail = std::iter::once(work).map(block_on).map(Ok::<_, Infallible>);
+    dep::Body::from_stream(head.chain(tail))
+}
+
+fn serve() -> dep::Body {
+    let make = |n: u64| envelope(async move { n * 5 });
+    make(2)
+}
+
+fn main() {
+    let filled = [7u8; 4096];
+    std::hint::black_box(&filled);
+    let body = serve();
+    println!("parts {:?} streamed {}", body.parts(), body.streamed());
+    let again = dep::Body::new(body);
+    println!("again {:?} streamed {}", again.parts(), again.streamed());
+    if std::env::args().nth(1).is_some_and(|it| it == "panic") {
+        panic!("failed with {}", again.parts().len());
+    }
+}
+"""
+TYPEID_DEP = """\
+use std::any::Any;
+use std::convert::Infallible;
+
+/// axum-core's: `k` as a `T` when it is one, which `Body::new` asks of every body it is given.
+pub fn try_downcast<T: 'static, K: 'static>(k: K) -> Result<T, K> {
+    let mut k = Some(k);
+    if let Some(k) = <dyn Any>::downcast_mut::<Option<T>>(&mut k) {
+        Ok(k.take().unwrap())
+    } else {
+        Err(k.unwrap())
+    }
+}
+
+pub struct StreamBody<S>(S);
+
+pub struct Body {
+    parts: Vec<u64>,
+    streamed: bool,
+}
+
+impl Body {
+    pub fn new<B: IntoIterator<Item = Result<u64, Infallible>> + 'static>(body: B) -> Body {
+        try_downcast::<Body, B>(body).unwrap_or_else(|body| Body {
+            parts: body.into_iter().map(|it| it.unwrap_or_else(|never| match never {})).collect(),
+            streamed: false,
+        })
+    }
+
+    pub fn from_stream<S: Iterator<Item = Result<u64, Infallible>> + 'static>(stream: S) -> Body {
+        let mut body = Body::new(StreamBody(stream));
+        body.streamed = true;
+        body
+    }
+
+    pub fn parts(&self) -> &[u64] {
+        &self.parts
+    }
+
+    pub fn streamed(&self) -> bool {
+        self.streamed
+    }
+}
+
+impl<S: Iterator<Item = Result<u64, Infallible>>> IntoIterator for StreamBody<S> {
+    type Item = S::Item;
+    type IntoIter = S;
+
+    fn into_iter(self) -> S {
+        self.0
+    }
+}
+
+impl IntoIterator for Body {
+    type Item = Result<u64, Infallible>;
+    type IntoIter = std::iter::Map<std::vec::IntoIter<u64>, fn(u64) -> Result<u64, Infallible>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.parts.into_iter().map(Ok as fn(u64) -> Result<u64, Infallible>)
+    }
+}
+"""
+TYPEID_FILES = {**FILES, "app/src/main.rs": TYPEID_MAIN, "dep/src/lib.rs": TYPEID_DEP}
+TYPEID_SCENARIOS = {
+    "typeid-ctor": ([[edit(M, "    let first = 1;\n", "    let first = 2;\n")],
+                     [edit(M, "    let first = 2;\n", "    let first = 3;\n")]], ["full", "patch"], 0, {}),
+}
+SCENARIOS.update(TYPEID_SCENARIOS)
+
 # How the daemon's own base is to go before the first edit, in the scenarios that say.
 OWN_BASE = {"unbuilt-member": "built", "own-base-budget": "given up", "own-base-budget-full": "given up"}
 
@@ -443,7 +689,10 @@ def how_built(lines):
 
 
 def wanted(want):
-    """What a scenario's `full` is on this platform: only an ELF executable is spliced whole."""
+    """What a scenario's `full` is on this platform: only an ELF executable is spliced whole.
+    `linked` is a build in full that is linked in full everywhere."""
+    if want == "linked":
+        return "full"
     return "whole" if want == "full" and sys.platform == "linux" else want
 
 
@@ -476,6 +725,12 @@ def main():
             files = LIB_FILES
         elif name in SAME_NAME_SCENARIOS:
             files = SAME_NAME_FILES
+        elif name in TYPEID_SCENARIOS:
+            files = TYPEID_FILES
+        elif name in STATICS_SCENARIOS:
+            files = STATICS_FILES
+        elif name in TLS_SCENARIOS:
+            files = TLS_FILES
         write_workspace(ws, files)
         home, target, store = (os.path.join(work, it) for it in ("home", "target", "store"))
         for path in (home, target, store, fn_cache):
@@ -546,6 +801,10 @@ def main():
                     failed.append(f"{name} edit {step}: {how}, not {want}")
                     for it in lines[-60:]:
                         print(f"      | {it[:240]}", flush=True)
+                over = [it for it in lines if re.match(r"round \d+: .*started over", it)
+                        or "was not spliced into it" in it]
+                if name in ONE_ROUND and over:
+                    failed.append(f"{name} edit {step}: {over[0][:400]}")
         except Exception as e:
             failed.append(f"{name}: {e}")
             print(f"  FAILED: {e}", flush=True)

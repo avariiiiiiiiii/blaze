@@ -17,13 +17,12 @@ import tempfile
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-NIGHTLY = "nightly-2026-09-15"
+NIGHTLY = open(os.path.join(HERE, "toolchain")).read().strip()
 sys.path.insert(0, HERE)
 
 # difftest.py reads RUSTUP_TOOLCHAIN when it is imported. Keep this assignment
 # before importing it so cargo, rustc and ra-jit inspect the same nightly tree.
 os.environ["RUSTUP_TOOLCHAIN"] = NIGHTLY
-os.environ["RA_JIT_OTHER_TOOLCHAIN"] = "1"
 from difftest import Fixture, RA_JIT  # noqa: E402
 
 

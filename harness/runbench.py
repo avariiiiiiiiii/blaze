@@ -48,6 +48,7 @@ DEFAULT = ["kernels", "numeric", "jsonrt", "ripgrep", "fd", "tokei", "eza", "bat
 RA_JIT_ENV = {"RA_JIT_BACKEND": "llvm", "RA_JIT_OPT": "3"}
 # What a variant may not inherit from the shell: the build is said by its flags alone.
 OWN_VARS = ["RA_JIT_BACKEND", "RA_JIT_OPT", "RA_JIT_EMIT", "RA_JIT_MIR_OPT", "RA_JIT_INLINE",
+            "RA_JIT_BUILT_IN", "RA_JIT_LLVM_INLINE_THRESHOLD",
             "RUSTFLAGS", "CARGO_INCREMENTAL", "RA_JIT_ALONE"]
 
 

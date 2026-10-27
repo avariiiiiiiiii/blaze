@@ -9,7 +9,9 @@ its own. Cargo builds it as it is, and again with ra-jit as `RUSTC_WRAPPER` and
 crates and stand-ins of no code for the workspace's, and ra-jit compiles every crate of the
 program into one object, with the C `main` of it, which is linked in their place. Both
 programs run, and what they print on either stream and the status they exit with have to be
-the same.
+the same. ra-jit then builds the object once more, and it has to be the same bytes: a whole
+program's layout follows the order its functions were asked for, not the order the threads
+finished them (#200).
 
   default_alloc  the default allocator; output on both streams and a status of its own
   custom_alloc   a `#[global_allocator]` of the program that counts what it is asked for
@@ -48,13 +50,22 @@ def check(ws, case, release):
         return "  not built as a whole program, LLVM left to Cranelift:\n" + "\n".join(f"    {it}" for it in left)
     program, _ = apps.reference(ws, {"package": case}, "release" if release else "debug")
     theirs, ours = fx.behaviour(program), fx.behaviour(fx.binary)
-    if theirs == ours:
-        return None
     lines = []
     for what, a, b in zip(("status", "stdout", "stderr"), theirs, ours):
         if a != b:
             lines.append(f"  {what}: cargo's {a!r}, ra-jit's {b!r}")
-    return "\n".join(lines)
+    if lines:
+        return "\n".join(lines)
+    # The same source has to give the same object every build, whichever thread compiled
+    # which function first (#200).
+    first = open(fx.objects[0], "rb").read()
+    try:
+        fx.ra_jit_build()
+    except SystemExit as failed:
+        return f"  ra-jit's second build failed: {str(failed)[-800:]}"
+    if open(fx.objects[0], "rb").read() != first:
+        return f"  built differently the second time: {fx.objects[0]} ({len(first)} bytes the first)"
+    return None
 
 
 def main():

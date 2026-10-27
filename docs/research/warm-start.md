@@ -236,3 +236,152 @@ after #295 (`stable-marks`), after is the branch; dev-aws-7 (64 vCPUs, nothing e
   for rustc's copy that says which build of the checkout it is of (**unverified** which).
 - So the cold compile at a nushell restart is still 6,401 functions and 51,413 instances in
   14.4 s, as before (**read**, "cold:").
+
+## Calls of rustc's copies kept in the store (#216, 2026-10-25)
+
+An entry whose function called rustc's copy of a function of the checkout was not kept ("rustc's
+copy of a function of the checkout"), and every entry that called it was not found ("an entry
+that calls what cannot be used"). The entry now names the function and the copy
+(`CachedTarget::Copy`): the build that takes it wants the function compiled and calls the copy,
+as `callee` does in a build that compiles the caller. What `callee` decides by is in the names
+the entry is kept under (the crate's content and ` checked` in the stable name, the program in
+the key) but for whether the program links the copy, which `links` asks, and for a function
+that returns a future, which stays refused. Before is main at 820c02e20b, after is the branch;
+dev-aws-5 (64 vCPUs, one other lane's tests running beside), `harness/warmstart.py`, the two
+interleaved, two rounds each:
+
+| | before | after |
+|---|---|---|
+| ripgrep `restart` build | 4.68, 4.61 s | 4.33, 4.25 s |
+| ripgrep functions compiled at `restart` | 2,375 | 0 |
+| ripgrep roots found in the store | 1,397 of 2,560 | 1,743 of 2,560 |
+| nushell `restart` build | 22.87, 22.75 s | 19.90, 19.68 s |
+| nushell `again` build | 22.86, 22.89 s | 19.53, 19.93 s |
+| nushell functions compiled at `restart` | 25,844 | 17 |
+| nushell roots found in the store | 4,888 of 12,559 | 7,622 of 12,559 |
+| nushell "not kept" / "not found" | 6,736 / 23,629 | 6 / 5 |
+| nushell first edit after the restart | 0.33 s | 0.58 s |
+| ripgrep first edit after the restart | 0.08 s | 0.29 s |
+
+- Where the nushell restart's 19.9 s go now (**read**, `said-restart.txt`): the spare worker's
+  crates 2.3 s and the workspace 1.1 s, rustc's symbols 2.2 s, name resolution 4.3 s (69 def
+  maps with a procedural macro are not frozen), then the code: finding the stored roots 3.9 s,
+  defining 1.4 s, writing the object 2.6 s, 9.9 s in all, and the link 0.8 s.
+- Finding the stored roots reads every entry whole, 155,843 of them, about 58 s summed over the
+  cores ("store read"), where the build before read 130,019 while it compiled. The blocks the
+  store unpacked lately are 32 MB; with 4 GB the reads take 46.5 s and the restart 19.1 s
+  (**read**, one run each), so unpacking a block again is not most of it.
+- The first edit after the restart is slower: warmstart's edit adds a line at the top of
+  `search` in ripgrep's `crates/core/main.rs`. 18 functions of that file from the store are
+  stale, as their lines moved, and the patch compiles 158 instances generic over closures
+  written in `search` (`filter_map`, `sort_by`, `attach_timestamps`), which the edit renamed: a
+  closure's stable name is the index of its expression in the body, which the added statement
+  moves (**read**, a temporary print of what a patch compiles). Main compiled those instances
+  at the start, and its patch is 21 functions (**read**): rust-analyzer interns a closure by
+  its place among the closures of its body (`ClosureKey` in `hir-ty/src/db.rs`), which the
+  added statement leaves, so the instances the base compiled are the patch's (**read**).
+
+## Closures named by their place and their source (2026-10-25)
+
+The stable name of a closure is now its place among the closures of its body, as it is
+interned (`ClosureKey::nth`), and the first 8 bytes of the SHA-256 of its source text, where it
+was the index of its expression. Before is `store-copies`, after is `closure-names`; dev-aws-5,
+warmstart.py, the two interleaved on a quiet host (a second round ran under another lane's
+load of 97 and is left out):
+
+| | before | after |
+|---|---|---|
+| ripgrep first edit after the restart | 0.29, 0.29 s, 176 functions patched | 0.26, 0.26 s, 19 |
+| nushell first edit after the restart | 0.57, 0.58 s, 66 functions patched | 0.54, 0.56 s, 17 |
+| ripgrep / nushell `restart` build | 4.33 / 20.40 s | 4.41 / 19.81 s |
+
+- The place alone is not enough (**read**, storetracked.py's step "a closure above a
+  closure"). A closure's instance name prints the arguments of its parent and not its
+  signature or what it captures, so a closure added above another took the other's name. The
+  patch found base code for that name and called it with what the new closure takes: the
+  program printed nothing. The hash of the source names the two apart; that step now compiles
+  11 instances the base has no code for, where the steps that edit a generic function's body
+  or a line above a closure compile none.
+- The hash is of the closure's text alone, so it moves with neither the file's path nor the
+  lines around it, which keeps it content-only as the store's keys are (#226), and it is the
+  kind of key item content hashes (#344) would give a closure.
+- What is left of the edit is the look for what it made stale: 166 ms on ripgrep ("check" in
+  the timeline), where main took 21 ms. Each function from the store in the edited file, and
+  what calls it, is compiled again to compare its mark with the store's: 382 functions on
+  ripgrep, 411 on nushell ("stats"), where the build that compiled them at its start had them
+  at hand (**read**).
+
+## What the nushell restart spends its 20 s on (profile, 2026-10-25)
+
+`perf record -F 499` of the worker through warmstart.py's nushell restart on dev-aws-5 (branch
+`closure-names`, release build without frame pointers, so by function only), cut into windows
+by the second the samples fall in (**read**):
+
+- Seconds 2 to 9 (the symbols of rustc's libraries, name resolution): SHA-256 5 %, SipHash
+  2 %, demangling, the parser; nothing above 6 %.
+- Seconds 10 to 12, the stored roots, on every core: `Symbol::intern` 33 %, zstd unpacking
+  13 %, `Interned<Told>::new` 3 %, `Search<Listed>::own` 2 %. Reading an entry turns its
+  debugger's types back into a set (`TypeSet::from` in `Entries::types`), interning every
+  name of every type, which 64 threads ask of one interner, the popular names counted on one
+  cache line.
+- Seconds 12 to 20, on one or two cores: the entries stitched (`Entries::get`,
+  `found_callee`), the debug info written with gimli (its string table's `insert_full` 6 %,
+  `calculate_offsets` 6 %), and lld's link. What the build read is freed on another thread
+  already (`finish`).
+
+So the next costs are the debugger's types read whole for every entry while the roots are
+looked for, which only stitching needs; the debug info of all 155,843 functions written again
+when nothing changed; and the link of an executable the target directory already has.
+
+## The first edit after a restart: code from the store told unchanged by its items (2026-10-25)
+
+Each store entry now names the items of the checkout its code comes from, as they were written
+when it was compiled: the body it is written in, the bodies whose places it tells (a panic's
+location, a `#[track_caller]` declaration) with the line and column each begins on, and the
+bodies it mentions a coroutine of, and the bodies that give an `impl Trait` in it its type
+with the closures in that type, by a hash of the text of each. After an edit of nothing but
+bodies, code from the store whose items in the edited files read as they did is taken as it
+was, not compiled again to compare its mark. A closure or function an instance is generic over
+is not one of its items: its stable name prints it whole, what a closure captures with it, so
+the same name is the same code and a changed one leaves the old code uncalled. Before is main
+(`24cb49d6`), after is the branch merged with it; "old" is main before #360 compiled everything
+at the start (`2be2c76`). dev-aws-7, warmstart.py, quiet host, main and the branch interleaved,
+three nushell pairs in both orders (**read**):
+
+| | old | main | after |
+|---|---|---|---|
+| ripgrep first edit after the restart | 0.09, 0.10 s | 0.30 to 0.32 s | 0.22, 0.23 s |
+| ripgrep: functions asked, "check" | 382 (warm), 25 ms | 382, 210 ms | 17, 114 ms |
+| nushell first edit after the restart | 0.37, 0.36 s | 0.57 to 0.68 s | 0.53 to 0.70 s |
+| nushell: functions asked, "check" | 156 (warm), 216 ms | 156, 439 to 528 ms | 18, 443 to 530 ms |
+| ripgrep / nushell `restart` build | 4.78 / 25.7 s | 4.63 to 4.75 / 20.4 to 21.4 s | 4.72 to 4.94 / 21.4 to 22.2 s |
+
+The nushell restarts differ by which ran first of a pair: main first, main took 21.38 and 21.21 s
+and the branch 21.44 and 21.61 s, its compile of the roots 9.7 s where main's took 10.2 s.
+
+- What ripgrep still asks is what changed: the 17 functions below the edit whose panic
+  locations moved a line, each patched. They cost what they do because nothing they reach is
+  compiled yet: `perf record -g` of the edit (frame pointers) puts 27 % of the daemon's time in
+  `inlinable`/`small_body`, the MIR of every callee a recompiled function might inline, each
+  on a cold body of another crate (its file parsed, 14 %; inferred, 23 %), and most of the
+  rest in the instance's own inference, layouts and macro expansions. The revert after it
+  ("back", 0.10 s) finds them warm (**read**).
+- nushell asked 105 before the `impl Trait`s were looked through: 87 drop glues of types with
+  one in them, whose type a body says and no name does, had no items and were compiled to
+  tell (**read**, `RJ_DBG` run). Now it asks 18, but the edit takes as long: the check is the
+  edited function itself and the 17 below it, compiled cold, 483 to 509 ms each where main's
+  156 asks, warming what they share on 64 threads, left the edited one 295 to 320 ms. The
+  revert after it takes 0.26 s (**read**).
+- Compiling the store's code of the checkout at the end of the restart instead, as main did
+  before #360, was tried: ripgrep's check fell to 26 ms, but the restart took 1.1 s longer and
+  the edit then wrote the 8,155 functions it compiled, 0.18 to 0.20 s in all (**read**). The
+  rest of the gap is work that only a warm database or a persisted answer saves: which
+  callees are small enough to inline, kept by the callee's content, would take the largest
+  share (**unverified**).
+- A stored mark hashed where the named locals of the code are kept for a debugger, and a full
+  build and a later compile of the same code differ there: std's `map_fold` over the
+  fixture's closures, whose two zero-sized parameters `f` and `g` have a slot each in the
+  full build and none in the later compile, the machine code byte for byte the same. Every
+  edit after a restart found such code changed and compiled it again; the mark now leaves
+  the slots out with the variables (**read**, storetracked.py under `RA_JIT_CHECK_ALL`). Why
+  the two compiles give them slots differently is not known (**unverified**).

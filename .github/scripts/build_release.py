@@ -10,8 +10,13 @@ build it with this.
   build_release.py --pin DIR                      # pgo/profiles.json names the profiles in DIR
   build_release.py --target T --show              # the command the build runs, for any other driver
 
-The build is `cargo build -p ra-jit --profile dist --locked --target T` with
-`RUSTFLAGS=-Cprofile-use=<profile>`. The profile is the one pgo/profiles.json pins for T: it
+The build is `cargo build -p ra-jit --profile dist --locked --target T --features llvm` with
+`RUSTFLAGS=-Cprofile-use=<profile>`. The `llvm` feature is part of every build of it, the
+training's included, so that every user gets the LLVM tiers (docs/tiers.md): LLVM is linked in
+statically from the build crates/hir-ty-codegen/llvm.json pins, which `LLVM_SYS_231_PREFIX`
+names (the flake's) or, unset, .github/scripts/llvm.py fetches into target/llvm/T. The binaries
+are refused when one loads libLLVM, or on Linux a C++ runtime: a machine that downloads them has
+neither. The profile is the one pgo/profiles.json pins for T: it
 is downloaded from the `pgo-profiles` release and refused unless its sha256 is the pinned
 one; `--profdata` gives the file instead (the flake fetches it with the same hash, since a nix
 build has no network).
@@ -46,6 +51,14 @@ built whole by ra-jit (`--exe`), over the standard library ra-jit compiles, so i
 bridge of the libraries that ra-jit compiles; its own serde derives are expanded by the
 toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
 Linux only, where ra-jit links proc-macro libraries so far.
+
+On Linux every binary in DIR, the server's included, is refused when it asks for a glibc newer
+than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
+oldest hosted Ubuntu, and a binary linked on a newer system asks for that system's glibc
+(GitHub issue #351). install.sh says the same floor to a system below it. With `--nix` (the
+flake's `dist`) every binary has to load nixpkgs' glibc through a loader under /nix/store
+instead, as a binary built by Nix does: it never meets the system's glibc, so the floor is not
+its own, and a binary of the build that would meet it is refused.
 """
 
 import argparse
@@ -56,6 +69,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -85,6 +99,14 @@ STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
 # profile by its symbol, so a build whose hash is not the profile's finds next to nothing in it
 # (the crates that did not change below, none of the workspace's), and says nothing.
 CRATE = re.compile(rb"Cs([0-9A-Za-z]+)_6ra_jit")
+# The newest glibc a Linux binary of a release may ask for (install.sh's `glibc_floor`), and
+# how a binary names the versions it asks for (in its dynamic string table).
+GLIBC = (2, 34)
+GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
+# The LLVM the `llvm` feature links (crates/hir-ty-codegen/build.rs), and the libraries no
+# shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
+LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
+NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM")}
 
 
 def run(argv, **kwargs):
@@ -100,9 +122,10 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def recipe(target, rustflags, cflags, features=None):
+def recipe(target, rustflags, cflags, features=None, llvm="<LLVM_SYS_231_PREFIX>"):
     """The environment and command of the build for `target`: `cargo build -p ra-jit --profile
-    dist` with `rustflags`, and `cflags` for the C code that crates build with `cc`. No wrapper
+    dist --features llvm` with `rustflags`, `cflags` for the C code that crates build with `cc`,
+    and the LLVM prefix `llvm`. No wrapper
     of rustc: one around the workspace's crates (`ra-jit enable`'s, nixpkgs' cargo-auditable)
     changes their symbols, and the profile no longer finds them. Cargo hashes the empty
     `RUSTC_WORKSPACE_WRAPPER` too, unlike an unset one, so every build sets it, the training's
@@ -111,17 +134,28 @@ def recipe(target, rustflags, cflags, features=None):
     well (`0` is `dist`'s own setting, so the hashes are those of a build without it)."""
     triple = target.replace("-", "_")
     env = {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "RUSTFLAGS": rustflags, "RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": "",
-           "CARGO_INCREMENTAL": "0"}
+           "CARGO_INCREMENTAL": "0", LLVM_PREFIX: str(llvm)}
     for name in ("CFLAGS", "CXXFLAGS"):
         env[f"{name}_{triple}"] = " ".join(filter(None, [os.environ.get(f"{name}_{triple}"), cflags]))
     return env, ["cargo", "build", "-p", "ra-jit", "--profile", "dist", "--locked", "--target", target,
-                 *(["--features", features] if features else [])]
+                 "--features", ",".join(["llvm", *filter(None, [features])])]
+
+
+def llvm_prefix(target):
+    """The prefix of the pinned LLVM: `LLVM_SYS_231_PREFIX` when it is set (build.rs refuses any
+    but the pinned build), else the pinned archive for `target`, fetched into target/llvm."""
+    given = os.environ.get(LLVM_PREFIX)
+    if given:
+        return Path(given)
+    prefix = ROOT / "target" / "llvm" / target
+    run([sys.executable, "-I", ROOT / ".github" / "scripts" / "llvm.py", "fetch", "--target", target, "--dir", prefix])
+    return prefix
 
 
 def build(target, target_dir, rustflags, cflags, features=None):
     """The build into `target_dir`; the result is the binaries it built (every one of ra-jit's:
     what ships is all of them) and how many functions LLVM found changed since the profile."""
-    own, argv = recipe(target, rustflags, cflags, features)
+    own, argv = recipe(target, rustflags, cflags, features, llvm_prefix(target))
     own["CARGO_TARGET_DIR"] = str(target_dir)
     env = dict(os.environ, **own)
     print("+", " ".join(f"{k}={shlex.quote(v)}" for k, v in own.items()), " ".join(argv), flush=True)
@@ -275,6 +309,88 @@ def proc_macro_server(ra_jit, out):
     return exe
 
 
+def glibc_asked(binary):
+    """The newest glibc `binary` asks for, as (major, minor), or None for one that asks for none."""
+    found = {(int(major), int(minor)) for major, minor in GLIBC_VERSION.findall(binary.read_bytes())}
+    return max(found, default=None)
+
+
+def check_glibc(out):
+    """Refuses the build when a binary in `out` asks for a glibc newer than `GLIBC`."""
+    shown = ".".join(map(str, GLIBC))
+    newer = []
+    for binary in sorted(out.iterdir()):
+        if binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF":
+            asked = glibc_asked(binary)
+            if asked and asked > GLIBC:
+                newer.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}")
+    if newer:
+        sys.exit(f"error: build_release: {'; '.join(newer)}, newer than RHEL 9's {shown}, so it does not start "
+                 "there: build on Ubuntu 22.04, as the release does")
+    print(f"build_release: the binaries in {out} ask for glibc {shown} or older", flush=True)
+
+
+def check_loads(out):
+    """Refuses the build when a binary in `out` loads a library `NOT_LOADED` names."""
+    system = "darwin" if sys.platform == "darwin" else "linux"
+    wrong = []
+    for binary in sorted(out.iterdir()):
+        if not binary.is_file() or binary.read_bytes()[:4] not in (b"\x7fELF", b"\xcf\xfa\xed\xfe"):
+            continue
+        argv = ["otool", "-L", binary] if system == "darwin" else ["readelf", "-d", binary]
+        shown = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
+        lines = shown.splitlines()[1:] if system == "darwin" else [l for l in shown.splitlines() if "(NEEDED)" in l]
+        wrong += [f"{binary.name}: {line.strip()}" for line in lines if NOT_LOADED[system].search(line)]
+    if wrong:
+        sys.exit(f"error: build_release: a shipped binary loads what a user's machine lacks: {'; '.join(wrong)}. "
+                 "LLVM and, on Linux, libstdc++ are linked in statically (crates/hir-ty-codegen/build.rs)")
+    print(f"build_release: the binaries in {out} load no libLLVM" + ("" if system == "darwin" else " or C++ runtime"),
+          flush=True)
+
+
+def interpreter(binary):
+    """The loader a 64-bit ELF executable names (PT_INTERP), or None for one that names none."""
+    data = binary.read_bytes()
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        return None
+    endian = "<" if data[5] == 1 else ">"
+    (phoff,) = struct.unpack_from(endian + "Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from(endian + "HH", data, 0x36)
+    for index in range(phnum):
+        header = phoff + index * phentsize
+        if struct.unpack_from(endian + "I", data, header)[0] == 3:
+            offset, size = struct.unpack_from(endian + "Q", data, header + 8)[0], struct.unpack_from(endian + "Q", data, header + 32)[0]
+            return data[offset:offset + size].rstrip(b"\0").decode()
+    return None
+
+
+def check_nix(out):
+    """Refuses the build when a binary in `out` would load the system's glibc and not nixpkgs'."""
+    system = []
+    for binary in sorted(out.iterdir()):
+        if binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF":
+            loader = interpreter(binary)
+            if loader is not None and not loader.startswith("/nix/store/"):
+                system.append(f"{binary.name} loads {loader}")
+    if system:
+        sys.exit(f"error: build_release: --nix, but {'; '.join(system)}, the system's glibc: build it in the flake")
+    print(f"build_release: the binaries in {out} load nixpkgs' glibc from /nix/store (--nix: RHEL 9's glibc floor is the release's)", flush=True)
+
+
+def ship(args, binaries):
+    """The binaries copied into `--out`, with blaze's proc-macro server for `--server`."""
+    if not args.out:
+        return
+    args.out.mkdir(parents=True, exist_ok=True)
+    for binary in binaries:
+        shutil.copy2(binary, args.out / binary.name)
+    if args.server:
+        proc_macro_server(args.out / "ra-jit", args.out)
+    check_loads(args.out)
+    if "linux" in args.target:
+        check_nix(args.out) if args.nix else check_glibc(args.out)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--target")
@@ -282,10 +398,12 @@ def main():
     parser.add_argument("--train", type=Path, metavar="DIR", help="train a new profile into DIR")
     parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
     parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
-    parser.add_argument("--features", help="cargo features of ra-jit (`llvm`); a release has none")
+    parser.add_argument("--features", help="cargo features of ra-jit besides `llvm`, which every build has")
     parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that ra-jit")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
+    parser.add_argument("--nix", action="store_true",
+                        help="the flake's build: its Linux binaries load nixpkgs' glibc, not the system's (no RHEL 9 floor)")
     args = parser.parse_args()
     if args.pin:
         return pin(args.pin)
@@ -293,6 +411,8 @@ def main():
         parser.error("--target is required")
     if args.server and not args.out:
         parser.error("--server builds into --out")
+    # The server is built from its own directory, where a relative `--out` names nothing.
+    args.out = args.out and args.out.resolve()
     if args.train:
         return train(args.target, args.train)
     if args.show:
@@ -300,9 +420,19 @@ def main():
         env, argv = recipe(args.target, f"-Cprofile-use=<{chosen['url']}, sha256 {chosen['sha256']}>", "-fno-profile-use", args.features)
         print(" ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()), " ".join(argv))
         return
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+    if pins()["toolchain"] != TOOLCHAIN and not args.strict:
+        # The toolchain moved and the pgo workflow has not trained on it yet (it runs when
+        # harness/toolchain changes on main): a build that is not a release goes without PGO.
+        print(f"warning: build_release: {PINS} has profiles of Rust {pins()['toolchain']}, ra-jit builds with "
+              f"{TOOLCHAIN}: built without PGO until the pgo workflow trains on {TOOLCHAIN}", file=sys.stderr, flush=True)
+        binaries, _ = build(args.target, target_dir, "", "", args.features)
+        ship(args, binaries)
+        print(f"build_release: {', '.join(b.name for b in binaries)} in {args.out or binaries[0].parent}, "
+              "without PGO", flush=True)
+        return
     path, chosen = profile(args.target, args.profdata)
-    binaries, stale = build(args.target, Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")),
-                            f"-Cprofile-use={path}", "-fno-profile-use", args.features)
+    binaries, stale = build(args.target, target_dir, f"-Cprofile-use={path}", "-fno-profile-use", args.features)
     crate = crate_hash(binaries)
     if crate != chosen.get("crate"):
         said = (f"build_release: this build's crates are not the ones the profile was trained on (ra-jit is crate "
@@ -312,12 +442,7 @@ def main():
         if args.strict:
             sys.exit(f"error: {said}")
         print(f"warning: {said}", file=sys.stderr, flush=True)
-    if args.out:
-        args.out.mkdir(parents=True, exist_ok=True)
-        for binary in binaries:
-            shutil.copy2(binary, args.out / binary.name)
-        if args.server:
-            proc_macro_server(args.out / "ra-jit", args.out)
+    ship(args, binaries)
     shown = args.out or binaries[0].parent
     print(f"build_release: {', '.join(b.name for b in binaries)} in {shown}, with the profile trained at "
           f"{chosen['commit'][:10]}; {stale} functions changed since and are not optimized by it", flush=True)

@@ -82,3 +82,55 @@ Times are wall times from the run's start; "queue wait" is a job's creation to i
 - **The cache's size.** GitHub sells more than 10 GB; with pull requests and queue entries no
   longer writing sccache, the space should go to main's entries. `nix-live.yaml`'s pull
   request entries (0.65 GB) are still written.
+
+## 2026-10-26: a lean pull request and queue, the rest nightly
+
+Measured from every `ra-jit.yaml` run of 2026-10-25 10:21Z to 10-27 00:33Z (the jobs, steps and
+the logs of every failed job, with `gh api`):
+
+- **Merge queue: 140 runs, 51 failed (37%).** Passing runs took 39.5 minutes at the median and
+  45.4 at p90; failing ones 43.1 and 48.8. Pushes to main the same (40.0, 45.7). No job waited
+  for a runner (0.1 minutes).
+- **The longest path** was the macOS build (6.4 minutes) and then macOS `quick-2` (33 at the
+  median, 37.6 at p90). `wholeprogram.py` alone took 644 to 1309 seconds of it and failed in
+  none of the runs. The Linux `quick-2` parts took 20 to 23 minutes for the same reason.
+- **Most failures were real breakage that sank whole groups.** A pull request's own run was
+  `fmt` alone, so a broken change met the harnesses first in a queue group of up to five: of the
+  126 pull requests in failed groups, 94 later landed unchanged. Repeated causes: `live_types.py`
+  (36 jobs, in clusters), `norustc.py` (46), the consteval unit tests (30), `selects.py` (28),
+  `renamedstatics.py --not-incremental` (22), `coldbuild.py` (10).
+- **Flakes** (the same commit failed and passed): `testselect.py`'s "that test taken out of the
+  sandbox" (about 15 Linux runs, pushes to main among them; #412), `aheadready.py` on macOS (6;
+  #413), and the `git fetch` of rust-lang/rust in `borrowck` and `pinned-ui` refused with HTTP
+  429 (26 jobs).
+- **`nix build (x86_64-linux)`** in `nix-live.yaml` failed on every run: the flake's `dist` ran
+  `build_release.py`, whose glibc 2.34 floor refused binaries linked against nixpkgs' glibc
+  (2.39 and newer).
+
+What changed: a pull request runs the fast tier on Linux x86-64 and must pass it to be queued;
+the queue adds Linux AArch64 and macOS, each with the harnesses where the platform matters
+(`FAST` in `harness/ci.py`); the harnesses are packed into parts of about four minutes; a push
+to main only builds and runs the unit tests, which write the caches; `wholeprogram.py`,
+`aheadready.py` on macOS and `nix-live.yaml`'s builds moved to the nightly, which opens an issue
+per failed job; every harness gets a daemon home of its own; rustc's tests come from the Actions
+cache; `testselect.py`'s flaky step is quarantined in the fast tier (#412); the flake's `dist`
+checks its binaries with `build_release.py --nix`. The numbers after are in harness.md's CI
+section once measured.
+
+## 2026-10-27: a merge gate of minutes, and the release train
+
+The queue still took 35 to 45 minutes a run after the change above, with no wait for a runner:
+the builds took 2 to 5 minutes (sccache hits), the unit tests 3 to 6, and the rest was
+harnesses, `quick-2` taking 20 to 30 minutes on each platform. Every entry of the queue paid
+that, for failures the harnesses could as well report on main with the commits they came in.
+
+What changed: the merge gate (`ra-jit.yaml`, the `ci` check) is the build and the unit tests on
+Linux x86-64, `harness/imports.py` and `harness/rustcsites.py`; `cargo fmt --check` is gone,
+and `fmt.yaml` formats main after each push. Everything else is the release train
+(`train.yaml`), on each push to main, one at a time on the newest commit: the full tier on four
+platforms, and `nix-live.yaml` (not blocking until it has been green a while). Its `core` part,
+36 to 47 minutes as one job in the nightly of 2026-10-26, is packed into `core-1` ...
+`core-N` by measured seconds, so that no part is longer than `wholeprogram.py` (19 minutes on
+macOS). A green train releases main when it has changes since the last release, through
+`pgo.yaml` and `release.yaml`; a red one opens or adds to one issue. The nightly schedules of
+`ra-jit.yaml` and `nix-live.yaml` are gone; `nix/units` was regenerated, after a week stale.

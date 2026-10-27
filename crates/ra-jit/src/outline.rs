@@ -43,8 +43,11 @@ const INERT: &[&str] = &[
 #[derive(Default)]
 pub(crate) struct Outlines {
     files: FxHashMap<FileId, Option<Outline>>,
-    /// The types each file defines, as [`types`] has them.
+    /// The types each file defines, as [`types`] has them, and those it defined and no longer
+    /// does: one that comes back is the same type, and a running program may still have
+    /// values of it.
     types: FxHashMap<FileId, FxHashMap<String, u64>>,
+    gone: FxHashMap<FileId, FxHashMap<String, u64>>,
     /// What [`copied`] found in each file before its first edit: as rustc compiled it.
     copied: FxHashMap<FileId, Copied>,
     /// The files of the edit about to be applied that it adds functions to, as
@@ -165,19 +168,29 @@ impl Outlines {
         homed
     }
 
-    /// The types that the files of the edit just applied defined and now define otherwise,
-    /// or no longer. A running program has values laid out as they were.
+    /// The types that the files of the edit just applied define otherwise than they did, or
+    /// than before they took them away: a running program has values laid out as they were,
+    /// which code of the new definition misreads. A type added under a name of its own, or
+    /// taken away, is no change: no value the program has is of it, or code that reads one
+    /// is gone with it.
     fn types_changed(&mut self, db: &RootDatabase, files: &[FileId]) -> Vec<String> {
         let mut changed = Vec::new();
         for &file in files {
             let now = types(db, file);
-            if let Some(was) = self.types.insert(file, now) {
-                let now = &self.types[&file];
-                changed.extend(
-                    was.into_iter()
-                        .filter(|(name, hash)| now.get(name) != Some(hash))
-                        .map(|it| it.0),
-                );
+            let Some(was) = self.types.insert(file, now) else { continue };
+            let now = &self.types[&file];
+            let gone = self.gone.entry(file).or_default();
+            for (name, hash) in &was {
+                match now.get(name) {
+                    Some(now) if now != hash => changed.push(name.clone()),
+                    Some(_) => {}
+                    None => _ = gone.insert(name.clone(), *hash),
+                }
+            }
+            for (name, hash) in now.iter().filter(|it| !was.contains_key(it.0)) {
+                if gone.remove(name).is_some_and(|it| it != *hash) {
+                    changed.push(name.clone());
+                }
             }
         }
         changed.sort_unstable();
@@ -271,8 +284,8 @@ impl Outlines {
 /// each starts. A panic in a copy says the line and column rustc compiled it at.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Copied {
-    /// Generic functions of the file's modules, not `#[inline]`, by name: rustc's symbols
-    /// name each copy by the types it is of.
+    /// Generic functions of the file's modules and of their `impl`s that are not generic, not
+    /// `#[inline]`, by name: rustc's symbols name each copy by the types it is of.
     generics: FxHashMap<String, u64>,
     /// `#[inline]` functions that are not generic, of the file's modules and their `impl`s,
     /// by name: rustc copies one into each crate that calls it.
@@ -296,6 +309,10 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
         })
     };
     let is_copied = |func: &ast::Fn| {
+        // A trait's method declared without a body has no code to copy.
+        if func.body().is_none() {
+            return false;
+        }
         let impl_trait_parameter = func.param_list().is_some_and(|it| {
             it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
         });
@@ -312,12 +329,18 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
     let inline = |func: &ast::Fn| {
         func.attrs().any(|attr| attr.syntax().text().to_string().contains("inline"))
     };
+    // Of the file's modules or an `impl` of them that is not generic, where the function's
+    // path names it alone.
     let of_modules = |func: &ast::Fn| {
-        let in_modules = func.syntax().ancestors().skip(1).all(|it| {
-            matches!(
-                it.kind(),
-                SyntaxKind::SOURCE_FILE | SyntaxKind::MODULE | SyntaxKind::ITEM_LIST
-            )
+        let in_modules = func.syntax().ancestors().skip(1).all(|it| match it.kind() {
+            SyntaxKind::SOURCE_FILE
+            | SyntaxKind::MODULE
+            | SyntaxKind::ITEM_LIST
+            | SyntaxKind::ASSOC_ITEM_LIST => true,
+            SyntaxKind::IMPL => {
+                !generic(ast::Impl::cast(it).and_then(|it| it.generic_param_list()))
+            }
+            _ => false,
         });
         in_modules && !inline(func)
     };
@@ -486,7 +509,10 @@ fn types(db: &RootDatabase, file: FileId) -> FxHashMap<String, u64> {
             .collect();
         let mut hasher = FxHasher::default();
         for token in node.descendants_with_tokens().filter_map(|it| it.into_token()) {
+            // A doc comment is an attribute, which this parser gives a kind of its own.
+            let doc = [SyntaxKind::OUTER_DOC_COMMENT, SyntaxKind::INNER_DOC_COMMENT];
             if token.kind().is_trivia()
+                || doc.contains(&token.kind())
                 || bodies.iter().any(|it| it.contains_range(token.text_range()))
             {
                 continue;
@@ -1548,6 +1574,9 @@ mod tests {
         told("fn g() {} fn f<T>() {}", "fn g() { } fn f<T>() {}");
         told("/* ab */ fn f<T>() {}", "/* é */ fn f<T>() {}");
         same("fn f<T>() {}\nfn g() {}", "fn f<T>() {}\nfn g() {\n}");
+        // A trait's method without a body has no code, wherever it is.
+        same("fn g() {}\ntrait T { fn f(&self); }", "fn g() {\n}\ntrait T { fn f(&self); }");
+        told("fn g() {}\ntrait T { fn f(&self) {} }", "fn g() {\n}\ntrait T { fn f(&self) {} }");
     }
 
     #[test]
@@ -1560,6 +1589,8 @@ mod tests {
             ("fn g() {}\nfn f<T>() {}", "fn g() {\n}\nfn f<T>() {}"),
             ("mod m { fn f(x: impl Fn()) { 1; } }", "mod m { fn f(x: impl Fn()) { 2; } }"),
             ("fn f<T>() {}\nfn g<T>() {}", "fn f<T>() { }\nfn g<T>() {}"),
+            ("impl S { fn f<T>(&self) { 1; } }", "impl S { fn f<T>(&self) { 2; } }"),
+            ("impl T for S { fn f<U>(&self) { 1; } }", "impl T for S { fn f<U>(&self) { 2; } }"),
         ] {
             assert!(generics(before, after) && !others(before, after), "{before:?}");
         }

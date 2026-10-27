@@ -183,7 +183,100 @@ fn below(paths: &[PathBuf], root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The environment cargo runs `unit`'s script with, when cargo's own is `inherited`.
+/// Where openssl-probe 0.1.6 looks for certificates, in order, on `host`.
+fn certificate_dirs(host: &str) -> Vec<&'static Path> {
+    let mut dirs = vec![
+        "/var/ssl",
+        "/usr/share/ssl",
+        "/usr/local/ssl",
+        "/usr/local/openssl",
+        "/usr/local/etc/openssl",
+        "/usr/local/share",
+        "/usr/lib/ssl",
+        "/usr/ssl",
+        "/etc/openssl",
+        "/etc/pki/ca-trust/extracted/pem",
+        "/etc/pki/tls",
+        "/etc/ssl",
+        "/etc/certs",
+        "/opt/etc/ssl",
+    ];
+    if host.contains("android") {
+        dirs.push("/data/data/com.termux/files/usr/etc/tls");
+    }
+    if host.contains("haiku") {
+        dirs.push("/boot/system/data/ssl");
+    }
+    dirs.into_iter().map(Path::new).collect()
+}
+
+const CERTIFICATE_FILES: [&str; 10] = [
+    "cert.pem",
+    "certs.pem",
+    "ca-bundle.pem",
+    "cacert.pem",
+    "ca-certificates.crt",
+    "certs/ca-certificates.crt",
+    "certs/ca-root-nss.crt",
+    "certs/ca-bundle.crt",
+    "CARootCertificates.pem",
+    "tls-ca-bundle.pem",
+];
+
+/// cargo's environment once it has started, from the one it was started with: what its
+/// scripts inherit. Before any command, cargo starts libgit2, whose `openssl_env_init` (git2
+/// 0.21.0, on hosts other than Windows, macOS and iOS) sets `SSL_CERT_FILE` and `SSL_CERT_DIR`
+/// to the certificates openssl-probe 0.1.6 finds on this machine, unless they name a file and
+/// a directory that exist.
+pub fn cargo_started(
+    started_with: &[(OsString, OsString)],
+    host: &str,
+) -> Vec<(OsString, OsString)> {
+    cargo_started_in(started_with, host, &certificate_dirs(host))
+}
+
+fn cargo_started_in(
+    started_with: &[(OsString, OsString)],
+    host: &str,
+    certificate_dirs: &[&Path],
+) -> Vec<(OsString, OsString)> {
+    let os = HostOs::of(host);
+    let mut env = started_with.to_vec();
+    if os.windows || os.macos {
+        return env;
+    }
+    let existing = |name: &str| {
+        started_with
+            .iter()
+            .find(|(it, _)| it == OsStr::new(name))
+            .map(|(_, value)| PathBuf::from(value))
+            .filter(|it| it.exists())
+    };
+    let mut cert_file = existing("SSL_CERT_FILE");
+    let mut cert_dir = existing("SSL_CERT_DIR");
+    for dir in certificate_dirs.iter().filter(|it| it.exists()) {
+        if cert_file.is_none() {
+            cert_file = CERTIFICATE_FILES.iter().map(|it| dir.join(it)).find(|it| it.exists());
+        }
+        if cert_dir.is_none() && dir.join("certs").exists() {
+            cert_dir = Some(dir.join("certs"));
+        }
+        if cert_file.is_some() && cert_dir.is_some() {
+            break;
+        }
+    }
+    for (name, value) in [("SSL_CERT_FILE", cert_file), ("SSL_CERT_DIR", cert_dir)] {
+        let Some(value) = value else { continue };
+        match env.iter_mut().find(|(it, _)| it == OsStr::new(name)) {
+            Some((_, it)) => *it = value.into_os_string(),
+            None => env.push((name.into(), value.into_os_string())),
+        }
+    }
+    env
+}
+
+/// The environment cargo runs `unit`'s script with, when cargo's own is `inherited` (see
+/// [`cargo_started`]).
 pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error> {
     let host = HostOs::of(&unit.host);
     let inherited_var = |name: &str| {
@@ -194,8 +287,11 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
 
     // `fill_env`, for a process on the host.
     let search = &unit.dylib_search;
-    let mut search_path = below(&[], &search.host_root);
-    search_path.push(search.host_root.clone());
+    let mut search_path = Vec::new();
+    if let Some(host_root) = &search.host_root {
+        search_path.extend(below(&[], host_root));
+        search_path.push(host_root.clone());
+    }
     search_path.extend(search.host_deps.iter().cloned());
     search_path.push(search.sysroot_libdir.clone());
     let dylib_path =
@@ -306,10 +402,12 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
         }
     }
     // `add_plugin_deps`.
-    let mut search_path =
-        cmd.get(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
-    search_path.extend(below(&search.plugin_search, &search.host_root));
-    cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
+    if let Some(host_root) = &search.host_root {
+        let mut search_path =
+            cmd.get(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
+        search_path.extend(below(&search.plugin_search, host_root));
+        cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
+    }
     // The jobserver's `Client::configure`.
     if let Some(auth) = &unit.jobserver {
         cmd.set("CARGO_MAKEFLAGS", format!("-j --jobserver-fds={auth} --jobserver-auth={auth}"));

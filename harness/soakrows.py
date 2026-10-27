@@ -14,12 +14,12 @@ Writes SOAKROWS.md next to this file.
 """
 import argparse, glob, os, re, shutil, signal, subprocess, sys, tempfile, time
 
-from cargo_ra_jit import HERE, RA_JIT, Side, base_env, difference, how_built, program_output, test_results, wait_warm
+from cargo_ra_jit import HERE, RA_JIT, TOOLCHAIN, Side, base_env, difference, how_built, program_output, test_results, wait_warm
 
 GIT = ["git", "-c", "user.name=ra-jit", "-c", "user.email=ra-jit@localhost", "-c", "advice.detachedHead=false"]
 OTHER_TOOLCHAIN = "1.94.0"
-# The nightly CI installs for borrowck_ui.py.
-NIGHTLY = "nightly-2026-10-09"
+# The pinned nightly CI uses for borrowck_ui.py.
+NIGHTLY = TOOLCHAIN
 MARK = re.compile(r"pub fn mark\(\) -> u64 \{ \d+ \}")
 
 
@@ -1067,8 +1067,6 @@ def outside_its_package(row):
     in_place(outside, open(outside).read().replace("    70\n", "    eight() * 10\n"))
     row.both("an item added there and called", want="seven 80")
 
-
-TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 
 ROWS = {
     "symlinked file": (symlinked_file, {}),

@@ -50,3 +50,24 @@ impl fmt::Display for ManifestDiagnostic {
 }
 
 impl std::error::Error for ManifestDiagnostic {}
+
+/// An error as cargo prints it to stderr: the diagnostic if there is one, else `error:` and
+/// each cause under `Caused by:`.
+pub fn report(err: &anyhow::Error, cwd: &Path) -> String {
+    if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
+        return diagnostic.render(cwd);
+    }
+    let mut chain = err.chain();
+    let mut out = format!("error: {}", chain.next().unwrap());
+    for cause in chain {
+        out.push_str("\n\nCaused by:");
+        for line in cause.to_string().lines() {
+            out.push('\n');
+            if !line.is_empty() {
+                out.push_str("  ");
+                out.push_str(line);
+            }
+        }
+    }
+    out
+}

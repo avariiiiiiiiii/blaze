@@ -19,7 +19,7 @@ fetched:
 
 | file | what it is |
 |---|---|
-| `salsa-0.28.5-evicted-memo.patch.txt` | the patch to salsa 0.28.5 that tells an evicted memo from one a panic left, and evicts no provisional memo; paths are salsa's own |
+| `salsa-0.28.5-evicted-memo.patch.txt` | the patch to salsa 0.28.5 that tells an evicted memo from one a panic left, and evicts no provisional memo; paths are salsa's own. Applied to `vendor/salsa` on 2026-10-26 for [#261](https://github.com/indexable-inc/blaze/issues/261) |
 | `salsa-issue-lru-cycle.md` | a draft of the salsa issue that proposes it, not filed |
 
 The same `previous_iteration` is in salsa's latest source on docs.rs

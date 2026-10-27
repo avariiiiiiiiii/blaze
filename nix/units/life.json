@@ -3085,7 +3085,7 @@
   "ra-jit-live@0.1.0": {
    "authors": "Indexable, Inc.",
    "description": "Applies ra-jit's edits to a program while it runs",
-   "homepage": "https://ra-jit.ix.dev",
+   "homepage": "https://ix.dev/blaze",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,

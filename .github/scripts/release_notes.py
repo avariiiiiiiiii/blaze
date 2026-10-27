@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Release notes for one version, from CHANGELOG.md.
 
-  release_notes.py --tag v0.1.0 --out notes.md   # the release workflow, on a tag
-  release_notes.py --out notes.md                # the workspace version, no tag
+  release_notes.py --tag v0.20261026.0 --out notes.md   # the release workflow, on a tag
+  release_notes.py --out notes.md                       # the workspace version, no tag
 
 Reads the version from `workspace.package.version` in Cargo.toml, refuses a tag that is not
-`v<that version>`, and writes the body of CHANGELOG.md's `## [<version>]` section to --out.
+`v<that version>` or not a dated version, and writes the body of CHANGELOG.md's
+`## [<version>]` section to --out. Versions are `0.YYYYMMDD.N`, N counting the releases of that
+day from 0 (the release train's, .github/scripts/train_release.py): semver, as cargo and
+crates.io need, with no bump to choose.
 Under GitHub Actions it also sets the step output `version`. Stdlib only.
 """
 
 import argparse
+import datetime
 import os
 import re
 import sys
@@ -31,6 +35,17 @@ def workspace_version() -> str:
         return tomllib.loads(manifest.read_text())["workspace"]["package"]["version"]
     except KeyError:
         fail(f"{manifest} has no workspace.package.version")
+
+
+def dated(version: str) -> None:
+    """Refuses a version that is not `0.YYYYMMDD.N` with a real date."""
+    found = re.fullmatch(r"0\.(\d{8})\.(0|[1-9]\d*)", version)
+    try:
+        if found is None:
+            raise ValueError
+        datetime.datetime.strptime(found[1], "%Y%m%d")
+    except ValueError:
+        fail(f"version {version} is not dated: a release is 0.YYYYMMDD.N (0.20261026.0)")
 
 
 def section(changelog: str, version: str) -> str:
@@ -56,6 +71,8 @@ def main() -> None:
     version = workspace_version()
     if args.tag and args.tag != f"v{version}":
         fail(f"tag {args.tag} does not match workspace version {version} (expected v{version})")
+    if args.tag:
+        dated(version)
 
     notes = section((ROOT / "CHANGELOG.md").read_text(), version)
     args.out.write_text(notes)

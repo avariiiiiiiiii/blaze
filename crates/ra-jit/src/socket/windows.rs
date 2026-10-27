@@ -117,6 +117,28 @@ fn failed(status: u32) -> io::Result<()> {
     if status == ERROR_SUCCESS { Ok(()) } else { Err(io::Error::from_raw_os_error(status as i32)) }
 }
 
+/// Whether `path` is this user's by its owner, as [`the_users_alone`] reads it.
+pub(super) fn owned_by_user(path: &Path) -> io::Result<bool> {
+    let (mut owner, mut descriptor) = (ptr::null_mut(), ptr::null_mut());
+    // SAFETY: the path ends with a zero, and the descriptor that `owner` points into is freed
+    // after its last use.
+    failed(unsafe {
+        GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &raw mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    })?;
+    let _descriptor = Local(descriptor);
+    let token = own_token()?;
+    Ok(Sid::of(&token, TokenUser)?.is(owner) || Sid::of(&token, TokenOwner)?.is(owner))
+}
+
 /// Refuses a `path` that this user did not make, or that its access control list opens
 /// to anyone but this user, the system and the administrators, who can take it anyway.
 /// The rights of the owner, whoever that is, are this user's once the owner is.

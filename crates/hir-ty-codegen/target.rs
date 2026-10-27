@@ -247,7 +247,7 @@ impl Target {
 
     /// What LLVM is told of how a frame larger than a page reaches the stack it needs. A PE
     /// image has `__chkstk` for it, which LLVM calls unasked; elsewhere the code touches
-    /// each page itself.
+    /// each page itself. Cranelift's code touches each page inline everywhere ([`Self::isa`]).
     pub fn stack_probe(&self) -> Option<&'static str> {
         (self.object_format != ObjectFormat::Coff).then_some("inline-asm")
     }
@@ -284,9 +284,13 @@ impl Target {
         };
         flags.set("is_pic", pic).map_err(|e| e.to_string())?;
         flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
-        if self.object_format == ObjectFormat::Coff {
-            // Windows commits a stack one page at a time, as the guard page below the last
-            // is touched: a frame larger than a page has to touch each on its way down.
+        // A frame larger than a page touches each page on its way down, as rustc's code does
+        // (`probe-stack=inline-asm`, [`Target::stack_probe`]). Windows commits a stack one
+        // page at a time as the guard page below the last is touched; elsewhere a thread's
+        // stack ends in a guard page that a frame larger than it would step over, into
+        // whatever is mapped below, rather than fault where std says the stack overflowed.
+        // WebAssembly's stack is the engine's.
+        if self.arch != Arch::Wasm32 {
             flags.set("enable_probestack", "true").map_err(|e| e.to_string())?;
             flags.set("probestack_strategy", "inline").map_err(|e| e.to_string())?;
         }

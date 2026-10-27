@@ -453,8 +453,9 @@ builds it in a few minutes on the same machine. Its build needs `nix develop .#b
 ## Fairness
 
 - Same machine, same source, same moment: the two builds alternate after every edit.
-- Same toolchain on both sides: Rust 1.99.0 (`harness/toolchain`), from the flake's
-  `devShells.bench`, which also pins LLVM 20 for the LLVM tier.
+- Same toolchain on both sides: the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`;
+  the runs dated before 2026-10-25 were on Rust 1.99.0), from the flake's
+  `devShells.bench`, which also pins LLVM 23 for the LLVM tier.
 - Cargo is warm and incremental: the dev profile's default (`CARGO_INCREMENTAL` unset).
 - Same linker: the toolchain's default (`cc`, which runs GNU ld on the benchmark machine). No mold,
   no lld, no sccache or other `RUSTC_WRAPPER` on either side (bench.py removes it).
@@ -487,8 +488,8 @@ into a target directory of its own, right after plain cargo, on the same source:
 |---|---|
 | mold | cargo with mold 3.0 as the linker (`-C link-arg=-fuse-ld=mold`) |
 | wild | cargo with wild 0.10 as the linker (`-C link-arg=-fuse-ld=wild`) |
-| `-Zthreads=8` | rustc's parallel front end, on the same 1.99.0 (`RUSTC_BOOTSTRAP=1`) |
-| nightly | plain cargo on the nightly below, to tell the nightly's own difference from Cranelift's |
+| `-Zthreads=8` | rustc's parallel front end, on the same toolchain (on 1.99.0 with `RUSTC_BOOTSTRAP=1` in the runs before 2026-10-25) |
+| nightly | plain cargo on the nightly below, to tell the nightly's own difference from Cranelift's; since 2026-10-25 it is the same nightly as plain cargo's, so the two should agree |
 | cg_clif | rustc_codegen_cranelift (`-Zcodegen-backend=cranelift`), on the nightly: it ships with nightlies only |
 | cg_clif + wild + `-Zthreads=8` | all three at once, the fastest cargo build there is |
 | `cargo check` | builds no code, so there is nothing to run after it: the floor of what rustc does |
@@ -496,8 +497,8 @@ into a target directory of its own, right after plain cargo, on the same source:
 The flags go in through `--config target.'cfg(all())'.rustflags`, which cargo adds to each
 project's own (helix sets `--cfg tokio_unstable` there; `RUSTFLAGS` would replace it).
 `-Zshare-generics` is not a column: it is already on in every debug build. The nightly is
-`rust-bin.nightly."2026-10-09"` with `rustc-codegen-cranelift-preview`, from the flake
-(`RA_JIT_NIGHTLY`). A setup that cannot build a project is reported as failed and not timed
+`harness/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
+the flake (`RA_JIT_NIGHTLY`; `rust-bin.nightly."2026-10-09"` in the runs before 2026-10-25). A setup that cannot build a project is reported as failed and not timed
 after that.
 
 Hot-patching a running program is compared on its own (`harness/hotpatch.py`): a small program
@@ -627,7 +628,7 @@ Every run of the workflow appends one line per platform to
 `docs/benchmarks/history/<platform>.jsonl` (`harness/benchhistory.py build`), whether or not the
 tables changed: the medians, spreads, who built each step, memory and store size of each project
 and phase, the platform, the machine and the run's link. The site's
-[/bench](https://ra-jit.ix.dev/bench) page charts those files, a platform and machine at a time,
+[/bench](https://ix.dev/blaze/bench) page charts those files, a platform and machine at a time,
 and the workflow starts the site's deploy after it commits.
 
 `benchhistory.py check` then compares the new line with the median of the last seven from the
@@ -650,7 +651,7 @@ machine; the band widens with the spread its own history shows.
 
 ## Run it yourself
 
-On any of the platforms with Nix (or with Rust 1.99.0, rust-src, LLVM 20 and Python 3 installed):
+On any of the platforms with Nix (or with the pinned nightly of `harness/toolchain`, rust-src, the pinned LLVM 23 and Python 3 installed):
 
 ```
 nix develop .#bench

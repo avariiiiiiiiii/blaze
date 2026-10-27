@@ -18,6 +18,7 @@ mod items;
 mod link;
 mod live;
 mod macro_list;
+mod macro_sandbox;
 mod memory;
 mod mirdump;
 mod outline;
@@ -37,6 +38,7 @@ mod test_harness;
 mod tier;
 mod trace;
 mod tree;
+mod unstable;
 mod weaken;
 mod whole;
 
@@ -385,8 +387,13 @@ struct Resolver<'a> {
     /// The symbols of the functions asked about, for every thread of the build: the threads
     /// that compile find them ahead of the one that puts the functions in the object.
     named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
+    /// The places of the closures and statics of the definitions gone through, for every
+    /// thread of the build.
+    places: Places,
     /// The symbols of what rustc linked, when the patch goes into it.
     linked: Option<Arc<symbols::Linked>>,
+    /// What the executable a whole build's patch goes into has kept of its link.
+    own_linked: Option<Arc<FxHashSet<String>>>,
     /// Set once the build turns out to be one in full, which `linked` is not for.
     in_full: Arc<std::sync::atomic::AtomicBool>,
     /// A build in full is spliced into what rustc linked too ([`onto_rustcs`]), and is for
@@ -418,7 +425,9 @@ struct ResolverParts<'a> {
     listed: &'a Listed,
     shared_paths: SharedPaths,
     named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
+    places: Places,
     linked: Option<Arc<symbols::Linked>>,
+    own_linked: Option<Arc<FxHashSet<String>>>,
     in_full: Arc<std::sync::atomic::AtomicBool>,
     onto: bool,
     prebuilt: Option<Arc<Prebuilt>>,
@@ -439,7 +448,9 @@ impl<'a> Resolver<'a> {
             listed: self.listed,
             shared_paths: self.shared_paths.clone(),
             named: self.named.clone(),
+            places: self.places.clone(),
             linked: self.linked.clone(),
+            own_linked: self.own_linked.clone(),
             in_full: self.in_full.clone(),
             onto: self.onto,
             prebuilt: self.prebuilt.clone(),
@@ -465,7 +476,9 @@ impl<'a> ResolverParts<'a> {
             listed,
             shared_paths,
             named,
+            places,
             linked,
+            own_linked,
             in_full,
             onto,
             prebuilt,
@@ -484,7 +497,9 @@ impl<'a> ResolverParts<'a> {
             listed,
             shared_paths,
             named,
+            places,
             linked,
+            own_linked,
             in_full,
             onto,
             prebuilt,
@@ -533,6 +548,33 @@ fn library_unit(db: &RootDatabase, program: &[Crate]) -> FxHashSet<ide_db::base_
     unit
 }
 
+/// What a program of tests compiles of the standard library's crates beside its own:
+/// `test`, and what only it links, which [`library_unit`] leaves out. None for another.
+fn tests_linked(
+    db: &RootDatabase,
+    program: &[Crate],
+    tests: bool,
+) -> FxHashSet<ide_db::base_db::Crate> {
+    use ide_db::base_db::LangCrateOrigin::Test;
+    let library = library_unit(db, program);
+    let unlinked = unlinked_panic_runtime(db, program);
+    let deps = |it: ide_db::base_db::Crate| it.data(db).dependencies.iter().map(|dep| dep.crate_id);
+    let mut next: Vec<ide_db::base_db::Crate> = match tests {
+        true => program.iter().flat_map(|&it| deps(it.into())).collect(),
+        false => Vec::new(),
+    };
+    next.retain(|it| matches!(it.data(db).origin, CrateOrigin::Lang(Test)));
+    let mut tested = FxHashSet::default();
+    while let Some(krate) = next.pop() {
+        let name = Crate::from(krate).display_name(db);
+        let unlinked = name.is_some_and(|it| it.crate_name().as_str() == unlinked);
+        if !library.contains(&krate) && !unlinked && tested.insert(krate) {
+            next.extend(deps(krate));
+        }
+    }
+    tested
+}
+
 /// The panic runtime a program does not link: `panic_unwind` when its crate is built with
 /// `panic = "abort"`, which the profile gives it as `cfg(panic = "abort")`, else
 /// `panic_abort`. std depends on both, and rustc links the one the strategy names.
@@ -567,9 +609,53 @@ fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
         // compiles itself to be told why. A thread-local is not a "definition" to `object`.
         let defined =
             file.symbols().filter(|it| !it.is_undefined() && it.scope() == SymbolScope::Dynamic);
-        names.extend(defined.filter_map(|it| it.name().ok().map(str::to_owned)));
+        // Mach-O spells every name with an underscore in front, which the names looked up
+        // ([`Resolver::in_prebuilt`]) don't have: with it kept, no function or static of the
+        // prebuilt std was found on macOS, a build script compiled std's itself and stopped
+        // at its first writable static (`GLOBAL_PANIC_COUNT`).
+        let macho = file.format() == object::BinaryFormat::MachO;
+        names.extend(defined.filter_map(|it| {
+            let name = it.name().ok()?;
+            Some(if macho { name.strip_prefix('_').unwrap_or(name) } else { name }.to_owned())
+        }));
     }
     Ok(names)
+}
+
+/// The names the executable at `path` defines, read once for each file a link writes: a
+/// splice adds to the file in place, where a link writes a new one.
+fn kept_names(path: &Path) -> Option<Arc<FxHashSet<String>>> {
+    #[cfg(unix)]
+    {
+        use object::{Object as _, ObjectSymbol as _};
+        use std::os::unix::fs::MetadataExt as _;
+        type Kept = FxHashMap<PathBuf, ((u64, u64), Arc<FxHashSet<String>>)>;
+        static KEPT: std::sync::LazyLock<std::sync::Mutex<Kept>> =
+            std::sync::LazyLock::new(Default::default);
+        let file = std::fs::metadata(path).ok()?;
+        let key = (file.dev(), file.ino());
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, names)) = kept.get(path)
+            && *at == key
+        {
+            return Some(names.clone());
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let file = object::File::parse(&*bytes).ok()?;
+        let macho = file.format() == object::BinaryFormat::MachO;
+        let names = file.symbols().filter(|it| it.is_definition()).filter_map(|it| {
+            let name = it.name().ok()?;
+            Some(if macho { name.strip_prefix('_').unwrap_or(name) } else { name }.to_owned())
+        });
+        let names = Arc::new(names.collect::<FxHashSet<_>>());
+        kept.insert(path.to_owned(), (key, names.clone()));
+        Some(names)
+    }
+    #[cfg(not(unix))]
+    {
+        _ = path;
+        None
+    }
 }
 
 /// The [`SymbolTable::generation`] and the checkout that paths were found with.
@@ -605,12 +691,22 @@ impl<'a> Resolver<'a> {
         listed: &'a Listed,
     ) -> Resolver<'a> {
         let over_rustc = known.homes() && !known.builds_base();
+        // A build with thread-locals of its own is linked in full: building it for a splice
+        // that can't be made would only build it again.
         let onto = !known.builds_base()
             && *SPLICING
             && args.patch.is_some()
             && args.link_cmd.is_some()
-            && args.splice.as_deref().is_some_and(onto_rustcs);
+            && args.splice.as_deref().is_some_and(|binary| {
+                onto_rustcs(binary)
+                    && !rustc_symbols(binary).is_some_and(|it| it.has_own_thread_locals())
+            });
         let linked = args.splice.as_deref().filter(|_| over_rustc || onto).and_then(rustc_symbols);
+        let own_linked = args
+            .splice
+            .as_deref()
+            .filter(|_| linked.is_none() && table.is_empty() && args.patch.is_some())
+            .and_then(kept_names);
         let (root, base) = (args.checkout.clone(), args.base.clone());
         let debug = args.debug;
         let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
@@ -638,7 +734,9 @@ impl<'a> Resolver<'a> {
             listed,
             shared_paths: Default::default(),
             named: Default::default(),
+            places: Places::default(),
             linked,
+            own_linked,
             in_full: Arc::default(),
             onto,
             prebuilt,
@@ -768,7 +866,16 @@ impl Resolver<'_> {
         if self.rustc_built(krate) && self.shares_path(func) {
             return None;
         }
-        let path = self.path(func)?;
+        let extern_block =
+            matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_));
+        let Some(path) = self.path(func) else {
+            // No path to look up in what rustc built, but one of a crate rustc built nothing of
+            // is ours to name all the same, by where it is written.
+            if extern_block || self.rustc_built(krate) {
+                return None;
+            }
+            return self.own_function_name(func);
+        };
         // A test is the second of its name where it is written: rustc puts the constant
         // that describes it to the harness before it, under the same name.
         let function = hir::Function::from(func);
@@ -786,7 +893,7 @@ impl Resolver<'_> {
             return Some(symbol.to_owned());
         } // rustc has built nothing of the crate: the function is ours to name, unless it is
         // declared in an `extern` block, where what it links to names it.
-        if matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_)) {
+        if extern_block {
             return None;
         }
         if self.rustc_built(krate) {
@@ -807,7 +914,14 @@ impl Resolver<'_> {
     /// The name ra-jit gives a non-generic function of the crate `id` names: where it is, and
     /// for one in a body where in the source that is.
     fn function_named_in(&self, func: FunctionId, id: u64) -> Option<String> {
-        let path = self.path(func)?;
+        let Some(path) = self.path(func) else {
+            // No path to write (the `impl` is for `!`, `dyn Trait`, a type taking a constant, or
+            // the function sits where `item_path` cannot reach): its name and where it is
+            // written say which function it is just as well.
+            let name = hir::Function::from(func).name(self.db);
+            let place = hir_ty_codegen::function_place(self.db, self, func)?;
+            return Some(format!("ra-jit.{id:x}.{}.{:x}", name.as_str(), short_hash(&place)));
+        };
         if hir_def::HasModule::module(&func, self.db).block(self.db).is_none() {
             return Some(format!("ra-jit.{id:x}.{path}"));
         }
@@ -943,8 +1057,9 @@ impl Resolver<'_> {
             return Some(short_hash(&format!("ra-jit crate {}", name.crate_name())));
         }
         let root = self.crate_root(krate.into())?;
-        let root = self.inside(&root).unwrap_or(&root);
-        let named = format!("ra-jit crate {} {}", name.crate_name(), root.display());
+        let home = self.contents.cargo_home(self.db);
+        let place = crate_place(&root, self.inside(&root), home.as_deref());
+        let named = format!("ra-jit crate {} {place}", name.crate_name());
         Some(short_hash(&named))
     }
 
@@ -1022,7 +1137,7 @@ impl Resolver<'_> {
         let mut owner = None;
         for node in sema.ancestors_with_macros(block) {
             if is_closure(&node) {
-                inner.push(format!("{{closure#{}}}", closure_number(&sema, &node)?));
+                inner.push(format!("{{closure#{}}}", closure_number(&sema, &self.places, &node)?));
                 continue;
             }
             if let Some(func) = ast::Fn::cast(node.clone()) {
@@ -1365,7 +1480,11 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn linked(&self, symbol: &str) -> bool {
-        self.rustcs().is_none_or(|it| it.has(symbol))
+        if let Some(linked) = self.rustcs() {
+            return linked.has(symbol);
+        }
+        let in_full = self.in_full.load(std::sync::atomic::Ordering::Relaxed);
+        in_full || self.own_linked.as_ref().is_none_or(|it| it.contains(symbol))
     }
 
     fn onto_rustcs(&self) -> bool {
@@ -1407,7 +1526,7 @@ impl SymbolResolver for Resolver<'_> {
         let mut inner = Vec::new();
         for node in sema.ancestors_with_macros(node.syntax().clone()) {
             if is_closure(&node) {
-                inner.push(format!("{{closure#{}}}", closure_number(&sema, &node)?));
+                inner.push(format!("{{closure#{}}}", closure_number(&sema, &self.places, &node)?));
                 continue;
             }
             if let Some(func) = ast::Fn::cast(node) {
@@ -1540,6 +1659,11 @@ impl SymbolResolver for Resolver<'_> {
         let mut earlier = 0;
         for other in it.module(db).impl_defs(db) {
             let other = other.source(db)?;
+            // rustc numbers what a module has written out before what its macros and derives
+            // make, which it only has once they are expanded.
+            if other.file_id.is_macro() {
+                continue;
+            }
             if other.file_id != source.file_id {
                 return None;
             }
@@ -1554,6 +1678,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn own_static(&self, id: StaticId) -> Option<String> {
         self.table.is_empty().then(|| self.own_static_name(id)).flatten()
+    }
+
+    fn static_copy(&self, symbol: &str) -> Option<hir_ty_codegen::RustcStaticCopy> {
+        self.table.static_copy(symbol).cloned()
     }
 
     fn static_(&self, id: StaticId) -> Option<String> {
@@ -1579,7 +1707,7 @@ impl SymbolResolver for Resolver<'_> {
         let mut owner = None;
         for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
             if is_closure(&node) {
-                closures.push(closure_number(&sema, &node)?);
+                closures.push(closure_number(&sema, &self.places, &node)?);
                 continue;
             }
             if let Some(func) = ast::Fn::cast(node.clone()) {
@@ -1590,26 +1718,10 @@ impl SymbolResolver for Resolver<'_> {
                 owner = Some(self.path(func.try_into().ok()?)?);
                 break;
             }
-            let name = match_ast! {
-                match node {
-                    ast::Const(it) => it.name(),
-                    ast::Static(it) => it.name(),
-                    _ => None,
-                }
-            };
-            if let Some(name) = name {
-                let named = |other: &SyntaxNode| {
-                    let other = match_ast! {
-                        match other {
-                            ast::Const(it) => it.name(),
-                            ast::Static(it) => it.name(),
-                            _ => None,
-                        }
-                    };
-                    other.is_some_and(|it| it.text() == name.text())
-                };
+            if let Some(name) = name_in_path(&node) {
+                let named = |other: &SyntaxNode| name_in_path(other).as_ref() == Some(&name);
                 around.push(place_in_definition(&sema, &node, &named)?.into());
-                names.push(name.text().to_string());
+                names.push(name);
             }
         }
         let owner = match owner {
@@ -1630,7 +1742,9 @@ impl SymbolResolver for Resolver<'_> {
             ast::Static::cast(node.clone())
                 .is_some_and(|it| it.name().is_some_and(|it| it.text() == name.as_str()))
         };
-        let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
+        let counted = Counted::Statics(name.as_str().to_owned());
+        let place =
+            place_counted(&sema, &self.places, counted, source.value.syntax(), &named)?.into();
         let symbol = self
             .table
             .get_nested(&path, &closures, place, &around)
@@ -1649,11 +1763,68 @@ impl SymbolResolver for Resolver<'_> {
         let item = ModuleDef::from(item);
         self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
     }
+
+    fn adt_at(&self, path: &str) -> Option<hir_def::AdtId> {
+        let db = self.db;
+        let mut segments = path.split("::");
+        let krate = segments.next()?;
+        let mut segments: Vec<&str> = segments.collect();
+        let name = segments.pop()?;
+        Crate::all(db)
+            .into_iter()
+            .filter(|&it| self.crate_path(it).as_deref() == Some(krate))
+            .find_map(|it| {
+                let mut module = it.root_module(db);
+                for segment in &segments {
+                    let child = |it: &Module| it.name(db).is_some_and(|it| it.as_str() == *segment);
+                    module = module.children(db).find(child)?;
+                }
+                let adt = module.declarations(db).into_iter().find_map(|it| match it {
+                    ModuleDef::Adt(adt) if adt.name(db).as_str() == name => Some(adt),
+                    _ => None,
+                })?;
+                let id = hir_def::AdtId::from(adt);
+                (self.item(id.into()).as_deref() == Some(path)).then_some(id)
+            })
+    }
+}
+
+/// The segment a constant or static that items are written in adds to their path, as rustc
+/// prints it: its name, or `_` for an unnamed constant. objc2's `declare_class!` keeps a
+/// class's ivar offsets in statics in a `const _: () = { .. }`, which rustc exports as
+/// `<module>::_::__OBJC2_IVAR_OFFSET`.
+fn name_in_path(node: &SyntaxNode) -> Option<String> {
+    match_ast! {
+        match node {
+            ast::Const(it) => it
+                .name()
+                .map(|it| it.text().to_string())
+                .or_else(|| it.underscore_token().map(|_| "_".to_owned())),
+            ast::Static(it) => it.name().map(|it| it.text().to_string()),
+            _ => None,
+        }
+    }
 }
 
 /// Whether what the module declares is written in a body.
 fn is_in_body(db: &RootDatabase, module: Module) -> bool {
     module.nearest_non_block_module(db) != module
+}
+
+/// What names the crate whose root is `root` in the id ra-jit gives it, the same on every
+/// machine: its path in the checkout (`inside`), or below where cargo keeps what it fetched
+/// (`cargo_home`), or else where it is.
+fn crate_place(root: &Path, inside: Option<&Path>, cargo_home: Option<&str>) -> String {
+    if let Some(inside) = inside {
+        return inside.display().to_string();
+    }
+    let fetched = root.to_str().zip(cargo_home);
+    match fetched
+        .and_then(|(root, home)| hir_ty_codegen::moved(root, home, hir_ty_codegen::CARGO_HOME))
+    {
+        Some(moved) => moved,
+        None => root.display().to_string(),
+    }
 }
 
 /// The first eight bytes of the SHA-256 of a text.
@@ -1687,21 +1858,126 @@ fn place_in_definition(
     counts: &dyn Fn(&SyntaxNode) -> bool,
 ) -> Option<u32> {
     let along: Vec<_> = sema.ancestors_with_macros(target.clone()).collect();
+    let owner = owner_of(&along)?;
+    let mut count = Count::new(sema, Some(target), along, counts, &owner);
+    count.all_in(&owner)?;
+    count.waiting_ones()?;
+    count.earlier
+}
+
+/// The definition a node is written in, as [`place_in_definition`] counts in: the first of
+/// `along` but the node that is one, or the last.
+fn owner_of(along: &[SyntaxNode]) -> Option<SyntaxNode> {
     let mut root = None;
     let owner = along.iter().skip(1).cloned().find(|node| {
         root = Some(node.clone());
         is_definition(node)
     });
-    let owner = owner.or(root)?;
-    let late = LateImports::around(sema, &owner);
-    let mut count =
-        Count { sema, target, along, counts, late, seen: 0, earlier: None, waiting: Vec::new() };
-    count.all_in(&owner)?;
-    while let Some(call) = count.waiting.pop() {
-        count.expansion_of(&call)?;
-    }
-    count.earlier
+    owner.or(root)
 }
+
+/// [`place_in_definition`] of what `counted` names, every node of the definition counted
+/// once and kept in `places`: a definition with many closures, or a macro used many times
+/// that declares a static each time (tracing's `META` and `__CALLSITE`), is gone through
+/// once instead of once a node, which made a build in full of a large program wait on one
+/// thread (#259). A node whose place the count does not find is counted alone as before.
+fn place_counted(
+    sema: &hir::Semantics<'_, RootDatabase>,
+    places: &Places,
+    counted: Counted,
+    target: &SyntaxNode,
+    counts: &dyn Fn(&SyntaxNode) -> bool,
+) -> Option<u32> {
+    let along: Vec<_> = sema.ancestors_with_macros(target.clone()).collect();
+    let owner = owner_of(&along)?;
+    if let Some(spot) = spot_in(&along, &owner) {
+        let of = PlacesOf {
+            file: sema.hir_file_for(&owner),
+            range: owner.text_range(),
+            kind: owner.kind(),
+            counted,
+        };
+        let known = places.0.lock().unwrap_or_else(|e| e.into_inner()).get(&of).cloned();
+        let all = known.unwrap_or_else(|| {
+            let all = all_places(sema, &owner, counts).map(Arc::new);
+            places.0.lock().unwrap_or_else(|e| e.into_inner()).insert(of, all.clone());
+            all
+        });
+        if let Some(&place) = all.as_ref().and_then(|all| all.get(&spot)) {
+            return Some(place);
+        }
+    }
+    place_in_definition(sema, target, counts)
+}
+
+/// The places of all the nodes of the definition `owner` that `counts` holds of, by where
+/// each is ([`Spot`]), or none when the order rustc numbers them in is not known.
+fn all_places(
+    sema: &hir::Semantics<'_, RootDatabase>,
+    owner: &SyntaxNode,
+    counts: &dyn Fn(&SyntaxNode) -> bool,
+) -> Option<FxHashMap<Spot, u32>> {
+    let mut count = Count::new(sema, None, Vec::new(), counts, owner);
+    count.places = Some(FxHashMap::default());
+    count.all_in(owner)?;
+    count.waiting_ones()?;
+    let mut places = count.places?;
+    // Two nodes in one spot are told apart by nothing a spot has.
+    for spot in count.twice {
+        places.remove(&spot);
+    }
+    Some(places)
+}
+
+/// Where `along`'s first node is in the definition `owner`, which `along` goes up to: the
+/// macros it is expanded from and the expansion of each, or none when an attribute or a
+/// derive made a node on the way, which the count does not go into.
+fn spot_in(along: &[SyntaxNode], owner: &SyntaxNode) -> Option<Spot> {
+    let at_owner = along.iter().position(|it| it == owner)?;
+    let mut calls = Vec::new();
+    for at in (1..at_owner).rev() {
+        let node = &along[at];
+        if ast::MacroCall::can_cast(node.kind()) {
+            let root = &along[at - 1];
+            if root.parent().is_some() {
+                return None;
+            }
+            calls.push((node.text_range(), root.kind()));
+        } else if node.parent().is_none() && !ast::MacroCall::can_cast(along[at + 1].kind()) {
+            // An expansion that no macro call along is of.
+            return None;
+        }
+    }
+    if along.first()?.parent().is_none() {
+        return None;
+    }
+    Some((calls, along.first()?.text_range()))
+}
+
+/// The places of the counted nodes of the definitions gone through ([`place_counted`]).
+#[derive(Clone, Default)]
+struct Places(Arc<std::sync::Mutex<FxHashMap<PlacesOf, Option<Arc<FxHashMap<Spot, u32>>>>>>);
+
+/// A definition, and what is counted in it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PlacesOf {
+    file: hir::HirFileId,
+    range: syntax::TextRange,
+    kind: syntax::SyntaxKind,
+    counted: Counted,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Counted {
+    Closures,
+    /// The statics of a name.
+    Statics(String),
+}
+
+/// Where a node is in a definition: the macros it is expanded from, the outermost first,
+/// each by where it is used and what it is expanded to (a macro used in a body is expanded
+/// both to items and to statements, of the same text), and the node's range in the last.
+type Spot = (Vec<(syntax::TextRange, syntax::SyntaxKind)>, syntax::TextRange);
 
 /// The imports of the scope of a definition that rustc has not resolved when it first comes
 /// to the macros used in the definition: those a macro expanded to. It resolves the imports
@@ -1802,17 +2078,55 @@ enum Turn {
 
 struct Count<'a, 'db> {
     sema: &'a hir::Semantics<'db, RootDatabase>,
-    target: &'a SyntaxNode,
+    target: Option<&'a SyntaxNode>,
     /// The target and what it is in, the macros it is expanded from with their expansions.
     along: Vec<SyntaxNode>,
     counts: &'a dyn Fn(&SyntaxNode) -> bool,
     late: LateImports,
     seen: u32,
     earlier: Option<u32>,
-    waiting: Vec<ast::MacroCall>,
+    /// The macros to expand after the others, each with the macros it is in.
+    waiting: Vec<(ast::MacroCall, Vec<(syntax::TextRange, syntax::SyntaxKind)>)>,
+    /// The macros the nodes being counted are in, as a [`Spot`] has them.
+    calls: Vec<(syntax::TextRange, syntax::SyntaxKind)>,
+    /// The place of every counted node, when they are all wanted.
+    places: Option<FxHashMap<Spot, u32>>,
+    twice: Vec<Spot>,
 }
 
-impl Count<'_, '_> {
+impl<'a, 'db> Count<'a, 'db> {
+    fn new(
+        sema: &'a hir::Semantics<'db, RootDatabase>,
+        target: Option<&'a SyntaxNode>,
+        along: Vec<SyntaxNode>,
+        counts: &'a dyn Fn(&SyntaxNode) -> bool,
+        owner: &SyntaxNode,
+    ) -> Self {
+        let late = LateImports::around(sema, owner);
+        Count {
+            sema,
+            target,
+            along,
+            counts,
+            late,
+            seen: 0,
+            earlier: None,
+            waiting: Vec::new(),
+            calls: Vec::new(),
+            places: None,
+            twice: Vec::new(),
+        }
+    }
+
+    /// Expands the macros that wait for the others, the last come to first.
+    fn waiting_ones(&mut self) -> Option<()> {
+        while let Some((call, calls)) = self.waiting.pop() {
+            self.calls = calls;
+            self.expansion_of(&call)?;
+        }
+        Some(())
+    }
+
     /// Counts the nodes of the definition `node` is of, or none when the order rustc numbers
     /// them in is not known.
     ///
@@ -1824,7 +2138,7 @@ impl Count<'_, '_> {
         for call in calls {
             match self.turn(&call) {
                 Some(Turn::Now) => self.expansion_of(&call)?,
-                Some(Turn::Later) => self.waiting.push(call),
+                Some(Turn::Later) => self.waiting.push((call, self.calls.clone())),
                 None => self.nothing_in(&call)?,
             }
         }
@@ -1835,15 +2149,18 @@ impl Count<'_, '_> {
         // A macro used in a body is expanded twice, to items and to statements, and of the
         // same text: the target is in one of them, which need not be the one sema gives.
         let at = self.along.iter().position(|it| it == call.syntax());
-        if let Some(root) = at.and_then(|at| at.checked_sub(1)).map(|at| self.along[at].clone())
-            && root.parent().is_none()
-        {
-            return self.all_in(&root);
-        }
-        match self.sema.expand_macro_call(call) {
-            Some(expansion) => self.all_in(&expansion.value),
-            None => Some(()),
-        }
+        let along = at.and_then(|at| at.checked_sub(1)).map(|at| self.along[at].clone());
+        let root = match along.filter(|root| root.parent().is_none()) {
+            Some(root) => root,
+            None => match self.sema.expand_macro_call(call) {
+                Some(expansion) => expansion.value,
+                None => return Some(()),
+            },
+        };
+        self.calls.push((call.syntax().text_range(), root.kind()));
+        self.all_in(&root)?;
+        self.calls.pop();
+        Some(())
     }
 
     /// That the macro expands to nothing that is counted, so that when it is expanded is
@@ -1861,11 +2178,18 @@ impl Count<'_, '_> {
                 calls.push(call);
                 continue;
             }
-            let target = child == *self.target;
+            let target = self.target == Some(&child);
             if target {
                 self.earlier = Some(self.seen);
             }
-            if target || (self.counts)(&child) {
+            let counted = (self.counts)(&child);
+            if counted && let Some(places) = &mut self.places {
+                let spot = (self.calls.clone(), child.text_range());
+                if places.insert(spot.clone(), self.seen).is_some() {
+                    self.twice.push(spot);
+                }
+            }
+            if target || counted {
                 self.seen += 1;
             }
             if !target && !is_definition(&child) {
@@ -1902,9 +2226,9 @@ impl Count<'_, '_> {
         (home == here || home.origin(self.sema.db).is_lang()).then_some(Turn::Now)
     }
 
-    /// Whether a path finds the macro with no import: any but a `macro_rules!` one of this
-    /// crate that is not exported, which is in no module but by an import of it, and
-    /// whether that import is a late one is not known.
+    /// Whether a path finds the macro with no late import: any but a `macro_rules!` one of
+    /// this crate that is not exported, which is in no module but by an import of it, and is
+    /// found at once only through an import written in the module the path names.
     fn reached_by_path(&self, call: &ast::MacroCall) -> bool {
         let sema = self.sema;
         let Some(found) = sema.resolve_macro_call(call) else { return true };
@@ -1913,10 +2237,52 @@ impl Count<'_, '_> {
             return true;
         }
         match sema.source(found).and_then(|it| it.value.left()) {
-            Some(ast::Macro::MacroRules(rules)) => ast::HasAttrs::attrs(&rules)
-                .any(|it| it.simple_name().is_some_and(|name| name == "macro_export")),
+            Some(ast::Macro::MacroRules(rules)) => {
+                ast::HasAttrs::attrs(&rules)
+                    .any(|it| it.simple_name().is_some_and(|name| name == "macro_export"))
+                    || self.imported_where_written(call)
+            }
             _ => true,
         }
+    }
+
+    /// Whether the module that the path of `call` names imports the macro by a `use` written
+    /// in it, which no macro made: rustc resolves those before it expands any macro, as
+    /// `crate::tracing::debug!` finds salsa's `pub(crate) use debug;`.
+    fn imported_where_written(&self, call: &ast::MacroCall) -> bool {
+        let sema = self.sema;
+        let Some(path) = call.path() else { return false };
+        let (Some(qualifier), Some(name)) =
+            (path.qualifier(), path.segment().and_then(|it| it.name_ref()))
+        else {
+            return false;
+        };
+        let Some(hir::PathResolution::Def(ModuleDef::Module(module))) =
+            sema.resolve_path(&qualifier)
+        else {
+            return false;
+        };
+        let mut around = Some(module);
+        while let Some(it) = around {
+            if it.declaration_source(sema.db).is_some_and(|it| it.file_id.is_macro()) {
+                return false;
+            }
+            around = it.parent(sema.db);
+        }
+        let written = sema.module_definition_node(module);
+        if written.file_id.is_macro() {
+            return false;
+        }
+        let items = match ast::Module::cast(written.value.clone()) {
+            Some(inline) => inline.item_list().map(|it| it.syntax().clone()),
+            None => ast::SourceFile::can_cast(written.value.kind()).then_some(written.value),
+        };
+        let uses = items.iter().flat_map(|it| it.children()).filter_map(ast::Use::cast);
+        uses.filter(|it| !has_attribute_macro(sema, &ast::Item::Use(it.clone()))).any(|it| {
+            let mut imported = LateImports::default();
+            it.use_tree().into_iter().for_each(|tree| imported.add(&tree, None));
+            imported.names.contains(&*name.text())
+        })
     }
 
     /// Whether the macro is a `macro_rules!` one found by where it is written, which is
@@ -1976,8 +2342,12 @@ impl Count<'_, '_> {
 
 /// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
 /// definition it is written in, a closure's own closures being counted apart.
-fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode) -> Option<u32> {
-    place_in_definition(sema, closure, &is_closure)
+fn closure_number(
+    sema: &hir::Semantics<'_, RootDatabase>,
+    places: &Places,
+    closure: &SyntaxNode,
+) -> Option<u32> {
+    place_counted(sema, places, Counted::Closures, closure, &is_closure)
 }
 
 /// The crates called `krate` that a build of the checkout at `checkout` compiles: a package's
@@ -2663,22 +3033,19 @@ fn pause_after_load() {
     }
 }
 
-/// Waits for `RA_JIT_SYMBOLS_PAUSE_MS` before the symbols rustc built are read, and says so:
-/// what `harness/aheadready.py` has functions compiled ahead in.
-fn pause_before_symbols() {
-    let pause = std::env::var("RA_JIT_SYMBOLS_PAUSE_MS").ok().and_then(|it| it.parse().ok());
-    if let Some(pause) = pause {
-        eprintln!("symbols: paused");
-        std::thread::sleep(Duration::from_millis(pause));
-    }
-}
-
-/// The directory cargo put the executables of the build in: the one its `deps`, where the
-/// libraries of the build are, is in.
+/// The directory cargo put the executables of the build in: the profile's directory the
+/// libraries of the build are written below, `deps` in cargo's first layout and
+/// `build/<package>/<hash>/out` in its second (`cargo::layout`). The standard library's,
+/// in the toolchain, are below neither.
 fn executables_of(symbol_files: &[PathBuf]) -> Option<AbsPathBuf> {
-    let deps = symbol_files.iter().filter_map(|file| file.parent());
-    let deps = deps.filter(|deps| deps.file_name().is_some_and(|name| name == "deps"));
-    let built = deps.filter_map(Path::parent).next()?;
+    let built = symbol_files.iter().find_map(|file| {
+        let dir = file.parent()?;
+        let first = dir.file_name().is_some_and(|name| name == "deps");
+        match first {
+            true => dir.parent(),
+            false => cargo::layout::unit_dir(dir).filter(|it| it.dir.join("out") == dir)?.profile(),
+        }
+    })?;
     AbsPathBuf::try_from(built.to_str()?).ok()
 }
 
@@ -3186,7 +3553,7 @@ fn on_idle_threads<T: Sync>(
     use std::sync::atomic::Ordering::Relaxed;
     let wanted = (work.len() / per).min(threads - 1);
     let mut helpers = 0;
-    _ = helping.fetch_update(Relaxed, Relaxed, |busy| {
+    _ = helping.try_update(Relaxed, Relaxed, |busy| {
         helpers = wanted.min(threads.saturating_sub(busy + 1));
         Some(busy + helpers)
     });
@@ -3815,10 +4182,18 @@ fn home_in_rustcs(
             })
             .collect();
         let homing = |file: vfs::FileId| programs.iter().any(|it| it.known.homes_file(file));
+        let found: Vec<_> = found
+            .into_iter()
+            .map(|(file, functions, statics)| {
+                let callers =
+                    if homing(file) { callers_of_generic(db, &functions) } else { vec![] };
+                (file, functions, statics, callers)
+            })
+            .collect();
         let written: Vec<FunctionId> = found
             .iter()
             .filter(|(file, ..)| homing(*file))
-            .flat_map(|(_, functions, _)| functions.iter().copied())
+            .flat_map(|(_, functions, _, callers)| functions.iter().chain(callers).copied())
             .collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -3837,12 +4212,69 @@ fn home_in_rustcs(
         for program in programs.iter_mut().filter(|it| it.known.homes()) {
             let Program { args, table, known, .. } = program;
             let resolver = Resolver::of(db, table, args, known, &contents, listed);
-            for (file, functions, statics) in &found {
-                known.home(db, &resolver, *file, functions, statics);
+            for (file, functions, statics, callers) in &found {
+                known.home(db, &resolver, *file, functions, statics, callers);
             }
         }
     });
 }
+
+/// The functions written elsewhere that call the generic functions among `functions`, or call
+/// a generic one that does, as far as [`CALLERS_SEARCHED`] and [`CALLERS_COMPILED`] go: rustc
+/// copied those into them. A method of a trait's impl is called through the trait's method as
+/// well. A call outside a function's body is left out, as are the callers past the bound; the
+/// copies they have are then ones no patch is known to reach.
+fn callers_of_generic(db: &RootDatabase, functions: &[FunctionId]) -> Vec<FunctionId> {
+    let sema = hir::Semantics::new(db);
+    let of_trait = |func: FunctionId| {
+        let container = hir::Function::from(func).as_assoc_item(db).map(|it| it.container(db));
+        matches!(container, Some(hir::AssocItemContainer::Trait(_)))
+    };
+    let named = |func: FunctionId| {
+        let func = hir::Function::from(func);
+        let trait_ = func.as_assoc_item(db).and_then(|it| it.implemented_trait(db));
+        std::iter::once(func).chain(trait_.and_then(|it| it.function(db, func.name(db))))
+    };
+    let mut seen: FxHashSet<FunctionId> = functions.iter().copied().collect();
+    let mut queue: Vec<FunctionId> = functions
+        .iter()
+        .copied()
+        .filter(|&it| !of_trait(it) && hir_ty_codegen::copied_by_rustc(db, it))
+        .collect();
+    let (mut callers, mut searched) = (Vec::new(), 0);
+    while let Some(func) = queue.pop() {
+        searched += 1;
+        if searched > CALLERS_SEARCHED || callers.len() > CALLERS_COMPILED {
+            break;
+        }
+        let usages =
+            named(func).flat_map(|it| ide_db::defs::Definition::Function(it).usages(&sema).all());
+        for reference in usages.flat_map(|(_, references)| references) {
+            if reference.category.contains(ide_db::search::ReferenceCategory::IMPORT) {
+                continue;
+            }
+            let ide_db::search::FileReferenceNode::NameRef(name) = reference.name else { continue };
+            let caller = sema.ancestors_with_macros(name.syntax().clone()).find_map(ast::Fn::cast);
+            let caller = caller.and_then(|it| sema.to_def(&it));
+            let Some(caller) = caller.and_then(|it| FunctionId::try_from(it).ok()) else {
+                continue;
+            };
+            if !seen.insert(caller) {
+                continue;
+            }
+            callers.push(caller);
+            if hir_ty_codegen::copied_by_rustc(db, caller) {
+                queue.push(caller);
+            }
+        }
+    }
+    callers
+}
+
+/// How many generic functions [`callers_of_generic`] finds the callers of, and about how many
+/// callers it finds, which are compiled before the edit.
+const CALLERS_SEARCHED: usize = 16;
+const CALLERS_COMPILED: usize = 512;
 
 /// Whether the executable `program`'s edits patch has no copy of the functions written in
 /// `file` with one of the `names`, which rustc would have copied into each crate that calls
@@ -4025,19 +4457,10 @@ thread_local! {
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Has the thread be one that probes for as long as it lives.
-pub(crate) struct Probing(bool);
-
-impl Probing {
-    pub(crate) fn new() -> Probing {
-        Probing(PROBING.replace(true))
-    }
-}
-
-impl Drop for Probing {
-    fn drop(&mut self) {
-        PROBING.set(self.0);
-    }
+/// Whether the edits of the build are patches of an object that has the standard library in
+/// it. A whole build's (`--exe`) are patched over the library it links as a unit of its own.
+fn patches_its_library(args: &Args) -> bool {
+    args.patch.is_some() && args.exe.is_none()
 }
 
 /// The standard library of a build with nothing of rustc's, compiled before the program into
@@ -4051,7 +4474,7 @@ fn std_unit(
     listed: &Listed,
 ) -> anyhow::Result<Option<PathBuf>> {
     use sha2::{Digest, Sha256};
-    if !table.is_empty() || args.prebuilt.is_some() || args.patch.is_some() {
+    if !table.is_empty() || args.prebuilt.is_some() || patches_its_library(args) {
         return Ok(None);
     }
     let mut program = Vec::new();
@@ -4088,8 +4511,12 @@ fn std_unit(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"ra-jit standard library 2");
+    field(b"ra-jit standard library 3");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
+    // An object of one section is linked whole, with what the program never reaches.
+    if !hir_ty_codegen::sections_of_their_own() {
+        field(b"one section");
+    }
     // A crate that is not the library's own is told by where its source is.
     let mut described: Vec<String> = members
         .iter()
@@ -4179,6 +4606,10 @@ fn std_unit(
     Ok(Some(path))
 }
 
+/// The sysroot of the workspace loaded first, which an executable with nothing of rustc's
+/// is linked against.
+static SYSROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
 /// Links the executable of a build with nothing of rustc's: `--out` and the standard
 /// library's object, with the native libraries the crates ask for.
 fn link_executable(
@@ -4224,6 +4655,24 @@ fn link_executable(
         eprintln!("  {said}");
     }
     Ok(())
+}
+
+/// What a whole build's daemon links the program at `--exe` with and splices its edits into:
+/// G's line. `None` when it is not one, or has it already.
+fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(String, PathBuf)>> {
+    let Some(exe) = args.exe.as_ref().filter(|_| args.patch.is_some() && args.link_cmd.is_none())
+    else {
+        return Ok(None);
+    };
+    let mut program = Vec::new();
+    for named in args.crates() {
+        program.extend(crates_named(db, named, args)?);
+    }
+    let objects: Vec<&Path> =
+        std::iter::once(args.out.as_path()).chain(args.prebuilt.as_deref()).collect();
+    let sysroot = SYSROOT.get().and_then(Option::as_deref);
+    let cmd = link::command(db, &program, &objects, sysroot, exe)?;
+    Ok(Some((cmd, exe.clone())))
 }
 
 /// Writes to `path` the dep-info rustc writes of the crate `args` asks for, linked as `exe`:
@@ -4357,10 +4806,12 @@ fn build(
     // standard library is built apart ([`std_unit`]) or asked for by name.
     if table.is_empty() {
         let asked: FxHashSet<Crate> = local.iter().copied().collect();
+        let tested = tests_linked(db, &local, of_tests(args));
         let linked: FxHashSet<Crate> = local
             .iter()
             .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db))
             .filter(|it| !it.data(db).origin.is_lang() && !resolver.prebuilt(*it))
+            .chain(tested)
             .map(Crate::from)
             .filter(|it| !asked.contains(it))
             .collect();
@@ -4383,6 +4834,13 @@ fn build(
             .collect(),
         false => Vec::new(),
     };
+    // A generic function is not a function until its types are given, and with nothing of
+    // rustc's there is no copy of it to name: each instance a caller asks for is compiled with
+    // the caller. As a root it would only be counted as left out ("no rustc symbol"), which is
+    // not something blaze could not compile.
+    if table.is_empty() {
+        functions.retain(|&(func, _)| !resolver.is_generic(func));
+    }
     let list = start.elapsed();
     // With a program to start from, only what it reaches is compiled, and what a runtime
     // looks up by name. Without one any function may be the one called.
@@ -4491,8 +4949,13 @@ fn build(
     let mut unwritten = Vec::new();
     if let Some(mut object) = unit.object.take() {
         // A patch defines again what the object does, and the linker of Mach-O takes two
-        // definitions of a name only when one of them gives way.
-        weaken::ours(&mut object);
+        // definitions of a name only when one of them gives way. The standard library's unit
+        // gives way to nothing: it is linked with nothing of rustc's, and a program over it
+        // takes its definitions by name ([`Prebuilt`]), which a private external, what
+        // weakening makes of a name of Rust's, is not to `defined_symbols` (#255).
+        if !args.library {
+            weaken::ours(&mut object);
+        }
         // The files a debugger is sent to are there before the object that sends it.
         for file in std::mem::take(&mut unit.apart) {
             unwritten.push((PathBuf::from(file.name), file.bytes));
@@ -4583,7 +5046,10 @@ fn with_failed_macro(
     let frontend = match &error {
         CodegenError::Frontend(_) => true,
         CodegenError::Unsupported(why) => why.contains("frontend:"),
-        CodegenError::Backend(_) | CodegenError::NoSymbol | CodegenError::Private => false,
+        CodegenError::Backend(_)
+        | CodegenError::NoSymbol
+        | CodegenError::Private
+        | CodegenError::Refused(_) => false,
     };
     if !frontend {
         return error;
@@ -4688,14 +5154,21 @@ fn rustc_symbols(binary: &Path) -> Option<Arc<symbols::Linked>> {
     let mut all = lock(&RUSTC_SYMBOLS);
     let names = match all.remove(binary)? {
         LinkedNames::Read(names) => names,
-        LinkedNames::Reading(thread) => match thread.join() {
-            Ok(Ok(names)) => Arc::new(names),
-            Ok(Err(error)) => {
-                eprintln!("reading the symbols of what rustc linked: {error:#}");
-                return None;
+        LinkedNames::Reading(thread) => {
+            let start = Instant::now();
+            let read = thread.join();
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!("rustc-symbols-us: waited={}", start.elapsed().as_micros());
             }
-            Err(_) => return None,
-        },
+            match read {
+                Ok(Ok(names)) => Arc::new(names),
+                Ok(Err(error)) => {
+                    eprintln!("reading the symbols of what rustc linked: {error:#}");
+                    return None;
+                }
+                Err(_) => return None,
+            }
+        }
     };
     all.insert(binary.to_owned(), LinkedNames::Read(names.clone()));
     Some(names)
@@ -4725,13 +5198,29 @@ impl std::fmt::Display for RustcLinkedLost {
 
 impl std::error::Error for RustcLinkedLost {}
 
+/// Why a patch was not spliced into the executable whose link line does not have it: the
+/// program is built in full and linked instead.
+#[derive(Debug)]
+struct PatchUnlinked {
+    why: String,
+}
+
+impl std::fmt::Display for PatchUnlinked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the patch was not spliced into the program{}", self.why)
+    }
+}
+
+impl std::error::Error for PatchUnlinked {}
+
 /// Brings an executable up to date with its objects. An edit that left the whole object alone
 /// is spliced into the executable at `splice`, which `--binary` names, when that is known from
 /// its last link; anything else, and whatever the splice declines, runs the link command, whose
 /// result is then known. `RA_JIT_SPLICE=0` has every edit linked in full. A patch of what rustc
 /// linked (`over_rustc`) is spliced or fails with [`RustcLinkedLost`], and so is an object
 /// that names what only that executable has (`onto`, [`ONTO_RUSTCS`]). With `packs` the object
-/// is kept packed after the link ([`whole`]).
+/// is kept packed after the link ([`whole`]). A patch the splice declines whose line is the
+/// worker's own (`own_line`, [`own_link_line`]) fails with [`PatchUnlinked`].
 #[expect(clippy::too_many_arguments)]
 fn link(
     cmd: Option<&str>,
@@ -4743,6 +5232,7 @@ fn link(
     onto: bool,
     defer: bool,
     packs: bool,
+    own_line: bool,
 ) -> anyhow::Result<()> {
     let rustcs = splice.is_some_and(|it| lock(&RUSTC_LINKED).contains(it));
     if let Some(binary) = splice.filter(|_| !patched) {
@@ -4820,12 +5310,10 @@ fn link(
     }
     let start = Instant::now();
     let mut declined = String::new();
-    let running = splice.map_or(Ok(false), set_aside)?;
     let into_rustcs = into_rustcs.filter(|_| patch.is_some());
     let tried = into_rustcs.is_some();
     if let (Some(binary), Some(patch), Some(old)) = (splice, patch, into_rustcs) {
         let spliced = match old {
-            _ if running => Err(anyhow::anyhow!("the executable is running")),
             Ok(old) if old.is_of(binary) => {
                 let _reading = whole::read(object)?;
                 old.spliced_whole(object, patch)
@@ -4862,7 +5350,6 @@ fn link(
         }
         let spliced = match known {
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
-            _ if running => Err(anyhow::anyhow!("the executable is running")),
             Some(Ok(mut baseline)) if baseline.is_of(binary) => match std::fs::read(patch) {
                 // The program has the edit: the executable on disk is for its next start,
                 // and is spliced once the edits stop (see `splicer`).
@@ -4920,8 +5407,13 @@ fn link(
         lock(&ONTO_RUSTCS).remove(binary);
         return Err(RustcLinkedLost { why: declined, onto: true }.into());
     }
+    // The worker's own line has the object and not the patch, which alone has the edit.
+    if own_line && patched && patch.is_some() {
+        return Err(PatchUnlinked { why: declined }.into());
+    }
     let reading = whole::read(object)?;
     if let Some(binary) = splice {
+        set_aside(binary)?;
         headerpad_ahead(binary)?;
     }
     let reached = cargo::plan::reached_only(cmd);
@@ -5058,40 +5550,23 @@ fn headerpad_short(binary: &Path) -> Option<u64> {
     (pad > kept).then_some(pad)
 }
 
-/// Whether the executable at `binary` runs, in which case Windows lets nothing write it, and
-/// it is moved aside: it runs on there, and the link writes a new one. It is deleted once it
-/// has exited, by the first link to come after.
+/// Moves the executable at `binary` aside when a program runs it, which Windows lets nothing
+/// write: it runs on there, and the link writes a new one ([`splice::move_aside`]).
 #[cfg(windows)]
-fn set_aside(binary: &Path) -> anyhow::Result<bool> {
+fn set_aside(binary: &Path) -> anyhow::Result<()> {
     const SHARING_VIOLATION: i32 = 32;
-    let name = binary.file_name().context("an executable without a name")?.to_owned();
-    let siblings = binary.parent().map(std::fs::read_dir).transpose()?.into_iter().flatten();
-    for sibling in siblings {
-        let sibling = sibling?;
-        let is_aside = sibling.path().extension() == Some("running".as_ref())
-            && sibling.file_name().as_encoded_bytes().starts_with(name.as_encoded_bytes());
-        if is_aside {
-            // The one that still runs stays.
-            let _ = std::fs::remove_file(sibling.path());
-        }
-    }
     match std::fs::OpenOptions::new().write(true).open(binary) {
-        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {}
-        _ => return Ok(false),
+        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {
+            splice::move_aside(binary).context("moving the running executable aside")
+        }
+        _ => Ok(()),
     }
-    static ASIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let aside = ASIDE.fetch_add(1, Ordering::Relaxed);
-    let mut moved = binary.as_os_str().to_owned();
-    moved.push(format!(".{}-{aside}.running", std::process::id()));
-    std::fs::rename(binary, &moved).context("moving the running executable aside")?;
-    Ok(true)
 }
 
-/// Whether the executable at `binary` runs, which is nothing to a link on Unix: the linker
-/// writes a new file in its place.
+/// Nothing on Unix: the linker writes a new file in place of one a program runs.
 #[cfg(unix)]
-fn set_aside(_: &Path) -> anyhow::Result<bool> {
-    Ok(false)
+fn set_aside(_: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// The last `count` lines of `text` that say something, on one line: what a linker that
@@ -5930,6 +6405,9 @@ struct Target {
     patch: Option<PathBuf>,
     link_cmd: Option<String>,
     splice: Option<PathBuf>,
+    /// The executable blaze links the program into itself, with nothing of rustc's: a build
+    /// from nothing (docs/no-rustc.md, step K).
+    exe: Option<PathBuf>,
     /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
     /// that program's own objects, so another has to be told where its copies are. Empty for
     /// the files the daemon was started with.
@@ -5947,6 +6425,7 @@ impl Target {
             patch: args.patch.clone(),
             link_cmd: args.link_cmd.clone(),
             splice: args.splice.clone(),
+            exe: args.exe.clone(),
             symbol_files: args.symbol_files.clone(),
         }
     }
@@ -5957,7 +6436,8 @@ impl Target {
 
     /// The daemon's arguments, were it started for this program.
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
-        let Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files } = self;
+        let Target { project, krate, batch, out, patch, link_cmd, splice, exe, symbol_files } =
+            self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
         let Parts { root: checkout, base, members, debug, lints_capped } =
             checkouts.parts(&project)?;
@@ -5981,6 +6461,7 @@ impl Target {
             patch,
             link_cmd,
             splice,
+            exe,
             symbol_files,
             rustc_binary: None,
             by_symbol: Vec::new(),
@@ -5991,7 +6472,7 @@ impl Target {
     /// From what follows the socket on the command line of a client.
     fn from_flags(mut flags: impl Iterator<Item = String>) -> anyhow::Result<Option<Target>> {
         let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
-        let (mut project, mut splice) = (None, None);
+        let (mut project, mut splice, mut exe) = (None, None, None);
         let mut symbol_files = Vec::new();
         while let Some(flag) = flags.next() {
             let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
@@ -6002,6 +6483,7 @@ impl Target {
                 "--patch" => patch = Some(PathBuf::from(value)),
                 "--link-cmd" => link_cmd = Some(value),
                 "--binary" | "--splice" => splice = Some(PathBuf::from(value)),
+                "--exe" => exe = Some(PathBuf::from(value)),
                 "--symbols" => symbol_files.push(PathBuf::from(value)),
                 _ => bail!("unexpected argument {flag}"),
             }
@@ -6017,6 +6499,7 @@ impl Target {
                     patch,
                     link_cmd,
                     splice,
+                    exe,
                     symbol_files,
                 }))
             }
@@ -6024,6 +6507,7 @@ impl Target {
                 if patch.is_none()
                     && link_cmd.is_none()
                     && splice.is_none()
+                    && exe.is_none()
                     && symbol_files.is_empty()
                     && project.is_none() =>
             {
@@ -6035,7 +6519,8 @@ impl Target {
 
     /// The fields after the request's name on its line, each after a tab. Empty is absent.
     fn parse(fields: &[&str]) -> Option<Target> {
-        let &[project, krate, out, patch, link_cmd, splice, ref symbol_files @ ..] = fields else {
+        let &[project, krate, out, patch, link_cmd, splice, exe, ref symbol_files @ ..] = fields
+        else {
             return None;
         };
         let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
@@ -6048,6 +6533,7 @@ impl Target {
             patch: given(patch).map(PathBuf::from),
             link_cmd: given(link_cmd),
             splice: given(splice).map(PathBuf::from),
+            exe: given(exe).map(PathBuf::from),
             symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
         })
     }
@@ -6070,13 +6556,14 @@ impl Target {
             None => self.krate.clone(),
         };
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             crates,
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.link_cmd.as_deref().unwrap_or_default(),
-            self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default()
+            self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
+            self.exe.as_ref().map(|it| it.display().to_string()).unwrap_or_default()
         );
         for file in &self.symbol_files {
             fields.push('\t');
@@ -6329,11 +6816,51 @@ impl Drop for Tiering {
 /// Lets go now of what the queries with an `lru` keep past it, the trees parsed and the bodies
 /// lowered for the builds that are over, which would otherwise wait for the next edit. Only
 /// when nothing else holds the database: this cancels what does.
-fn let_go(db: &mut RootDatabase, builds: &Builds) {
+fn let_go(db: &mut RootDatabase, builds: &Builds, programs: &[Program]) {
     use ide_db::base_db::salsa::Database;
-    if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 {
+    // An own base an edit interrupted is built again from what it had computed, which letting
+    // it go would have it compute again (#261): only once it is built, or given up.
+    let base_to_come = (programs.iter().enumerate())
+        .any(|(at, it)| !builds.given_up.contains(&at) && it.known.wants_base());
+    if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 && !base_to_come {
         db.trigger_lru_eviction();
+        // An idle worker allocates nothing, and jemalloc returns freed pages only as it
+        // allocates, so what the build and the eviction freed would stay resident.
+        memory::give_back();
     }
+}
+
+/// How many values of the queries that hold the most of a build in full salsa keeps past the
+/// revision of the build: the lowered and the runtime MIR of each body (and their
+/// monomorphized copies), the code of each instance and the bodies to inline. A worker's own
+/// base computes all of them for the whole program; kept, they were about 4.5 GB of reth's
+/// 13 GB live (#261). One let go is computed again if an edit asks for it, which only the
+/// first edit after a build in full does much of. `RA_JIT_LRU` (`mir=N,runtime=N,compiled=N,
+/// inlinable=N`) sets any of them; 0 keeps every value.
+fn memo_capacities(db: &mut RootDatabase) -> anyhow::Result<()> {
+    let (mut mir, mut runtime, mut compiled, mut inlinable) = (2048, 2048, 16384, 8192);
+    let said = match std::env::var("RA_JIT_LRU") {
+        Ok(said) => said,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(why) => bail!("RA_JIT_LRU: {why}"),
+    };
+    for it in said.split(',').filter(|it| !it.trim().is_empty()) {
+        let parsed =
+            it.split_once('=').and_then(|(name, n)| Some((name.trim(), n.trim().parse().ok()?)));
+        match parsed {
+            Some(("mir", n)) => mir = n,
+            Some(("runtime", n)) => runtime = n,
+            Some(("compiled", n)) => compiled = n,
+            Some(("inlinable", n)) => inlinable = n,
+            _ => bail!(
+                "RA_JIT_LRU: `{it}` is not one of mir, runtime, compiled or inlinable = a number"
+            ),
+        }
+    }
+    hir_ty::mir::set_mir_capacity(db, mir);
+    hir_ty::mir::set_runtime_mir_capacity(db, runtime);
+    hir_ty_codegen::set_code_capacity(db, compiled, inlinable);
+    Ok(())
 }
 
 impl std::io::Write for &Client {
@@ -6952,8 +7479,9 @@ fn take_blaze_names() {
     }
 }
 
-/// `blaze 0.1.0 (abc123def456)`: the crate's version, and the commit when the build was
-/// told it in `RA_JIT_GIT_SHA` (the release workflow and the flake set it).
+/// `blaze 0.20261026.0 (fb82b09)`: the crate's version (`0.YYYYMMDD.N`, the release train's,
+/// docs/harness.md "CI"), and the commit, which build.rs takes from `RA_JIT_GIT_SHA` (the
+/// release workflow and the flake set it) or the checkout's HEAD.
 pub(crate) fn version() -> String {
     let version = env!("CARGO_PKG_VERSION");
     match option_env!("RA_JIT_GIT_SHA") {
@@ -6969,6 +7497,9 @@ fn main() -> anyhow::Result<()> {
     }
     trace::began();
     take_blaze_names();
+    if let Some(sources) = option_env!("RA_JIT_SOURCES") {
+        ra_jit_store::built_from(sources);
+    }
     syntax::set_green_trees(std::env::var_os("RA_JIT_GREEN_TREES").is_some());
     project_model::answer_toolchain_questions_with(answers::ask);
     let stands_in_for_rustc = std::env::var_os("RA_JIT_WRAPS_RUSTC").is_some();
@@ -7046,9 +7577,6 @@ fn main() -> anyhow::Result<()> {
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
     {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
-    }
-    if std::env::var_os(doctest::ENABLED).is_some() {
-        return doctest::command(std::env::args_os().skip(1));
     }
     trace::install();
     run(Args::parse(std::env::args().skip(1))?, None)
@@ -7185,6 +7713,7 @@ fn cargo_config(args: &Args) -> CargoConfig {
         extra_args: selected(&args),
         only_manifest_package: true,
         executables: executables_of(&args.symbol_files),
+        own_metadata: cargo::metadata::own(&args.selection),
         target_dir_config: match args.own_target {
             true => TargetDirectoryConfig::UseSubdirectory,
             false => TargetDirectoryConfig::None,
@@ -7657,6 +8186,8 @@ fn process_wide() {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     ra_jit_expand::install();
+    // Every proc-macro server is started in the sandbox.
+    macro_sandbox::install();
     let server = cargo::own_macro::server();
     if let Some(Ok(server)) = server.and_then(Path::to_str).map(AbsPathBuf::try_from) {
         load_cargo::serve_listed_with(server);
@@ -7705,6 +8236,9 @@ fn run_holding(
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
+    if args.exe.is_some() {
+        hir_ty_codegen::links_own();
+    }
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
     let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
     let (said, whole) = match ahead {
@@ -7719,7 +8253,6 @@ fn run_holding(
         let whole = whole.map(|it| it.recv()?).transpose()?;
         let symbol_files = whole.as_ref().map_or(&symbol_files, |it| &it.symbol_files);
         let start = Instant::now();
-        pause_before_symbols();
         let table = SymbolTable::load(symbol_files, &root)?;
         eprintln!("symbols: {} in {:.1?}", table.len(), start.elapsed());
         Ok::<_, anyhow::Error>((table, whole))
@@ -7784,7 +8317,7 @@ fn run_holding(
     }
     // A build with nothing of rustc's starts from the standard library, which a release ships.
     let nothing_of_rustc = library.is_none() && args.symbol_files.is_empty();
-    let shipped = (nothing_of_rustc && args.prebuilt.is_none() && args.patch.is_none())
+    let shipped = (nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args))
         .then(|| shipped::fetch_ahead(emits.triple()))
         .flatten();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
@@ -7944,6 +8477,8 @@ fn run_holding(
             bail!("{why}");
         }
     }
+    let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
+    let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let cold = match rustcs_to_patch(&args, written.is_empty() && !harnessed) {
         Some(rustcs) => {
             let start = Instant::now();
@@ -7969,6 +8504,9 @@ fn run_holding(
             if let Some(unit) = std_unit(&db, &table, &args, &listed)? {
                 args.prebuilt = Some(unit);
                 known.not_counted();
+            }
+            if let Some((cmd, exe)) = own_link_line(&db, &args)? {
+                (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
             }
             let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
             // An `include!` in a body is first seen when the body is compiled.
@@ -7998,12 +8536,14 @@ fn run_holding(
                 known.stats.onto_rustcs,
                 false,
                 packs_whole(&args),
+                args.exe.is_some(),
             )?;
             if let Some(exe) = &args.exe {
-                let workspace = checkouts.loaded.workspaces().first();
-                let sysroot = workspace.and_then(|it| it.sysroot.root());
-                let sysroot = sysroot.map(|it| it.as_ref());
-                link_executable(&db, &table, &listed, &args, sysroot, exe)?;
+                // A daemon's link line linked it already.
+                if args.splice.is_none() {
+                    let sysroot = SYSROOT.get().and_then(Option::as_deref);
+                    link_executable(&db, &table, &listed, &args, sysroot, exe)?;
+                }
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }
@@ -8057,6 +8597,11 @@ fn run_holding(
     {
         use ide_db::base_db::salsa::{Database, Durability};
         db.synthetic_write(Durability::LOW);
+    }
+    // Only a worker that serves builds again and lets go after; the bookkeeping of an `lru`
+    // costs every fetch of its queries.
+    if listener.is_some() {
+        memo_capacities(&mut db)?;
     }
     memory::report(&mut db, "warm-up")?;
     eprintln!("watching {} files", files.len());
@@ -8215,7 +8760,7 @@ fn run_holding(
                     Some(at) if idle => match builds.events.recv_timeout(OWN_BASE_AFTER) {
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {
-                                let_go(&mut db, &builds);
+                                let_go(&mut db, &builds, &programs);
                                 memory::served(&mut db)?;
                             }
                         }
@@ -8227,7 +8772,7 @@ fn run_holding(
                     _ if builds.stuck || idle => {
                         let event = builds.events.recv()?;
                         if builds.take(event, &mut programs)? {
-                            let_go(&mut db, &builds);
+                            let_go(&mut db, &builds, &programs);
                             memory::served(&mut db)?;
                         }
                     }
@@ -8246,7 +8791,7 @@ fn run_holding(
                     // requests sent with its own to arrive.
                     while let Ok(event) = builds.events.try_recv() {
                         if builds.take(event, &mut programs)? {
-                            let_go(&mut db, &builds);
+                            let_go(&mut db, &builds, &programs);
                             memory::served(&mut db)?;
                         }
                     }
@@ -8366,7 +8911,13 @@ fn run_holding(
                             && lock(&as_built)
                                 .get(&target.out)
                                 .is_some_and(|it| it.still(&files, &db, view, target, request));
-                        if unchanged && !reach_owed(&target.out) {
+                        // Nor is it unchanged when rustc linked the program again since.
+                        let relinked = programs.iter().any(|it| {
+                            target.is(&it.args)
+                                && !target.symbol_files.is_empty()
+                                && target.symbol_files != it.args.symbol_files
+                        });
+                        if unchanged && !relinked && !reach_owed(&target.out) {
                             let _ = writeln!(&stream, "ok unchanged");
                             continue;
                         }
@@ -8421,6 +8972,25 @@ fn run_holding(
                             interrupt |= builds.running.get(&at).is_some_and(|it| it.own_base);
                             later.push((request, asked, stream));
                             continue;
+                        }
+                        // rustc linked the program again since it was built here, as cargo
+                        // does of one the daemon did not build while it builds the others,
+                        // which the daemon keeps (`Checkout::kept`): what was built of it is
+                        // of rustc's copies from before.
+                        if let Some(target) = &target
+                            && target.is(&programs[at].args)
+                            && !target.symbol_files.is_empty()
+                            && target.symbol_files != programs[at].args.symbol_files
+                        {
+                            let again =
+                                checkouts.parts(&programs[at].args.project).and_then(|parts| {
+                                    programs[at].start_over(&db, parts, Some(target), &[], &files)
+                                });
+                            if let Err(error) = again {
+                                let _ = writeln!(&stream, "failed: {error:#}");
+                                continue;
+                            }
+                            eprintln!("rustc linked {} again: built over", programs[at].args.krate);
                         }
                         outputs.insert(at, wanted);
                         if let Some(view) = view {
@@ -8847,6 +9417,8 @@ fn run_holding(
         for (&at, wanted) in &outputs {
             let program = &mut programs[at];
             program.unbuilt.stale |= program.wrote.as_ref() != Some(&wanted.out);
+            // An executable of its own that was taken away is linked again.
+            program.unbuilt.stale |= program.args.exe.as_ref().is_some_and(|it| !it.exists());
             // The files a link reads and writes are not written again under it.
             if let Some(link) = links.remove(&wanted.out) {
                 _ = link.join();
@@ -9506,6 +10078,7 @@ fn run_holding(
             let from = Settled::of(&files, &db, base, over, patch, link_cmd.clone());
             let (as_built, object) = (as_built.clone(), out.clone());
             let packs = packs_whole(&programs[at].args);
+            let own_line = programs[at].args.exe.is_some();
             let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
             let linked = std::thread::spawn(move || {
                 let failed = link(
@@ -9518,6 +10091,7 @@ fn run_holding(
                     onto,
                     defer,
                     packs,
+                    own_line,
                 )
                 .err();
                 if failed.is_none() {
@@ -9540,7 +10114,7 @@ fn run_holding(
             });
             links.insert(out, linked);
         }
-        let_go(&mut db, &builds);
+        let_go(&mut db, &builds, &programs);
         memory::served(&mut db)?;
     }
 }
@@ -9765,6 +10339,8 @@ impl Program {
                 self.distrust_rustc(db, files, None);
                 self.unbuilt.named_anew = true;
                 self.args.widened.clear();
+                // The tests listed were of the program rustc linked before.
+                (self.tests, self.tests_now) = (None, None);
             }
             None => {
                 self.known.start_again();
@@ -9781,6 +10357,10 @@ impl Program {
     /// not use) has nothing in it an edit changes. The result is why one can't be taken over,
     /// when one can't.
     fn widen(&mut self, db: &RootDatabase) -> Option<String> {
+        // Every crate of a whole build is the daemon's: rustc has no copy of any.
+        if self.args.exe.is_some() {
+            return None;
+        }
         let built: Vec<ide_db::base_db::Crate> = self
             .args
             .crates()
@@ -9892,8 +10472,16 @@ impl Program {
             checked: last_checked,
             ..
         } = self;
+        if let Some((cmd, exe)) = own_link_line(db, args)? {
+            (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
+        }
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
+        // A whole build's link line is the worker's own, which no client names.
+        let (link_cmd, splice) = match &args.exe {
+            Some(_) => (link_cmd.or(args.link_cmd.clone()), splice.or(args.splice.clone())),
+            None => (link_cmd, splice),
+        };
         let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
@@ -10073,8 +10661,11 @@ impl Program {
             let (over_rustc, onto) = (known.stats.over_rustc, known.stats.onto_rustcs);
             begin_link();
             let packs = packs_whole(args);
-            let unlinked =
-                link(cmd, splice, patch, &args.out, patched, over_rustc, onto, defer, packs).err();
+            let own_line = args.exe.is_some();
+            let unlinked = link(
+                cmd, splice, patch, &args.out, patched, over_rustc, onto, defer, packs, own_line,
+            )
+            .err();
             if let Some(lost) =
                 unlinked.as_ref().and_then(|it| it.downcast_ref::<RustcLinkedLost>())
             {
@@ -10085,7 +10676,19 @@ impl Program {
                 }
                 return self.sync(db, listed, paths, edit, wanted, link_it, defer);
             }
+            if let Some(lost) = unlinked.as_ref().and_then(|it| it.downcast_ref::<PatchUnlinked>())
+            {
+                eprintln!("{lost}: built in full");
+                known.start_again();
+                return self.sync(db, listed, paths, edit, wanted, link_it, defer);
+            }
             failed = failed.or(unlinked.map(|it| Refused::Cargos(it.to_string())));
+            let unspliced = || failed.is_none() && link_it && full && args.splice.is_none();
+            if let Some(exe) = args.exe.as_deref().filter(|_| unspliced()) {
+                let sysroot = SYSROOT.get().and_then(Option::as_deref);
+                let linked = link_executable(db, table, listed, args, sysroot, exe);
+                failed = linked.err().map(|it| Refused::Cargos(format!("{it:#}")));
+            }
         }
         if let Some(why) = &failed {
             eprintln!("refused: {why}");
@@ -10138,11 +10741,14 @@ impl Program {
                 steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
             eprintln!("timeline-us: {}", steps.join(" "));
             eprintln!(
-                "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: roots {:.1?}, \
-                 instances {:.1?}, statics {:.1?}, left {:.1?}",
+                "asked: {} roots, {} instances, slowest {:.1?}; unchanged by their items: {} roots, \
+                 {} instances; longest on a thread: roots {:.1?}, instances {:.1?}, statics \
+                 {:.1?}, left {:.1?}",
                 warm.looked.roots_asked,
                 warm.looked.instances_asked,
                 warm.looked.slowest,
+                warm.looked.roots_unchanged,
+                warm.looked.instances_unchanged,
                 warm.looked.roots,
                 warm.looked.instances,
                 warm.looked.statics,
@@ -10285,6 +10891,22 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fetched_crate_is_named_the_same_wherever_cargo_keeps_it() {
+        let fetched = "registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/lib.rs";
+        let at =
+            |home: &str| crate_place(Path::new(&format!("{home}/{fetched}")), None, Some(home));
+        assert_eq!(at("/home/one/.cargo"), at("/Users/other/.cargo"));
+        assert_eq!(at("/home/one/.cargo"), format!("/cargo/{fetched}"));
+        let elsewhere = Path::new("/opt/crates/lib.rs");
+        assert_eq!(crate_place(elsewhere, None, Some("/home/one/.cargo")), "/opt/crates/lib.rs");
+        let inside = Path::new("/ws/app/src/main.rs");
+        assert_eq!(
+            crate_place(inside, Some(Path::new("app/src/main.rs")), None),
+            "app/src/main.rs"
+        );
+    }
 
     /// An rlib whose `lib.rmeta` is `metadata`, as an archive of one member.
     fn rlib(metadata: &[u8]) -> Vec<u8> {

@@ -1,6 +1,6 @@
-//! One `Cargo.toml` read as cargo 1.99 reads it (`src/workspace/parser/mod.rs` there): parsed
-//! into cargo's own schema, `workspace = true` fields and dependencies inherited, targets
-//! discovered, dependencies and features checked.
+//! One `Cargo.toml` read as the pinned nightly's cargo reads it (`src/workspace/parser/mod.rs`
+//! there): parsed into cargo's own schema, `workspace = true` fields and dependencies
+//! inherited, targets discovered, dependencies and features checked.
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
@@ -10,19 +10,21 @@ use anyhow::{Context as _, anyhow, bail};
 use cargo_platform::Platform;
 use cargo_util_schemas::core::{PackageIdSpec, PartialVersion};
 use cargo_util_schemas::manifest::{
-    self, Hints, InheritableField, InheritablePackage, PackageName, RustVersion, StringOrBool,
-    TomlDependency, TomlDetailedDependency, TomlInheritedDependency, TomlLints, TomlManifest,
-    TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
+    self, Hints, InheritableField, InheritablePackage, PackageName, PathBaseName, RustVersion,
+    StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency, TomlLints,
+    TomlManifest, TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
 };
 use rustc_hash::FxHashMap;
 use url::Url;
 
 use crate::config::Config;
+use crate::config::path::ConfigRelativePath;
 use crate::dependency::{DepKind, Dependency, FeatureMap, build_summary_features};
 use crate::diagnostic::ManifestDiagnostic;
 use crate::edit_distance::closest_msg;
 use crate::features::{Edition, Feature, Features, ResolveBehavior};
 use crate::paths::normalize_path;
+use crate::profiles::validate_profiles;
 use crate::source::{CRATES_IO_INDEX, CRATES_IO_REGISTRY, SourceId, into_url};
 use crate::targets::{self, Target};
 use crate::workspace::find_workspace_root;
@@ -394,6 +396,7 @@ pub fn read_manifest(
         } else if normalized_toml.workspace.is_some() {
             to_virtual_manifest(normalized_toml, features, workspace_config, source_id, path, ctx)
                 .map(|mut m| {
+                    warnings.append(&mut m.warnings);
                     m.warnings = std::mem::take(&mut warnings);
                     EitherManifest::Virtual(Box::new(m))
                 })
@@ -465,11 +468,15 @@ fn normalize_toml(
         cargo_features: original_toml.cargo_features.clone(),
         workspace: original_toml.workspace.clone(),
         profile: original_toml.profile.clone(),
-        patch: normalize_patch(original_toml.patch.as_ref(), features)?,
+        patch: normalize_patch(
+            &ctx.config,
+            original_toml.patch.as_ref(),
+            &workspace_root,
+            features,
+        )?,
         replace: original_toml.replace.clone(),
         ..Default::default()
     };
-    let _ = workspace_root;
 
     if let Some(original_package) = original_toml.package() {
         let normalized_package =
@@ -529,6 +536,7 @@ fn normalize_toml(
         normalized_toml.dependencies = normalize_dependencies(
             edition,
             features,
+            &ctx.config,
             original_toml.dependencies.as_ref(),
             DepKind::Normal,
             &inherit,
@@ -547,6 +555,7 @@ fn normalize_toml(
         normalized_toml.dev_dependencies = normalize_dependencies(
             edition,
             features,
+            &ctx.config,
             original_toml.dev_dependencies(),
             DepKind::Development,
             &inherit,
@@ -565,6 +574,7 @@ fn normalize_toml(
         normalized_toml.build_dependencies = normalize_dependencies(
             edition,
             features,
+            &ctx.config,
             original_toml.build_dependencies(),
             DepKind::Build,
             &inherit,
@@ -576,6 +586,7 @@ fn normalize_toml(
             let dependencies = normalize_dependencies(
                 edition,
                 features,
+                &ctx.config,
                 platform.dependencies.as_ref(),
                 DepKind::Normal,
                 &inherit,
@@ -594,6 +605,7 @@ fn normalize_toml(
             let dev_dependencies = normalize_dependencies(
                 edition,
                 features,
+                &ctx.config,
                 platform.dev_dependencies(),
                 DepKind::Development,
                 &inherit,
@@ -612,6 +624,7 @@ fn normalize_toml(
             let build_dependencies = normalize_dependencies(
                 edition,
                 features,
+                &ctx.config,
                 platform.build_dependencies(),
                 DepKind::Build,
                 &inherit,
@@ -654,24 +667,34 @@ fn normalize_toml(
     Ok(normalized_toml)
 }
 
-fn normalize_patch(
+fn normalize_patch<'a>(
+    config: &Config,
     original_patch: Option<&BTreeMap<String, BTreeMap<PackageName, TomlDependency>>>,
+    workspace_root: &dyn Fn() -> anyhow::Result<&'a Path>,
     features: &Features,
 ) -> anyhow::Result<Option<BTreeMap<String, BTreeMap<PackageName, TomlDependency>>>> {
     let Some(patch) = original_patch else {
         return Ok(None);
     };
+    let mut normalized_patch = BTreeMap::new();
     for (name, packages) in patch {
+        let mut normalized_packages = BTreeMap::new();
         for (pkg, dep) in packages {
-            if let TomlDependency::Detailed(dep) = dep {
+            let dep = if let TomlDependency::Detailed(dep) = dep {
                 let mut dep = dep.clone();
-                normalize_path_dependency(&mut dep, features).with_context(|| {
-                    format!("resolving path for patch of ({pkg}) for source ({name})")
-                })?;
-            }
+                normalize_path_dependency(config, &mut dep, workspace_root, features)
+                    .with_context(|| {
+                        format!("resolving path for patch of ({pkg}) for source ({name})")
+                    })?;
+                TomlDependency::Detailed(dep)
+            } else {
+                dep.clone()
+            };
+            normalized_packages.insert(pkg.clone(), dep);
         }
+        normalized_patch.insert(name.clone(), normalized_packages);
     }
-    Ok(Some(patch.clone()))
+    Ok(Some(normalized_patch))
 }
 
 fn field_inherit_with<T>(
@@ -805,6 +828,7 @@ fn normalize_package_readme(package_root: &Path, readme: Option<&StringOrBool>) 
 fn normalize_dependencies<'a>(
     edition: Edition,
     features: &Features,
+    config: &Config,
     orig_deps: Option<&BTreeMap<PackageName, manifest::InheritableDependency>>,
     kind: DepKind,
     inherit: &Inherit<'a>,
@@ -854,7 +878,8 @@ fn normalize_dependencies<'a>(
                     }
                 }
             }
-            normalize_path_dependency(d, features)
+            let workspace_root = || inherit().map(|fields| fields.ws_root());
+            normalize_path_dependency(config, d, &workspace_root, features)
                 .with_context(|| format!("resolving path dependency {name_in_toml}"))?;
         }
         deps.insert(name_in_toml.clone(), manifest::InheritableDependency::Value(resolved));
@@ -862,19 +887,46 @@ fn normalize_dependencies<'a>(
     Ok(Some(deps))
 }
 
-/// `base` needs the unstable `path-bases`, which stable cargo refuses.
-fn normalize_path_dependency(
+/// A path dependency's `base` (the unstable `path-bases`) joined to its `path`, as nightly
+/// cargo's `normalize_path_dependency` does.
+fn normalize_path_dependency<'a>(
+    config: &Config,
     detailed_dep: &mut TomlDetailedDependency,
+    workspace_root: &dyn Fn() -> anyhow::Result<&'a Path>,
     features: &Features,
 ) -> anyhow::Result<()> {
-    if detailed_dep.base.is_some() {
-        if detailed_dep.path.is_some() {
-            features.require(Feature::path_bases)?;
+    if let Some(base) = detailed_dep.base.take() {
+        if let Some(path) = detailed_dep.path.as_mut() {
+            let new_path = lookup_path_base(&base, config, workspace_root, features)?.join(&path);
+            *path = new_path.to_str().unwrap().to_owned();
         } else {
             bail!("`base` can only be used with path dependencies");
         }
     }
     Ok(())
+}
+
+/// Where the path base `base` points: the configuration's `[path-bases]` entry, else the
+/// built-in `workspace`, cargo's `lookup_path_base`.
+fn lookup_path_base<'a>(
+    base: &PathBaseName,
+    config: &Config,
+    workspace_root: &dyn Fn() -> anyhow::Result<&'a Path>,
+    features: &Features,
+) -> anyhow::Result<PathBuf> {
+    features.require(Feature::path_bases)?;
+    if let Some(path) =
+        config.get::<Option<ConfigRelativePath>>(&format!("path-bases.{}", base.as_str()))?
+    {
+        return Ok(path.resolve_path(config.cwd()));
+    }
+    match base.as_str() {
+        "workspace" => Ok(workspace_root()?.to_path_buf()),
+        _ => bail!(
+            "path base `{base}` is undefined. \
+             You must add an entry for `{base}` in the Cargo configuration [path-bases] table."
+        ),
+    }
 }
 
 fn load_inheritable_fields(
@@ -1252,6 +1304,10 @@ fn to_real_manifest(
         rust_version,
     };
 
+    if let Some(profiles) = &normalized_toml.profile {
+        validate_profiles(profiles, &features, warnings)?;
+    }
+
     let version = normalized_package.normalized_version().expect("previously normalized");
     let publish = match normalized_package.normalized_publish().expect("previously normalized") {
         Some(VecStringOrBool::VecString(vecstring)) => Some(vecstring.clone()),
@@ -1359,6 +1415,9 @@ fn to_virtual_manifest(
         };
         (replace(&normalized_toml, &mut manifest_ctx)?, patch(&normalized_toml, &mut manifest_ctx)?)
     };
+    if let Some(profiles) = &normalized_toml.profile {
+        validate_profiles(profiles, &features, &mut warnings)?;
+    }
     let resolve_behavior = normalized_toml
         .workspace
         .as_ref()

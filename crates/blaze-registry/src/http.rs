@@ -10,9 +10,9 @@ use std::{
 };
 
 use anyhow::Context;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::{
-    Request, StatusCode,
+    Method, Request, StatusCode,
     body::{Bytes, Incoming},
     header,
 };
@@ -22,7 +22,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 
-/// An answer to a GET, after its redirects, with its body decoded.
+/// An answer to a request, after its redirects, with its body decoded.
 #[derive(Clone, Debug, Default)]
 pub struct Response {
     pub status: u16,
@@ -177,7 +177,7 @@ const REDIRECTS: usize = 10;
 /// that any number of threads ask through at once.
 pub struct HyperHttp {
     runtime: tokio::runtime::Runtime,
-    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     user_agent: String,
     /// How long a connection or a transfer may go without a byte, cargo's `http.timeout`.
     timeout: Duration,
@@ -208,16 +208,35 @@ impl HyperHttp {
         shared.clone().map_err(anyhow::Error::msg)
     }
 
-    async fn fetch(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
+    /// `method` of `url` with `body`, after its redirects, as cargo's handle follows them.
+    pub fn send(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> anyhow::Result<Response> {
+        self.runtime.block_on(self.fetch(method, url, headers, Bytes::from(body)))
+    }
+
+    async fn fetch(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> anyhow::Result<Response> {
         let mut address = url.to_owned();
         for _ in 0..=REDIRECTS {
-            let mut request = Request::get(&address)
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri(&address)
                 .header(header::USER_AGENT, &self.user_agent)
                 .header(header::ACCEPT_ENCODING, "gzip");
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
-            let request = request.body(Empty::new())?;
+            let request = request.body(Full::new(body.clone()))?;
             let answer = tokio::time::timeout(self.timeout, self.client.request(request))
                 .await
                 .map_err(|_| Transport(format!("no answer from {address} in {:?}", self.timeout)))?
@@ -271,7 +290,7 @@ impl HyperHttp {
 
 impl Http for HyperHttp {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.fetch(url, headers))
+        self.send(Method::GET, url, headers, Vec::new())
     }
 }
 

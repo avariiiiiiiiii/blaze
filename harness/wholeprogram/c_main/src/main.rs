@@ -9,7 +9,7 @@ macro_rules! times4 {
 
 // More instructions than LLVM is given in a build that edits follow: in a whole program's
 // it is LLVM's all the same. Braced, as rustc parses `times4!(times4!(...))` as an expression
-// and rejects it, which ra-jit does not (#154).
+// and rejects it, and so does ra-jit (#154).
 #[inline(never)]
 fn mix(seed: u64) -> u64 {
     let mut acc = seed;

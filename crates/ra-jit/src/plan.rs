@@ -130,6 +130,15 @@ pub(crate) struct Asked<'a> {
     pub(crate) env: &'a FxHashMap<String, Option<String>>,
 }
 
+/// cargo, run in `dir` with `env` for the variables of whoever asks.
+fn cargo_in(dir: &Path, env: &FxHashMap<String, Option<String>>) -> std::process::Command {
+    let mut command = toolchain::command("cargo", dir, env);
+    // The unit graph and `cargo config get` are not stable yet.
+    command.env("RUSTC_BOOTSTRAP", "1").stdin(Stdio::null());
+    crate::answers::ready_cargo(&mut command);
+    command
+}
+
 impl Asked<'_> {
     fn var(&self, name: &str) -> Option<String> {
         match self.env.get(name) {
@@ -140,11 +149,7 @@ impl Asked<'_> {
 
     /// cargo, run in `dir` as whoever asks would run it.
     fn cargo(&self, dir: &Path) -> std::process::Command {
-        let mut command = toolchain::command("cargo", dir, self.env);
-        // The unit graph and `cargo config get` are not stable yet.
-        command.env("RUSTC_BOOTSTRAP", "1").stdin(Stdio::null());
-        crate::answers::ready_cargo(&mut command);
-        command
+        cargo_in(dir, self.env)
     }
 
     /// Whether the key of a `[target]` table of cargo's configuration names what is built for.
@@ -178,6 +183,10 @@ pub(crate) struct Profile {
     debuginfo: DebugLevel,
     split_debuginfo: Option<String>,
     strip: Strip,
+    /// The profile's own `rustflags` (cargo's `-Z profile-rustflags`), which come after the
+    /// others.
+    #[serde(default)]
+    rustflags: Vec<String>,
 }
 
 /// A `debug` setting as cargo passes it on: a level by its number or by its name.
@@ -379,10 +388,10 @@ impl Flags {
     /// for and `[build]` of the configuration that has any.
     fn of(dir: &Path, asked: &Asked<'_>) -> anyhow::Result<Flags> {
         if let Some(encoded) = asked.var("CARGO_ENCODED_RUSTFLAGS") {
-            return Ok(Flags::parse(encoded.split('\u{1f}')));
+            return Flags::parse(encoded.split('\u{1f}'));
         }
         if let Some(flags) = asked.var("RUSTFLAGS") {
-            return Ok(Flags::parse(flags.split_whitespace()));
+            return Flags::parse(flags.split_whitespace());
         }
         let mut command = asked.cargo(dir);
         // `cargo config get` is how cargo says what its configuration files and variables
@@ -405,12 +414,19 @@ impl Flags {
             .flat_map(Words::words)
             .collect();
         if !of_target.is_empty() {
-            return Ok(Flags::parse(of_target.into_iter()));
+            return Flags::parse(of_target.into_iter());
         }
-        Ok(Flags::parse(config.build.rustflags.iter().flat_map(Words::words)))
+        Flags::parse(config.build.rustflags.iter().flat_map(Words::words))
     }
 
-    fn parse<'a>(mut words: impl Iterator<Item = &'a str>) -> Flags {
+    /// The flags of `words`. `Err` names a `-Z` flag ra-jit does not build code with
+    /// ([`crate::unstable`]); the others it ignores, or what they ask is what it does.
+    fn parse<'a>(words: impl Iterator<Item = &'a str>) -> anyhow::Result<Flags> {
+        let words: Vec<&str> = words.collect();
+        if let Some(why) = crate::unstable::refusal(&words) {
+            anyhow::bail!("the flags for rustc have {why}; ra-jit does not build with it");
+        }
+        let mut words = words.into_iter();
         let mut flags = Flags::default();
         while let Some(word) = words.next() {
             if ["--cap-lints", "--force-warn"].iter().any(|it| {
@@ -457,7 +473,7 @@ impl Flags {
                 _ => {}
             }
         }
-        flags
+        Ok(flags)
     }
 }
 
@@ -528,23 +544,7 @@ impl Plan {
             }
             None => (manifest.parent().unwrap_or(Path::new(".")), Some(manifest)),
         };
-        let mut command = asked.cargo(dir);
-        command.args(["build", "--unit-graph", "-Z", "unstable-options"]);
-        if let Some(manifest) = manifest {
-            command.arg("--manifest-path").arg(manifest);
-        }
-        command.args(selection.flags());
-        if selection.dev_deps {
-            command.arg("--all-targets");
-        }
-        let output = command.output().context("running `cargo build`")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "`cargo build --unit-graph` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        let graph: UnitGraph =
-            serde_json::from_slice(&output.stdout).context("reading cargo's unit graph")?;
+        let graph = UnitGraph::of(dir, manifest, selection, asked.env)?;
         graph.plan(&Flags::of(dir, asked)?)
     }
 
@@ -615,6 +615,8 @@ struct Unit {
 #[derive(Deserialize)]
 struct UnitTarget {
     kind: Vec<String>,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -635,6 +637,33 @@ impl Unit {
 }
 
 impl UnitGraph {
+    /// What `cargo build --unit-graph` says of the build `selection` names, asked in `dir` of
+    /// the package of `manifest` when there is one, with `env` for the variables of whoever
+    /// asks.
+    fn of(
+        dir: &Path,
+        manifest: Option<&Path>,
+        selection: &Selection,
+        env: &FxHashMap<String, Option<String>>,
+    ) -> anyhow::Result<UnitGraph> {
+        let mut command = cargo_in(dir, env);
+        command.args(["build", "--unit-graph", "-Z", "unstable-options"]);
+        if let Some(manifest) = manifest {
+            command.arg("--manifest-path").arg(manifest);
+        }
+        command.args(selection.flags());
+        if selection.dev_deps {
+            command.arg("--all-targets");
+        }
+        let output = command.output().context("running `cargo build`")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "`cargo build --unit-graph` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        serde_json::from_slice(&output.stdout).context("reading cargo's unit graph")
+    }
+
     /// The units that end up in the program: those the roots reach without going through one
     /// that runs on the host.
     fn for_target(&self) -> FxHashSet<usize> {
@@ -662,6 +691,14 @@ impl UnitGraph {
             "`-C lto` is among the flags: rustc compiles the whole program again as it links \
              it and leaves no library on the link line for ra-jit's functions to be linked against"
         );
+        for unit in &self.units {
+            if let Some(why) = crate::unstable::refusal(&unit.profile.rustflags) {
+                anyhow::bail!(
+                    "the profile's rustflags for `{}` have {why}; ra-jit does not build with it",
+                    unit.target.name
+                );
+            }
+        }
         let lto = for_target.iter().any(|&it| self.units[it].profile.links_from_bitcode());
         if lto {
             eprintln!("{LTO_ACCEPTED}");
@@ -701,7 +738,7 @@ mod tests {
 
     #[test]
     fn force_frame_pointers_is_read_in_each_spelling() {
-        let kept = |flags: &str| Flags::parse(flags.split_whitespace()).frame_pointers;
+        let kept = |flags: &str| Flags::parse(flags.split_whitespace()).unwrap().frame_pointers;
         assert!(kept("-Cforce-frame-pointers=yes"));
         assert!(kept("--cap-lints allow -C force-frame-pointers"));
         assert!(kept("-C force_frame_pointers=always"));
@@ -712,11 +749,19 @@ mod tests {
 
     #[test]
     fn the_flags_that_cap_lints_are_read() {
-        let capped = |flags: &str| Flags::parse(flags.split_whitespace()).lints_capped;
+        let capped = |flags: &str| Flags::parse(flags.split_whitespace()).unwrap().lints_capped;
         assert!(capped("--cap-lints warn"));
         assert!(capped("-C opt-level=1 --cap-lints=allow"));
         assert!(capped("--force-warn non_snake_case"));
         assert!(!capped("-D warnings -A dead_code"));
         assert!(!capped("--cap-lintsx"));
+    }
+
+    #[test]
+    fn unstable_flags_are_ignored_or_refused_by_name() {
+        let flags = Flags::parse("-Zthreads=8 -Z time-passes -Copt-level=1".split_whitespace());
+        assert_eq!(flags.unwrap().opt_level.as_deref(), Some("1"));
+        let refused = Flags::parse("-Zthreads=8 -Z location-detail=none".split_whitespace());
+        assert!(refused.unwrap_err().to_string().contains("-Z location-detail=none"));
     }
 }

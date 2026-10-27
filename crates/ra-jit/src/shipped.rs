@@ -102,7 +102,7 @@ pub(crate) fn fetched(ahead: Option<JoinHandle<()>>) {
 /// Builds a program that prints a line, whole, with `profile` and the toolchain at `sysroot`,
 /// in `dir` and into `store`: a program keys the standard library's unit by the debug info
 /// its profile asks for, which a build script's does not ask for, so the shipped store has
-/// the unit of each profile a build from nothing (`RA_JIT_WHOLE_BUILD`) takes.
+/// the unit of each profile a whole build takes.
 fn program_unit(sysroot: &Path, dir: &Path, store: &Path, profile: &str) -> anyhow::Result<String> {
     std::fs::create_dir_all(dir.join("src"))?;
     let manifest =

@@ -49,10 +49,6 @@ WORKSPACE = {
     "pub fn one() -> u32 {\n    1\n}\n",
 }
 
-# On macOS every example is rustc's for this one reason, whichever of std's writable statics
-# (`CLEANUP`, `GLOBAL_PANIC_COUNT`) is reached first (#255); any other is still WRONG.
-MACOS_LEFT = re.compile(r"unsupported: writable static `\w+` without a rustc symbol$")
-
 STEPS = [
     ("every example passes", [], {}),
     ("examples fail", [], {"DOCTEST_FAIL": "1"}),
@@ -100,7 +96,6 @@ def main():
             got, said = tested(ws, ["ra-jit"], args, extra, os.path.join(scratch, "ra-jit"))
             loads = len(re.findall(r"(?m)^load workspace: ", said))
             left = re.findall(r"ra-jit: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
-            left = [it for it in left if not (sys.platform == "darwin" and MACOS_LEFT.search(it))]
             built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by ra-jit", said))
             parts = ["exit status", "results", "`Doc-tests` lines", "lines of what failed"]
             differs = [f"{part}: {first_difference(w, g)}"[:400] for part, w, g in zip(parts, want, got) if w != g]

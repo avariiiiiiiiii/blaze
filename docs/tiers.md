@@ -4,7 +4,8 @@ A program that takes edits with `ra-jit-live` is also made faster while it runs.
 samples where its threads are, compiles the functions it spends its time in again with LLVM,
 and swaps them in as patches, the way HotSpot or V8 tier up, without a restart
 ([#6](https://github.com/indexable-inc/ra-jit/issues/6)). macOS on Apple silicon only, as
-live edits are; it needs a ra-jit built with `--features llvm`.
+live edits are. Released binaries have LLVM in them (23.1.4, linked statically); a ra-jit
+built from source needs `--features llvm` ([contributing.md](contributing.md#llvm-for---features-llvm)).
 
 ![The Tiers island of the Game of Life window](tiers.png)
 
@@ -120,6 +121,33 @@ would have:
 - **Alignment is not said**: an access is `align 1` unless Cranelift's IR flags it aligned.
   On AArch64 an unaligned load is the same instruction; LLVM's code for the benchmark's
   `step` is the same with every access given its natural alignment.
+
+### LLVM's inliner
+
+LLVM's own inliner runs at threshold 500 (`llvm::INLINE_THRESHOLD`), over the 225 of `-O2` and
+250 of `-O3`; `RA_JIT_LLVM_INLINE_THRESHOLD=N` sets another, and the store keeps code of each
+threshold apart. Measured on LLVM 23 with the runtime set of docs/benchmarks.md (dev-aws-5,
+x86-64, 16 cores, 5 rounds, each build with a cold store of its own; ratio to rustc's release
+build, lower is faster):
+
+| Build | Geomean | words | ripgrep | tokei | Code, bat | Code, ripgrep | Compile, all 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| blaze's building in, LLVM's default | 1.091 | 1.22 | 1.14 | 1.28 | 9.06 MB | 12.79 MB | 129.0 s |
+| nothing built in by blaze (`RA_JIT_BUILT_IN=0`) | 1.092 | 1.22 | 1.14 | 1.31 | 9.06 MB | 12.79 MB | 129.7 s |
+| threshold 225 | 1.100 | 1.24 | 1.15 | 1.37 | 8.96 MB | 12.78 MB | 129.2 s |
+| **threshold 500** | **1.080** | 1.16 | 1.11 | 1.26 | 9.55 MB | 13.03 MB | 128.6 s |
+| threshold 1000 | 1.079 | 1.13 | 1.10 | 1.18 | 10.29 MB | 13.32 MB | 130.7 s |
+| nothing built in, threshold 500 | 1.077 | 1.16 | 1.09 | 1.24 | 9.54 MB | 13.03 MB | 129.3 s |
+| nothing built in, threshold 1000 | 1.079 | 1.13 | 1.09 | 1.17 | 10.29 MB | 13.33 MB | 130.4 s |
+
+Leaving every call to LLVM's inliner changes nothing measurable: the library's bodies blaze
+builds in are the small ones LLVM's inliner takes anyway. 500 is as fast as 1000 for half the
+growth in code (2 to 5% over the default against 4 to 14%), and neither costs compile time.
+The frames (`harness/frames.py` over the kept binaries): ripgrep's sum of frames is 992 KiB at
+the default, 977 KiB at 500 and 981 KiB at 1000 (rustc 581 KiB), its largest 36 KiB in every
+build; tokei's 1208, 1187 and 1177 KiB (rustc 570 KiB), its largest 124 KiB in every build,
+against 4.1 KiB under rustc. The inliner's threshold is not what makes blaze's frames
+larger than rustc's.
 
 ### Profile-guided optimization
 

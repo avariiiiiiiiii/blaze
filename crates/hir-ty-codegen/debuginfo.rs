@@ -19,7 +19,7 @@ mod types;
 use codeview::CodeView;
 pub(super) use set::TypeSet;
 use set::{Of, Told};
-pub(super) use types::{Sets, described};
+pub(super) use types::{ByEnv, Sets, described};
 
 use cranelift_codegen::{
     binemit::CodeOffset,
@@ -423,10 +423,22 @@ impl DebugContext {
     }
 }
 
-/// A [`DebugContext`] on a thread of its own, which describes the functions it is sent
-/// while the thread that sends them goes on putting code in the object.
+/// A [`DebugContext`] on threads of their own, which describe the functions they are sent
+/// while the thread that sends them goes on putting code in the object. DWARF linked into
+/// an ELF object is described on several, each writing units of its own: one thread falls
+/// behind the one putting code in the object, and the object waits for it.
 pub(super) struct Describer {
-    functions: std::sync::mpsc::Sender<(FuncId, u32, FunctionDebug)>,
+    shards: Vec<Shard>,
+    /// How many functions were sent, which picks the thread a function goes to.
+    sent: std::sync::atomic::AtomicUsize,
+}
+
+/// A function to describe, with the entries it is of when the store had it: its types are read
+/// on the describing thread.
+type Sent = (FuncId, u32, FunctionDebug, Option<std::sync::Arc<super::cached::Entries>>);
+
+struct Shard {
+    functions: std::sync::mpsc::Sender<Sent>,
     described: std::thread::JoinHandle<Described>,
 }
 
@@ -439,10 +451,80 @@ enum Described {
 }
 
 impl Describer {
-    pub(super) fn new(mut context: DebugContext) -> Describer {
-        let (functions, sent) = std::sync::mpsc::channel::<(FuncId, u32, FunctionDebug)>();
+    /// With `elf`, the object is an ELF one, which can have DWARF of several threads: its
+    /// linker puts the sections of one name together, and each unit reads the sections
+    /// beside it.
+    pub(super) fn new(context: DebugContext, elf: bool) -> Describer {
+        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let mut contexts = vec![];
+        if let DebugContext::Dwarf(dwarf) = &context
+            && elf
+            && dwarf.apart.is_none()
+            && !dwarf.grouped
+        {
+            // The types of the functions put in from the store are read here as well.
+            contexts.extend((1..(threads / 4).clamp(1, 16)).map(|_| dwarf.like()));
+        }
+        let contexts = std::iter::once(context)
+            .chain(contexts.into_iter().map(|it| DebugContext::Dwarf(Box::new(it))));
+        let shards = contexts.map(Shard::new).collect();
+        Describer { shards, sent: Default::default() }
+    }
+
+    /// Describes the function `func` of the module, which is `len` bytes of code.
+    pub(super) fn add_function(&self, func: FuncId, len: u32, debug: FunctionDebug) {
+        self.send((func, len, debug, None));
+    }
+
+    /// Describes the function `func` put in the module from `entries`.
+    pub(super) fn add_stored(
+        &self,
+        func: FuncId,
+        len: u32,
+        debug: FunctionDebug,
+        entries: std::sync::Arc<super::cached::Entries>,
+    ) {
+        self.send((func, len, debug, Some(entries)));
+    }
+
+    fn send(&self, function: Sent) {
+        let sent = self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let shard = &self.shards[(sent / FUNCTIONS_OF_A_UNIT) % self.shards.len()];
+        // The thread ends only when it panicked, which `emit` says.
+        let _ = shard.functions.send(function);
+    }
+
+    /// Writes the sections into the object, when it has a function to describe. What is
+    /// returned is what was kept apart from the object.
+    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
+        let mut written = Vec::new();
+        let mut kept = None;
+        // Every thread is told there is nothing more before any is waited for.
+        let threads: Vec<_> = self.shards.into_iter().map(|it| it.described).collect();
+        for described in threads {
+            match described.join().map_err(|_| "describing the functions panicked")? {
+                Described::Sections(sections) => written.push(sections?),
+                Described::Context(context) => kept = Some(context),
+            }
+        }
+        if let Some(context) = kept {
+            return context.emit(product);
+        }
+        if matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
+            place_all(product, written)?;
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl Shard {
+    fn new(mut context: DebugContext) -> Shard {
+        let (functions, sent) = std::sync::mpsc::channel::<Sent>();
         let described = std::thread::spawn(move || {
-            for (func, len, debug) in sent {
+            for (func, len, mut debug, entries) in sent {
+                if let Some(entries) = entries {
+                    entries.describe(&mut debug);
+                }
                 context.add_function(func, len, &debug);
             }
             match context {
@@ -452,28 +534,7 @@ impl Describer {
                 context => Described::Context(context),
             }
         });
-        Describer { functions, described }
-    }
-
-    /// Describes the function `func` of the module, which is `len` bytes of code.
-    pub(super) fn add_function(&self, func: FuncId, len: u32, debug: FunctionDebug) {
-        // The thread ends only when it panicked, which `emit` says.
-        let _ = self.functions.send((func, len, debug));
-    }
-
-    /// Writes the sections into the object, when it has a function to describe. What is
-    /// returned is what was kept apart from the object.
-    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
-        drop(self.functions);
-        match self.described.join().map_err(|_| "describing the functions panicked")? {
-            Described::Sections(sections) => {
-                if matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
-                    place(product, sections?)?;
-                }
-                Ok(Vec::new())
-            }
-            Described::Context(context) => context.emit(product),
-        }
+        Shard { functions, described }
     }
 }
 
@@ -538,6 +599,18 @@ impl Dwarf {
     fn new(isa: &dyn TargetIsa, directory: &str, variables: bool, apart: Option<String>) -> Self {
         let encoding =
             Encoding { format: Format::Dwarf32, version: 4, address_size: isa.pointer_bytes() };
+        Self::of(encoding, directory.as_bytes().to_vec(), variables, apart)
+    }
+
+    /// Units of their own, of the object this describes the functions of.
+    fn like(&self) -> Self {
+        let apart = self.apart.as_ref().map(|it| it.0.clone());
+        let mut dwarf = Self::of(self.encoding, self.directory.clone(), self.variables, apart);
+        dwarf.grouped = self.grouped;
+        dwarf
+    }
+
+    fn of(encoding: Encoding, directory: Vec<u8>, variables: bool, apart: Option<String>) -> Self {
         let mut context = Dwarf {
             dwarf: DwarfUnit::new(encoding),
             full: Vec::new(),
@@ -545,7 +618,7 @@ impl Dwarf {
             id: FxHasher::default(),
             addresses: Vec::new(),
             encoding,
-            directory: directory.as_bytes().to_vec(),
+            directory,
             files: FxHashMap::default(),
             ranges: Vec::new(),
             types: FxHashMap::default(),
@@ -1186,20 +1259,29 @@ pub struct Sidecar {
 /// map: an offset into another section is written as it is, and an address is relocated
 /// against its section, which [`settle_macho`] adds the address of once the object is laid out.
 fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), String> {
+    place_all(product, vec![sections])
+}
+
+/// [`place`] for the sections of several [`Dwarf`]s, each of which reads only its own.
+fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), String> {
     let macho = product.object.format() == BinaryFormat::MachO;
     let mut placed = FxHashMap::default();
     let mut linked = Vec::new();
     // A section with nothing in it is still there when another says where in it to read. A
     // unit's own sections are read by that unit, and the shared ones by every unit.
-    let read: Vec<(Option<usize>, SectionId)> = (sections.iter())
-        .flat_map(|it| it.written.relocs.iter().map(move |reloc| (it.group, reloc)))
-        .filter_map(|(group, it)| match it.target {
-            Target::Section(section) => Some((group, section)),
+    let read: Vec<(usize, Option<usize>, SectionId)> = (all.iter().enumerate())
+        .flat_map(|(of, sections)| sections.iter().map(move |it| (of, it)))
+        .flat_map(|(of, it)| it.written.relocs.iter().map(move |reloc| (of, it.group, reloc)))
+        .filter_map(|(of, group, it)| match it.target {
+            Target::Section(section) => Some((of, group, section)),
             Target::Function(_) => None,
         })
         .collect();
-    for Section { id, group, written } in sections {
-        let is_read = read.iter().any(|&(by, it)| it == id && (by == group || group.is_none()));
+    let sections = (all.into_iter().enumerate())
+        .flat_map(|(of, sections)| sections.into_iter().map(move |it| (of, it)));
+    for (of, Section { id, group, written }) in sections {
+        let is_read = (read.iter())
+            .any(|&(at, by, it)| at == of && it == id && (by == group || group.is_none()));
         if written.bytes.slice().is_empty() && !is_read {
             continue;
         }
@@ -1215,15 +1297,16 @@ fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), Stri
         };
         let at = product.object.add_section(segment, name, kind);
         product.object.section_mut(at).set_data(written.bytes.slice().to_vec(), 1);
-        placed.insert((group, id), at);
-        linked.push((id, group, at, written.relocs));
+        placed.insert((of, group, id), at);
+        linked.push((of, id, group, at, written.relocs));
     }
-    for (id, group, at, relocs) in linked {
+    for (of, id, group, at, relocs) in linked {
         for reloc in &relocs {
             let (symbol, addend) = match reloc.target {
                 Target::Function(func) => function_place(product, func),
                 Target::Section(section) => {
-                    let found = placed.get(&(group, section)).or(placed.get(&(None, section)));
+                    let found =
+                        placed.get(&(of, group, section)).or(placed.get(&(of, None, section)));
                     let Some(&section) = found else {
                         return Err(format!("{} points to a section left out", id.name()));
                     };

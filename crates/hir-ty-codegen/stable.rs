@@ -60,6 +60,17 @@ pub fn lower_declared(db: &dyn HirDatabase, crates: &[Crate], lower: &dyn Fn(&[D
     declared(db, crates, lower, &mut |_| ());
 }
 
+/// The statics `crates` declare, in their modules and in the blocks of their bodies.
+pub(super) fn declared_statics(db: &dyn HirDatabase, crates: &[Crate]) -> Vec<StaticId> {
+    let mut statics = Vec::new();
+    declared(db, crates, &|_| (), &mut |it| {
+        if let Declared::Static(id) = it {
+            statics.push(id);
+        }
+    });
+    statics
+}
+
 /// The functions and statics `crates` declare, in their modules and in the blocks of their
 /// bodies: a `static` is often written by a macro.
 fn declared(

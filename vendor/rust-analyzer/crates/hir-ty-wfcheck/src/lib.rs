@@ -39,7 +39,7 @@ use hir_ty::{
 };
 
 pub use outlives::Inferred;
-use outlives::{Known, Needs};
+use outlives::{Known, Needs, Wfcx};
 
 /// Where an error is: rustc's span of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
@@ -55,6 +55,12 @@ pub enum Site {
     Bound(GenericDefId, u32),
     /// An `impl Trait` a function returns, by its index among those of its return type.
     Opaque(FunctionId, u32),
+    /// The type of a function's parameter, by its index, `self` included.
+    Param(FunctionId, u32),
+    /// The type a function returns.
+    Output(FunctionId),
+    /// The type an impl is for.
+    SelfTy(ImplId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
@@ -142,7 +148,12 @@ impl<'db> Check<'_, 'db> {
                         .map(|it| (it, Site::Field(variant, field))),
                 );
                 let mut found = Vec::new();
-                outlives::projection_needs(self.db, adt.into(), ty, &mut found);
+                outlives::projection_needs(
+                    self.db,
+                    &Wfcx::new(self.db, adt.into()),
+                    ty,
+                    &mut found,
+                );
                 needs.extend(found.into_iter().map(|it| (it, Site::Field(variant, field))));
             }
         }
@@ -151,8 +162,7 @@ impl<'db> Check<'_, 'db> {
     }
 
     /// The self type and trait arguments of an impl, which it and its items assume
-    /// well-formed. `None` when they have an error or an associated type: what normalizing
-    /// them would imply is not known here.
+    /// well-formed. `None` when they have an error.
     fn header(&self, impl_: ImplId) -> Option<Vec<Ty<'db>>> {
         let db = self.db;
         let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
@@ -164,10 +174,16 @@ impl<'db> Check<'_, 'db> {
                 _ => None,
             }));
         }
-        if header.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
+        if header.iter().any(|ty| ty.references_error()) {
             return None;
         }
         Some(header)
+    }
+
+    /// The impl's header, when it has no associated type: what normalizing it would imply
+    /// is not reasoned about for the impl itself and its associated types.
+    fn plain_header(&self, impl_: ImplId) -> Option<Vec<Ty<'db>>> {
+        self.header(impl_).filter(|header| !header.iter().any(|ty| ty.has_aliases()))
     }
 
     /// What an item knows: its where clauses and what the types it assumes well-formed imply.
@@ -183,9 +199,19 @@ impl<'db> Check<'_, 'db> {
 
     fn impl_(&mut self, impl_: ImplId) {
         let db = self.db;
-        let Some(header) = self.header(impl_) else { return };
+        let Some(header) = self.plain_header(impl_) else { return };
         let known = self.known(impl_.into(), &header);
         let mut needs = self.where_needs(impl_.into());
+        // The header is well-formed: the trait bounds that asks hold.
+        for (index, &ty) in header.iter().enumerate() {
+            let site = match index {
+                0 => Site::SelfTy(impl_),
+                _ => Site::ImplTrait(impl_),
+            };
+            let mut found = Vec::new();
+            outlives::trait_needs(db, &Wfcx::new(db, impl_.into()), ty, &mut found);
+            needs.extend(found.into_iter().map(|it| (it, site)));
+        }
 
         // The trait's outlives bounds hold of the impl's arguments.
         if let Some(trait_ref) = db.impl_trait(impl_) {
@@ -266,24 +292,57 @@ impl<'db> Check<'_, 'db> {
                 })
             })
             .collect();
-        let mut assumed = inputs.clone();
-        if assumed.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
+        if inputs.iter().any(|ty| ty.references_error()) {
             return;
         }
+        let wfcx = Wfcx::new(db, function.into());
+        // What it assumes well-formed is normalized for what that implies apart from the
+        // normalizing of its signature for its well-formedness, as rustc's implied bounds.
+        let mut assumed: Vec<Ty<'db>> =
+            inputs.iter().map(|&ty| wfcx.normalize(ty, &mut Vec::new())).collect();
         if let ItemContainerId::ImplId(impl_) = function.lookup(db).container {
             let Some(header) = self.header(impl_) else { return };
-            assumed.extend(header);
+            assumed.extend(header.into_iter().map(|ty| wfcx.normalize(ty, &mut Vec::new())));
         }
+        assumed.retain(|ty| !ty.references_error());
         // An `impl Trait` it returns has those lifetimes too.
         let regions = hir_ty::elided_lifetimes(db, function).regions(&errors);
         let output = hir_ty::with_elided_regions(db, sig.output(), function, &regions);
         if output.references_error() {
             return;
         }
-        if !output.has_aliases() {
-            assumed.push(output);
+        if let ItemContainerId::TraitId(_) = function.lookup(db).container
+            && output.has_opaque_types()
+        {
+            // An `impl Trait` a trait's method returns is an associated type of the trait,
+            // whose bounds must be well-formed given only what the method's parameters imply:
+            // the return type, its projection, implies nothing.
             let known = self.known(function.into(), &assumed);
-            let needs = self.where_needs(function.into());
+            self.trait_opaques(function, output, &known);
+        }
+        if !output.has_opaque_types() {
+            assumed.extend(
+                Some(wfcx.normalize(output, &mut Vec::new())).filter(|ty| !ty.references_error()),
+            );
+            let known = self.known(function.into(), &assumed);
+            let mut needs = self.where_needs(function.into());
+            // Its signature, normalized, is well-formed: what that needs of what outlives
+            // what holds, and so do the trait bounds it asks. Without an associated type
+            // what a type needs is what it implies.
+            let sites = (0..inputs.len() as u32)
+                .map(|it| Site::Param(function, it))
+                .chain([Site::Output(function)]);
+            for (&ty, site) in inputs.iter().chain([&output]).zip(sites) {
+                let mut found = Vec::new();
+                let normalized = wfcx.normalize(ty, &mut found);
+                if !normalized.references_error() {
+                    if ty.has_aliases() {
+                        outlives::wf(db, &mut self.inferred, normalized, &mut found);
+                    }
+                    outlives::trait_needs(db, &wfcx, normalized, &mut found);
+                }
+                needs.extend(found.into_iter().map(|it| (it, site)));
+            }
             self.resolve(&known, needs);
         } else if !FunctionSignature::of(db, function).is_async() {
             let known = self.known(function.into(), &assumed);
@@ -344,6 +403,60 @@ impl<'db> Check<'_, 'db> {
                 }
             }
             needs.extend(found.into_iter().map(|it| (it, site)));
+            self.resolve(known, needs);
+        }
+    }
+
+    /// rustc's `check_associated_type_bounds` of the associated type an `impl Trait` a
+    /// trait's method returns is (an `async fn`'s future too): the types its bounds name are
+    /// well-formed given what the method knows, so `async fn foo(&self) -> &(T, U)` in
+    /// `trait MyTrait<T, U>` needs `T` and `U` to outlive the lifetime of `&self` (E0311), as
+    /// only `Self` is known to. An `impl Trait` with no outlives bound outlives as its
+    /// arguments do: `&'static impl T` needs `Self: 'static` (E0310).
+    fn trait_opaques(&mut self, function: FunctionId, output: Ty<'db>, known: &Known<'db>) {
+        let db = self.db;
+        let interner = self.interner();
+        let mut opaques = Vec::new();
+        outlives::opaques(output, &mut opaques);
+        for alias in opaques {
+            let SolverDefId::InternedOpaqueTyId(opaque) = alias.kind.def_id() else { continue };
+            let ImplTraitId::ReturnTypeImplTrait(owner, index) = opaque.loc(db) else { continue };
+            if owner != function {
+                continue;
+            }
+            let mut found = Vec::new();
+            let bounds = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id());
+            for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
+                let (args, term) = match clause.kind().skip_binder() {
+                    ClauseKind::Trait(predicate) => (predicate.trait_ref.args, None),
+                    ClauseKind::Projection(predicate) => {
+                        (predicate.projection_term.args, predicate.term.as_type())
+                    }
+                    _ => continue,
+                };
+                let tys = args
+                    .iter()
+                    .skip(1)
+                    .filter_map(|arg| match arg.kind() {
+                        GenericArgKind::Type(ty) => Some(ty),
+                        _ => None,
+                    })
+                    .chain(term);
+                for ty in tys {
+                    if !ty.references_error() {
+                        outlives::wf(db, &mut self.inferred, ty, &mut found);
+                    }
+                }
+            }
+            let site = Site::Opaque(function, index.into_raw().into_u32());
+            let needs = found
+                .into_iter()
+                .map(|it| match it {
+                    Needs::Type(ty, region) => Needs::Type(outlives::outlived_as(db, ty), region),
+                    Needs::Region(..) => it,
+                })
+                .map(|it| (it, site))
+                .collect();
             self.resolve(known, needs);
         }
     }
@@ -471,27 +584,55 @@ impl<'db> Check<'_, 'db> {
     fn resolve(&mut self, known: &Known<'db>, needs: Vec<(Needs<'db>, Site)>) {
         let region_fails = needs.iter().any(|&(need, _)| match need {
             Needs::Region(longer, shorter) => !known.region_outlives(longer, shorter),
-            Needs::Type(ty, region) => outlives::components(ty).into_iter().any(|it| {
-                matches!(it, outlives::Component::Region(longer)
-                    if !known.region_outlives(longer, region))
-            }),
+            Needs::Type(..) => false,
         });
         if region_fails {
             return;
         }
+        // A type that outlives a region only if a lifetime in it does, which it is not known
+        // to: rustc's `ConcreteFailure` of a `RelateParamBound`, E0477, which also keeps the
+        // errors of type parameters from being reported.
+        let mut concrete = Vec::new();
+        for &(need, site) in &needs {
+            let Needs::Type(ty, region) = need else { continue };
+            let fails = outlives::components(ty).into_iter().any(|it| {
+                matches!(it, outlives::Component::Region(longer)
+                    if !known.region_outlives(longer, region))
+            });
+            let message = "the type does not fulfill the required lifetime".to_owned();
+            let diagnostic = WfDiagnostic { code: "E0477", message, site };
+            if fails && !concrete.contains(&diagnostic) {
+                concrete.push(diagnostic);
+            }
+        }
+        if !concrete.is_empty() {
+            for diagnostic in concrete {
+                if !self.found.contains(&diagnostic) {
+                    self.found.push(diagnostic);
+                }
+            }
+            return;
+        }
         for (need, site) in needs {
             let Needs::Type(ty, region) = need else { continue };
+            let code = match region.kind() {
+                RegionKind::ReStatic => "E0310",
+                RegionKind::ReLateParam(late)
+                    if !matches!(late.bound_region.kind, BoundRegionKind::Named(_)) =>
+                {
+                    "E0311"
+                }
+                _ => "E0309",
+            };
+            for _ in known.failing_aliases(self.db, ty, region) {
+                let message = "the associated type may not live long enough".to_owned();
+                let diagnostic = WfDiagnostic { code, message, site };
+                if !self.found.contains(&diagnostic) {
+                    self.found.push(diagnostic);
+                }
+            }
             for param in known.failing_params(ty, region) {
                 let TyKind::Param(param) = param.kind() else { continue };
-                let code = match region.kind() {
-                    RegionKind::ReStatic => "E0310",
-                    RegionKind::ReLateParam(late)
-                        if !matches!(late.bound_region.kind, BoundRegionKind::Named(_)) =>
-                    {
-                        "E0311"
-                    }
-                    _ => "E0309",
-                };
                 let params = GenericParams::of(self.db, param.id.parent());
                 let name = params[param.id.local_id()].name().map_or("_", |it| it.as_str());
                 let message = format!("the parameter type `{name}` may not live long enough");

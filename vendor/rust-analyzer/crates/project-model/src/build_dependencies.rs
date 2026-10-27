@@ -180,6 +180,21 @@ impl WorkspaceBuildScripts {
         self.outputs.get(package)?.out_dir.as_deref()
     }
 
+    /// What a load reads of `package`, for an embedder to show: its script's cfgs and
+    /// variables, where it wrote, and its proc macro's library when it has one built.
+    pub fn read_of(&self, package: Package) -> Option<crate::OwnBuildOutput> {
+        let output = self.outputs.get(package)?;
+        Some(crate::OwnBuildOutput {
+            cfgs: output.cfgs.iter().map(ToString::to_string).collect(),
+            envs: output.envs.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+            out_dir: output.out_dir.clone(),
+            proc_macro_dylib: match &output.proc_macro_dylib_path {
+                ProcMacroDylibPath::Path(path) => Some(path.clone()),
+                _ => None,
+            },
+        })
+    }
+
     pub(crate) fn get_output(&self, idx: Package) -> Option<&BuildScriptOutput> {
         self.outputs.get(idx)
     }
@@ -330,6 +345,46 @@ impl WorkspaceBuildScripts {
         Ok(res)
     }
 
+    /// What an embedder's own build said of the scripts and the proc macros of `workspace`
+    /// (`CargoConfig::own_build_scripts`), as `cargo check --compile-time-deps` would.
+    pub fn of_own(
+        workspace: &CargoWorkspace,
+        outputs: Vec<(Package, crate::OwnBuildOutput)>,
+    ) -> anyhow::Result<WorkspaceBuildScripts> {
+        let mut res = WorkspaceBuildScripts::default();
+        for package in workspace.packages() {
+            let is_proc_macro = workspace[package]
+                .targets
+                .iter()
+                .any(|&it| matches!(workspace[it].kind, TargetKind::Lib { is_proc_macro: true }));
+            let data = BuildScriptOutput {
+                proc_macro_dylib_path: match is_proc_macro {
+                    true => ProcMacroDylibPath::NotBuilt,
+                    false => ProcMacroDylibPath::NotProcMacro,
+                },
+                ..BuildScriptOutput::default()
+            };
+            res.outputs.insert(package, data);
+        }
+        for (package, own) in outputs {
+            let data = &mut res.outputs[package];
+            if let Some(out_dir) = own.out_dir {
+                data.cfgs = own
+                    .cfgs
+                    .iter()
+                    .map(|it| crate::parse_cfg(it).map_err(|err| anyhow::format_err!("{err}")))
+                    .collect::<anyhow::Result<_>>()?;
+                data.envs.extend(own.envs);
+                data.envs.insert("OUT_DIR", out_dir.as_str());
+                data.out_dir = Some(out_dir);
+            }
+            if let Some(dylib) = own.proc_macro_dylib {
+                data.proc_macro_dylib_path = ProcMacroDylibPath::Path(dylib);
+            }
+        }
+        Ok(res)
+    }
+
     /// What cargo said of the scripts and the proc macros of `workspace` in `lines` of its
     /// `--message-format=json`, for whoever ran cargo itself: nothing is run for it here.
     pub fn of_messages<'a>(
@@ -379,6 +434,17 @@ impl WorkspaceBuildScripts {
         match message {
             Message::BuildScriptExecuted(mut message) => {
                 with_output_for(&message.package_id, &mut |name, data| {
+                    // A package both the target and the host build (a dependency of a proc
+                    // macro) has its script run for each, which can say different things;
+                    // the code read is the target's. With `--target` cargo runs the host's in
+                    // `<dir>/<profile>` and the target's in `<dir>/<triple>/<profile>`.
+                    let depth = message.out_dir.components().count();
+                    if data.out_dir.as_ref().is_some_and(|was| {
+                        !message.out_dir.as_str().is_empty()
+                            && depth < Utf8Path::new(was.as_str()).components().count()
+                    }) {
+                        return;
+                    }
                     progress(format!("build script {name} run"));
                     let cfgs = {
                         let mut acc = Vec::new();
@@ -621,5 +687,50 @@ fn is_dylib(path: &Utf8Path) -> bool {
     match path.extension().map(|e| e.to_ascii_lowercase()) {
         None => false,
         Some(ext) => matches!(ext.as_str(), "dll" | "dylib" | "so"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executed(out_dir: &str, cfgs: &[&str]) -> String {
+        serde_json::json!({
+            "reason": "build-script-executed",
+            "package_id": "path+file:///w/dep#0.1.0",
+            "linked_libs": [],
+            "linked_paths": [],
+            "cfgs": cfgs,
+            "env": [],
+            "out_dir": out_dir,
+        })
+        .to_string()
+    }
+
+    /// The cfgs a package's script is read to have said after `lines`.
+    fn cfgs_after(lines: &[String]) -> Vec<String> {
+        let mut data = BuildScriptOutput::default();
+        let mut with_output_for =
+            |_: &PackageId, cb: &mut dyn FnMut(&str, &mut BuildScriptOutput)| cb("dep", &mut data);
+        for line in lines {
+            WorkspaceBuildScripts::said(line, &mut with_output_for, &|_| {}, &|e| panic!("{e}"));
+        }
+        data.cfgs.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn the_targets_run_of_a_script_the_host_also_runs_is_kept() {
+        let host = executed("/w/target/debug/build/dep/1111/out", &["host_only"]);
+        let target =
+            executed("/w/target/wasm32-unknown-unknown/debug/build/dep/2222/out", &["for_target"]);
+        assert_eq!(cfgs_after(&[host.clone(), target.clone()]), ["for_target"]);
+        assert_eq!(cfgs_after(&[target, host]), ["for_target"]);
+    }
+
+    #[test]
+    fn a_script_run_again_says_what_it_said_last() {
+        let first = executed("/w/target/debug/build/dep/1111/out", &["first"]);
+        let again = executed("/w/target/debug/build/dep/1111/out", &["again"]);
+        assert_eq!(cfgs_after(&[first, again]), ["again"]);
     }
 }

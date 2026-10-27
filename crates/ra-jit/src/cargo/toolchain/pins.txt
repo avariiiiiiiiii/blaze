@@ -1,25 +1,25 @@
 # The Rust nightly blaze downloads as its own toolchain: written by
-# harness/toolchain_pins.py --write from https://static.rust-lang.org/dist/2026-10-25/channel-rust-nightly.toml.
+# harness/toolchain_pins.py --write from https://static.rust-lang.org/dist/2026-10-27/channel-rust-nightly.toml.
 # release <toolchain> <date> <channel>; rustc <what `rustc -V` says after `rustc `>;
 # commit <rust-lang/rust commit>; manifest <sha256> <bytes>; then per host
 # <host> <package> <target> <sha256 of the .tar.xz> <bytes>.
-release nightly-2026-10-25 2026-10-25 nightly
-rustc 1.101.0-nightly (12433c307 2026-10-24)
-commit 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0
-manifest b31ee8ceae8eade71b5713ef767c1088a1ae881ea64c1272556e923d87d2e25e 923466
-aarch64-apple-darwin rustc aarch64-apple-darwin bc6715d0ecf8008decf7a5a7e2befc809d0197c830b29e89954b16b71e44cb89 51599312
-aarch64-apple-darwin cargo aarch64-apple-darwin 629f3033a58b3c9ece1ac35cfbd864cb354ccae5eaf79582033f44fd9c22fb9d 8879452
-aarch64-apple-darwin rust-std aarch64-apple-darwin 9907a39fad39d1fef85821aa0d5b5521193d3509fa54757bee123457a5d32de3 30924284
-aarch64-apple-darwin rust-src * 7b1d947ad85ae0a52a2a40a565a726d7578141bf863ffa1bad7b88c5e70ef97d 6013872
-x86_64-unknown-linux-gnu rustc x86_64-unknown-linux-gnu 0af637473814f27193c8147ce13fa9af8fb62d20300a6b16762d2bbf096a03c6 84945032
-x86_64-unknown-linux-gnu cargo x86_64-unknown-linux-gnu 3dd74349f745568842b65b7c8777f180ce09095b8cae9b2741d4496a0dc5ebfb 10910464
-x86_64-unknown-linux-gnu rust-std x86_64-unknown-linux-gnu 0c80a940a48e98785bf6fd00e72ec8209864b912602f05d8f9ba76b2c4c1e0d5 31705208
-x86_64-unknown-linux-gnu rust-src * 7b1d947ad85ae0a52a2a40a565a726d7578141bf863ffa1bad7b88c5e70ef97d 6013872
-aarch64-unknown-linux-gnu rustc aarch64-unknown-linux-gnu 7b461a1d80ce27488e9c8d72e46879b7cfdf7a3692aeec1178d5e76dd8b9aa92 69756508
-aarch64-unknown-linux-gnu cargo aarch64-unknown-linux-gnu 140fd3cbfc1aab4ca1fea1c4101bb6fad89d0f0f560ee086366a1ea447a9d77e 10557760
-aarch64-unknown-linux-gnu rust-std aarch64-unknown-linux-gnu f2cd7715728412f8f33769121af6fe67df85ac0884526d75ba2fad39258b10a8 31888424
-aarch64-unknown-linux-gnu rust-src * 7b1d947ad85ae0a52a2a40a565a726d7578141bf863ffa1bad7b88c5e70ef97d 6013872
-x86_64-pc-windows-msvc rustc x86_64-pc-windows-msvc 90f79a05496b137cb70477da661d3ceb9bbeace47f39823384787c304cd0fc4a 77971420
-x86_64-pc-windows-msvc cargo x86_64-pc-windows-msvc f119517d8225a957e0325ea228f9e6c76828b6545e964f6a90e99cc11831b08b 9799504
-x86_64-pc-windows-msvc rust-std x86_64-pc-windows-msvc 7770f91209cc4640c5ccc7b2b2ab32936091820244aeb162614bb5bf36453d72 23584324
-x86_64-pc-windows-msvc rust-src * 7b1d947ad85ae0a52a2a40a565a726d7578141bf863ffa1bad7b88c5e70ef97d 6013872
+release nightly-2026-10-27 2026-10-27 nightly
+rustc 1.101.0-nightly (16d1ffac1 2026-10-26)
+commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977
+manifest 34f3d9bf04640a082e561310f3f258846397f4cf64a2bcfebcea96ebf18e2572 923466
+aarch64-apple-darwin rustc aarch64-apple-darwin af85a40276f7d603a92d53beccb91ba7bc3002a1d1c359d22271677606cf3ad0 51536192
+aarch64-apple-darwin cargo aarch64-apple-darwin 49b555c9a3311e3966e0207a1d2472da6aa9daa2755820ec7e598051aaf88112 8881356
+aarch64-apple-darwin rust-std aarch64-apple-darwin 2166fc613da615fdbaabda16cd71f670f70d70a41ed63014de3ac36aa1c741a7 30907328
+aarch64-apple-darwin rust-src * a93702df5593f45fe549b38ec589d33f503fa9966c1bbfd933ff8d8b4997726c 6016216
+x86_64-unknown-linux-gnu rustc x86_64-unknown-linux-gnu 23364ff3e720e67d008d34e28bc0e1ea98e9c2b83837828248dd1c047ec4905f 85183536
+x86_64-unknown-linux-gnu cargo x86_64-unknown-linux-gnu b741cb5b0f1d75d83b52412a8565b13fcf69afef6e73d7b1d57d15c3c2d327ec 10900904
+x86_64-unknown-linux-gnu rust-std x86_64-unknown-linux-gnu 3c43042ff1f1d67b2a8192ebf3439de1964789e844044cc9383171e7ab1d71d3 31721028
+x86_64-unknown-linux-gnu rust-src * a93702df5593f45fe549b38ec589d33f503fa9966c1bbfd933ff8d8b4997726c 6016216
+aarch64-unknown-linux-gnu rustc aarch64-unknown-linux-gnu 31c9d3011998df2f723d60781b034d7c0a2af7532eca3358fd8814726dc051be 69729344
+aarch64-unknown-linux-gnu cargo aarch64-unknown-linux-gnu dc1616c2739dd67476c27438520f28e4103bd9efb3e21128964afb29a3d8ec13 10551720
+aarch64-unknown-linux-gnu rust-std aarch64-unknown-linux-gnu 2915637b8c604460823e53906f74015b2c87244d5e6a2e52113de0b823703c2a 31919532
+aarch64-unknown-linux-gnu rust-src * a93702df5593f45fe549b38ec589d33f503fa9966c1bbfd933ff8d8b4997726c 6016216
+x86_64-pc-windows-msvc rustc x86_64-pc-windows-msvc 9d78f0d532d703d529d31034536866d6d8cfb556c7751cd96f1562d9679e821f 78049116
+x86_64-pc-windows-msvc cargo x86_64-pc-windows-msvc 7e934747f7be67803e0dc58d361496e5e878b80357150363b09f2abe2812c654 9798264
+x86_64-pc-windows-msvc rust-std x86_64-pc-windows-msvc 71fcdf9474b212c1069e7c6f72fed912a999b9f8451d5e28b795d6af1ba3927a 23653400
+x86_64-pc-windows-msvc rust-src * a93702df5593f45fe549b38ec589d33f503fa9966c1bbfd933ff8d8b4997726c 6016216

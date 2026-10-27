@@ -151,25 +151,25 @@ def write(path, text):
 
 
 def fetched_workspace(top):
-    """A workspace whose program is built on a crate of a registry of this machine's own."""
+    """A workspace whose program is built on a crate of a registry of this machine's own: a
+    local-registry the `local` registry's source is replaced with, as blaze reads no git index."""
     registry, ws = os.path.join(top, "registry"), os.path.join(top, "ws")
     write(f"{top}/stage/dep-0.1.0/Cargo.toml", '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n')
     write(f"{top}/stage/dep-0.1.0/src/lib.rs",
           'pub fn place() -> &\'static str {\n    file!()\n}\n\n'
           'pub fn third(of: &[u32]) -> u32 {\n    of[2]\n}\n\n'
           'pub fn first<T: Copy>(of: &[T]) -> T {\n    of[0]\n}\n')
-    os.makedirs(f"{registry}/crates")
-    crate = f"{registry}/crates/dep-0.1.0.crate"
+    os.makedirs(registry)
+    crate = f"{registry}/dep-0.1.0.crate"
     subprocess.run(["tar", "-czf", crate, "-C", f"{top}/stage", "dep-0.1.0"], check=True)
     import hashlib
     cksum = hashlib.sha256(open(crate, "rb").read()).hexdigest()
     write(f"{registry}/index/3/d/dep",
           '{"name":"dep","vers":"0.1.0","deps":[],"cksum":"%s","features":{},"yanked":false}\n' % cksum)
-    write(f"{registry}/index/config.json", '{"dl": "file://%s/crates/{crate}-{version}.crate"}\n' % registry)
-    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", f"{registry}/index"]
-    for args in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "index"]):
-        subprocess.run([*git, *args], check=True)
-    write(f"{ws}/.cargo/config.toml", f'[registries.local]\nindex = "file://{registry}/index"\n')
+    index = f"file://{registry}/index"
+    write(f"{ws}/.cargo/config.toml",
+          f'[registries.local]\nindex = "{index}"\n\n[source.local-index]\nregistry = "{index}"\n'
+          f'replace-with = "local-files"\n\n[source.local-files]\nlocal-registry = "{registry}"\n')
     write(f"{ws}/Cargo.toml", '[workspace]\nmembers = ["app"]\nresolver = "2"\n')
     write(f"{ws}/app/Cargo.toml", '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
           '[dependencies]\ndep = { version = "0.1", registry = "local" }\n')

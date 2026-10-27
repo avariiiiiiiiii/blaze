@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import Fixture, RUNNER
 
-CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro"]
+CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro", "overlap"]
 # Crates that use a nightly feature, built by the pinned compiler with RUSTC_BOOTSTRAP=1. That
 # also has cargo read the `[unstable]` table of its configuration, where `checksum-freshness`
 # would make the touch that has cargo link the test again do nothing.
@@ -30,7 +30,7 @@ LEFT = {"caller_in_constant", "empty_array_by_impl", "macro_reads_its_spelling",
 # Crates reduced and not fixed, where ra-jit says so: a function of these is left to rustc.
 LEFT_CRATES = []
 # Cases about the code around a function ra-jit has to leave to rustc: that one is meant to be.
-AROUND_LEFT = {"await_left_in_generic", "provided_method_static::rustcs"}
+AROUND_LEFT = {"await_left_in_generic", "provided_method_static::rustcs", "neon_fma_lanes"}
 
 
 def main():

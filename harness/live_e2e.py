@@ -72,17 +72,17 @@ OTHER_TOOLCHAIN = ("compiles for", "rust-src")
 
 async def serving(project: Path, env: dict[str, str]) -> None:
     """Builds until the daemon serves one. Until the daemon has loaded the workspace a build is
-    cargo's, which `cargo ra-jit` says why of; one it served says `[ra-jit]`."""
+    cargo's, which `cargo ra-jit` says why of; one it served says `[blaze]`."""
     why = []
     for _ in range(120):
         said = await build("wait for the daemon", project, env)
-        if "[ra-jit]" in said:
+        if "[blaze]" in said:
             return
-        why = [it for it in said.splitlines() if "ra-jit:" in it] or why
+        why = [it for it in said.splitlines() if "blaze:" in it] or why
         if any(reason in line for line in why for reason in OTHER_TOOLCHAIN):
             raise StepError("wait for the daemon: the daemon builds nothing with this toolchain:\n  " + "\n  ".join(why))
         await asyncio.sleep(0.5)
-    raise StepError("wait for the daemon: no build said `[ra-jit]` in 120 tries; the last said:\n  " + "\n  ".join(why))
+    raise StepError("wait for the daemon: no build said `[blaze]` in 120 tries; the last said:\n  " + "\n  ".join(why))
 
 
 def edit(source: Path, old: int, new: int) -> None:

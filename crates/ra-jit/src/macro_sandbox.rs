@@ -128,6 +128,7 @@ fn spec_of(server: &Command) -> anyhow::Result<PathBuf> {
         record: None,
         record_reads: false,
         not_inputs: Vec::new(),
+        view: None,
     };
     let bytes = serde_json::to_vec(&spec)?;
     let dir = crate::cargo::daemon::home()?.join("sandbox");

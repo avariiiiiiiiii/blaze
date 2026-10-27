@@ -117,7 +117,7 @@ def main():
                 expected = f"{want} {2 * factor}"
                 if printed != expected:
                     verdict = f"after {step}: PRINTED {printed!r}, NOT {expected!r}"
-                elif "[ra-jit]" not in said:
+                elif "[blaze]" not in said:
                     verdict = f"after {step}: NOT SERVED BY THE DAEMON"
                 if verdict != "ok":
                     break

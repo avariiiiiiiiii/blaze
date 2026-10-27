@@ -32,11 +32,13 @@ mod handlers {
     pub(crate) mod array_pattern_without_fixed_length;
     pub(crate) mod await_outside_of_async;
     pub(crate) mod bad_rtn;
+    pub(crate) mod binary_operator_cannot_be_applied;
     pub(crate) mod borrowck;
     pub(crate) mod break_outside_of_loop;
     pub(crate) mod cannot_be_dereferenced;
     pub(crate) mod cannot_implicitly_deref_trait_object;
     pub(crate) mod cannot_index_into;
+    pub(crate) mod closure_kind_mismatch;
     pub(crate) mod duplicate_field;
     pub(crate) mod elided_lifetimes_in_path;
     pub(crate) mod expected_array_or_slice_pat;
@@ -391,6 +393,31 @@ pub fn semantic_diagnostics_within(
     file_id: FileId,
     within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
 ) -> Vec<Diagnostic> {
+    semantic_diagnostics_asked(db, config, resolve, file_id, within, None)
+}
+
+/// [`semantic_diagnostics_within`], of the bodies only those `bodies` asks for, for a caller
+/// that knows what the others' are: those of the items themselves are all there. The walk of
+/// the file's syntax is left out, which gives none but weak warnings.
+pub fn semantic_diagnostics_of_bodies(
+    db: &RootDatabase,
+    config: &DiagnosticsConfig,
+    resolve: &AssistResolveStrategy,
+    file_id: FileId,
+    within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
+    bodies: &dyn Fn(hir::DefWithBody) -> bool,
+) -> Vec<Diagnostic> {
+    semantic_diagnostics_asked(db, config, resolve, file_id, within, Some(bodies))
+}
+
+fn semantic_diagnostics_asked(
+    db: &RootDatabase,
+    config: &DiagnosticsConfig,
+    resolve: &AssistResolveStrategy,
+    file_id: FileId,
+    within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
+    bodies: Option<&dyn Fn(hir::DefWithBody) -> bool>,
+) -> Vec<Diagnostic> {
     let _p = tracing::info_span!("semantic_diagnostics").entered();
     let sema = match within {
         Some(crates) => Semantics::new_within(db, crates),
@@ -406,7 +433,7 @@ pub fn semantic_diagnostics_within(
     // FIXME: This iterates the entire file which is a rather expensive operation.
     // We should implement these differently in some form?
     // Salsa caching + incremental re-parse would be better here
-    for node in parse.syntax().descendants() {
+    for node in parse.syntax().descendants().filter(|_| bodies.is_none()) {
         handlers::useless_braces::useless_braces(db, &mut res, editioned_file_id, &node);
         handlers::field_shorthand::field_shorthand(db, &mut res, editioned_file_id, &node);
         handlers::json_is_not_rust::json_in_items(
@@ -445,7 +472,12 @@ pub fn semantic_diagnostics_within(
         // file, so we skip semantic diagnostics so we can show these faster.
         Some(m) => {
             if editioned_file_id.parse_errors(db).is_none_or(|es| es.len() < 16) {
-                m.diagnostics(db, &mut diags, config.style_lints);
+                match bodies {
+                    Some(bodies) => {
+                        m.diagnostics_of_bodies(db, &mut diags, config.style_lints, bodies)
+                    }
+                    None => m.diagnostics(db, &mut diags, config.style_lints),
+                }
             }
         }
         None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, editioned_file_id),
@@ -456,6 +488,7 @@ pub fn semantic_diagnostics_within(
             AnyDiagnostic::AwaitOutsideOfAsync(d) => handlers::await_outside_of_async::await_outside_of_async(&ctx, &d),
             AnyDiagnostic::CannotBeDereferenced(d) => handlers::cannot_be_dereferenced::cannot_be_dereferenced(&ctx, &d),
             AnyDiagnostic::UnaryOperatorCannotBeApplied(d) => handlers::unary_operator_cannot_be_applied::unary_operator_cannot_be_applied(&ctx, &d),
+            AnyDiagnostic::BinaryOperatorCannotBeApplied(d) => handlers::binary_operator_cannot_be_applied::binary_operator_cannot_be_applied(&ctx, &d),
             AnyDiagnostic::CannotImplicitlyDerefTraitObject(d) => handlers::cannot_implicitly_deref_trait_object::cannot_implicitly_deref_trait_object(&ctx, &d),
             AnyDiagnostic::CannotIndexInto(d) => handlers::cannot_index_into::cannot_index_into(&ctx, &d),
             AnyDiagnostic::CastToUnsized(d) => handlers::invalid_cast::cast_to_unsized(&ctx, &d),
@@ -561,6 +594,7 @@ pub fn semantic_diagnostics_within(
                 handlers::union_pat_has_rest::union_pat_has_rest(&ctx, &d)
             }
             AnyDiagnostic::UnimplementedTrait(d) => handlers::unimplemented_trait::unimplemented_trait(&ctx, &d),
+            AnyDiagnostic::ClosureKindMismatch(d) => handlers::closure_kind_mismatch::closure_kind_mismatch(&ctx, &d),
             AnyDiagnostic::FruInDestructuringAssignment(d) => handlers::fru_in_destructuring_assignment::fru_in_destructuring_assignment(&ctx, &d),
             AnyDiagnostic::MissingBody(d) => handlers::missing_body::missing_body(&ctx, &d),
             AnyDiagnostic::BorrowckError(d) => handlers::borrowck::borrowck_error(&ctx, &d),

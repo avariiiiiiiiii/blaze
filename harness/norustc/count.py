@@ -117,7 +117,7 @@ def main():
         quiet()
         ended = time.time()
         err = run.stderr.splitlines()
-        notes = [l for l in err if "ra-jit" in l or "Finished" in l or "error" in l.lower()][-25:]
+        notes = [l for l in err if "blaze" in l or "Finished" in l or "error" in l.lower()][-25:]
         row = dict(step=label, argv=argv, began=began, returned=returned, ended=ended, code=run.returncode,
                    secs=round(returned - began, 1), notes=notes, status=status[-2000:])
         with open(steps_out, "a") as out:

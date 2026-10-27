@@ -224,7 +224,7 @@ if platform.machine() in ("x86_64", "AMD64"):
 def said(stderr):
     """What the run said of each cached function: its first line about it."""
     found = {}
-    for name, what in re.findall(r"^ra-jit cache: fcache::(\w+)(?:::<[^>]*>)?: (.*)$", stderr, re.M):
+    for name, what in re.findall(r"^blaze cache: fcache::(\w+)(?:::<[^>]*>)?: (.*)$", stderr, re.M):
         found.setdefault(name, what)
     return found
 
@@ -303,7 +303,7 @@ def main():
                     + ("" if same else "  DIFFERENT OUTPUT") + (f"  said {missed}" if missed else ""))
         # The two instances of `width` have entries of their own, and give their own results.
         ours, stderr, _ = run(binary)
-        widths = re.findall(r"^ra-jit cache: fcache::width::<(\w+)>: (.*)$", stderr, re.M)
+        widths = re.findall(r"^blaze cache: fcache::width::<(\w+)>: (.*)$", stderr, re.M)
         verdict("generic instances kept apart", "width 5 40\n" in ours and len({t for t, _ in widths}) == 2,
                 f"{widths}")
         for name, pattern in REFUSED.items():
@@ -425,11 +425,11 @@ def live():
 
             await cargo_ra_jit("first build")
             for _ in range(120):
-                if "[ra-jit]" in await cargo_ra_jit("wait for the daemon"):
+                if "[blaze]" in await cargo_ra_jit("wait for the daemon"):
                     break
                 await asyncio.sleep(0.5)
             else:
-                raise e2e.StepError("no build said `[ra-jit]`")
+                raise e2e.StepError("no build said `[blaze]`")
 
             def edit(old, new):
                 text = open(source).read()

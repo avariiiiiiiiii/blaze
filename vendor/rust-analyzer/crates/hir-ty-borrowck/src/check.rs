@@ -9,6 +9,7 @@ use rustc_type_ir::{
     ClauseKind, OutlivesPredicate, RegionKind,
     inherent::{GenericArgs as _, IntoKind, Region as _},
 };
+use smallvec::SmallVec;
 
 use hir_ty::{
     mir::{
@@ -38,59 +39,84 @@ pub(super) fn check<'db>(
     requirements: &FxHashMap<ExprId, (usize, Vec<regions::Requirement<'db>>)>,
     mut_upvars: &FxHashMap<ExprId, Vec<usize>>,
     out: &mut Vec<BorrowckDiagnostic>,
+    moved: &mut Vec<UseOfMoved>,
 ) -> (usize, Vec<regions::Requirement<'db>>, Vec<usize>) {
-    let cfg = Cfg::new(body);
-    let moves = MoveData::gather(ctx, body, &cfg);
-    let flow = InitFlow::compute(body, &cfg, &moves);
-    let dominators = Dominators::new(&cfg);
-    let capture_temps = capture_temps(body);
-    let mut regions = regions::build(ctx, body, &cfg, requirements);
+    use crate::timings::{Phase, phase};
+    let (cfg, moves, rustc_moves, upvar_sources, flow, dominators, capture_temps, index_spans) =
+        phase(Phase::Moves, || {
+            let cfg = Cfg::new(body);
+            let moves = MoveData::gather(ctx, body, &cfg);
+            let rustc_moves = rustc_move_indices(ctx, body, &moves);
+            let upvar_sources = upvar_sources(ctx, body);
+            let flow = InitFlow::compute(body, &cfg, &moves);
+            let dominators = Dominators::new(&cfg);
+            let capture_temps = capture_temps(body);
+            let index_spans = index_spans(body);
+            (cfg, moves, rustc_moves, upvar_sources, flow, dominators, capture_temps, index_spans)
+        });
+    let mut regions = phase(Phase::Constraints, || regions::build(ctx, body, &cfg, requirements));
     let count = ctx.infcx.num_region_vars();
-    let live = liveness::region_liveness(ctx, body, &cfg, &moves, &regions, count);
+    let live = phase(Phase::Liveness, || {
+        liveness::region_liveness(ctx, body, &cfg, &moves, &regions, count)
+    });
     let live_loans_input = (ctx.mode == Mode::Polonius).then(|| live.clone());
     let again = (!regions.members.is_empty()).then(|| live.clone());
-    let mut values = regions::infer(&regions, count, cfg.points, live);
-    // rustc's member constraints: a region of a returned `impl Trait`'s hidden type that can
-    // be none of the lifetimes it captures is an error, reported only when the body has no
-    // other region error. One that can is made to outlive the least it can be, as rustc's
-    // `apply_member_constraint`, which what it must outlive in turn may not.
-    let chosen = member_choices(&regions, &values, count);
-    let unnamed = chosen.iter().any(|(_, it)| it.is_none());
-    let applied: Vec<regions::Outlives> = chosen
-        .iter()
-        .filter_map(|&(member, choice)| {
-            let choice = choice?;
-            (member != choice
-                && !values.universals_of(member).any(|it| regions.universals[it].0 == choice))
-            .then_some(regions::Outlives {
-                sup: member,
-                sub: choice,
-                location: None,
-                category: Category::Opaque,
-                span: MirSpan::Unknown,
-                from_closure: false,
+    let (values, unnamed) = phase(Phase::Infer, || {
+        let mut values = regions::infer(&regions, count, cfg.points, live);
+        // rustc's member constraints: a region of a returned `impl Trait`'s hidden type that can
+        // be none of the lifetimes it captures is an error, reported only when the body has no
+        // other region error. One that can is made to outlive the least it can be, as rustc's
+        // `apply_member_constraint`, which what it must outlive in turn may not.
+        let chosen = member_choices(&regions, &values, count);
+        let unnamed = chosen.iter().any(|(_, it)| it.is_none());
+        let applied: Vec<regions::Outlives> = chosen
+            .iter()
+            .filter_map(|&(member, choice)| {
+                let choice = choice?;
+                (member != choice
+                    && !values.universals_of(member).any(|it| regions.universals[it].0 == choice))
+                .then_some(regions::Outlives {
+                    sup: member,
+                    sub: choice,
+                    location: None,
+                    category: Category::Opaque,
+                    span: MirSpan::Unknown,
+                    from_closure: false,
+                })
             })
-        })
-        .collect();
-    if let Some(live) = again
-        && !applied.is_empty()
-    {
-        regions.outlives.extend(applied);
-        values = regions::infer(&regions, count, cfg.points, live);
-    }
+            .collect();
+        if let Some(live) = again
+            && !applied.is_empty()
+        {
+            regions.outlives.extend(applied);
+            values = regions::infer(&regions, count, cfg.points, live);
+        }
+        (values, unnamed)
+    });
     let unique = |assigned: LocalId, local: LocalId, projection: &[PlaceElem]| {
         capture_temps.contains_key(&assigned)
             && is_immutable_root(ctx, PlaceRef { local, projection })
     };
-    let mut loans = Loans::gather(ctx, body, &cfg, &regions, unique);
-    match live_loans_input {
+    let mut loans = phase(Phase::Loans, || Loans::gather(ctx, body, &cfg, &regions, unique));
+    phase(Phase::Scopes, || match live_loans_input {
         Some(liveness) => {
             let live = polonius::live_loans(ctx, body, &cfg, &regions, count, &liveness, &loans);
             loans.compute_polonius_scopes(body, &cfg, &live);
         }
         None => loans.compute_scopes(body, &cfg, &values),
-    }
-    let borrows_entry = loans.entry_sets(ctx, body, &cfg);
+    });
+    let borrows_entry = phase(Phase::EntrySets, || loans.entry_sets(ctx, body, &cfg));
+    crate::timings::count(|it| {
+        it.bodies += 1;
+        it.blocks += body.basic_blocks.len();
+        it.points += cfg.points;
+        it.locals += body.locals.len();
+        it.regions += count;
+        it.universals += regions.universals.len();
+        it.constraints += regions.outlives.len();
+        it.localized += regions.outlives.iter().filter(|it| it.location.is_some()).count();
+        it.loans += loans.loans.len();
+    });
     if crate::debugging(ctx.db, ctx.owner) {
         for (local, ty) in regions.local_tys.iter().enumerate() {
             eprintln!("_{local}: {ty:?}");
@@ -107,7 +133,7 @@ pub(super) fn check<'db>(
         }
         for loan in &loans.loans {
             let points: Vec<usize> =
-                values.values[loan.region].iter().filter(|&it| it < cfg.points).collect();
+                values.points_of(loan.region).iter().filter(|&it| it < cfg.points).collect();
             eprintln!(
                 "loan {:?} {:?} at {:?} region {} points {points:?}",
                 loan.local, loan.projection, loan.location, loan.region
@@ -132,9 +158,12 @@ pub(super) fn check<'db>(
         access_reported: FxHashSet::default(),
         uninit_reported: FxHashSet::default(),
         move_reported: FxHashMap::default(),
+        rustc_moves,
+        upvar_sources,
         move_errors: Vec::new(),
         scrutinees: None,
         capture_temps,
+        index_spans,
         assigned_local: super::return_slot(),
         regions: &regions,
         region_count: count,
@@ -152,6 +181,7 @@ pub(super) fn check<'db>(
         used_mut: FxHashSet::default(),
         used_mut_upvars: Vec::new(),
     };
+    let walk = crate::timings::start();
     let guard_borrows = guard_borrows(ctx, body);
     let index_borrows = index_borrows(ctx, body);
     let tested_at = tested_at(ctx);
@@ -222,6 +252,8 @@ pub(super) fn check<'db>(
             checker.terminator(location, &terminator.kind, span);
         }
     }
+    crate::timings::finish(Phase::Walk, walk);
+    let errors = crate::timings::start();
     checker.report_move_errors();
     let before = checker.errors.len();
     checker.report_region_errors();
@@ -236,8 +268,13 @@ pub(super) fn check<'db>(
         }));
     }
     let unused_mut = checker.unused_mut();
+    crate::timings::finish(Phase::Errors, errors);
     out.extend(checker.errors.into_iter().flatten());
-    out.extend(checker.move_reported.into_values().map(|(_, _, error)| error));
+    for (_, (_, mut error)) in checker.move_reported {
+        error.at = out.len();
+        out.push(error.diagnostic.clone());
+        moved.push(error);
+    }
     out.extend(unused_mut);
     let count = regions.creator_positions.values().filter(|&&it| it < regions::IMPL_ANON).count();
     let mut used_mut_upvars = checker.used_mut_upvars;
@@ -397,6 +434,117 @@ fn union_literals(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
     found
 }
 
+/// An `E0382` of a body, as rustc buffers it with those of the other bodies of the function:
+/// rustc keeps one buffer of them for a function and the closures in it, keyed by the indices
+/// of the moves each is about, each body numbering its own moves.
+pub(super) struct UseOfMoved {
+    /// The indices of the moves, as rustc numbers them in the body; `None` when one of them is
+    /// a move of rust-analyzer's lowering that rustc's MIR does not have.
+    pub(super) rustc_key: Option<Vec<usize>>,
+    /// The place used, as rustc's MIR has it: a capture is a field of the closure.
+    pub(super) place: (LocalId, Vec<PlaceElem>),
+    pub(super) diagnostic: BorrowckDiagnostic,
+    /// Where the error is in what `check` reports.
+    pub(super) at: usize,
+}
+
+/// Each move out's index as rustc's `MoveData` numbers its move outs: every operand moved,
+/// and every `StorageDead`, in the order of the blocks and their statements. A move rustc's
+/// MIR does not have has none: a drop, a capture copied into a local of the closure body, and
+/// a temporary lowering moves an operand into where rustc moves the place itself.
+fn rustc_move_indices(
+    ctx: &Ctx<'_, '_>,
+    body: &MirBody<'_>,
+    moves: &MoveData,
+) -> Vec<Option<usize>> {
+    let upvar_locals: FxHashSet<LocalId> = ctx.upvars.iter().map(|it| it.local).collect();
+    let variables: FxHashSet<LocalId> = body.binding_locals.values().copied().collect();
+    // For each local, how often it is assigned and whether every assignment moves a place
+    // into the whole of it.
+    let mut assigned: FxHashMap<LocalId, (usize, bool)> = FxHashMap::default();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(place, rvalue) = &statement.kind {
+                let entry = assigned.entry(place.local).or_insert((0, true));
+                entry.0 += 1;
+                entry.1 &= place.projection.as_slice().is_empty()
+                    && matches!(rvalue, Rvalue::Use(it) if matches!(it.kind, OperandKind::Move(_)));
+            }
+        }
+        if let Some(terminator) = &block.terminator
+            && let TerminatorKind::Call { destination, .. } = &terminator.kind
+        {
+            assigned.entry(destination.local).or_insert((0, false)).1 = false;
+        }
+    }
+    let lowering_temp = |local: LocalId| {
+        !variables.contains(&local)
+            && !body.param_locals.contains(&local)
+            && !upvar_locals.contains(&local)
+            && assigned.get(&local).is_some_and(|&(count, moved)| count == 1 && moved)
+    };
+    let mut order: Vec<usize> = (0..moves.moves.len())
+        .filter(|&it| {
+            let out = moves.moves[it];
+            let local = moves.paths[out.path].local;
+            let block = &body.basic_blocks[out.location.block];
+            match block.statements.get(out.location.statement) {
+                Some(statement) => match &statement.kind {
+                    StatementKind::StorageDead(_) => {
+                        !lowering_temp(local) && !upvar_locals.contains(&local)
+                    }
+                    StatementKind::Assign(dest, _) if upvar_locals.contains(&dest.local) => {
+                        Some(local) != ctx.closure_local
+                    }
+                    _ => !lowering_temp(local),
+                },
+                None => {
+                    !matches!(
+                        block.terminator.as_ref().map(|it| &it.kind),
+                        Some(TerminatorKind::Drop { .. } | TerminatorKind::DropAndReplace { .. })
+                    ) && !lowering_temp(local)
+                }
+            }
+        })
+        .collect();
+    order.sort_by_key(|&it| {
+        let location = moves.moves[it].location;
+        (index(location.block), location.statement, it)
+    });
+    let mut out = vec![None; moves.moves.len()];
+    for (rustc, it) in order.into_iter().enumerate() {
+        out[it] = Some(rustc);
+    }
+    out
+}
+
+/// In a closure, the place of the closure each local lowering copies a capture into is
+/// (`_2 = move (_1.0)`, `_2 = &(*_1).0`), as rustc's MIR uses that place itself.
+fn upvar_sources(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<LocalId, StoredPlace> {
+    let mut out = FxHashMap::default();
+    let Some(closure) = ctx.closure_local else { return out };
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            let StatementKind::Assign(dest, rvalue) = &statement.kind else { continue };
+            if !dest.projection.as_slice().is_empty() || ctx.upvar_of_local(dest.local).is_none() {
+                continue;
+            }
+            let source = match rvalue {
+                Rvalue::Use(it) => match &it.kind {
+                    OperandKind::Move(place) | OperandKind::Copy(place) => place,
+                    _ => continue,
+                },
+                Rvalue::Ref(_, place) => place,
+                _ => continue,
+            };
+            if source.local == closure {
+                out.entry(dest.local).or_insert_with(|| source.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Whether the variable `place` starts from is declared without `mut`: rustc's
 /// `limit_capture_mutability` makes a closure's mutable borrow of such a place a unique one.
 /// In a closure, a capture of its own captures is checked against how the variable it captured
@@ -435,7 +583,7 @@ impl<'p> PlaceRef<'p> {
         (self.local, self.projection.to_vec())
     }
 
-    fn is_prefix_of(self, other: PlaceRef<'_>) -> bool {
+    pub(super) fn is_prefix_of(self, other: PlaceRef<'_>) -> bool {
         self.local == other.local && other.projection.starts_with(self.projection)
     }
 }
@@ -546,11 +694,17 @@ struct Checker<'a, 'b, 'db> {
     access_reported: FxHashSet<((LocalId, Vec<PlaceElem>), MirSpan)>,
     uninit_reported: FxHashSet<LocalId>,
     /// The `E0382` reported for a set of moves, with the place it is about.
-    move_reported: FxHashMap<Vec<usize>, ((LocalId, Vec<PlaceElem>), Location, BorrowckDiagnostic)>,
+    move_reported: FxHashMap<Vec<usize>, ((LocalId, Vec<PlaceElem>), UseOfMoved)>,
+    /// For each move out, its index in rustc's numbering, if rustc's MIR has it.
+    rustc_moves: Vec<Option<usize>>,
+    /// In a closure, the place of the closure each local a capture is copied into is.
+    upvar_sources: FxHashMap<LocalId, StoredPlace>,
     move_errors: Vec<MoveError>,
     scrutinees: Option<FxHashMap<BindingId, Option<ExprId>>>,
     /// The temporaries that hold a borrow a closure captures, with the span of the closure.
     capture_temps: FxHashMap<LocalId, MirSpan>,
+    /// The index expression each index temporary is evaluated for.
+    index_spans: FxHashMap<LocalId, MirSpan>,
     /// The local the statement being checked assigns, if it assigns one.
     assigned_local: LocalId,
     /// The temporaries that point to a `static mut`.
@@ -817,11 +971,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             TerminatorKind::Drop { place, .. }
                 if self.body.basic_blocks[location.block].is_cleanup
                     && place.projection.as_slice().is_empty()
-                    && hir_ty::drop::has_drop_glue(
-                        &self.ctx.infcx,
-                        self.body.locals[place.local].ty.as_ref(),
-                        self.ctx.env,
-                    ) == hir_ty::drop::DropGlue::None =>
+                    && self.ctx.drop_glue(self.body.locals[place.local].ty.as_ref())
+                        == hir_ty::drop::DropGlue::None =>
             {
                 // rustc's unwind paths drop only what has drop glue and end no storage, so a
                 // borrow of a `MetricsCounter` stays valid while the callbacks holding it drop.
@@ -973,6 +1124,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     fn consume_rvalue(&mut self, location: Location, rvalue: &Rvalue, span: MirSpan) {
         match rvalue {
             Rvalue::Ref(..) if self.loans.promoted.contains(&location) => (),
+            // Lowering computes `offset_of!` as the address of the field of a value at address
+            // 0, where rustc has `NullOp::OffsetOf`, which accesses no place.
+            Rvalue::Ref(..)
+                if matches!(span, MirSpan::ExprId(expr)
+                    if matches!(self.ctx.store[expr], hir_def::hir::Expr::OffsetOf(_))) => {}
             Rvalue::Ref(kind, place) => {
                 let place = PlaceRef::of(place);
                 let (access, depth, action) = match kind {
@@ -1069,11 +1225,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         self.check_if_assigned_path_is_moved(location, place, span);
         // An immutable variable can be assigned while it has never been initialized.
         if place.projection.is_empty() && self.ctx.is_immutable(place.local) {
-            // A binding of a pattern is a new variable each time, where rustc ends the storage
-            // of the bindings of a candidate whose guard fails; lowering does not.
-            let binds = matches!(span, MirSpan::PatId(_) | MirSpan::BindingId(_));
-            if !binds
-                && self.ever.contains(place.local.into_raw().into_u32() as usize)
+            if self.ever.contains(place.local.into_raw().into_u32() as usize)
                 && !self.access_reported.contains(&(place.key(), span))
             {
                 self.report_illegal_reassignment(place, span);
@@ -1084,6 +1236,51 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     }
 
     fn access_place(
+        &mut self,
+        location: Location,
+        place: PlaceRef<'_>,
+        span: MirSpan,
+        access: Access,
+        allowed: Allowed,
+        depth: Depth,
+    ) {
+        self.bounds_check_reads(location, place, span);
+        self.access_place_only(location, place, span, access, allowed, depth);
+    }
+
+    /// What rustc's bounds check of each index of a slice in `place` reads, at the index
+    /// expression, before `place` is accessed (`len_of_slice_or_array`): a slice behind a
+    /// `Copy` local has its length read from the local (`PtrMetadata(copy _1)`), another
+    /// slice's is a shallow read of the slice (`&raw const (fake) *_1`, `ArrayLength`), so
+    /// `&mut list[i]` uses `*list`, which a mutable borrow of it still live forbids (E0503).
+    /// An array's length is its constant; its `FakeRead(ForIndex)` checks only that the array
+    /// is initialized.
+    fn bounds_check_reads(&mut self, location: Location, place: PlaceRef<'_>, span: MirSpan) {
+        for (at, elem) in place.projection.iter().enumerate() {
+            let ProjectionElem::Index(index) = elem else { continue };
+            let base = place.base(at);
+            let span = self.index_spans.get(index).copied().unwrap_or(span);
+            let ty = self.ctx.place_ty(self.body, base.local, base.projection).ty;
+            let (read, depth) = match ty.kind() {
+                TyKind::Slice(_) => match base.projection {
+                    [ProjectionElem::Deref]
+                        if self
+                            .ctx
+                            .place_ty(self.body, base.local, &[])
+                            .ty
+                            .is_trivially_pure_clone_copy() =>
+                    {
+                        (PlaceRef { local: base.local, projection: &[] }, Depth::Deep)
+                    }
+                    _ => (base, Depth::ShallowArtificial),
+                },
+                _ => continue,
+            };
+            self.access_place_only(location, read, span, Access::Read, Allowed::No, depth);
+        }
+    }
+
+    fn access_place_only(
         &mut self,
         location: Location,
         place: PlaceRef<'_>,
@@ -1113,7 +1310,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         access: Access,
         depth: Depth,
     ) -> bool {
-        let in_scope: Vec<usize> = self.in_scope.iter().collect();
+        // Only a loan of the place's local can conflict with it; `of_local` lists them in the
+        // order they were made, the order of `in_scope`.
+        let Some(of_local) = self.loans.of_local.get(&place.local) else { return false };
+        let in_scope: SmallVec<[usize; 4]> =
+            of_local.iter().copied().filter(|&id| self.in_scope.contains(id)).collect();
         for id in in_scope {
             let loan = &self.loans.loans[id];
             if !places_conflict(
@@ -1337,7 +1538,20 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
         let projection = loan.projection.clone();
         let place = PlaceRef { local: loan.local, projection: &projection };
-        let capture = self.capture_temps.get(&loan.assigned).copied();
+        // rustc's `borrow_spans` knows a capture only by a closure's or a coroutine's aggregate:
+        // what an `async` closure borrows is blamed as any other borrow of a local.
+        let capture = self.capture_temps.get(&loan.assigned).copied().filter(|it| {
+            !matches!(
+                it,
+                MirSpan::ExprId(expr) if matches!(
+                    self.ctx.store[*expr],
+                    hir_def::hir::Expr::Closure {
+                        closure_kind: hir_def::hir::ClosureKind::CoroutineClosure(_),
+                        ..
+                    }
+                )
+            )
+        });
         // A loan whose region outlives a universal one must be valid for it, and the error
         // says why: it is returned, or it goes to where a closure escapes to.
         let universal = self
@@ -1555,7 +1769,12 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             // to its creator by how it gets there.
             let escapes = in_closure
                 && matches!(shorter_kind, UniversalKind::Creator | UniversalKind::Static);
-            let (code, message) = if placeholder {
+            let (code, message) = if placeholder
+                && self.regions.related_placeholders.contains(&longer)
+                && !self.regions.normalized_placeholders.contains(&longer)
+            {
+                ("E0308", "mismatched types".to_owned())
+            } else if placeholder {
                 ("", "higher-ranked lifetime error".to_owned())
             } else if escapes
                 && blamed.category == Category::Return
@@ -1675,7 +1894,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         code,
                         span: test.span,
                         message,
-                        at_signature: false,
+                        at_signature: test.signature,
                     }));
                 }
                 break;
@@ -2586,7 +2805,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             self.report("E0381", span, message);
             return;
         }
-        if let Some((reported, _, _)) = self.move_reported.get(&move_outs) {
+        if let Some((reported, _)) = self.move_reported.get(&move_outs) {
             let reported = PlaceRef { local: reported.0, projection: &reported.1 };
             if used.is_prefix_of(reported) {
                 return;
@@ -2599,7 +2818,21 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let what = if partially { "partially moved value" } else { "moved value" };
         let message = format!("{} of {what}: {name}", action.noun());
         let diagnostic = BorrowckDiagnostic { code: "E0382", span, message, at_signature: false };
-        self.move_reported.insert(move_outs, (used.key(), location, diagnostic));
+        let mut rustc_key =
+            move_outs.iter().map(|&it| self.rustc_moves[it]).collect::<Option<Vec<usize>>>();
+        if let Some(key) = &mut rustc_key {
+            key.sort_unstable();
+        }
+        let place = match self.upvar_sources.get(&used.local) {
+            Some(source) => {
+                let mut projection = source.projection.as_slice().to_vec();
+                projection.extend_from_slice(used.projection);
+                (source.local, projection)
+            }
+            None => used.key(),
+        };
+        let error = UseOfMoved { rustc_key, place, diagnostic, at: 0 };
+        self.move_reported.insert(move_outs, (used.key(), error));
     }
 
     /// The moves out of `path` or a path above it that reach `location` without an init in
@@ -3082,6 +3315,18 @@ fn index_borrows<'db>(
         }
     }
     out
+}
+
+/// The span of the index expression each index temporary is evaluated for, where lowering
+/// starts its storage.
+fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
+    let statements = body.basic_blocks.iter().flat_map(|(_, block)| &block.statements);
+    statements
+        .filter_map(|statement| match statement.kind {
+            StatementKind::StorageLive(local) => Some((local, statement.span)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn capture_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {

@@ -61,6 +61,10 @@ HARNESSES = [
     ("core", ["wholeprogram.py"], {}, on("linux", "macos"), None),
     # `cargo blaze build` from nothing: G's whole build, no cargo build.
     ("core", ["coldbuild.py"], {}, on("linux"), 2),
+    # A load refused for configuration must be retried without stopping the daemon (#597).
+    ("core", ["loadretry.py"], {}, on("linux", "macos"), 2),
+    # Its program of writable statics of its own crates on macOS too, where anim's `HOME` was refused.
+    ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),
     ("core", ["live_e2e.py"], {}, on("linux-x86_64"), 1),
     # A type added beside another, the code moved to it and the old one deleted, each a patch.
@@ -94,6 +98,7 @@ HARNESSES = [
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
     # `cargo ra-jit check`'s diagnostics, in each `--message-format`, against rustc's.
     ("core", ["check_json.py"], {}, on("linux", "macos", backend="cranelift"), 2),
+    ("core", ["checktargets.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     # ra-jit answers what is asked of rustc as rustc answers it, on every target it knows.
     ("core", ["answers.py"], {}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["worktrees.py"], {}, EVERYWHERE, 2),
@@ -104,6 +109,8 @@ HARNESSES = [
     # Generated programs on fixed seeds, and generated edits under a daemon against cold builds.
     # Only x86-64 Linux has been fuzzed so far.
     ("core", ["fuzz/fuzz.py", "smoke", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
+    # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR.
+    ("core", ["fuzz/store.py", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
     ("core", ["fuzz/edits.py", "smoke", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
     # Every reduced program fuzzing found ra-jit building wrong, on both architectures they
     # were found on; a part of its own, as it takes minutes.
@@ -144,6 +151,7 @@ FAST = {
     "unwinds.py": (11, ()),
     "growth.py": (31, (X64,)),
     "coldbuild.py": (78, (X64,)),
+    "loadretry.py": (30, ()),
     "splices.py": (51, ()),
     "live_e2e.py": (16, ()),
     "live_types.py": (9, ()),
@@ -163,12 +171,14 @@ FAST = {
     "rustsrc.py": (1, ()),
     "norustc.py": (253, (X64,)),
     "check_json.py": (38, (X64,)),
+    "checktargets.py": (40, (X64,)),
     "answers.py": (17, (X64,)),
     "worktrees.py": (26, (X64, MAC)),
     "worktrees.py --join --together": (28, ()),
     "worktrees.py --overlay": (34, ()),
     "tiers.py": (87, ()),
     "fuzz/fuzz.py smoke": (60, ()),
+    "fuzz/store.py": (120, ()),
     "fuzz/edits.py smoke": (62, ()),
     "fuzz/fuzz.py check": (259, ()),
     "backends.py corpus": (23, (X64,)),
@@ -202,6 +212,7 @@ CORE = {
     "fuzz/edits.py smoke": 52,
     "testselect.py": 51,
     "fuzz/fuzz.py smoke": 41,
+    "fuzz/store.py": 120,
     "difftest.py corpus": 34,
     "check_json.py": 32,
     "worktrees.py --overlay": 30,

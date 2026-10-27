@@ -3,6 +3,7 @@
 no `cargo build` (docs/no-rustc.md, step K, #91).
 
     python3 coldbuild.py                 # the fixtures
+    python3 coldbuild.py statics         # the fixture of a program's own writable statics alone
     python3 coldbuild.py bench [names]   # bench.py's projects: ripgrep fd hyperfine by default
     python3 coldbuild.py bench --keep    # and what they built, with the daemon's logs, kept
 
@@ -11,7 +12,10 @@ built from nothing by `cargo blaze build` (dev, then release) and `cargo blaze r
 each executable has to be where cargo puts it and print what cargo's build of the same source
 does, and no `cargo build` may run (cargo would leave `.fingerprint` in the target directory).
 An edit to a body after the first build is built by the daemon on what it loaded. A program that reaches a function blaze cannot compile fails its build with what it is, exit
-101, and leaves no executable and no cargo build behind.
+101, and leaves no executable and no cargo build behind. A program whose own crates have writable
+statics (`OnceLock`, `Mutex`, atomics, `static mut`) that `main` reaches is run by
+`cargo blaze run`, dev and `--release`, and has to print what it should, as cargo's build does:
+blaze defines those statics itself, with no rustc symbol behind them.
 
 `bench` does the same for bench.py's projects, the program run with bench.py's `run`
 arguments, and says how long blaze's cold build took against cargo's, then its body and
@@ -19,7 +23,8 @@ signature edits (bench.py's) against cargo's incremental build of each. The edit
 by the daemon's worker on what it loaded for the cold build. The standard library comes from
 a remote `ra-jit std` made once, as a release's does.
 
-RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, as allrajit.py.
+RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, as allrajit.py;
+`statics` on macOS too.
 """
 import os, re, shutil, subprocess, sys, tempfile, time
 
@@ -65,27 +70,108 @@ pub fn counted(words: &str) -> BTreeMap<&str, usize> {
 }
 """,
 }
-# What blaze cannot compile yet: `f128` (docs/no-rustc.md, step G). `kbad`'s own `main` has
-# one; `kuses` reaches a library's function that has one, whose stand-in would be left in the
-# executable.
-HALVED = """#![feature(f128)]
+# What blaze cannot compile on any target: `do yeet` (`yeet_expr`), which rust-analyzer's MIR
+# lowering refuses. Not a class of no-rustc step E, whose lanes make the others compile (`f128`
+# was this until it compiled on AArch64 and x86-64). `kbad`'s own `main` reaches one; `kuses`
+# reaches a library's function that has one, whose stand-in would be left in the executable.
+HALVED = """#![feature(yeet_expr)]
 
 #[inline(never)]
-pub fn halved(x: f64) -> f64 {
-    let x: f128 = std::hint::black_box(x as f128);
-    (x / 2.0) as f64
+pub fn halved(x: f64) -> Option<f64> {
+    if std::hint::black_box(x) < 0.0 {
+        do yeet;
+    }
+    Some(x / 2.0)
 }
 """
 UNSUPPORTED = {
     "Cargo.toml": '[workspace]\nmembers = ["bad", "uses", "half"]\nresolver = "2"\n',
     "bad/Cargo.toml": '[package]\nname = "kbad"\nversion = "0.1.0"\nedition = "2021"\n',
-    "bad/src/main.rs": HALVED + 'fn main() {\n    println!("{}", halved(3.0));\n}\n',
+    "bad/src/main.rs": HALVED + 'fn main() {\n    println!("{:?}", halved(3.0));\n}\n',
     "half/Cargo.toml": '[package]\nname = "khalf"\nversion = "0.1.0"\nedition = "2021"\n',
     "half/src/lib.rs": HALVED,
     "uses/Cargo.toml": '[package]\nname = "kuses"\nversion = "0.1.0"\nedition = "2021"\n\n'
                        '[dependencies]\nkhalf = { path = "../half" }\n',
-    "uses/src/main.rs": 'fn main() {\n    println!("{}", khalf::halved(3.0));\n}\n',
+    "uses/src/main.rs": 'fn main() {\n    println!("{:?}", khalf::halved(3.0));\n}\n',
 }
+# Writable statics of the program's own crates, reached from `main`: anim's `HOME`, a `OnceLock`
+# set in the `detect` that `main` calls, which a build refused as "writable static `HOME`
+# without a rustc symbol"; a `Mutex`, atomics (one in a function's body), a `static mut`, and a
+# library's. A whole build has no rustc copy of any of them: blaze defines each.
+STATICS = {
+    "Cargo.toml": '[workspace]\nmembers = ["kstatics", "kstate"]\nresolver = "2"\n',
+    "kstate/Cargo.toml": '[package]\nname = "kstate"\nversion = "0.1.0"\nedition = "2024"\n',
+    "kstate/src/lib.rs": """use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+pub static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+pub fn bump() -> u32 {
+    static N: AtomicU32 = AtomicU32::new(0);
+    N.fetch_add(1, Ordering::Relaxed) + 1
+}
+""",
+    "kstatics/Cargo.toml": '[package]\nname = "kstatics"\nversion = "0.1.0"\nedition = "2024"\n\n'
+                           '[dependencies]\nkstate = { path = "../kstate" }\n',
+    "kstatics/src/main.rs": """use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+struct Caps {
+    rows: u16,
+}
+
+fn detect(answer: &str) -> std::io::Result<Caps> {
+    let mut parts = answer.split(';').map(|it| it.parse::<u16>());
+    if let (Some(Ok(row)), Some(Ok(col))) = (parts.next(), parts.next()) {
+        let _ = HOME.set((row, col));
+    }
+    Ok(Caps { rows: 24 })
+}
+
+static HOME: OnceLock<(u16, u16)> = OnceLock::new();
+static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CALLS: AtomicU32 = AtomicU32::new(0);
+static mut TOTAL: u64 = 0;
+
+fn note(what: String) {
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    SEEN.lock().unwrap().push(what);
+}
+
+fn tally(n: u64) {
+    unsafe { TOTAL += n };
+}
+
+fn frame() -> u64 {
+    static FRAME: AtomicU64 = AtomicU64::new(0);
+    FRAME.fetch_add(1, Ordering::Relaxed)
+}
+
+fn main() {
+    let caps = detect(std::hint::black_box("12;40")).unwrap();
+    let threads: Vec<_> = (0..4).map(|i| std::thread::spawn(move || note(format!("t{i}")))).collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    note("main".to_owned());
+    for n in 1..=10 {
+        tally(n);
+    }
+    kstate::NAMES.lock().unwrap().extend(["a", "b"]);
+    let mut seen = SEEN.lock().unwrap().clone();
+    seen.sort();
+    println!("home {:?} rows {}", HOME.get(), caps.rows);
+    println!("calls {} seen {:?} total {}", CALLS.load(Ordering::Relaxed), seen, unsafe { TOTAL });
+    println!("frames {} {} {}", frame(), frame(), frame());
+    println!("kstate {:?} {} {}", kstate::NAMES.lock().unwrap(), kstate::bump(), kstate::bump());
+}
+""",
+}
+STATICS_PRINT = """home Some((12, 40)) rows 24
+calls 5 seen ["main", "t0", "t1", "t2", "t3"] total 55
+frames 0 1 2
+kstate ["a", "b"] 1 2
+"""
 
 
 def write(root, files):
@@ -136,11 +222,25 @@ def cargo_built(target):
                if at != own and not at.startswith(own + os.sep))
 
 
-def fixtures():
+def statics(root, env, check):
+    """`cargo blaze run` of STATICS, dev and release: it prints STATICS_PRINT, as cargo's does."""
+    ws = os.path.join(root, "statics")
+    write(ws, STATICS)
+    for flags in ([], ["--release"]):
+        ran, _ = blaze(ws, env, "run", "-q", *flags)
+        said = ran.stdout + ran.stderr
+        named = " ".join(["`cargo blaze run", *flags]) + "`"
+        check(f"{named} of a program's own writable statics runs", (ran.returncode, ran.stdout) == (0, STATICS_PRINT),
+              f"blaze's: exit {ran.returncode} {ran.stdout!r}\n{ran.stderr}")
+        check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(ws, "target")), said)
+        reference, _ = cargo(ws, env, os.path.join(root, "statics-ref"), "run", "-q", *flags)
+        check("  ... and cargo's build prints the same", (reference.returncode, reference.stdout) == (0, STATICS_PRINT),
+              f"cargo's: exit {reference.returncode} {reference.stdout!r}\n{reference.stderr}")
+    return ws
+
+
+def fixtures(only_statics=False):
     root = tempfile.mkdtemp(prefix="ra-jit-coldbuild-", dir="/tmp")
-    ws, bad = os.path.join(root, "ws"), os.path.join(root, "bad")
-    write(ws, FILES)
-    write(bad, UNSUPPORTED)
     env = env_for(root)
     wrong = []
 
@@ -151,6 +251,21 @@ def fixtures():
             if said:
                 print(said[-3000:], flush=True)
 
+    ws = statics(root, env, check)
+    if not only_statics:
+        whole(root, env, check)
+    subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+    if wrong:
+        sys.exit(f"coldbuild.py: {len(wrong)} wrong; under {root}")
+    print("coldbuild.py: all right")
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def whole(root, env, check):
+    """The fixtures of FILES and UNSUPPORTED."""
+    ws, bad = os.path.join(root, "ws"), os.path.join(root, "bad")
+    write(ws, FILES)
+    write(bad, UNSUPPORTED)
     for profile, flags in (("debug", []), ("release", ["--release"])):
         ran, took = blaze(ws, env, "build", *flags)
         said = ran.stdout + ran.stderr
@@ -190,14 +305,9 @@ def fixtures():
         ran, _ = blaze(bad, env, "build", "-p", package)
         said = ran.stdout + ran.stderr
         check(f"a program with {whose} function blaze cannot compile fails", ran.returncode == 101, said)
-        check("  ... and says which and why", "could not compile" in said and "halved" in said and "f128" in said, said)
+        check("  ... and says which and why", "could not compile" in said and "halved" in said and "yeet" in said, said)
         check("  ... with no executable and no build of cargo's",
               not os.path.exists(os.path.join(bad, "target", "debug", package)) and not cargo_built(os.path.join(bad, "target")))
-    subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
-    if wrong:
-        sys.exit(f"coldbuild.py: {len(wrong)} wrong; under {root}")
-    print("coldbuild.py: all right")
-    shutil.rmtree(root, ignore_errors=True)
 
 
 # The edits of bench.py's projects a whole build is measured on, after its cold build: the
@@ -290,7 +400,7 @@ def main():
         names = [it for it in sys.argv[2:] if it != "--keep"]
         bench(names or ["ripgrep", "fd", "hyperfine"], "--keep" in sys.argv)
     else:
-        fixtures()
+        fixtures(only_statics=sys.argv[1:2] == ["statics"])
 
 
 if __name__ == "__main__":

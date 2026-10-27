@@ -19,7 +19,11 @@ use object::{
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
-use super::{Arch, ObjectFormat, Target, store::Store};
+use super::{
+    Arch, ObjectFormat, Target,
+    avx512::{Load, Out},
+    store::Store,
+};
 
 mod aarch64;
 
@@ -47,6 +51,41 @@ pub(super) fn pause() -> String {
 /// AArch64's instruction barrier, of the whole system as `__isb(SY)` asks for it.
 pub(super) fn isb() -> String {
     format!(".globl {SYMBOL}\n{SYMBOL}:\nisb\nret\n")
+}
+
+/// AArch64's `fcvt` from the float in the first vector register to one of another width,
+/// both named by their registers' letters (`h`, `s`, `d`): what LLVM converts an `f16` with
+/// on a target without the half-precision instructions.
+pub(super) fn fcvt(to: char, from: char) -> String {
+    format!(".globl {SYMBOL}\n{SYMBOL}:\nfcvt {to}0, {from}0\nret\n")
+}
+
+/// An AArch64 instruction of the half-precision extension on the halves passed in `h0` up,
+/// which leaves its result in `h0`: what LLVM does an `f16` with where the extension is enabled.
+pub(super) fn half(instruction: &str) -> String {
+    format!(".arch_extension fp16\n.globl {SYMBOL}\n{SYMBOL}:\n{instruction}\nret\n")
+}
+
+/// An x86-64 instruction of AVX512-FP16 on the halves passed in `xmm0` up, which leaves its
+/// result in `xmm0`.
+pub(super) fn x86_half(instruction: &str) -> String {
+    format!(".globl {SYMBOL}\n{SYMBOL}:\n{instruction}\nret\n")
+}
+
+/// A function of the one AArch64 instruction whose word is `word`.
+pub(super) fn instruction_word(word: u32) -> String {
+    format!(".globl {SYMBOL}\n{SYMBOL}:\n.inst {word:#010x}\nret\n")
+}
+
+/// Writes a random number of AArch64's `RNDR` (or `RNDRRS`, `reseeded`) where its argument
+/// points, and after it a byte that is 1 when there was none. The registers are named by
+/// number, which needs no extension of the assembler.
+pub(super) fn random(reseeded: bool) -> String {
+    let register = if reseeded { "s3_3_c2_c4_1" } else { "s3_3_c2_c4_0" };
+    format!(
+        ".globl {SYMBOL}\n{SYMBOL}:\nmrs x9, {register}\ncset w10, eq\nstr x9, [x0]\n\
+         strb w10, [x0, #8]\nret\n"
+    )
 }
 
 /// AArch64's CRC-32 of its second argument into the checksum of its first, as `instruction`
@@ -157,19 +196,10 @@ fn aarch64_extension(feature: &str) -> Option<&'static str> {
         "sve2-bitperm" => "sve2-bitperm",
         "tme" => "tme",
         "mops" => "mops",
+        "faminmax" => "faminmax",
+        "fp8" => "fp8",
         _ => return None,
     })
-}
-
-/// Returns its first float argument with the second left in the register it was passed in,
-/// which is where a pair of floats is returned.
-pub(super) fn join_floats() -> String {
-    format!(".globl {SYMBOL}\n{SYMBOL}:\nret\n")
-}
-
-/// Answers what is in the two registers a pair of floats is returned in, as integers.
-pub(super) fn split_floats() -> String {
-    format!(".globl {SYMBOL}\n{SYMBOL}:\nmovq rax, xmm0\nmovq rdx, xmm1\nret\n")
 }
 
 /// `vcvtps2ph` makes half-precision floats of the single-precision ones at its first
@@ -208,6 +238,237 @@ pub(super) fn neon_instruction(extension: &str, instruction: &str) -> String {
         ".arch_extension {extension}\n.globl {SYMBOL}\n{SYMBOL}:\nldr q0, [x0]\nldr q1, [x1]\n\
          ldr q2, [x2]\n{instruction}\nstr q0, [x2]\nret\n"
     )
+}
+
+/// A function of AArch64 instructions on SIMD registers, an intrinsic of LLVM's as
+/// `neon::lower` has it. The first argument is where the results go and each other points at
+/// a value: `args[i]` says how many bytes of argument `i + 1` are read into `v{i+1}`, or that
+/// it is a pointer, read into `x{i+1}`. `text` runs after the reads, with `directives` (the
+/// extensions it needs) before it, and leaves the results in `v0` up: `results` says their
+/// sizes, and each is written after the one before it.
+pub(super) fn neon_function(
+    directives: &str,
+    args: &[Option<u32>],
+    text: &str,
+    results: &[(u32, u32)],
+) -> String {
+    let mut out = format!("{directives}.globl {SYMBOL}\n{SYMBOL}:\n");
+    let register = |bytes: u32| match bytes {
+        1 => 'b',
+        2 => 'h',
+        4 => 's',
+        8 => 'd',
+        _ => 'q',
+    };
+    for (i, arg) in args.iter().enumerate() {
+        let k = i + 1;
+        match arg {
+            Some(bytes) => _ = writeln!(out, "ldr {}{k}, [x{k}]", register(*bytes)),
+            None => _ = writeln!(out, "ldr x{k}, [x{k}]"),
+        }
+    }
+    _ = writeln!(out, "{text}");
+    for (k, (offset, bytes)) in results.iter().enumerate() {
+        _ = writeln!(out, "str {}{k}, [x0, #{offset}]", register(*bytes));
+    }
+    out.push_str("ret\n");
+    out
+}
+
+/// The register x86 names `name` and its bytes: `rax` to `al`, `xmm`, `ymm` and `zmm`.
+fn x86_register(name: &str) -> Option<(Reg, u32)> {
+    if let Some(row) = GPR.iter().position(|row| row.contains(&name)) {
+        let column = GPR[row].iter().position(|&it| it == name)?;
+        return Some((Reg::Gpr(row), 8 >> column));
+    }
+    [("xmm", 16), ("ymm", 32), ("zmm", 64)].into_iter().find_map(|(prefix, bytes)| {
+        let number = name.strip_prefix(prefix)?.parse().ok()?;
+        Some((Reg::Vector(number), bytes))
+    })
+}
+
+/// The bytes of the x86 register `name`.
+pub(super) fn x86_register_bytes(name: &str) -> Option<u32> {
+    x86_register(name).map(|(_, bytes)| bytes)
+}
+
+/// The instruction that moves the register `name` to or from `memory`.
+fn x86_move(name: &str, memory: &str, load: bool) -> String {
+    let (mnemonic, width) = match x86_register(name).expect("a register") {
+        (Reg::Gpr(_), 1) => ("mov", "byte"),
+        (Reg::Gpr(_), 2) => ("mov", "word"),
+        (Reg::Gpr(_), 4) => ("mov", "dword"),
+        (Reg::Gpr(_), _) => ("mov", "qword"),
+        (_, 16) => ("movups", "xmmword"),
+        (_, 32) => ("vmovups", "ymmword"),
+        (_, _) => ("vmovups", "zmmword"),
+    };
+    match load {
+        true => format!("{mnemonic} {name}, {width} ptr [{memory}]\n"),
+        false => format!("{mnemonic} {width} ptr [{memory}], {name}\n"),
+    }
+}
+
+/// A function of x86 instructions on registers, an intrinsic of LLVM's as `x86::lower` has
+/// it. The first argument points at the arguments and the second at where the results go:
+/// `args` names the register each argument is read into and where it is, `results` the
+/// register each result is written from and where. `clobbers` are the other registers `text`
+/// writes. Each of these registers that the calling convention keeps is kept on the stack,
+/// and the upper halves of the vector registers are zeroed once a 256- or 512-bit one is
+/// used, as LLVM does before a function returns.
+pub(super) fn x86_function(
+    text: &str,
+    args: &[(&str, u32)],
+    results: &[(&str, u32)],
+    clobbers: &[&str],
+) -> Result<String, String> {
+    let convention = Convention::of_target();
+    let [from, to, _] = convention.arguments.map(|row| GPR[row][0]);
+    let mut out = format!(".globl {SYMBOL}\n{SYMBOL}:\nmov r10, {from}\nmov r11, {to}\n");
+    let names = args.iter().chain(results).map(|(name, _)| *name).chain(clobbers.iter().copied());
+    let mut kept = Vec::new();
+    let mut vectors = Vec::new();
+    let mut wide = text.contains("ymm") || text.contains("zmm");
+    for name in names {
+        let Some((reg, bytes)) = x86_register(name) else {
+            return Err(format!("the register `{name}`"));
+        };
+        wide |= bytes > 16;
+        match reg {
+            Reg::Gpr(row) if convention.kept.contains(&row) && !kept.contains(&row) => {
+                kept.push(row)
+            }
+            Reg::Vector(number)
+                if convention.kept_vectors.contains(&number) && !vectors.contains(&number) =>
+            {
+                vectors.push(number)
+            }
+            _ => {}
+        }
+    }
+    for &row in &kept {
+        _ = writeln!(out, "push {}", GPR[row][0]);
+    }
+    if !vectors.is_empty() {
+        _ = writeln!(out, "sub rsp, {}", vectors.len() * 16);
+    }
+    for (i, number) in vectors.iter().enumerate() {
+        _ = writeln!(out, "movups xmmword ptr [rsp + {}], xmm{number}", i * 16);
+    }
+    for (name, offset) in args {
+        out.push_str(&x86_move(name, &format!("r10 + {offset}"), true));
+    }
+    _ = writeln!(out, "{text}");
+    for (name, offset) in results {
+        out.push_str(&x86_move(name, &format!("r11 + {offset}"), false));
+    }
+    for (i, number) in vectors.iter().enumerate() {
+        _ = writeln!(out, "movups xmm{number}, xmmword ptr [rsp + {}]", i * 16);
+    }
+    if !vectors.is_empty() {
+        _ = writeln!(out, "add rsp, {}", vectors.len() * 16);
+    }
+    for &row in kept.iter().rev() {
+        _ = writeln!(out, "pop {}", GPR[row][0]);
+    }
+    if wide {
+        out.push_str("vzeroupper\n");
+    }
+    out.push_str("ret\n");
+    Ok(out)
+}
+
+/// A function of x86 instructions on vector and mask registers, an intrinsic of LLVM's as
+/// `avx512::lower` has it. Its argument points at the address of the result and after it the
+/// address of each operand: `loads[i]` says what of operand `i` is read, and into which
+/// register. `text` runs after the reads and leaves the result where `out` says, which is
+/// written to the first address. A mask of 8 bits is read with AVX512F's `kmovw`, as LLVM
+/// moves one without AVX512DQ.
+pub(super) fn avx512_function(loads: &[Load], text: &str, out: Out) -> String {
+    let slot = GPR[Convention::of_target().arguments[0]][0];
+    let mut s = format!(".globl {SYMBOL}\n{SYMBOL}:\nmov r10, {slot}\n");
+    for (i, load) in loads.iter().enumerate() {
+        let (k, at) = (i + 1, 8 * (i + 1));
+        match *load {
+            Load::Immediate => {}
+            Load::Pointer => {
+                _ = writeln!(s, "mov r11, qword ptr [r10 + {at}]\nmov r11, qword ptr [r11]")
+            }
+            Load::Int(bytes) => {
+                let (to, width) = if bytes == 8 { ("rcx", "qword") } else { ("ecx", "dword") };
+                _ = writeln!(s, "mov rax, qword ptr [r10 + {at}]\nmov {to}, {width} ptr [rax]");
+            }
+            Load::Vector(8) => {
+                let name = vector_name(k, 16);
+                _ = writeln!(s, "mov rax, qword ptr [r10 + {at}]\nvmovq {name}, qword ptr [rax]");
+            }
+            Load::Vector(4) => {
+                let name = vector_name(k, 16);
+                _ = writeln!(s, "mov rax, qword ptr [r10 + {at}]\nvmovd {name}, dword ptr [rax]");
+            }
+            Load::Vector(2) => {
+                let name = vector_name(k, 16);
+                _ = writeln!(
+                    s,
+                    "mov rax, qword ptr [r10 + {at}]\nmovzx eax, word ptr [rax]\nvmovd {name}, eax"
+                );
+            }
+            Load::Vector(bytes) => {
+                let name = vector_name(k, bytes);
+                let width = vector_width(bytes);
+                _ = writeln!(
+                    s,
+                    "mov rax, qword ptr [r10 + {at}]\nvmovups {name}, {width} ptr [rax]"
+                );
+            }
+            Load::Mask(bytes) => {
+                _ = writeln!(s, "mov rax, qword ptr [r10 + {at}]");
+                _ = match bytes {
+                    1 => writeln!(s, "movzx eax, byte ptr [rax]\nkmovw k{k}, eax"),
+                    2 => writeln!(s, "kmovw k{k}, word ptr [rax]"),
+                    4 => writeln!(s, "kmovd k{k}, dword ptr [rax]"),
+                    _ => writeln!(s, "kmovq k{k}, qword ptr [rax]"),
+                };
+            }
+        }
+    }
+    _ = writeln!(s, "{text}\nmov r10, qword ptr [r10]");
+    let mask = |s: &mut String, k: u32, bytes: u32, at: u32| {
+        _ = match bytes {
+            1 => writeln!(s, "kmovw eax, k{k}\nmov byte ptr [r10 + {at}], al"),
+            2 => writeln!(s, "kmovw word ptr [r10 + {at}], k{k}"),
+            4 => writeln!(s, "kmovd dword ptr [r10 + {at}], k{k}"),
+            _ => writeln!(s, "kmovq qword ptr [r10 + {at}], k{k}"),
+        };
+    };
+    match out {
+        Out::Nothing => {}
+        Out::Vector(8) => _ = writeln!(s, "vmovq qword ptr [r10], xmm0"),
+        Out::Vector(4) => _ = writeln!(s, "vmovd dword ptr [r10], xmm0"),
+        Out::Vector(2) => _ = writeln!(s, "vmovd eax, xmm0\nmov word ptr [r10], ax"),
+        Out::Vector(bytes) => {
+            let (name, width) = (vector_name(0, bytes), vector_width(bytes));
+            _ = writeln!(s, "vmovups {width} ptr [r10], {name}");
+        }
+        Out::Mask(bytes) => mask(&mut s, 0, bytes, 0),
+        Out::Int(8) => _ = writeln!(s, "mov qword ptr [r10], rax"),
+        Out::Int(_) => _ = writeln!(s, "mov dword ptr [r10], eax"),
+        Out::Masks(bytes, at) => {
+            mask(&mut s, 0, bytes, 0);
+            mask(&mut s, 1, bytes, at);
+        }
+    }
+    s.push_str("vzeroupper\nret\n");
+    s
+}
+
+/// What Intel's syntax calls a memory operand of a vector of `bytes`.
+fn vector_width(bytes: u32) -> &'static str {
+    match bytes {
+        ..=16 => "xmmword",
+        32 => "ymmword",
+        _ => "zmmword",
+    }
 }
 
 /// `sha1rnds4` does four rounds of SHA-1 on the vectors at its first two arguments. Which
@@ -327,6 +588,8 @@ enum Reg {
     Gpr(usize),
     /// `xmm`, `ymm` and `zmm` of one number are one register.
     Vector(usize),
+    /// `k1` to `k7`, AVX-512's masks.
+    Mask(usize),
     /// One a call does not keep and that holds no value here: nothing to do.
     Scratch,
 }
@@ -393,6 +656,9 @@ fn named(name: &str) -> Result<Reg, String> {
             return Ok(Reg::Vector(number));
         }
     }
+    if let Some(number @ 1..8) = name.strip_prefix('k').and_then(|it| it.parse().ok()) {
+        return Ok(Reg::Mask(number));
+    }
     let scratch = ["k", "mm", "st", "tmm"].iter().any(|prefix| {
         name.strip_prefix(prefix)
             .is_some_and(|rest| rest.trim_matches(['(', ')']).chars().all(|it| it.is_ascii_digit()))
@@ -440,6 +706,24 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
     }
 }
 
+/// The instructions that move a mask of `size` bytes between `k{number}` and the slot (`load`)
+/// or back. AVX512F moves 16 bits; a byte goes through `eax`, as LLVM moves one without
+/// AVX512DQ, and 32 and 64 bits need AVX512BW, which LLVM needs for a mask of them too.
+fn mask_transfer(load: bool, number: usize, size: u32, offset: u32) -> Result<String, String> {
+    let memory = |width: &str| format!("{width} ptr [rbx + {offset}]");
+    Ok(match (load, size) {
+        (true, 1) => format!("movzx eax, {}\nkmovw k{number}, eax", memory("byte")),
+        (false, 1) => format!("kmovw eax, k{number}\nmov {}, al", memory("byte")),
+        (true, 2) => format!("kmovw k{number}, {}", memory("word")),
+        (true, 4) => format!("kmovd k{number}, {}", memory("dword")),
+        (true, 8) => format!("kmovq k{number}, {}", memory("qword")),
+        (false, 2) => format!("kmovw {}, k{number}", memory("word")),
+        (false, 4) => format!("kmovd {}, k{number}", memory("dword")),
+        (false, 8) => format!("kmovq {}, k{number}", memory("qword")),
+        _ => return Err(format!("an inline assembly operand of {size} bytes in a mask register")),
+    })
+}
+
 /// The function for a block, in the assembly of the architecture.
 pub(super) fn wrapper(
     target: &Target,
@@ -484,6 +768,7 @@ fn wrapper_x86_64(
             "reg" | "reg_byte" => (0..OPERANDS).map(Reg::Gpr).find(|&it| free(it)),
             "reg_abcd" => (0..3).map(Reg::Gpr).find(|&it| free(it)),
             "xmm_reg" | "ymm_reg" | "zmm_reg" => (0..16).map(Reg::Vector).find(|&it| free(it)),
+            "kreg" => (1..8).map(Reg::Mask).find(|&it| free(it)),
             _ => return Err(format!("the register class `{class}`")),
         };
         let Some(found) = found else {
@@ -530,8 +815,14 @@ fn wrapper_x86_64(
     for (at, &number) in kept_vectors.iter().enumerate() {
         _ = writeln!(text, "movups xmmword ptr [rbx + {}], xmm{number}", at * 16);
     }
+    // A mask of one byte goes through `eax`, before any operand is there.
     for (reg, size, offset, input, _) in values() {
-        if input {
+        if let (Reg::Mask(number), true) = (reg, input) {
+            _ = writeln!(text, "{}", mask_transfer(true, number, size, offset)?);
+        }
+    }
+    for (reg, size, offset, input, _) in values() {
+        if input && !matches!(reg, Reg::Mask(_)) {
             let (instruction, reg, memory) = transfer(reg, size, offset)?;
             _ = writeln!(text, "{instruction} {reg}, {memory}");
         }
@@ -542,8 +833,14 @@ fn wrapper_x86_64(
     }
     for piece in template {
         let (index, modifier) = match piece {
-            AsmPiece::Lit(lit) => {
+            // rustc hands LLVM each `$` as `$$`, which LLVM prints as `$` in AT&T syntax and as
+            // nothing in Intel's: Windows' `abort_internal` is `int $$0x29`, assembled `int 41`.
+            AsmPiece::Lit(lit) if att => {
                 text.push_str(lit);
+                continue;
+            }
+            AsmPiece::Lit(lit) => {
+                text.extend(lit.chars().filter(|&it| it != '$'));
                 continue;
             }
             AsmPiece::Operand { index, modifier } => (*index, *modifier),
@@ -569,6 +866,7 @@ fn wrapper_x86_64(
                 }
                 .to_owned()
             }
+            (_, Some(Reg::Mask(number))) if modifier.is_none() => format!("k{number}"),
             (_, Some(Reg::Vector(number))) => {
                 let size = match (modifier, classes[index]) {
                     (Some('x'), _) | (None, "xmm_reg") => 16,
@@ -592,9 +890,15 @@ fn wrapper_x86_64(
     let returns = !options.contains(AsmOptions::NORETURN);
     if returns {
         for (reg, size, offset, _, output) in values() {
-            if output {
+            if output && !matches!(reg, Reg::Mask(_)) {
                 let (instruction, reg, memory) = transfer(reg, size, offset)?;
                 _ = writeln!(text, "{instruction} {memory}, {reg}");
+            }
+        }
+        // After every other output is written, as one of a byte goes through `eax`.
+        for (reg, size, offset, _, output) in values() {
+            if let (Reg::Mask(number), true) = (reg, output) {
+                _ = writeln!(text, "{}", mask_transfer(false, number, size, offset)?);
             }
         }
         if labels(operands).next().is_some() {
@@ -1061,10 +1365,44 @@ impl Assembler {
 /// The text as rustc hands it to the assembler: `asm!` is in Intel's syntax on x86-64.
 fn as_rustc_gives_it(triple: &str, text: &str) -> String {
     if triple.starts_with("x86_64") {
-        format!(".intel_syntax noprefix\n{text}\n.att_syntax\n")
+        let text: Vec<String> = text.lines().map(hash_comment).collect();
+        format!(".intel_syntax noprefix\n{}\n.att_syntax\n", text.join("\n"))
     } else {
         format!("{text}\n")
     }
+}
+
+/// The line with a comment of `//`, which LLVM's assembler takes on every target and GNU's
+/// on x86 only at the start of a line, as the `#` both take. A `//` in a string or a
+/// character (`'c'`, `'\c'`) is not one, as LLVM's lexer reads them; a line with a `'`
+/// before it that is not a character is left as it is.
+fn hash_comment(line: &str) -> String {
+    let mut chars = line.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '"' => loop {
+                match chars.next() {
+                    Some((_, '\\')) => _ = chars.next(),
+                    Some((_, '"')) => break,
+                    Some(_) => {}
+                    None => return line.to_owned(),
+                }
+            },
+            '\'' => {
+                if let Some((_, '\\')) = chars.next() {
+                    chars.next();
+                }
+                if !matches!(chars.next(), Some((_, '\''))) {
+                    return line.to_owned();
+                }
+            }
+            '/' if matches!(chars.peek(), Some((_, '/'))) => {
+                return format!("{}#{}", &line[..at], &line[at + 2..]);
+            }
+            _ => {}
+        }
+    }
+    line.to_owned()
 }
 
 /// The C compiler that assembles for `triple`, with the arguments that say the target:
@@ -1094,9 +1432,9 @@ fn no_assembler(triple: &str) -> String {
         && matches!(std::env::consts::OS, "macos" | "linux");
     let or_cc = if host { " or a C compiler (`cc`)" } else { "" };
     format!(
-        "inline assembly: nothing here assembles it for {triple}. This ra-jit was built without \
+        "inline assembly: nothing here assembles it for {triple}. This blaze was built without \
          LLVM, so it assembles `asm!` with clang{or_cc}, and there is none on PATH: install \
-         clang, or use a build of ra-jit with LLVM (`--features llvm`)"
+         clang, or use a build of blaze with LLVM (`--features llvm`)"
     )
 }
 
@@ -1200,7 +1538,19 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arch, extensions};
+    use super::{Arch, extensions, hash_comment};
+
+    /// compiler_builtins' `__rust_probestack` ends an instruction with `// ...`.
+    #[test]
+    fn a_comment_of_two_slashes_is_one_gnu_as_reads() {
+        assert_eq!(hash_comment("mov r11, rax // dup"), "mov r11, rax # dup");
+        assert_eq!(hash_comment(".ascii \"a//b\\\"//\" // c"), ".ascii \"a//b\\\"//\" # c");
+        assert_eq!(hash_comment("// we're guaranteed"), "# we're guaranteed");
+        assert_eq!(hash_comment("mov al, '/' // c'"), "mov al, '/' # c'");
+        assert_eq!(hash_comment("mov al, '\\'' // c"), "mov al, '\\'' # c");
+        assert_eq!(hash_comment("mov al, 'ab' // c"), "mov al, 'ab' // c");
+        assert_eq!(hash_comment("div rcx"), "div rcx");
+    }
 
     /// constant_time_eq's `#[target_feature(enable = "dit")]` reads DIT, which LLVM's
     /// assembler has no extension of: the architecture that has it comes before the
@@ -1214,5 +1564,20 @@ mod tests {
         assert_eq!(extensions(Arch::Aarch64, ["v9a", "dit"]), ".arch armv9-a\n");
         assert_eq!(extensions(Arch::Aarch64, ["neon"]), ".arch_extension simd\n");
         assert_eq!(extensions(Arch::X86_64, ["dit"]), "");
+    }
+
+    /// What rustc 1.99's LLVM assembled of these: `int 41` and `mov eax, 5`, and in AT&T
+    /// syntax the template as it is written.
+    #[test]
+    fn a_dollar_is_nothing_in_intel_syntax() {
+        use super::{AsmOptions, AsmPiece, ObjectFormat, wrapper_x86_64};
+        let text = |template: &str, options| {
+            let template = [AsmPiece::Lit(template.into())];
+            wrapper_x86_64(ObjectFormat::Coff, &template, options, &[]).unwrap().text
+        };
+        let intel = text("int $$0x29\nmov eax, $$$$5", AsmOptions::NORETURN);
+        assert!(intel.contains("int 0x29\nmov eax, 5\n"), "{intel}");
+        let att = text("movl $$7, %eax", AsmOptions::NORETURN | AsmOptions::ATT_SYNTAX);
+        assert!(att.contains("movl $$7, %eax\n"), "{att}");
     }
 }

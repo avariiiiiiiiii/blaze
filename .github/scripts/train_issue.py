@@ -57,7 +57,9 @@ async def jobs_of(run, attempt=None):
 
 async def failed_harnesses(job_id):
     """ci.py's `failed:` line of a harness job's log, or None for a job with none."""
-    log = await gh("api", f"repos/{REPO}/actions/jobs/{job_id}/logs", step=f"the log of job {job_id}")
+    # gh refuses a response with terminal escapes unless told to, and a job's log has them.
+    log = await gh("api", "--allow-escape-sequences", f"repos/{REPO}/actions/jobs/{job_id}/logs",
+                   step=f"the log of job {job_id}")
     found = re.findall(r"failed: (.+)$", ANSI.sub("", log), re.M)
     return found[-1].strip() if found and found[-1].strip() != "none" else None
 

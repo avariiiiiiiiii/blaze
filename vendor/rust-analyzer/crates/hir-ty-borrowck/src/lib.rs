@@ -11,12 +11,16 @@ extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 mod bitset;
 mod cfg;
 mod check;
+mod inference;
+mod intervals;
 mod liveness;
 mod loans;
 mod moves;
 mod names;
 mod polonius;
+mod qualifs;
 mod regions;
+pub mod timings;
 
 use std::sync::LazyLock;
 
@@ -34,7 +38,7 @@ use hir_ty::{
     closure_analysis::CapturedPlace,
     db::{HirDatabase, InternedCoroutineId},
     next_solver::{
-        DbInterner, ParamEnv, Ty, TypingMode,
+        DbInterner, ParamEnv, Region, Ty, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
@@ -97,7 +101,11 @@ pub struct BorrowckResult {
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
 #[salsa::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckResult {
-    let mode = mode();
+    borrowck_in_mode(db, def, mode())
+}
+
+/// [`borrowck`] in `mode`, not cached: for measuring the checker in each mode.
+pub fn borrowck_in_mode(db: &dyn HirDatabase, def: DefWithBodyId, mode: Mode) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
         return result;
@@ -109,7 +117,9 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     }
     // rustc borrow checks no body its lowering or type check found an error in, which an
     // error of either taints: a cast that is not one, `..base` in a destructuring assignment.
-    let (_, source_map) = hir_def::expr_store::Body::with_source_map(db, def);
+    // The source map that stays the same while edits elsewhere move the body, so such an
+    // edit checks it again only if it changes it.
+    let source_map = hir_def::expr_store::Body::unmoved_source_map(db, def);
     if source_map.diagnostics().iter().any(|it| {
         !matches!(it, hir_def::expr_store::ExpressionStoreDiagnostics::InactiveCode { .. })
     }) {
@@ -130,7 +140,7 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     {
         return result;
     }
-    check_owner(db, owner, Some(def))
+    check_owner(db, owner, Some(def), mode)
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
@@ -148,7 +158,7 @@ pub fn borrowck_anon_const<'db>(
     if infer.has_type_mismatches() || infer.is_erroneous() {
         return BorrowckResult::default();
     }
-    check_owner(db, owner, None)
+    check_owner(db, owner, None, mode())
 }
 
 /// The errors in `owner`'s body and the closures, coroutines and `const { .. }` blocks in it;
@@ -157,11 +167,11 @@ fn check_owner<'db>(
     db: &'db dyn HirDatabase,
     owner: InferBodyId<'db>,
     def: Option<DefWithBodyId>,
+    mode: Mode,
 ) -> BorrowckResult {
-    let mode = mode();
     let mut result = BorrowckResult::default();
     let infer = InferenceResult::of(db, owner);
-    let body = match db.mir_body(owner) {
+    let body = match timings::phase(timings::Phase::Mir, || db.mir_body(owner)) {
         Ok(body) => body,
         Err(error) => {
             result.skipped = Some(format!("{error:?}"));
@@ -170,34 +180,53 @@ fn check_owner<'db>(
     };
     let store = ExpressionStore::of(db, owner.expression_store_owner(db));
     let mut bodies = vec![(body, None, None)];
+    // What each body is written as: `None` for the owner's.
+    let mut written = vec![None];
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut index = 0;
     while let Some(&(body, _, _)) = bodies.get(index) {
+        let at = written[index];
         index += 1;
-        for &closure in &body.closures {
-            match db.mir_body_for_closure(closure) {
-                Ok(it) => bodies.push((it, Some(closure.loc(db).expr), None)),
-                Err(error) => {
-                    result.skipped.get_or_insert_with(|| format!("closure: {error:?}"));
-                }
-            }
-        }
+        let mut nested = Vec::new();
+        nested.extend(body.closures.iter().map(|&it| Nested::Closure(it)));
         // The body of an `async` block or `async fn`, checked as rustc checks a coroutine: as
         // a closure of the body that makes it.
-        for coroutine in coroutines(body) {
-            match db.mir_body_for_coroutine(coroutine) {
-                Ok(it) => bodies.push((it, Some(coroutine.loc(db).expr), None)),
-                Err(error) => {
-                    result.skipped.get_or_insert_with(|| format!("coroutine: {error:?}"));
-                }
-            }
-        }
+        nested.extend(coroutines(body).into_iter().map(Nested::Coroutine));
         // A `const { .. }` block, which MIR lowering makes a constant of its own, checked with
         // the body as rustc checks an inline const.
-        for konst in inline_consts(db, body) {
-            match db.mir_body(InferBodyId::AnonConstId(konst)) {
-                Ok(it) => bodies.push((it, None, Some(konst.loc(db).expr))),
+        nested.extend(inline_consts(db, body).into_iter().map(Nested::Const));
+        // Those in code that is never reached, which MIR lowering leaves out: rustc borrow
+        // checks every body nested in the item's (`nested_bodies_within`), so a closure after a
+        // `return` is checked too.
+        nested.extend(nested_bodies_written(db, owner, store, infer, at));
+        for it in nested {
+            if !seen.insert(it) {
+                continue;
+            }
+            let (lowered, what) = timings::phase(timings::Phase::Mir, || match it {
+                Nested::Closure(closure) => (
+                    db.mir_body_for_closure(closure)
+                        .map(|body| (body, Some(closure.loc(db).expr), None)),
+                    "closure",
+                ),
+                Nested::Coroutine(coroutine) => (
+                    db.mir_body_for_coroutine(coroutine)
+                        .map(|body| (body, Some(coroutine.loc(db).expr), None)),
+                    "coroutine",
+                ),
+                Nested::Const(konst) => (
+                    db.mir_body(InferBodyId::AnonConstId(konst))
+                        .map(|body| (body, None, Some(konst.loc(db).expr))),
+                    "inline const",
+                ),
+            });
+            match lowered {
+                Ok(it) => {
+                    written.push(it.1.or(it.2));
+                    bodies.push(it);
+                }
                 Err(error) => {
-                    result.skipped.get_or_insert_with(|| format!("inline const: {error:?}"));
+                    result.skipped.get_or_insert_with(|| format!("{what}: {error:?}"));
                 }
             }
         }
@@ -206,18 +235,46 @@ fn check_owner<'db>(
     // the closure needs of it.
     let mut requirements = FxHashMap::default();
     let mut mut_upvars = FxHashMap::default();
-    let mut diagnostics = Vec::new();
+    let mut diagnostics: Vec<Vec<Option<BorrowckDiagnostic>>> = Vec::new();
+    // rustc's `buffered_move_errors`, one for the function and the closures in it: the body,
+    // the error's place as rustc has it and where the error is, by the moves it is about.
+    let mut move_errors: FxHashMap<Vec<usize>, (usize, (LocalId, Vec<PlaceElem>), usize)> =
+        FxHashMap::default();
     for (body, closure, inline_const) in bodies.into_iter().rev() {
-        let mut ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
+        let mut ctx = timings::phase(timings::Phase::Setup, || {
+            Ctx::new(db, owner, store, infer, body, closure, mode)
+        });
         ctx.inline_const = inline_const.is_some();
         if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
             return result;
         }
         let mut found = Vec::new();
+        let mut moved = Vec::new();
         let (count, needs, used_mut_upvars) =
-            check::check(&ctx, body, &requirements, &mut_upvars, &mut found);
+            check::check(&ctx, body, &requirements, &mut_upvars, &mut found, &mut moved);
         if ctx.tainted.get() {
             return result;
+        }
+        let this = diagnostics.len();
+        let mut found: Vec<_> = found.into_iter().map(Some).collect();
+        // rustc numbers the moves of each body from 0 but buffers the errors of all of them
+        // by those numbers, so a use of a moved value whose moves are numbered as those of
+        // an error a closure gave, of a place the closure's is in (the variable `_1` and the
+        // capture `_1.0`), is not reported; of another place, it replaces the closure's.
+        for error in moved {
+            let Some(key) = error.rustc_key else { continue };
+            if let Some(&(other, ref place, at)) = move_errors.get(&key)
+                && other != this
+            {
+                let reported = check::PlaceRef { local: place.0, projection: &place.1 };
+                let used = check::PlaceRef { local: error.place.0, projection: &error.place.1 };
+                if used.is_prefix_of(reported) {
+                    found[error.at] = None;
+                    continue;
+                }
+                diagnostics[other][at] = None;
+            }
+            move_errors.insert(key, (this, error.place, error.at));
         }
         diagnostics.push(found);
         if let Some(nested) = closure.or(inline_const) {
@@ -225,8 +282,11 @@ fn check_owner<'db>(
             mut_upvars.insert(nested, used_mut_upvars);
         }
     }
-    result.diagnostics.extend(diagnostics.into_iter().rev().flatten());
+    result.diagnostics.extend(diagnostics.into_iter().rev().flatten().flatten());
     if debugging(db, owner) {
+        if let Some(skipped) = &result.skipped {
+            eprintln!("skipped {skipped}");
+        }
         for it in &result.diagnostics {
             eprintln!("diagnostic {it:?}");
         }
@@ -271,11 +331,8 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
         place.projection.as_slice().is_empty()
             && place.local != return_slot()
             && !moved.contains(&place.local)
-            && hir_ty::drop::has_drop_glue(
-                &ctx.infcx,
-                body.locals[place.local].ty.as_ref(),
-                ctx.env,
-            ) == hir_ty::drop::DropGlue::HasDropGlue
+            && ctx.drop_glue(body.locals[place.local].ty.as_ref())
+                == hir_ty::drop::DropGlue::HasDropGlue
     })
 }
 
@@ -294,6 +351,64 @@ fn coroutines<'db>(body: &MirBody<'db>) -> Vec<InternedCoroutineId<'db>> {
             {
                 out.push(id.0);
             }
+        }
+    }
+    out
+}
+
+/// A body checked with the one it is written in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Nested<'db> {
+    Closure(hir_ty::db::InternedClosureId<'db>),
+    Coroutine(InternedCoroutineId<'db>),
+    Const(hir_ty::db::AnonConstId<'db>),
+}
+
+/// The closures, `async` blocks and `const { .. }` blocks written directly in the body written
+/// as `at` (the owner's for `None`), not in another of them, reached or not.
+fn nested_bodies_written<'db>(
+    db: &'db dyn HirDatabase,
+    owner: InferBodyId<'db>,
+    store: &ExpressionStore,
+    infer: &InferenceResult<'db>,
+    at: Option<ExprId>,
+) -> Vec<Nested<'db>> {
+    use hir_def::hir::{ClosureKind, CoroutineKind, Expr};
+    use hir_ty::next_solver::TyKind;
+    use rustc_type_ir::inherent::IntoKind;
+    let mut stack = Vec::new();
+    match at {
+        Some(at) => store.walk_child_exprs(at, |it| stack.push(it)),
+        None => match owner {
+            InferBodyId::DefWithBodyId(def) => {
+                stack.push(hir_def::expr_store::Body::of(db, def).root_expr())
+            }
+            InferBodyId::AnonConstId(konst) => stack.push(konst.loc(db).expr),
+        },
+    }
+    let mut out = Vec::new();
+    while let Some(expr) = stack.pop() {
+        match &store[expr] {
+            // The kinds MIR lowering makes a body of.
+            Expr::Closure {
+                closure_kind:
+                    ClosureKind::Closure
+                    | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. }
+                    | ClosureKind::CoroutineClosure(CoroutineKind::Async),
+                ..
+            } => match infer.expr_ty(expr).kind() {
+                TyKind::Closure(id, _) => out.push(Nested::Closure(id.0)),
+                TyKind::CoroutineClosure(id, _) => out.push(Nested::Closure(id.0.as_closure(db))),
+                TyKind::Coroutine(id, _) => out.push(Nested::Coroutine(id.0)),
+                _ => {}
+            },
+            Expr::Closure { .. } => {}
+            Expr::Const(_)
+                if let Some(konst) = hir_ty::mir::inline_const_at(db, owner, infer, expr) =>
+            {
+                out.push(Nested::Const(konst))
+            }
+            _ => store.walk_child_exprs(expr, |it| stack.push(it)),
         }
     }
     out
@@ -354,6 +469,8 @@ pub(crate) struct Ctx<'a, 'db> {
     /// A where clause of a call does not hold, rustc's E0277, which rust-analyzer does not
     /// report: rustc does not borrow check a body whose type check fails.
     pub(crate) tainted: std::cell::Cell<bool>,
+    copy: std::cell::RefCell<FxHashMap<Ty<'db>, bool>>,
+    glue: std::cell::RefCell<FxHashMap<Ty<'db>, hir_ty::drop::DropGlue>>,
 }
 
 fn guard_bindings(store: &ExpressionStore) -> FxHashMap<ExprId, Vec<BindingId>> {
@@ -449,6 +566,8 @@ impl<'a, 'db> Ctx<'a, 'db> {
             inline_const: false,
             guard_bindings: guard_bindings(store),
             tainted: std::cell::Cell::new(false),
+            copy: Default::default(),
+            glue: Default::default(),
         }
     }
 
@@ -498,8 +617,35 @@ impl<'a, 'db> Ctx<'a, 'db> {
     /// Whether a value of `ty` neither needs dropping nor has interior mutability, which a
     /// constant must to be promoted.
     pub(crate) fn is_plain(&self, ty: Ty<'db>) -> bool {
-        hir_ty::drop::has_drop_glue(&self.infcx, ty, self.env) == hir_ty::drop::DropGlue::None
+        self.drop_glue(ty) == hir_ty::drop::DropGlue::None
             && hir_ty::drop::is_freeze(&self.infcx, ty, self.env)
+    }
+
+    /// Whether dropping a value of `ty` runs code, as [`Self::is_copy`] asks once per type
+    /// modulo regions, which drop glue does not depend on.
+    pub(crate) fn drop_glue(&self, ty: Ty<'db>) -> hir_ty::drop::DropGlue {
+        use hir_ty::drop::DropGlue;
+        use rustc_type_ir::{TypeVisitableExt as _, inherent::Region as _};
+        let interner = self.infcx.interner;
+        let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        if let Some(&known) = self.glue.borrow().get(&ty) {
+            return known;
+        }
+        let known = if ty.has_non_region_infer() {
+            hir_ty::drop::has_drop_glue(&self.infcx, ty, self.env)
+        } else {
+            match *drop_glue_query(
+                self.db,
+                hir_ty::ParamEnvAndCrate { param_env: self.env, krate: self.krate }.store(),
+                ty.store(),
+            ) {
+                0 => DropGlue::None,
+                1 => DropGlue::DependOnParams,
+                _ => DropGlue::HasDropGlue,
+            }
+        };
+        self.glue.borrow_mut().insert(ty, known);
+        known
     }
 
     pub(crate) fn has_destructor(&self, adt: hir_def::AdtId) -> bool {
@@ -507,7 +653,24 @@ impl<'a, 'db> Ctx<'a, 'db> {
     }
 
     pub(crate) fn is_copy(&self, ty: Ty<'db>) -> bool {
-        self.infcx.type_is_copy_modulo_regions(self.env, ty)
+        // Modulo regions, so asked once per type whatever its free regions are: each local's
+        // type has region variables of its own.
+        use rustc_type_ir::inherent::Region as _;
+        let interner = self.infcx.interner;
+        let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        if let Some(&known) = self.copy.borrow().get(&ty) {
+            return known;
+        }
+        let known = match rustc_type_ir::TypeVisitableExt::has_non_region_infer(&ty) {
+            true => self.infcx.type_is_copy_modulo_regions(self.env, ty),
+            false => *is_copy_query(
+                self.db,
+                hir_ty::ParamEnvAndCrate { param_env: self.env, krate: self.krate }.store(),
+                ty.store(),
+            ),
+        };
+        self.copy.borrow_mut().insert(ty, known);
+        known
     }
 
     /// The place `operand` moves out of. Lowering says a value a closure captures by value is
@@ -536,6 +699,35 @@ impl<'a, 'db> Ctx<'a, 'db> {
     pub(crate) fn upvar_of_local(&self, local: LocalId) -> Option<usize> {
         self.upvars.iter().position(|it| it.local == local)
     }
+}
+
+/// Whether `ty`, its regions `'static`, is `Copy` in `env`: a query, as what it asks of the
+/// solver can be long (a future through every type it holds) and is the same in every body of
+/// the environment, and after an edit.
+#[salsa::tracked]
+fn is_copy_query(
+    db: &dyn HirDatabase,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    ty: hir_ty::next_solver::StoredTy,
+) -> bool {
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    infcx.type_is_copy_modulo_regions(env.param_env, ty.as_ref())
+}
+
+/// [`hir_ty::drop::has_drop_glue`] of `ty`, its regions `'static`, in `env`, as the order of
+/// its variants: a query as [`is_copy_query`] is.
+#[salsa::tracked]
+fn drop_glue_query(
+    db: &dyn HirDatabase,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    ty: hir_ty::next_solver::StoredTy,
+) -> u8 {
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    hir_ty::drop::has_drop_glue(&infcx, ty.as_ref(), env.param_env) as u8
 }
 
 /// `env` with the projections in its where clauses that name no parameter normalized, as

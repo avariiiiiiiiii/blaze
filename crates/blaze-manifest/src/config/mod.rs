@@ -20,6 +20,7 @@ pub mod error;
 pub mod get;
 pub mod key;
 pub mod path;
+pub mod print;
 pub mod schema;
 mod source;
 pub mod target;

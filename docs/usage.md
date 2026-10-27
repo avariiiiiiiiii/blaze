@@ -102,7 +102,9 @@ and comes with the next release. How it works, and how fast from a keystroke to 
 ## What works and what doesn't yet
 
 - **Platforms.** macOS on Apple silicon, Linux x86-64 and Linux ARM64 are measured in
-  [benchmarks.md](benchmarks.md). On Windows every build is cargo's. Intel Macs are not supported.
+  [benchmarks.md](benchmarks.md). Windows x86-64 (MSVC) builds and takes live edits through
+  blaze too, run by hand and not in CI ([platforms.md](platforms.md#windows-x86-64-msvc)).
+  Intel Macs are not supported.
 - **One Rust version, the latest nightly.** blaze builds with the dated nightly it pins
   (`nightly-2026-10-25`) whatever toolchain the project pins. Stable code and `#![feature(...)]`
   code both build; code that needs what that nightly lacks, such as a feature it removed, fails

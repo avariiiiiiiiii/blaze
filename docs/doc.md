@@ -80,11 +80,6 @@ dependencies, which rustc loads as the compiler's own), and apply as rustdoc's
 crate: a type it re-exports gets the impls of every crate it links, not only those its own
 crate sees (`hashbrown`'s `Equivalent` on `gix_diff::blob::Algorithm`, from `imara_diff`).
 
-rust-analyzer stores no macro expansion longer than 2,097,152 tokens, a guard for the editor;
-rustc has no such limit, and biome_wasm's one `#[wasm_bindgen] extern "C"` block of 2271 types
-expands past it. The command lifts the limit for its process before the load
-(`blaze_doc::before_load`, `hir_expand::set_token_limit`), which the one-shot load allows.
-
 ### The load is one-shot, in the command's process
 
 `cargo blaze doc` loads the workspace in its own process, as the daemon's checker loads it

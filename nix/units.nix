@@ -20,12 +20,24 @@ let
   rustcAbi = vendored "rustc_abi";
   system = pkgs.stdenv.hostPlatform.system;
   all = builtins.fromJSON (builtins.readFile json);
-  data = all // (all.systems.${system} or (throw "${json} has no unit graph for ${system}: add its triple to TARGETS in nix/unit_graph.py and rerun it"));
+  graph = all.systems.${system} or (throw "${json} has no unit graph for ${system}: add its triple to TARGETS in nix/unit_graph.py and rerun it");
+  # The file keys each unit by a name of its own, so that adding one moves no other (#353); below,
+  # a unit is its position in the sorted keys and names its dependencies by position.
+  keys = builtins.attrNames graph.units;
+  position = builtins.listToAttrs (lib.imap0 (i: k: lib.nameValuePair k i) keys);
+  data = all // {
+    units = map
+      (k: graph.units.${k} // { deps = map (d: { i = position.${d.unit}; inherit (d) name; }) graph.units.${k}.deps; })
+      keys;
+    roots = map (k: position.${k}) graph.roots;
+  };
 
-  stale = n: builtins.hashFile "sha256" (repo + "/${all.dir}/${n}") != all.inputs.${n};
+  # The file keeps the parsed Cargo.lock and Cargo.toml it was made from, not their hashes, so that
+  # two pull requests that change the lock in different places merge without a conflict here.
+  stale = n: copy: builtins.fromTOML (builtins.readFile (repo + "/${all.dir}/${n}")) != copy;
   checked =
-    if stale "Cargo.lock" || stale "Cargo.toml"
-    then throw "${json} is stale against Cargo.lock/Cargo.toml: run nix/unit_graph.py"
+    if !(all ? lock && all ? manifest) || stale "Cargo.lock" all.lock || stale "Cargo.toml" all.manifest
+    then throw "${json} is stale against ${all.dir}/Cargo.lock or Cargo.toml: run nix/unit_graph.py"
     else data;
 
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that

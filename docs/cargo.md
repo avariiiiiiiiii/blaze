@@ -22,7 +22,7 @@ engine, so the two have to be installed side by side, with `ra-jit-rustc` and
 [installer](../install.sh) and `cargo install` both do that:
 
     curl -fsSL https://ix.dev/blaze | sh
-    cargo +nightly-2026-10-25 install --locked cargo-blaze
+    cargo +nightly-2026-10-27 install --locked cargo-blaze
 
 From the release after 0.1.0, `--profile dist` builds the profile a release is built with, less
 the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0.1.0 has no such
@@ -40,7 +40,7 @@ same LLVM. `cargo build -p ra-jit --release` is the quicker build the harnesses 
 working on blaze; it is not what ships.
 
 `cargo blaze` builds with the one toolchain blaze compiles, the dated nightly in
-`harness/toolchain` (`nightly-2026-10-25`), whatever toolchain the project names (a
+`harness/toolchain` (`nightly-2026-10-27`), whatever toolchain the project names (a
 `rust-toolchain.toml`, `rustup override`, `+toolchain`, `RUSTUP_TOOLCHAIN` or rustup's
 default): it runs cargo, rustc and the daemon under that nightly by naming it in
 `RUSTUP_TOOLCHAIN` and `CARGO`. The nightly builds what older releases built, so a project on a
@@ -52,10 +52,10 @@ directory: cargo keys what it builds by the rustc, so neither rebuilds the other
 ([support.md](support.md#toolchain)).
 
 Where the nightly comes from, in this order: `RUSTC` naming a rustc whose `rustc -V` line is
-the pinned one's (`rustc 1.101.0-nightly (12433c307 2026-10-24)`: the whole line, since every
-nightly of a release says `1.101.0`) with its library's source; rustup's `nightly-2026-10-25`
+the pinned one's (`rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`: the whole line, since every
+nightly of a release says `1.101.0`) with its library's source; rustup's `nightly-2026-10-27`
 with `rust-src`, when rustup has it; else blaze's own copy in
-`~/.blaze/toolchains/nightly-2026-10-25-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
+`~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
 out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
 stderr while it does: rustc, cargo, the standard library and its source from the Rust project's
 own servers, 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
@@ -84,6 +84,10 @@ set, the `BLAZE_` one wins.
 
 `blaze <command>` is the same as `cargo blaze <command>`, for a machine where blaze brought
 its own Rust and there is no `cargo` on the path.
+
+A plain `cargo blaze check` checks libraries and binaries. Tests, examples and benchmarks
+are checked with their dev-dependencies when dev targets are selected (`--tests`,
+`--all-targets`, and the other dev-target flags).
 
 `build`, `run` and `test` take the flags cargo takes and leave the same files in the same
 places under `target/`. `check` is what the daemon says of the source as it builds the
@@ -122,9 +126,20 @@ build, which says which and why; nothing is handed to cargo or rustc:
 
 What blaze does not build yet fails the same way, saying what: the targets `--bins`,
 `--examples`, `--tests`, `--benches` and `--all-targets` pick, several `--target`s,
-`--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`. A build of
-libraries alone (`--lib`, or a workspace with no program) is the daemon's check of them:
-blaze writes no library for cargo, and says what it finds.
+`--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`, and a
+library whose crate types include `staticlib` when the build would write it (a plain `build`,
+or `--lib`): blaze does not link one yet, and says which
+([#262](https://github.com/indexable-inc/blaze/issues/262)). A library's `cdylib` (a native
+Node addon, a Python extension, a plugin) is a program of the build: a plain `build` or
+`--lib` links it as a shared library at cargo's path (`target/debug/lib<name>.so`, `.dylib`
+on macOS), exporting the functions and statics its crate
+names with `#[no_mangle]` or `#[export_name]` and nothing else, with the package's
+`cargo:rustc-link-arg` and `cargo:rustc-cdylib-link-arg`. Each build after an edit compiles
+what changed on what the worker loaded and links the library again; it is not spliced, so an
+exported function an edit adds is exported. A host that loaded the library (node, python)
+loads it again to see the edit. A build of other libraries alone (`--lib`, or a workspace with
+no program) is the daemon's check of them: blaze writes no `rlib` for cargo, and says what it
+finds.
 
 The build is the daemon's: its worker loads the workspace, builds and links the programs, and
 answers once they are linked. The next build asks the same worker, which compiles the
@@ -160,8 +175,10 @@ in a sandbox.
 "Everything should by default be in sandbox and yea it should have sandbox support macos"
 (Andrew, 2026-10-26). Every test executable `cargo ra-jit test` runs, under `all` and
 `affected` alike, runs in a sandbox of its own, with libtest's threads inside it as cargo would
-run them. In it the machine's files are read-only; the workspace and the target directory are
-as they are, but what a test writes there is kept to the run and gone when it ends; `/tmp`,
+run them. In it the machine's files are read-only; the workspace, the target directory and
+cargo's home (`CARGO_HOME`, `~/.cargo`) are as they are, but what a test writes there is kept
+to the run and gone when it ends (every cargo takes its locks in its home and records there
+what it used, so a test that runs cargo, as trybuild's do, writes it); `/tmp`,
 `/var/tmp` and `/dev/shm` (on macOS the temporary directory) start empty; there is no network
 but the sandbox's own loopback, and no Unix socket but those the run makes itself; and the
 environment is fixed. A write outside gets the error a read-only file system gives, and a
@@ -171,10 +188,29 @@ controlling terminal, so it can't push input into the terminal it was started fr
 process.
 
 The sandbox records what each test reached, by name: the harness tells it, before and after
-each test, which test the thread is running. Of a test executable that fails, the note under
-it names each failed test the sandbox refused something, and how to run it outside:
+each test, which test the thread is running.
 
-    note: tests::writes_home failed in the sandbox, which refused it writing `/home/me/.cache/x` (the machine is read-only in a sandbox); if it needs that, run it outside: `unsandboxed-tests = ["tests::writes_home"]` under `[package.metadata.blaze.sandbox]` in /home/me/tsel/Cargo.toml (`tests = false` for every test of the package), or `RA_JIT_SANDBOX=off` for every test of the command
+Tests are hermetic: "tests should be just like builds" (Andrew, 2026-10-27), their end a
+function of their code and what they read, so that a pass can be kept and stand for a run
+([below](#running-only-the-tests-that-have-not-passed)). So what would make a test's end
+depend on something else is denied, and a test the sandbox denied something fails, whatever
+it ended with, with what was denied and the way out:
+
+    error: tests::writes_home fails: the sandbox denied it writing `/home/me/.cache/x` (the machine is read-only in a sandbox); tests are hermetic, so if it needs that, take it out of the sandbox, where it runs every time and is never cached: `unsandboxed-tests = ["tests::writes_home"]` under `[package.metadata.blaze.sandbox]` in /home/me/tsel/Cargo.toml (`tests = false` for every test of the package), or `RA_JIT_SANDBOX=off` for every test of the command
+
+| a test | in the sandbox |
+|---|---|
+| writes the workspace or the target directory | allowed, kept to its run (an overlay) |
+| writes `/tmp`, `/var/tmp`, `/dev/shm` | allowed, empty at its start |
+| writes anywhere else | denied (`EROFS`), and the test fails |
+| reads a file, lists a directory, looks a path up | allowed, and recorded: part of its key |
+| connects to, binds or sends to loopback | allowed: a network namespace of its own |
+| connects to any other address, or a Unix socket of the machine's | denied (`ENETUNREACH`, `EACCES`), and the test fails; so no name is resolved: a DNS server outside is denied, and one on the machine's loopback is not in the sandbox's |
+| starts a program | allowed on Linux: what the program reads, its executable and libraries too, is recorded with the test's reads, so it is a recorded input; on macOS a program macOS protects (`/bin/sh`) is started without the interposer, what it reads is not known, and the test is never kept |
+| reads the clock, draws randomness, starts threads | allowed: a test whose end they decide passes and fails under one key, and is marked flaky and never kept |
+
+What a thread no test marked or a process a test started was denied fails every test of the
+run, since which test it was for is not known.
 
 A package takes its tests out of the sandbox in its manifest:
 
@@ -187,7 +223,9 @@ unsandboxed-tests = ["tests::writes_home"]    # or these, by libtest's names
 Any other key there is an error. The tests named run in a second run of the executable,
 outside, after the sandboxed one (libtest's `--exact` and `--skip` split them); `-v` says
 which and why. `RA_JIT_SANDBOX=off` runs every test of the command outside, as cargo does
-(`BLAZE_SANDBOX`, when set, wins over it, for tests, build scripts and proc macros alike).
+(`BLAZE_SANDBOX`, when set, wins over it, for tests, build scripts and proc macros alike). A
+test outside the sandbox is not hermetic: it runs every time and its pass is never kept, and
+the summary of the command names it.
 
 Where no sandbox can be made, `cargo ra-jit test` stops before any test runs, says why and how
 to fix it, and exits 101. It does not go on outside with a warning: a run that did would break,
@@ -290,8 +328,15 @@ in the same sandbox, below.
 Every build script blaze's cargo runs, the workspace's and its dependencies', whoever compiled
 it (ra-jit or rustc), and the daemon's own reruns of one, runs in the sandbox tests run in
 ([#147](https://github.com/indexable-inc/blaze/issues/147)): `cargo/script_sandbox.rs` is the
-one place a script is run. A script's environment is the whole of what cargo gave it (`PATH`,
-`CC`, `TARGET`, the jobserver's descriptors and the rest); the machine is read-only; it writes
+one place a script is run. A script is given, of what cargo gave it, what cargo sets for
+scripts (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, `PROFILE`, ...), the C compiler's and
+pkg-config's variables (`CC`, `CFLAGS_<target>`, `PKG_CONFIG_PATH`, `NIX_CFLAGS_COMPILE`,
+`CPATH`, `SOURCE_DATE_EPOCH`, ...), `PATH`, `HOME`, `LANG` and the rest tests are given, and
+what the root manifest's `build-script-env` names, and what it says it reads
+(`cargo:rerun-if-env-changed=OPENSSL_DIR`) as cargo has it; what else the shell had is not
+there. A run that said it reads a variable it was not given saw it unset, so the script runs
+again given it, and the store keeps that run under the variable's value. The machine is
+read-only; it writes
 its `OUT_DIR` for real, which is the one directory the Cargo book lets a script write ("Scripts
 should not modify any files outside of that directory"); the temporary directories start empty;
 there is no network but the sandbox's own loopback. Its package's directory, the workspace and
@@ -305,6 +350,17 @@ A script that fails having been refused a write or a connection says so under it
 
     note: the build script of `sys-crate` failed in the sandbox, which refused it writing `/home/me/ws/sys-crate/src/bindings.rs` (the machine is read-only in a sandbox); if it needs that, run it outside: `unsandboxed-build-scripts = ["sys-crate"]` under `[workspace.metadata.blaze.sandbox]` in /home/me/ws/Cargo.toml (or `build-script = false` under `[package.metadata.blaze.sandbox]` in its own manifest, for a package of the workspace), or `RA_JIT_SANDBOX=off` for every build script and test of the command
 
+A script that downloads a prebuilt library (`v8`, `ort-sys`, `webrtc-sys`) is given it
+instead, pinned as Nix pins a fixed-output derivation. `blaze lock --fetches` (`--target
+<triple>` for each target, the host's by default) works out each download of the workspace's
+resolve, keeps its bytes in blaze's store by their sha256 and writes them into
+`Cargo.fetches.lock` beside `Cargo.lock`, by the package's name, version and `Cargo.lock`
+checksum (commit it). A build writes the store's copy below the target directory and sets the
+crate's own variable for a local copy to it; a missing or stale entry fails the build, naming
+the command, and nothing is downloaded. The crates blaze knows and their variables are
+`OVERRIDES` in `crates/ra-jit/src/cargo/fetches.rs`; a script refused the network that it does
+not know is told which variable an entry there would set.
+
 The ways out, in the workspace's root manifest, which is the only one a dependency from a
 registry can be named in:
 
@@ -312,7 +368,21 @@ registry can be named in:
 [workspace.metadata.blaze.sandbox]
 unsandboxed-build-scripts = ["hegeltest", "flecs_ecs_sys"]   # by package name
 unsandboxed-proc-macros = ["sqlx-macros"]                    # by package name
+build-script-env = ["OPENSSL_DIR", "LIBGIT2_NO_VENDOR"]       # given to every build script
+build-script-link-dirs = ["/opt/vendor/lib"]                 # rustc-link-search may name
 ```
+
+What a sandboxed script prints is checked before cargo reads it (`cargo/directives.rs`), since
+it goes into every rustc and linker run of its package and of what links it. A
+`rustc-link-search` (or `rustc-flags`' `-L`) names a directory in its `OUT_DIR`, its package,
+the target directory's build directory (its dependencies' `OUT_DIR`s), a system directory
+(`/usr/lib`, `/lib64`, `/usr/local/lib`, the Nix store, Homebrew's, Apple's SDKs) or one of
+`build-script-link-dirs`; a `rustc-link-arg` is one of a short list (`-pthread`, `-rdynamic`,
+`-Wl,--as-needed`, `-Wl,-z,now`, `-Wl,-soname,NAME`, `-lNAME`, ...) or an rpath to `$ORIGIN`
+or a directory a search may name; a `rustc-env` sets no variable cargo or rustc gives the crate
+itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `CARGO_CFG_*`, `OUT_DIR`, `RUSTC*`, ...). Anything
+else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
+rules refuse none (`bench/results/2026-10-27-bscache/directives.md`).
 
 and, for a package of the workspace, in its own manifest:
 
@@ -329,15 +399,71 @@ run does, and a proc-macro server does not start and the load says why: nothing 
 outside instead, nor goes to cargo or rustc. Windows has no sandbox yet, so there a build with
 build scripts or proc macros needs `RA_JIT_SANDBOX=off`.
 
-What a script read is recorded, and decides one thing only. Cargo runs a script again when a
-file of its `rerun-if-changed` changed, when a variable of `rerun-if-env-changed` did, and,
-when it named neither, when any file of its package did. In that last case a run whose record
-is whole (macOS records nothing of a program it protects, such as `/bin/sh` or `/usr/bin/cc`,
-and the record then says it is not whole) and whose every read path is as it was stands for a
-run now: the store keeps it with what it read, and cargo's rerun is answered from the store
-without running it; the daemon's check of the script (`ra-jit-reads` beside its `OUT_DIR`)
-needs no run either. A script that named what it reads runs again exactly when cargo says, and
-one whose record is not whole whenever cargo would run it.
+In a container the sandbox's user namespace may be refused: Docker's default seccomp profile
+refuses `unshare(CLONE_NEWUSER)` to a process without `CAP_SYS_ADMIN`, so in a plain `docker
+run` every build script and proc macro fails with
+`a user namespace (unshare): Operation not permitted`
+([#420](https://github.com/indexable-inc/blaze/issues/420)). Where the process can tell it is
+in a container (`/.dockerenv`, `/run/.containerenv`, the `container` variable, or
+`/proc/1/cgroup` naming docker, kubepods, containerd, libpod or lxc), the error says so and
+names the ways on: run the container with `--security-opt seccomp=unconfined` (or a seccomp
+profile that allows user namespaces; on Kubernetes `securityContext.seccompProfile.type:
+Unconfined`), which keeps the sandbox, or set `BLAZE_SANDBOX=off`, which runs build scripts,
+proc macros and tests outside it, as cargo does. blaze does not make a weaker sandbox there on
+its own.
+
+A sandbox can be given a view (`sandbox::View`, the spec's `view`) in place of the machine,
+which is what a build script is to see under the Nix model (Andrew, 2026-10-27): its declared
+closure and nothing else. On Linux the view is a root of the sandbox's own, a tmpfs that
+becomes `/` (`pivot_root`) with the machine's tree detached from it, holding what the view
+binds, each where it says (the package's source and the toolchain read-only, a store path
+unpacked in blaze's cache at its `/nix/store/<hash>-<name>` so that nixpkgs' interpreters,
+RPATHs and scripts resolve, `OUT_DIR` written for real), and besides them only a `/proc` of
+the sandbox's processes, a `/dev` of `null`, `zero`, `full`, `random`, `urandom` and `tty`
+with an empty `shm`, an empty `/tmp`, and an `/etc` of `passwd` and `group` (one line for the
+user, one for `nobody`) and `hosts` (`localhost`), as Nix's sandbox has. `/usr`, `$HOME`, the
+machine's `/etc` and every store path not bound are not there, for the script and every
+program it runs, so a read of something undeclared fails with `ENOENT`; the root and what is
+bound read-only refuse writes, and the network is the loopback alone, as in every sandbox.
+A view whose bind is not there fails before anything runs, naming it. It is made by an
+unprivileged user namespace alone, and costs a mount per bind, about 20 µs each: `true` takes
+6.1 ms in a view of 40 binds and 10.7 ms in one of 300, against 4.9 ms in the sandbox without
+a view and 0.33 ms bare (median of 50, an arm64 ix VM of 16 cores, 2026-10-27). On macOS
+a view is not made (decided): the spec's other fields apply and the binds are not read.
+
+Compiling a build script, running it and building a proc macro are each an entry of the
+store, so they travel with `ra-jit cache push` and `pull` and through the gateway like any
+compiled function ([remote-cache.md](remote-cache.md)). Each is kept under two keys
+(`cargo/keyed.rs`): the first of what it is declared to be made of, and a second of what it
+was seen reading and what each of those has, so `rerun-if-*` is a hint and the record is what
+counts. A first key holds up to 16 sets of reads.
+
+- A build ra-jit makes of a script or a proc macro (`own_script.rs`) is first keyed by the
+  rust-project description of it and its dependencies (sources' crates, cfgs, features,
+  edition, target) and the toolchain (its channel manifest and the names in its `lib`); then
+  by every file the build read (modules, `include!`, `include_str!`), each variable `env!`
+  read, its dependencies' proc-macro libraries and the files their dep-info names. Beside the
+  executable, `<exe>.made-of` says which build it is.
+- A run (`script.rs`) is first keyed by that build (or the executable's bytes, for one rustc
+  linked), the toolchain of its `RUSTC`, its arguments and what it was given, with the
+  checkout's and the target directory's paths taken out, so another checkout or machine finds
+  it; then by every file the sandbox saw it read and every file of its `rerun-if-changed`,
+  but those of the toolchain, ra-jit and its own build. A directory outside its package
+  counts as being one, not by its names (git and the loader walk through those). What is
+  kept is what it printed and what it left in `OUT_DIR`.
+
+A run whose record is not whole (macOS records nothing of a program it protects, such as
+`/bin/sh` or `/usr/bin/cc`) is not kept, and runs whenever cargo would run it. A run outside
+the sandbox (`unsandboxed-build-scripts`, `RA_JIT_SANDBOX=off`) is never kept, so it is never
+pushed either. The daemon's check of a script (`ra-jit-reads` beside its `OUT_DIR`) needs no
+run when what it read is as it was.
+
+`RA_JIT_BSCACHE=check` builds and runs everything the store has anyway and compares: a run
+that printed or wrote something else, or a build that read files the store's build of it did
+not, fails the build. Two builds of one script by ra-jit are not the same bytes (the order of
+functions in the executable is not), so a build is compared by what it read, not by bytes.
+With `RA_JIT_STATS` each hit says so (`ra-jit: a run the store kept`, `ra-jit: a build the
+store kept: ...`), where cargo shows what a script printed.
 
 Every proc-macro server a load starts, the toolchain's and ra-jit's own, runs in the sandbox
 too, writing nothing: no `OUT_DIR`, only the empty temporary directories. A server is started
@@ -368,57 +494,205 @@ sees the directories of the libraries of the loads before it started, so a works
 `/tmp` loaded later by the same daemon is not seen by it on Linux; doctests and the
 `blaze-build-script` crate's own runner (`harness/scripts.py` only) are not sandboxed.
 
-### Running only the tests an edit reached
+### Build scripts under WASI (an experiment, off by default)
+
+A build script can instead be compiled for `wasm32-wasip1` and run under Wasmtime. Nothing
+of the host is reachable but what is handed to it, and the module is not built for the host
+it runs on. It is off unless asked for, and asking needs a ra-jit built with the feature `wasi`
+(`cargo build --release -p ra-jit --features wasi`), which adds Wasmtime to it:
+
+- `RA_JIT_BUILD_SCRIPTS=wasi` runs every build script so, or
+- in the workspace's root manifest, `wasi-build-scripts = ["pkg", ...]` (`["*"]` for all)
+  under `[workspace.metadata.blaze.sandbox]` runs those packages' scripts so.
+
+When the wrapper is asked for a build script it also builds it for `wasm32-wasip1`, from the
+same description, beside where rustc links it (`build_script_build.wasm`). The standard
+library of that build is the toolchain's with one file of blaze's in place of
+`std/src/sys/process/unsupported.rs` (`crates/blaze-wasi/std/process.rs`, `ra-jit
+--run-tool`), so `std::process::Command` works. A command runs on the host when its output
+is first needed: `wait`, `output`, a read of its stdout. ra-jit refuses that std when the
+toolchain's file is not the one it was written against. Without `--run-tool` a wasip1 build
+keeps rustc's behaviour: `Command` is unsupported.
+
+When cargo runs the script, the module runs in its place:
+
+| | under WASI |
+|---|---|
+| files | the package's directory, read-only, at its path and at `.`; `OUT_DIR`, writable, at its path; nothing else. `std::env::current_dir()` is `/` (wasi-libc's), not the package's directory, though relative paths are found in it |
+| environment | the variables cargo documents for build scripts (`CARGO_*` of the package, features and cfgs, `OUT_DIR`, `TARGET`, `HOST`, `DEP_*`, `RUSTC`, ...) and no other |
+| commands | the toolchain's `rustc` (the `RUSTC` it is given, which is ra-jit's: [above](#build-scripts-and-proc-macros-run-in-a-sandbox)), C and C++ compilers (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, `cpp`, with a target's prefix or a version), their archivers (`ar`, `ranlib`, `llvm-ar`, `llvm-ranlib`) and `pkg-config`: each runs in the sandbox the script would have run in, with the environment the script gave it over the sandbox's for C toolchains (`PATH`, `CC`, Nix's wrappers). Anything else is refused, naming the program: the script sees `PermissionDenied` |
+| record | every command, with the program that ran, its arguments, how it ended or why it was refused, in `ra-jit-wasi-tools.jsonl` beside `OUT_DIR` |
+
+What it printed is checked as a native run's is. A run is kept in the store under the Nix
+model's key: the module's bytes, the package's files, the environment and arguments with
+the checkout's and target directory's places unplaced, the toolchain, and each command it
+may run as `PATH` finds it. There are no read sets. A module ra-jit can't build, or a run
+that fails, is an error: the native script does not run instead.
+
+`RA_JIT_BUILD_SCRIPTS=wasi-compare` is for measuring it. The module runs first and what it
+printed and wrote is set aside in `ra-jit-wasi/` beside `OUT_DIR`, then the native script
+runs for cargo. `harness/bswasi.py` compares the two over the bench corpus;
+[the report](reports/BSWASI.md) has which scripts run unchanged and why the others don't.
+
+### Proc macros run as WebAssembly
+
+By default every proc macro of a load is built by blaze, from its source, as a WebAssembly
+module (`wasm32-wasip1`, a WASI reactor), and blaze expands with it in its own process under
+Wasmtime and Cranelift (`crates/ra-jit-macro-wasm`): no rustc-built code runs, and no
+proc-macro server is started for it. In ra-jit's own target directory the module is built
+from cargo's unit graph, with the build scripts (`cargo/compile_time.rs`). Elsewhere it is
+built from the load's own description of the macro's crate and what it depends on
+(`load_cargo::described`), whoever compiled the macro's library. Either build is kept in the
+store like a build script's. The macro's `proc_macro` crate is a shim
+(`crates/ra-jit-macro-wasm/guest/proc_macro.rs`) whose handles go to the host by imports, so
+`syn`, `quote` and `proc-macro2` build unchanged. A module is linked with the wasi-libc of
+the toolchain's `wasm32-wasip1` target. When the toolchain does not have that target, blaze
+runs `rustup target add wasm32-wasip1` for it, once.
+
+A module sees only what cargo documents for a proc macro:
+
+- Its package's directory, read-only, at `/blaze/package`: `CARGO_MANIFEST_DIR` names it, and
+  `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), ..))` or a `std::fs` read below it
+  works. Nothing else of the machine is there. A write fails with `EROFS`, a path out of the
+  package with `ENOTCAPABLE`.
+- The variables cargo sets for a crate (`CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`,
+  `CARGO_PKG_*`, `CARGO_CRATE_NAME`, `CARGO_PRIMARY_PACKAGE`, `CARGO_BIN_NAME`, `OUT_DIR`), never
+  the environment of the shell or the daemon.
+- A clock that reads 0 and random bytes that are the same on every run.
+
+Each expansion is kept in the store. Its first key is what the module was built of (two
+builds of one source are not the same bytes), the macro, its input and the variables. Its
+second key adds the file reads the host recorded: each path, relative to the package, and
+what that file held. A later expansion is found only while each of those reads holds the
+same as before; the format is `cargo/keyed.rs`'s. The expansion's own keys hold no absolute
+path and no host triple. But what a module was built of names the checkout's paths, so for
+now only the same checkout finds it. An expansion that asked the compiler about a span (its
+source text, file, line or a join) is not kept. A module's machine code is kept too, for
+the machine that compiled it: a new process loads it in about 3 ms rather than compiling it
+again (4 to 11 s for the corpus's macros). The list of a module's macros is kept in a
+`.macros` file beside it, so a load compiles nothing; a module is compiled, or loaded from
+the store, when one of its macros first expands.
+
+A proc macro that can't be built or loaded as a module fails the load, naming it:
+
+    error: the proc macro `my_derive` cannot run as WebAssembly: ...
+      name its package in `native-proc-macros` under [workspace.metadata.blaze] in /home/me/ws/Cargo.toml to expand it natively, or set RA_JIT_PROC_MACRO_WASM=0 for every proc macro
+
+It is never expanded natively instead. The ways out, in the workspace's root manifest:
+
+```toml
+[workspace.metadata.blaze]
+native-proc-macros = ["sqlx-macros"]   # by package name
+```
+
+A package listed there, and every proc macro under `RA_JIT_PROC_MACRO_WASM=0`, is expanded
+as before: rustc's library, by the toolchain's proc-macro server in the sandbox
+([above](#build-scripts-and-proc-macros-run-in-a-sandbox)). A value that is not a list of
+names is an error.
+
+### Running only the tests that have not passed
 
 With `RA_JIT_TESTS=affected`, `cargo ra-jit test` runs, of each test executable the daemon
-built, the tests an edit could have changed the end of since they last passed:
+built, the tests that have not passed with what they are a function of as it is now. A pass is
+kept in blaze's store, as a compiled function is, so it travels with the store through a remote
+(`ra-jit cache push|pull`, `RA_JIT_REMOTE`): a pass on main's CI stands on every branch whose
+test and inputs are the same.
 
     Running unittests src/lib.rs (target/debug/deps/tsel-1f2e): 2 of 5 tests
-    Skipping tests/it.rs (target/debug/deps/it-9a8b): 2 tests, unchanged since the last pass
-    Skipped 5 tests, unchanged since the last pass; 1 test run every time (`-v` says why); `RA_JIT_TESTS=all` runs every test
+    Cached tests/it.rs (target/debug/deps/it-9a8b): 2 tests, passed before as they are now
+    Cached 5 tests from commit 2bfa62d8ce (run 18834512), 2 from an earlier run on this machine; 1 test run every time (`-v` says why); `RA_JIT_TESTS=all` runs every test
 
 At each build the daemon hashes every test's code with the code of every function it calls,
 directly or through others, in any crate of the workspace or its dependencies, and its
 attributes (`#[ignore]`, `#[should_panic]`). The standard library is named by the toolchain.
-A test runs again when that hash is not the one it last passed with, when it has not passed
-since it was added or failed, and every time when it reaches what its code does not decide:
-a file, the environment, another process, the network, or a function ra-jit can't compile.
-Of a test executable that fails, the tests libtest's summary lists as failed run again, and
-the others that ran are remembered as passed; one that ends with no summary (a crash, or a
-test that exits the process) has every test it ran run again. Its output is passed on through
-a pipe as it comes, colored as libtest would color it on the terminal.
-An integration test also runs again when a program of its package that cargo hands it as
-`CARGO_BIN_EXE_<name>` was built again. `cargo ra-jit test -v` says, under each test
-executable, why each test it runs every time does, by the fewest calls from the test to it:
+A function of a crate outside the workspace, instantiated with types of such crates, is hashed
+by its stable name, which stands for its code and all it calls as it does for the compiled
+functions the store keeps; what the hash needs of what is below it (whether that reaches code
+ra-jit can't compile, or the world outside) is kept in the store under the name, so a daemon
+that starts with the store compiles none of the dependencies to hash the tests.
+A test's pass is kept under a key of that hash and of what else it is a function of:
 
-    Always tests::reads_a_file: it reaches `statx`, which reads or writes files, by tsel::tests::reads_a_file -> std::fs::read_to_string::<…> -> std::fs::read_to_string::inner -> <std::fs::File>::metadata -> … -> statx
+- the ra-jit that ran it (every key of the store has it);
+- the content of each program cargo hands an integration test as `CARGO_BIN_EXE_<name>`;
+- the environment the sandbox gives it (below);
+- what the command builds it with: features, `--profile`, `--target`, `--config` and `-Z`
+  flags, and the machine's architecture and system;
+- the harness's flags that change how it runs (`--nocapture`, `--test-threads`; not `-q`,
+  `--color` or `--show-output`, which change only what is shown);
+- for a test that reaches what its code does not decide (a file, the environment, another
+  process, the network), what it read: every path the sandbox saw it open, look up, list or
+  run, and what is there now (a file's bytes, whether it can be run, a link's text, a
+  directory's names, or that nothing is). Of a path it only looked at (`stat`, `access`,
+  `chdir`, `readlink`) the key has what that could tell: what is there, whether it can be run,
+  a link's text and a file's size. A test run looks at `target/debug`, whose names change
+  as the daemon writes there after a build; keyed by them, a pass missed once after each fresh
+  target. What a stat says of times (`mtime`) is not in the key: a test
+  that decides by a file's time is as one that decides by the clock.
 
-Under `affected` a test that reaches outside its code is not run every time: the sandbox
-records every path it opens, looks at, lists or runs, with the environment it was given (the
-variables cargo sets for a test, `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`,
-`LC_*`, `TZ`, `CARGO`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `LD_LIBRARY_PATH`,
-`NIX_LD`, `NIX_LD_LIBRARY_PATH`, `RUST_BACKTRACE`, `RUST_LIB_BACKTRACE`, `RUST_MIN_STACK`, and
-those `RA_JIT_TEST_ENV` names, by commas; under `all` a test gets the whole environment). Once
-it passes, what was at each path (a file's contents, a directory's names, nothing) is kept
-beside its program, and the test runs again when its code, its environment or one of those
-changed; otherwise it is skipped like any other. `-v` says why one runs:
+That last part is found in two steps, as a build cache finds what a step read: the store keeps,
+under the rest of the key, the paths a run that passed read (up to four sets, for a test that
+reads other paths as what it reads differs), and the pass under those paths with what was at
+each. A test is skipped when one of the sets, with what is at its paths now, has a pass. Only a
+pass is kept; a test that failed runs until it passes, and once it does, a return to code that
+passed before is skipped again, as a build is. `-v` says why each test that reaches outside its
+code runs:
 
     Sandboxed tests::reads_a_file: it read `/home/me/tsel/data.txt`, which changed
 
-A test whose reads are not all known (a program macOS starts without the interposer), one its
-package takes out of the sandbox, and every one under `RA_JIT_SANDBOX=off` runs every time.
-The time a test reads, the randomness it draws and the threads it starts are its own still.
+A test the sandbox can't make hermetic runs every time and is never kept: one that reaches a
+function ra-jit can't compile, a benchmark, one its package takes out of the sandbox, every one
+under `RA_JIT_SANDBOX=off`, and one whose reads are not all known (a program macOS starts
+without the interposer). The summary says how many there are and names those outside the
+sandbox. `cargo ra-jit test -v` says, under each test executable, why each test it runs every
+time does (`Always`), by the fewest calls from the test to it.
+
+Of a test executable that fails, the tests libtest's summary lists as failed, and those the
+sandbox denied something, are not kept; the others that ran are. One that ends with no summary
+(a crash, or a test that exits the process), or whose summary counts other tests than it was
+asked to run, has nothing kept. Its output is passed on through a pipe as it comes, colored as
+libtest would color it on the terminal.
+
+The environment of a sandboxed test under `affected` is cut down to the variables cargo sets for
+a test, `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `CARGO`,
+`CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `LD_LIBRARY_PATH`, `NIX_LD`,
+`NIX_LD_LIBRARY_PATH`, `RUST_BACKTRACE`, `RUST_LIB_BACKTRACE`, `RUST_MIN_STACK`, and those
+`RA_JIT_TEST_ENV` names, by commas (under `all` a test gets the whole environment). Paths are
+kept as they are, so a pass stands where the checkout, the target directory and the home are
+at the same paths: every run of a CI job is, and two checkouts of one machine are not.
+
+What is not in a key, and so is caught only as a flake: the time, randomness (a `HashMap`'s
+seed too) and threads; the kernel's views (`/proc`, `/sys`, which say what the machine and the
+process are, as the number of cores does); a file's times and owner. A test that passed and
+failed under one key is flaky: the store marks it, it runs every time after, and the command
+warns with where it passed. `RA_JIT_TESTS=verify` picks the tests as `affected` does, runs them
+all, and says whether each kept as passed passed again:
+
+    Verified the passes kept: 245 of 245 tests passed again
+
+One that failed is flaky or its key misses something it is a function of, which is a bug in
+blaze; it is named, marked flaky, and the command fails. It is for the release train, which
+does not run it yet.
+
+On a CI runner's shape (a fresh target directory and daemon, with the store main's run filled),
+every test that passed on main is skipped. After a one-function edit, only the tests that reach
+the function run: just ran 344 of its 515 passing tests and took 171 from main, nushell 42 of 67,
+cargo none of 8, and `verify` found every pass kept to pass again on seven projects. On these
+projects it is not yet faster than running every test, whose tests are short: the walk for the
+tests' hashes on a fresh daemon takes 0.94 s for axum and 0.45 s for just, down from 6.2 s and
+7.6 s before dependencies were hashed by name, and the run takes 13.5 s against 11.9 s for every
+test (axum) and 32.3 s against 28.8 s (just;
+[the numbers](../bench/results/2026-10-27-testcache/README.md)).
 
 `-v`, `-q` and `--color` only change what cargo prints, and are the same build to the daemon.
 
 A test executable cargo built, a command that names tests or passes the harness other flags
 than `-q`, `--nocapture`, `--show-output`, `--test-threads` and `--color`, and one that runs
-the ignored tests run as asked: every test. Time, randomness (a `HashMap`'s seed too) and
-threads are not counted as outside the code, so a test that depends on them by chance is as
-flaky as it was; nor is a backtrace, whose capture reads `RUST_BACKTRACE` and whose text the
-working directory, for what a failure prints. Unset, or `all`, runs every test, as cargo does;
-the daemon then hashes nothing. What is left (a hash that never compiles on a warm store, a
-watch mode) is [#227](https://github.com/indexable-inc/ra-jit/issues/227).
+the ignored tests run as asked: every test, and nothing is kept. Unset, or `all`, runs every
+test, as cargo does; the daemon then hashes nothing. With no store (`RA_JIT_CACHE=off`)
+`affected` keeps nothing and runs every test. `RA_JIT_TESTS_FROM` names where the passes a
+command keeps came from, for its summary; on GitHub Actions it is the commit and run
+(`GITHUB_SHA`, `GITHUB_RUN_ID`). What is left is
+[#227](https://github.com/indexable-inc/blaze/issues/227).
 
 While cargo builds, a spare worker already loads the workspace, resolves it and compiles the
 functions of each crate cargo is done with on a quarter of the cores, and reads the symbols of
@@ -604,11 +878,17 @@ build a command line is, so changing one starts from a cargo build again.
 | `RA_JIT_EMIT` | LLVM instruction selection: `optimized` or `fast` | `optimized`; `fast` at level 0 |
 | `RA_JIT_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `RA_JIT_SPLICE` | `0` links in full after every edit instead of splicing | splice |
+| `RA_JIT_PROC_MACRO_WASM` | `0` expands proc macros natively, with rustc's libraries, rather than as WebAssembly ([above](#proc-macros-run-as-webassembly)) | WebAssembly |
 | `RA_JIT_OTHER_TOOLCHAIN` | `1` builds with the project's toolchain when it is not the pinned nightly, rather than with the pinned nightly, for a project pinned to a nightly near it; nothing checks that it agrees ([support.md](support.md#toolchain)) | not set |
 
+`RA_JIT_BUILD_SCRIPTS` (`wasi`, `wasi-compare`, `native`) is read by the wrapper and by each
+run of a build script ([above](#build-scripts-under-wasi-an-experiment-off-by-default)).
+
 `RA_JIT_TESTS` is read by each `cargo ra-jit test` alone and is not part of which build it
-is: `affected` runs the tests an edit reached
-([above](#running-only-the-tests-an-edit-reached)), `all` every test. The default is `all`.
+is: `affected` runs the tests that have not passed as they are now, by the passes the store
+keeps ([above](#running-only-the-tests-that-have-not-passed)), `verify` runs those too and
+checks that they pass again, `all` every test. The default is `all`. `RA_JIT_TESTS_FROM` names
+where the passes a command keeps came from, for the summary of a command that finds them.
 `RA_JIT_SANDBOX=off` runs every test outside the sandbox
 ([above](#every-test-runs-in-a-sandbox)), and `RA_JIT_TEST_ENV` names more variables a test
 is given under `affected`, by commas; both are read the same way.
@@ -647,9 +927,10 @@ before changing it.
   what such a build would, when the daemon has it loaded, and what it finds in the whole
   workspace otherwise.
 - Linux x86-64 and macOS arm64 have been run; on macOS only ripgrep, fd and hyperfine and
-  the generated workspace of the harness. The code compiles for Windows, but every build
-  there would go to cargo (the link step knows ELF and Mach-O), and the command has not
-  been built or run there. The socket's permission and peer checks do nothing on Windows.
+  the generated workspace of the harness. On Windows x86-64 (MSVC) builds go through the
+  daemon and link with `rust-lld`; that was run by hand on a toy crate and `demo/life`, and
+  this harness has not run there ([platforms.md](platforms.md#windows-x86-64-msvc)). The
+  socket's permission and peer checks do nothing on Windows.
 - On Linux `cargo ra-jit` was measured with the Cranelift backend only; LLVM has been run
   through the harness gate, not through `harness/cargo_ra_jit.py`. On macOS the harness was
   run under both.
@@ -740,8 +1021,7 @@ match cargo on every step. `harness/cargo_ra_jit.py` runs all of this.
 
 Not checked: a proc macro defined in the workspace, `--target` for another triple,
 `cargo install` from the registry, a real rust-analyzer session next to it, real sccache (a
-stand-in wrapper was used). On Windows every build is cargo's in this mode and nothing was
-run. macOS arm64 is below.
+stand-in wrapper was used). None of it was run on Windows. macOS arm64 is below.
 
 ### Known problems
 

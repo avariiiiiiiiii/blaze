@@ -11,6 +11,7 @@ it does not cover. The full account, with every finding, is in
     cd harness
     export RA_JIT_BIN=$PWD/../target/release/ra-jit
     python3 fuzz/fuzz.py smoke                                  # 2 programs, fixed seed; in CI
+    python3 fuzz/store.py                                       # asm changes, cold and warm store; in CI
     python3 fuzz/fuzz.py run --seed S --rounds N --jobs 8 --out DIR
     python3 fuzz/fuzz.py repro S-ROUND [CASE ...]               # one program again, or some of its cases
     python3 fuzz/fuzz.py check fuzz/found/*.rs                  # every stored reduction against this ra-jit
@@ -19,6 +20,14 @@ it does not cover. The full account, with every finding, is in
 By default each program is built under both backends, so `RA_JIT_BIN` should be a build with
 `--features llvm`; `--backends cranelift` runs one. LLVM is run with
 `RA_JIT_OPT=2 RA_JIT_EMIT=fast`. The exit status is 1 when there is a finding.
+
+`store.py` uses fresh stores of its own. It compiles a function, changes only its `asm!`
+text, then builds each version again from the store, comparing every output with rustc.
+It also runs the smoke seeds twice against another store, empty on the first pass and warm
+on the second. This covers #418, where the uncached smoke run passed but smoke-1/c16 read
+another assembly wrapper's code from the LLVM store. The assembly is part of the cache key
+since `2a3a0a35`; `fuzz/found/differs-checksum-smoke-1-c16.rs` records the recovered reduction.
+On failure the script prints and keeps its work directory, including each smoke pass's logs.
 
 `run` also takes `--cases` (cases per program, 30 by default), `--first` (the number of the
 first round), `--reduce` (seconds a reduction may take, 0 to only count) and `--work`
@@ -54,8 +63,9 @@ The generator has to produce programs on which two correct compilers cannot disa
 - Half the programs are built as edition 2021 and half as 2024, because drop order differs
   between them.
 
-It does not generate `async`, threads, macros of its own, inline assembly, SIMD intrinsics,
-`dyn Any`, or any I/O other than the checksum lines. Programs are a single crate and use
+The generator also combines scenes for async futures, `dyn Any`, inline assembly and
+unwinding (`fuzz/scenes.py`). It does not generate threads, macros of its own, SIMD
+intrinsics, or any I/O other than the checksum lines. Programs are a single crate and use
 only `std`.
 
 ## What counts as a finding

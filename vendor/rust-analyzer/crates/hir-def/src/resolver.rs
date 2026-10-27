@@ -410,18 +410,28 @@ impl<'db> Resolver<'db> {
         let tmp = Name::new_symbol_root(sym::self_);
         let first_name = if path.is_self() { &tmp } else { path.segments().first()? };
         let skip_to_mod = path.kind != PathKind::Plain && !path.is_self();
-        if skip_to_mod {
-            return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path));
-        }
         let path_hygiene = hygiene_id;
+        if skip_to_mod {
+            // A `macro` names the modules of where it is defined, private ones too: its
+            // `crate::` path is looked up there when it is not visible where the macro is used,
+            // as a plain path is below.
+            return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path)).or_else(
+                || {
+                    macro_def_site(db, path_hygiene).and_then(|module| {
+                        module.resolver(db).module_scope.resolve_path_in_value_ns(db, path)
+                    })
+                },
+            );
+        }
 
         if n_segments <= 1 {
             let mut hygiene_info = hygiene_info(db, hygiene_id);
             for scope in self.scopes() {
                 match scope {
                     Scope::ExprScope(scope) => {
+                        // A name a pattern binds twice means its last binding.
                         let entry =
-                            scope.expr_scopes.entries(scope.scope_id).iter().find(|entry| {
+                            scope.expr_scopes.entries(scope.scope_id).iter().rev().find(|entry| {
                                 entry.name() == first_name && entry.hygiene() == hygiene_id
                             });
 
@@ -830,7 +840,7 @@ impl<'db> Resolver<'db> {
         for scope in self.scopes() {
             match scope {
                 Scope::ExprScope(scope) => {
-                    for entry in scope.expr_scopes.entries(scope.scope_id) {
+                    for entry in scope.expr_scopes.entries(scope.scope_id).iter().rev() {
                         if entry.hygiene() == hygiene_id {
                             if entry.binding() == to_be_renamed {
                                 // This currently resolves to our renamed variable, now `will_be_resolved_to`
@@ -878,7 +888,7 @@ impl<'db> Resolver<'db> {
         for scope in self.scopes() {
             match scope {
                 Scope::ExprScope(scope) => {
-                    for entry in scope.expr_scopes.entries(scope.scope_id) {
+                    for entry in scope.expr_scopes.entries(scope.scope_id).iter().rev() {
                         if entry.binding() == to_be_renamed {
                             will_resolve_to_renamed = true;
                         } else if entry.hygiene() == hygiene_id && entry.name() == name {

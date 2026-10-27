@@ -1,29 +1,25 @@
 # What is new since the fork: the flake (per-unit nix builds of the daemon and the demo), the
-# unit graphs behind them, the Game of Life demo, and live edits (ra-jit-live). The builds take
-# about 40 minutes, so they run in the release train (train.yaml calls this workflow on every
-# push to main) and by hand; a pull request that changes the flake, nix/ or the dependencies
-# (which the unit graphs are generated from) checks the unit graphs alone, in two minutes. The
-# train's harnesses have live edits too (live_e2e.py, tiers.py). In the train these jobs do not
-# block it (`soft`) until they have been green a while: the unit graphs were stale for a week
-# before 2026-10-26, and nothing said so but this workflow.
+# unit graphs behind them, the Game of Life demo, and live edits (ra-jit-live). A cold build of
+# the flake takes up to two hours, so they run on every push to main in a workflow of their own,
+# not in the release train: the train's run would stay open until they ended, and main's next
+# train waits for it. A pull request that changes the flake, nix/ or the dependencies (which the
+# unit graphs are generated from) checks the unit graphs alone, in two minutes. The train's
+# harnesses have live edits too (live_e2e.py, tiers.py). Nothing waits on this workflow; what it
+# says is shown on main's commits. The unit graphs were stale for a week before 2026-10-26, and
+# nothing said so but this workflow.
 #
 #   unit graphs   nix/units/*.json are what `nix/unit_graph.py` generates from Cargo.lock now
 #   nix           `nix build` of the daemon, the demo and the per-unit builds, and the flake's apps
 #   nix (darwin)  the flake evaluates and builds its cheapest outputs on aarch64-darwin
 #   demo          demo/life builds and its window opens (xvfb) and stays up
 #   live edits    macOS arm64: edit a running program's function, ra-jit-live applies the patch
+#
+# The nix store is cached in the GitHub Actions cache. FlakeHub Cache needs an organization
+# `indexable-inc` on FlakeHub, which does not exist, and `id-token: write` on the jobs.
 name: nix and live
 on:
-  workflow_call:
-    inputs:
-      full:
-        description: the builds, the demo and live edits, besides the unit graphs
-        type: boolean
-        default: true
-      soft:
-        description: a job that fails does not fail the caller
-        type: boolean
-        default: false
+  push:
+    branches: ["main"]
   pull_request:
     paths:
       - "flake.nix"
@@ -34,10 +30,11 @@ on:
       - ".github/workflows/nix-live.yaml"
   workflow_dispatch:
 
-# A pull request's newer push cancels its run before. Called by the train, the train's own
-# concurrency group holds it.
+# A pull request's newer push cancels its run before. On main one run at a time, as the train:
+# a push while it runs waits, and a newer push replaces the one waiting. A run cancelled by each
+# push would never end while main takes a merge every few minutes.
 concurrency:
-  group: nix-live-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}${{ inputs.full && '-train' || '' }}
+  group: nix-live-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -49,12 +46,14 @@ jobs:
     name: nix unit graphs are current
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    continue-on-error: ${{ inputs.soft == true }}
     steps:
       - uses: actions/checkout@v7
       # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
       - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/flakehub-cache-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-flakehub: false
+          use-gha-cache: true
       - run: python3 nix/unit_graph.py
       - name: nix/units is what unit_graph.py writes
         run: |
@@ -63,14 +62,16 @@ jobs:
 
   nix:
     name: nix build (x86_64-linux)
-    if: inputs.full || github.event_name == 'workflow_dispatch'
-    continue-on-error: ${{ inputs.soft == true }}
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/flakehub-cache-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-flakehub: false
+          use-gha-cache: true
       - name: flake evaluates
         run: nix flake check --print-build-logs
       # The daemon as a package, the demo as a package, and the per-unit builds both are made of.
@@ -90,14 +91,16 @@ jobs:
 
   nix-darwin:
     name: nix build (aarch64-darwin)
-    if: inputs.full || github.event_name == 'workflow_dispatch'
-    continue-on-error: ${{ inputs.soft == true }}
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/flakehub-cache-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-flakehub: false
+          use-gha-cache: true
       - name: outputs evaluate
         run: |
           for attr in daemon run life daemon-units life-bin; do
@@ -108,8 +111,7 @@ jobs:
 
   demo:
     name: demo/life and ra-jit-live (linux)
-    if: inputs.full || github.event_name == 'workflow_dispatch'
-    continue-on-error: ${{ inputs.soft == true }}
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -138,7 +140,7 @@ jobs:
 
   live-edits:
     name: live edits (macOS arm64)
-    if: inputs.full || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 60
     # Not required: it runs a daemon, a program and a patch between them on a hosted macOS VM,

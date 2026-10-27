@@ -81,7 +81,7 @@ left to rustc. "Layouts" is how many types ra-jit laid out differently from rust
 | Linux AArch64, native | 825 of 825 | 0 of 903 | 11,813 of 11,813 | 0 | same | PLAT-ABI2.md |
 | Windows x86-64 MSVC | 830 of 830 | 0 of 898 | 11,801 of 11,801 | 0 | same | PLAT-ABI2.md |
 | macOS arm64 | 828 of 828 | 0 of 914 | 11,879 of 11,879 | 0 | same | PLAT-ABI2.md |
-| wasm32-wasip1 (wasmtime) | 655 of 656 | not run | no LLVM | | report at 0d0588c9f1, nightly-2026-05-10 | WASM32.md |
+| wasm32-wasip1 (wasmtime) | 957 of 959 | not run | no LLVM | | fdc1c53f15, nightly-2026-10-25, arm64 ix VM | platforms.md |
 
 The rest of the gate on that CI run, on every leg: programs, stress, breakers (43 of 43, 5
 open), unwinds, splices, asmedits, includes, worktrees, keys (36 of 36, 0 open),
@@ -89,8 +89,14 @@ storekills, storecorrupts, storeshared. The Linux legs add `debuginfo.py`, `stor
 and `buildmodel.py`; AArch64 adds `farsplices.py`. The report does not print the counts of
 each harness per leg, only that the legs passed.
 
-The wasm row is from an earlier branch on a nightly toolchain, when the corpus was
-smaller. It has not been rerun on 1.99.0 and is not in CI.
+The wasm row was measured by hand on 2026-10-27 with wasmtime 49.0.2, along with stress 100 of
+100, splices 71 of 71 and breakers 176 of 177 (`procmacro`'s `spelled`, which fails the same way
+on the aarch64 host without blaze's proc-macro server). The train runs the corpus, stress and
+`allrajit_wasm.py` for wasm32 on every push to main (`harness/wasm32.py`, Linux x86-64). Of
+the two functions left to rustc there, `undecided_alias_drop`'s `release_state` (a layout with
+a type error) is left on the aarch64 host as well, and `fma_nans::vectors` calls `simd_fma`,
+which ra-jit refuses on wasm. Builds with nothing of rustc's (wasm-host guests, Cloudflare
+Workers, blaze-manifest and blaze-resolve) are in [platforms.md](platforms.md), wasm32.
 
 ## 3. The gate on Linux x86-64
 

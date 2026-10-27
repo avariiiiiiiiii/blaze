@@ -23,6 +23,10 @@
 //! overlay or anywhere else outside the run, but what it reads is not seen. Each run of a
 //! program is given a nonce the library says back when it loads, and a program that never said
 //! it is an `X` line in the record: the record is incomplete.
+//!
+//! A view ([`Spec::view`]) is not made on macOS (decided, 2026-10-27): a spec with one is run
+//! as though it had none, its binds unread, and the program sees the machine as Seatbelt
+//! leaves it. Linux is where a build sees its declared closure alone.
 
 use std::{
     collections::HashSet,
@@ -363,7 +367,7 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
                 // SAFETY: the error is a string sandbox_init_with_parameters made.
                 false => unsafe { std::ffi::CStr::from_ptr(error) }.to_string_lossy(),
             };
-            eprintln!("ra-jit: the sandbox could not be made: Seatbelt refused the profile: {why}");
+            eprintln!("blaze: the sandbox could not be made: Seatbelt refused the profile: {why}");
             unsafe { libc::_exit(super::COULD_NOT) };
         }
         if program.is_none() {
@@ -371,12 +375,12 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
         }
         if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
             let error = os(&format!("the working directory {}", spec.cwd.display()));
-            eprintln!("ra-jit: the sandbox could not be made: {error}");
+            eprintln!("blaze: the sandbox could not be made: {error}");
             unsafe { libc::_exit(super::COULD_NOT) };
         }
         unsafe { libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
         let error = std::io::Error::last_os_error();
-        eprintln!("ra-jit: could not run {}: {error}", argv[0].to_string_lossy());
+        eprintln!("blaze: could not run {}: {error}", argv[0].to_string_lossy());
         unsafe { libc::_exit(127) };
     }
     super::pass_signals_to(child);

@@ -298,7 +298,12 @@ impl WorkerConfig {
         if self.selection.dev_deps {
             args.push("--dev-deps".into());
         }
+        // Where the build was asked, from the root of the checkout when it is in it.
         if let Some(asked_in) = &self.selection.asked_in {
+            let asked_in = match asked_in.as_os_str().is_empty() {
+                true => root.to_owned(),
+                false => root.join(asked_in),
+            };
             args.extend(["--asked-in".into(), asked_in.into()]);
         }
         for krate in crates {
@@ -374,12 +379,16 @@ impl Checkout {
             true => (String::new(), plan.binary.display().to_string()),
             false => (plan.binary.display().to_string(), String::new()),
         };
+        // A shared library is linked again for each build, not patched: see [`Plan::shared`].
+        let (shared, patch) = match plan.shared {
+            true => ("shared", String::new()),
+            false => ("", plan.patch.display().to_string()),
+        };
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{}\t{}\t{splice}\t{exe}",
+            "sync\t{}\t{}\t{}\t{patch}\t{}\t{splice}\t{exe}\t{shared}",
             self.project().display(),
             crates,
             plan.object.display(),
-            plan.patch.display(),
             plan.link_cmd,
         );
         for file in &plan.symbol_files {
@@ -397,7 +406,7 @@ enum Warmth {
     Loading(Instant),
     Ready,
     /// Why the worker has no part in the checkout as cargo last built it.
-    Failed(String, SystemTime),
+    Failed(String),
     /// The errors in the source the worker found loading it or building it first: each
     /// program's build fails with them until a source is written.
     Broken(crate::errors::Said, SystemTime),
@@ -408,7 +417,7 @@ impl Warmth {
         match self {
             Warmth::Loading(since) => format!("loading for {:.0?}", since.elapsed()),
             Warmth::Ready => "ready".to_owned(),
-            Warmth::Failed(why, _) => format!("failed: {why}"),
+            Warmth::Failed(why) => format!("failed: {why}"),
             Warmth::Broken(..) => "the source has an error".to_owned(),
         }
     }
@@ -481,9 +490,14 @@ impl Worker {
             ("--socket", &socket),
         ];
         let named: &[(&str, &Path)] = if first.whole { &whole } else { &rustcs };
-        for &(flag, path) in named {
+        // A shared library is linked again for each build, not patched: see [`Plan::shared`].
+        let patched = |flag: &str| !(first.shared && flag == "--patch");
+        for &(flag, path) in named.iter().filter(|(flag, _)| patched(flag)) {
             args.push(flag.into());
             args.push(path.into());
+        }
+        if first.shared {
+            args.push("--shared".into());
         }
         if let Some(rustcs) = &first.rustc_binary {
             args.push("--rustc-binary".into());
@@ -509,12 +523,27 @@ impl Worker {
             args.push("--scripts-from".into());
             args.push(scripts.into());
         }
-        let mut env = crate::process::own();
+        // Sent with each request, so the daemon's flags would reload the workspace with them.
+        let not_ours = super::cli::not_the_builds(&config.env);
+        let mut env: ide_db::base_db::Env = Vec::from(crate::process::own())
+            .into_iter()
+            .filter(|(name, _)| !not_ours.contains(name))
+            .collect();
         for (name, value) in &config.env {
             env.set(name, value);
         }
         env.set(ENDS_WITH_INPUT, "1");
-        let told = spare.and_then(|it| it.told(&args, &checkout.config, &checkout.root, false));
+        // What `env!` reads of the places cargo set, as each request has them: the load
+        // compiles the crates before the first request is read, and an integration test
+        // that names a program (`CARGO_BIN_EXE_<name>`) would not compile without them.
+        let mut started: BTreeMap<String, String> = checkout
+            .env
+            .iter()
+            .filter(|(name, _)| super::wrapper::names_a_place(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        started.extend(config.env.clone());
+        let told = spare.and_then(|it| it.told(&args, &started, &checkout.root, false));
         let child = match told {
             Some(spare) => {
                 log = spare.log;
@@ -529,7 +558,8 @@ impl Worker {
                 };
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
-                command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+                command.envs(&started).env(ENDS_WITH_INPUT, "1");
+                exact_env(&mut command, &config.env);
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
@@ -633,12 +663,14 @@ impl Worker {
         let warmth = match self.warmed(checkout) {
             Ok(None) => Warmth::Ready,
             Ok(Some(said)) => Warmth::Broken(said, SystemTime::now()),
+            // The worker leaves the errors before it ends, which under load can be after the
+            // daemon has stopped waiting for it to; `start` took away those of any before it.
             Err(why) => match std::fs::read(errors_beside(&self.socket)) {
-                Ok(said) if self.ended().is_some() => match serde_json::from_slice(&said) {
+                Ok(said) => match serde_json::from_slice(&said) {
                     Ok(said) => Warmth::Broken(said, SystemTime::now()),
-                    Err(_) => Warmth::Failed(format!("{why:#}"), SystemTime::now()),
+                    Err(_) => Warmth::Failed(format!("{why:#}")),
                 },
-                _ => Warmth::Failed(format!("{why:#}"), SystemTime::now()),
+                _ => Warmth::Failed(format!("{why:#}")),
             },
         };
         eprintln!("{}: {}", checkout.root.display(), warmth.describe());
@@ -801,6 +833,14 @@ struct Spare {
     log: PathBuf,
 }
 
+/// Takes away from a worker's `command` each variable a worker has only as its build has it
+/// that its build, `env`, does not set, which it would otherwise have from the daemon.
+fn exact_env(command: &mut Command, env: &BTreeMap<String, String>) {
+    for name in super::cli::not_the_builds(env) {
+        command.env_remove(name);
+    }
+}
+
 impl Spare {
     /// Starts one with its files in `dir`.
     fn start(dir: &Path) -> anyhow::Result<Spare> {
@@ -820,22 +860,21 @@ impl Spare {
         Ok(Spare { child, log })
     }
 
-    /// Tells it to be the worker `args` start for `checkout`. `None` when it can't be
-    /// told: it has ended, or a path of the build is not text.
+    /// Tells it to be the worker `args` start, with the variables `env`. `None` when it
+    /// can't be told: it has ended, or a path of the build is not text.
     /// One told a build `ahead` has what cargo has not built yet left out of `args`, and
     /// is told them whole afterwards.
     fn told(
         mut self,
         args: &[OsString],
-        config: &WorkerConfig,
+        env: &BTreeMap<String, String>,
         cwd: &Path,
         ahead: bool,
     ) -> Option<Spare> {
         let told = || {
             let args: Option<Vec<String>> =
                 args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
-            let told =
-                crate::Told { args: args?, env: config.env.clone(), cwd: cwd.to_owned(), ahead };
+            let told = crate::Told { args: args?, env: env.clone(), cwd: cwd.to_owned(), ahead };
             let mut line = serde_json::to_string(&told).ok()?;
             line.push('\n');
             Some(line)
@@ -897,6 +936,7 @@ impl Checker {
         let output =
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
         command.envs(&ahead.config.env).env(ENDS_WITH_INPUT, "1");
+        exact_env(&mut command, &ahead.config.env);
         command.current_dir(&ahead.root);
         command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
         own_group(&mut command);
@@ -1238,10 +1278,7 @@ impl Daemon {
         *lock(&worker.asked) = Instant::now();
         let warmth = match lock(&worker.checkouts).get(&checkout.key) {
             Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
-            _ => Warmth::Failed(
-                "the daemon has not loaded this build of the workspace".to_owned(),
-                SystemTime::now(),
-            ),
+            _ => Warmth::Failed("the daemon has not loaded this build of the workspace".to_owned()),
         };
         match warmth {
             Warmth::Ready => worker.sync(checkout),
@@ -1251,7 +1288,7 @@ impl Daemon {
                     since.elapsed()
                 ),
             },
-            Warmth::Failed(reason, _) => Reply::Cold { reason },
+            Warmth::Failed(reason) => Reply::Cold { reason },
             Warmth::Broken(said, _) => {
                 let programs = checkout.programs.iter().map(|_| Err(NotBuilt::Error(said.clone())));
                 Reply::Synced { programs: programs.collect(), spans: Vec::new() }
@@ -1284,22 +1321,20 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
-        // What a worker could not load once it can't load again, until cargo builds anew or
-        // a source is written: the failure may be an error in the source.
+        // Source diagnostics stay valid until a source is written. A failed load has not
+        // established its inputs: configuration, even a file since deleted, may have caused
+        // it. Retry that load on the next request rather than keep its error indefinitely.
         let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
             Some(Loaded { generation, warmth, .. }) if *generation == checkout.generation => {
                 match warmth {
-                    Warmth::Failed(why, at) => Some((Some(why.clone()), *at)),
-                    // Its builds say the errors.
-                    Warmth::Broken(_, at) => Some((None, *at)),
+                    Warmth::Failed(_) | Warmth::Broken(..) => Some(warmth.clone()),
                     _ => None,
                 }
             }
             _ => None,
         });
         match failed {
-            Some((Some(why), at)) if !checkout.written_since(at) => anyhow::bail!(why),
-            Some((None, at)) if !checkout.written_since(at) => return Ok(()),
+            Some(Warmth::Broken(_, at)) if !checkout.written_since(at) => return Ok(()),
             Some(_) => {
                 if let Some(old) = workers.remove(&id) {
                     old.stop();
@@ -1501,7 +1536,7 @@ impl Daemon {
         let Some(spare) = waiting.or_else(|| self.new_spare()) else { return };
         let mut args = ahead.config.args(&ahead.root, &ahead.crates);
         args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config, &ahead.root, true)
+        if let Some(spare) = spare.told(&args, &ahead.config.env, &ahead.root, true)
             && let Some(mut other) = lock(&self.ahead).insert(id, spare)
         {
             other.stop();

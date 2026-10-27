@@ -74,13 +74,20 @@ impl Linked {
         // Taken before the daemon answers: whoever is given the program waits for the write.
         let lock = Writing::ahead(&binary);
         Linked(std::thread::spawn(move || {
-            Baseline::parse(&binary, &patch?, &object, false)?.laid_out(binary, lock)
+            Baseline::parse(&binary, Some(&patch?), &object, false)?.laid_out(binary, lock)
         }))
+    }
+
+    /// As [`Linked::read`], of an executable linked with the object alone, no patch: a patch
+    /// is then spliced into it with the read baseline. Read here and now, for the splice.
+    pub(crate) fn read_bare(binary: PathBuf, object: &Path) -> anyhow::Result<Baseline> {
+        let lock = Writing::ahead(&binary);
+        Baseline::parse(&binary, None, object, false)?.laid_out(binary, lock)
     }
 
     /// As [`Linked::read`], of what rustc linked, which `binary` is another name of: it is
     /// made a copy of its own first, for a splice to write. One the daemon linked is refused:
-    /// cargo's place for the program has the daemon's once it served one.
+    /// cargo's place for the program has a copy of the daemon's once it served one.
     pub(crate) fn read_rustcs(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
         let (patch, object) = (std::fs::read(patch), object.to_owned());
         Linked(std::thread::spawn(move || {
@@ -93,7 +100,7 @@ impl Linked {
                 let (binary, copy) = (binary.clone(), copy.clone());
                 std::thread::spawn(move || std::fs::copy(binary, copy))
             };
-            let parsed = Baseline::parse(&binary, &patch, &object, true);
+            let parsed = Baseline::parse(&binary, Some(&patch), &object, true);
             copying.join().map_err(|_| anyhow::anyhow!("copying the executable panicked"))??;
             let mut parsed = parsed?;
             // Whoever takes the file meanwhile takes either, which are the same, and waits for
@@ -230,8 +237,14 @@ impl Parsed {
 }
 
 impl Baseline {
-    /// Reads the executable at `path`, which was linked with `patch` ahead of `object`.
-    fn parse(path: &Path, patch: &[u8], object: &Path, rustcs: bool) -> anyhow::Result<Parsed> {
+    /// Reads the executable at `path`, which was linked with `patch` ahead of `object`, or
+    /// with `object` alone.
+    fn parse(
+        path: &Path,
+        patch: Option<&[u8]>,
+        object: &Path,
+        rustcs: bool,
+    ) -> anyhow::Result<Parsed> {
         let file = File::open(path)?;
         let stamp = Stamp::of(&file)?;
         // SAFETY: the daemon is the one that has the link write the file, and it does not
@@ -252,22 +265,26 @@ impl Baseline {
             );
         }
         let (image, baked) = if bytes.starts_with(b"\0asm") {
-            (Executable::Wasm(wasm::Module::read(bytes.to_vec())?), wasm::defined(patch)?)
+            let baked = patch.map(wasm::defined).transpose()?.unwrap_or_default();
+            (Executable::Wasm(wasm::Module::read(bytes.to_vec())?), baked)
         } else {
             let image = match object::FileKind::parse(&*bytes)? {
                 object::FileKind::MachO64 => Executable::MachO(macho::Image::read(&bytes)?),
                 object::FileKind::Pe64 => {
                     let object = std::fs::read(object)?;
-                    Executable::Pe(pe::Image::read(&bytes, path, &[patch, &object])?)
+                    let objects: Vec<&[u8]> = patch.into_iter().chain([&*object]).collect();
+                    Executable::Pe(pe::Image::read(&bytes, path, &objects)?)
                 }
                 _ => Executable::Elf(Image::read(&bytes)?),
             };
-            let patch = object::File::parse(patch)?;
-            let baked = patch
-                .symbols()
-                .filter(|it| it.is_definition() && !it.is_local())
-                .filter_map(|it| it.name_bytes().ok().map(Box::from))
-                .collect();
+            let baked = match patch {
+                Some(patch) => object::File::parse(patch)?
+                    .symbols()
+                    .filter(|it| it.is_definition() && !it.is_local())
+                    .filter_map(|it| it.name_bytes().ok().map(Box::from))
+                    .collect(),
+                None => Vec::new(),
+            };
             (image, baked)
         };
         Ok(Parsed { image, baked, stamp })
@@ -336,7 +353,7 @@ impl Baseline {
         let patch = std::fs::read(patch);
         let lock = Writing::ahead(&path);
         let linked = Linked(std::thread::spawn(move || {
-            let mut parsed = Baseline::parse(&path, &patch?, &object, false)?;
+            let mut parsed = Baseline::parse(&path, Some(&patch?), &object, false)?;
             let Executable::Elf(image) = &mut parsed.image else {
                 bail!("the executable is ELF no more")
             };
@@ -928,7 +945,7 @@ fn write_runs(file: &File, writes: &[(u64, Vec<u8>)]) -> std::io::Result<()> {
 /// Copies the file at `from` to `to` as [`std::fs::copy`] does, but for the runs of it the
 /// filesystem keeps no blocks of, which stay so in the copy: a spliced executable has many,
 /// and a filesystem that shares no blocks writes the rest in full.
-fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     if copy_holes(from, to).is_ok() {
         return Ok(());

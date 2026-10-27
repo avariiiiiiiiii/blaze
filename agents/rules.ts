@@ -51,8 +51,8 @@ export const rules = [
 	},
 	{
 		id: "own-nightly",
-		info: "blaze is its own toolchain: build every project with blaze's own pinned nightly (`harness/toolchain`), named and versioned as blaze's, whatever the project pins. Don't follow the project's toolchain, support stable or several rustc versions, or pin stable. The nightly moves only when blaze moves it, deliberately, with the corpus difftest as the gate. It is the language and std definition blaze matches while rustc is still in the tree, not a dependency to track; every rustc use left is removed on the way to none. Users keep their own toolchain and CI as the final word: blaze says so rather than switching toolchains.",
-		reason: "\"You should use your own nightly that you control since you are trying to replace rustc\" (Andrew, 2026-10-26). We are moving off rustc entirely (\"no rustc\", Andrew).",
+		info: "blaze is its own toolchain: build every project with blaze's own pinned nightly (`harness/toolchain`), named and versioned as blaze's, whatever the project pins. Don't follow the project's toolchain, support stable or several rustc versions, or pin stable. The pin is the latest nightly: a daily workflow moves it to the newest one, gated by the merge gate and the release train on the bump's branch (docs/toolchain.md, \"The daily bump\"), and a bump that is not green is an open issue, not a skipped day. It is the language and std definition blaze matches while rustc is still in the tree, not a rustc blaze maintains; every rustc use left is removed on the way to none. Users keep their own toolchain and CI as the final word: blaze says so rather than switching toolchains.",
+		reason: "\"You should use your own nightly that you control since you are trying to replace rustc\" (Andrew, 2026-10-26). \"blaze should be the latest-nightly equivalent\" (Andrew, 2026-10-27, #404). We are moving off rustc entirely (\"no rustc\", Andrew).",
 		link: "docs/no-rustc.md",
 	},
 	{
@@ -90,8 +90,8 @@ export const rules = [
 		reason: "The stash is shared by every worktree.",
 	},
 	{
-		id: "land-through-queue",
-		info: "Land small and often, through the merge queue only. After the local gate, run `python3 .github/scripts/land.py \"what the branch does\"` in the lane's worktree: it opens the pull request, waits for its run (the merge gate: the build and the unit tests, about 5 minutes), queues it and waits until the gate has passed on it merged onto main and it is merged, or says why not. Every harness runs after the merge, in the release train (train.yaml), whose issue \"Release train is red\" names the commits since it was last green. Its waiting survives a tool that kills it; `land.py --wait` picks it up again. Never push to main or merge into it by hand.",
+		id: "land-through-pr",
+		info: "Land small and often, through a pull request only (no merge queue; the branch need not be up to date with main). After the local gate, run `python3 .github/scripts/land.py \"what the branch does\"` in the lane's worktree: it opens the pull request, turns on auto-merge, waits for its run (the merge gate: the build and the unit tests, about 5 minutes) and for GitHub to merge it, or says why not. Every harness runs after the merge, in the release train (train.yaml), whose issue \"Release train is red\" names the commits since it was last green. Its waiting survives a tool that kills it; `land.py --wait` picks it up again. Never push to main or merge into it by hand.",
 		link: "docs/contributing.md#landing-a-change",
 	},
 	{

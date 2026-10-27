@@ -17,14 +17,15 @@ step goes to a file of link arguments that `bun-exe`'s build script reads (BUN_N
 and the member is added. It returns that tree, to be copied without its `build` directory, and
 the environment every build of it needs: bun's pinned toolchain, the code bun's build generated
 (BUN_CODEGEN_DIR) and the link arguments. `in_place(ws)` does the same in a checkout of its own
-(apps.py's `prepare`).
+(apps.py's `prepare`). `sources(ws)` only fetches the crates bun's workspace has under `vendor/`,
+what `cargo metadata` needs (borrowck_apps.py's `prepare`).
 
 What bun's build needs is on PATH: what docs/project/contributing.mdx lists (LLVM 23, cmake,
 ninja, go, a bun to run its scripts), as `nix develop .#bench-bun` has it, whose only Rust is
 bun's pinned nightly. With rustup, that nightly is installed when it is missing.
 docs/research/bun.md says what was measured with it.
 """
-import hashlib, os, re, shlex, shutil, subprocess, sys
+import hashlib, os, re, shlex, shutil, subprocess, sys, tarfile, urllib.request
 
 # The checkout's rust-toolchain.toml.
 TOOLCHAIN = "nightly-2026-09-15"
@@ -311,6 +312,45 @@ def prepare(checkout):
         shutil.copytree(checkout, tree, symlinks=True)
     native(tree, head)
     return tree, env_of(tree)
+
+
+def sources(ws):
+    """What `cargo metadata` needs of a checkout without bun's own build: the crates its
+    Cargo.toml has under `vendor/`, which that build fetches (scripts/build/deps/<name>.ts) at
+    the commit the file pins, with the `.patch` files it lists applied as that build applies them
+    (rust-argon2's lifts its memory floor). Enough for `ra-jit borrowck --project`, which builds
+    nothing."""
+    for name in re.findall(r'path = "vendor/([^"/]+)"', open(os.path.join(ws, "Cargo.toml")).read()):
+        dep = open(os.path.join(ws, "scripts", "build", "deps", f"{name}.ts")).read()
+        if re.search(r'kind: "([^"]+)"', dep)[1] != "github-archive":
+            raise SystemExit(f"bunprep: vendor/{name} is not fetched from a GitHub archive")
+        repo = re.search(r'repo: "([^"]+)"', dep)[1]
+        commit = re.search(r'commit: (\w+)', dep)[1]
+        commit = re.search(rf'const {commit} = "([0-9a-f]{{40}})"', dep)[1]
+        listed = re.search(r"patches: \[([^\]]*)\]", dep)
+        patches = re.findall(r'"([^"]+)"', listed[1]) if listed else []
+        if "patches:" in dep and not listed or any(not it.endswith(".patch") for it in patches):
+            raise SystemExit(f"bunprep: vendor/{name} has patches other than a list of `.patch` files")
+        # The commit and the patches' contents, as bun's build identifies a fetched source.
+        identity = hashlib.sha256("\0".join([commit, *(open(os.path.join(ws, it)).read() for it in patches)])
+                                  .encode()).hexdigest()
+        into = os.path.join(ws, "vendor", name)
+        stamp = os.path.join(into, ".bunprep-commit")
+        if os.path.exists(stamp) and open(stamp).read().strip() == identity:
+            continue
+        shutil.rmtree(into, ignore_errors=True)
+        os.makedirs(into)
+        url = f"https://github.com/{repo}/archive/{commit}.tar.gz"
+        with urllib.request.urlopen(url) as archive, tarfile.open(fileobj=archive, mode="r|gz") as tar:
+            for member in tar:
+                member.name = member.name.partition("/")[2]
+                if member.name:
+                    tar.extract(member, into, filter="data")
+        # From the checkout's root: in a directory of a repository, `git apply` takes the
+        # patch's paths as the repository's.
+        for patch in patches:
+            subprocess.run(["git", "apply", f"--directory=vendor/{name}", patch], cwd=ws, check=True)
+        open(stamp, "w").write(f"{identity}\n")
 
 
 def in_place(ws):

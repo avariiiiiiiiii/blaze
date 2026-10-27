@@ -57,7 +57,7 @@ pub fn key<A: Serialize>(code: &Code, args: &A) -> Option<Key> {
     if !code.known() {
         let why = code.text();
         if !why.is_empty() && cache.lock().refusals.insert(why) {
-            eprintln!("ra-jit: {why}");
+            eprintln!("blaze: {why}");
         }
         return None;
     }
@@ -169,7 +169,7 @@ impl Cache {
 
     fn log(&self, name: &str, what: &str) {
         if self.log {
-            eprintln!("ra-jit cache: {name}: {what}");
+            eprintln!("blaze cache: {name}: {what}");
         }
     }
 

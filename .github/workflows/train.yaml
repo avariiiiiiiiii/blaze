@@ -5,9 +5,11 @@
 #   every harness of harness/ci.py's full tier, on Linux x86-64, Linux AArch64, macOS arm64 and
 #       Windows x86-64, under both producers; Bun's fixtures, rustc's borrow-check tests and the
 #       pinned run-pass tests (Linux x86-64; those on macOS too); `fork alone`; `cargo ra-jit` on
-#       small projects (Linux x86-64, macOS) and the larger ones (AArch64); the ripgrep bench
-#       (not blocking); and nix-live.yaml: the flake's builds, the demo and live edits on macOS
-#       (not blocking, until they have been green a while)
+#       small projects (Linux x86-64, macOS) and the larger ones (AArch64); harness/wasm32.py,
+#       programs built for wasm32 and run under wasmtime (Linux x86-64); and the ripgrep
+#       bench (not blocking). nix-live.yaml (the flake's builds, the demo and live edits on macOS)
+#       runs on the same pushes in a workflow of its own: a cold nix build takes up to two hours,
+#       and in the train's run it held main's next train that long
 #   green: when main has changes since the last release, a commit `release: v0.YYYYMMDD.N`
 #       (the version of today's next release, N from 0, and a CHANGELOG.md section of what was
 #       merged) and the pgo workflow, whose pin job tags v0.YYYYMMDD.N when the profiles are
@@ -18,7 +20,9 @@
 # On every push to main and by hand. One train runs at a time; a push while it runs waits, and a
 # newer push replaces the one waiting, so the train runs on the newest commit of main as soon
 # as the one before is done. A run cancelled by each push (`cancel-in-progress`) would never end
-# while main takes a merge every few minutes, and a train takes about 45.
+# while main takes a merge every few minutes, and a train takes about 45. The group is per ref:
+# a train run by hand on a branch (contributing.md: before landing what the fast tier does not
+# cover) neither waits behind main's nor takes the place of main's waiting one.
 name: train
 on:
   push:
@@ -26,7 +30,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: train
+  group: train-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -45,6 +49,7 @@ jobs:
       cargo-ra-jit: true
       bench: true
       bun-e2e: true
+      wasm32: true
 
   linux-arm64:
     name: linux arm64
@@ -92,14 +97,7 @@ jobs:
       - working-directory: ${{ runner.temp }}/rust-analyzer
         run: cargo test -p hir-ty -p hir-ty-borrowck -p hir-ty-wfcheck -p ide-diagnostics && cargo check -p hir
 
-  nix:
-    name: nix
-    uses: ./.github/workflows/nix-live.yaml
-    with:
-      full: true
-      soft: true
-
-  # The train's verdict: every job above but nix, whose jobs do not fail it (`soft`).
+  # The train's verdict: every job above.
   train:
     name: train
     needs: [linux-x64, linux-arm64, macos, windows, fork]
@@ -132,7 +130,10 @@ jobs:
           token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
       # cargo and nix/unit_graph.py from the flake's dev shell, as nix-live.yaml's unit graphs.
       - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/flakehub-cache-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-flakehub: false
+          use-gha-cache: true
       - run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

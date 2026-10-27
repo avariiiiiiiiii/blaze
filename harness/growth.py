@@ -15,12 +15,19 @@ while a value with a destructor is live, as x11-dl's `x11_link!` opens Xlib's 78
 `?` leaves through what the fields before it hold. Leaving was a drop chain per `?` over every
 field before it, 3 blocks a field squared, and bevy's build with Xlib's took 364 GB. Every program
 is also run against cargo's.
+
+Both sizes are allocated by the single-pass register allocator. By default a function of more
+than SINGLE_PASS instructions (hir-ty-codegen) gets it and a smaller one the backtracking one,
+whose code is smaller: with the limit between the two sizes, the ratio measured the
+change of allocator, not the growth (Windows' load of 200 fields, under the limit since #561,
+took x2.63 the code at 400 that were over it; the 400 were the same 288 KB as before).
 """
 import os, shutil, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ["RA_JIT_CACHE"] = "off"
+os.environ["RA_JIT_REGALLOC"] = "single_pass"
 from difftest import Fixture
 
 CARGO_TOML = """[package]

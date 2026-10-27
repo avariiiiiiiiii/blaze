@@ -17,11 +17,11 @@ architecture. The rest of this page says how, so that anyone can check it or run
 ## How fast an edit builds
 
 <!-- benchsummary:start -->
-<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/edits-dark.svg"><img alt="How much faster an edit builds under ra-jit than under cargo, by platform: All projects (geometric mean): macOS arm64 10× faster, Linux aarch64 24× faster, Linux x86-64 11× faster; ripgrep 15.1.0: macOS arm64 8.1× faster, Linux aarch64 23× faster, Linux x86-64 12× faster; fd 10.3.0: macOS arm64 6.0× faster, Linux aarch64 22× faster, Linux x86-64 9.3× faster; bat 0.26.0: Linux aarch64 33× faster, Linux x86-64 14× faster; hyperfine 1.19.0: Linux aarch64 14× faster, Linux x86-64 8.0× faster; just 1.43.0: Linux aarch64 22× faster, Linux x86-64 14× faster; axum 0.8.6: Linux aarch64 16× faster, Linux x86-64 10× faster; nushell 0.108.0: macOS arm64 10× faster, Linux aarch64 34× faster, Linux x86-64 20× faster; helix 25.07.1: Linux aarch64 48× faster, Linux x86-64 19× faster; bevy 0.20.0: Linux aarch64 26× faster, Linux x86-64 3.7× faster; biome @biomejs/biome@2.6.3: Linux x86-64 5.6× faster; bun 1.4.3: macOS arm64 21× faster, Linux aarch64 22× faster, Linux x86-64 22× faster" src="benchmarks/charts/edits-light.svg" width="760"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/edits-dark.svg"><img alt="How much faster an edit builds under blaze than under cargo, by platform: All projects (geometric mean): macOS arm64 10× faster, Linux aarch64 24× faster, Linux x86-64 11× faster; ripgrep 15.1.0: macOS arm64 8.1× faster, Linux aarch64 23× faster, Linux x86-64 12× faster; fd 10.3.0: macOS arm64 6.0× faster, Linux aarch64 22× faster, Linux x86-64 9.3× faster; bat 0.26.0: Linux aarch64 33× faster, Linux x86-64 14× faster; hyperfine 1.19.0: Linux aarch64 14× faster, Linux x86-64 8.0× faster; just 1.43.0: Linux aarch64 22× faster, Linux x86-64 14× faster; axum 0.8.6: Linux aarch64 16× faster, Linux x86-64 10× faster; nushell 0.108.0: macOS arm64 10× faster, Linux aarch64 34× faster, Linux x86-64 20× faster; helix 25.07.1: Linux aarch64 48× faster, Linux x86-64 19× faster; bevy 0.20.0: Linux aarch64 26× faster, Linux x86-64 3.7× faster; biome @biomejs/biome@2.6.3: Linux x86-64 5.6× faster; bun 1.4.3: macOS arm64 21× faster, Linux aarch64 22× faster, Linux x86-64 22× faster" src="benchmarks/charts/edits-light.svg" width="760"></picture>
 
-Edit, then build, on real projects at pinned commits: incremental `cargo build` → `cargo ra-jit build`, both warm, same linker, Cranelift, the median of each run's edits. Each platform is a machine of its own: compare numbers within a platform, not across.
+Edit, then build, on real projects at pinned commits: incremental `cargo build` → `cargo blaze build`, both warm, same linker, Cranelift, the median of each run's edits. Each platform is a machine of its own: compare numbers within a platform, not across.
 
-An edit to one function, cargo → ra-jit:
+An edit to one function, cargo → blaze:
 
 | Project | macOS arm64 | Linux aarch64 | Linux x86-64 |
 |---|---:|---:|---:|
@@ -37,10 +37,10 @@ An edit to one function, cargo → ra-jit:
 | biome @biomejs/biome@2.6.3 | - | - | 2.12 s → **2.38 s** (0.9x) |
 | bun 1.4.3 | 7.55 s → **362 ms** (21x) | 10.63 s → **486 ms** (22x) | 9.11 s → **451 ms** (20x) |
 
-- **macOS arm64**: MacBook Pro (Mac17,6), macOS 27.0.1, with other work running (Apple M5 Max, 18 cores, 128 GiB), ra-jit [`84760c3f51`](https://github.com/indexable-inc/blaze/commit/84760c3f517a76f6e8a3aa41ccd81fc3f26b87c7) on 2026-10-21, median of 3 edits, load average 48 at the start, by hand.
-- **Linux aarch64**: AWS c8g.16xlarge, pinned to 16 cores with taskset (Neoverse-V2, 16 of its 64 cores, 124 GiB), ra-jit [`c93e530e47`](https://github.com/indexable-inc/blaze/commit/c93e530e474c4de2d67a7a9ec49fd5581894efb8) on 2026-10-23, median of 5 edits, by hand.
-- **Linux x86-64**: AWS c8a.metal-24xl (dev-aws-3), pinned to 16 cores with taskset (AMD EPYC 9R45, 16 of its 96 cores, 188 GiB), ra-jit [`1a005421b7`](https://github.com/indexable-inc/blaze/commit/1a005421b7a47fa3968bc5de6645e25a50dfd855) on 2026-10-25, median of 5 edits, by hand.
-- **bun** is measured on its own, by the `bench-bun` workflow: macOS arm64 on one machine (Apple M5 Max, 18 cores, 128 GiB), ra-jit [`27077156cc`](https://github.com/indexable-inc/blaze/commit/27077156ccbd476079d261e529fc25b3225f0ace) on 2026-10-23, median of 3 edits, by hand; Linux aarch64 on AWS c8g.24xlarge (dev-aws-eph-rajit-arm64bun), pinned to 16 cores with taskset (Neoverse-V2, 16 of its 96 cores, 185 GiB), ra-jit [`ac1ee2dd68`](https://github.com/indexable-inc/blaze/commit/ac1ee2dd682b7d321ba75a67924aaf95609572f0) on 2026-10-23, median of 3 edits, by hand; Linux x86-64 on AWS c8a.24xlarge (dev-aws-eph-rajit-x86edits), pinned to 16 cores with taskset (AMD EPYC 9R45, 16 of its 96 cores, 185 GiB), ra-jit [`961bb3105a`](https://github.com/indexable-inc/blaze/commit/961bb3105a8e90e0ac33488c803f5513f075bb87) on 2026-10-23, median of 3 edits, load average 12 at the start, by hand. It is the Rust port of [bun](https://github.com/oven-sh/bun), 1.25M lines of Rust in 103 crates on a nightly beside a JavaScript engine's C and C++, built with frame pointers as bun's own build is (`-C force-frame-pointers=yes`; [what it took](research/bun.md)). Its test suites are not measured yet.
+- **macOS arm64**: MacBook Pro (Mac17,6), macOS 27.0.1, with other work running (Apple M5 Max, 18 cores, 128 GiB), blaze [`84760c3f51`](https://github.com/indexable-inc/blaze/commit/84760c3f517a76f6e8a3aa41ccd81fc3f26b87c7) on 2026-10-21, median of 3 edits, load average 48 at the start, by hand.
+- **Linux aarch64**: AWS c8g.16xlarge, pinned to 16 cores with taskset (Neoverse-V2, 16 of its 64 cores, 124 GiB), blaze [`c93e530e47`](https://github.com/indexable-inc/blaze/commit/c93e530e474c4de2d67a7a9ec49fd5581894efb8) on 2026-10-23, median of 5 edits, by hand.
+- **Linux x86-64**: AWS c8a.metal-24xl (dev-aws-3), pinned to 16 cores with taskset (AMD EPYC 9R45, 16 of its 96 cores, 188 GiB), blaze [`1a005421b7`](https://github.com/indexable-inc/blaze/commit/1a005421b7a47fa3968bc5de6645e25a50dfd855) on 2026-10-25, median of 5 edits, by hand.
+- **bun** is measured on its own, by the `bench-bun` workflow: macOS arm64 on one machine (Apple M5 Max, 18 cores, 128 GiB), blaze [`27077156cc`](https://github.com/indexable-inc/blaze/commit/27077156ccbd476079d261e529fc25b3225f0ace) on 2026-10-23, median of 3 edits, by hand; Linux aarch64 on AWS c8g.24xlarge (dev-aws-eph-rajit-arm64bun), pinned to 16 cores with taskset (Neoverse-V2, 16 of its 96 cores, 185 GiB), blaze [`ac1ee2dd68`](https://github.com/indexable-inc/blaze/commit/ac1ee2dd682b7d321ba75a67924aaf95609572f0) on 2026-10-23, median of 3 edits, by hand; Linux x86-64 on AWS c8a.24xlarge (dev-aws-eph-rajit-x86edits), pinned to 16 cores with taskset (AMD EPYC 9R45, 16 of its 96 cores, 185 GiB), blaze [`961bb3105a`](https://github.com/indexable-inc/blaze/commit/961bb3105a8e90e0ac33488c803f5513f075bb87) on 2026-10-23, median of 3 edits, load average 12 at the start, by hand. It is the Rust port of [bun](https://github.com/oven-sh/bun), 1.25M lines of Rust in 103 crates on a nightly beside a JavaScript engine's C and C++, built with frame pointers as bun's own build is (`-C force-frame-pointers=yes`; [what it took](research/bun.md)). Its test suites are not measured yet.
 
 <details><summary>Every kind of edit, by platform</summary>
 
@@ -88,19 +88,19 @@ An edit to one function, cargo → ra-jit:
 
 (c): the daemon handed this edit to cargo (a fallback, so about cargo's time).
 
-Measured by hand with `harness/bench.py`, or by the `bench-readme` workflow (a project measured on its own, by its own workflow) on each platform's benchmark machine once it is registered. The ra-jit measured is `cargo build --release`; the binaries a release ships are the `dist` profile with PGO, which start and edit faster ([how](https://github.com/indexable-inc/blaze/blob/main/docs/reports/RELEASE-BUILD.md)). Cold builds, the spread of every number, the LLVM tier and how fast the built programs run: [every number below](#results). Raw JSON: [macOS arm64](benchmarks/macos-arm64.json), [Linux aarch64](benchmarks/linux-aarch64.json), [Linux x86-64](benchmarks/linux-x86-64.json); bun: [macOS arm64](benchmarks/bun-macos-arm64.json), [Linux aarch64](benchmarks/bun-linux-aarch64.json), [Linux x86-64](benchmarks/bun-linux-x86-64.json).
+Measured by hand with `harness/bench.py`, or by the `bench-readme` workflow (a project measured on its own, by its own workflow) on each platform's benchmark machine once it is registered. The blaze measured is `cargo build --release`; the binaries a release ships are the `dist` profile with PGO, which start and edit faster ([how](https://github.com/indexable-inc/blaze/blob/main/docs/reports/RELEASE-BUILD.md)). Cold builds, the spread of every number, the LLVM tier and how fast the built programs run: [every number below](#results). Raw JSON: [macOS arm64](benchmarks/macos-arm64.json), [Linux aarch64](benchmarks/linux-aarch64.json), [Linux x86-64](benchmarks/linux-x86-64.json); bun: [macOS arm64](benchmarks/bun-macos-arm64.json), [Linux aarch64](benchmarks/bun-linux-aarch64.json), [Linux x86-64](benchmarks/bun-linux-x86-64.json).
 <!-- benchsummary:end -->
 
 ## How much memory and disk it takes
 
 <!-- benchmem:start -->
-<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/memory-dark.svg"><img alt="Peak memory while an edit to one function builds, ra-jit against cargo, by platform: All projects (geometric mean): macOS arm64 12× more, Linux aarch64 3.9× more, Linux x86-64 3.2× more; ripgrep 15.1.0: macOS arm64 12× more · 2.9 GB vs cargo's 235 MB, Linux aarch64 3.6× more · 1.7 GB vs cargo's 464 MB, Linux x86-64 3.1× more · 1.7 GB vs cargo's 528 MB; fd 10.3.0: macOS arm64 12× more · 2.6 GB vs cargo's 212 MB, Linux aarch64 2.9× more · 1.5 GB vs cargo's 520 MB, Linux x86-64 2.4× more · 1.5 GB vs cargo's 605 MB; bat 0.26.0: Linux aarch64 2.9× more · 2.0 GB vs cargo's 672 MB, Linux x86-64 2.7× more · 2.0 GB vs cargo's 747 MB; hyperfine 1.19.0: Linux aarch64 4.9× more · 1.8 GB vs cargo's 361 MB, Linux x86-64 3.0× more · 1.6 GB vs cargo's 534 MB; just 1.43.0: Linux aarch64 4.7× more · 2.1 GB vs cargo's 434 MB, Linux x86-64 3.6× more · 1.9 GB vs cargo's 535 MB; axum 0.8.6: Linux aarch64 4.8× more · 1.9 GB vs cargo's 399 MB, Linux x86-64 3.5× more · 1.9 GB vs cargo's 534 MB; nushell 0.108.0: macOS arm64 12× more · 12.5 GB vs cargo's 1.1 GB, Linux aarch64 3.2× more · 7.6 GB vs cargo's 2.4 GB, Linux x86-64 2.7× more · 7.2 GB vs cargo's 2.7 GB; helix 25.07.1: Linux aarch64 3.7× more · 6.6 GB vs cargo's 1.8 GB, Linux x86-64 2.7× more · 5.8 GB vs cargo's 2.1 GB; bevy 0.20.0: Linux aarch64 2.6× more · 17.8 GB vs cargo's 6.7 GB, Linux x86-64 3.4× more · 28.9 GB vs cargo's 8.5 GB; biome @biomejs/biome@2.6.3: Linux x86-64 2.5× more · 7.6 GB vs cargo's 3.0 GB; bun 1.4.3: macOS arm64 12× more · 26.1 GB vs cargo's 2.1 GB, Linux aarch64 7.9× more · 27.7 GB vs cargo's 3.5 GB, Linux x86-64 7.4× more · 24.5 GB vs cargo's 3.3 GB" src="benchmarks/charts/memory-light.svg" width="760"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/memory-dark.svg"><img alt="Peak memory while an edit to one function builds, blaze against cargo, by platform: All projects (geometric mean): macOS arm64 12× more, Linux aarch64 3.9× more, Linux x86-64 3.2× more; ripgrep 15.1.0: macOS arm64 12× more · 2.9 GB vs cargo's 235 MB, Linux aarch64 3.6× more · 1.7 GB vs cargo's 464 MB, Linux x86-64 3.1× more · 1.7 GB vs cargo's 528 MB; fd 10.3.0: macOS arm64 12× more · 2.6 GB vs cargo's 212 MB, Linux aarch64 2.9× more · 1.5 GB vs cargo's 520 MB, Linux x86-64 2.4× more · 1.5 GB vs cargo's 605 MB; bat 0.26.0: Linux aarch64 2.9× more · 2.0 GB vs cargo's 672 MB, Linux x86-64 2.7× more · 2.0 GB vs cargo's 747 MB; hyperfine 1.19.0: Linux aarch64 4.9× more · 1.8 GB vs cargo's 361 MB, Linux x86-64 3.0× more · 1.6 GB vs cargo's 534 MB; just 1.43.0: Linux aarch64 4.7× more · 2.1 GB vs cargo's 434 MB, Linux x86-64 3.6× more · 1.9 GB vs cargo's 535 MB; axum 0.8.6: Linux aarch64 4.8× more · 1.9 GB vs cargo's 399 MB, Linux x86-64 3.5× more · 1.9 GB vs cargo's 534 MB; nushell 0.108.0: macOS arm64 12× more · 12.5 GB vs cargo's 1.1 GB, Linux aarch64 3.2× more · 7.6 GB vs cargo's 2.4 GB, Linux x86-64 2.7× more · 7.2 GB vs cargo's 2.7 GB; helix 25.07.1: Linux aarch64 3.7× more · 6.6 GB vs cargo's 1.8 GB, Linux x86-64 2.7× more · 5.8 GB vs cargo's 2.1 GB; bevy 0.20.0: Linux aarch64 2.6× more · 17.8 GB vs cargo's 6.7 GB, Linux x86-64 3.4× more · 28.9 GB vs cargo's 8.5 GB; biome @biomejs/biome@2.6.3: Linux x86-64 2.5× more · 7.6 GB vs cargo's 3.0 GB; bun 1.4.3: macOS arm64 12× more · 26.1 GB vs cargo's 2.1 GB, Linux aarch64 7.9× more · 27.7 GB vs cargo's 3.5 GB, Linux x86-64 7.4× more · 24.5 GB vs cargo's 3.3 GB" src="benchmarks/charts/memory-light.svg" width="760"></picture>
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/disk-dark.svg"><img alt="What a project's build keeps on disk, ra-jit against cargo, by platform: All projects (geometric mean): macOS arm64 1.5× more, Linux aarch64 1.2× more, Linux x86-64 2.0× more; ripgrep 15.1.0: macOS arm64 1.4× more · 598 MB vs cargo's 416 MB, Linux aarch64 1.3× more · 518 MB vs cargo's 404 MB, Linux x86-64 2.1× more · 852 MB vs cargo's 407 MB; fd 10.3.0: macOS arm64 1.3× more · 460 MB vs cargo's 355 MB, Linux aarch64 1.2× more · 801 MB vs cargo's 678 MB, Linux x86-64 2.3× more · 1.3 GB vs cargo's 571 MB; bat 0.26.0: Linux aarch64 1.2× more · 1.2 GB vs cargo's 980 MB, Linux x86-64 2.1× more · 2.0 GB vs cargo's 973 MB; hyperfine 1.19.0: Linux aarch64 1.3× more · 432 MB vs cargo's 340 MB, Linux x86-64 3.4× more · 1.2 GB vs cargo's 342 MB; just 1.43.0: Linux aarch64 1.2× more · 784 MB vs cargo's 664 MB, Linux x86-64 2.3× more · 1.5 GB vs cargo's 667 MB; axum 0.8.6: Linux aarch64 1.1× more · 454 MB vs cargo's 405 MB, Linux x86-64 2.0× more · 825 MB vs cargo's 404 MB; nushell 0.108.0: macOS arm64 1.3× more · 6.9 GB vs cargo's 5.3 GB, Linux aarch64 1.0× · 5.6 GB vs cargo's 5.3 GB, Linux x86-64 1.5× more · 7.8 GB vs cargo's 5.3 GB; helix 25.07.1: Linux aarch64 1.3× more · 4.6 GB vs cargo's 3.7 GB, Linux x86-64 1.6× more · 5.8 GB vs cargo's 3.7 GB; bevy 0.20.0: Linux aarch64 1.1× less · 16.0 GB vs cargo's 17.5 GB, Linux x86-64 1.1× more · 19.2 GB vs cargo's 17.5 GB; biome @biomejs/biome@2.6.3: Linux x86-64 3.9× more · 42.5 GB vs cargo's 11.0 GB; bun 1.4.3: macOS arm64 1.9× more · 11.3 GB vs cargo's 6.0 GB, Linux aarch64 1.2× more · 6.7 GB vs cargo's 5.6 GB, Linux x86-64 1.2× more · 6.7 GB vs cargo's 5.7 GB" src="benchmarks/charts/disk-light.svg" width="760"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/disk-dark.svg"><img alt="What a project's build keeps on disk, blaze against cargo, by platform: All projects (geometric mean): macOS arm64 1.5× more, Linux aarch64 1.2× more, Linux x86-64 2.0× more; ripgrep 15.1.0: macOS arm64 1.4× more · 598 MB vs cargo's 416 MB, Linux aarch64 1.3× more · 518 MB vs cargo's 404 MB, Linux x86-64 2.1× more · 852 MB vs cargo's 407 MB; fd 10.3.0: macOS arm64 1.3× more · 460 MB vs cargo's 355 MB, Linux aarch64 1.2× more · 801 MB vs cargo's 678 MB, Linux x86-64 2.3× more · 1.3 GB vs cargo's 571 MB; bat 0.26.0: Linux aarch64 1.2× more · 1.2 GB vs cargo's 980 MB, Linux x86-64 2.1× more · 2.0 GB vs cargo's 973 MB; hyperfine 1.19.0: Linux aarch64 1.3× more · 432 MB vs cargo's 340 MB, Linux x86-64 3.4× more · 1.2 GB vs cargo's 342 MB; just 1.43.0: Linux aarch64 1.2× more · 784 MB vs cargo's 664 MB, Linux x86-64 2.3× more · 1.5 GB vs cargo's 667 MB; axum 0.8.6: Linux aarch64 1.1× more · 454 MB vs cargo's 405 MB, Linux x86-64 2.0× more · 825 MB vs cargo's 404 MB; nushell 0.108.0: macOS arm64 1.3× more · 6.9 GB vs cargo's 5.3 GB, Linux aarch64 1.0× · 5.6 GB vs cargo's 5.3 GB, Linux x86-64 1.5× more · 7.8 GB vs cargo's 5.3 GB; helix 25.07.1: Linux aarch64 1.3× more · 4.6 GB vs cargo's 3.7 GB, Linux x86-64 1.6× more · 5.8 GB vs cargo's 3.7 GB; bevy 0.20.0: Linux aarch64 1.1× less · 16.0 GB vs cargo's 17.5 GB, Linux x86-64 1.1× more · 19.2 GB vs cargo's 17.5 GB; biome @biomejs/biome@2.6.3: Linux x86-64 3.9× more · 42.5 GB vs cargo's 11.0 GB; bun 1.4.3: macOS arm64 1.9× more · 11.3 GB vs cargo's 6.0 GB, Linux aarch64 1.2× more · 6.7 GB vs cargo's 5.6 GB, Linux x86-64 1.2× more · 6.7 GB vs cargo's 5.7 GB" src="benchmarks/charts/disk-light.svg" width="760"></picture>
 
-Memory and disk, Cranelift, from the same runs as the build table. Peak: the most every process doing the work held at once, cargo → ra-jit. For ra-jit that is the daemon, its workers and what they run, and `cargo ra-jit build` with any cargo it ran; for plain cargo, cargo itself, rustc, build scripts and the linker. How it is measured: [docs/benchmarks.md](#memory-and-disk).
+Memory and disk, Cranelift, from the same runs as the build table. Peak: the most every process doing the work held at once, cargo → blaze. For blaze that is the daemon, its workers and what they run, and `cargo blaze build` with any cargo it ran; for plain cargo, cargo itself, rustc, build scripts and the linker. How it is measured: [docs/benchmarks.md](#memory-and-disk).
 
-Peak while an edit to one function builds, cargo → ra-jit:
+Peak while an edit to one function builds, cargo → blaze:
 
 | Project | macOS arm64 | Linux aarch64 | Linux x86-64 |
 |---|---:|---:|---:|
@@ -158,7 +158,7 @@ Peak while an edit to one function builds, cargo → ra-jit:
 | biome @biomejs/biome@2.6.3 | 3.0 GB → **7.6 GB** | 6.9 GB ready, 19.3 GB after 57 builds | 8.6 GB → **9.6 GB** | 11.0 GB → 42.5 GB |
 | bun 1.4.3 | 3.3 GB → **24.5 GB** | 10.5 GB ready, 24.5 GB after 33 builds | 4.5 GB → **14.1 GB** | 5.7 GB → 6.7 GB |
 
-On disk: cargo's target directory → ra-jit's target directory, store and home.
+On disk: cargo's target directory → blaze's target directory, store and home.
 
 </details>
 <!-- benchmem:end -->
@@ -166,9 +166,9 @@ On disk: cargo's target directory → ra-jit's target directory, store and home.
 ## How fast the built programs run
 
 <!-- runbench:start -->
-<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/runtime-dark.svg"><img alt="How fast each benchmark runs built by ra-jit, against cargo build --release, by platform: All benchmarks (geometric mean): macOS arm64 1.18× slower, Linux aarch64 1.14× slower, Linux x86-64 1.10× slower; sieve: macOS arm64 1.12× slower, Linux aarch64 1.07× slower, Linux x86-64 1.00×; collatz: macOS arm64 1.01× slower, Linux aarch64 1.00×, Linux x86-64 1.00×; fnv: macOS arm64 1.00×, Linux aarch64 1.01× slower, Linux x86-64 1.00×; qsort: macOS arm64 1.05× faster, Linux aarch64 1.08× slower, Linux x86-64 1.01× slower; matmul: macOS arm64 1.21× slower, Linux aarch64 1.04× slower, Linux x86-64 1.07× slower; nbody: macOS arm64 1.31× slower, Linux aarch64 1.04× slower, Linux x86-64 1.02× faster; mandelbrot: macOS arm64 1.01× slower, Linux aarch64 1.00×, Linux x86-64 1.03× faster; words: macOS arm64 1.37× slower, Linux aarch64 1.44× slower, Linux x86-64 1.13× slower; numeric: macOS arm64 1.31× slower, Linux aarch64 1.22× slower, Linux x86-64 1.02× faster; jsonrt: macOS arm64 ≈1.38× slower, Linux aarch64 1.42× slower, Linux x86-64 1.25× slower; ripgrep: macOS arm64 ≈1.50× slower, Linux aarch64 1.30× slower, Linux x86-64 1.21× slower; fd: macOS arm64 ≈1.12× slower, Linux aarch64 1.23× slower, Linux x86-64 1.27× slower; tokei: macOS arm64 1.29× slower, Linux aarch64 1.21× slower, Linux x86-64 1.32× slower; eza: macOS arm64 ≈1.06× slower, Linux aarch64 1.05× slower, Linux x86-64 1.08× slower; bat: macOS arm64 ≈1.16× slower, Linux aarch64 1.13× slower, Linux x86-64 1.17× slower; bun: macOS arm64 1.25× slower, Linux aarch64 1.17× slower, Linux x86-64 1.22× slower" src="benchmarks/charts/runtime-light.svg" width="760"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/runtime-dark.svg"><img alt="How fast each benchmark runs built by blaze, against cargo build --release, by platform: All benchmarks (geometric mean): macOS arm64 1.18× slower, Linux aarch64 1.14× slower, Linux x86-64 1.10× slower; sieve: macOS arm64 1.12× slower, Linux aarch64 1.07× slower, Linux x86-64 1.00×; collatz: macOS arm64 1.01× slower, Linux aarch64 1.00×, Linux x86-64 1.00×; fnv: macOS arm64 1.00×, Linux aarch64 1.01× slower, Linux x86-64 1.00×; qsort: macOS arm64 1.05× faster, Linux aarch64 1.08× slower, Linux x86-64 1.01× slower; matmul: macOS arm64 1.21× slower, Linux aarch64 1.04× slower, Linux x86-64 1.07× slower; nbody: macOS arm64 1.31× slower, Linux aarch64 1.04× slower, Linux x86-64 1.02× faster; mandelbrot: macOS arm64 1.01× slower, Linux aarch64 1.00×, Linux x86-64 1.03× faster; words: macOS arm64 1.37× slower, Linux aarch64 1.44× slower, Linux x86-64 1.13× slower; numeric: macOS arm64 1.31× slower, Linux aarch64 1.22× slower, Linux x86-64 1.02× faster; jsonrt: macOS arm64 ≈1.38× slower, Linux aarch64 1.42× slower, Linux x86-64 1.25× slower; ripgrep: macOS arm64 ≈1.50× slower, Linux aarch64 1.30× slower, Linux x86-64 1.21× slower; fd: macOS arm64 ≈1.12× slower, Linux aarch64 1.23× slower, Linux x86-64 1.27× slower; tokei: macOS arm64 1.29× slower, Linux aarch64 1.21× slower, Linux x86-64 1.32× slower; eza: macOS arm64 ≈1.06× slower, Linux aarch64 1.05× slower, Linux x86-64 1.08× slower; bat: macOS arm64 ≈1.16× slower, Linux aarch64 1.13× slower, Linux x86-64 1.17× slower; bun: macOS arm64 1.25× slower, Linux aarch64 1.17× slower, Linux x86-64 1.22× slower" src="benchmarks/charts/runtime-light.svg" width="760"></picture>
 
-How fast the programs run. Each program is built by `cargo build --release` and by ra-jit with LLVM at `-O3`, every crate of it compiled by ra-jit, with the release profile; each benchmark is then run several times, the builds taking turns, median. A run is published only when every program did what the release build's did. Each platform is a machine of its own, and each number is ra-jit's time ÷ release's on it: 1x is as fast.
+How fast the programs run. Each program is built by `cargo build --release` and by blaze with LLVM at `-O3`, every crate of it compiled by blaze, with the release profile; each benchmark is then run several times, the builds taking turns, median. A run is published only when every program did what the release build's did. Each platform is a machine of its own, and each number is blaze's time ÷ release's on it: 1x is as fast.
 
 | Benchmark | macOS arm64 | Linux aarch64 | Linux x86-64 |
 |---|---:|---:|---:|
@@ -192,16 +192,16 @@ How fast the programs run. Each program is built by `cargo build --release` and 
 
 ≈: that benchmark's runs varied by more than 1.5× from fastest to slowest on that machine; read it as rough.
 
-- **macOS arm64**: GitHub-hosted macos-15 runner (a shared VM) (Apple M1 (Virtual), 3 cores, 7 GiB), ra-jit [`9c31e64d83`](https://github.com/indexable-inc/blaze/commit/9c31e64d83cd4cc2d0bbbd2e56b7e48d8a9326c6) on 2026-10-23, each benchmark run 5 times, load average 12 at the start, [by CI](https://github.com/indexable-inc/ra-jit/actions/runs/39876666206).
-- **Linux aarch64**: AWS c8g.8xlarge (Graviton4), pinned to 16 cores with taskset (Neoverse-V2, 16 of its 32 cores, 62 GiB), ra-jit [`e8d8a63da4`](https://github.com/indexable-inc/blaze/commit/e8d8a63da4) on 2026-10-23, each benchmark run 10 times, load average 11 at the start, by hand.
-- **Linux x86-64**: AWS c8a.8xlarge, pinned to 16 cores with taskset (AMD EPYC 9R45, 16 of its 32 cores, 62 GiB), ra-jit [`e8d8a63da4`](https://github.com/indexable-inc/blaze/commit/e8d8a63da4) on 2026-10-23, each benchmark run 10 times, load average 13 at the start, by hand.
-- **bun** is measured on its own, by the `bench-bun` workflow: macOS arm64 on one machine (Apple M5 Max, 18 cores, 128 GiB), ra-jit [`948d54e375`](https://github.com/indexable-inc/blaze/commit/948d54e375ef4f4685a932539d3a4118992a31c1) on 2026-10-23, each benchmark run 5 times, load average 29 at the start, by hand; Linux aarch64 on one machine (Neoverse-V2, 16 of its 96 cores, 185 GiB), ra-jit [`68c3558698`](https://github.com/indexable-inc/blaze/commit/68c3558698d1a050d728c592737766712fefae86) on 2026-10-23, each benchmark run 5 times, load average 12 at the start, by hand; Linux x86-64 on one machine (AMD EPYC 9R45, 16 of its 96 cores, 185 GiB), ra-jit [`68c3558698`](https://github.com/indexable-inc/blaze/commit/68c3558698d1a050d728c592737766712fefae86) on 2026-10-23, each benchmark run 5 times, load average 12 at the start, by hand.
+- **macOS arm64**: GitHub-hosted macos-15 runner (a shared VM) (Apple M1 (Virtual), 3 cores, 7 GiB), blaze [`9c31e64d83`](https://github.com/indexable-inc/blaze/commit/9c31e64d83cd4cc2d0bbbd2e56b7e48d8a9326c6) on 2026-10-23, each benchmark run 5 times, load average 12 at the start, [by CI](https://github.com/indexable-inc/ra-jit/actions/runs/39876666206).
+- **Linux aarch64**: AWS c8g.8xlarge (Graviton4), pinned to 16 cores with taskset (Neoverse-V2, 16 of its 32 cores, 62 GiB), blaze [`e8d8a63da4`](https://github.com/indexable-inc/blaze/commit/e8d8a63da4) on 2026-10-23, each benchmark run 10 times, load average 11 at the start, by hand.
+- **Linux x86-64**: AWS c8a.8xlarge, pinned to 16 cores with taskset (AMD EPYC 9R45, 16 of its 32 cores, 62 GiB), blaze [`e8d8a63da4`](https://github.com/indexable-inc/blaze/commit/e8d8a63da4) on 2026-10-23, each benchmark run 10 times, load average 13 at the start, by hand.
+- **bun** is measured on its own, by the `bench-bun` workflow: macOS arm64 on one machine (Apple M5 Max, 18 cores, 128 GiB), blaze [`948d54e375`](https://github.com/indexable-inc/blaze/commit/948d54e375ef4f4685a932539d3a4118992a31c1) on 2026-10-23, each benchmark run 5 times, load average 29 at the start, by hand; Linux aarch64 on one machine (Neoverse-V2, 16 of its 96 cores, 185 GiB), blaze [`68c3558698`](https://github.com/indexable-inc/blaze/commit/68c3558698d1a050d728c592737766712fefae86) on 2026-10-23, each benchmark run 5 times, load average 12 at the start, by hand; Linux x86-64 on one machine (AMD EPYC 9R45, 16 of its 96 cores, 185 GiB), blaze [`68c3558698`](https://github.com/indexable-inc/blaze/commit/68c3558698d1a050d728c592737766712fefae86) on 2026-10-23, each benchmark run 5 times, load average 12 at the start, by hand.
 
 <details><summary>Times, memory and builds, by platform</summary>
 
 **macOS arm64**
 
-| Benchmark | `cargo build --release` | ra-jit, LLVM | ra-jit ÷ release | release with dev checks ÷ release | Peak memory, release → ra-jit |
+| Benchmark | `cargo build --release` | blaze, LLVM | blaze ÷ release | release with dev checks ÷ release | Peak memory, release → blaze |
 |---|---:|---:|---:|---:|---:|
 | sieve | 45 ms | **50 ms** | 1.12x | 1.01x | 17 MB → 17 MB |
 | collatz | 150 ms | **151 ms** | 1.01x | 1.49x | 1 MB → 2 MB |
@@ -221,7 +221,7 @@ How fast the programs run. Each program is built by `cargo build --release` and 
 | bun | 332 ms | **415 ms** | 1.25x | - | 43 MB → 46 MB |
 | **All benchmarks (geometric mean)** | | | **1.18x** | 1.05x | |
 
-What each program takes, release → ra-jit: its build from cold (for ra-jit, cargo running the build scripts and proc macros, ra-jit's compile of every crate and the link), its size, and its build's memory (the most the build's processes held at once, and the largest one process: rustc or ra-jit, or the linker).
+What each program takes, release → blaze: its build from cold (for blaze, cargo running the build scripts and proc macros, blaze's compile of every crate and the link), its size, and its build's memory (the most the build's processes held at once, and the largest one process: rustc or blaze, or the linker).
 
 | Program | Build | Size | Build, peak | Build, largest process |
 |---|---:|---:|---:|---:|
@@ -237,7 +237,7 @@ What each program takes, release → ra-jit: its build from cold (for ra-jit, ca
 
 **Linux aarch64**
 
-| Benchmark | `cargo build --release` | ra-jit, LLVM | ra-jit ÷ release | release with dev checks ÷ release | Peak memory, release → ra-jit |
+| Benchmark | `cargo build --release` | blaze, LLVM | blaze ÷ release | release with dev checks ÷ release | Peak memory, release → blaze |
 |---|---:|---:|---:|---:|---:|
 | sieve | 50 ms | **54 ms** | 1.07x | 1.01x | 23 MB → 23 MB |
 | collatz | 105 ms | **105 ms** | 1.00x | 1.91x | 23 MB → 23 MB |
@@ -257,7 +257,7 @@ What each program takes, release → ra-jit: its build from cold (for ra-jit, ca
 | bun | 535 ms | **624 ms** | 1.17x | 1.10x | 54 MB → 58 MB |
 | **All benchmarks (geometric mean)** | | | **1.14x** | 1.07x | |
 
-What each program takes, release → ra-jit: its build from cold (for ra-jit, cargo running the build scripts and proc macros, ra-jit's compile of every crate and the link), its size, and its build's memory (the most the build's processes held at once, and the largest one process: rustc or ra-jit, or the linker).
+What each program takes, release → blaze: its build from cold (for blaze, cargo running the build scripts and proc macros, blaze's compile of every crate and the link), its size, and its build's memory (the most the build's processes held at once, and the largest one process: rustc or blaze, or the linker).
 
 | Program | Build | Size | Build, peak | Build, largest process |
 |---|---:|---:|---:|---:|
@@ -273,7 +273,7 @@ What each program takes, release → ra-jit: its build from cold (for ra-jit, ca
 
 **Linux x86-64**
 
-| Benchmark | `cargo build --release` | ra-jit, LLVM | ra-jit ÷ release | release with dev checks ÷ release | Peak memory, release → ra-jit |
+| Benchmark | `cargo build --release` | blaze, LLVM | blaze ÷ release | release with dev checks ÷ release | Peak memory, release → blaze |
 |---|---:|---:|---:|---:|---:|
 | sieve | 26 ms | **26 ms** | 1.00x | 1.00x | 22 MB → 22 MB |
 | collatz | 94 ms | **94 ms** | 1.00x | 1.80x | 22 MB → 22 MB |
@@ -293,7 +293,7 @@ What each program takes, release → ra-jit: its build from cold (for ra-jit, ca
 | bun | 389 ms | **476 ms** | 1.22x | 1.10x | 51 MB → 62 MB |
 | **All benchmarks (geometric mean)** | | | **1.10x** | 1.07x | |
 
-What each program takes, release → ra-jit: its build from cold (for ra-jit, cargo running the build scripts and proc macros, ra-jit's compile of every crate and the link), its size, and its build's memory (the most the build's processes held at once, and the largest one process: rustc or ra-jit, or the linker).
+What each program takes, release → blaze: its build from cold (for blaze, cargo running the build scripts and proc macros, blaze's compile of every crate and the link), its size, and its build's memory (the most the build's processes held at once, and the largest one process: rustc or blaze, or the linker).
 
 | Program | Build | Size | Build, peak | Build, largest process |
 |---|---:|---:|---:|---:|
@@ -613,7 +613,7 @@ when:
 It then commits those files to main as `github-actions[bot]` with `[skip ci]` in the message (so
 the commit starts no other workflow), once for every platform, rebasing onto main if main moved
 during the run. It pushes with the secret `RA_JIT_BOT_TOKEN`, a repository admin's token, which
-the ruleset on main lets past its merge queue; the job's own `GITHUB_TOKEN` is refused
+the ruleset on main lets past its required check; the job's own `GITHUB_TOKEN` is refused
 ([harness.md](harness.md#ci)). `bench-bun.yaml` does the same for bun, nightly, on the same runners: bun takes
 hours, so it has a workflow and a stored result of its own (`docs/benchmarks/bun-<platform>.json`
 and `runtime-bun-<platform>.json`, written by `benchreport.py --name bun`), but it is a project like
@@ -764,7 +764,7 @@ Every number of the newest run of each platform, then of each project measured o
 
 ### macOS arm64
 
-ra-jit [`84760c3f51`](https://github.com/indexable-inc/blaze/commit/84760c3f517a76f6e8a3aa41ccd81fc3f26b87c7), 2026-10-21T21:03:27Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/macos-arm64.json](benchmarks/macos-arm64.json).
+blaze [`84760c3f51`](https://github.com/indexable-inc/blaze/commit/84760c3f517a76f6e8a3aa41ccd81fc3f26b87c7), 2026-10-21T21:03:27Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/macos-arm64.json](benchmarks/macos-arm64.json).
 
 | Machine | |
 |---|---|
@@ -786,7 +786,7 @@ ra-jit [`84760c3f51`](https://github.com/indexable-inc/blaze/commit/84760c3f517a
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | ripgrep 15.1.0 | Edit a function | 993 ms | 126 ms | 7.9x | 646 ms to 1.11 s | 125 ms to 191 ms | daemon | spliced |
 | ripgrep 15.1.0 | Edit a widely used function | 1.31 s | 159 ms | 8.2x | 1.02 s to 4.28 s | 104 ms to 160 ms | daemon | spliced |
@@ -811,9 +811,9 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, Cranelift, macOS arm64
 
-From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 9.83 s | 12.08 s | 14.68 s | 17.62 s | 18,437 | 2,360 MB | 72 MB |
 | fd 10.3.0 | 9.17 s | 11.57 s | 12.62 s | 13.16 s | 8,478 | 1,946 MB | 32 MB |
@@ -821,9 +821,9 @@ From an empty target directory, crates already downloaded, one run. The empty st
 
 #### Memory and disk, Cranelift, macOS arm64
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | Cold, until the daemon is ready | 541 MB | 2.4 GB | 356 MB | 2.2 GB | 2.2 GB |
 | ripgrep 15.1.0 | Edit a function | 235 MB | 2.9 GB | 235 MB | 1.9 GB | 2.9 GB |
@@ -851,7 +851,7 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 2.2 GB | 2.8 GB | 2.8 GB after 39 builds | +23 MB | 2.3 GB, 2.0 GB | 416 MB | 526 MB | 72 MB | 0 MB |
 | fd 10.3.0 | 1.8 GB | 2.5 GB | 2.6 GB after 33 builds | +50 MB | 1.9 GB, 1.6 GB | 355 MB | 427 MB | 33 MB | 0 MB |
@@ -859,15 +859,15 @@ The daemon between builds, and what each side keeps on disk once the edits are d
 
 #### How fast the program runs, Cranelift, macOS arm64
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | ripgrep 15.1.0 | `rg -uuu --sort path -c \w+_unchecked\(\|unsafe \{ <the toolchain's library source>` | 1.01 s (676 ms to 1.43 s); 12 MB, 28.5 MB | 753 ms (679 ms to 1.07 s); 8 MB, 15.6 MB | 167 ms (129 ms to 308 ms); 6 MB, 6.6 MB |
 
 ### macOS arm64, bun
 
-ra-jit [`27077156cc`](https://github.com/indexable-inc/blaze/commit/27077156ccbd476079d261e529fc25b3225f0ace), 2026-10-23T05:22:33Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/bun-macos-arm64.json](benchmarks/bun-macos-arm64.json).
+blaze [`27077156cc`](https://github.com/indexable-inc/blaze/commit/27077156ccbd476079d261e529fc25b3225f0ace), 2026-10-23T05:22:33Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/bun-macos-arm64.json](benchmarks/bun-macos-arm64.json).
 
 | Machine | |
 |---|---|
@@ -889,7 +889,7 @@ ra-jit [`27077156cc`](https://github.com/indexable-inc/blaze/commit/27077156ccbd
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | bun 1.4.3 | Edit a function | 7.55 s | 362 ms | 21x | 6.96 s to 7.71 s | 305 ms to 1.07 s | daemon | spliced |
 | bun 1.4.3 | Edit a widely used function | 16.01 s | 457 ms | 35x | 15.53 s to 16.95 s | 454 ms to 604 ms | daemon | spliced |
@@ -900,17 +900,17 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, Cranelift, macOS arm64, bun
 
-From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 83.29 s | 79.49 s | 81.44 s | 64.31 s | 0 | 13,684 MB | 2,654 MB |
 
 #### Memory and disk, Cranelift, macOS arm64, bun
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | bun 1.4.3 | Cold, until the daemon is ready | 3.1 GB | 13.7 GB | 2.7 GB | 11.8 GB | 11.8 GB |
 | bun 1.4.3 | Edit a function | 2.1 GB | 26.1 GB | 2.1 GB | 26.0 GB | 26.1 GB |
@@ -922,21 +922,21 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 11.8 GB | 26.0 GB | 27.8 GB after 33 builds | +1.7 GB | 13.8 GB, 12.0 GB | 6.0 GB | 8.6 GB | 2.6 GB | 103 MB |
 
 #### How fast the program runs, Cranelift, macOS arm64, bun
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | bun 1.4.3 | `bun -e const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)` | 1.33 s (1.08 s to 1.55 s); 74 MB, 478.6 MB | 846 ms (720 ms to 935 ms); 54 MB, 245.9 MB | 113 ms (108 ms to 151 ms); 41 MB, 103.1 MB |
 
 ### Linux aarch64
 
-ra-jit [`c93e530e47`](https://github.com/indexable-inc/blaze/commit/c93e530e474c4de2d67a7a9ec49fd5581894efb8), 2026-10-23T21:59:50Z, Rust 1.99.0, 5 runs of each edit, measured by hand. Raw: [benchmarks/linux-aarch64.json](benchmarks/linux-aarch64.json).
+blaze [`c93e530e47`](https://github.com/indexable-inc/blaze/commit/c93e530e474c4de2d67a7a9ec49fd5581894efb8), 2026-10-23T21:59:50Z, Rust 1.99.0, 5 runs of each edit, measured by hand. Raw: [benchmarks/linux-aarch64.json](benchmarks/linux-aarch64.json).
 
 | Machine | |
 |---|---|
@@ -958,7 +958,7 @@ ra-jit [`c93e530e47`](https://github.com/indexable-inc/blaze/commit/c93e530e474c
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | ripgrep 15.1.0 | Edit a function | 1.18 s | 62 ms | 19x | 1.17 s to 1.19 s | 62 ms to 75 ms | daemon | spliced |
 | ripgrep 15.1.0 | Edit a widely used function | 1.54 s | 57 ms | 27x | 1.53 s to 1.57 s | 57 ms to 94 ms | daemon | spliced |
@@ -1015,9 +1015,9 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, Cranelift, Linux aarch64
 
-From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 6.11 s (6.05 s to 6.12 s) | 6.31 s (6.29 s to 6.34 s) | 6.86 s (6.85 s to 6.90 s) | 6.67 s (6.66 s to 6.72 s) | 0 | 2,095 MB | 18 MB |
 | fd 10.3.0 | 32.35 s (32.08 s to 32.36 s) | 32.51 s (32.42 s to 32.54 s) | 33.33 s (33.24 s to 33.36 s) | 32.86 s (32.77 s to 32.94 s) | 0 | 1,820 MB | 17 MB |
@@ -1031,9 +1031,9 @@ From an empty target directory, crates already downloaded, median of 5 runs, eac
 
 #### Memory and disk, Cranelift, Linux aarch64
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | Cold, until the daemon is ready | 1.9 GB | 2.5 GB | 416 MB | 1.7 GB | 1.5 GB |
 | ripgrep 15.1.0 | Edit a function | 464 MB | 1.7 GB | 274 MB | 1.6 GB | 1.7 GB |
@@ -1099,7 +1099,7 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 1.5 GB | 1.7 GB | 1.6 GB after 65 builds | −130 MB | 2.5 GB, 1.6 GB | 404 MB | 502 MB | 16 MB | 0 MB |
 | fd 10.3.0 | 1.7 GB | 1.6 GB | 1.5 GB after 55 builds | −139 MB | 3.2 GB, 1.5 GB | 678 MB | 786 MB | 15 MB | 0 MB |
@@ -1113,9 +1113,9 @@ The daemon between builds, and what each side keeps on disk once the edits are d
 
 #### How fast the program runs, Cranelift, Linux aarch64
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | ripgrep 15.1.0 | `rg -uuu --sort path -c \w+_unchecked\(\|unsafe \{ <the toolchain's library source>` | 1.10 s (1.10 s to 1.10 s); 50 MB, 200.1 MB | 1.08 s (1.08 s to 1.09 s); 50 MB, 51.4 MB | 54 ms (54 ms to 54 ms); 50 MB, 31.6 MB |
 
@@ -1123,7 +1123,7 @@ The same command run by the program ra-jit linked and by cargo's debug and relea
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | ripgrep 15.1.0 | Edit a function | 1.20 s | 72 ms | 17x | 1.20 s to 1.21 s | 71 ms to 88 ms | daemon | spliced |
 | ripgrep 15.1.0 | Edit a widely used function | 1.56 s | 67 ms | 23x | 1.56 s to 1.57 s | 66 ms to 105 ms | daemon | spliced |
@@ -1180,9 +1180,9 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, LLVM, Linux aarch64
 
-From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 6.52 s (6.44 s to 6.63 s) | 6.49 s (6.48 s to 6.51 s) | 7.08 s (7.06 s to 7.09 s) | 6.79 s (6.75 s to 6.82 s) | 0 | 2,194 MB | 17 MB |
 | fd 10.3.0 | 33.05 s (33.02 s to 33.20 s) | 32.54 s (32.42 s to 32.73 s) | 33.40 s (33.28 s to 33.59 s) | 32.85 s (32.82 s to 33.25 s) | 0 | 1,991 MB | 17 MB |
@@ -1196,9 +1196,9 @@ From an empty target directory, crates already downloaded, median of 5 runs, eac
 
 #### Memory and disk, LLVM, Linux aarch64
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | Cold, until the daemon is ready | 2.0 GB | 4.0 GB | 413 MB | 1.8 GB | 1.7 GB |
 | ripgrep 15.1.0 | Edit a function | 464 MB | 1.8 GB | 273 MB | 1.7 GB | 1.8 GB |
@@ -1264,7 +1264,7 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 1.7 GB | 1.9 GB | 1.7 GB after 65 builds | −148 MB | 3.2 GB, 1.8 GB | 404 MB | 502 MB | 15 MB | 1 MB |
 | fd 10.3.0 | 1.8 GB | 1.7 GB | 1.6 GB after 55 builds | −88 MB | 3.4 GB, 1.6 GB | 678 MB | 784 MB | 15 MB | 1 MB |
@@ -1278,15 +1278,15 @@ The daemon between builds, and what each side keeps on disk once the edits are d
 
 #### How fast the program runs, LLVM, Linux aarch64
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | ripgrep 15.1.0 | `rg -uuu --sort path -c \w+_unchecked\(\|unsafe \{ <the toolchain's library source>` | 1.09 s (1.09 s to 1.09 s); 57 MB, 197.9 MB | 1.08 s (1.08 s to 1.08 s); 57 MB, 51.4 MB | 54 ms (54 ms to 55 ms); 57 MB, 31.6 MB |
 
 ### Linux aarch64, bun
 
-ra-jit [`ac1ee2dd68`](https://github.com/indexable-inc/blaze/commit/ac1ee2dd682b7d321ba75a67924aaf95609572f0), 2026-10-23T08:43:38Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/bun-linux-aarch64.json](benchmarks/bun-linux-aarch64.json).
+blaze [`ac1ee2dd68`](https://github.com/indexable-inc/blaze/commit/ac1ee2dd682b7d321ba75a67924aaf95609572f0), 2026-10-23T08:43:38Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/bun-linux-aarch64.json](benchmarks/bun-linux-aarch64.json).
 
 | Machine | |
 |---|---|
@@ -1308,7 +1308,7 @@ ra-jit [`ac1ee2dd68`](https://github.com/indexable-inc/blaze/commit/ac1ee2dd682b
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | bun 1.4.3 | Edit a function | 10.63 s | 486 ms | 22x | 10.59 s to 10.65 s | 483 ms to 497 ms | daemon | spliced |
 | bun 1.4.3 | Edit a widely used function | 19.64 s | 477 ms | 41x | 19.63 s to 19.66 s | 477 ms to 480 ms | daemon | spliced |
@@ -1319,17 +1319,17 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, Cranelift, Linux aarch64, bun
 
-From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 89.03 s | 87.68 s | 91.44 s | 90.72 s | 0 | 36,189 MB | 92 MB |
 
 #### Memory and disk, Cranelift, Linux aarch64, bun
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | bun 1.4.3 | Cold, until the daemon is ready | 4.5 GB | 15.8 GB | 3.2 GB | 12.2 GB | 12.3 GB |
 | bun 1.4.3 | Edit a function | 3.5 GB | 27.7 GB | 3.2 GB | 27.6 GB | 27.7 GB |
@@ -1341,15 +1341,15 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 12.3 GB | 27.7 GB | 27.7 GB after 33 builds | +55 MB | 15.9 GB, 12.2 GB | 5.6 GB | 6.6 GB | 88 MB | 1 MB |
 
 #### How fast the program runs, Cranelift, Linux aarch64, bun
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | bun 1.4.3 | `bun -e const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)` | 3.51 s (3.51 s to 3.52 s); 105 MB, 601.0 MB | 2.03 s (2.03 s to 2.03 s); 105 MB, 408.4 MB | 189 ms (188 ms to 189 ms); 105 MB, 318.7 MB |
 
@@ -1357,7 +1357,7 @@ The same command run by the program ra-jit linked and by cargo's debug and relea
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | bun 1.4.3 | Edit a function | 10.66 s | 493 ms | 22x | 10.65 s to 10.67 s | 490 ms to 508 ms | daemon | spliced |
 | bun 1.4.3 | Edit a widely used function | 19.66 s | 483 ms | 41x | 19.59 s to 19.74 s | 481 ms to 494 ms | daemon | spliced |
@@ -1368,17 +1368,17 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, LLVM, Linux aarch64, bun
 
-From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 94.97 s | 89.03 s | 92.67 s | 90.46 s | 0 | 34,829 MB | 60 MB |
 
 #### Memory and disk, LLVM, Linux aarch64, bun
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | bun 1.4.3 | Cold, until the daemon is ready | 4.5 GB | 15.8 GB | 3.2 GB | 12.1 GB | 12.2 GB |
 | bun 1.4.3 | Edit a function | 3.5 GB | 27.3 GB | 3.2 GB | 27.1 GB | 27.2 GB |
@@ -1390,21 +1390,21 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 12.2 GB | 27.2 GB | 27.2 GB after 33 builds | +38 MB | 15.7 GB, 11.6 GB | 5.6 GB | 6.4 GB | 56 MB | 1 MB |
 
 #### How fast the program runs, LLVM, Linux aarch64, bun
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | bun 1.4.3 | `bun -e const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)` | 1.90 s (1.89 s to 1.90 s); 131 MB, 538.2 MB | 2.03 s (2.03 s to 2.06 s); 131 MB, 408.4 MB | 189 ms (188 ms to 190 ms); 131 MB, 318.7 MB |
 
 ### Linux x86-64
 
-ra-jit [`1a005421b7`](https://github.com/indexable-inc/blaze/commit/1a005421b7a47fa3968bc5de6645e25a50dfd855), 2026-10-25T02:46:55Z, Rust 1.99.0, 5 runs of each edit, measured by hand. Raw: [benchmarks/linux-x86-64.json](benchmarks/linux-x86-64.json).
+blaze [`1a005421b7`](https://github.com/indexable-inc/blaze/commit/1a005421b7a47fa3968bc5de6645e25a50dfd855), 2026-10-25T02:46:55Z, Rust 1.99.0, 5 runs of each edit, measured by hand. Raw: [benchmarks/linux-x86-64.json](benchmarks/linux-x86-64.json).
 
 | Machine | |
 |---|---|
@@ -1426,7 +1426,7 @@ ra-jit [`1a005421b7`](https://github.com/indexable-inc/blaze/commit/1a005421b7a4
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | ripgrep 15.1.0 | Edit a function | 508 ms | 56 ms | 9.1x | 504 ms to 516 ms | 55 ms to 66 ms | daemon | spliced |
 | ripgrep 15.1.0 | Edit a widely used function | 781 ms | 53 ms | 15x | 778 ms to 784 ms | 52 ms to 88 ms | daemon | spliced |
@@ -1490,9 +1490,9 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, Cranelift, Linux x86-64
 
-From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 4.67 s (4.63 s to 4.71 s) | 5.20 s (5.19 s to 5.23 s) | 5.75 s (5.74 s to 5.78 s) | 5.38 s (5.33 s to 5.45 s) | 0 | 2,034 MB | 93 MB |
 | fd 10.3.0 | 26.10 s (25.95 s to 26.14 s) | 29.57 s (29.45 s to 29.63 s) | 30.13 s (30.00 s to 30.18 s) | 29.77 s (29.60 s to 30.25 s) | 0 | 1,735 MB | 1,470 MB |
@@ -1507,9 +1507,9 @@ From an empty target directory, crates already downloaded, median of 5 runs, eac
 
 #### Memory and disk, Cranelift, Linux x86-64
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | Cold, until the daemon is ready | 2.4 GB | 5.2 GB | 421 MB | 1.7 GB | 1.6 GB |
 | ripgrep 15.1.0 | Edit a function | 528 MB | 1.7 GB | 294 MB | 1.5 GB | 1.6 GB |
@@ -1583,7 +1583,7 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 1.6 GB | 1.8 GB | 1.6 GB after 65 builds | −137 MB | 4.9 GB, 1.7 GB | 407 MB | 760 MB | 91 MB | 1 MB |
 | fd 10.3.0 | 1.6 GB | 1.5 GB | 1.4 GB after 55 builds | −93 MB | 6.5 GB, 1.4 GB | 571 MB | 1.0 GB | 321 MB | 0 MB |
@@ -1598,9 +1598,9 @@ The daemon between builds, and what each side keeps on disk once the edits are d
 
 #### How fast the program runs, Cranelift, Linux x86-64
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | ripgrep 15.1.0 | `rg -uuu --sort path -c \w+_unchecked\(\|unsafe \{ <the toolchain's library source>` | 1.09 s (1.09 s to 1.09 s); 111 MB, 200.8 MB | 1.07 s (1.07 s to 1.07 s); 111 MB, 53.2 MB | 30 ms (29 ms to 30 ms); 111 MB, 30.7 MB |
 
@@ -1608,7 +1608,7 @@ The same command run by the program ra-jit linked and by cargo's debug and relea
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | ripgrep 15.1.0 | Edit a function | 502 ms | 64 ms | 7.8x | 500 ms to 508 ms | 63 ms to 74 ms | daemon | spliced |
 | ripgrep 15.1.0 | Edit a widely used function | 781 ms | 62 ms | 13x | 779 ms to 783 ms | 61 ms to 96 ms | daemon | spliced |
@@ -1672,9 +1672,9 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, LLVM, Linux x86-64
 
-From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, median of 5 runs, each from nothing. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 5.17 s (5.13 s to 5.26 s) | 5.65 s (5.62 s to 5.75 s) | 6.24 s (6.21 s to 6.33 s) | 5.84 s (5.80 s to 5.89 s) | 0 | 2,041 MB | 63 MB |
 | fd 10.3.0 | 26.88 s (26.84 s to 27.00 s) | 31.80 s (31.79 s to 31.84 s) | 32.39 s (32.36 s to 32.43 s) | 32.69 s (32.41 s to 32.96 s) | 0 | 1,773 MB | 1,440 MB |
@@ -1689,9 +1689,9 @@ From an empty target directory, crates already downloaded, median of 5 runs, eac
 
 #### Memory and disk, LLVM, Linux x86-64
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | Cold, until the daemon is ready | 2.4 GB | 5.7 GB | 448 MB | 1.7 GB | 1.7 GB |
 | ripgrep 15.1.0 | Edit a function | 529 MB | 1.8 GB | 294 MB | 1.6 GB | 1.7 GB |
@@ -1765,7 +1765,7 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | ripgrep 15.1.0 | 1.7 GB | 1.8 GB | 1.7 GB after 65 builds | −86 MB | 5.6 GB, 1.7 GB | 407 MB | 608 MB | 61 MB | 0 MB |
 | fd 10.3.0 | 1.6 GB | 1.7 GB | 1.6 GB after 55 builds | −124 MB | 7.7 GB, 1.7 GB | 571 MB | 804 MB | 290 MB | 1 MB |
@@ -1780,15 +1780,15 @@ The daemon between builds, and what each side keeps on disk once the edits are d
 
 #### How fast the program runs, LLVM, Linux x86-64
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | ripgrep 15.1.0 | `rg -uuu --sort path -c \w+_unchecked\(\|unsafe \{ <the toolchain's library source>` | 1.08 s (1.07 s to 1.08 s); 111 MB, 199.8 MB | 1.08 s (1.07 s to 1.08 s); 111 MB, 53.2 MB | 30 ms (28 ms to 31 ms); 111 MB, 30.7 MB |
 
 ### Linux x86-64, bun
 
-ra-jit [`961bb3105a`](https://github.com/indexable-inc/blaze/commit/961bb3105a8e90e0ac33488c803f5513f075bb87), 2026-10-23T15:45:27Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/bun-linux-x86-64.json](benchmarks/bun-linux-x86-64.json).
+blaze [`961bb3105a`](https://github.com/indexable-inc/blaze/commit/961bb3105a8e90e0ac33488c803f5513f075bb87), 2026-10-23T15:45:27Z, Rust 1.99.0, 3 runs of each edit, measured by hand. Raw: [benchmarks/bun-linux-x86-64.json](benchmarks/bun-linux-x86-64.json).
 
 | Machine | |
 |---|---|
@@ -1810,7 +1810,7 @@ ra-jit [`961bb3105a`](https://github.com/indexable-inc/blaze/commit/961bb3105a8e
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | bun 1.4.3 | Edit a function | 9.11 s | 451 ms | 20x | 9.10 s to 9.23 s | 443 ms to 534 ms | daemon | spliced |
 | bun 1.4.3 | Edit a widely used function | 16.51 s | 430 ms | 38x | 16.48 s to 16.75 s | 420 ms to 439 ms | daemon | spliced |
@@ -1821,17 +1821,17 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, Cranelift, Linux x86-64, bun
 
-From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 71.44 s | 69.88 s | 73.07 s | 72.59 s | 0 | 32,580 MB | 100 MB |
 
 #### Memory and disk, Cranelift, Linux x86-64, bun
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | bun 1.4.3 | Cold, until the daemon is ready | 4.5 GB | 14.1 GB | 3.0 GB | 10.9 GB | 10.5 GB |
 | bun 1.4.3 | Edit a function | 3.3 GB | 24.5 GB | 3.0 GB | 24.3 GB | 24.5 GB |
@@ -1843,15 +1843,15 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 10.5 GB | 25.5 GB | 24.5 GB after 33 builds | −1.0 GB | 14.0 GB, 10.5 GB | 5.7 GB | 6.6 GB | 96 MB | 1 MB |
 
 #### How fast the program runs, Cranelift, Linux x86-64, bun
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | bun 1.4.3 | `bun -e const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)` | 1.40 s (1.40 s to 1.40 s); 108 MB, 591.4 MB | 961 ms (960 ms to 962 ms); 100 MB, 397.9 MB | 136 ms (136 ms to 136 ms); 100 MB, 314.0 MB |
 
@@ -1859,7 +1859,7 @@ The same command run by the program ra-jit linked and by cargo's debug and relea
 
 Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). Link: the change was spliced into the program, or it was linked again.
 
-| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |
+| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |
 |---|---|---:|---:|---:|---|---|---|---|
 | bun 1.4.3 | Edit a function | 9.06 s | 462 ms | 20x | 9.04 s to 9.14 s | 455 ms to 536 ms | daemon | spliced |
 | bun 1.4.3 | Edit a widely used function | 16.50 s | 438 ms | 38x | 16.49 s to 16.55 s | 437 ms to 439 ms | daemon | spliced |
@@ -1870,17 +1870,17 @@ Median, then the fastest and slowest run. Built: who built the edit (daemon, or 
 
 #### Cold, LLVM, Linux x86-64, bun
 
-From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
+From an empty target directory, crates already downloaded, one run. The empty store fetches the standard library as a release's first build does. `cargo blaze build` is cargo's own build (the daemon is not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. Warm store: the same in another checkout of the same commit, with the store the first one filled.
 
-| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
+| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | Functions compiled | Daemon memory | Store |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 78.33 s | 71.93 s | 74.95 s | 73.11 s | 0 | 31,245 MB | 68 MB |
 
 #### Memory and disk, LLVM, Linux x86-64, bun
 
-Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
+Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).
 
-| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |
+| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |
 |---|---|---:|---:|---:|---:|---:|
 | bun 1.4.3 | Cold, until the daemon is ready | 4.5 GB | 13.9 GB | 3.0 GB | 10.6 GB | 10.3 GB |
 | bun 1.4.3 | Edit a function | 3.3 GB | 24.2 GB | 3.0 GB | 24.0 GB | 24.1 GB |
@@ -1892,15 +1892,15 @@ Peak: the most every process doing the work held at once, sampled every 10 ms an
 
 The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.
 
-| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |
+| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | bun 1.4.3 | 10.3 GB | 25.1 GB | 24.2 GB after 33 builds | −952 MB | 13.8 GB, 10.4 GB | 5.7 GB | 6.5 GB | 64 MB | 1 MB |
 
 #### How fast the program runs, LLVM, Linux x86-64, bun
 
-The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
+The same command run by the program blaze linked and by cargo's debug and release builds, in turn. Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran (median of the runs, as the kernel kept it) and the size of the program.
 
-| Project | Command | ra-jit | cargo debug | cargo release |
+| Project | Command | blaze | cargo debug | cargo release |
 |---|---|---:|---:|---:|
 | bun 1.4.3 | `bun -e const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)` | 916 ms (916 ms to 917 ms); 135 MB, 530.5 MB | 961 ms (961 ms to 962 ms); 135 MB, 397.9 MB | 135 ms (135 ms to 136 ms); 135 MB, 314.0 MB |
 

@@ -37,10 +37,7 @@ use cranelift_codegen::ir::{InstBuilder, Value, types};
 use cranelift_module::ModuleRelocTarget;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
-    attrs::AttrFlags,
-    signatures::{
-        FunctionSignature, StaticFlags, StaticSignature, StructSignature, TraitSignature,
-    },
+    signatures::{FunctionSignature, StaticSignature, StructSignature, TraitSignature},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
@@ -60,7 +57,8 @@ use hir_ty::{
 
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
-    InstanceDef, MEM, Requests, Result, compiled_instance, compiled_root, compiled_static,
+    InstanceDef, MEM, Requests, Result, SymbolResolver, compiled_instance, compiled_root,
+    compiled_static,
     fragment::{Code, TextPart},
     home::Homes,
     is_thread_local, link_name, ptr, type_id,
@@ -185,20 +183,60 @@ pub(super) fn cache_code(
 /// The nodes are hashed once for all the roots; each root then hashes, in the order it finds
 /// them, every node it reaches with where the node's edges go in that order, so that a hash
 /// does not depend on the other roots.
+///
+/// A function of crates outside the checkout, instantiated with their types, is hashed by its
+/// stable name and not gone into: the name stands for its code and for all it reaches, as it
+/// does for the store's compiled functions ([`super::cached`]). What a test's hash says of
+/// what is below it, that it reaches what can't be compiled or the world outside, is kept in
+/// the store by the name, so that a daemon with the store compiles none of it.
 pub fn tests_reach(
     db: &dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
     roots: &[FunctionId],
 ) -> Vec<std::result::Result<Reach, AlwaysRun>> {
+    let header = (
+        FORMAT,
+        "tests by stable names",
+        super::target::Target::current().triple(),
+        super::store::toolchain(),
+    );
+    let names = super::stable::StableNames::new(db, symbols, FxHashSet::default(), true);
+    let store = super::store::Store::global();
     let mut walk = Walk::new(db, false);
     walk.tests = true;
     let starts: Vec<u32> = roots.iter().map(|&it| walk.reach(Node::Root(it))).collect();
+    let mut sealed: FxHashMap<u32, Sealed> = FxHashMap::default();
     let mut next = 0;
     while let Some(node) = walk.nodes.get(next).map(|it| it.node.clone()) {
-        walk.hash_node(next as u32, &node);
+        let at = next as u32;
         next += 1;
+        let Some(name) = sealed_name(db, &names, &node) else {
+            walk.hash_node(at, &node);
+            continue;
+        };
+        let key = below_key(&header, &name);
+        let below = store.and_then(|it| it.get(&key)).and_then(|it| Below::read(&it));
+        if below.is_none() {
+            walk.hash_node(at, &node);
+            walk.segments.pop();
+        }
+        let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+        (4u8, &name).hash(&mut hasher);
+        let type_id::Fingerprint(low, high) = hasher.finish();
+        walk.segments.push(u128::from(low) | u128::from(high) << 64);
+        sealed.insert(at, Sealed { key, below });
     }
-    let header =
-        (FORMAT, "tests", super::target::Target::current().triple(), super::store::toolchain());
+    // One found later is mostly below one found earlier, and is then taken whole by it.
+    let mut walked: Vec<u32> =
+        sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
+    walked.sort_unstable_by(|a, b| b.cmp(a));
+    for at in walked {
+        let below = below_of(db, &walk, &sealed, at);
+        if let Some(store) = store {
+            store.insert(&sealed[&at].key, below.write().as_bytes());
+        }
+        sealed.get_mut(&at).unwrap().below = Some(below);
+    }
     let mut local: FxHashMap<u32, u32> = FxHashMap::default();
     let mut order: Vec<u32> = Vec::new();
     // Where in `order` the node that first reached each one is.
@@ -216,16 +254,34 @@ pub fn tests_reach(
             let mut at = 0;
             while let Some(&node) = order.get(at) {
                 let seen = &walk.nodes[node as usize].node;
+                if let Some(Sealed { below: Some(below), .. }) = sealed.get(&node) {
+                    let path = |rest: &[String]| {
+                        let mut path = path_to(db, &walk, &order, &from, at);
+                        path.extend(rest.iter().skip(1).cloned());
+                        path
+                    };
+                    if let Some((why, rest)) = &below.uncompiled {
+                        return Err(AlwaysRun { why: why.clone(), path: path(rest) });
+                    }
+                    if outside_at.is_none()
+                        && let Some((why, rest)) = &below.outside
+                    {
+                        outside_at = Some((why.clone(), path(rest)));
+                    }
+                    at += 1;
+                    continue;
+                }
                 if walk.uncompiled.contains(&node) {
                     let why =
-                        format!("it reaches {}, which ra-jit can't compile", describe(db, seen));
+                        format!("it reaches {}, which blaze can't compile", describe(db, seen));
                     return Err(AlwaysRun { why, path: path_to(db, &walk, &order, &from, at) });
                 }
                 if outside_at.is_none()
                     && let Node::Leaf(name, _) = seen
                     && let Some(what) = outside(name)
                 {
-                    outside_at = Some((format!("it reaches `{name}`, which {what}"), at));
+                    let path = path_to(db, &walk, &order, &from, at);
+                    outside_at = Some((format!("it reaches `{name}`, which {what}"), path));
                 }
                 for edge in &walk.nodes[node as usize].edges {
                     if let std::collections::hash_map::Entry::Vacant(it) = local.entry(edge.to) {
@@ -240,18 +296,166 @@ pub fn tests_reach(
             header.hash(&mut hasher);
             for &node in &order {
                 walk.segments[node as usize].hash(&mut hasher);
-                let edges = &walk.nodes[node as usize].edges;
+                let edges = match sealed.contains_key(&node) {
+                    true => &[][..],
+                    false => &walk.nodes[node as usize].edges[..],
+                };
                 edges.len().hash(&mut hasher);
                 for edge in edges {
                     local[&edge.to].hash(&mut hasher);
                 }
             }
             let type_id::Fingerprint(low, high) = hasher.finish();
-            let outside = outside_at
-                .map(|(why, at)| AlwaysRun { why, path: path_to(db, &walk, &order, &from, at) });
+            let outside = outside_at.map(|(why, path)| AlwaysRun { why, path });
             Ok(Reach { hash: u128::from(low) | u128::from(high) << 64, outside })
         })
         .collect()
+}
+
+/// A node [`tests_reach`] takes whole by its stable name.
+struct Sealed {
+    /// Where the store keeps what is below it.
+    key: [u8; super::store::KEY],
+    /// Read from the store, or found by going into it.
+    below: Option<Below>,
+}
+
+/// What a test's hash says of what a node reaches, the node itself too: the first of what
+/// can't be compiled and the first way to the world outside, each with why and the calls to
+/// it from the node.
+#[derive(Default)]
+struct Below {
+    uncompiled: Option<(String, Vec<String>)>,
+    outside: Option<(String, Vec<String>)>,
+}
+
+impl Below {
+    const FORMAT: &str = "below 1";
+
+    /// A line for each that is there: `u` or `o`, why, and each call, all after tabs.
+    fn write(&self) -> String {
+        let mut out = format!("{}\n", Self::FORMAT);
+        for (kind, it) in [("u", &self.uncompiled), ("o", &self.outside)] {
+            let Some((why, path)) = it else { continue };
+            out.push_str(kind);
+            for field in std::iter::once(why).chain(path) {
+                out.push('\t');
+                out.push_str(&field.replace(['\t', '\n'], " "));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn read(bytes: &[u8]) -> Option<Below> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != Self::FORMAT {
+            return None;
+        }
+        let mut below = Below::default();
+        for line in lines {
+            let mut fields = line.split('\t');
+            let slot = match fields.next()? {
+                "u" => &mut below.uncompiled,
+                "o" => &mut below.outside,
+                _ => return None,
+            };
+            let why = fields.next()?.to_owned();
+            *slot = Some((why, fields.map(str::to_owned).collect()));
+        }
+        Some(below)
+    }
+}
+
+/// The stable name `node` is taken whole by in a test's hash: that of a function, a closure
+/// or a coroutine with nothing of the checkout in its name. `None` for anything else, and for
+/// what has no stable name.
+fn sealed_name(
+    db: &dyn HirDatabase,
+    names: &super::stable::StableNames<'_, '_>,
+    node: &Node,
+) -> Option<String> {
+    let name = match node {
+        Node::Root(func) => names.instance(&super::root_instance(db, *func))?,
+        Node::Instance(instance, _) => match instance.def {
+            InstanceDef::Fn(_)
+            | InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_) => names.instance(instance)?,
+            _ => return None,
+        },
+        Node::Static(_) | Node::Leaf(..) => return None,
+    };
+    (!super::stable::StableNames::of_checkout(&name)).then_some(name)
+}
+
+fn below_key(header: &impl std::fmt::Debug, name: &str) -> [u8; super::store::KEY] {
+    use sha2::Digest;
+    sha2::Sha256::digest(format!("tests reach below\n{header:?}\n{name}").as_bytes()).into()
+}
+
+/// What `start`, a sealed node gone into, reaches, as [`Below`] has it: a sealed node below it
+/// that has what is below it is not gone into again.
+fn below_of(
+    db: &dyn HirDatabase,
+    walk: &Walk<'_>,
+    sealed: &FxHashMap<u32, Sealed>,
+    start: u32,
+) -> Below {
+    let mut below = Below::default();
+    let (mut order, mut from) = (vec![start], vec![0u32]);
+    let mut seen = FxHashSet::from_iter([start]);
+    let mut at = 0;
+    while let Some(&node) = order.get(at) {
+        let path = |rest: &[String]| {
+            let mut path = path_to(db, walk, &order, &from, at);
+            path.extend(rest.iter().skip(1).cloned());
+            path
+        };
+        let known = sealed.get(&node).and_then(|it| it.below.as_ref()).filter(|_| node != start);
+        match known {
+            Some(inner) => {
+                if below.uncompiled.is_none()
+                    && let Some((why, rest)) = &inner.uncompiled
+                {
+                    below.uncompiled = Some((why.clone(), path(rest)));
+                }
+                if below.outside.is_none()
+                    && let Some((why, rest)) = &inner.outside
+                {
+                    below.outside = Some((why.clone(), path(rest)));
+                }
+            }
+            None => {
+                let seen_node = &walk.nodes[node as usize].node;
+                if below.uncompiled.is_none() && walk.uncompiled.contains(&node) {
+                    let why = format!(
+                        "it reaches {}, which blaze can't compile",
+                        describe(db, seen_node)
+                    );
+                    below.uncompiled = Some((why, path(&[])));
+                }
+                if below.outside.is_none()
+                    && let Node::Leaf(name, _) = seen_node
+                    && let Some(what) = outside(name)
+                {
+                    below.outside = Some((format!("it reaches `{name}`, which {what}"), path(&[])));
+                }
+                for edge in &walk.nodes[node as usize].edges {
+                    if seen.insert(edge.to) {
+                        order.push(edge.to);
+                        from.push(at as u32);
+                    }
+                }
+            }
+        }
+        if below.uncompiled.is_some() && below.outside.is_some() {
+            break;
+        }
+        at += 1;
+    }
+    below
 }
 
 /// The fewest calls from the root of `order` to its node at `at`, each by its name without
@@ -718,7 +922,7 @@ impl<'db> Walk<'db> {
     /// Notes that the node did not compile: nothing tells what it does then.
     fn cannot(&mut self, at: u32, hasher: &mut impl Hasher, e: &CodegenError) {
         self.uncompiled.insert(at);
-        self.nodes[at as usize].why = Why::own(format!("can't be compiled by ra-jit ({e})"));
+        self.nodes[at as usize].why = Why::own(format!("can't be compiled by blaze ({e})"));
         e.to_string().hash(hasher);
     }
 
@@ -1425,7 +1629,7 @@ fn library_body<'db>(
     };
     let mir = match mir {
         Ok(it) => it,
-        Err(e) => return Some(format!("has MIR ra-jit can't read ({e:?})")),
+        Err(e) => return Some(format!("has MIR blaze can't read ({e:?})")),
     };
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
     for (_, block) in mir.basic_blocks.iter() {
@@ -1480,7 +1684,7 @@ fn library_operand<'db>(
         }
         return match compiled_static(db, id) {
             Ok(it) => it.writable.then(|| format!("reads the static `{name}`, which can change")),
-            Err(e) => Some(format!("reads the static `{name}`, which ra-jit can't compile ({e})")),
+            Err(e) => Some(format!("reads the static `{name}`, which blaze can't compile ({e})")),
         };
     }
     let (func, args) = fn_item(operand)?;
@@ -1545,11 +1749,7 @@ fn library_name(db: &dyn HirDatabase, body: LibraryBody<'_>) -> String {
 
 /// The symbol a foreign static is linked by, if `id` is one.
 fn foreign_static(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
-    let signature = StaticSignature::of(db, id);
-    signature.flags.contains(StaticFlags::EXTERN).then(|| {
-        AttrFlags::link_name(db, id.into())
-            .map_or_else(|| signature.name.as_str().to_owned(), |it| it.as_str().to_owned())
-    })
+    super::static_link_name(db, id)
 }
 
 /// Why the arguments of the closure can't be what a result is kept by, and whether one holds
@@ -1651,7 +1851,7 @@ fn trouble<'db>(
         }
         TyKind::Dynamic(..) => Some("is a trait object".to_owned()),
         TyKind::Alias(..) if in_library => None,
-        _ => Some("is of a type ra-jit can't see into".to_owned()),
+        _ => Some("is of a type blaze can't see into".to_owned()),
     }
 }
 
@@ -1765,5 +1965,27 @@ mod tests {
         let other = code(&[0x90, 0x90, 0xc3], Vec::new());
         assert_eq!(hash(&here), hash(&moved));
         assert_ne!(hash(&here), hash(&other));
+    }
+
+    #[test]
+    fn what_is_below_a_sealed_node_reads_back_as_it_was_written() {
+        let path = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+        let below = Below {
+            uncompiled: None,
+            outside: Some((
+                "it reaches `open`, which reads or writes files".to_owned(),
+                path(&["std::fs::read", "std::fs::File::open", "open"]),
+            )),
+        };
+        let read = Below::read(below.write().as_bytes()).unwrap();
+        assert_eq!(read.uncompiled, None);
+        assert_eq!(read.outside, below.outside);
+        let nothing = Below::read(Below::default().write().as_bytes()).unwrap();
+        assert!(nothing.uncompiled.is_none() && nothing.outside.is_none());
+        // A tab in what is said would start a call of its own.
+        let tabbed = Below { uncompiled: Some(("a\tb".to_owned(), path(&["f"]))), outside: None };
+        let read = Below::read(tabbed.write().as_bytes()).unwrap();
+        assert_eq!(read.uncompiled, Some(("a b".to_owned(), path(&["f"]))));
+        assert!(Below::read(b"below 0\n").is_none());
     }
 }

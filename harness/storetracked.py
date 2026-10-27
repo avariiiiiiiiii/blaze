@@ -203,11 +203,11 @@ def serve(ws, env, label):
     unasked."""
     build(ws, env, f"{label}: the first build")
     for _ in range(240):
-        if "[ra-jit]" in build(ws, env, f"{label}: the wait for the daemon"):
+        if "[blaze]" in build(ws, env, f"{label}: the wait for the daemon"):
             break
         time.sleep(0.5)
     else:
-        raise SystemExit(f"{label}: no build said `[ra-jit]`; the daemon's log is in {env['RA_JIT_HOME']}")
+        raise SystemExit(f"{label}: no build said `[blaze]`; the daemon's log is in {env['RA_JIT_HOME']}")
     for _ in range(40):
         status = subprocess.run(["cargo", "ra-jit", "status"], cwd=ws, env=env, capture_output=True,
                                 text=True, timeout=120).stdout
@@ -249,7 +249,7 @@ def restart(ws, env, label, steps):
         verdict = "ok"
         if printed != expected:
             verdict = f"PRINTED {printed!r}, NOT {expected!r}"
-        elif "[ra-jit]" not in said:
+        elif "[blaze]" not in said:
             verdict = "NOT SERVED BY THE DAEMON"
         elif in_full:
             how = f"built in full; {how}"

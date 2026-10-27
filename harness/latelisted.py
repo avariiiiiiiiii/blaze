@@ -92,7 +92,7 @@ def main():
         made = patches(home)[seen:]
         ran = subprocess.run([program], capture_output=True, text=True, timeout=60)
         _, theirs = reference.cargo("run", "-q", "-p", "app")
-        if "[ra-jit]" not in said:
+        if "[blaze]" not in said:
             wrong.append("the edit was not built by the daemon")
         elif not made:
             wrong.append("the edit was not patched")

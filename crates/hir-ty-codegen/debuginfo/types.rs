@@ -243,6 +243,11 @@ impl<'db> Types<'db> {
         let size = layout.size.bytes();
         let base = |name, encoding| Some(DebugType::Base { name, size, encoding });
         let mut of = Aggregate::opaque(name, size);
+        // A scalable vector's lanes are as many as the machine's vector length makes them,
+        // which a fixed description has no word for: it is told of without its fields.
+        if let rustc_abi::BackendRepr::SimdScalableVector { .. } = layout.backend_repr {
+            return Some(DebugType::Struct(of));
+        }
         match ty.kind() {
             TyKind::Bool => return base(of.name, encoding::BOOLEAN),
             TyKind::Char => return base(of.name, encoding::UTF),

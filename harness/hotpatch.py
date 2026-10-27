@@ -92,7 +92,7 @@ class Tool:
             self.build("first build")
             if self.name == "ra-jit":
                 for _ in range(240):
-                    if "[ra-jit]" in self.build("wait for the daemon"):
+                    if "[blaze]" in self.build("wait for the daemon"):
                         break
                     time.sleep(0.5)
                 else:

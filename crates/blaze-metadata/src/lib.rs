@@ -102,7 +102,7 @@ pub fn workspace_root(
 }
 
 /// A program a `cargo build` or `cargo test` links: a binary or an example of a member it
-/// builds, or a test of one.
+/// builds, a `cdylib` or `staticlib` of its library, or a test of one.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Program {
     /// The id of its package, as `cargo metadata` spells it.
@@ -125,14 +125,29 @@ pub enum Kind {
     Bin,
     Example,
     Test,
+    /// The `cdylib` of a library, which `cargo build` links as a shared library (#262).
+    Cdylib,
+    /// The `staticlib` of a library, an archive `cargo build` writes.
+    Staticlib,
 }
 
-/// The programs a build names with `--bin` or `--example`, or none for every binary; of
-/// `cargo test` (`test`), also the targets `--lib` and `--test` name.
+impl Kind {
+    /// Whether it is a library's linked output, a `cdylib` or a `staticlib`, and not an
+    /// executable.
+    pub fn linked_library(self) -> bool {
+        matches!(self, Kind::Cdylib | Kind::Staticlib)
+    }
+}
+
+/// The programs a build names with `--bin`, `--example` or `--lib`, or none for every binary
+/// and the `cdylib` and `staticlib` of each library; of `cargo test` (`test`), also the targets
+/// `--lib` and `--test` name.
 #[derive(Clone, Copy, Default)]
 pub struct Targets<'a> {
     pub bin: Option<&'a str>,
     pub example: Option<&'a str>,
+    /// `--lib` of a build: the library's `cdylib` and `staticlib`.
+    pub lib: bool,
     pub test: Option<Tests<'a>>,
 }
 
@@ -154,9 +169,14 @@ impl Targets<'_> {
     fn picks(&self, kind: Kind, name: &str, tested: bool) -> Option<bool> {
         let Some(tests) = self.test else {
             let named = match self {
-                Targets { bin: Some(asked), .. } => kind == Kind::Bin && name == *asked,
-                Targets { example: Some(asked), .. } => kind == Kind::Example && name == *asked,
-                _ => kind == Kind::Bin,
+                Targets { bin: None, example: None, lib: false, .. } => {
+                    kind == Kind::Bin || kind.linked_library()
+                }
+                _ => {
+                    (kind == Kind::Bin && self.bin == Some(name))
+                        || (kind == Kind::Example && self.example == Some(name))
+                        || (kind.linked_library() && self.lib)
+                }
             };
             return named.then_some(false);
         };
@@ -172,6 +192,7 @@ impl Targets<'_> {
             Kind::Bin => self.bin == Some(name),
             Kind::Example => self.example == Some(name),
             Kind::Test => tests.test == Some(name),
+            Kind::Cdylib | Kind::Staticlib => false,
         };
         named.then_some(kind != Kind::Example || tested)
     }
@@ -180,6 +201,28 @@ impl Targets<'_> {
 /// The JSON `cargo metadata --format-version 1` prints for `asked`.
 pub fn metadata(asked: &Asked<'_>) -> Result<String> {
     Ok(made(asked)?.json)
+}
+
+/// The JSON `cargo metadata --format-version 1 --no-deps` prints for `asked`: the members
+/// alone, nothing resolved or fetched.
+pub fn metadata_no_deps(asked: &Asked<'_>) -> Result<String> {
+    let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
+    config.start("metadata", asked.config)?;
+    let ctx = Context::new(config);
+    let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
+    Ok(serde_json::to_string(&blaze_manifest::metadata::export_no_deps(&ws))?)
+}
+
+/// [`metadata`] of a workspace whose lock file is never written, as `cargo metadata
+/// --locked` reads one: a lock file the manifests no longer agree with is cargo's
+/// `--locked` error. The standard library's workspace in a toolchain is read so.
+pub fn metadata_locked(asked: &Asked<'_>) -> Result<String> {
+    let relock =
+        Relock { command: "metadata", locked: Some("--locked"), respect_source_config: true };
+    let made = resolving_with(asked, None, Some(relock), |resolved, serialized, ids, _| {
+        described(asked, &resolved, serialized, ids)
+    })?;
+    Ok(made.json)
 }
 
 /// The metadata of `asked`'s build, and the programs it links of `targets`, as cargo's unit
@@ -220,6 +263,16 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
                 _ if of("kind", "custom-build") => continue,
                 _ => Kind::Lib,
             };
+            // A build links a library's `cdylib` and `staticlib`, each a program of its own;
+            // its `rlib` is linked into the others.
+            let kinds: Vec<Kind> = match (kind, targets.test) {
+                (Kind::Lib, None) => [("cdylib", Kind::Cdylib), ("staticlib", Kind::Staticlib)]
+                    .into_iter()
+                    .filter(|(it, _)| of("crate_types", it))
+                    .map(|(_, kind)| kind)
+                    .collect(),
+                _ => vec![kind],
+            };
             let name = target["name"].as_str().unwrap_or_default();
             let tested = target["test"].as_bool().unwrap_or(false);
             let root = PathBuf::from(target["src_path"].as_str().unwrap_or_default());
@@ -232,21 +285,23 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
             if kind == Kind::Bin && missing.is_empty() {
                 bins.push((name, root.clone()));
             }
-            let Some(test) = targets.picks(kind, name, tested) else { continue };
-            if !missing.is_empty() && targets.named() {
-                let listed: Vec<String> = missing.iter().map(|it| format!("`{it}`")).collect();
-                bail!(
-                    "target `{name}` in package `{}` requires the features: {}\nConsider enabling them by passing, e.g., `--features=\"{}\"`",
-                    package["name"].as_str().unwrap_or_default(),
-                    listed.join(", "),
-                    missing.join(" ")
-                );
-            }
-            if missing.is_empty() {
-                integration |= kind == Kind::Test;
-                let harness = test && !unharnessed.contains(&root);
-                let (package, name) = (id.to_owned(), name.to_owned());
-                programs.push(Program { package, name, root, kind, test, harness });
+            for kind in kinds {
+                let Some(test) = targets.picks(kind, name, tested) else { continue };
+                if !missing.is_empty() && targets.named() {
+                    let listed: Vec<String> = missing.iter().map(|it| format!("`{it}`")).collect();
+                    bail!(
+                        "target `{name}` in package `{}` requires the features: {}\nConsider enabling them by passing, e.g., `--features=\"{}\"`",
+                        package["name"].as_str().unwrap_or_default(),
+                        listed.join(", "),
+                        missing.join(" ")
+                    );
+                }
+                if missing.is_empty() {
+                    integration |= kind == Kind::Test;
+                    let harness = test && !unharnessed.contains(&root);
+                    let (package, name, root) = (id.to_owned(), name.to_owned(), root.clone());
+                    programs.push(Program { package, name, root, kind, test, harness });
+                }
             }
         }
         for (name, root) in bins.into_iter().filter(|_| integration) {
@@ -256,6 +311,85 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
         }
     }
     Ok((json, programs))
+}
+
+/// The unit graph of a build, as `cargo build --unit-graph` prints it: which of its targets
+/// and how, as [`blaze_units::Request`] says.
+pub struct Units<'a> {
+    pub intent: blaze_units::Intent,
+    pub filter: &'a blaze_units::Filter,
+    /// `--release`.
+    pub release: bool,
+    /// `--profile`.
+    pub profile: Option<&'a str>,
+    /// The host's triple and cfg.
+    pub host: &'a blaze_units::Platformed,
+    /// `--target`'s, when the build is not for the host.
+    pub target: Option<&'a blaze_units::Platformed>,
+}
+
+/// The unit graph of `asked`'s build (`asked.build` selects its members, and has to want the
+/// dev-dependencies exactly when the filter's targets do), made by blaze-units from blaze's
+/// own resolve: what `cargo <command> --unit-graph` prints.
+pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGraph> {
+    let build = asked.build.as_ref().context("a unit graph is of a build")?;
+    let has_dev_units = units.filter.need_dev_deps(units.intent);
+    anyhow::ensure!(
+        build.dev_units == has_dev_units,
+        "the build {} the dev-dependencies but its targets {}",
+        if build.dev_units { "resolves" } else { "does not resolve" },
+        if has_dev_units { "need them" } else { "do not" },
+    );
+    let requested = blaze_manifest::profiles::requested_profile(
+        units.intent.default_profile(),
+        units.release,
+        units.profile,
+    )?;
+    resolved(asked, None, |resolved| {
+        let Resolved { ws, resolve, specs, cli_features, behavior, packages: reads, .. } = resolved;
+        let profiles = blaze_manifest::profiles::Profiles::new(
+            ws.profiles(),
+            ws.unstable_features(),
+            resolved.config,
+            &requested,
+            &units.host.triple,
+        )?;
+        let host = TargetPlatform { triple: &units.host.triple, cfg: &units.host.cfg };
+        let target = units.target.map(|it| TargetPlatform { triple: &it.triple, cfg: &it.cfg });
+        let packages =
+            Packages { reads, platform: Some(target.as_ref().unwrap_or(&host)), host: Some(&host) };
+        let kinds = match units.target {
+            Some(target) => vec![CompileKind::Target(InternedString::new(&target.triple))],
+            None => vec![CompileKind::Host],
+        };
+        let member_features = members_with_features(&resolved.members, specs, cli_features)?;
+        let dev = if has_dev_units { HasDevUnits::Yes } else { HasDevUnits::No };
+        let opts = FeatureOpts::new(behavior, dev, ForceAllTargets::No);
+        let features =
+            FeatureResolver::resolve(&packages, resolve, &member_features, &kinds, opts)?;
+        let roots: Vec<PackageId> = member_features.iter().map(|(it, _)| it.package_id()).collect();
+        let mut by_id = FxHashMap::default();
+        for id in resolve.iter() {
+            let manifest = resolved
+                .manifests
+                .get(&id)
+                .with_context(|| format!("no manifest of `{id}` was read"))?;
+            let is_member = resolved.member_ids.contains(&id);
+            by_id.insert(id, blaze_units::Package { manifest, is_member });
+        }
+        blaze_units::unit_graph(&blaze_units::Request {
+            packages: &by_id,
+            resolve,
+            features: &features,
+            profiles: &profiles,
+            roots: &roots,
+            intent: units.intent,
+            filter: units.filter,
+            host: units.host,
+            target: units.target,
+            has_dev_units,
+        })
+    })
 }
 
 /// The workspace of an [`Asked`] resolved as cargo's `resolve_ws_with_opts` resolves it, before
@@ -273,6 +407,10 @@ pub struct Resolved<'a> {
     pub has_dev_units: HasDevUnits,
     /// What was read of every package the lock file names.
     pub packages: &'a FxHashMap<PackageId, Read>,
+    /// The manifest of every package the lock file names.
+    pub manifests: &'a FxHashMap<PackageId, &'a Manifest>,
+    /// The configuration the workspace was read with.
+    pub config: &'a Config,
 }
 
 /// The packages a command selects of the workspace, from its members' ids.
@@ -528,6 +666,13 @@ fn resolving_with<R>(
         }
     }
     let unused_patches = whole.unused_patches().to_vec();
+    let manifests: FxHashMap<PackageId, &Manifest> = ws
+        .members()
+        .map(|(_, m)| m)
+        .chain(path_packages.iter().chain(&fetched).map(|it| &*it.manifest))
+        .zip(&ids)
+        .map(|(m, id)| (*id, m))
+        .collect();
     let resolved = Resolved {
         ws: &ws,
         resolve: &targeted,
@@ -538,6 +683,8 @@ fn resolving_with<R>(
         behavior,
         has_dev_units,
         packages: &reads,
+        manifests: &manifests,
+        config: &ctx.config,
     };
     then(resolved, serialized, &ids, &unused_patches)
 }
@@ -567,7 +714,7 @@ fn described(
         Some(platform) => vec![CompileKind::Target(InternedString::new(platform.triple))],
         None => vec![CompileKind::Host],
     };
-    let packages = Packages { reads, platform: asked.platform.as_ref() };
+    let packages = Packages { reads, platform: asked.platform.as_ref(), host: None };
     let mut roots = Vec::new();
     let resolve = match &asked.build {
         None => resolve_graph(targeted, member_ids, current, &packages, &kinds)?,
@@ -623,11 +770,20 @@ struct Made {
 struct Packages<'a> {
     reads: &'a FxHashMap<PackageId, Read>,
     platform: Option<&'a TargetPlatform<'a>>,
+    /// The host's platform, for what is built for it, when it is not `platform`.
+    host: Option<&'a TargetPlatform<'a>>,
 }
 
 impl Packages<'_> {
     fn activates(&self, platform: &Platform) -> bool {
         self.platform.is_none_or(|it| it.activates(platform))
+    }
+
+    fn activates_for(&self, platform: &Platform, kind: CompileKind) -> bool {
+        match (kind, self.host) {
+            (CompileKind::Host, Some(host)) => host.activates(platform),
+            _ => self.activates(platform),
+        }
     }
 }
 
@@ -654,8 +810,8 @@ impl PackageTargets for Packages<'_> {
         self.reads.get(&package_id).is_some_and(|it| it.proc_macro_lib)
     }
 
-    fn platform_activated(&self, platform: &Platform, _kind: CompileKind) -> bool {
-        self.activates(platform)
+    fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool {
+        self.activates_for(platform, kind)
     }
 }
 

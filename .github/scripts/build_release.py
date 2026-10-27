@@ -9,6 +9,7 @@ build it with this.
   build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
   build_release.py --pin DIR                      # pgo/profiles.json names the profiles in DIR
   build_release.py --target T --show              # the command the build runs, for any other driver
+  build_release.py --server-beside RA_JIT         # blaze's proc-macro server beside a ra-jit already built (CI)
 
 The build is `cargo build -p ra-jit --profile dist --locked --target T --features llvm` with
 `RUSTFLAGS=-Cprofile-use=<profile>`. The `llvm` feature is part of every build of it, the
@@ -50,7 +51,7 @@ proc-macro libraries ra-jit links, found beside ra-jit (`RA_JIT_PROC_MACRO_SERVE
 built whole by ra-jit (`--exe`), over the standard library ra-jit compiles, so it speaks the
 bridge of the libraries that ra-jit compiles; its own serde derives are expanded by the
 toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
-Linux only, where ra-jit links proc-macro libraries so far.
+Not on Windows, whose release blaze does not build yet.
 
 On Linux every binary in DIR, the server's included, is refused when it asks for a glibc newer
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
@@ -400,6 +401,8 @@ def main():
     parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
     parser.add_argument("--features", help="cargo features of ra-jit besides `llvm`, which every build has")
     parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that ra-jit")
+    parser.add_argument("--server-beside", type=Path, metavar="RA_JIT",
+                        help="only build blaze's proc-macro server, with RA_JIT, beside it (CI's build of ra-jit)")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
     parser.add_argument("--nix", action="store_true",
@@ -407,6 +410,10 @@ def main():
     args = parser.parse_args()
     if args.pin:
         return pin(args.pin)
+    if args.server_beside:
+        ra_jit = args.server_beside.resolve()
+        proc_macro_server(ra_jit, ra_jit.parent)
+        return
     if not args.target:
         parser.error("--target is required")
     if args.server and not args.out:

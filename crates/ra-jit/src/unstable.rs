@@ -41,19 +41,19 @@ const CHECKS: &str = "what rustc checks of itself while it compiles";
 const ACCEPTS: &str = "which programs rustc's type checker accepts, not the code of one it accepts";
 const RUSTC_BACKEND: &str =
     "how rustc's backend optimizes or lays out its own code; the program does the same";
-const DEBUG: &str = "what rustc's own objects tell a debugger; ra-jit writes its own debug info";
-const CODE: &str = "it changes the code rustc generates, which ra-jit's code generator does not do";
-const ABI: &str = "it changes the ABI or symbols rustc's code has, which ra-jit's code must match";
+const DEBUG: &str = "what rustc's own objects tell a debugger; blaze writes its own debug info";
+const CODE: &str = "it changes the code rustc generates, which blaze's code generator does not do";
+const ABI: &str = "it changes the ABI or symbols rustc's code has, which blaze's code must match";
 const EXPORTS: &str =
-    "it changes which functions rustc's libraries export, which ra-jit links against";
-const SEMANTICS: &str = "it changes what the program does, which ra-jit does not model";
-const LINKS: &str = "it changes how rustc links, which ra-jit's link does not do";
+    "it changes which functions rustc's libraries export, which blaze links against";
+const SEMANTICS: &str = "it changes what the program does, which blaze does not model";
+const LINKS: &str = "it changes how rustc links, which blaze's link does not do";
 const NOT_BUILT: &str = "rustc does not build the crate's code with it";
-const INSTRUMENTS: &str = "it instruments the code, which ra-jit's code generator does not do";
+const INSTRUMENTS: &str = "it instruments the code, which blaze's code generator does not do";
 
 /// Every flag of `rustc -Z help`, sorted by name.
 const TABLE: &[(&str, Row)] = &[
-    ("allow-features", Refused("ra-jit does not check which features a crate enables")),
+    ("allow-features", Refused("blaze does not check which features a crate enables")),
     ("allow-partial-mitigations", Refused(ABI)),
     ("always-encode-mir", Refused(EXPORTS)),
     ("annotate-moves", Ignored(DEBUG)),
@@ -73,13 +73,13 @@ const TABLE: &[(&str, Row)] = &[
     ("checksum-hash-algorithm", Ignored(PRINTS)),
     (
         "codegen-backend",
-        Refused("ra-jit links against what rustc's LLVM backend builds, not another backend's"),
+        Refused("blaze links against what rustc's LLVM backend builds, not another backend's"),
     ),
     ("codegen-emit-retag", Refused(INSTRUMENTS)),
     ("codegen-source-order", Ignored(RUSTC_BACKEND)),
-    ("contract-checks", OffOnly("ra-jit compiles `contract_checks()` as false")),
+    ("contract-checks", OffOnly("blaze compiles `contract_checks()` as false")),
     ("coverage-options", Refused(INSTRUMENTS)),
-    ("crate-attr", Refused("ra-jit's front end does not see the attribute it adds")),
+    ("crate-attr", Refused("blaze's front end does not see the attribute it adds")),
     ("cross-crate-inline-threshold", Refused(EXPORTS)),
     ("debug-info-type-line-numbers", Ignored(DEBUG)),
     ("debuginfo-compression", Ignored(DEBUG)),
@@ -204,7 +204,7 @@ const TABLE: &[(&str, Row)] = &[
     ("packed-stack", Refused(ABI)),
     (
         "panic-abort-tests",
-        Refused("ra-jit's test harness does not run tests built with panic=abort"),
+        Refused("blaze's test harness does not run tests built with panic=abort"),
     ),
     ("panic-in-drop", Refused(SEMANTICS)),
     ("parse-crate-root-only", Refused(NOT_BUILT)),
@@ -221,7 +221,7 @@ const TABLE: &[(&str, Row)] = &[
     ("print-mono-items", Ignored(PRINTS)),
     ("print-type-sizes", Ignored(PRINTS)),
     ("proc-macro-backtrace", Ignored(PRINTS)),
-    ("proc-macro-execution-strategy", Refused("ra-jit runs proc macros its own way")),
+    ("proc-macro-execution-strategy", Refused("blaze runs proc macros its own way")),
     ("profile-closures", Ignored(PRINTS)),
     ("profiler-runtime", Refused(LINKS)),
     ("query-dep-graph", Ignored(CHECKS)),
@@ -283,7 +283,7 @@ const TABLE: &[(&str, Row)] = &[
     ("treat-err-as-bug", Ignored(CHECKS)),
     ("trim-diagnostic-paths", Ignored(PRINTS)),
     ("tune-cpu", Ignored(RUSTC_BACKEND)),
-    ("ub-checks", OffOnly("ra-jit compiles `ub_checks()` as false")),
+    ("ub-checks", OffOnly("blaze compiles `ub_checks()` as false")),
     ("ui-testing", Ignored(PRINTS)),
     ("uninit-const-chunk-threshold", Refused(CODE)),
     ("unleash-the-miri-inside-of-you", Refused(SEMANTICS)),
@@ -304,7 +304,7 @@ const TABLE: &[(&str, Row)] = &[
 ];
 
 /// What a flag the table does not have gets.
-const UNKNOWN: &str = "ra-jit does not know the flag";
+const UNKNOWN: &str = "blaze does not know the flag";
 
 /// One `-Z` flag as given: its name with `_` spelled `-`, as rustc reads both, and its value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,7 +326,7 @@ impl Flag<'_> {
             Ok(OffOnly(why)) => match off(self.value) {
                 Some(true) => Treatment::Modelled(why),
                 Some(false) => Treatment::Refused(why),
-                None => Treatment::Refused("ra-jit does not know the value"),
+                None => Treatment::Refused("blaze does not know the value"),
             },
         }
     }

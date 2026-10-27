@@ -97,11 +97,11 @@ def main():
     try:
         build(ws, env, "first build")
         for _ in range(240):
-            if "[ra-jit]" in build(ws, env, "wait for the daemon"):
+            if "[blaze]" in build(ws, env, "wait for the daemon"):
                 break
             time.sleep(0.5)
         else:
-            raise SystemExit(f"no build said `[ra-jit]`; the daemon's log is in {home}")
+            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         for n, (what, edits, expected) in enumerate(STEPS):
             text = open(source).read()
             for old, new in edits:
@@ -116,7 +116,7 @@ def main():
             verdict = "ok"
             if printed != expected:
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"
-            elif "[ra-jit]" not in said:
+            elif "[blaze]" not in said:
                 verdict = "NOT SERVED BY THE DAEMON"
             elif n > 0 and not how.startswith("spliced") and full_builds(home) == full:
                 verdict = "NOT SPLICED"

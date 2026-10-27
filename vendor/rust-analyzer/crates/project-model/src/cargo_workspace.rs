@@ -155,9 +155,12 @@ pub struct CargoConfig {
     /// The directory a build put the executables of the workspace in, which the tests of a
     /// package are told as `CARGO_BIN_EXE_<name>`.
     pub executables: Option<AbsPathBuf>,
-    /// Where the workspace and its `cargo metadata` come from instead of cargo. Cargo is
-    /// asked when it says no.
+    /// Where the workspace and its `cargo metadata` come from instead of cargo. When it fails,
+    /// so does the load: cargo is not asked instead.
     pub own_metadata: Option<OwnMetadata>,
+    /// What builds and runs the build scripts and proc macros of a workspace in place of
+    /// `cargo check --compile-time-deps`.
+    pub own_build_scripts: Option<OwnBuildScripts>,
 }
 
 /// The root manifest of the workspace a manifest is in, and `cargo metadata` of it for the
@@ -172,17 +175,34 @@ type Metadata = dyn Fn(
     + Send
     + Sync;
 
+/// `cargo metadata` of the standard library's workspace at the manifest given (a toolchain's
+/// `library/Cargo.toml`), as `Sysroot::load_workspace` asks cargo for it: with the features
+/// given, for the target with the triple given (none: every platform's), `--no-deps` or not,
+/// cargo run with the variables given.
+type Library = dyn Fn(
+        &ManifestPath,
+        &CargoFeatures,
+        Option<&str>,
+        bool,
+        &FxHashMap<String, Option<String>>,
+    ) -> anyhow::Result<cargo_metadata::Metadata>
+    + Send
+    + Sync;
+
 /// What reads a workspace in place of `cargo locate-project` and `cargo metadata`.
 #[derive(Clone)]
 pub struct OwnMetadata {
     pub root: std::sync::Arc<Root>,
     pub metadata: std::sync::Arc<Metadata>,
+    /// The standard library's workspace, which cargo is never asked for when this is set.
+    pub library: std::sync::Arc<Library>,
 }
 
 impl PartialEq for OwnMetadata {
     fn eq(&self, other: &OwnMetadata) -> bool {
         std::sync::Arc::ptr_eq(&self.root, &other.root)
             && std::sync::Arc::ptr_eq(&self.metadata, &other.metadata)
+            && std::sync::Arc::ptr_eq(&self.library, &other.library)
     }
 }
 
@@ -191,6 +211,51 @@ impl Eq for OwnMetadata {}
 impl fmt::Debug for OwnMetadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OwnMetadata")
+    }
+}
+
+/// What a load is asked to build its build scripts and proc macros for: the toolchain and
+/// what `rustc --print cfg` says of the target.
+pub struct OwnBuildAsked<'a> {
+    pub sysroot: &'a crate::Sysroot,
+    pub rustc_cfg: &'a [cfg::CfgAtom],
+    pub config: &'a CargoConfig,
+}
+
+/// What the build script of a package said and where it wrote, and the proc macro the
+/// package has, as a build of `cargo check --compile-time-deps` has them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnBuildOutput {
+    /// `cargo::rustc-cfg`, as cargo prints them in `build-script-executed`.
+    pub cfgs: Vec<String>,
+    /// `cargo::rustc-env`.
+    pub envs: Vec<(String, String)>,
+    /// `OUT_DIR`, when the package has a build script that ran.
+    pub out_dir: Option<AbsPathBuf>,
+    /// The library of the package's proc macro.
+    pub proc_macro_dylib: Option<AbsPathBuf>,
+}
+
+type BuildScripts = dyn Fn(&CargoWorkspace, &OwnBuildAsked<'_>) -> anyhow::Result<Vec<(Package, OwnBuildOutput)>>
+    + Send
+    + Sync;
+
+/// What builds and runs the build scripts and proc macros of a workspace in place of cargo.
+/// A failure is the load's: cargo is not asked instead.
+#[derive(Clone)]
+pub struct OwnBuildScripts(pub std::sync::Arc<BuildScripts>);
+
+impl PartialEq for OwnBuildScripts {
+    fn eq(&self, other: &OwnBuildScripts) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for OwnBuildScripts {}
+
+impl fmt::Debug for OwnBuildScripts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnBuildScripts")
     }
 }
 
@@ -245,6 +310,8 @@ pub struct PackageData {
     pub readme: Option<Utf8PathBuf>,
     /// Rust version as given in the `Cargo.toml`
     pub rust_version: Option<semver::Version>,
+    /// `links` as given in the `Cargo.toml`: the native library its build script links.
+    pub links: Option<String>,
     /// The contents of [package.metadata.rust-analyzer]
     pub metadata: RustAnalyzerPackageMetaData,
     /// If this package is a member of the workspace, store all direct and transitive
@@ -263,6 +330,10 @@ pub struct PackageDependency {
     pub pkg: Package,
     pub name: String,
     pub kind: DepKind,
+    /// The name a feature of the package turns the dependency on with (`dep:name`), when
+    /// every entry of the manifest for it of its kind is optional: whether it is built is
+    /// then the package's features' to say, which [`PackageData::activates`] reads.
+    pub optional: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +418,8 @@ pub struct CargoMetadataConfig {
     /// The toolchain version, if known.
     /// Used to conditionally enable unstable cargo features.
     pub toolchain_version: Option<semver::Version>,
+    /// What reads the standard library's workspace in place of cargo (`kind` "sysroot").
+    pub own_metadata: Option<OwnMetadata>,
 }
 
 // Deserialize helper for the cargo metadata
@@ -364,6 +437,11 @@ impl CargoWorkspace {
         is_sysroot: bool,
     ) -> CargoWorkspace {
         let mut pkg_by_id = FxHashMap::default();
+        // For each package, its manifest's dependencies: the name it is known by in the
+        // package (its `rename`, or its own, with `_` for `-`), the name its features turn it
+        // on with, its kind, and whether it is optional.
+        let mut manifest_deps: FxHashMap<Arc<PackageId>, Vec<(String, String, DepKind, bool)>> =
+            FxHashMap::default();
         let mut packages = Arena::default();
         let mut targets = Arena::default();
 
@@ -397,9 +475,22 @@ impl CargoWorkspace {
                 license_file,
                 readme,
                 rust_version,
+                dependencies: declared,
+                links,
                 ..
             } = meta_pkg;
             let id = Arc::new(id);
+            let declared = declared.into_iter().filter_map(|dep| {
+                let kind = match dep.kind {
+                    cargo_metadata::DependencyKind::Normal => DepKind::Normal,
+                    cargo_metadata::DependencyKind::Development => DepKind::Dev,
+                    cargo_metadata::DependencyKind::Build => DepKind::Build,
+                    cargo_metadata::DependencyKind::Unknown => return None,
+                };
+                let key = dep.rename.unwrap_or(dep.name);
+                Some((key.replace('-', "_"), key, kind, dep.optional))
+            });
+            manifest_deps.insert(id.clone(), declared.collect());
             let meta = from_value::<PackageMetadata>(metadata).unwrap_or_default();
             let edition = match edition {
                 cargo_metadata::Edition::E2015 => Edition::Edition2015,
@@ -435,6 +526,7 @@ impl CargoWorkspace {
                 license_file,
                 readme,
                 rust_version,
+                links,
                 dependencies: Vec::new(),
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),
@@ -480,9 +572,20 @@ impl CargoWorkspace {
                 .deps
                 .iter()
                 .flat_map(|dep| DepKind::iter(&dep.dep_kinds).map(move |kind| (dep, kind)));
+            let declared = manifest_deps.get(&node.id).map_or(&[][..], |it| &**it);
             for (dep_node, kind) in dependencies {
                 let &pkg = pkg_by_id.get(&dep_node.pkg).unwrap();
-                let dep = PackageDependency { name: dep_node.name.to_string(), pkg, kind };
+                // `cargo metadata`'s graph has an optional dependency that only a weak
+                // feature (`dep?/feature`) names, as hashbrown's `nightly` names foldhash for
+                // the standard library, which cargo does not build: the features say.
+                let mut entries = declared
+                    .iter()
+                    .filter(|(named, _, of, _)| *named == *dep_node.name && *of == kind)
+                    .peekable();
+                let key = entries.peek().map(|(_, key, _, _)| key.clone());
+                let optional = key.filter(|_| entries.all(|(_, _, _, optional)| *optional));
+                let dep =
+                    PackageDependency { name: dep_node.name.to_string(), pkg, kind, optional };
                 packages[source].dependencies.push(dep);
             }
             packages[source]
@@ -930,9 +1033,23 @@ impl FetchMetadata {
 }
 
 impl PackageData {
+    /// Whether the package's active features turn on its optional dependency `key`: its
+    /// implicit feature of that name, or a feature that names `dep:key` or `key/feature`
+    /// (not the weak `key?/feature`, which only adds to a dependency something else turns on).
+    /// The active features are all of them, those the ones written imply too.
+    pub fn activates(&self, key: &str) -> bool {
+        let turns_on = |value: &String| {
+            value.strip_prefix("dep:") == Some(key)
+                || value.strip_prefix(key).is_some_and(|rest| rest.starts_with('/'))
+        };
+        self.active_features.iter().any(|feature| {
+            *feature == key || self.features.get(feature).is_some_and(|it| it.iter().any(turns_on))
+        })
+    }
+
     /// `rust-version` as the manifest has it, which is what cargo hands to `env!`: cargo's
     /// metadata, and so `rust_version`, has `1.70` as `1.70.0`.
-    pub(crate) fn rust_version_as_written(&self) -> Option<String> {
+    pub fn rust_version_as_written(&self) -> Option<String> {
         let parsed = self.rust_version.as_ref()?.to_string();
         let written = |manifest: &Utf8Path, tables: &[&str]| {
             let manifest: toml::Table = std::fs::read_to_string(manifest).ok()?.parse().ok()?;

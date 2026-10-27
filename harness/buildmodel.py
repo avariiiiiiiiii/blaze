@@ -203,7 +203,13 @@ class Case:
             raise Wrong("cargo failed with what ra-jit needs of it: " + run.stderr[-600:])
         printed = run.stdout + run.stderr
         if whole:
-            printed = "\n".join(l for l in printed.splitlines() if re.search(rf"[/\\]{re.escape(self.artifact_name())}-", l))
+            # The program is `deps/<name>-<hash>` in cargo's first layout of the build directory
+            # and `build/<name>/<hash>/out/<name>` in its second, where the build script's
+            # line also has the package's directory in it. On Windows rustc prints each argument
+            # quoted as Rust's Debug does, every `\` doubled.
+            name = re.escape(self.artifact_name())
+            program = rf"[/\\]{name}-|[/\\]+out[/\\]+{name}(\.exe)?[\"'\s]"
+            printed = "\n".join(l for l in printed.splitlines() if re.search(program, l))
         try:
             # rustc's `symbols.o` asks for what the libraries need of one another, which a linker
             # that reads archives in order finds no other way: `-C save-temps` keeps the file.
@@ -527,7 +533,7 @@ def judge_doctests(want, got):
     if w != g or (not names and want[0] != got[0]):
         lines = [f"cargo's `{a}`, ra-jit's `{b}`" for a, b in zip(w, g) if a != b]
         return "WRONG", (lines[0] if lines else f"cargo's ends with {want[0]} after {len(w)} lines, ra-jit's with {got[0]} after {len(g)}")[:300]
-    built = re.findall(r"doctests: (\d+) built by ra-jit, (\d+) not built", got[2])
+    built = re.findall(r"doctests: (\d+) built by blaze, (\d+) not built", got[2])
     if not built:
         return "WRONG", "ra-jit did not say what it built for the doctests"
     tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])

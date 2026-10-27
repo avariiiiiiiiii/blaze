@@ -296,7 +296,7 @@ impl Contents {
 
     /// The name and version of a crate, which one from a registry is the same by wherever
     /// it is.
-    fn version(db: &RootDatabase, krate: Crate) -> String {
+    pub(crate) fn version(db: &RootDatabase, krate: Crate) -> String {
         let extra = krate.extra_data(db);
         let name = extra.display_name.as_ref().map(|it| it.to_string());
         format!("{name:?} {:?}", extra.version)
@@ -322,7 +322,7 @@ pub(crate) fn written_to(db: &RootDatabase, krate: Crate, out: &str) -> Vec<(Str
 
 /// The hash of the file `file` at `path`. One that is not UTF-8 has no text: it is hashed as
 /// it is on disk, where an `include_bytes!` reads it from.
-fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Hash {
+pub(crate) fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Hash {
     if db.has_file_text(file) {
         FileHashes::of(db, file)
     } else {

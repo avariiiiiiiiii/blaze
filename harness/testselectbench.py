@@ -35,7 +35,7 @@ TIMEOUT = 7200
 KEEP = None
 RAN = re.compile(r"^test (.+?) \.\.\. ", re.M)
 SKIPPED = re.compile(r"Skipped (\d+) tests?,")
-FELL = re.compile(r"^(?:\x1b\[[0-9;]*m)?ra-jit:(?:\x1b\[0m)? (.*)$", re.M)
+FELL = re.compile(r"^(?:\x1b\[[0-9;]*m)?blaze:(?:\x1b\[0m)? (.*)$", re.M)
 
 
 STD = ("std::", "<std::", "core::", "<core::", "alloc::", "<alloc::")
@@ -73,7 +73,7 @@ def row(ws, env, args, mode, what):
     listed, sandboxed, always, by = reach([os.path.join(ws, "target"), env["RA_JIT_HOME"]])
     # Why a build was cargo's, as `cargo ra-jit` says it; not the doc tests rustc builds.
     fell = [it for it in dict.fromkeys(FELL.findall(ran.stderr)) if "is rustc's" not in it and "rustdoc" not in it]
-    return dict(step=what, mode=mode, exit=ran.returncode, seconds=round(took, 1), served="[ra-jit]" in said, fell=fell[:3],
+    return dict(step=what, mode=mode, exit=ran.returncode, seconds=round(took, 1), served="[blaze]" in said, fell=fell[:3],
                 ran=len(RAN.findall(ran.stdout)), skipped=skipped, listed=listed, always=sum(always.values()), sandboxed=sandboxed,
                 why=always.most_common(8), by=[(f"{first} … {leaf}", n) for (first, leaf), n in by.most_common(12)])
 

@@ -349,6 +349,8 @@ pub(super) struct Recorder<'db> {
     span_ids: FxHashMap<MirSpan, u32>,
     /// The locals written with a name that a stack slot of their own tells where they are.
     pub(super) named: Vec<Named>,
+    /// The slots of the locals of the body, for [`overlap`](super::overlap) to share.
+    pub(super) frame_locals: Option<super::overlap::FrameLocals>,
     /// The bodies of the callees that are built into their callers, which call them by their
     /// place here in [`INLINED`] until [`inline`](super::inline) puts the bodies there.
     pub(super) inlined: Vec<ir::Function>,
@@ -580,7 +582,12 @@ impl Wants {
         self.func(FuncTarget::Path(path.to_owned()), sig)
     }
 
+    /// A function of assembly. The text is assembled here, on the thread compiling the caller,
+    /// into the cache [`super::asm::assemble`] keeps: the one thread that puts functions in the
+    /// object would otherwise run the assembler for each block in turn. An error is not kept,
+    /// so that thread meets it again and refuses the caller with it as before.
     pub(super) fn assembly(&mut self, text: String, sig: &Signature) -> FuncId {
+        _ = super::asm::assemble(&self.isa.triple().to_string(), &text);
         self.func(FuncTarget::Asm(text), sig)
     }
 
@@ -698,6 +705,7 @@ impl<'db> Recorder<'db> {
             spans: Vec::new(),
             span_ids: FxHashMap::default(),
             named: Vec::new(),
+            frame_locals: None,
             inlined: Vec::new(),
             unlocated: false,
             opaque: false,

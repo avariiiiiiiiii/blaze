@@ -9,11 +9,12 @@ use hir_def::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind;
+use smallvec::SmallVec;
 
 use hir_ty::{
     InferBodyId,
     mir::{
-        BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, OperandKind, PlaceElem,
+        BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, OperandKind, PlaceElem,
         ProjectionElem, Rvalue, StatementKind, TerminatorKind,
     },
     next_solver::TyKind,
@@ -23,6 +24,7 @@ use super::{
     Ctx,
     bitset::BitSet,
     cfg::{Cfg, Location, index},
+    intervals::IntervalSet,
     regions::{RegionValues, Regions, Rv},
 };
 
@@ -122,107 +124,18 @@ fn is_call(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
 /// Whether the value `expr` makes has nothing to drop and no cell in it, which rustc asks of a
 /// value it promotes rather than of its type: `&[MarkupElement::Emphasis]` or
 /// `&FormatElement::Line(LineMode::Hard)` is promoted, though another variant holds a `Cow` or
-/// a `Box`, and `&[]` of any element type, `[Cell<u8>]` too. A struct, variant, tuple or array
-/// is made of its parts, unless its type has a `Drop` impl or is `UnsafeCell` or a union.
-fn plain_value(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
-    let parts_of = |ty: hir_ty::next_solver::Ty<'_>| match ty.kind() {
-        TyKind::Adt(def, _) => {
-            let id = def.def_id();
-            !matches!(id, hir_def::AdtId::UnionId(_))
-                && hir_ty::drop::destructor(ctx.db, id).is_none()
-                && !matches!(id, hir_def::AdtId::StructId(it)
-                    if Some(it) == ctx.infcx.interner.lang_items().UnsafeCell)
-        }
-        _ => true,
+/// a `Box`, and `&[]` of any element type, `[Cell<u8>]` too.
+fn plain_value<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, expr: hir_def::hir::ExprId) -> bool {
+    let cx = super::qualifs::ValueCx {
+        db: ctx.db,
+        infcx: &ctx.infcx,
+        env: ctx.env,
+        owner: body.owner,
+        store: ctx.store,
+        infer: ctx.infer,
+        consts: &Default::default(),
     };
-    let ty = ctx.infer.expr_ty(expr);
-    match &ctx.store[expr] {
-        Expr::Literal(_) | Expr::Ref { .. } => true,
-        Expr::Path(_) if ctx.infer.variant_resolution_for_expr(expr).is_some() => parts_of(ty),
-        Expr::Path(_) if names_const_item(ctx, body, expr) => {
-            hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env) && !const_item_called(ctx, body, expr)
-        }
-        Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
-            exprs.iter().all(|&it| plain_value(ctx, body, it))
-        }
-        &Expr::Array(Array::Repeat { initializer, .. }) => plain_value(ctx, body, initializer),
-        Expr::RecordLit { fields, spread: hir_def::hir::RecordSpread::None, .. } => {
-            parts_of(ty) && fields.iter().all(|it| plain_value(ctx, body, it.expr))
-        }
-        Expr::Call { callee, args }
-            if matches!(ctx.infer.expr_ty(*callee).kind(), TyKind::FnDef(def, _)
-                if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))) =>
-        {
-            parts_of(ty) && args.iter().all(|&it| plain_value(ctx, body, it))
-        }
-        _ => ctx.is_plain(ty),
-    }
-}
-
-/// Whether `expr` names a `const` item outside any impl or trait: rustc asks whether its value,
-/// not its type, needs dropping, which only a value that does (a `String` that is not empty)
-/// fails; such a value is taken to be promotable when its type has no interior mutability.
-fn names_const_item(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
-    use hir_def::{
-        Lookup,
-        resolver::{HasResolver, ValueNs},
-    };
-    let Expr::Path(path) = &ctx.store[expr] else { return false };
-    let owner = body.owner;
-    let mut resolver = owner.resolver(ctx.db);
-    let _guard = resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
-    let hygiene = ctx.store.expr_path_hygiene(expr);
-    matches!(
-        resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene),
-        Some(ValueNs::ConstId(it))
-            if matches!(it.lookup(ctx.db).container, hir_def::ItemContainerId::ModuleId(_))
-    )
-}
-
-/// Whether the `const` item `expr` names has in its value what a function returns of a type
-/// that needs dropping, which rustc takes to need dropping (`const S: String = String::new()`,
-/// or `P { a: String::new() }`): it looks through the aggregates the value is built of.
-fn const_item_called(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
-    use hir_def::resolver::{HasResolver, ValueNs};
-    let Expr::Path(path) = &ctx.store[expr] else { return false };
-    let owner = body.owner;
-    let mut resolver = owner.resolver(ctx.db);
-    let _guard = resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
-    let hygiene = ctx.store.expr_path_hygiene(expr);
-    let Some(ValueNs::ConstId(konst)) =
-        resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene)
-    else {
-        return false;
-    };
-    let def = DefWithBodyId::ConstId(konst);
-    let value = hir_def::expr_store::Body::of(ctx.db, def);
-    let infer = hir_ty::InferenceResult::of(ctx.db, InferBodyId::DefWithBodyId(def));
-    let needs_drop = |expr| {
-        hir_ty::drop::has_drop_glue(&ctx.infcx, infer.expr_ty(expr), ctx.env)
-            != hir_ty::drop::DropGlue::None
-    };
-    let mut stack = vec![value.root_expr()];
-    while let Some(expr) = stack.pop() {
-        match &value.store[expr] {
-            Expr::Block { statements, tail: Some(tail), .. } if statements.is_empty() => {
-                stack.push(*tail)
-            }
-            Expr::MethodCall { .. } if needs_drop(expr) => return true,
-            Expr::Call { callee, args } => match infer.expr_ty(*callee).kind() {
-                TyKind::FnDef(def, _) if matches!(def.0, hir_def::CallableDefId::FunctionId(_)) => {
-                    if needs_drop(expr) {
-                        return true;
-                    }
-                }
-                _ => stack.extend(args.iter().copied()),
-            },
-            Expr::RecordLit { fields, .. } => stack.extend(fields.iter().map(|it| it.expr)),
-            Expr::Tuple { exprs } => stack.extend(exprs.iter().copied()),
-            Expr::Array(Array::ElementList { elements }) => stack.extend(elements.iter().copied()),
-            _ => (),
-        }
-    }
-    false
+    cx.value(expr, 0).is_empty()
 }
 
 /// The locals a `static` is read through.
@@ -326,8 +239,7 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
             {
                 let ty = body.locals[place.local].ty.as_ref();
                 if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
-                    && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
-                        == hir_ty::drop::DropGlue::None
+                    && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
                 {
                     found.insert(place.local);
                 }
@@ -433,8 +345,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
             {
                 let ty = body.locals[place.local].ty.as_ref();
                 if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
-                    && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
-                        == hir_ty::drop::DropGlue::None
+                    && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
                 {
                     found.insert(Location { block, statement });
                 }
@@ -465,10 +376,20 @@ fn const_promotable(
             let _guard =
                 resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
             let hygiene = ctx.store.expr_path_hygiene(expr);
-            !matches!(
-                resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene),
-                None | Some(ValueNs::LocalBinding(_) | ValueNs::StaticId(_))
-            )
+            match resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene) {
+                None | Some(ValueNs::LocalBinding(_)) => false,
+                // rustc's `promote_consts` lets a static be borrowed or read in a static's
+                // value, but not a thread-local or an extern one, which CTFE cannot read.
+                Some(ValueNs::StaticId(it)) => {
+                    matches!(body.owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_)))
+                        && !hir_def::signatures::StaticSignature::of(ctx.db, it)
+                            .flags
+                            .contains(hir_def::signatures::StaticFlags::EXTERN)
+                        && !hir_def::attrs::AttrFlags::query(ctx.db, it.into())
+                            .contains(hir_def::attrs::AttrFlags::THREAD_LOCAL)
+                }
+                Some(_) => true,
+            }
         }
         Expr::Array(Array::ElementList { elements }) => all(elements.to_vec()),
         Expr::Array(Array::Repeat { initializer, .. }) => {
@@ -493,10 +414,9 @@ fn const_promotable(
                 _ => false,
             };
             // Not with an argument that needs dropping, `ManuallyDrop::new(String::new())`.
-            let dropped = args.iter().any(|&it| {
-                hir_ty::drop::has_drop_glue(&ctx.infcx, ctx.infer.expr_ty(it), ctx.env)
-                    != hir_ty::drop::DropGlue::None
-            });
+            let dropped = args
+                .iter()
+                .any(|&it| ctx.drop_glue(ctx.infer.expr_ty(it)) != hir_ty::drop::DropGlue::None);
             callable && !dropped && all(args.to_vec())
         }
         // `NAME.as_str()` of a `const NAME`, as tracing's `fieldset!` names its fields.
@@ -504,10 +424,9 @@ fn const_promotable(
             let callable = ctx.infer.method_resolution(expr).is_some_and(|(func, _)| {
                 hir_def::signatures::FunctionSignature::of(ctx.db, func).is_const()
             });
-            let dropped = std::iter::once(receiver).chain(args.iter()).any(|&it| {
-                hir_ty::drop::has_drop_glue(&ctx.infcx, ctx.infer.expr_ty(it), ctx.env)
-                    != hir_ty::drop::DropGlue::None
-            });
+            let dropped = std::iter::once(receiver)
+                .chain(args.iter())
+                .any(|&it| ctx.drop_glue(ctx.infer.expr_ty(it)) != hir_ty::drop::DropGlue::None);
             callable && !dropped && all(std::iter::once(*receiver).chain(args.to_vec()).collect())
         }
         // A block of items and a tail is its tail in MIR, where rustc promotes.
@@ -690,18 +609,13 @@ impl Loans {
     /// Where each loan goes out of scope: the first points past it its region does not hold
     /// at, as rustc's `OutOfScopePrecomputer`.
     pub(super) fn compute_scopes(&mut self, body: &MirBody<'_>, cfg: &Cfg, values: &RegionValues) {
-        for (id, loan) in self.loans.iter().enumerate() {
-            let mut seen = BitSet::new(cfg.points);
-            let mut work = successors_of(body, cfg, loan.location);
-            while let Some(point) = work.pop() {
-                if !seen.insert(point) {
-                    continue;
-                }
-                if !values.contains_point(loan.region, point) {
-                    self.out_of_scope.entry(point).or_default().push(id);
-                    continue;
-                }
-                work.extend(successors_of(body, cfg, cfg.location(point)));
+        for id in 0..self.loans.len() {
+            let points = values.points_of(self.loans[id].region);
+            let ends = out_of_scope(body, cfg, self.loans[id].location, |start, end| {
+                points.first_absent_in(start, end)
+            });
+            for point in ends {
+                self.out_of_scope.entry(point).or_default().push(id);
             }
         }
     }
@@ -712,21 +626,21 @@ impl Loans {
         &mut self,
         body: &MirBody<'_>,
         cfg: &Cfg,
-        live: &[BitSet],
+        live: &[IntervalSet],
     ) {
-        for (id, loan) in self.loans.iter().enumerate() {
-            let issued = cfg.point(loan.location);
-            let mut seen = BitSet::new(cfg.points);
-            let mut work = successors_of(body, cfg, loan.location);
-            while let Some(point) = work.pop() {
-                if !seen.insert(point) {
-                    continue;
+        for id in 0..self.loans.len() {
+            let issued = cfg.point(self.loans[id].location);
+            // The loan is in scope where it is made, live there or not.
+            let ends = out_of_scope(body, cfg, self.loans[id].location, |start, end| {
+                match live[id].first_absent_in(start, end) {
+                    Some(point) if point == issued => {
+                        (point < end).then(|| live[id].first_absent_in(point + 1, end)).flatten()
+                    }
+                    other => other,
                 }
-                if point != issued && !live[id].contains(point) {
-                    self.out_of_scope.entry(point).or_default().push(id);
-                    continue;
-                }
-                work.extend(successors_of(body, cfg, cfg.location(point)));
+            });
+            for point in ends {
+                self.out_of_scope.entry(point).or_default().push(id);
             }
         }
     }
@@ -741,17 +655,36 @@ impl Loans {
         let blocks = body.basic_blocks.len();
         let count = self.loans.len();
         let mut entry = vec![BitSet::new(count); blocks];
+        if count == 0 {
+            return entry;
+        }
+        // A block only adds and removes loans, whatever is in scope, so what it does is
+        // `(in & kept) | made`: `made` is what it leaves of nothing in scope, `kept` of all.
+        let mut all = BitSet::new(count);
+        for id in 0..count {
+            all.insert(id);
+        }
+        let mut effect: Vec<Option<(BitSet, BitSet)>> = vec![None; blocks];
+        for &block in &cfg.order {
+            let data = &body.basic_blocks[block];
+            let (mut made, mut kept) = (BitSet::new(count), all.clone());
+            for statement in 0..=data.statements.len() {
+                let location = Location { block, statement };
+                for state in [&mut made, &mut kept] {
+                    self.before(cfg, location, state);
+                    self.after(ctx, body, location, state);
+                }
+            }
+            effect[index(block)] = Some((made, kept));
+        }
         let mut changed = true;
         while changed {
             changed = false;
             for &block in &cfg.order {
+                let Some((made, kept)) = &effect[index(block)] else { continue };
                 let mut state = entry[index(block)].clone();
-                let data = &body.basic_blocks[block];
-                for statement in 0..=data.statements.len() {
-                    let location = Location { block, statement };
-                    self.before(cfg, location, &mut state);
-                    self.after(ctx, body, location, &mut state);
-                }
+                state.intersect(kept);
+                state.union(made);
                 for &successor in &cfg.successors[index(block)] {
                     changed |= entry[index(successor)].union(&state);
                 }
@@ -838,16 +771,47 @@ impl Loans {
     }
 }
 
-fn successors_of(body: &MirBody<'_>, cfg: &Cfg, location: Location) -> Vec<usize> {
-    let data = &body.basic_blocks[location.block];
-    if location.statement < data.statements.len() {
-        vec![cfg.point(Location { block: location.block, statement: location.statement + 1 })]
+/// The first points reachable from just past `issued` that are not in scope, given
+/// `first_absent(start, end)`, the first point of `start..=end` not in scope. It walks whole
+/// blocks: a block's points are consecutive, so one lookup finds where a loan ends in it.
+fn out_of_scope(
+    body: &MirBody<'_>,
+    cfg: &Cfg,
+    issued: Location,
+    mut first_absent: impl FnMut(usize, usize) -> Option<usize>,
+) -> SmallVec<[usize; 2]> {
+    let mut out = SmallVec::new();
+    let last = |block: BasicBlockId| {
+        cfg.point(Location { block, statement: body.basic_blocks[block].statements.len() })
+    };
+    let mut entered = BitSet::new(body.basic_blocks.len());
+    let mut work: Vec<BasicBlockId> = Vec::new();
+    // The rest of the issuing block, if the loan is not made by its terminator.
+    let issued_point = cfg.point(issued);
+    let rest = issued.statement < body.basic_blocks[issued.block].statements.len();
+    if rest {
+        match first_absent(issued_point + 1, last(issued.block)) {
+            Some(point) => out.push(point),
+            None => work.extend(cfg.successors[index(issued.block)].iter().copied()),
+        }
     } else {
-        cfg.successors[index(location.block)]
-            .iter()
-            .map(|&it| cfg.point(Location { block: it, statement: 0 }))
-            .collect()
+        work.extend(cfg.successors[index(issued.block)].iter().copied());
     }
+    while let Some(block) = work.pop() {
+        if !entered.insert(index(block)) {
+            continue;
+        }
+        let start = cfg.point(Location { block, statement: 0 });
+        // Coming back around to the issuing block, the points past the loan were seen.
+        let (end, through) =
+            if rest && block == issued.block { (issued_point, false) } else { (last(block), true) };
+        match first_absent(start, end) {
+            Some(point) => out.push(point),
+            None if through => work.extend(cfg.successors[index(block)].iter().copied()),
+            None => (),
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

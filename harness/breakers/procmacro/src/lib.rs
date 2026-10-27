@@ -24,3 +24,20 @@ pub fn records() -> (Vec<u32>, usize) {
     });
     (held.collect(), std::mem::size_of::<sized::Record>())
 }
+
+/// A type as `stringify!` spells it in a `macro_rules!` body, given it by a proc macro.
+#[macro_export]
+macro_rules! spelled_type {
+    ($ty:ty) => {
+        stringify!($ty)
+    };
+}
+
+/// Types a proc macro passed on to `stringify!`.
+pub fn spelled() -> [[&'static str; 2]; 3] {
+    [
+        macros::spelled!(AstId<ast::Macro>),
+        macros::spelled!(Modules<'db>),
+        macros::spelled!(Vec<(u8, [u16; 2])>),
+    ]
+}

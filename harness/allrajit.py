@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """allrajit.py: programs with nothing rustc built in them (docs/no-rustc.md, steps F and G).
 
-Five programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
+Eight programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
 formatting, a file and an uncaught panic, one with a `#[global_allocator]` of its own, one
-built with `panic = "abort"`, and one with a static of proc-macro clients as J2 writes it,
-are built by ra-jit with every crate its own, the standard library included, and linked by
-ra-jit (`--exe`): the native libraries are the ones the crates' `#[link]`s ask for, and
-nothing it could not compile may be left in the executable. A shared library is linked too
-(`--exe` with `--shared`), loaded with `dlopen` and called as cargo's `cdylib` of it is, and
-a proc-macro crate's, whose list of macros ra-jit writes into it is read off the library.
+built with `panic = "abort"`, one with a static of proc-macro clients as J2 writes it, one
+of 128-bit atomics raced by threads, one of the paths of `split_paths_ref` and the XDG
+directories, and one of the FMA wrappers of `core::arch::x86_64` on NaNs, are built by ra-jit with every crate its own, the standard library included,
+and linked by ra-jit (`--exe`): the native libraries are the ones the crates' `#[link]`s ask
+for, and nothing it could not compile may be left in the executable. A shared library is
+linked too (`--exe` with `--shared`), loaded with `dlopen` and called as cargo's `cdylib` of
+it is, and a proc-macro crate's, whose list of macros ra-jit writes into it is read off the
+library.
 Each is built three ways:
 
   - whole: the program and the standard library in one build, one object;
@@ -161,10 +163,102 @@ fn main() {
     println!("clients {} {}", first != 0 && second != 0, first != second);
 }
 """
+# 128-bit atomics, raced by threads across the carry out of the low half: on AArch64 Linux,
+# compare-and-swaps of compiler_builtins.
+ATOMICS = r"""#![cfg_attr(target_has_atomic = "128", feature(integer_atomics))]
+#[cfg(target_has_atomic = "128")]
+fn atomics() {
+    use std::sync::atomic::{AtomicI128, AtomicU128, Ordering::*};
+    use std::sync::Arc;
+    let sum = Arc::new(AtomicU128::new(u64::MAX as u128 - 3));
+    let bits = Arc::new(AtomicU128::new(0));
+    let max = Arc::new(AtomicI128::new(i128::MIN));
+    let min = Arc::new(AtomicI128::new(i128::MAX));
+    let umax = Arc::new(AtomicU128::new(0));
+    let counted = Arc::new(AtomicU128::new(u64::MAX as u128));
+    let threads: Vec<_> = (0..8u32).map(|t| {
+        let (sum, bits, max, min) = (sum.clone(), bits.clone(), max.clone(), min.clone());
+        let (umax, counted) = (umax.clone(), counted.clone());
+        std::thread::spawn(move || {
+            for i in 0..2000u128 {
+                sum.fetch_add((1 << 64) | 3, SeqCst);
+                sum.fetch_sub(1 << 63, AcqRel);
+                bits.fetch_or(1 << (t * 15 + (i % 15) as u32), Relaxed);
+                bits.fetch_xor(1 << 127, Release);
+                let signed = ((i as i128) << 70) - ((t as i128) << 100);
+                max.fetch_max(signed, Acquire);
+                min.fetch_min(signed, SeqCst);
+                umax.fetch_max(u128::MAX - i - (t as u128) * 7, SeqCst);
+                let mut seen = counted.load(Relaxed);
+                loop {
+                    match counted.compare_exchange_weak(seen, seen + 1, SeqCst, Relaxed) {
+                        Ok(_) => break,
+                        Err(now) => seen = now,
+                    }
+                }
+            }
+        })
+    }).collect();
+    for t in threads { t.join().unwrap(); }
+    println!("sum {:#x} bits {:#x}", sum.load(SeqCst), bits.load(SeqCst));
+    println!("max {:#x} min {:#x} umax {:#x}", max.load(SeqCst), min.load(SeqCst), umax.load(SeqCst));
+    println!("counted {:#x}", counted.load(SeqCst));
+    let one = AtomicU128::new(u128::MAX - 1);
+    println!("swap {:#x} {:#x}", one.swap(1 << 100, SeqCst), one.load(Acquire));
+    one.store(0x1234_5678_9abc_def0_0fed_cba9_8765_4321, Release);
+    println!("and {:#x} nand {:#x}", one.fetch_and(!(u64::MAX as u128), SeqCst), one.fetch_nand(u128::MAX >> 4, SeqCst));
+    println!("now {:#x}", one.load(SeqCst));
+    println!("cas {:?} {:?}", one.compare_exchange(5, 6, SeqCst, SeqCst), one.compare_exchange(one.load(SeqCst), 7, SeqCst, Acquire));
+    let signed = AtomicI128::new(-1);
+    println!("signed {} {} {}", signed.fetch_add(i128::MIN + 1, SeqCst), signed.fetch_min(0, SeqCst), signed.load(SeqCst));
+}
+
+#[cfg(not(target_has_atomic = "128"))]
+fn atomics() {}
+
+fn main() {
+    atomics();
+}
+"""
+# The paths of `split_paths_ref` and the XDG directories, whose iterator is a type alias of
+# `impl Trait` that a function inside another defines.
+PATHS = r"""#![feature(env_split_paths_ref, fs_home_dirs)]
+use std::ffi::OsString;
+use std::fs::HomeDirs;
+use std::os::unix::fs::HomeDirsExt;
+use std::path::Path;
+
+fn main() {
+    let unparsed = "/usr/bin::relative/x:/opt/a b/:/";
+    let paths = std::env::split_paths_ref(unparsed).unwrap();
+    println!("hint {:?}", paths.size_hint());
+    println!("paths {:?} {:?}", paths.collect::<Vec<&Path>>(), std::env::split_paths_ref("").map(|it| it.count()));
+    unsafe {
+        std::env::set_var("HOME", "/home/someone");
+        std::env::set_var("XDG_CONFIG_HOME", "relative");
+        std::env::set_var("XDG_CONFIG_DIRS", "/etc/one:rel:/etc/two/");
+        std::env::set_var("XDG_DATA_DIRS", "nothing:absolute");
+        std::env::remove_var("XDG_CACHE_HOME");
+    }
+    let mut dirs = HomeDirs::xdg().unwrap();
+    println!("config {:?} cache {:?}", dirs.config_home(), dirs.cache_home());
+    println!("config dirs {:?}", dirs.config_dirs().map(|it| it.collect::<Vec<_>>()));
+    println!("data dirs {:?}", dirs.data_dirs().map(|it| it.collect::<Vec<_>>()));
+    dirs.set_config_dirs(OsString::from("/x:/y/z/"));
+    dirs.set_data_dirs(OsString::from("/only"));
+    println!("set {:?} {:?}", dirs.config_dirs().map(|it| it.collect::<Vec<_>>()), dirs.data_dirs().map(|it| it.count()));
+    println!("debug {:?} {:?}", dirs.config_dirs(), std::env::split_paths_ref(unparsed));
+}
+"""
+# The breaker of the FMA wrappers of `core::arch::x86_64`, whose NaNs are what LLVM folds into
+# each by the code around it: there they are rustc's, here those of ra-jit's standard library.
+FMA = (open(os.path.join(HERE, "breakers/cases/src/fma_feature_nans.rs")).read()
+       + 'fn main() {\n    println!("{:?}", run());\n}\n')
 # (program, its source, the runs to compare: the arguments of each, its panic strategy)
 PROGRAMS = [("hello", HELLO, [["a", "b"]], "unwind"), ("rich", RICH, [[], ["fail"]], "unwind"),
             ("counting", ALLOC, [[]], "unwind"), ("abort", ABORT, [[], ["fail"]], "abort"),
-            ("macros", MACROS, [[]], "unwind")]
+            ("macros", MACROS, [[]], "unwind"), ("atomics", ATOMICS, [[]], "unwind"),
+            ("paths", PATHS, [[]], "unwind"), ("fma", FMA, [[]], "unwind")]
 # A shared library, as J2 links a proc macro's (`--exe` with `--shared`): its function
 # allocates, formats, keeps a thread-local and catches a panic, which the allocator shim, the
 # library's TLS and the unwinder have to be right for, loaded into a process ra-jit did not link.
@@ -209,7 +303,7 @@ pub fn answer(_input: TokenStream) -> TokenStream {
 # Kind (derive, attribute, function-like), name and helper attributes, by name.
 MACRO_LIST = [[0, "Hello", ["hello", "greet"]], [2, "answer", []], [1, "same", []]]
 # cargo's build of these needs the unstable features they name.
-UNSTABLE = {"macros"}
+UNSTABLE = {"macros", "atomics", "paths"}
 # Crates of the standard library a program links that the library's unit leaves out. What
 # they depend on (`rustc-literal-escaper` of `proc_macro`) makes the unit another one.
 LINKS = {"macros": ["proc_macro"]}
@@ -305,7 +399,7 @@ def ra_jit(root, crates, out, *extra, env=None):
 
 def linked(ran, what):
     """How long ra-jit's link took, failing when it left something it could not compile."""
-    said = re.search(r"^linked .* in (\S+), (\d+) functions in it ra-jit could not compile$",
+    said = re.search(r"^linked .* in (\S+), (\d+) functions in it blaze could not compile$",
                      ran.stderr, re.M)
     if not said:
         raise SystemExit(f"FAIL: {what}: ra-jit did not say it linked:\n{ran.stderr}")
@@ -379,6 +473,14 @@ def main():
                         raise SystemExit(f"FAIL: {name} ({way}, build {at + 1}) "
                                          f"{'should have taken' if unit in compiled else 'took'} the "
                                          f"standard library from the store: {said}\n{ran.stderr}")
+                    # The unit is the crates rustc's sysroot has of the library, no other: not
+                    # an optional dependency no feature turns on, as hashbrown's foldhash, nor
+                    # what only the library's own tests depend on, as std's rand.
+                    crates = int(re.match(r"(?:from the store, )?(\d+) crates", said[0])[1])
+                    if not LINKS.get(name) and crates != len(std_of(panic)):
+                        raise SystemExit(f"FAIL: {name} ({way}): the standard library's unit has "
+                                         f"{crates} crates, not the {len(std_of(panic))} of "
+                                         f"rustc's sysroot ({', '.join(std_of(panic))})")
                     compiled.add(unit)
                     how = (", the standard library from the remote" if store is stores[1]
                            else ", the standard library from the store" if stored

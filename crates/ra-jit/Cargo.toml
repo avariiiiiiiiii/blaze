@@ -21,6 +21,14 @@ categories = ["development-tools::cargo-plugins", "development-tools::build-util
 name = "ra-jit"
 path = "src/main.rs"
 
+# These make a sandbox with a view, whose seccomp listener the kernel refuses inside the test
+# sandbox's own (one listener to a process): `cargo blaze test` runs them outside.
+[package.metadata.blaze.sandbox]
+unsandboxed-tests = [
+    "sandbox::linux::tests::a_view_shows_its_binds_and_nothing_of_the_machine",
+    "sandbox::linux::tests::a_view_binds_a_store_path_from_anywhere",
+]
+
 # `cargo binstall cargo-blaze`: the archive the release workflow makes for each target, named and
 # laid out as `blaze-v<version>-<target>/` in .github/workflows/release.yaml (and install.sh). A
 # target with no archive is built from source; a third party's build is never used.
@@ -70,7 +78,9 @@ hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-codegen.workspace = true
+hir-ty-borrowck.workspace = true
 ra-jit-expand.workspace = true
+ra-jit-macro-wasm.workspace = true
 ra-jit-store.workspace = true
 blaze-doc.workspace = true
 blaze-fmt.workspace = true
@@ -79,8 +89,10 @@ blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
 blaze-tree.workspace = true
+blaze-units.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-registry = { path = "../blaze-registry" }
+blaze-build-script = { path = "../blaze-build-script" }
 cargo-util-schemas = "=0.14.3"
 ide-db.workspace = true
 ide-diagnostics.workspace = true
@@ -116,11 +128,20 @@ semver.workspace = true
 # version blaze-manifest and blaze-new read and write with.
 toml_edit = { version = "=0.25.12", default-features = false, features = ["display", "parse"] }
 tar = "0.4.44"
+# The zips build scripts download, unpacked where a crate's variable names a directory
+# (`cargo/fetches.rs`): deflate on flate2, which is in the tree already.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 zstd = "0.13.3"
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "optimization"] }
+# The keys and signatures of nixpkgs' binary cache (`cargo/closure/narinfo.rs`); already in the
+# graph, by hyper-util.
+base64 = "0.23"
 ra-jit-live = { path = "../ra-jit-live" }
+# blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
+# feature `wasi`.
+blaze-wasi = { path = "../blaze-wasi" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -130,6 +151,9 @@ tikv-jemalloc-sys = "0.5.4"
 
 
 [dev-dependencies]
+# The in-process fake of the cache gateway that `remote/gateway/tests.rs` talks to.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+tokio = { version = "1.47", features = ["net"] }
 object = { version = "0.37", default-features = false, features = ["write", "elf"] }
 test-fixture.workspace = true
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
@@ -147,6 +171,10 @@ heap-profile = ["tikv-jemallocator/profiling"]
 
 # Adds LLVM as a code producer, chosen with `RA_JIT_BACKEND=llvm`.
 llvm = ["hir-ty-codegen/llvm"]
+
+# Runs build scripts compiled for wasm32-wasip1 under Wasmtime when a workspace asks for it
+# (`RA_JIT_BUILD_SCRIPTS=wasi`, docs/cargo.md "Build scripts under WASI"): an experiment.
+wasi = ["blaze-wasi/run"]
 
 [lints]
 workspace = true

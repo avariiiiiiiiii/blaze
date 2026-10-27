@@ -409,6 +409,54 @@ UNBUILT_SCENARIOS = {
     "unbuilt-member": ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 8, {}),
 }
 SCENARIOS.update(UNBUILT_SCENARIOS)
+
+# A `#[global_allocator]` at opt-level 1, where rustc's allocator entries (`__rust_alloc` and the
+# rest) have its methods inlined and no copy of them is left to patch: an edit of `alloc` has to
+# reach what the program allocates with (#386).
+ALLOC_MAIN = """\
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[unsafe(no_mangle)]
+pub static ALLOC_LAST: AtomicUsize = AtomicUsize::new(0);
+
+struct Last;
+
+unsafe impl GlobalAlloc for Last {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOC_LAST.store(1, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static A: Last = Last;
+
+fn main() {
+    let filled = [7u8; 4096];
+    std::hint::black_box(&filled);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let v: Vec<u8> = vec![1; args.len() + 3];
+    println!("last {} {}", ALLOC_LAST.load(Ordering::Relaxed), v.len());
+    println!("dep {}", dep::value(2));
+    if args.first().is_some_and(|it| it == "panic") {
+        panic!("failed");
+    }
+}
+"""
+ALLOC_FILES = {
+    **FILES,
+    "Cargo.toml": FILES["Cargo.toml"] + "\n[profile.dev]\nopt-level = 1\n",
+    "app/src/main.rs": ALLOC_MAIN,
+}
+ALLOC_SCENARIOS = {
+    "global-alloc": ([[edit(M, "store(1,", "store(2,")], [edit(M, "store(2,", "store(3,")]],
+                     ["patch", "patch"], 0, {}),
+}
+SCENARIOS.update(ALLOC_SCENARIOS)
 # The own base holds more than the memory it may, so it is given up once and not started again,
 # and the edit patches what rustc linked.
 SCENARIOS["own-base-budget"] = ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 8, {"RA_JIT_OWN_BASE_MEMORY": "1"})
@@ -721,6 +769,8 @@ def main():
             files = GENERIC_FILES
         elif name in UNBUILT_SCENARIOS:
             files = UNBUILT_FILES
+        elif name in ALLOC_SCENARIOS:
+            files = ALLOC_FILES
         elif name in LIB_SCENARIOS:
             files = LIB_FILES
         elif name in SAME_NAME_SCENARIOS:

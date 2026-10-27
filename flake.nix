@@ -242,6 +242,15 @@
           # this the binary finds neither the store's glibc nor its libgcc_s when it runs.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-Clinker-features=-lld";
         });
+        # What builds, runs and inspects wasm32 programs (harness/wasm32.py, the train's wasm32
+        # job): wasmtime for wasm32-wasip1 and `--invoke` of a library's exports,
+        # wasm-tools where the harnesses read objects, wasm-bindgen and node for web guests. The
+        # targets are rustup's: `rustup target add wasm32-wasip1 wasm32-unknown-unknown`.
+        devShells.wasm = pkgs.mkShell (llvmEnv // {
+          packages = [ pkgs.rustup pkgs.python3 llvm pkgs.wasmtime pkgs.wasm-tools pkgs.wasm-bindgen-cli pkgs.nodejs ];
+          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
+          hardeningDisable = [ "all" ];
+        });
         devShells.bench = pkgs.mkShell bench;
         # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
         # bun's own pinned nightly in place of ra-jit's (rust-src, which ra-jit reads `core` from), and

@@ -21,7 +21,7 @@ use super::{
     FAILED,
     cli::{Invocation, Subcommand, worker_env},
     client::{self, Start},
-    daemon::{Checkout, Reply, Request, WorkerConfig},
+    daemon::{Checkout, NotBuilt, Reply, Request, WorkerConfig},
     plan::Plan as Linked,
     run, say,
     state::{as_built, configured_env, library_path, place, repository, run_env},
@@ -54,6 +54,9 @@ fn refused(asked: &Invocation) -> Option<String> {
             (Some(flag), _) => not_yet(&format!(
                 "the targets `{flag}` picks; a build of the default programs, or of one named by `--bin` or `--example`, is"
             )),
+            (None, Subcommand::Test) if asked.target().is_some_and(|it| is_wasm(&it)) => {
+                not_yet("or run the tests of a wasm target")
+            }
             (None, _) => asked.target_not_linked(),
         },
     }
@@ -87,13 +90,27 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
     let metadata = super::state::metadata(asked);
-    let programs = match planned(asked, &cwd, &metadata, None) {
+    let mut programs = match planned(asked, &cwd, &metadata, None) {
         Ok(programs) => programs,
         Err(why) => {
             say::error(&format!("blaze could not plan the build: {why:#}"));
             return Ok(FAILED);
         }
     };
+    // `cargo run` builds the binary it runs, not a library's `cdylib` or `staticlib`.
+    if asked.subcommand == Subcommand::Run {
+        programs.retain(|it| !it.kind.linked_library());
+    }
+    if let Some(it) = programs.iter().find(|it| it.kind == Kind::Staticlib) {
+        let kind = format!("{:?}", it.kind).to_lowercase();
+        say::error(&format!(
+            "blaze does not link the `{kind}` of `{}` (target `{}`) yet, so it would write no `{}` (#262)",
+            it.package.name,
+            it.name,
+            it.executable.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        return Ok(FAILED);
+    }
     if programs.is_empty() && asked.subcommand == Subcommand::Run {
         say::error("a bin target must be available for `cargo run`");
         return Ok(FAILED);
@@ -104,10 +121,13 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     compiling(asked, &programs);
     let checkout = checkout(asked, &cwd, &metadata, &programs, false, BTreeMap::new());
     if let Err(why) = whole(&cwd, &checkout, &programs) {
-        say::error(&why);
+        why.say();
         return Ok(FAILED);
     }
     finished(asked, asked.profile(), started);
+    if let Some(failed) = super::remote_failed_it() {
+        return Ok(failed);
+    }
     if asked.subcommand != Subcommand::Run {
         return Ok(0);
     }
@@ -147,12 +167,18 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
         return Ok(FAILED);
     }
     compiling(asked, &programs);
-    // What an integration test's `env!` reads to run a binary of its package.
-    let places: BTreeMap<String, String> = programs
+    // What an integration test's `env!` reads to run a binary of its package, and the scratch
+    // directory cargo makes for the integration tests and benchmarks, `target/tmp`. The whole
+    // build gives one environment to all its crates, so a program sees it too, where cargo's
+    // `env!` of it would not compile.
+    let mut places: BTreeMap<String, String> = programs
         .iter()
         .filter(|it| it.kind == Kind::Bin && !it.test)
         .map(|it| (format!("CARGO_BIN_EXE_{}", it.name), it.executable.display().to_string()))
         .collect();
+    let scratch = metadata.target_directory.as_std_path().join("tmp");
+    _ = std::fs::create_dir_all(&scratch);
+    places.insert("CARGO_TARGET_TMPDIR".to_owned(), scratch.display().to_string());
     let (units, others): (Vec<Program>, Vec<Program>) = programs.into_iter().partition(unit);
     let checkouts = [
         checkout(asked, &cwd, &metadata, &others, false, places),
@@ -161,6 +187,21 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
     let profile = match asked.profile() {
         "dev" => "test",
         other => other,
+    };
+    // A cargo since rust-lang/cargo#16421 also sets `CARGO_BIN_EXE_<name>` of each program of
+    // its package when it runs an integration test: assert_cmd's `cargo_bin` reads it at run
+    // time, and finds no program beside the test in cargo's second layout.
+    let programs_named = |test: &Program| -> Vec<(String, String)> {
+        if test.kind != Kind::Test {
+            return Vec::new();
+        }
+        let named =
+            |it: &&Program| it.kind == Kind::Bin && !it.test && it.package.id == test.package.id;
+        others
+            .iter()
+            .filter(named)
+            .map(|it| (format!("CARGO_BIN_EXE_{}", it.name), it.executable.display().to_string()))
+            .collect()
     };
     let mut ran = Vec::new();
     for (at, programs) in [&others, &units].into_iter().enumerate() {
@@ -176,6 +217,7 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
                 run_env(&program.package, &[])
                     .into_iter()
                     .chain(library_path(&program.executable, None))
+                    .chain(programs_named(program))
                     .collect(),
             ));
         }
@@ -216,11 +258,14 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
             }
         }
         if let Err(why) = whole(&cwd, checkout, programs) {
-            say::error(&why);
+            why.say();
             return Ok(FAILED);
         }
     }
     finished(asked, profile, started);
+    if let Some(failed) = super::remote_failed_it() {
+        return Ok(failed);
+    }
     if asked.flags.no_run {
         return Ok(0);
     }
@@ -254,7 +299,10 @@ fn doc_tests(
     let asked_in = asked.flags.manifest_path.as_ref().map_or(cwd.to_owned(), |it| cwd.join(it));
     let build = Selection { asked_in: Some(asked_in), ..asked.selection() };
     let build = serde_json::to_string(&build)?;
-    let test_args = shlex::try_join(asked.trailing.iter().map(String::as_str))?;
+    // Cargo's `-q` is the harness's too: it shows the results tersely.
+    let quiet = asked.flags.quiet.then_some("--quiet");
+    let test_args =
+        shlex::try_join(quiet.into_iter().chain(asked.trailing.iter().map(String::as_str)))?;
     for library in libraries {
         let package = &library.package;
         let target = package.targets.iter().find(|it| it.src_path.as_std_path() == library.root);
@@ -308,6 +356,7 @@ fn state_kind(kind: Kind) -> super::state::Kind {
         Kind::Bin => super::state::Kind::Bin,
         Kind::Example => super::state::Kind::Example,
         Kind::Test => super::state::Kind::Test,
+        Kind::Cdylib | Kind::Staticlib => super::state::Kind::Lib,
     }
 }
 
@@ -332,29 +381,71 @@ fn compiling(asked: &Invocation, programs: &[Program]) {
 /// Says the build of `profile` is done.
 fn finished(asked: &Invocation, profile: &str, started: Instant) {
     let took = started.elapsed().as_secs_f64();
-    let finished = format!("`{profile}` profile [ra-jit] target(s) in {took:.2}s");
+    let finished = format!("`{profile}` profile [{}] target(s) in {took:.2}s", super::blaze_tag());
     say::status(asked.flags.quiet, "Finished", &finished);
+}
+
+/// Why a whole build failed: the errors the daemon found in the source, written as rustc
+/// and cargo write them, or what else kept a program from being built.
+enum Unbuilt {
+    Said(String),
+    Why(String),
+}
+
+impl From<String> for Unbuilt {
+    fn from(why: String) -> Unbuilt {
+        Unbuilt::Why(why)
+    }
+}
+
+impl Unbuilt {
+    fn say(self) {
+        match self {
+            Unbuilt::Said(written) => eprintln!("{written}"),
+            Unbuilt::Why(why) => say::error(&why),
+        }
+    }
+}
+
+/// The errors `said` of `program`, as cargo ends a build rustc turned down: with the target
+/// that did not compile.
+fn turned_down(program: &Program, said: &crate::errors::Said) -> String {
+    let name = &program.name;
+    let target = match (program.kind, program.test) {
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, false) => "lib".to_owned(),
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, true) => "lib test".to_owned(),
+        (Kind::Bin, false) => format!("bin \"{name}\""),
+        (Kind::Bin, true) => format!("bin \"{name}\" test"),
+        (Kind::Example, _) => format!("example \"{name}\""),
+        (Kind::Test, _) => format!("test \"{name}\""),
+    };
+    super::state::turned_down(said, &program.package.name.to_string(), &target)
 }
 
 /// Has the daemon build the `programs` of `checkout` whole, and puts each where cargo would.
 /// A worker of the daemon loads the workspace and links each program before it answers, and
 /// builds them again on what it has loaded when asked next. `Err` says why not.
-fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), String> {
+fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), Unbuilt> {
     let reply = client::ask(Request::Build(super::asking(checkout)), Start::IfMissing)
         .map_err(|it| format!("{it:#}"))?;
     let built = match reply {
         Some(Reply::Synced { programs, .. }) => programs,
-        Some(Reply::Cold { reason }) => return Err(not_loaded(cwd, checkout, &reason)),
-        None => return Err(client::why_none()),
-        Some(other) => return Err(format!("the daemon answered {other:?}")),
+        Some(Reply::Cold { reason }) => return Err(not_loaded(cwd, checkout, &reason).into()),
+        None => return Err(client::why_none().into()),
+        Some(other) => return Err(format!("the daemon answered {other:?}").into()),
     };
     for ((program, plan), built) in std::iter::zip(programs, &checkout.programs).zip(built) {
-        if let Err(why) = built {
-            return Err(format!("could not build `{}`: {}", program.name, why.why()));
+        match built {
+            Ok(_) => {}
+            Err(NotBuilt::Error(said)) => return Err(Unbuilt::Said(turned_down(program, &said))),
+            Err(why) => {
+                return Err(format!("could not build `{}`: {}", program.name, why.why()).into());
+            }
         }
         let _unwritten = crate::splice::unwritten(&plan.binary);
         let stand_ins = crate::link::stand_ins(&plan.binary).map_err(|it| format!("{it:#}"))?;
-        if !stand_ins.is_empty() {
+        // On Windows the executable keeps every stand-in (see `main.rs`, `link_whole`).
+        if !stand_ins.is_empty() && !cfg!(windows) {
             let mut reached: Vec<String> = stand_ins
                 .iter()
                 .take(SHOWN)
@@ -368,7 +459,8 @@ fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), St
                 "`{}` can reach functions blaze could not compile, so it is not built:\n  {}",
                 program.name,
                 reached.join("\n  ")
-            ));
+            )
+            .into());
         }
         if let Some(parent) = program.executable.parent() {
             std::fs::create_dir_all(parent)
@@ -393,6 +485,9 @@ fn checkout(
 ) -> Checkout {
     let root = metadata.workspace_root.as_std_path();
     let asked_in = asked.flags.manifest_path.as_ref().map_or(cwd.to_owned(), |it| cwd.join(it));
+    // From the root of the checkout, as `project` is: the same build in a worktree of the
+    // repository is loaded by the same worker (docs/cargo.md).
+    let asked_in = asked_in.strip_prefix(root).map_or(asked_in.clone(), Path::to_owned);
     let project = programs.first().map(|it| super::state::package_dir(&it.package));
     let project = project.as_deref().unwrap_or(root);
     let config = WorkerConfig {
@@ -403,23 +498,37 @@ fn checkout(
         env: worker_env(),
         whole: true,
     };
-    let plans = programs.iter().map(|program| Linked {
-        crates: vec![program.root.clone()],
-        object: program.dir.join(format!("{}.o", program.name)),
-        patch: program.dir.join(format!("{}.patch.o", program.name)),
-        binary: program.dir.join(&program.name),
-        rustc_binary: None,
-        link_cmd: String::new(),
-        symbol_files: Vec::new(),
-        unit_test: unit_tests,
-        linked_as_built: Vec::new(),
-        copies: Vec::new(),
-        package: None,
-        stamp: 0,
-        whole: true,
+    // A worker links its programs where it was started to and builds again only what was
+    // edited: another worker's build, of other features or flags, is not in its files.
+    let worker = config.id();
+    let dirs: Vec<PathBuf> = programs.iter().map(|it| it.dir.join(&worker)).collect();
+    let plans = programs.iter().zip(&dirs).map(|(program, dir)| {
+        // A `cdylib` is linked under the name of its file, which a binary of the same name
+        // beside it does not have.
+        let shared = program.kind == Kind::Cdylib;
+        let name = match shared {
+            true => program.executable.file_name().unwrap_or_default().to_string_lossy().into(),
+            false => program.name.clone(),
+        };
+        Linked {
+            crates: vec![program.root.clone()],
+            object: dir.join(format!("{name}.o")),
+            patch: dir.join(format!("{name}.patch.o")),
+            binary: dir.join(&name),
+            rustc_binary: None,
+            link_cmd: String::new(),
+            symbol_files: Vec::new(),
+            unit_test: unit_tests,
+            linked_as_built: Vec::new(),
+            copies: Vec::new(),
+            package: None,
+            stamp: 0,
+            whole: true,
+            shared,
+        }
     });
-    for program in programs {
-        _ = std::fs::create_dir_all(&program.dir);
+    for dir in &dirs {
+        _ = std::fs::create_dir_all(dir);
     }
     let members = metadata.workspace_packages();
     let manifests = members.iter().map(|it| it.manifest_path.as_std_path().to_owned());
@@ -488,17 +597,19 @@ fn not_loaded(cwd: &Path, checkout: &Checkout, reason: &str) -> String {
     };
     let said = std::fs::read_to_string(&log).unwrap_or_default();
     let shown = log.strip_prefix(cwd).unwrap_or(&log).display().to_string();
-    // A function of the program's own crates blaze cannot compile is left out of the object,
-    // and the link then fails on what it would have defined.
-    let unsupported: Vec<String> = said
+    // The functions of the program blaze could not compile, which nothing else compiles: the
+    // lines after the error's first ([`crate::refused_error`]).
+    let refused: Vec<&str> = said
         .lines()
-        .filter_map(|it| it.trim().strip_prefix("left to rustc: "))
-        .map(without_hashes)
+        .skip_while(|it| !(it.starts_with("Error: ") && it.contains(crate::REFUSED_SAYS)))
+        .skip(1)
+        .take_while(|it| it.starts_with("  "))
+        .map(str::trim)
         .collect();
-    if !unsupported.is_empty() {
+    if !refused.is_empty() {
         return format!(
-            "{named} has functions blaze could not compile, so it is not built:\n  {}\n(what blaze said is in {shown})",
-            unsupported.join("\n  ")
+            "{named} reaches functions blaze could not compile, so it is not built:\n  {}\n(what blaze said is in {shown})",
+            refused.join("\n  ")
         );
     }
     let last = said.lines().rev().find(|it| it.starts_with("Error"));
@@ -516,7 +627,7 @@ fn worker_log(project: &Path) -> Option<PathBuf> {
 
 /// `name` with the `[0123456789abcdef]` after each crate's name, and the `ra-jit.<hash>.` of
 /// a symbol, taken out.
-fn without_hashes(name: &str) -> String {
+pub(crate) fn without_hashes(name: &str) -> String {
     let is_hash = |it: &str| it.len() == 16 && it.bytes().all(|it| it.is_ascii_hexdigit());
     let mut name = name.to_owned();
     while let Some(at) = name.find("ra-jit.")
@@ -565,9 +676,37 @@ fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i
     };
     let shown =
         program.executable.strip_prefix(cwd).unwrap_or(&program.executable).display().to_string();
+    let target = asked.selection().target;
+    let runner = match &target {
+        Some(triple) => runner(asked, cwd, triple)?,
+        None => None,
+    };
+    let mut command = match runner {
+        Some(mut runner) => {
+            runner.arg(&program.executable);
+            runner
+        }
+        None if target.as_deref().is_some_and(is_wasm) => {
+            let triple = target.unwrap_or_default();
+            let variable =
+                format!("CARGO_TARGET_{}_RUNNER", triple.replace('-', "_").to_uppercase());
+            say::error(&format!(
+                "`{shown}` is a wasm module, which runs in a runtime: name one with `target.{triple}.runner` in the configuration or `{variable}` (`wasmtime run`, say), as cargo runs it"
+            ));
+            return Ok(FAILED);
+        }
+        None => Command::new(&program.executable),
+    };
     let args = asked.program_args().map(|it| format!(" {it}")).collect::<String>();
-    say::status(asked.flags.quiet, "Running", &format!("`{shown}{args}`"));
-    let mut command = Command::new(&program.executable);
+    let ran = std::iter::once(command.get_program()).chain(command.get_args());
+    let ran: Vec<String> = ran.map(|it| it.to_string_lossy().into_owned()).collect();
+    let ran = match ran.len() {
+        1 => shown.clone(),
+        _ => {
+            format!("{} {shown}", shlex::try_join(ran[..ran.len() - 1].iter().map(String::as_str))?)
+        }
+    };
+    say::status(asked.flags.quiet, "Running", &format!("`{ran}{args}`"));
     for it in configured_env(cwd) {
         if it.force || std::env::var_os(&it.name).is_none() {
             command.env(&it.name, &it.value);
@@ -594,6 +733,7 @@ fn planned(
     let named = blaze_metadata::Targets {
         bin: asked.flags.bin.as_deref(),
         example: asked.flags.example.as_deref(),
+        lib: tests.is_none() && asked.typed("--lib"),
         test: tests,
     };
     let planned = super::metadata::programs(&selection, dir, manifest.as_deref(), named)?;
@@ -608,6 +748,15 @@ fn planned(
         out.push(triple);
     }
     out.push(profile);
+    // Cargo's tests are in its build directory (`build.build-dir`), in the layout of it that
+    // cargo has: a test that finds a program from where it is itself finds what it finds there.
+    let build_dir = metadata.build_directory.as_ref().map_or(target, |it| it.as_std_path());
+    let mut built = build_dir.to_owned();
+    if let Some(triple) = &selection.target {
+        built.push(triple);
+    }
+    built.push(profile);
+    let second = second_layout(&asked.flags.config);
     let mut programs = Vec::new();
     for program in planned {
         let Some(package) = metadata.packages.iter().find(|it| it.id.repr == program.package)
@@ -617,13 +766,34 @@ fn planned(
                 program.package
             );
         };
-        let exe = |name: &str| format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let named = FileNames::of(selection.target.as_deref());
+        let exe = |name: &str| format!("{name}{}", named.exe_suffix);
         let kind = format!("{:?}", program.kind).to_lowercase();
+        // A library's file is named for its crate, as rustc names it.
+        let library = |prefix: &str, suffix: &str| {
+            format!("{prefix}{}{suffix}", program.name.replace('-', "_"))
+        };
         let executable = match (program.kind, program.test) {
             (Kind::Example, _) => out.join("examples").join(exe(&program.name)),
+            (Kind::Cdylib, _) => out.join(library(named.dll_prefix, named.dll_suffix)),
+            (Kind::Staticlib, _) => out.join(match cfg!(windows) {
+                true => library("", ".lib"),
+                false => library("lib", ".a"),
+            }),
             (_, false) => out.join(exe(&program.name)),
-            // Cargo names a test by its target and a hash of the unit; blaze by the kind.
-            (_, true) => out.join("deps").join(exe(&format!("{}-{kind}", program.name))),
+            // Cargo names a test by its target and a hash of the unit; blaze by a hash of
+            // what tells its tests apart.
+            (_, true) => {
+                let hash = test_hash(&package.id.repr, &kind, &program.name, &built);
+                let name = exe(&format!("{}-{hash}", program.name));
+                match second {
+                    true => {
+                        let unit = built.join("build").join(package.name.as_str()).join(&hash);
+                        unit.join("out").join(name)
+                    }
+                    false => built.join("deps").join(name),
+                }
+            }
         };
         // A test's directory has the file that says it starts in the harness, and a build of
         // `cargo test` is another worker's than that of `cargo build`.
@@ -647,4 +817,69 @@ fn planned(
         });
     }
     Ok(programs)
+}
+
+/// Whether cargo lays its build directory out in its second layout ([`super::layout`]): the
+/// nightly blaze pins does, unless `unstable.build-dir-new-layout` (or
+/// `CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT`) is false. `config` is cargo's `--config` arguments.
+fn second_layout(config: &[String]) -> bool {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = blaze_manifest::Config::load(&cwd, std::env::vars(), config);
+    let set = config.and_then(|it| it.get::<Option<bool>>("unstable.build-dir-new-layout"));
+    set.map_or(true, |it| it != Some(false))
+}
+
+/// Sixteen hexadecimal digits, as cargo names a unit by, of the test `name` of `kind` in
+/// `package` built in the profile directory `profile`.
+fn test_hash(package: &str, kind: &str, name: &str, profile: &Path) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = rustc_hash::FxHasher::default();
+    (package, kind, name, profile).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// How rustc names the files of the programs it links for a target (its spec's
+/// `exe-suffix`, `dll-prefix` and `dll-suffix`), which cargo puts as they are.
+struct FileNames {
+    exe_suffix: &'static str,
+    dll_prefix: &'static str,
+    dll_suffix: &'static str,
+}
+
+impl FileNames {
+    /// Of the target `triple`, the host when it is none.
+    fn of(triple: Option<&str>) -> FileNames {
+        match triple {
+            Some(triple) if is_wasm(triple) => {
+                FileNames { exe_suffix: ".wasm", dll_prefix: "", dll_suffix: ".wasm" }
+            }
+            _ => FileNames {
+                exe_suffix: std::env::consts::EXE_SUFFIX,
+                dll_prefix: std::env::consts::DLL_PREFIX,
+                dll_suffix: std::env::consts::DLL_SUFFIX,
+            },
+        }
+    }
+}
+
+/// Whether `triple` is a WebAssembly target, whose programs run in a runtime.
+fn is_wasm(triple: &str) -> bool {
+    triple.starts_with("wasm32-") || triple.starts_with("wasm64-")
+}
+
+/// The program `target.<triple>.runner` (or a `target.'cfg(..)'.runner` that matches, or
+/// `CARGO_TARGET_<TRIPLE>_RUNNER`) names to run what is built for `triple`, and its
+/// arguments, as cargo finds it for `cargo run`.
+fn runner(asked: &Invocation, cwd: &Path, triple: &str) -> anyhow::Result<Option<Command>> {
+    use blaze_manifest::config::CompileKind;
+    let config = blaze_manifest::Config::load(cwd, std::env::vars(), &asked.flags.config)?;
+    let host = super::own::manifest::host_triple()?;
+    let cfg = super::own::manifest::target_cfg(triple)?;
+    let kind = CompileKind::Target(triple.to_owned());
+    let Some((program, args)) = config.target_runner(&kind, &host, &cfg)? else {
+        return Ok(None);
+    };
+    let mut command = Command::new(program);
+    command.args(args);
+    Ok(Some(command))
 }

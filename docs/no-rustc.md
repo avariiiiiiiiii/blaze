@@ -151,10 +151,34 @@ project exactly as cargo does. Until K, J and M land, blaze keeps a toolchain of
 private to it: the pinned nightly's `rustc`, `cargo`, `rust-std` and `rust-src` as the Rust project
 publishes them (96 to 133 MB), each piece removed as the step that ends its use lands. A
 project's own pin does not change which Rust blaze builds with
-([#269](https://github.com/indexable-inc/blaze/issues/269)). blaze's manifest reader, registry
-and resolver (`crates/blaze-manifest`, `blaze-registry`, `blaze-resolve`) replace `cargo
-metadata`, `cargo build --unit-graph` and cargo's fetching, held equal to cargo's by
-`harness/resolve.py`; with them K needs no cargo to plan a build.
+([#269](https://github.com/indexable-inc/blaze/issues/269)). blaze's manifest reader, registry,
+resolver and unit graph (`crates/blaze-manifest`, `blaze-registry`, `blaze-resolve`,
+`blaze-units`) replace `cargo metadata`, `cargo build --unit-graph` and cargo's fetching, held
+equal to cargo's by `harness/resolve.py`; with them K needs no cargo to plan a build. Since
+2026-10-27 the standard library's workspace is read by them too (`OwnMetadata.library`,
+`harness/resolve.py sysroot`), a workspace load's questions of the toolchain and configuration
+(`cargo --version`, `cargo config get` in TOML for rust-analyzer and the rustflags `plan.rs`
+reads, `cargo rustc --print cfg` and `target-spec-json`) are blaze's
+(`crates/ra-jit/src/answers/cargo.rs` over blaze-manifest, `resolve.py toolchain`), and
+`plan.rs` plans each load from blaze-units' graph with no `cargo build --unit-graph`
+(`resolve.py units`); and a load's build scripts and proc macros are built and run by blaze
+over that graph, with no `cargo check --compile-time-deps` (`cargo/compile_time.rs`,
+`resolve.py ctdeps`). A question blaze cannot answer is an error naming it, never a cargo run. The cargo
+processes of a cold `cargo blaze build` and `test` from a clean `target/` (strace, Linux arm64,
+the typed `cargo blaze` included):
+
+| run | before | sysroot read by blaze | and the toolchain's answers | and blaze-units' graph | and blaze's build scripts |
+|---|---|---|---|---|---|
+| harness/norustc/fixture `build` | 14 | 8 | 3 | 2 | 1 |
+| harness/norustc/fixture `test` | 12 | 8 | 3 | 2 | 1 |
+| ripgrep 15.1.0 `build` | 26 | 8 | 3 | 2 | 1 |
+| ripgrep 15.1.0 `test` | 43 | 15 | 5 | 3 | 1 |
+
+The one left is the typed `cargo blaze` itself; `blaze build` and `blaze test` run no cargo at
+all. The same holds with `--whole`, and none of the eight runs starts the toolchain's rustc or
+rustdoc (the `rustc` a build script is given is ra-jit's stand-in). What blaze still keeps of
+cargo is in the toolchain it ships, for a load into cargo's own target directory (the harness's
+reference builds) and with `RA_JIT_PROC_MACRO_SERVER=off`.
 
 ## While the paths remain
 
@@ -249,10 +273,10 @@ Paths are under `crates/`; line numbers are of 41e7906192.
 
 | Where | What it does | When |
 |---|---|---|
-| `ra-jit/src/main.rs:2261` `ProjectWorkspace::load` | `cargo metadata`, plus rustc's `-vV`, `--print sysroot`, `--print cfg`, `--print target-spec-json` through `cargo rustc --print` (`vendor/rust-analyzer/crates/project-model/src/toolchain_info/`) | every load: the daemon's workers and spares, and each doctest process; since B, ra-jit answers them (`answers/own.rs`) |
+| `ra-jit/src/main.rs:2261` `ProjectWorkspace::load` | `cargo metadata`, plus rustc's `-vV`, `--print sysroot`, `--print cfg`, `--print target-spec-json` through `cargo rustc --print` (`vendor/rust-analyzer/crates/project-model/src/toolchain_info/`) | every load: the daemon's workers and spares, and each doctest process; since B, ra-jit answers them (`answers/own.rs`); the `cargo metadata` of the sysroot's `library/` (rust-analyzer's `Sysroot::load_workspace`, two per load and per unit load of a build script or proc macro) is blaze-metadata's since 2026-10-27 (`cargo/metadata.rs` `library`); since 2026-10-27 too no cargo runs for `cargo --version`, `cargo config get --format toml --show-origin` (`cargo_config_file.rs`) or `cargo rustc --print cfg` / `target-spec-json`: `answers/cargo.rs` answers them with blaze-manifest's configuration (`config/print.rs` for the flags cargo hands rustc), held equal to cargo's by `resolve.py toolchain` |
 | `ra-jit/src/main.rs:2272` | asks rustc for the target triple | every load |
-| `ra-jit/src/plan.rs:475` | `cargo build --unit-graph`, which asks rustc about the target | every load, and every doctest run per library |
-| `ra-jit/src/main.rs:2314`, `ra-jit/src/inputs.rs:282` `run_build_scripts` | rust-analyzer's `cargo check --compile-time-deps`: into ra-jit's own target directory (every load of `cargo ra-jit` and the daemon) nothing is rustc's since 2026-10-27 (J, below): ra-jit links the scripts and proc macros and only describes their libraries; into cargo's (a load without `--own-target`) rustc compiles them all; the scripts run | a load that is neither beside nor after a cargo build of the workspace (a worker after one reads what cargo said, `cargo/state.rs` `kept_said`), whose target directory does not have them yet; after an edit to a proc macro or build script |
+| `ra-jit/src/plan.rs` `UnitGraph::of` | until 2026-10-27, `cargo build --unit-graph`, which asks rustc about the target; now blaze-units' graph (`blaze_metadata::units`), no cargo and no rustc; the rustflags of each target (`Flags::of`) are blaze-manifest's since 2026-10-27 (`answers::cargo_rustflags`), no `cargo config get --format json` | every load, and every doctest run per library |
+| `ra-jit/src/main.rs:2314`, `ra-jit/src/inputs.rs:282` `run_build_scripts` | into ra-jit's own target directory (every load of `cargo blaze` and the daemon) no cargo since 2026-10-27 (the `ctdeps` lane): blaze compiles the build scripts and proc macros over the build's unit graph and runs the scripts itself (`cargo/compile_time.rs`, project-model's `OwnBuildScripts` hook), and a script or proc macro it cannot build or run fails the load; `harness/resolve.py ctdeps` holds what the load reads to rust-analyzer's `cargo check --compile-time-deps`. Before, nothing was rustc's there (J, below) but cargo scheduled the compiles and runs. Into cargo's target directory (a load without `--own-target`, the harness's reference builds) and with `RA_JIT_PROC_MACRO_SERVER=off`, rust-analyzer's `cargo check --compile-time-deps` still runs and rustc compiles them all | a load that is neither beside nor after a cargo build of the workspace (a worker after one reads what cargo said, `cargo/state.rs` `kept_said`), whose target directory does not have them yet; after an edit to a proc macro or build script |
 | `ra-jit/src/main.rs:5287`, `ra-jit/src/borrowck.rs:113` `ProcMacroServerChoice::Sysroot` | expands with the toolchain's `rust-analyzer-proc-macro-srv` loading rustc's proc-macro libraries | every load that has a proc macro |
 | `ra-jit/src/cargo/state.rs` `other_toolchain` | `rustc --version`, `--print=sysroot` | every client command; its `cargo metadata --no-deps` is blaze-manifest's reading since 2026-10-25 ([resolve.md](resolve.md)) |
 
@@ -491,8 +515,9 @@ arguments, the variables rustc reads for them and the input, and gives it again 
 only an answer with status 0 and nothing on stderr is kept, and `RA_JIT_ANSWERS=0` asks rustc
 every time. The processes that ask one question together wait for the first one's answer, so
 each is asked once. cargo asks through ra-jit as the workspace's wrapper in builds and as
-`RUSTC_WRAPPER` in the cargos ra-jit runs only to ask (`metadata`, `rustc --print`,
-`--unit-graph`, `config get`), unless the user named a wrapper; rust-analyzer's queries go
+`RUSTC_WRAPPER` in the cargos ra-jit runs only to ask (`--unit-graph`; the
+sysroot's `metadata`, `rustc --print` and `config get` are blaze's since 2026-10-27), unless the user
+named a wrapper; rust-analyzer's queries go
 through a hook in project-model's `utf8_stdout`. Left: the first ask of each question, 12 on
 the fixture's cold build and 17 on ripgrep's, which answering from ra-jit's own targets removes;
 `cargo check --compile-time-deps`'s probes (I) and plain `cargo check`'s (D).
@@ -601,8 +626,9 @@ check with what the build's verdict finds in every file of the workspace's crate
 sure errors, the borrow checker's, the deny lints). It stays loaded and takes in edits of the
 files it has; a new source file, a changed manifest, or a changed build script or proc macro
 has it load again. The build scripts and proc macros are cargo's from an earlier build; a
-workspace that never had them built has rust-analyzer's `cargo check --compile-time-deps` build
-them with rustc, which I and J remove. Code rustc accepts that ra-jit takes for wrong fails such
+workspace that never had them built has blaze build and run them (`cargo/compile_time.rs`, since
+2026-10-27; before, rust-analyzer's `cargo check --compile-time-deps` built them with rustc, which
+I and J removed). Code rustc accepts that ra-jit takes for wrong fails such
 a check, as it fails a build. On `harness/norustc.py`'s workspace (dev host, cranelift) the
 `check unloaded` scenario (the daemon stopped, an error, the error mended, another package)
 runs no rustc, and `check` itself none on every platform CI has (5 recorded before). Counted on ripgrep with `harness/norustc` (dev-aws-3, 2026-10-22), the
@@ -688,8 +714,17 @@ builds, links and runs with nothing rustc built, and 19 of its commands (searche
 ra-jit cannot compile (1,786 of the library's: 534 for f16 and f128, most of the rest
 `core::arch`'s SIMD; the 222 intrinsics declared with no body are not functions to compile,
 every call to one being the compiler's own code) is, where something calls it, a hidden stand-in
-that says so when it runs; a program that calls one compiles its own copy and is told at its
-build. The unit is what the program takes of the library and everything that depends on, but
+that says so when it runs. A program that reaches one is not built: a function of its own
+crates ra-jit refused (its `main`, or one only code of the object calls, its own copy of an
+`#[inline]` function of the library's among them) stops the build before the link, and a stand-in
+the link keeps, the library unit's included, fails it after; either way the error names each
+function and why it was refused (`` `p` reaches 1 function ra-jit could not compile, and a build
+with nothing of rustc's has nothing else to compile it, so it is not built:``), and no
+executable is left. A function the library exports by name that nothing in it calls has no
+stand-in, as one exported under the name could take the place of a definition the program
+links from elsewhere (libgcc's soft float is named as the library's is): the unit keeps a list
+of those it refused beside it and in the store, and a link that fails on one of their names
+is the same error, naming the function and why. The unit is what the program takes of the library and everything that depends on, but
 `test`, `proc_macro` and the panic runtime the program does not link, which rust-analyzer's
 graph has every crate depend on: 21 crates, `rand` and `foldhash` among them, which std's own
 workspace adds to its graph and which nothing compiled uses. The library's build names only the
@@ -703,7 +738,7 @@ over ripgrep: 2.5 s against 0.25 s), and the native libraries the crates linked 
 `#[link(name, kind, modifiers, cfg)]`, read from their `extern` blocks, a crate's before those
 of the crates it depends on; no list of libraries is fixed. What the link leaves out it proves
 unreachable, so a stand-in left in the executable is a function the program can reach that
-ra-jit could not compile: ra-jit says how many after the link, and `allrajit.py` fails on any.
+ra-jit could not compile: ra-jit says how many after the link and fails on any.
 None is left in hello, the four `allrajit.py` programs or ripgrep. The rest of what rustc
 does around the link: the allocator shim calls the `#[global_allocator]`'s methods (through the
 four functions the attribute's expansion exports) or else std's defaults; the panic runtime is
@@ -813,8 +848,9 @@ main 24be505), "cold": with a store that has the standard library's unit, ripgre
 4.5), nushell 27.2 s (25.6 to 25.9); with an empty store, 11.2 s and 37.3 s. rustc compiles
 the build scripts of the cold build: ripgrep 7 times before, 1 (crossbeam-utils, `include!`);
 nushell 50 before, 5 (crossbeam-utils and portable-atomic, `include!`; bigdecimal, `env!`;
-nu-cmd-lang and oem_cp, a proc macro). Not done: rust-analyzer's `cargo check
---compile-time-deps` replaced; the harness that compares every script's output with rustc's. For
+nu-cmd-lang and oem_cp, a proc macro). Done since (2026-10-27, the `ctdeps` lane): rust-analyzer's
+`cargo check --compile-time-deps` replaced, see K. Not done: the harness that compares every
+script's output with rustc's. For
 the F+G lane: the printed lines a library is linked with are where cargo keeps them
 (`cargo::script::printed`), whether ra-jit compiled the script or not, and a script ra-jit
 compiles is one more crate of a `rust-project.json`, so the standard library's scripts can take
@@ -1072,7 +1108,10 @@ Where J stands (2026-10-24):
   macro is compiled again by rustc. A script or proc macro ra-jit cannot build, or a proc
   macro with no server beside ra-jit, fails the load with why. A crate cargo built before the
   directory was seeded from it is described from cargo's records. `RA_JIT_PROC_MACRO_SERVER=0`
-  is kept for `macroserver.py`'s reference build alone, which rustc builds whole. On blaze's
+  is kept for `macroserver.py`'s reference build alone, which rustc builds whole, into a
+  directory of its own (`target/rust-analyzer-rustc`): cargo does not fingerprint the
+  variable, and in one directory rustc read the empty files (#460). The variable is part of
+  which build and worker it is, so the daemon never keeps the mode it was started with. On blaze's
   own release build this took the load from about 100 compiles by rustc (54 scripts, 28
   libraries, 18 proc macros compiled again) to none.
 - Shipped (2026-10-25): on Linux the release workflow's ra-jit builds the server
@@ -1138,6 +1177,23 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   0.37 s (0.46 s), ripgrep 0.25 s (0.58 s), nushell 0.99 s (5.16 s). A whole build takes no
   crate over from rustc on an edit (`Program::widen`): every crate is the worker's already,
   and taking one over wrote the whole object again (ripgrep's signature edit 2.9 s before).
+- Done (2026-10-27, the `ctdeps` lane): a load into ra-jit's own target directory builds and
+  runs its build scripts and proc macros without cargo. rust-analyzer's `cargo check
+  --compile-time-deps` was cargo scheduling compiles that were already ra-jit's; now
+  `cargo/compile_time.rs` walks the build's unit graph (plan.rs, the same answer the plan
+  reads, asked once per load), compiles each build script with `own_script.rs` from a
+  description of the libraries it links (features, `debug_assertions`, the flags' `--cfg`s, what
+  their own scripts printed, cargo's variables for rustc), runs it through `ra-jit build-script`
+  with `blaze-build-script`'s environment (`DEP_<links>_*` from the scripts it runs after) and
+  reads what it printed as cargo does, and links each proc macro for ra-jit's server. It fills
+  project-model's `OwnBuildScripts` hook, as `OwnMetadata` does for `cargo metadata`; what it
+  cannot build or run fails the load, naming the package. `harness/resolve.py ctdeps`
+  ([resolve.md](resolve.md)) holds what the load reads (cfgs, variables, `OUT_DIR`'s files,
+  the proc macros) to cargo's: equal on 10 of the 14, and on fd too with the build-script
+  sandbox off, whose environment is not cargo's ([resolve.md](resolve.md)); biome
+  stops at a syn-1 proc macro ra-jit cannot compile (#327), and zed and bun fail for both, at a
+  program or path package the machine lacks. A cold `cargo blaze build` or `test` of the fixture or
+  ripgrep now starts no cargo but the typed one ([the counts](#self-contained-no-rustup-no-cargo)).
 - Next: the cold builds, which are slower than cargo's but axum's (dev-aws-14, quiet,
   2026-10-26: ripgrep 4.8 s against 4.0 s, fd 22.1 s against 16.8 s, bat 12.6 s against
   7.0 s, hyperfine 7.0 s against 3.8 s, just 11.0 s against 5.5 s, axum 6.1 s against 6.1 s,

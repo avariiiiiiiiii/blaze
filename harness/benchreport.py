@@ -153,7 +153,7 @@ def failure(key, measured):
     """What failed and where, in the project's own paths: a line for under the tables."""
     said = [line for line in measured["failed"].splitlines()[1:] if line.strip()] or measured["failed"].splitlines()
     said = re.sub(r"/\S*?/[\w.-]+-(cranelift|llvm)/(target/\S*?: )?", "", said[-1].removeprefix("error: "))
-    said = said.removeprefix("ra-jit did not build ")
+    said = said.removeprefix("blaze did not build ")
     if len(said) > 140:
         said = said[:140].rsplit(" ", 1)[0]
         said += "`" * (said.count("`") % 2) + " …"
@@ -273,7 +273,7 @@ def machines(results, extra=lambda r: "", said=False):
     lines = []
     for p in NAMES:
         r = own(results[p]) if p in results else None
-        lines.append(f"- **{p}**: " + (f"{machine_line(r)}, ra-jit {commit_link(r)} on {r['date'][:10]}{extra(r)}{loaded(r)}, {who(r)}."
+        lines.append(f"- **{p}**: " + (f"{machine_line(r)}, blaze {commit_link(r)} on {r['date'][:10]}{extra(r)}{loaded(r)}, {who(r)}."
                                        if r else f"{NOT_MEASURED} ([the machines](docs/benchmarks.md#the-machines))."))
     return lines + apart_lines(results, extra, said)
 
@@ -286,7 +286,7 @@ def apart_lines(results, extra=lambda r: "", said=False):
         if on:
             what = f" {APART[name]}" if said and name in APART else ""
             lines.append(f"- **{name}** is measured on its own, by the `bench-{name}` workflow: " + "; ".join(
-                f"{p} on {machine_line(r)}, ra-jit {commit_link(r)} on {r['date'][:10]}{extra(r)}{loaded(r)}, {who(r)}"
+                f"{p} on {machine_line(r)}, blaze {commit_link(r)} on {r['date'][:10]}{extra(r)}{loaded(r)}, {who(r)}"
                 for p, r in on.items()) + "." + what)
     return lines
 
@@ -433,8 +433,8 @@ def summary_section(results):
     backend = "cranelift"
     lines = [SUM_START]
     if summary := edits_chart(results, backend):
-        lines += [benchcharts.picture("edits", f"How much faster an edit builds under ra-jit than under cargo, by platform: {summary}"), ""]
-    lines += ["Edit, then build, on real projects at pinned commits: incremental `cargo build` → `cargo ra-jit build`, both "
+        lines += [benchcharts.picture("edits", f"How much faster an edit builds under blaze than under cargo, by platform: {summary}"), ""]
+    lines += ["Edit, then build, on real projects at pinned commits: incremental `cargo build` → `cargo blaze build`, both "
               "warm, same linker, Cranelift, the median of each run's edits. Each platform is a machine of its "
               "own: compare numbers within a platform, not across.", ""]
     fell_back = False
@@ -452,7 +452,7 @@ def summary_section(results):
             out.append(f"| {project_name(key, measured)} | " + " | ".join(cells) + " |")
         return out
 
-    lines += ["An edit to one function, cargo → ra-jit:", "",
+    lines += ["An edit to one function, cargo → blaze:", "",
               "| Project | " + " | ".join(NAMES) + " |", "|---|" + "---:|" * len(NAMES)]
     for key in keys_of(results, backend):
         cells = []
@@ -470,7 +470,7 @@ def summary_section(results):
     lines += ["", "</details>", ""]
     if fell_back:
         lines += ["(c): the daemon handed this edit to cargo (a fallback, so about cargo's time).", ""]
-    built = (f" The ra-jit measured is `cargo build --release`; the binaries a release ships are the `dist` profile with PGO, "
+    built = (f" The blaze measured is `cargo build --release`; the binaries a release ships are the `dist` profile with PGO, "
              f"which start and edit faster ([how]({REPO}/blob/main/docs/reports/RELEASE-BUILD.md)).")
     lines.append("Measured by hand with `harness/bench.py`, or by the `bench-readme` workflow (a project measured on its own, by "
                  "its own workflow) on each platform's benchmark machine once it is registered." + built + " Cold builds, the "
@@ -489,14 +489,14 @@ def memory_section(results):
     if backend is None:
         return "\n".join([MEM_START, "Memory: no platform's stored run measured it yet.", MEM_END])
     if summary := memory_chart(measured, backend):
-        lines += [benchcharts.picture("memory", f"Peak memory while an edit to one function builds, ra-jit against cargo, by platform: {summary}"), ""]
+        lines += [benchcharts.picture("memory", f"Peak memory while an edit to one function builds, blaze against cargo, by platform: {summary}"), ""]
     if summary := disk_chart(measured, backend):
-        lines += [benchcharts.picture("disk", f"What a project's build keeps on disk, ra-jit against cargo, by platform: {summary}"), ""]
+        lines += [benchcharts.picture("disk", f"What a project's build keeps on disk, blaze against cargo, by platform: {summary}"), ""]
     lines += [f"Memory and disk, {BACKEND_NAMES[backend]}, from the same runs as the build table. Peak: the most every process "
-              "doing the work held at once, cargo → ra-jit. For ra-jit that is the daemon, its workers and what they run, and "
-              "`cargo ra-jit build` with any cargo it ran; for plain cargo, cargo itself, rustc, build scripts and the linker. "
+              "doing the work held at once, cargo → blaze. For blaze that is the daemon, its workers and what they run, and "
+              "`cargo blaze build` with any cargo it ran; for plain cargo, cargo itself, rustc, build scripts and the linker. "
               "How it is measured: [docs/benchmarks.md](docs/benchmarks.md#memory-and-disk).", "",
-              "Peak while an edit to one function builds, cargo → ra-jit:", "",
+              "Peak while an edit to one function builds, cargo → blaze:", "",
               "| Project | " + " | ".join(NAMES) + " |", "|---|" + "---:|" * len(NAMES)]
     pair = lambda m: f"{megabytes(m['cargo']['peak_mb'])} → **{megabytes(m['ra-jit']['peak_mb'])}**" if m else "-"
     keys = [k for k in keys_of(measured, backend) if any(k in r["results"] and edit_memory(r["results"][k]) for r in measured.values())]
@@ -520,7 +520,7 @@ def memory_section(results):
             ours = sum(disk.get(k) or 0 for k in ("target", "store", "home"))
             on_disk = f"{megabytes(disk.get('cargo target'))} → {megabytes(ours)}" if disk else ""
             lines.append(f"| {project_name(key, m)} | {pair(edit_memory(m))} | {held} | {pair(cold) if cold else ''} | {on_disk} |")
-    lines += ["", "On disk: cargo's target directory → ra-jit's target directory, store and home.", "", "</details>", MEM_END]
+    lines += ["", "On disk: cargo's target directory → blaze's target directory, store and home.", "", "</details>", MEM_END]
     return "\n".join(lines)
 
 
@@ -534,10 +534,10 @@ def memory_tables(result, keys, backend, name=""):
              "Peak: the most every process doing the work held at once, sampled every 10 ms and never below the largest "
              "process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel "
              "kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint "
-             "of each, counting for the daemon only a peak it passed during the step). ra-jit is the daemon, its workers and "
-             "what they run, and the `cargo ra-jit build` with any cargo it ran; cargo is cargo itself, rustc, build scripts "
+             "of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and "
+             "what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts "
              "and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).", "",
-             "| Project | Step | cargo, peak | ra-jit, peak | cargo, largest process | ra-jit, largest process | Daemon after |",
+             "| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |",
              "|---|---|---:|---:|---:|---:|---:|"]
     for key in keys:
         measured = result["results"][key]
@@ -551,7 +551,7 @@ def memory_tables(result, keys, backend, name=""):
     lines += ["", "The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). "
               "After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, "
               "over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.", "",
-              "| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | ra-jit target | Store | Home |",
+              "| Project | Daemon ready | After the first build | At the end | Growth | Warm store: peak, ready | cargo target | blaze target | Store | Home |",
               "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for key in keys:
         measured = result["results"][key]
@@ -582,7 +582,7 @@ def setups_table(result, keys, backend, name=""):
              "is there to tell its own difference from Cranelift's (rustc_codegen_cranelift comes only with nightlies); `cargo check` "
              "builds no code, so nothing can be run after it. The fastest of each row is in bold; \"failed\" is a setup that could "
              "not build the project, and is not timed after that.", "",
-             "| Project | Step | cargo | " + " | ".join(SETUPS[n] for n in names) + " | ra-jit |",
+             "| Project | Step | cargo | " + " | ".join(SETUPS[n] for n in names) + " | blaze |",
              "|---|---|---:|" + "---:|" * (len(names) + 1)]
     for key in keys:
         measured = result["results"][key]
@@ -609,7 +609,7 @@ def setups_table(result, keys, backend, name=""):
 def said_otherwise(difference):
     """How a test suite ended otherwise under ra-jit, for a table cell."""
     if found := re.fullmatch(r"(-?\d+) for (-?\d+)", difference or ""):
-        return f"`cargo ra-jit test` exited {found[1]}, `cargo test` {found[2]}"
+        return f"`cargo blaze test` exited {found[1]}, `cargo test` {found[2]}"
     return (difference or "").replace("|", "\\|")[:120]
 
 
@@ -618,11 +618,11 @@ def tests_table(result, keys, backend, name=""):
     if not keys:
         return []
     lines = ["", f"#### Test suites, {BACKEND_NAMES[backend]}{', ' + name if name else ''}", "",
-             "`cargo ra-jit test` and `cargo test` of the same tests, median of three: after the edit of a widely used function "
+             "`cargo blaze test` and `cargo test` of the same tests, median of three: after the edit of a widely used function "
              "(the file named), and again with nothing changed. Each includes running the tests. First runs: the three untimed "
-             "runs of `cargo ra-jit test` before them (the first is handed to cargo, the daemon builds the test targets at the "
+             "runs of `cargo blaze test` before them (the first is handed to cargo, the daemon builds the test targets at the "
              "second). Every test has to end the same way under both, every time.", "",
-             "| Project | Command | Tests | Same outcome | Edited | Edit, then test: cargo | ra-jit | | Built | Nothing changed: cargo | ra-jit | First runs of ra-jit |",
+             "| Project | Command | Tests | Same outcome | Edited | Edit, then test: cargo | blaze | | Built | Nothing changed: cargo | blaze | First runs of blaze |",
              "|---|---|---:|---|---|---:|---:|---:|---|---:|---:|---|"]
     for key in keys:
         test = result["results"][key]["phases"]["test"]
@@ -748,7 +748,7 @@ def platform_doc(name, result, stored):
     host = result.get("host") or {}
     raw = os.path.relpath(stored, os.path.join(ROOT, "docs"))
     lines = [f"### {name}", "",
-             f"ra-jit {commit_link(result)}, {result['date']}, Rust {result['toolchain']}, {result['runs']} runs of each edit, "
+             f"blaze {commit_link(result)}, {result['date']}, Rust {result['toolchain']}, {result['runs']} runs of each edit, "
              f"measured {who(result)}. Raw: [{raw}]({raw}).", "",
              "| Machine | |", "|---|---|"]
     shown = dict(host, os="macOS" if host.get("os") == "Darwin" else host.get("os"),
@@ -766,7 +766,7 @@ def platform_doc(name, result, stored):
         lines += [f"#### Edits, {BACKEND_NAMES[backend]}, {name}", "",
                   "Median, then the fastest and slowest run. Built: who built the edit (daemon, or cargo and why). "
                   "Link: the change was spliced into the program, or it was linked again.", "",
-                  "| Project | Edit | cargo | ra-jit | | cargo runs | ra-jit runs | Built | Link |",
+                  "| Project | Edit | cargo | blaze | | cargo runs | blaze runs | Built | Link |",
                   "|---|---|---:|---:|---:|---|---|---|---|"]
         for key in keys:
             measured = result["results"][key]
@@ -782,10 +782,10 @@ def platform_doc(name, result, stored):
         lines += ["", f"#### Cold, {BACKEND_NAMES[backend]}, {name}", "",
                   "From an empty target directory, crates already downloaded, " + ("one run." if cold_runs == 1 else
                   f"median of {cold_runs} runs, each from nothing.") + " The empty store fetches the standard library as a "
-                  "release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is "
+                  "release's first build does. `cargo blaze build` is cargo's own build (the daemon is "
                   "not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. "
                   "Warm store: the same in another checkout of the same commit, with the store the first one filled.", "",
-                  "| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | "
+                  "| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | "
                   "Functions compiled | Daemon memory | Store |",
                   "|---|---:|---:|---:|---:|---:|---:|---:|"]
         for key in keys:
@@ -804,10 +804,10 @@ def platform_doc(name, result, stored):
         timed = [k for k in keys if result["results"][k].get("runtime")]
         if timed:
             lines += ["", f"#### How fast the program runs, {BACKEND_NAMES[backend]}, {name}", "",
-                      "The same command run by the program ra-jit linked and by cargo's debug and release builds, in turn. "
+                      "The same command run by the program blaze linked and by cargo's debug and release builds, in turn. "
                       "Median, then fastest and slowest; where measured, then the program's peak resident memory while it ran "
                       "(median of the runs, as the kernel kept it) and the size of the program.", "",
-                      "| Project | Command | ra-jit | cargo debug | cargo release |", "|---|---|---:|---:|---:|"]
+                      "| Project | Command | blaze | cargo debug | cargo release |", "|---|---|---:|---:|---:|"]
             for key in timed:
                 run = result["results"][key]["runtime"]
                 cell = lambda r: f"{seconds(r['median_s'])} ({seconds(r['min_s'])} to {seconds(r['max_s'])})" + (
@@ -867,7 +867,7 @@ def runtime_chart(results):
               for bench, row in pr["benches"].items() if rough(row)}
     builds = sorted({b[2] for b in best.values()})
     named = builds[0] if len(builds) == 1 else "; ".join(f"{p} {b[2]}" for p, b in best.items())
-    return benchcharts.runtime(rows, f"ra-jit's LLVM at {named}. " + where({p: results[p] for p in best}),
+    return benchcharts.runtime(rows, f"blaze's LLVM at {named}. " + where({p: results[p] for p in best}),
                                marked, f"≈: that benchmark's runs varied by more than {ROUGH:g}×, so read it as rough.")
 
 
@@ -876,8 +876,8 @@ def runtime_tables(result):
     measured = result["runbench"]
     checked = "checked" in measured["builds"]
     mem = lambda row, b: megabytes(row[b]["peak_mb"]) if row.get(b, {}).get("peak_mb") is not None else "-"
-    lines = ["| Benchmark | `cargo build --release` | ra-jit, LLVM | ra-jit ÷ release |" + (" release with dev checks ÷ release |" if checked else "")
-             + " Peak memory, release → ra-jit |",
+    lines = ["| Benchmark | `cargo build --release` | blaze, LLVM | blaze ÷ release |" + (" release with dev checks ÷ release |" if checked else "")
+             + " Peak memory, release → blaze |",
              "|---|---:|---:|---:|" + ("---:|" if checked else "") + "---:|"]
     sized = []
     for name, program in measured["programs"].items():
@@ -896,9 +896,9 @@ def runtime_tables(result):
         lines.append(f"| **All benchmarks (geometric mean)** | | | **{times(geomean['ra-jit'])}** |" +
                      (f" {times(geomean['checked'])} |" if checked and geomean.get("checked") else (" |" if checked else "")) + " |")
     if sized:
-        lines += ["", "What each program takes, release → ra-jit: its build from cold (for ra-jit, cargo running the build "
-                  "scripts and proc macros, ra-jit's compile of every crate and the link), its size, and its build's memory "
-                  "(the most the build's processes held at once, and the largest one process: rustc or ra-jit, or the linker).", "",
+        lines += ["", "What each program takes, release → blaze: its build from cold (for blaze, cargo running the build "
+                  "scripts and proc macros, blaze's compile of every crate and the link), its size, and its build's memory "
+                  "(the most the build's processes held at once, and the largest one process: rustc or blaze, or the linker).", "",
                   "| Program | Build | Size | Build, peak | Build, largest process |", "|---|---:|---:|---:|---:|", *sized]
     return lines
 
@@ -914,11 +914,11 @@ def runtime_section(results):
     times, memory and builds."""
     lines = [RUN_START]
     if summary := runtime_chart(results):
-        lines += [benchcharts.picture("runtime", f"How fast each benchmark runs built by ra-jit, against cargo build --release, by platform: {summary}"), ""]
-    lines += ["How fast the programs run. Each program is built by `cargo build --release` and by ra-jit with LLVM at `-O3`, "
-              "every crate of it compiled by ra-jit, with the release profile; each benchmark is then run several times, the "
+        lines += [benchcharts.picture("runtime", f"How fast each benchmark runs built by blaze, against cargo build --release, by platform: {summary}"), ""]
+    lines += ["How fast the programs run. Each program is built by `cargo build --release` and by blaze with LLVM at `-O3`, "
+              "every crate of it compiled by blaze, with the release profile; each benchmark is then run several times, the "
               "builds taking turns, median. A run is published only when every program did what the release build's did. Each "
-              "platform is a machine of its own, and each number is ra-jit's time ÷ release's on it: 1x is as fast.", "",
+              "platform is a machine of its own, and each number is blaze's time ÷ release's on it: 1x is as fast.", "",
               "| Benchmark | " + " | ".join(NAMES) + " |", "|---|" + "---:|" * len(NAMES)]
     noisy = False
     for bench in benchmarks(results):

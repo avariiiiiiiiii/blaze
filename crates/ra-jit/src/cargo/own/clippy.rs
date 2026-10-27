@@ -86,7 +86,8 @@ pub(crate) fn command(rest: &[String]) -> anyhow::Result<i32> {
     let failed = written(&plan, &answer, format, clippy_args);
     if !failed {
         let took = started.elapsed().as_secs_f64();
-        let finished = format!("`{}` profile [ra-jit] target(s) in {took:.2}s", asked.profile());
+        let tag = crate::cargo::blaze_tag();
+        let finished = format!("`{}` profile [{tag}] target(s) in {took:.2}s", asked.profile());
         say::status(asked.flags.quiet, "Finished", &finished);
     }
     if format.is_json() {
@@ -375,7 +376,15 @@ fn colour(typed: &[String]) -> bool {
 }
 
 /// The columns of the terminal standard error is, which cargo passes rustc as
+/// `--diagnostic-width`. None on Windows, which has no `TIOCGWINSZ`.
+#[cfg(not(unix))]
+fn terminal_width() -> Option<usize> {
+    None
+}
+
+/// The columns of the terminal standard error is, which cargo passes rustc as
 /// `--diagnostic-width`.
+#[cfg(unix)]
 fn terminal_width() -> Option<usize> {
     if !std::io::stderr().is_terminal() {
         return None;

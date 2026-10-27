@@ -1,6 +1,29 @@
 # A shared remote cache: one store for CI and everyone
 
-2026-10-27. Status: design, nothing built. Written against blaze main `e4bbb88` and
+2026-10-27. Status: slice 1's gateway is built and deployed (`worker/remote-cache`, API-v0.md,
+measured in `bench/remote-cache/gateway-v0.tsv`), and so is slice 3's server side: `/has`, `/get`,
+`/blob`, `/put`, the D1 location table and the private HMAC namespaces (`worker/remote-cache/API.md`,
+`bench/remote-cache/cas-v1.tsv`; `/put` decompresses with workerd's own zstd, `node:zlib`, not
+`ruzstd`). Slice 4's server side is deployed too: key lists, heads and segments with every
+index-write check, the refresh inside head writes, the 80-day location expiry, and the lifecycle
+rules (API.md "Index", `bench/remote-cache/index-v1.tsv`). One deviation: the refresh rewrites each
+old object onto its own name through the R2 binding (a streamed get and put, R2 checking the MD5 or
+SHA-256), not S3 `CopyObject`, since no R2 S3 credential is readable to the Worker; measured live, a
+rewrite moves the upload date. The client speaks v0: `RA_JIT_REMOTE=blaze+https://<gateway>/t/<tenant>/v3`
+with `RA_JIT_REMOTE_TOKEN` pushes and pulls today's packs through the gateway
+([#525](https://github.com/indexable-inc/blaze/pull/525), `bench/remote-cache/e2e-client.tsv`), and
+`.github/actions/blaze-remote` is CI's step for it (pull on every run, push from main after the
+tests), which goes into the merge gate once the gate builds with blaze and a release contains the
+client. The client's use of `/has`, `/get`, `/put` and the index needs #283. On blaze's own store
+(`bench/remote-cache/selfbuild.tsv`, ix arm64 VM in us-west-2), a pull of 121 packs, 237.8 MB, took
+8.6 s (26.5 MiB/s), against 51 to 55 s for cargo's no-edit build with main's target dir. The build
+from a warm store is not measured yet: a cold `cargo blaze build -p ra-jit` of blaze needs more than
+16 GB (OOM-killed at 14.8 GB on 4 CPUs; 28.3 GB peak where it finished, in 389.6 s), so main's
+store could not be made in the VMs that could be placed that day, and the gate's 16 GB runners hit
+the same limit on a cold store. The Worker is TypeScript rather than workers-rs: its tests run on real R2 and KV bindings
+in workerd, and a Rust part would need rustc to build its wasm while blaze cannot build `wasm32`
+(blaze-builds-blaze). The sans-IO `blaze-gateway-core` below stays the plan for the native server
+and for the Worker once blaze builds wasm. Written against blaze main `e4bbb88` and
 `blaze-next` `5c5299f` ([#283](https://github.com/indexable-inc/blaze/pull/283)). Each claim is
 marked **read** (in a source we read, or measured by us), **reported** (a document or someone
 says so, not checked again here) or **unverified** (our inference or an estimate). "Slice R2"
@@ -212,6 +235,14 @@ linked into one program. So the version is checked, not trusted.
   pull request's. The seed is a hash of the key, so a rerun sees the same randomness.
 - **Proc-macro expansions and build-script runs**, as cache.md keys them, under `EXPAND` and
   `SCRIPT`.
+- **Build scripts and proc macros, built and run.** Two steps too, as tests are: a first key
+  of what the build or run is declared to be made of (its rust-project description and the
+  toolchain; for a run, the build of its script, its arguments and the environment it was
+  given, without the checkout's paths), whose slots hold the sets of files it was seen
+  reading, and a second key of those files' digests, which holds the executable or library,
+  or what the run printed and left in `OUT_DIR` ([cargo.md](cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)).
+  They are ordinary store entries, so push, pull and the gateway carry them unchanged. A run
+  outside the sandbox is never kept, so never pushed.
 
 ## The gateway
 
@@ -423,10 +454,8 @@ The bucket exists: `blaze-cache`, in Indexable's Cloudflare account. The reposit
 secrets `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` and `R2_ENDPOINT`, from an object read and
 write token scoped to that bucket alone, checked with `aws s3 ls` (**reported**, by the
 coordinator, 2026-10-27). With the gateway they leave GitHub: the Worker reads and writes through
-its binding, and keeps an R2 S3 token as a Worker secret only for the server-side copies of the
-[refresh](#gc), which the binding lacks. Its one lifecycle rule so far aborts multipart uploads
-left incomplete after a day. Only the gateway reads or writes these names; everything except
-heads and trust lists is immutable.
+its binding, the [refresh](#gc)'s rewrites included. Its lifecycle rules are in [GC](#gc).
+Only the gateway reads or writes these names; everything except heads and trust lists is immutable.
 
     trust/<tid>/keys                          the tenant's signing keys, signed by its root key; never expires
     index/heads/<tid>/p/<project>/<commit>    a signed head: one main commit of one project
@@ -943,9 +972,11 @@ What follows from it:
 - Cost of the refreshes: a copy per old pack and per reused segment per main commit, tens of
   writes at $4.50 a million.
 
-The rules are added with `wrangler r2 bucket lifecycle add blaze-cache ...`, one per prefix
-(`index/heads/`, `index/seg/`, `cas/`) by age, once the layout is final, which is the last step of
-slice 4; until then nothing expires but the incomplete multipart uploads. A self-hosted
+The rules on `blaze-cache`, added 2026-10-27 with `wrangler r2 bucket lifecycle add` after the
+refresh was deployed and checked live: `expire-index-heads` (`index/heads/`, 28 days),
+`expire-index-seg` (`index/seg/`, 32 days), `expire-cas` (`cas/`, 90 days), beside
+`abort-multipart` (incomplete multipart uploads, 1 day) and Cloudflare's default (7 days). No rule
+touches `trust/` or v0's `v3/`. A self-hosted
 `blaze-gateway-server` over S3 uses S3 lifecycle rules with the same prefixes; over a disk it
 expires by the same ages itself.
 

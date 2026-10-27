@@ -4,6 +4,10 @@ This is the report for the `ra-jit-wasm32-target` branch: the daemon runs native
 compiles a workspace's crates to wasm32, links them ahead of what cargo built for the same
 target, and answers an edit without the linker.
 
+The numbers here are of that branch. Those at the current commit, measured 2026-10-27 on the
+pinned nightly and checked by the train on every push to main, are in
+[platforms.md](../platforms.md), wasm32.
+
 Everything below is either measured (I ran it, on this Linux x86-64 VM, 8 cores, with the
 toolchain in `harness/toolchain`, `nightly-2026-05-10`) or marked as read from code or
 inferred. Timings are medians over the edits of one run unless they say otherwise; the

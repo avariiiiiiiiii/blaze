@@ -1020,11 +1020,15 @@ impl Machine {
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
         // The baseline CPU, as rustc compiles for; position-independent, as the rest of
         // the program is.
+        // 128-bit atomics are `lock cmpxchg16b`: Windows 8.1 and later require the instruction,
+        // and the library calls LLVM makes otherwise (`__atomic_*_16`) are nobody's here.
+        let features =
+            if emitted.arch == Arch::X86_64 && name.contains("windows") { "+cx16" } else { "" };
         target
             .create_target_machine(
                 &triple,
                 emitted.cpu(),
-                "",
+                features,
                 optimization.level(),
                 RelocMode::PIC,
                 CodeModel::Default,
@@ -1464,16 +1468,21 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         ];
         let unit = emit_unit(&mut wants, &members, Optimization::NONE, &[]).unwrap();
         let mut codes: Vec<Code> = unit.members.into_iter().map(Result::unwrap).collect();
+        // The distinct targets of one namespace: AArch64 loads a constant with `adrp` and
+        // `ldr`, two relocations of one symbol.
         let named = |code: &Code, wanted| -> Vec<u32> {
             let names = code.relocs.iter().map(|it| &it.name);
-            names
+            let mut indices: Vec<u32> = names
                 .filter_map(|it| match *it {
                     ModuleRelocTarget::User { namespace, index } if namespace == wanted => {
                         Some(index)
                     }
                     _ => None,
                 })
-                .collect()
+                .collect();
+            indices.sort_unstable();
+            indices.dedup();
+            indices
         };
         assert_eq!(named(&codes[0], 0), [callee.as_u32()]);
         assert_eq!(named(&codes[1], 0), Vec::<u32>::new());

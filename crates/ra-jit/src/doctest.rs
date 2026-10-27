@@ -638,9 +638,8 @@ struct Test {
     name: String,
     marks: Marks,
     program: Program,
-    /// The path and line rustc is to show for the first line of the example.
+    /// The path rustc is to show for the example.
     shown_path: String,
-    line: usize,
     edition: Edition,
     /// Whether rustdoc builds the example in one program with the others, as it does from
     /// edition 2024: the test harness of that program names it.
@@ -670,11 +669,23 @@ impl Ours {
             Ours::Checked | Ours::FailsToCompile => anyhow::bail!("nothing to link"),
         };
         let binary = dir.join("rust_out");
-        let linked = line.link(&[&objects[0], &objects[1]], &binary).and_then(|_| {
+        // A name the standard library's unit refused, which nothing defines then.
+        let refused = |failed: anyhow::Error| {
+            let refused = crate::refused_undefined(&format!("{failed:#}"), &objects[1]);
+            match refused.first() {
+                Some(first) => anyhow::anyhow!(
+                    "it calls {} functions blaze could not compile: {first}",
+                    refused.len()
+                ),
+                None => failed,
+            }
+        };
+        let linked = line.link(&[&objects[0], &objects[1]], &binary).map_err(refused);
+        let linked = linked.and_then(|_| {
             let stand_ins = crate::link::stand_ins(&binary)?;
             match stand_ins.first() {
                 Some(first) => anyhow::bail!(
-                    "it calls {} functions ra-jit could not compile: {first}",
+                    "it calls {} functions blaze could not compile: {first}",
                     stand_ins.len()
                 ),
                 None => Ok(()),
@@ -712,21 +723,7 @@ impl Test {
         let edition = edition.parse().unwrap_or(Edition::CURRENT);
         let program = Program::of(&example.code, frame, &id, edition);
         let in_one = edition.at_least_2024();
-        Test {
-            name,
-            marks: example.marks,
-            program,
-            shown_path,
-            line: example.line,
-            edition,
-            in_one,
-        }
-    }
-
-    /// The lines before the program's first in a file of it whose lines are numbered as
-    /// rustdoc has rustc show them: from the line of the example in its documentation.
-    fn padding(&self) -> usize {
-        self.line.saturating_sub(self.program.lines_before)
+        Test { name, marks: example.marks, program, shown_path, edition, in_one }
     }
 
     /// The name with what the harness adds for how the example is tested.
@@ -1072,8 +1069,7 @@ fn add_crates(
         };
         let file = vfs::FileId::from_raw(FIRST_FILE - n as u32);
         let root = SourceRootId(FIRST_SOURCE_ROOT - n as u32);
-        let text = format!("{}{}", "\n".repeat(test.padding()), test.program.source);
-        db.set_file_text_with_durability(file, &text, Durability::LOW);
+        db.set_file_text_with_durability(file, &test.program.source, Durability::LOW);
         db.set_file_source_root_with_durability(file, root, Durability::LOW);
         let mut files = FileSet::default();
         files.insert(file, VfsPath::from(vfs_path));
@@ -1106,10 +1102,54 @@ fn add_crates(
     added
 }
 
+/// What the examples of `library` are compiled from besides their own text, as a hash: each
+/// crate of the library and of what it depends on, with its cfgs, and the files of those of
+/// the workspace as they are now. Rustdoc's run under cargo names the libraries cargo built
+/// with `--extern`, whose files [`Asked::key`] stamps; blaze's own run names none, and
+/// compiles them from these.
+fn built_from(db: &RootDatabase, library: ide_db::base_db::Crate) -> String {
+    use ide_db::base_db::SourceDatabase as _;
+    use sha2::{Digest as _, Sha256};
+    let mut crates: Vec<String> = library
+        .transitive_deps(db)
+        .into_iter()
+        .map(|krate| {
+            let mut hasher = Sha256::new();
+            hasher.update(crate::content::Contents::version(db, krate));
+            let mut cfgs: Vec<String> =
+                krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
+            cfgs.sort_unstable();
+            hasher.update(cfgs.join("\n"));
+            let data = krate.data(db);
+            if data.origin.is_local() {
+                let root = db.file_source_root(data.root_file_id).source_root_id(db);
+                let root = db.source_root(root).source_root(db);
+                let mut files: Vec<(String, [u8; 32])> = root
+                    .iter()
+                    .filter_map(|file| {
+                        let path = root.path_for_file(&file)?.as_path()?.to_string();
+                        Some((path.clone(), crate::content::file_hash(db, file, Path::new(&path))))
+                    })
+                    .collect();
+                files.sort_unstable();
+                for (path, hash) in files {
+                    hasher.update((path.len() as u64).to_le_bytes());
+                    hasher.update(path);
+                    hasher.update(hash);
+                }
+            }
+            hasher.finalize().iter().map(|it| format!("{it:02x}")).collect()
+        })
+        .collect();
+    crates.sort_unstable();
+    crates.join(",")
+}
+
 /// Compiles the example whose crate is `name` with everything it links over the standard
 /// library's `unit`, into an object in a directory of its own, to link with nothing of
 /// rustc's. The program ra-jit linked of it in an earlier run is taken again while what it
-/// was built from is unchanged ([`Asked::key`]), and while ra-jit is.
+/// was built from is unchanged ([`Asked::key`], and `built_from` of [`built_from`]), and while
+/// ra-jit is.
 fn compile(
     db: &RootDatabase,
     building: &Building<'_>,
@@ -1117,13 +1157,14 @@ fn compile(
     test: &Test,
     name: &str,
     unit: &Path,
+    built_from: &str,
 ) -> anyhow::Result<Ours> {
     // What a program reads while it is compiled, besides the libraries, is named by rustc's
     // dep-info only, which ra-jit does not write.
     let reads = ["include!", "include_str!", "include_bytes!", "env!"];
     let reads = reads.iter().any(|it| test.program.source.contains(it));
     let ra_jit = std::env::current_exe().ok().and_then(|it| stamp(&it));
-    let env = [("RA_JIT", format!("{ra_jit:?}"))];
+    let env = [("RA_JIT", format!("{ra_jit:?}")), ("built from", built_from.to_owned())];
     let edition = format!("{:?}", test.edition);
     let memo = asked.memo().filter(|_| !reads && ra_jit.is_some()).map(|memo| {
         memo.join(format!("ra-jit-{}", asked.key(&test.program.source, &edition, &env, true)))
@@ -1148,11 +1189,14 @@ fn compile(
     let built = || {
         let mut known = crate::Rejections::default();
         let built = crate::build_unheld(db, building.table, &args, &mut known, building.listed)?;
-        if let Some(unset) = built.unset {
-            anyhow::bail!(unset);
+        if let Some(unset) = &built.unset {
+            anyhow::bail!("{unset}");
+        }
+        if let Some(why) = built.refused_reached(&args) {
+            anyhow::bail!(why);
         }
         let example = crate::crates_named(db, name, &args)?;
-        crate::link::Line::of(db, &example, building.sysroot, false)
+        crate::link::Line::of(db, &example, building.sysroot, false, &[], args.debug.level)
     };
     match built() {
         Ok(line) => {
@@ -1230,6 +1274,7 @@ fn run(
     document(db, krate);
     let (tests, left_out) = hir::attach_db(db, || tests(db, asked, krate));
     library.set_cfg_options(db).to(cfg);
+    let built_from = built_from(db, library);
     let (plans, unit) = plan(db, building, asked, krate, &tests, target);
     let db: &RootDatabase = db;
     let out = std::io::stdout();
@@ -1293,13 +1338,14 @@ fn run(
             .map(|_| {
                 let (db, ready, ours) = (db.clone(), ready.clone(), &ours);
                 let unit = unit.as_deref();
-                let (tests, counted) = (&tests, &counted);
+                let (tests, counted, built_from) = (&tests, &counted, &built_from);
                 scope.spawn(move || {
                     let Some(unit) = unit else { return };
                     loop {
                         let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();
                         let Some((at, name)) = job else { break };
-                        let compiled = compile(&db, building, asked, &tests[at], name, unit);
+                        let test = &tests[at];
+                        let compiled = compile(&db, building, asked, test, name, unit, built_from);
                         if let Ok(Ours::Linked(_)) = &compiled {
                             counted.remembered.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1320,7 +1366,7 @@ fn run(
         n => format!(" ({n} unchanged since the last run)"),
     };
     eprintln!(
-        "doctests: {} built by ra-jit, {} not built; compiling took {compiling:.1?}{remembered}",
+        "doctests: {} built by blaze, {} not built; compiling took {compiling:.1?}{remembered}",
         counted.ra_jit.load(Ordering::Relaxed),
         counted.refused.load(Ordering::Relaxed),
     );
@@ -1333,7 +1379,7 @@ fn run(
             Ok(Ended::Ignored) => ignored += 1,
             // libtest lists a failure by the name alone, without how it is tested.
             Ok(Ended::Failed(shown)) => failed.push((tests[at].name.clone(), shown)),
-            Err(error) => failed.push((tests[at].name.clone(), format!("ra-jit: {error:#}"))),
+            Err(error) => failed.push((tests[at].name.clone(), format!("blaze: {error:#}"))),
         }
     }
     if !failed.is_empty() {

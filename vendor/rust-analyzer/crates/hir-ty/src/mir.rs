@@ -39,6 +39,7 @@ mod monomorphization;
 mod optimize;
 pub mod overflow;
 mod pretty;
+mod storage;
 pub mod target;
 mod transform;
 pub mod type_name;
@@ -50,9 +51,9 @@ pub use eval::{
 pub use held::{HeldLocals, YieldPoint};
 pub use lower::is_builtin_index;
 pub use lower::{
-    MirLowerError, is_by_move_coroutine, lower_body_to_mir, lower_to_mir_with_store,
-    mir_body_for_closure_query, mir_body_for_coroutine_by_move_query, mir_body_for_coroutine_query,
-    mir_body_query, promoted_mir_body_query, set_mir_capacity,
+    MirLowerError, inline_const_at, is_by_move_coroutine, lower_body_to_mir,
+    lower_to_mir_with_store, mir_body_for_closure_query, mir_body_for_coroutine_by_move_query,
+    mir_body_for_coroutine_query, mir_body_query, promoted_mir_body_query, set_mir_capacity,
 };
 pub use monomorphization::monomorphized;
 pub(crate) use monomorphization::opaque_of_impl;
@@ -67,6 +68,7 @@ pub use optimize::{
     optimized_mir_body_query, passes_not_ported, set_interpreter_mir_opt_level,
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
+pub use storage::StorageConflicts;
 pub use transform::{
     monomorphized_runtime_mir_body_for_closure_query,
     monomorphized_runtime_mir_body_for_coroutine_by_move_query,
@@ -1441,8 +1443,20 @@ pub struct CoroutineLocals {
 /// A walk over every place a body mentions, as `walk_places` (each place can be changed) or
 /// `visit_places` (each is only read).
 macro_rules! places_walker {
-    ($name:ident, $iter:ident, $each:ident $(, $m:tt)?) => {
+    ($name:ident, $statement:ident, $terminator:ident, $iter:ident, $each:ident $(, $m:tt)?) => {
         pub fn $name(&$($m)? self, mut f: impl FnMut(&$($m)? StoredPlace)) {
+            for (_, block) in self.basic_blocks.$iter() {
+                for statement in &$($m)? block.statements {
+                    Self::$statement(&$($m)? statement.kind, &mut f);
+                }
+                if let Some(terminator) = &$($m)? block.terminator {
+                    Self::$terminator(&$($m)? terminator.kind, &mut f);
+                }
+            }
+        }
+
+        /// The places one statement mentions, as the walk over the body has them.
+        pub fn $statement(kind: &$($m)? StatementKind, mut f: &mut impl FnMut(&$($m)? StoredPlace)) {
             fn for_operand(op: &$($m)? Operand, f: &mut impl FnMut(&$($m)? StoredPlace)) {
                 match &$($m)? op.kind {
                     OperandKind::Copy(p) | OperandKind::Move(p) => {
@@ -1453,9 +1467,7 @@ macro_rules! places_walker {
                     | OperandKind::Allocation { .. } => (),
                 }
             }
-            for (_, block) in self.basic_blocks.$iter() {
-                for statement in &$($m)? block.statements {
-                    match &$($m)? statement.kind {
+                    match kind {
                         StatementKind::Assign(p, r) => {
                             f(p);
                             match r {
@@ -1507,9 +1519,21 @@ macro_rules! places_walker {
                         | StatementKind::StorageDead(_)
                         | StatementKind::Nop => (),
                     }
+        }
+
+        /// The places one terminator mentions, as the walk over the body has them.
+        pub fn $terminator(kind: &$($m)? TerminatorKind, mut f: &mut impl FnMut(&$($m)? StoredPlace)) {
+            fn for_operand(op: &$($m)? Operand, f: &mut impl FnMut(&$($m)? StoredPlace)) {
+                match &$($m)? op.kind {
+                    OperandKind::Copy(p) | OperandKind::Move(p) => {
+                        f(p);
+                    }
+                    OperandKind::Constant { .. }
+                    | OperandKind::Static(_)
+                    | OperandKind::Allocation { .. } => (),
                 }
-                match &$($m)? block.terminator {
-                    Some(x) => match &$($m)? x.kind {
+            }
+                    match kind {
                         TerminatorKind::SwitchInt { discr, .. } => for_operand(discr, &mut f),
                         TerminatorKind::FalseEdge { .. }
                         | TerminatorKind::FalseUnwind { .. }
@@ -1539,10 +1563,7 @@ macro_rules! places_walker {
                             for_operand(value, &mut f);
                             f(resume_arg);
                         }
-                    },
-                    None => (),
-                }
-            }
+                    }
         }
     };
 }
@@ -1572,8 +1593,21 @@ impl MirBody<'_> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }
 
-    places_walker!(walk_places, iter_mut, for_each_operand_mut, mut);
-    places_walker!(visit_places, iter, for_each_operand);
+    places_walker!(
+        walk_places,
+        walk_statement_places,
+        walk_terminator_places,
+        iter_mut,
+        for_each_operand_mut,
+        mut
+    );
+    places_walker!(
+        visit_places,
+        visit_statement_places,
+        visit_terminator_places,
+        iter,
+        for_each_operand
+    );
 }
 
 impl<'db> MirBody<'db> {

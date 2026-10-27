@@ -1053,5 +1053,5 @@ fn produce(
     _: &ir::Function,
     _: Option<&Weights>,
 ) -> Result<super::fragment::Code> {
-    Err(CodegenError::Unsupported("ra-jit was built without `--features llvm`".to_owned()))
+    Err(CodegenError::Unsupported("blaze was built without `--features llvm`".to_owned()))
 }

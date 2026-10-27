@@ -15,8 +15,10 @@ const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
 
 /// What Apple's linker is told so that the loader finds what it fixes up in tables, as the
 /// splice reads and writes them, and not in chains through the pointers themselves. The
-/// linker makes chains for a deployment target of macOS 12 or later, as nix's shell sets.
-const NO_FIXUP_CHAINS: &str = "-Wl,-no_fixup_chains";
+/// linker makes chains for a deployment target of macOS 12 or later, as nix's shell sets, and
+/// `cc` gives a line that names none the version of the Mac it runs on. The links of
+/// [`crate::link`] ask for it too.
+pub(crate) const NO_FIXUP_CHAINS: &str = "-Wl,-no_fixup_chains";
 
 /// The room Apple's linker is told to leave after the load commands when nothing says more,
 /// so that a splice has room there for its two segments and for the unwind table, which
@@ -104,6 +106,13 @@ pub(crate) struct Plan {
     /// `binary` linked by blaze, with nothing of rustc's (docs/no-rustc.md, step K).
     #[serde(default)]
     pub(crate) whole: bool,
+    /// Whether `binary` is a shared library, a `cdylib`, which exports the functions and
+    /// statics its crate names with `#[no_mangle]` or `#[export_name]` (#262). It is built
+    /// again on what the worker has loaded and linked again each time, not patched: a patch
+    /// spliced into it would not export a function an edit adds or the new value of an
+    /// exported static, and the splice reads no Mach-O library.
+    #[serde(default)]
+    pub(crate) shared: bool,
 }
 
 /// The library of the workspace among `records` that wrote the file a link line names. The
@@ -153,6 +162,7 @@ impl Plan {
                 .flatten(),
             stamp: unit.stamp,
             whole: false,
+            shared: false,
         };
         // rustc's object of the names the program keeps is moved to its copy, which stays when
         // the target directory is cleaned. GNU ld takes the panic runtime by it.
@@ -231,8 +241,10 @@ fn calls_by_symbol(unit: &Record) -> bool {
 
 /// The file in a program's directory that says it is a program of tests, which the daemon
 /// starts in ra-jit's test harness. It holds why the daemon builds it only with that harness,
-/// when it does: [`harness_alone`].
-pub(crate) const TESTS: &str = "tests";
+/// when it does: [`harness_alone`]. A program's own file is never named so, as rustc takes no
+/// `.` in a crate's name: a whole build links a program of tests in the same directory, and
+/// one of an integration test `tests/tests.rs` is named `tests`.
+pub(crate) const TESTS: &str = "tests.harness";
 
 /// The file in a program of tests' directory that says `cargo ra-jit test` runs only the
 /// tests an edit reaches, for the daemon to write [`REACH`] at each build of it.
@@ -501,13 +513,7 @@ impl LinkLine {
         if self.flavor == Flavor::Apple {
             // Last, so that it is what the linker takes: it is at least what the line asks.
             let asked = self.args.iter().filter_map(|it| headerpad_in(it)).last();
-            let kept = headerpad_of(binary);
-            let pad = asked.unwrap_or(HEADERPAD).max(kept.unwrap_or(0));
-            if kept != Some(pad) {
-                write_headerpad(binary, pad)?;
-            }
-            let file = headerpad_file(binary);
-            command.push(shlex::try_quote(&format!("@{}", file.display()))?.into_owned());
+            command.push(shlex::try_quote(&headerpad_read(binary, asked)?)?.into_owned());
         }
         Ok(command.join(" "))
     }
@@ -613,8 +619,15 @@ pub(crate) fn reached_only(cmd: &str) -> Option<String> {
         let reached = reached_file(response);
         reached.is_file().then_some((response.display().to_string(), reached))
     })?;
-    let response = format!("@{response}");
-    cmd.contains(&response).then(|| cmd.replacen(&response, &format!("@{}", reached.display()), 1))
+    // The response file as the line has it: quoted for a shell after `cc` (where a Windows
+    // path's `\` is escaped), in double quotes as it is after `link.exe`.
+    let quotings: [fn(&str) -> Option<String>; 2] =
+        [|it| Some(shlex::try_quote(it).ok()?.into_owned()), |it| Some(format!("\"{it}\""))];
+    quotings.iter().find_map(|quote| {
+        let response = quote(&format!("@{response}"))?;
+        let reached = quote(&format!("@{}", reached.display()))?;
+        cmd.contains(&response).then(|| cmd.replacen(&response, &reached, 1))
+    })
 }
 
 /// The file the link of the Apple executable at `binary` reads the room after its load
@@ -629,6 +642,18 @@ pub(crate) fn headerpad_file(binary: &Path) -> PathBuf {
 /// The room the link of the executable at `binary` asks for, when it reads it from a file.
 pub(crate) fn headerpad_of(binary: &Path) -> Option<u64> {
     headerpad_in(std::fs::read_to_string(headerpad_file(binary)).ok()?.trim())
+}
+
+/// The last argument of a link of the Apple executable at `binary`, which has it read the room
+/// from [`headerpad_file`]: what the line `asked` for, or [`HEADERPAD`], and no less than the
+/// file says already.
+pub(crate) fn headerpad_read(binary: &Path, asked: Option<u64>) -> std::io::Result<String> {
+    let kept = headerpad_of(binary);
+    let pad = asked.unwrap_or(HEADERPAD).max(kept.unwrap_or(0));
+    if kept != Some(pad) {
+        write_headerpad(binary, pad)?;
+    }
+    Ok(format!("@{}", headerpad_file(binary).display()))
 }
 
 /// What rustc's link of a program for Apple is told besides what cargo asked, for the
@@ -664,7 +689,7 @@ pub(crate) fn write_headerpad(binary: &Path, pad: u64) -> std::io::Result<()> {
 }
 
 /// The room an argument of the driver asks Apple's linker for, which reads it in hexadecimal.
-fn headerpad_in(arg: &str) -> Option<u64> {
+pub(crate) fn headerpad_in(arg: &str) -> Option<u64> {
     let digits = arg.strip_prefix(HEADERPAD_FLAG)?;
     let digits = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits);
     u64::from_str_radix(digits, 16).ok()
@@ -928,6 +953,7 @@ mod tests {
             stamp: 0,
             package: None,
             whole: false,
+            shared: false,
         };
         let response = dir.join("link.args");
         let link = LinkLine::parse(LINE).unwrap().present();
@@ -999,6 +1025,7 @@ mod tests {
             package: None,
             stamp: 0,
             whole: false,
+            shared: false,
         };
         let response = dir.join("link.args");
         let command = LinkLine::parse(LINE)

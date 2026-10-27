@@ -227,7 +227,7 @@ impl Turns {
         let unread = |why: &dyn std::fmt::Display| {
             Unremembered(format!(
                 "{}, where the turn of `{name}` is remembered, {why}: no list is taken in its \
-                 place. `ra-jit cache forget REMOTE` removes what is remembered of a remote",
+                 place. `blaze cache forget REMOTE` removes what is remembered of a remote",
                 file.display()
             ))
         };
@@ -485,7 +485,7 @@ mod tests {
             for turn in [0, 5, 9] {
                 let refused = turns.take("manifests/a", turn).unwrap_err();
                 assert!(refused.is::<Unremembered>(), "{damage:?}: {refused}");
-                assert!(refused.to_string().contains("ra-jit cache forget"), "{refused}");
+                assert!(refused.to_string().contains("blaze cache forget"), "{refused}");
             }
             assert_eq!(std::fs::read_to_string(turns.file("manifests/a")).unwrap(), damage);
         }

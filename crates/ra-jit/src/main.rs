@@ -8866,9 +8866,9 @@ fn run_holding(
     }
     // A build with nothing of rustc's starts from the standard library, which a release ships.
     let nothing_of_rustc = library.is_none() && args.symbol_files.is_empty();
-    let shipped = (nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args))
-        .then(|| shipped::fetch_ahead(emits.triple()))
-        .flatten();
+    if nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args) {
+        shipped::fetch_ahead(emits.triple(), &args.project)?;
+    }
     let following_at = start.elapsed();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
     if std::env::var_os("RA_JIT_STATS").is_some() {
@@ -8918,10 +8918,9 @@ fn run_holding(
     if checkouts.lto(&args.project)? {
         linked_from_libraries(&db, &args)?;
     }
-    // The store reads its packs when first opened, which serving does: what is fetched after
-    // that is not in it for this build.
+    // The store reads its packs when first opened, which serving does: what the remote's pull
+    // brings after that is not in it for this build.
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))??;
-    shipped::fetched(shipped);
     let built = built_crates(&db, &args)?;
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and

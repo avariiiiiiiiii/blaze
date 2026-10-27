@@ -888,9 +888,6 @@ pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), S
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
     let wasm = Wasm::known(path, known, Some(&bytes), store)?;
     list(path, &wasm, &wasm.list()?);
-    if let Some(store) = store {
-        store.seal();
-    }
     if std::env::var_os("RA_JIT_STATS").is_some() {
         eprintln!("blaze: the proc-macro module {} ready in {:.1?}", path.display(), start.elapsed());
     }

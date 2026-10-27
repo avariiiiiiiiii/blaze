@@ -835,6 +835,7 @@ impl Index {
             .collect();
         again.sort_unstable_by_key(|it| format!("{it:?}"));
         again.dedup();
+        let again_len = again.len();
         let again_entries = entries_of(db, fan, &again);
         self.parts.push(("again", start.elapsed()));
         for (id, entry) in again.into_iter().zip(again_entries) {
@@ -886,6 +887,16 @@ impl Index {
                 took[2],
                 took[3],
                 took[4]
+            );
+            let parts: Vec<String> = (self.parts.iter())
+                .map(|(part, at)| format!("{part} {}", at.as_micros()))
+                .collect();
+            eprintln!(
+                "items-pushed-us: {}; {} rewritten files, {} items, {} codes, {again_len} written again",
+                parts.join(", "),
+                rewritten_files.len(),
+                ids.len(),
+                funcs.len()
             );
         }
         Ok(Pushed { changed, files: rewritten, written, ..pushed })

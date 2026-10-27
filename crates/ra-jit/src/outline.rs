@@ -1425,15 +1425,20 @@ pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
 /// The tokens of `lexed` that say something, with whether each punctuation is joined to the
 /// next: the spacing a token tree has of it.
 fn said<'a>(lexed: &'a syntax::LexedStr<'_>) -> impl Iterator<Item = (SyntaxKind, &'a str, bool)> {
-    let joins = |next: SyntaxKind| next.is_punct() || next == SyntaxKind::LIFETIME_IDENT;
+    // A delimiter has no spacing of its own.
+    fn spaced(kind: SyntaxKind) -> bool {
+        use SyntaxKind::*;
+        kind.is_punct()
+            && !matches!(kind, L_PAREN | R_PAREN | L_CURLY | R_CURLY | L_BRACK | R_BRACK)
+    }
+    let joins = |next: SyntaxKind| spaced(next) || next == SyntaxKind::LIFETIME_IDENT;
     (0..lexed.len()).filter_map(move |at| {
         let (kind, text) = (lexed.kind(at), lexed.text(at));
         match kind {
             SyntaxKind::WHITESPACE => None,
             SyntaxKind::COMMENT if !is_doc(text) => None,
             _ => {
-                let joint =
-                    kind.is_punct() && at + 1 < lexed.len() && joins(lexed.kind(at + 1));
+                let joint = spaced(kind) && at + 1 < lexed.len() && joins(lexed.kind(at + 1));
                 Some((kind, text, joint))
             }
         }

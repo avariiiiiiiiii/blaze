@@ -70,3 +70,11 @@ Re-spawned one agent per sub-lane at ~02:25 to resume from its worktree WIP + VM
 own HANDOFF.md and commits WIP often).
 Re-spawned (02:25): sysroot, toolq, unitgraph, ctdeps agents running in background. If this run dies
 again, check each sub worktree's HANDOFF.md and `git log origin/main..` before re-spawning.
+
+## Restart 2 (2026-10-27 02:32, watchdog)
+Agents died again (the parent's run ending kills background subagents). State found: sysroot
+built + harness 26/26 equal, next after-trace + land; toolq 3 commits, next build/test/land;
+unitgraph 3 WIP commits (blaze-units crate, blaze-metadata units()), no HANDOFF.md; ctdeps 1 commit
++ uncommitted WIP (compile_time.rs etc). VMs nc-* all RUNNING. No PRs yet.
+Re-spawned all 4 as FOREGROUND agents in one message (parent blocks until they return), so the
+parent stays alive. If restarted again: same check, same re-spawn.

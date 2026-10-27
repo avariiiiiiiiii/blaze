@@ -12,11 +12,13 @@
 //! runs ([`VariableDebug`]), by where the slot is from the frame pointer.
 
 mod codeview;
+mod respaced;
 mod set;
 mod split;
 mod types;
 
 use codeview::CodeView;
+pub use respaced::{LineUnitId, LineUnits};
 pub(super) use set::TypeSet;
 use set::{Of, Told};
 pub(super) use types::{Sets, described};

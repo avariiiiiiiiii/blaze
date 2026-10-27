@@ -1416,7 +1416,9 @@ pub(crate) fn respace(edition: Edition, was: &str, now: &str) -> Option<Vec<(u32
         let mut moves = Vec::with_capacity(was.0.len());
         for ((said, a), (_, b)) in said_was.iter().zip(&said_now) {
             match said {
-                Said::Token(token) => moves.push((was.1[a.start], now.1[b.start], token.1.len() as u32)),
+                Said::Token(token) => {
+                    moves.push((was.1[a.start], now.1[b.start], token.1.len() as u32))
+                }
                 Said::Uses(_) => moves.extend(a.clone().map(|k| (was.1[k], now.1[b.start], 0))),
             }
         }
@@ -1429,7 +1431,9 @@ pub(crate) fn respace(edition: Edition, was: &str, now: &str) -> Option<Vec<(u32
         let near = |said: &[&Said<'_>]| -> String {
             (said[at.saturating_sub(3)..(at + 3).min(said.len())].iter())
                 .map(|it| match it {
-                    Said::Token((_, text, joint)) => format!("{text}{}", if *joint { "~" } else { "" }),
+                    Said::Token((_, text, joint)) => {
+                        format!("{text}{}", if *joint { "~" } else { "" })
+                    }
                     Said::Uses(uses) => format!("[{} uses]", uses.len()),
                 })
                 .collect::<Vec<_>>()
@@ -1663,9 +1667,15 @@ mod tests {
             "use b;\n#[cfg(x)]\n/// a\npub(crate) use a;\nmod m {\n    use d;\n    use c;\n}"
         ));
         assert!(!same("m! { use a; use b; }", "m! { use b; use a; }"));
-        assert!(!same("macro_rules! m { () => { use a; use b; } }", "macro_rules! m { () => { use b; use a; } }"));
+        assert!(!same(
+            "macro_rules! m { () => { use a; use b; } }",
+            "macro_rules! m { () => { use b; use a; } }"
+        ));
         assert!(!same("#[a(use b; use c;)] fn f() {}", "#[a(use c; use b;)] fn f() {}"));
-        assert!(!same("fn f() -> impl Sized + use<'a, T> {}", "fn f() -> impl Sized + use<T, 'a> {}"));
+        assert!(!same(
+            "fn f() -> impl Sized + use<'a, T> {}",
+            "fn f() -> impl Sized + use<T, 'a> {}"
+        ));
         assert!(!same("use a; #[x] use b;", "#[x] use a; use b;"));
     }
 

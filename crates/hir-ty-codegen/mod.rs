@@ -118,6 +118,7 @@ pub use patch::Handout;
 mod places;
 mod placing;
 mod respace;
+pub use debuginfo::{LineUnitId, LineUnits};
 pub use respace::Respace;
 #[cfg(feature = "llvm")]
 mod units;
@@ -2037,6 +2038,8 @@ struct ObjectCodegen<'a, 'db> {
     /// edits follow.
     places: Option<FxHashMap<placing::PlaceKey, DataId>>,
     source_paths: FxHashMap<base_db::FileId, Option<String>>,
+    /// Where the code of the files the database has an earlier text of is written now.
+    respace: FxHashMap<base_db::FileId, std::sync::Arc<Respace>>,
     builder_ctx: FunctionBuilderContext,
     location_counter: u32,
     names: stable::StableNames<'a, 'db>,
@@ -4689,6 +4692,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 && !Target::current().writes_wasm_objects())
             .then(FxHashMap::default),
             source_paths: FxHashMap::default(),
+            respace: base.map(|it| it.respace().clone()).unwrap_or_default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
             names,
@@ -5501,6 +5505,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             debug.declared = Some(debug.place(file, line, column));
         }
         for &(offset, file, line, column) in rows {
+            let (line, column) = self.now_at(file, line, column);
             let Some(file) = self.source_path(file) else { continue };
             let place = debug.place(file, line, column);
             debug.row(offset, place);
@@ -6445,19 +6450,36 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn location_at(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> Option<(String, u32, u32)> {
-        at.and_then(|(owner, span)| source_location(self.db, owner, span))
-            .and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)))
+        let (file, line, col) =
+            at.and_then(|(owner, span)| source_location(self.db, owner, span))?;
+        self.named_at(file, line, col)
     }
 
     fn declaration_at(&mut self, func: FunctionId) -> Option<(String, u32, u32)> {
-        declaration_location(self.db, func)
-            .and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)))
+        let (file, line, col) = (*declaration_location(self.db, func))?;
+        self.named_at(file, line, col)
     }
 
     /// Where a debugger is told `func` is declared: [`debug_declaration_location`].
     fn debug_declaration_at(&mut self, func: FunctionId) -> Option<(String, u32, u32)> {
-        debug_declaration_location(self.db, func)
-            .and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)))
+        let (file, line, col) = (*debug_declaration_location(self.db, func))?;
+        self.named_at(file, line, col)
+    }
+
+    /// A place of the database's text, by the name of its file and where it is written now.
+    fn named_at(
+        &mut self,
+        file: base_db::FileId,
+        line: u32,
+        col: u32,
+    ) -> Option<(String, u32, u32)> {
+        let (line, col) = self.now_at(file, line, col);
+        Some((self.source_path(file)?, line, col))
+    }
+
+    /// Where a line and a column of the database's text of `file` are written now.
+    fn now_at(&self, file: base_db::FileId, line: u32, col: u32) -> (u32, u32) {
+        self.respace.get(&file).map_or((line, col), |it| it.place(line, col))
     }
 
     /// A `core::panic::Location`, of no place in particular when the place is not known.
@@ -6486,11 +6508,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Defines a place of the base again, under its name there, where it is now.
-    fn define_place_again(
-        &mut self,
-        symbol: &str,
-        at: placing::Location,
-    ) -> Result<()> {
+    fn define_place_again(&mut self, symbol: &str, at: placing::Location) -> Result<()> {
         let found = at.and_then(|(file, line, col)| Some((self.source_path(file)?, line, col)));
         let location = self.location_blob(found)?;
         let id = self.module.declare_data(symbol, Linkage::Hidden, false, false)?;

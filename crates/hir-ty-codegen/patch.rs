@@ -42,8 +42,8 @@ use super::{
     itempush::{Asked, ItemPush, Settled},
     left_to_rustc,
     naming::Naming,
+    placing::{Now, PlaceKey, Places, Placing, Rows, code_print},
     root_serial, row_location, source_location,
-    placing::{Now, PlaceKey, Placing, Places, Rows, code_print},
     stable::StableNames,
     static_serial, target,
 };
@@ -1523,7 +1523,11 @@ impl Base {
                 let bodies = mentioned_bodies(db, instance)
                     .filter(|bodies| bodies.iter().any(|it| ours(db, *it)));
                 let Some(bodies) = bodies else {
-                    return (Mark::of_instance(db, instance, env, debug), body_files(db, instance), None);
+                    return (
+                        Mark::of_instance(db, instance, env, debug),
+                        body_files(db, instance),
+                        None,
+                    );
                 };
                 let mut files: Vec<FileId> = bodies.iter().map(|it| body_file(db, *it)).collect();
                 files.sort_unstable();
@@ -2406,14 +2410,19 @@ impl Base {
         }
     }
 
-    /// After an edit of `files`: which bodies of the code whose places are found apart from it
-    /// lower otherwise now.
+    /// Where the code of the files the database has an earlier text of is written now.
+    pub(super) fn respace(&self) -> &FxHashMap<FileId, Arc<super::Respace>> {
+        self.places.respace()
+    }
+
     /// Whether an edit that writes `file` otherwise, saying the same, can leave its text to
     /// the database: what is compiled of it is the same, and a patch moves its places.
     pub(super) fn respaces(&self, file: FileId) -> bool {
         self.places_named && !self.placed_files.contains(&file)
     }
 
+    /// After an edit of `files`: which bodies of the code whose places are found apart from it
+    /// lower otherwise now.
     pub(super) fn after_edit(
         &mut self,
         db: &dyn HirDatabase,

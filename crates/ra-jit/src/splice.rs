@@ -129,6 +129,22 @@ pub(crate) struct Baseline {
     stamp: Stamp,
     /// What the last splice of a Mach-O executable appended, with the hashes of its pages.
     appended: Option<macho::Appended>,
+    /// The units of an ELF executable the last splice pointed at line programs written again.
+    pointed: debug::Pointed,
+}
+
+/// The files the database keeps an earlier text of ([`hir_ty_codegen::Respace`]), by their
+/// whole names: the rows of each in the executable are moved where its code is now.
+static RESPACED: std::sync::Mutex<Option<Arc<FxHashMap<Box<[u8]>, Arc<hir_ty_codegen::Respace>>>>> =
+    std::sync::Mutex::new(None);
+
+/// Says which files the splices that come have to move the rows of ([`RESPACED`]).
+pub(crate) fn respaced(files: FxHashMap<Box<[u8]>, Arc<hir_ty_codegen::Respace>>) {
+    *RESPACED.lock().unwrap_or_else(|it| it.into_inner()) = Some(Arc::new(files));
+}
+
+fn respaced_now() -> Arc<FxHashMap<Box<[u8]>, Arc<hir_ty_codegen::Respace>>> {
+    RESPACED.lock().unwrap_or_else(|it| it.into_inner()).clone().unwrap_or_default()
 }
 
 /// What a splice appended that the next may find where it is.
@@ -217,6 +233,7 @@ impl Parsed {
             copies,
             stamp,
             appended: None,
+            pointed: debug::Pointed::default(),
         })
     }
 }
@@ -279,6 +296,7 @@ impl Baseline {
             copies: self.copies.clone(),
             stamp: self.stamp.clone(),
             appended: None,
+            pointed: debug::Pointed::default(),
         }
     }
 
@@ -352,9 +370,15 @@ impl Baseline {
         let start = std::time::Instant::now();
         let (mut addition, len, pointed) = match &*self.image {
             Executable::Elf(image) => {
-                let patch = Patch::read(patch, image, whole)?;
+                let mut patch = Patch::read(patch, image, whole)?;
                 if whole && std::env::var_os("RA_JIT_STATS").is_some() {
                     eprintln!("splice-us: read={}", start.elapsed().as_micros());
+                }
+                let respaced = respaced_now();
+                if !whole && (!respaced.is_empty() || self.pointed.any()) {
+                    let file = File::open(&self.path)?;
+                    patch.rows =
+                        image.described.rows(&file, &self.copies, &mut self.pointed, &respaced);
                 }
                 self.has_baked(patch.replaced.iter().map(|it| it.name))?;
                 let addition = patch.place(image, &self.copies)?;
@@ -410,6 +434,9 @@ impl Baseline {
             }
         }
         self.copies = described.copies.clone();
+        if let Some(units) = &described.pointed {
+            self.pointed.pointed(units.clone());
+        }
         let copied_at = start.elapsed();
         left.append(&file, addition.offset, &addition.appended)?;
         write_all_at(&file, &addition.headers, addition.headers_offset)?;
@@ -1787,6 +1814,8 @@ struct Patch<'a> {
     replaced: Vec<Replaced<'a>>,
     /// The statics among them that go where the executable has them, by where the patch does.
     in_place: FxHashMap<SectionIndex, Vec<InPlace>>,
+    /// What the splice writes of the rows of the executable's files laid out again.
+    rows: debug::Rows,
 }
 
 #[derive(Clone, Copy)]
@@ -1923,6 +1952,7 @@ impl<'a> Patch<'a> {
             frames: 0,
             replaced: Vec::new(),
             in_place: FxHashMap::default(),
+            rows: debug::Rows::default(),
         };
         for section in patch.file.sections() {
             let object::SectionFlags::Elf { sh_flags } = section.flags() else { continue };

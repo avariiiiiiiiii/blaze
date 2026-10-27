@@ -9158,6 +9158,17 @@ fn run_holding(
         for file in &emptied {
             respacing_now.remove(file);
         }
+        if !texts.is_empty() || !emptied.is_empty() {
+            let whole = |file: vfs::FileId| {
+                let root = db.file_source_root(file).source_root_id(&db);
+                let root = db.source_root(root).source_root(&db);
+                let path = root.path_for_file(&file)?.as_path()?.to_string();
+                Some(path.into_bytes().into_boxed_slice())
+            };
+            let named =
+                respacing_now.iter().filter_map(|(file, it)| Some((whole(*file)?, it.clone())));
+            splice::respaced(named.collect());
+        }
         let respacing = respacing.elapsed();
         let looked: Vec<vfs::FileId> =
             editing.iter().copied().filter(|it| !respaced.contains(it)).collect();

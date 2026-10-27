@@ -10,6 +10,10 @@
 //! What the executable says of the functions the patch replaces stays: it is true of their
 //! old code, which is still there behind the jump.
 //!
+//! The rows of a file laid out again and not compiled again are moved where its code is now
+//! ([`Rows`]): each unit naming it has its line program written again behind the patch's,
+//! and points there until the file is compiled again.
+//!
 //! The sections are copied there once the executable is linked ([`Described::laid_out`]),
 //! each with room behind it, and the section headers point at the copies from then on: the
 //! linker's are let go of, so the file holds each section once also where the filesystem
@@ -19,14 +23,16 @@
 //! of. Of a program with hundreds of megabytes of them, the first copy is seconds.
 
 use anyhow::{Context, bail, ensure};
+use hir_ty_codegen::{LineUnitId, LineUnits, Respace};
 use object::{
     Endianness, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
     SectionIndex, SymbolKind, elf,
     read::elf::{ElfFile64, FileHeader, SectionHeader},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::{fs::File, sync::Arc};
 
-use super::{Machine, Patch, Target};
+use super::{Machine, Patch, Target, read_exact_at};
 
 /// The section headers of an executable, and the sections among them a debugger reads.
 pub(super) struct Described {
@@ -40,6 +46,41 @@ pub(super) struct Described {
     /// them, whether or not a patch adds to each: those a debugger reads, but not one that
     /// is loaded or compressed.
     laid: Vec<usize>,
+    /// The units that say where their rows are, of an executable whose units and their rows
+    /// are among `laid`.
+    units: Option<LineUnits>,
+}
+
+/// What the splices of an executable pointed at line programs written again.
+#[derive(Default)]
+pub(super) struct Pointed {
+    units: FxHashSet<LineUnitId>,
+    /// The programs written again, with the files of each laid out again as they were then.
+    written: FxHashMap<LineUnitId, (Vec<Arc<Respace>>, Arc<[u8]>)>,
+}
+
+/// What a splice writes of the rows of files laid out again: the line programs of the units
+/// naming one, and the units pointed back at their own.
+#[derive(Default)]
+pub(super) struct Rows {
+    programs: Vec<(LineUnitId, Arc<[u8]>)>,
+    back: Vec<LineUnitId>,
+}
+
+impl Pointed {
+    pub(super) fn any(&self) -> bool {
+        !self.units.is_empty()
+    }
+
+    pub(super) fn pointed(&mut self, units: FxHashSet<LineUnitId>) {
+        self.units = units;
+    }
+}
+
+impl Rows {
+    fn is_empty(&self) -> bool {
+        self.programs.is_empty() && self.back.is_empty()
+    }
 }
 
 /// What a section is given to grow into, at the least, before the one behind it moves.
@@ -78,6 +119,8 @@ pub(super) struct Tail {
     pub(super) headers: Option<(u64, u16)>,
     /// Where the sections are once the splice is through.
     pub(super) copies: Copies,
+    /// The units pointed at line programs written again, once the splice is through.
+    pub(super) pointed: Option<FxHashSet<LineUnitId>>,
 }
 
 /// What a patch adds to the sections a debugger reads.
@@ -112,7 +155,89 @@ impl Described {
             .collect();
         laid.sort_unstable_by_key(|&it| headers[it].sh_offset(endian));
         let table = file.elf_header().e_shoff(endian);
-        Ok(Described { headers, table, sections, names, laid })
+        let mut described = Described { headers, table, sections, names, laid, units: None };
+        described.units = described.units(file);
+        Ok(described)
+    }
+
+    /// The units of the executable that say where their rows are.
+    fn units(&self, file: &ElfFile64<'_, Endianness>) -> Option<LineUnits> {
+        let start = std::time::Instant::now();
+        let laid = |name: &[u8]| self.sections.get(name).filter(|it| self.laid.contains(it));
+        let data = |name: &[u8]| -> Option<&[u8]> {
+            let index = *laid(name)?;
+            file.section_by_index(SectionIndex(index)).ok()?.data().ok()
+        };
+        let (info, abbrev, line) =
+            (data(b".debug_info")?, data(b".debug_abbrev")?, data(b".debug_line")?);
+        let strings = data(b".debug_str").unwrap_or_default();
+        let line_strings = data(b".debug_line_str").unwrap_or_default();
+        let units = LineUnits::read(info, abbrev, line, strings, line_strings);
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!("splice-units: {} in {} us", units.len(), start.elapsed().as_micros());
+        }
+        Some(units)
+    }
+
+    /// Where in the file the section of `name` is copied to, of those `laid`.
+    fn copied(&self, copies: &Copies, name: &[u8]) -> Option<(usize, u64)> {
+        let index = *self.sections.get(name)?;
+        let k = self.laid.iter().position(|&it| it == index)?;
+        Some((index, copies.at.get(k)?.0))
+    }
+
+    /// The line programs of the units naming a file `respaced` lays out again, by its whole
+    /// name, with their rows where the code is now; and the units pointed at programs
+    /// written again that none of those name now. Read from the file where `copies` has them,
+    /// or as `pointed` has them when their files are laid out as they were.
+    pub(super) fn rows(
+        &self,
+        file: &File,
+        copies: &Copies,
+        pointed: &mut Pointed,
+        respaced: &FxHashMap<Box<[u8]>, Arc<Respace>>,
+    ) -> Rows {
+        let Some(units) = &self.units else { return Rows::default() };
+        let Some((_, line)) = self.copied(copies, b".debug_line") else { return Rows::default() };
+        let start = std::time::Instant::now();
+        let (mut programs, mut again) = (Vec::new(), 0);
+        for unit in units.naming(|it| respaced.contains_key(it)) {
+            let now: Vec<Arc<Respace>> =
+                units.files(unit).iter().filter_map(|it| respaced.get(it)).cloned().collect();
+            let same = |(was, _): &&(Vec<Arc<Respace>>, Arc<[u8]>)| {
+                was.len() == now.len() && was.iter().zip(&now).all(|(a, b)| Arc::ptr_eq(a, b))
+            };
+            if let Some((_, written)) = pointed.written.get(&unit).filter(same) {
+                programs.push((unit, written.clone()));
+                continue;
+            }
+            let (at, len) = units.program(unit);
+            let mut bytes = vec![0; len as usize];
+            if read_exact_at(file, &mut bytes, line + at).is_err() {
+                continue;
+            }
+            let respace = |it: &[u8]| respaced.get(it).map(|it| &**it);
+            let Some(written) = units.moved(unit, &bytes, respace) else { continue };
+            let written: Arc<[u8]> = written.into();
+            again += 1;
+            pointed.written.insert(unit, (now, written.clone()));
+            programs.push((unit, written));
+        }
+        pointed.written.retain(|unit, _| programs.iter().any(|it| it.0 == *unit));
+        let mut back: Vec<LineUnitId> = (pointed.units.iter().copied())
+            .filter(|unit| !programs.iter().any(|it| it.0 == *unit))
+            .collect();
+        back.sort_unstable_by_key(|it| units.field(*it).0);
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "splice-rows: {} of {} units moved, {again} written again, {} back, in {} us",
+                programs.len(),
+                units.len(),
+                back.len(),
+                start.elapsed().as_micros()
+            );
+        }
+        Rows { programs, back }
     }
 
     fn says_lines(&self) -> bool {
@@ -242,6 +367,17 @@ impl Patch<'_> {
                 Some,
             ),
         };
+        let rows = &self.rows;
+        let mut added = match added {
+            None if !rows.is_empty() => Some(Added {
+                headers: described.headers.clone(),
+                names: Vec::new(),
+                data: FxHashMap::default(),
+                others: Vec::new(),
+            }),
+            added => added,
+        };
+        let pointed = added.as_mut().and_then(|it| it.repoint(described, rows));
         let lens: Vec<u64> =
             described.laid.iter().map(|&it| described.headers[it].sh_size(e)).collect();
         let grown: Vec<u64> = (described.laid.iter())
@@ -252,6 +388,14 @@ impl Patch<'_> {
         let (copies, moved) = copies.make_room(&lens, &grown, offset);
         let mut tail = Tail { moved, copies, ..Tail::default() };
         let Some(Added { mut headers, names, mut data, others }) = added else { return tail };
+        if let Some((fields, units)) = pointed
+            && let Some((_, info)) = described.copied(&tail.copies, b".debug_info")
+        {
+            for (field, value) in fields {
+                tail.written.push((info + field, value.to_le_bytes().to_vec()));
+            }
+            tail.pointed = Some(units);
+        }
         for (&index, &(at, _)) in described.laid.iter().zip(&tail.copies.at) {
             let header = &mut headers[index];
             header.sh_offset.set(e, at);
@@ -294,6 +438,7 @@ impl Patch<'_> {
             );
             tail.written.clear();
             tail.copied.clear();
+            tail.pointed = None;
             return tail;
         };
         tail.written.push((end, object::bytes_of_slice(&headers).to_vec()));
@@ -372,6 +517,33 @@ impl Patch<'_> {
             data.insert(index, bytes);
         }
         Ok(Added { headers, names, data, others })
+    }
+}
+
+impl Added {
+    /// Appends the line programs of `rows` to what the patch adds to `.debug_line`, and says
+    /// where each unit is to be pointed: at a program appended, or back at its own. With the
+    /// units pointed elsewhere then.
+    fn repoint(
+        &mut self,
+        described: &Described,
+        rows: &Rows,
+    ) -> Option<(Vec<(u64, u32)>, FxHashSet<LineUnitId>)> {
+        let units = described.units.as_ref()?;
+        let e = Endianness::Little;
+        let line = *described.sections.get(&b".debug_line"[..])?;
+        let base = described.headers[line].sh_size(e);
+        let data = self.data.entry(line).or_default();
+        let mut fields = Vec::new();
+        let mut pointed = FxHashSet::default();
+        for (unit, program) in &rows.programs {
+            let Ok(at) = u32::try_from(base + data.len() as u64) else { break };
+            data.extend_from_slice(program);
+            fields.push((units.field(*unit).0, at));
+            pointed.insert(*unit);
+        }
+        fields.extend(rows.back.iter().map(|it| units.field(*it)));
+        Some((fields, pointed))
     }
 }
 

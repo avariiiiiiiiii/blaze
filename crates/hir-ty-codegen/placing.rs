@@ -312,6 +312,10 @@ impl Places {
 
     /// After an edit that changed no token of `files`, only where they are, which the
     /// database keeps the text of: their places are found again for every patch, and moved.
+    pub(super) fn respace(&self) -> &FxHashMap<FileId, Arc<Respace>> {
+        &self.respace
+    }
+
     pub(super) fn respaced(&mut self, files: &[(FileId, Arc<Respace>)]) {
         for (file, respace) in files {
             if self.edited.insert(*file) {
@@ -355,10 +359,7 @@ impl Places {
     /// the code of a body that lowers otherwise was asked, so what it was asked by is the
     /// body's from now on, and a place of it that no code the same as the base's asked for is
     /// had by none. `None` when code the same as the base's finds a place by two spans.
-    fn remap(
-        &mut self,
-        found: impl Iterator<Item = (PlaceKey, PlaceKey)>,
-    ) -> Option<()> {
+    fn remap(&mut self, found: impl Iterator<Item = (PlaceKey, PlaceKey)>) -> Option<()> {
         let mut by: FxHashMap<PlaceKey, PlaceKey> = FxHashMap::default();
         for (was, now) in found {
             if *by.entry(was).or_insert(now) != now {

@@ -401,7 +401,7 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         env: worker_env(),
         whole: false,
     };
-    Ok(daemon::Ahead { config, crates, root })
+    Ok(daemon::Ahead { config, crates, root, targets: asked.target_flags() })
 }
 
 impl Built {

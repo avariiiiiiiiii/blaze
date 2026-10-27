@@ -334,6 +334,111 @@ pub(crate) fn units(
     blaze_metadata::units(&asked, &units).context("making the build's unit graph")
 }
 
+/// The targets the flags `targets` pick (`--lib`, `--tests`, `--bin NAME`, ...), as cargo's
+/// `from_raw_arguments` reads them.
+fn filter(targets: &[String]) -> blaze_units::Filter {
+    let (mut lib, mut all_targets) = (false, false);
+    let (mut all_bins, mut all_tests, mut all_examples, mut all_benches) =
+        (false, false, false, false);
+    let (mut bins, mut tests, mut examples, mut benches) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut flags = targets.iter();
+    while let Some(flag) = flags.next() {
+        let mut named = |to: &mut Vec<String>| to.extend(flags.next().cloned());
+        match flag.as_str() {
+            "--lib" => lib = true,
+            "--all-targets" => all_targets = true,
+            "--bins" => all_bins = true,
+            "--tests" => all_tests = true,
+            "--examples" => all_examples = true,
+            "--benches" => all_benches = true,
+            "--bin" => named(&mut bins),
+            "--test" => named(&mut tests),
+            "--example" => named(&mut examples),
+            "--bench" => named(&mut benches),
+            _ => {}
+        }
+    }
+    blaze_units::Filter::from_flags(
+        lib,
+        bins,
+        all_bins,
+        tests,
+        all_tests,
+        examples,
+        all_examples,
+        benches,
+        all_benches,
+        all_targets,
+    )
+}
+
+/// The unit graph of `cargo check` of `selection` with the target flags `targets`, asked for
+/// in `cwd` (of the package of `manifest`, when there is one), for the triple `selection`
+/// names or the host's: the targets the check picks, each checked as a test or not, and what
+/// they depend on.
+pub(crate) fn checked(
+    selection: &crate::plan::Selection,
+    targets: &[String],
+    cwd: &Path,
+    manifest: Option<&Path>,
+) -> anyhow::Result<blaze_units::UnitGraph> {
+    if let Some(flag) = selection.unstable.first() {
+        anyhow::bail!("blaze's unit graph is not made for cargo's unstable flag `-Z {flag}`");
+    }
+    let rustc = super::state::rustc_path();
+    let said = |args: &[&str]| {
+        let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
+        said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
+    };
+    let platformed = |triple: &str| -> anyhow::Result<blaze_units::Platformed> {
+        let printed = said(&["--print", "cfg", "--target", triple])?;
+        let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {
+            use std::str::FromStr;
+            cargo_platform::Cfg::from_str(it).with_context(|| format!("the cfg {it}"))
+        });
+        let cfg = cfg.collect::<anyhow::Result<_>>()?;
+        Ok(blaze_units::Platformed { triple: triple.to_owned(), cfg })
+    };
+    let told = said(&["-vV"])?;
+    let host = told.lines().find_map(|it| it.strip_prefix("host: "));
+    let host = platformed(host.context("rustc names no host")?)?;
+    let target = selection.target.as_deref().map(platformed).transpose()?;
+    let filter = filter(targets);
+    let intent = blaze_units::Intent::Check { test: false };
+    let built_for = target.as_ref().unwrap_or(&host);
+    let asked = blaze_metadata::Asked {
+        cwd,
+        env: std::env::vars().collect(),
+        manifest_path: manifest,
+        config: &selection.config,
+        features: &selection.features,
+        all_features: selection.all_features,
+        no_default_features: selection.no_default_features,
+        build: Some(blaze_metadata::Build {
+            packages: &selection.packages,
+            workspace: selection.workspace,
+            excludes: &selection.excludes,
+            dev_units: filter.need_dev_deps(intent),
+        }),
+        platform: Some(blaze_metadata::TargetPlatform {
+            triple: &built_for.triple,
+            cfg: &built_for.cfg,
+        }),
+        offline: false,
+        store: None,
+    };
+    let units = blaze_metadata::Units {
+        intent,
+        filter: &filter,
+        release: false,
+        profile: Some(&selection.profile),
+        host: &host,
+        target: target.as_ref(),
+    };
+    blaze_metadata::units(&asked, &units).context("making the check's unit graph")
+}
+
 /// A `cfg` as rust-analyzer has it, as cargo's platforms read it.
 fn platform_cfg(atom: &cfg::CfgAtom) -> Option<cargo_platform::Cfg> {
     use std::str::FromStr;

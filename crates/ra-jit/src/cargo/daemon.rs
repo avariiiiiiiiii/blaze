@@ -308,6 +308,11 @@ pub(crate) struct Ahead {
     pub(crate) root: PathBuf,
     /// Where the source of each crate the daemon compiles starts.
     pub(crate) crates: Vec<PathBuf>,
+    /// The flags of a check that pick targets (`--tests`, `--bin NAME`, ...), each with its
+    /// value. What is loaded does not turn on them, so they are not the checker's
+    /// [`WorkerConfig`]: they are told it with each request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) targets: Vec<String>,
 }
 
 /// A checkout as cargo last built it, and the programs of it the daemon is asked for.
@@ -1458,7 +1463,7 @@ impl Daemon {
             };
             let checker = &mut held[at];
             checker.asked = Instant::now();
-            match checker.ask(request) {
+            match checker.ask(&crate::check::request(&ahead.targets, request)) {
                 Ok(reply) if reply == "ok" => return Reply::Checked { errors: None },
                 Ok(reply) if reply.starts_with(crate::check::LINT) => {
                     return Reply::Linted { answer: reply[crate::check::LINT.len()..].to_owned() };

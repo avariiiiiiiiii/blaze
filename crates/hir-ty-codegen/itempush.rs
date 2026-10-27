@@ -225,21 +225,6 @@ impl ItemPush {
         Asked { roots, instances }
     }
 
-    /// Notes what the roots and instances asked about refer to now, of the revision after the
-    /// edit: what called a thing by a name bound to another calls that one now.
-    pub(super) fn settle(
-        &mut self,
-        db: &dyn HirDatabase,
-        fan: &Fan<'_>,
-        asked: &Asked,
-        compiled: &[(FunctionId, String)],
-        instances: &FxIndexMap<Instance, BaseInstance>,
-    ) {
-        let (roots, instances) = Settled::asked(asked, compiled, instances);
-        let live = self.index.live();
-        self.take_settled(Settled::new(db, fan, &roots, &instances, &live));
-    }
-
     /// Takes what `asked` refers to for unknown, as it could not be settled.
     pub(super) fn forget(&mut self, asked: &Asked) {
         for &at in &asked.roots {

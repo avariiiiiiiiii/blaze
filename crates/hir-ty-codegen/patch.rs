@@ -2355,9 +2355,11 @@ impl Base {
         let moves = moves && files.len() >= 2;
         self.snapshot(db, files, fan, moves);
         let now = salsa::plumbing::current_revision(db);
+        // A settle still under way is not waited for: the edit stops it, and what it would
+        // have told is asked about again.
         let settled = (self.settling.take().filter(|_| self.items.is_some()))
             .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
-            .and_then(|it| it.recv().ok())
+            .and_then(|it| it.try_recv().ok())
             .filter(|(at, _)| self.of_now(*at, now));
         self.went.clear();
         let Some(items) = &mut self.items else { return };
@@ -2366,16 +2368,14 @@ impl Base {
         if let Some((pushes, funcs, codes)) = coded {
             items.index.take_codes(pushes, &funcs, codes);
         }
-        let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
+        let reitem = self.reitem.take();
         let took = start.elapsed();
         let asked = reitem.clone();
-        let settling = probe(|| {
-            hir_ty::attach_db(db, || match (reitem, settled) {
-                (Some(_), Some((_, settled))) => items.take_settled(settled),
-                (Some(asked), None) => items.settle(db, fan, &asked, compiled, instances),
-                (None, _) => {}
-            })
-        });
+        let settling = match (reitem, settled) {
+            (Some(_), Some((_, settled))) => probe(|| items.take_settled(settled)),
+            (Some(_), None) => None,
+            (None, _) => Some(()),
+        };
         // What could not be settled is asked about at every edit until it is: the threads
         // building the last patch, stopped by this edit, can have left what it reads unasked.
         if settling.is_none()

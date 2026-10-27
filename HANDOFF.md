@@ -68,3 +68,5 @@ written, not yet built/run; toolq: 8 files; unitgraph: new crates/blaze-units st
 ctdeps: plan.rs started) and their VMs nc-{sysroot,toolq,unitgraph,ctdeps} still RUNNING. No PRs yet.
 Re-spawned one agent per sub-lane at ~02:25 to resume from its worktree WIP + VM (each writes its
 own HANDOFF.md and commits WIP often).
+Re-spawned (02:25): sysroot, toolq, unitgraph, ctdeps agents running in background. If this run dies
+again, check each sub worktree's HANDOFF.md and `git log origin/main..` before re-spawning.

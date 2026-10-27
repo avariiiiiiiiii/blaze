@@ -200,29 +200,42 @@ impl Described {
         let Some(units) = &self.units else { return Rows::default() };
         let Some((_, line)) = self.copied(copies, b".debug_line") else { return Rows::default() };
         let start = std::time::Instant::now();
-        let (mut programs, mut again) = (Vec::new(), 0);
+        let mut programs = Vec::new();
+        let mut again: Vec<(LineUnitId, Vec<Arc<Respace>>)> = Vec::new();
         for unit in units.naming(|it| respaced.contains_key(it)) {
             let now: Vec<Arc<Respace>> =
                 units.files(unit).iter().filter_map(|it| respaced.get(it)).cloned().collect();
             let same = |(was, _): &&(Vec<Arc<Respace>>, Arc<[u8]>)| {
                 was.len() == now.len() && was.iter().zip(&now).all(|(a, b)| Arc::ptr_eq(a, b))
             };
-            if let Some((_, written)) = pointed.written.get(&unit).filter(same) {
-                programs.push((unit, written.clone()));
-                continue;
+            match pointed.written.get(&unit).filter(same) {
+                Some((_, written)) => programs.push((unit, written.clone())),
+                None => again.push((unit, now)),
             }
+        }
+        // Each unit's program is read and written again on a thread of its own.
+        let write = |unit: LineUnitId| -> Option<Arc<[u8]>> {
             let (at, len) = units.program(unit);
             let mut bytes = vec![0; len as usize];
-            if read_exact_at(file, &mut bytes, line + at).is_err() {
-                continue;
-            }
+            read_exact_at(file, &mut bytes, line + at).ok()?;
             let respace = |it: &[u8]| respaced.get(it).map(|it| &**it);
-            let Some(written) = units.moved(unit, &bytes, respace) else { continue };
-            let written: Arc<[u8]> = written.into();
-            again += 1;
+            Some(units.moved(unit, &bytes, respace)?.into())
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let per = again.len().div_ceil(threads).max(1);
+        let written: Vec<Option<Arc<[u8]>>> = std::thread::scope(|scope| {
+            let parts: Vec<_> = (again.chunks(per))
+                .map(|part| scope.spawn(|| part.iter().map(|it| write(it.0)).collect::<Vec<_>>()))
+                .collect();
+            parts.into_iter().flat_map(|it| it.join().unwrap_or_default()).collect()
+        });
+        let again_len = again.len();
+        for ((unit, now), written) in again.into_iter().zip(written) {
+            let Some(written) = written else { continue };
             pointed.written.insert(unit, (now, written.clone()));
             programs.push((unit, written));
         }
+        programs.sort_unstable_by_key(|it| units.field(it.0).0);
         pointed.written.retain(|unit, _| programs.iter().any(|it| it.0 == *unit));
         let mut back: Vec<LineUnitId> = (pointed.units.iter().copied())
             .filter(|unit| !programs.iter().any(|it| it.0 == *unit))
@@ -230,7 +243,7 @@ impl Described {
         back.sort_unstable_by_key(|it| units.field(*it).0);
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(
-                "splice-rows: {} of {} units moved, {again} written again, {} back, in {} us",
+                "splice-rows: {} of {} units moved, {again_len} written again, {} back, in {} us",
                 programs.len(),
                 units.len(),
                 back.len(),

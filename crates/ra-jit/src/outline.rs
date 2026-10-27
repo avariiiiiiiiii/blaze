@@ -16,7 +16,7 @@ use ide_db::{
 };
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use syntax::{
-    AstNode, Edition, SyntaxKind, SyntaxNode, TextRange, WalkEvent,
+    AstNode, Edition, SyntaxKind, SyntaxNode, T, TextRange, WalkEvent,
     ast::{self, HasAttrs, HasGenericParams, HasName},
 };
 use vfs::FileId;
@@ -1432,118 +1432,198 @@ fn key_of(func: &ast::Fn) -> Option<(String, bool)> {
 /// comments, and its imports in another order. Each token is joined to the next as it was
 /// where a macro or the parser can tell, and the doc comments, which are attributes, are as
 /// they were. What is compiled of it is the same but for where it is: the ids of its items
-/// are of their names, and an import's of the imports before it alone.
+/// are of their names, and an import's of what it says.
 pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
-    let was = syntax::SourceFile::parse(was, edition);
-    respaced_from(edition, &was, now)
-}
-
-/// [`respaced`], of a text the database has parsed already.
-pub(crate) fn respaced_from(
-    edition: Edition,
-    was: &syntax::Parse<syntax::SourceFile>,
-    now: &str,
-) -> bool {
-    let now = syntax::SourceFile::parse(now, edition);
-    if !was.errors().is_empty() || !now.errors().is_empty() {
+    let (was, now) = (syntax::LexedStr::new(edition, was), syntax::LexedStr::new(edition, now));
+    if was.errors().next().is_some() || now.errors().next().is_some() {
         return false;
     }
-    said(&was.syntax_node()) == said(&now.syntax_node())
+    let (was, now) = (Tokens::of(&was), Tokens::of(&now));
+    if was.0 == now.0 {
+        return true;
+    }
+    // What a `macro` is handed is not told from the tokens before its body, nor its imports.
+    let macros = |tokens: &Tokens<'_>| tokens.0.iter().any(|it| it.0 == T![macro]);
+    if macros(&was) || macros(&now) {
+        return false;
+    }
+    was.said() == now.said()
 }
 
-/// A part of what a file says: a token that says something, with whether it is punctuation
-/// joined to the next (the spacing a token tree has of it), or imports one after the other,
-/// in an order of their own.
-enum Said {
-    Token(syntax::SyntaxToken, bool),
+/// The tokens of a text that say something: neither blank space nor a comment but a doc
+/// comment, with whether each is punctuation joined to the next (the spacing a token tree
+/// has of it).
+struct Tokens<'a>(Vec<(SyntaxKind, &'a str, bool)>);
+
+/// A part of what a text says: a token, or imports one after the other, in an order of
+/// their own.
+#[derive(PartialEq)]
+enum Said<'a> {
+    Token((SyntaxKind, &'a str, bool)),
     Uses(Vec<String>),
 }
 
-impl PartialEq for Said {
-    fn eq(&self, other: &Said) -> bool {
-        match (self, other) {
-            (Said::Token(a, joint), Said::Token(b, other)) => {
-                (a.kind(), a.text(), joint) == (b.kind(), b.text(), other)
+impl<'a> Tokens<'a> {
+    fn of(lexed: &'a syntax::LexedStr<'_>) -> Tokens<'a> {
+        let mut tokens = Vec::with_capacity(lexed.len());
+        for at in 0..lexed.len() {
+            let (kind, text) = (lexed.kind(at), lexed.text(at));
+            match kind {
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => continue,
+                _ => {}
             }
-            (Said::Uses(a), Said::Uses(b)) => a == b,
-            _ => false,
+            let joint = spaced(kind) && at + 1 < lexed.len() && joins(lexed.kind(at + 1));
+            tokens.push((kind, text, joint));
         }
+        Tokens(tokens)
     }
-}
 
-fn said(tree: &SyntaxNode) -> Vec<Said> {
-    let mut said = Vec::new();
-    said_in(tree, &mut said);
-    said
-}
+    fn kind(&self, at: usize) -> Option<SyntaxKind> {
+        self.0.get(at).map(|it| it.0)
+    }
 
-fn said_in(node: &SyntaxNode, said: &mut Vec<Said>) {
-    let mut children = node.children_with_tokens().peekable();
-    while let Some(child) = children.next() {
-        match child {
-            syntax::NodeOrToken::Token(token) if says(&token) => {
-                let joint = spaced(token.kind())
-                    && token.next_token().is_some_and(|it| joins(it.kind()));
-                said.push(Said::Token(token, joint));
-            }
-            syntax::NodeOrToken::Token(_) => {}
-            syntax::NodeOrToken::Node(node) if node.kind() == SyntaxKind::USE => {
-                let mut uses = vec![use_written(&node)];
-                while let Some(next) = children.peek() {
-                    match next {
-                        syntax::NodeOrToken::Token(token) if !says(token) => {}
-                        syntax::NodeOrToken::Node(node) if node.kind() == SyntaxKind::USE => {
-                            uses.push(use_written(node));
-                        }
-                        _ => break,
+    /// The tokens past the matching delimiter of the one at `at`.
+    fn past_group(&self, at: usize) -> usize {
+        let mut depth = 0usize;
+        for (k, token) in self.0[at..].iter().enumerate() {
+            match token.0 {
+                T!['('] | T!['['] | T!['{'] => depth += 1,
+                T![')'] | T![']'] | T!['}'] => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return at + k + 1;
                     }
-                    children.next();
+                }
+                _ => {}
+            }
+        }
+        self.0.len()
+    }
+
+    /// Where the import that starts at `at` ends, with its outer attributes, doc comments and
+    /// visibility, when one does: past its `;`.
+    fn import_at(&self, at: usize) -> Option<usize> {
+        let mut k = at;
+        loop {
+            match self.0.get(k)?.0 {
+                SyntaxKind::OUTER_DOC_COMMENT => k += 1,
+                T![#] if self.kind(k + 1) == Some(T!['[']) => k = self.past_group(k + 1),
+                _ => break,
+            }
+        }
+        if self.kind(k) == Some(T![pub]) {
+            k += 1;
+            if self.kind(k) == Some(T!['(']) {
+                k = self.past_group(k);
+            }
+        }
+        if self.kind(k) != Some(T![use]) || self.kind(k + 1) == Some(T![<]) {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (j, token) in self.0[k..].iter().enumerate() {
+            match token.0 {
+                T!['{'] => depth += 1,
+                T!['}'] => depth = depth.checked_sub(1)?,
+                T![;] if depth == 0 => return Some(k + j + 1),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// An import as written, the same in every order of the trees in its lists.
+    fn import_written(&self, tokens: &[(SyntaxKind, &str, bool)]) -> String {
+        fn write(tokens: &[(SyntaxKind, &str, bool)], written: &mut String) {
+            let mut at = 0;
+            while at < tokens.len() {
+                if tokens[at].0 != T!['{'] {
+                    written.push_str(tokens[at].1);
+                    written.push(if tokens[at].2 { '\0' } else { ' ' });
+                    at += 1;
+                    continue;
+                }
+                // A list: its trees, split at the commas between them, sorted.
+                let (mut depth, mut from, mut trees) = (0usize, at + 1, Vec::new());
+                let mut end = tokens.len();
+                for (k, token) in tokens.iter().enumerate().skip(at) {
+                    match token.0 {
+                        T!['{'] => depth += 1,
+                        T!['}'] => {
+                            depth -= 1;
+                            if depth == 0 {
+                                trees.push(&tokens[from..k]);
+                                end = k + 1;
+                                break;
+                            }
+                        }
+                        T![,] if depth == 1 => {
+                            trees.push(&tokens[from..k]);
+                            from = k + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let mut written_trees: Vec<String> = (trees.into_iter())
+                    .filter(|it| !it.is_empty())
+                    .map(|it| {
+                        let mut tree = String::new();
+                        write(it, &mut tree);
+                        tree
+                    })
+                    .collect();
+                written_trees.sort_unstable();
+                written.push('{');
+                written.push_str(&written_trees.join(","));
+                written.push('}');
+                at = end;
+            }
+        }
+        let mut written = String::new();
+        write(tokens, &mut written);
+        written
+    }
+
+    /// What the text says, its imports one after the other in an order of their own but in
+    /// what a macro is handed, which can tell.
+    fn said(&self) -> Vec<Said<'a>> {
+        let mut said = Vec::with_capacity(self.0.len());
+        // Whether each delimiter open is of what a macro is handed.
+        let mut handed: Vec<bool> = Vec::new();
+        let mut at = 0;
+        while at < self.0.len() {
+            if !handed.last().copied().unwrap_or(false)
+                && let Some(end) = self.import_at(at)
+            {
+                let mut uses = vec![self.import_written(&self.0[at..end])];
+                let mut next = end;
+                while let Some(end) = self.import_at(next) {
+                    uses.push(self.import_written(&self.0[next..end]));
+                    next = end;
                 }
                 uses.sort_unstable();
                 said.push(Said::Uses(uses));
+                at = next;
+                continue;
             }
-            syntax::NodeOrToken::Node(node) => said_in(&node, said),
-        }
-    }
-}
-
-/// An import, or a tree of one, the same in every order of the trees in its lists.
-fn use_written(node: &SyntaxNode) -> String {
-    let mut written = String::new();
-    write_use(node, &mut written);
-    written
-}
-
-fn write_use(node: &SyntaxNode, written: &mut String) {
-    if node.kind() == SyntaxKind::USE_TREE_LIST {
-        let mut trees: Vec<String> = (node.children())
-            .filter(|it| it.kind() == SyntaxKind::USE_TREE)
-            .map(|it| use_written(&it))
-            .collect();
-        trees.sort_unstable();
-        written.push('{');
-        written.push_str(&trees.join(","));
-        written.push('}');
-        return;
-    }
-    for child in node.children_with_tokens() {
-        match child {
-            syntax::NodeOrToken::Token(token) if says(&token) => {
-                written.push_str(token.text());
-                written.push(' ');
+            let token = self.0[at];
+            match token.0 {
+                T!['('] | T!['['] | T!['{'] => {
+                    let before = |back: usize| at.checked_sub(back).map(|it| self.0[it].0);
+                    let macro_input = before(1) == Some(T![!])
+                        || before(2) == Some(T![!]) && before(1) == Some(SyntaxKind::IDENT)
+                        || before(1) == Some(T![#])
+                        || before(1) == Some(T![!]) && before(2) == Some(T![#]);
+                    let within = handed.last().copied().unwrap_or(false);
+                    handed.push(within || macro_input);
+                }
+                T![')'] | T![']'] | T!['}'] => _ = handed.pop(),
+                _ => {}
             }
-            syntax::NodeOrToken::Token(_) => {}
-            syntax::NodeOrToken::Node(node) => write_use(&node, written),
+            said.push(Said::Token(token));
+            at += 1;
         }
-    }
-}
-
-/// Whether a token says something: neither blank space nor a comment but a doc comment.
-fn says(token: &syntax::SyntaxToken) -> bool {
-    match token.kind() {
-        SyntaxKind::WHITESPACE => false,
-        SyntaxKind::COMMENT => is_doc(token.text()),
-        _ => true,
+        said
     }
 }
 
@@ -1556,11 +1636,6 @@ fn spaced(kind: SyntaxKind) -> bool {
 /// Whether punctuation followed by `next` is joined to it.
 fn joins(next: SyntaxKind) -> bool {
     spaced(next) || next == SyntaxKind::LIFETIME_IDENT
-}
-
-/// Whether a comment is a doc comment, or could be: `////` and `/***` are not.
-fn is_doc(text: &str) -> bool {
-    ["///", "//!", "/**", "/*!"].iter().any(|it| text.starts_with(it))
 }
 
 #[cfg(test)]
@@ -1587,6 +1662,19 @@ mod tests {
         assert!(!same("use a;\nfn f() {}\nuse b;", "use b;\nfn f() {}\nuse a;"));
         assert!(!same("use a::{b, c};", "use a::{b, d};"));
         assert!(!same("use a::b;", "use a::b as c;"));
+        assert!(same("#[cfg(x)] use a;\nuse b;", "use b;\n#[cfg(x)] use a;"));
+        assert!(same("/// a\nuse a;\nuse b;", "use b;\n/// a\nuse a;"));
+        assert!(same("pub(crate) use a;\nuse b;", "use b;\npub(crate) use a;"));
+        assert!(same("mod m { use c; use d; }", "mod m {\n    use d;\n    use c;\n}"));
+        assert!(same(
+            "#[cfg(x)]\n/// a\npub(crate) use a;\nuse b;\nmod m { use c; use d; }",
+            "use b;\n#[cfg(x)]\n/// a\npub(crate) use a;\nmod m {\n    use d;\n    use c;\n}"
+        ));
+        assert!(!same("m! { use a; use b; }", "m! { use b; use a; }"));
+        assert!(!same("macro_rules! m { () => { use a; use b; } }", "macro_rules! m { () => { use b; use a; } }"));
+        assert!(!same("#[a(use b; use c;)] fn f() {}", "#[a(use c; use b;)] fn f() {}"));
+        assert!(!same("fn f() -> impl Sized + use<'a, T> {}", "fn f() -> impl Sized + use<T, 'a> {}"));
+        assert!(!same("use a; #[x] use b;", "#[x] use a; use b;"));
     }
 
     fn hash(text: &str) -> u64 {

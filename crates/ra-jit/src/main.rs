@@ -5674,8 +5674,8 @@ fn respaced(db: &RootDatabase, texts: &[(vfs::FileId, String)]) -> Vec<vfs::File
         }
         let crates = ide_db::base_db::relevant_crates(db, *file);
         let edition = crates.first().map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
-        let was = ide_db::base_db::EditionedFileId::new(db, *file, edition).parse(db);
-        outline::respaced_from(edition, &was, text).then_some(*file)
+        let was = db.file_text(*file).text(db);
+        outline::respaced(edition, was, text).then_some(*file)
     };
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(texts.len());
     if threads <= 1 {

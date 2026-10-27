@@ -5,7 +5,8 @@ For each commit, a checkout of its parent (no `.git`, as leanprof.py copies one)
 `cargo ra-jit build` and left until the daemon has built its own base and made its items
 (`items_s` in the JSON, the seconds that took after the base); then the commit's files
 are written into it (removed files removed) and `cargo ra-jit build` is timed, then the parent's
-are written back and it is timed again, `--rounds` times (default 2). The project's build
+are written back and it is timed again, then once more with nothing written (`noop`, what any
+build costs), `--rounds` times (default 2). The project's build
 arguments and environment are bench.py's; REPO is a full clone with the commits. Prints a line
 per commit and writes them as JSON to WORK/commits.json, with the lines of what the daemon said
 of each edit that tell how it took it (all it said is in WORK/<commit>/said-*.log). A commit's
@@ -114,11 +115,12 @@ def one(name, spec, repo, commit, work, rounds, extra_env, keep):
         walls, said = [], []
         row["base_said"] = [line[:200] for line in daemon.said().splitlines() if SAID.match(line)][-20:]
         for n in range(rounds):
-            for label, files in (("commit", after), ("back", before)):
-                write(ws, files)
+            for label, files in (("commit", after), ("back", before), ("noop", None)):
+                if files is not None:
+                    write(ws, files)
                 took, ran = ours.cargo("build", *build)
                 walls.append((label, round(took, 3), ran.returncode, bench.how_built(ran.stderr)[:60]))
-                text = daemon.said(1)
+                text = daemon.said(0 if files is None else 1)
                 with open(os.path.join(root, f"said-{n}-{label}.log"), "w") as f:
                     f.write(text)
                 said.append([line[:200] for line in text.splitlines() if SAID.match(line)][:40])

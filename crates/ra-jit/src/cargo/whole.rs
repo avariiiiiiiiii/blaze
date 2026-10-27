@@ -748,15 +748,17 @@ fn planned(
         out.push(triple);
     }
     out.push(profile);
-    // Cargo's tests are in its build directory (`build.build-dir`), in the layout of it that
-    // cargo has: a test that finds a program from where it is itself finds what it finds there.
+    // A test is in the `deps` of cargo's build directory (`build.build-dir`), where stable
+    // cargo puts it, also where nightly's second layout would put it in its unit's directory:
+    // a test that finds its package's programs from its own path (`current_exe()`'s
+    // grandparent, the `executable-path` crate, assert_cmd's `cargo_bin`) finds them only
+    // from `deps`.
     let build_dir = metadata.build_directory.as_ref().map_or(target, |it| it.as_std_path());
     let mut built = build_dir.to_owned();
     if let Some(triple) = &selection.target {
         built.push(triple);
     }
     built.push(profile);
-    let second = second_layout(&asked.flags.config);
     let mut programs = Vec::new();
     for program in planned {
         let Some(package) = metadata.packages.iter().find(|it| it.id.repr == program.package)
@@ -785,14 +787,7 @@ fn planned(
             // what tells its tests apart.
             (_, true) => {
                 let hash = test_hash(&package.id.repr, &kind, &program.name, &built);
-                let name = exe(&format!("{}-{hash}", program.name));
-                match second {
-                    true => {
-                        let unit = built.join("build").join(package.name.as_str()).join(&hash);
-                        unit.join("out").join(name)
-                    }
-                    false => built.join("deps").join(name),
-                }
+                built.join("deps").join(exe(&format!("{}-{hash}", program.name)))
             }
         };
         // A test's directory has the file that says it starts in the harness, and a build of
@@ -817,16 +812,6 @@ fn planned(
         });
     }
     Ok(programs)
-}
-
-/// Whether cargo lays its build directory out in its second layout ([`super::layout`]): the
-/// nightly blaze pins does, unless `unstable.build-dir-new-layout` (or
-/// `CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT`) is false. `config` is cargo's `--config` arguments.
-fn second_layout(config: &[String]) -> bool {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let config = blaze_manifest::Config::load(&cwd, std::env::vars(), config);
-    let set = config.and_then(|it| it.get::<Option<bool>>("unstable.build-dir-new-layout"));
-    set.map_or(true, |it| it != Some(false))
 }
 
 /// Sixteen hexadecimal digits, as cargo names a unit by, of the test `name` of `kind` in

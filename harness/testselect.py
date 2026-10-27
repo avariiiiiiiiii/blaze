@@ -18,7 +18,10 @@ names: those whose code or what it calls changed, those added or given other att
 one that reads a file every time, the one that failed until it passes (and not the others that
 ran and passed beside it; once fixed back to code that passed, it is not run again), one added
 to a program with an `ignore` with a list, one added to a library with a bench (in a package of
-its own, built with RUSTC_BOOTSTRAP=1), and with `RA_JIT_TESTS=all` every test. A test that ran has to end as its source says. With `-v` the
+its own, built with RUSTC_BOOTSTRAP=1), and with `RA_JIT_TESTS=all` every test. A test that ran has to end as its source says.
+A package's unit and integration tests find its program from their own path, as fd's do: they are
+in the profile's `deps` (of the debug and release profiles, and of a `--target`), the program is
+in the profile's directory, and that is `CARGO_BIN_EXE_<name>`. With `-v` the
 output says why the one that reads a file runs, by the calls from it to the file system, and
 how many tests run every time.
 
@@ -374,6 +377,57 @@ def benched(root, env):
     return "ok"
 
 
+# A test finds its package's program from its own path, as fd's and ripgrep's do: it is in the
+# profile's `deps`, the program in the profile's directory, and that is `CARGO_BIN_EXE_<name>`.
+BESIDE_CHECK = """
+fn beside() -> (std::path::PathBuf, std::path::PathBuf) {
+    let exe = std::env::current_exe().unwrap();
+    let deps = exe.parent().unwrap();
+    assert_eq!(deps.file_name().unwrap(), "deps", "{}", exe.display());
+    let program = deps.parent().unwrap().join(format!("beside{}", std::env::consts::EXE_SUFFIX));
+    assert!(program.is_file(), "{}", program.display());
+    (exe, program)
+}
+"""
+BESIDE = {
+    "Cargo.toml": '[package]\nname = "beside"\nversion = "0.1.0"\nedition = "2021"\n',
+    "src/main.rs": "fn main() {\n    println!(\"beside\");\n}\n\n#[cfg(test)]\nmod tests {\n" + BESIDE_CHECK
+                   + "\n#[test]\nfn in_deps() {\n    beside();\n}\n}\n",
+    "tests/it.rs": BESIDE_CHECK + """
+#[test]
+fn finds_the_program() {
+    let (_, program) = beside();
+    assert_eq!(std::path::Path::new(env!("CARGO_BIN_EXE_beside")), program);
+    let ran = std::process::Command::new(&program).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "beside\\n");
+}
+""",
+}
+
+
+def beside(root, env):
+    """Tests in `deps` beside the program, in the debug and release profiles and of a target named."""
+    ws = os.path.join(root, "beside")
+    for path, text in BESIDE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        open(os.path.join(ws, path), "w").write(text)
+    host = re.search(r"^host: (\S+)", subprocess.run(["rustc", "-vV"], env=env, capture_output=True, text=True).stdout, re.M)[1]
+    try:
+        for args in ("", "--release", f"--target {host}"):
+            deadline = time.monotonic() + 300
+            while "[blaze]" not in (said := test(ws, env, f"all {args}"))[1]:
+                if time.monotonic() > deadline:
+                    return f"`{args}`: NEVER SERVED BY THE DAEMON"
+                time.sleep(0.5)
+            code, said = said
+            ran = {name for name, end in RAN.findall(said) if end == "ok"}
+            if ran != {"tests::in_deps", "finds_the_program"} or code != 0:
+                return f"`{args}`: ENDED {code} HAVING PASSED {', '.join(sorted(ran)) or 'nothing'}"
+    finally:
+        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+    return "ok"
+
+
 def test(ws, env, mode):
     """`mode` is RA_JIT_TESTS's value, then `cargo ra-jit test`'s arguments and NAME=VALUE for the
     environment. `remote` pushes the store to a directory, pulls that into an empty store and
@@ -473,10 +527,13 @@ def main():
         verdict = benched(root, env)
         wrong += verdict != "ok"
         print(f"{'a test added beside a bench':34} {verdict}", flush=True)
+        verdict = beside(root, env)
+        wrong += verdict != "ok"
+        print(f"{'a test finds its program from deps':34} {verdict}", flush=True)
     finally:
         subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         shutil.rmtree(OUTSIDE, ignore_errors=True)
-    print(f"{len(STEPS) + 1 - wrong} of {len(STEPS) + 1} right; under {root}, the daemon's home {home}")
+    print(f"{len(STEPS) + 2 - wrong} of {len(STEPS) + 2} right; under {root}, the daemon's home {home}")
     if wrong:
         sys.exit(1)
     shutil.rmtree(root, ignore_errors=True)

@@ -114,8 +114,10 @@ What is specific to the port:
   running cleanup; that is inferred from the code and not tested. A Rust panic is a C++
   exception on MSVC and is handled.
 - The splice (`splice/pe.rs`) adds sections behind the linker's last. `splices.py` is 71 of
-  71 with 60 spliced, 10 full links and 1 step with nothing edited, and fails on Windows if the
-  count is not 60. COFF
+  71 with 57 spliced, 13 full links and 1 step with nothing edited, and fails on Windows if the
+  count is not 57 (train run 40494685771, both backends). Five of the full links are the steps
+  after a thread-local's first value is edited, which then carry its own copy
+  ([live.md](live.md#statics)); Linux and macOS link those five in full too. COFF
   has no symbol sizes, so each named static gets a section of its own, and a static that
   grows is not spliced. Thread-local data in a patch declines the splice. Executables with
   Control Flow Guard, a signature, or no PDB always take the full link (inferred from the

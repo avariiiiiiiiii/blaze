@@ -67,8 +67,8 @@ lays out, mangles and passes values as the pinned nightly does.
    AArch64, where a branch reaches only 128 MB. Not every edit can be spliced: about 60 of
    the 71 steps are, and the rest link in full by design (an executable somebody else
    wrote, a static that grew, a running executable, and similar).
-4. [platforms.md](platforms.md), Windows: 71 of 71 with 60 spliced, 10 full links and
-   1 step with nothing edited, and the harness fails on Windows if the count is not 60.
+4. [platforms.md](platforms.md), Windows: 71 of 71 with 57 spliced, 13 full links and
+   1 step with nothing edited, and the harness fails on Windows if the count is not 57.
 5. [platforms.md](platforms.md), macOS: `splices.py` 71 of 71. The daemon links with
    `-no_fixup_chains`, so a deployment target of 12 or later splices as 11.0 does
    (`headerpad.py` builds for 14.0); an executable linked with chained fixups by a line of

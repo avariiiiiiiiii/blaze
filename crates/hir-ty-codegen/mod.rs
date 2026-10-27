@@ -14951,18 +14951,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 // factors the other way round, which decides which of two NaNs comes out; a
                 // vector of one lane is the scalar's `fmadd`, in order.
                 let swapped = self.cg.target.arch == Arch::Aarch64 && count > 1;
+                // Wasm has no fused multiply-add: LLVM calls libm's for each lane, and multiplies
+                // then adds where rounding twice is allowed.
+                let wasm = self.cg.target.is_wasm();
+                let libm = if lane.ty == types::F32 { "fmaf" } else { "fma" };
                 let lanes: Vec<Value> = (0..count)
                     .map(|i| {
                         let offset = (i * lane.ty.bytes() as u64) as i32;
                         let [x, y, z] =
                             [a, b, c].map(|v| self.builder.ins().load(lane.ty, MEM, v, offset));
-                        if swapped {
+                        Ok(if wasm && name == "simd_fma" {
+                            self.float_libcall(libm, lane.ty, &[x, y, z])?
+                        } else if wasm {
+                            let product = self.builder.ins().fmul(x, y);
+                            self.builder.ins().fadd(product, z)
+                        } else if swapped {
                             self.builder.ins().fma(y, x, z)
                         } else {
                             self.builder.ins().fma(x, y, z)
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 for (i, value) in lanes.into_iter().enumerate() {
                     self.builder.ins().store(MEM, value, dst, i as i32 * lane.ty.bytes() as i32);
                 }

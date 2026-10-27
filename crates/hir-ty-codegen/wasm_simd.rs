@@ -316,6 +316,39 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
                 Ok(true)
             }
+            ("simd_relaxed_fma", [a, b, c]) => {
+                let Some(lanes) = self.simd_shape(dst_ty)? else { return Ok(false) };
+                let Some(chunks) = lanes.chunks() else { return Ok(false) };
+                if !lanes.lane.ty.is_float() {
+                    return Ok(false);
+                }
+                // As LLVM has it: wasm has no fused multiply-add but `relaxed_madd`, which may
+                // round once or twice.
+                let madd = self.wasm_feature("relaxed-simd").then_some(if lanes.lane.ty == types::F32 {
+                    Instruction::F32x4RelaxedMadd
+                } else {
+                    Instruction::F64x2RelaxedMadd
+                });
+                let (a, _) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                let (c, _) = self.operand(c)?;
+                let vector = lanes.vector();
+                for chunk in 0..chunks {
+                    let at = chunk * 16;
+                    let [x, y, z] = [a, b, c].map(|it| self.builder.ins().load(vector, MEM, it, at));
+                    let value = match madd {
+                        Some(madd) => self
+                            .wasm_instruction(madd, &[x, y, z], Some(vector))
+                            .expect("`relaxed_madd` leaves a value"),
+                        None => {
+                            let product = self.builder.ins().fmul(x, y);
+                            self.builder.ins().fadd(product, z)
+                        }
+                    };
+                    self.builder.ins().store(MEM, value, dst, at);
+                }
+                Ok(true)
+            }
             ("simd_splat", [arg]) => {
                 let Some(lanes) = self.simd_shape(dst_ty)? else { return Ok(false) };
                 let Some(chunks) = lanes.chunks() else { return Ok(false) };

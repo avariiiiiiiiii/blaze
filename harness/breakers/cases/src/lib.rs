@@ -194,4 +194,5 @@ cases![
     trait_method_of_closure,
     const_float_min_max,
     guard_nested_guard,
+    self_projection_enum_pat,
 ];

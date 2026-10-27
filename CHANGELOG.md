@@ -1009,6 +1009,9 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- `Self::Variant` in a pattern of an `impl` whose `Self` type is an alias or projection to an
+  enum (`impl Deserialize<E, D> for <E as Archive>::Archived`, as `#[derive(rkyv::Deserialize)]`
+  writes) resolves the variant instead of failing MIR lowering with `unresolved variant`.
 - A red train opens or comments on the "Release train is red" issue again: train_issue.py read
   each harness job's log with `gh api`, which the runner's gh refuses without
   `--allow-escape-sequences`, so the `train issue` job failed and no issue was opened.

@@ -33,6 +33,38 @@ each, again-after-cold 3 each, edit and steady again 9 each).
 | wasm (all of this branch) | 46.08 (44.83, 47.25, 46.08) | 5.34 | 4.05 | 1.89 |
 | native | 45.17 (45.17, 42.58, 46.16) | 13.38 | 3.99 | 2.02 |
 
+The same after the branch was rebased on main (63aaa237db), two rounds; edit and steady again
+are medians of 6:
+
+| arm | cold | again | edit | again |
+|---|---|---|---|---|
+| wasm | 44.28, 46.67 | 4.15, 4.56 | 3.4 | 1.23 |
+| native | 42.63, 45.73 | 15.43, 15.95 | 3.5 | 1.24 |
+
+## Expansions, wasm against native, byte for byte
+
+`ra-jit proc-macro-wasm <module> --macro M --input F --runs 20 --native <lib>.so --server
+blaze-proc-macro-srv`, the module and the library both blaze's builds of the crate from the
+corpus's cold runs, no `.cwasm` and no store: milliseconds. Every output was the same text.
+
+| macro | wasm compile | wasm first | wasm warm | native start | native first | native warm |
+|---|---|---|---|---|---|---|
+| serde Serialize | 792 | 1.31 | 1.04 | 15.9 | 3.66 | 1.98 |
+| serde Deserialize | 656 | 4.29 | 3.98 | 1.7 | 10.03 | 8.19 |
+| clap Parser | 894 | 4.21 | 3.86 | 16.4 | 9.92 | 8.09 |
+| thiserror Error | 592 | 1.21 | 0.81 | 15.2 | 3.32 | 1.62 |
+| async_trait | 622 | 1.06 | 0.78 | 16.9 | 2.99 | 1.29 |
+| pin_project | 477 | 0.27 | 0.14 | 13.3 | 2.21 | 0.67 |
+| derive_more Display | 690 | 0.85 | 0.62 | 24.6 | 2.86 | 1.12 |
+| strum EnumString | 597 | 0.89 | 0.69 | 15.3 | 3.56 | 1.66 |
+| tokio main | 523 | 0.55 | 0.37 | 13.9 | 2.75 | 1.12 |
+
+One compile of serde_derive's module is 0.9 s of wall time and 5.5 s of CPU (`time`): the 8
+modules of a cold build take about 44 CPU seconds from its own units, which is the cold gap.
+`RA_JIT_WASM_OPT=none` (an experiment's `cranelift_opt_level(OptLevel::None)`) compiled and
+expanded within noise of `Speed`; compiling on a rayon pool of `nice 10` threads gave cold 44.54
+and 47.08 against native's 42.48 and 44.77, no better.
+
 ## Where the cold wasm build's time went, base
 
 - Cargo's step: 6.7 s, the same in both arms.

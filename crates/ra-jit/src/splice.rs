@@ -7,7 +7,8 @@
 //! code over the entry of each function the patch replaces. Whatever referred to the old
 //! function, a call, a vtable or a function pointer, still arrives there and goes on to the
 //! new one. Data has no entry to jump from, so a static with another value is written where
-//! the old one is, when it is no larger.
+//! the old one is. The patch names one that no longer fits there as a static new since the
+//! base, and holds everything that refers to it.
 //!
 //! What is appended, in four segments of its own:
 //!
@@ -54,7 +55,7 @@ use object::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(crate) use self::lasting::Lasting;
-use self::lasting::{Own, is_lasting};
+use self::lasting::{Own, is_lasting, left_behind};
 
 mod debug;
 mod lasting;
@@ -534,12 +535,7 @@ impl Baseline {
                 ensure!(image.machine == Machine::X86_64, "live edits support Linux x86-64 only");
                 let uuid = image.id.context("the executable has no GNU build ID")?;
                 let mut patch = Patch::read(patch, image, false)?;
-                ensure!(
-                    self.baked
-                        .iter()
-                        .all(|it| patch.replaced.iter().any(|replaced| replaced.name == &**it)),
-                    "a function the executable was linked with a patch of is as it first was"
-                );
+                self.has_baked(patch.replaced.iter().map(|it| it.name))?;
                 lasting.place(&patch.lasting_own()?)?;
                 patch.keep_lasting(|name| lasting.address(name))?;
                 let (code, moved) =
@@ -611,11 +607,7 @@ impl Baseline {
 
     /// The splice of a wasm module, which is written anew from the linker's each time.
     fn rewrite(&self, module: &wasm::Module, patch: &[u8]) -> anyhow::Result<(Vec<u8>, Spliced)> {
-        let defined: FxHashSet<Box<[u8]>> = wasm::defined(patch)?.into_iter().collect();
-        ensure!(
-            self.baked.iter().all(|it| defined.contains(it)),
-            "a function the executable was linked with a patch of is as it first was"
-        );
+        self.has_baked(wasm::defined(patch)?.iter().map(|it| &**it))?;
         ensure!(
             Stamp::of(&File::open(&self.path)?)? == self.stamp,
             "the executable was written by someone else"
@@ -625,15 +617,9 @@ impl Baseline {
 }
 
 impl Baseline {
-    /// Whether a patch that defines `defined` has every function of the patch the
-    /// executable was linked with.
-    fn has_baked<'a>(&self, defined: impl Iterator<Item = &'a [u8]>) -> anyhow::Result<()> {
-        let defined: FxHashSet<&[u8]> = defined.collect();
-        ensure!(
-            self.baked.iter().all(|it| defined.contains(&**it)),
-            "a function the executable was linked with a patch of is as it first was"
-        );
-        Ok(())
+    /// [`has_baked`] of the patch the executable was linked with.
+    fn has_baked<'a>(&self, defined: impl IntoIterator<Item = &'a [u8]>) -> anyhow::Result<()> {
+        has_baked(&self.baked, defined)
     }
 }
 
@@ -705,6 +691,28 @@ fn names_spliced(path: &Path, before: Option<(u64, u64)>) {
     {
         _ = (path, before);
     }
+}
+
+/// Whether a patch that defines `defined` has each of `baked`, what the patch the executable
+/// was linked with defined: one it lacks would be as it first was, which the executable no
+/// longer has. A static the patch left behind ([`lasting::left_behind`]) is not one: nothing
+/// refers to the executable's copy any more.
+pub(super) fn has_baked<'a>(
+    baked: &[Box<[u8]>],
+    defined: impl IntoIterator<Item = &'a [u8]>,
+) -> anyhow::Result<()> {
+    let defined: FxHashSet<&[u8]> = defined.into_iter().collect();
+    let left: FxHashSet<Vec<u8>> = defined.iter().filter_map(|it| left_behind(it)).collect();
+    let lacked = baked.iter().find(|it| {
+        !defined.contains(&***it) && !left.contains(&***it) && left_behind(it).is_none()
+    });
+    if let Some(lacked) = lacked {
+        bail!(
+            "{}, of the patch the executable was linked with, is as it first was",
+            String::from_utf8_lossy(lacked)
+        );
+    }
+    Ok(())
 }
 
 /// The `-headerpad` to link the executable at `path` with again for an edit to be spliced into
@@ -2177,6 +2185,9 @@ impl<'a> Patch<'a> {
                 None => None,
                 // The executable's is the same static with the same value: it is kept.
                 Some(_) if is_lasting(name) => None,
+                // One that says what a patch left behind is of that patch, which the executable
+                // was linked with, and says nothing of this one's.
+                Some(_) if left_behind(name).is_some() => None,
                 Some(Named::One(old))
                     if whole
                         && old.kind == SymbolKind::Text
@@ -2952,7 +2963,25 @@ fn binary_id(build_id: &[u8]) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Field, Machine, Writing};
+    use super::{Field, Machine, Writing, has_baked};
+
+    /// A patch has to define all the executable was linked with a patch of, but for a static
+    /// it left behind, under ELF's names and Mach-O's; what said so before is not looked for.
+    #[test]
+    fn a_static_left_behind_is_not_as_it_first_was() {
+        let names = |all: &[&str]| -> Vec<Box<[u8]>> {
+            all.iter().map(|it| it.as_bytes().into()).collect()
+        };
+        let moved = format!("{}ra_jit::static::7", hir_ty_codegen::MOVED_STATIC);
+        let baked = names(&["f", "ra_jit::static::7"]);
+        assert!(has_baked(&baked, [&b"f"[..], moved.as_bytes()]).is_ok());
+        assert!(has_baked(&baked, [&b"f"[..]]).is_err());
+        assert!(has_baked(&baked, [&b"ra_jit::static::7"[..]]).is_err());
+        let baked = names(&["_f", "_ra_jit::static::7"]);
+        assert!(has_baked(&baked, [&b"_f"[..], format!("_{moved}").as_bytes()]).is_ok());
+        assert!(has_baked(&baked, [&b"_f"[..], moved.as_bytes()]).is_err());
+        assert!(has_baked(&names(&["f", &moved]), [&b"f"[..]]).is_ok());
+    }
 
     /// What was read of the names stays across a splice that writes a new file, as on macOS,
     /// and not across a link: the splice after a link starts from the file the link wrote.

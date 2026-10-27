@@ -181,7 +181,10 @@ appends the patch: it lays the patch out behind everything the linker loaded, re
 references against the executable's symbols, and writes a jump to the new code over the
 entry of each replaced function. Calls, vtables and function pointers still arrive at the
 old entry and continue to the new code. A static with a new value is written in place when
-it is no larger. Each splice starts from the executable as the linker left it, so splices
+it fits there. One that outgrew its place (larger, or aligned to more) is a static of the
+patch's own, and the patch has everything of the program that refers to it compiled again
+to refer to that (`patch::Base::moved`, [#168](https://github.com/indexable-inc/blaze/issues/168)).
+Each splice starts from the executable as the linker left it, so splices
 do not accumulate; a program built in full onto what rustc linked is spliced into that
 executable whole, and the patches after it start from what that left (see "The first edits
 patch what rustc linked"). Anything the splice has no answer for is an error and the daemon links in
@@ -365,7 +368,7 @@ nothing in the store: it names rustc's private symbols, which no other link has.
 on Linux keeps the compiler-builtins functions ra-jit's code calls (`--undefined`,
 `hir_ty_codegen::BUILTINS`), which it would otherwise drop as unused. A splice that fails, of
 the whole or of a patch after it (a library function the executable does not import, a
-static that grows), has the daemon start again from what cargo builds and link, as when the
+static of the whole that grows), has the daemon start again from what cargo builds and link, as when the
 first edits' splice fails: that is what splicing can't do, and an own base links it too. Only ELF is spliced whole; on macOS
 such an edit still links in full, and the link takes the room for splices that the executable
 there wanted (`headerpad_ahead`), so it is not linked twice.

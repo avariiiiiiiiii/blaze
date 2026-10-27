@@ -21,8 +21,7 @@ otherwise.
   everything it uses into a WASI reactor that exports `blaze_proc_macro_list` and
   `blaze_proc_macro_expand`. No rustc-built code is in it.
 - The host (`src/lib.rs`, `src/wasi.rs`) compiles the module with Cranelift where blaze builds
-  it (`cargo/compile_time.rs`, `cargo/own_macro.rs`), on threads of lower priority than the
-  build's, and with no unit waiting: the module carries its list of macros in a custom section
+  it (`cargo/compile_time.rs`, `cargo/own_macro.rs`), with no unit waiting: the module carries its list of macros in a custom section
   (`blaze_proc_macros`), written to the `.macros` file beside it at once, stamped with the
   module's and its `.made-of`'s length, mtime and inode, so that a load reads no module. The
   first expansion of its macros waits for the compile. The machine code is kept beside the

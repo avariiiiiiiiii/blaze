@@ -61,3 +61,10 @@ Shared brief: /tmp/blaze-lanes/nocargo-sub-common.md. Each has worktree
   (depends on unitgraph to land the switch).
 Parent: wait for them, re-trace after merges (r2), update docs/no-rustc.md, write
 /tmp/blaze-lanes/nocargo.result.md. Parent VM `nocargo` still up for re-traces.
+
+## Restart 2026-10-27 02:20 (watchdog)
+Previous run died with its 4 sub-agents. Their worktrees had uncommitted WIP (sysroot: hook + harness
+written, not yet built/run; toolq: 8 files; unitgraph: new crates/blaze-units started (schema.rs);
+ctdeps: plan.rs started) and their VMs nc-{sysroot,toolq,unitgraph,ctdeps} still RUNNING. No PRs yet.
+Re-spawned one agent per sub-lane at ~02:25 to resume from its worktree WIP + VM (each writes its
+own HANDOFF.md and commits WIP often).

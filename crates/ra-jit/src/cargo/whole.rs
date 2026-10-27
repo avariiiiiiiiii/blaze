@@ -118,11 +118,15 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if programs.is_empty() {
         return super::check(asked);
     }
-    compiling(asked, &programs);
+    let mut said = Vec::new();
+    compiling(asked, programs.iter().filter(|it| !it.executable.exists()), &mut said);
     let checkout = checkout(asked, &cwd, &metadata, &programs, false, BTreeMap::new());
-    if let Err(why) = whole(&cwd, &checkout, &programs) {
-        why.say();
-        return Ok(FAILED);
+    match whole(&cwd, &checkout, &programs) {
+        Ok(rebuilt) => compiling(asked, rebuilt.into_iter().map(|at| &programs[at]), &mut said),
+        Err(why) => {
+            why.say();
+            return Ok(FAILED);
+        }
     }
     finished(asked, asked.profile(), started);
     if let Some(failed) = super::remote_failed_it() {
@@ -166,7 +170,8 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
         say::error(&format!("blaze does not build the unit tests of `{}` {why}", it.name));
         return Ok(FAILED);
     }
-    compiling(asked, &programs);
+    let mut said = Vec::new();
+    compiling(asked, programs.iter().filter(|it| !it.executable.exists()), &mut said);
     // What an integration test's `env!` reads to run a binary of its package, and the scratch
     // directory cargo makes for the integration tests and benchmarks, `target/tmp`. The whole
     // build gives one environment to all its crates, so a program sees it too, where cargo's
@@ -257,9 +262,12 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
                 false => _ = std::fs::remove_file(&tests),
             }
         }
-        if let Err(why) = whole(&cwd, checkout, programs) {
-            why.say();
-            return Ok(FAILED);
+        match whole(&cwd, checkout, programs) {
+            Ok(rebuilt) => compiling(asked, rebuilt.into_iter().map(|at| &programs[at]), &mut said),
+            Err(why) => {
+                why.say();
+                return Ok(FAILED);
+            }
         }
     }
     finished(asked, profile, started);
@@ -360,15 +368,20 @@ fn state_kind(kind: Kind) -> super::state::Kind {
     }
 }
 
-/// Says that each package of `programs` is compiled, once.
-fn compiling(asked: &Invocation, programs: &[Program]) {
-    let mut said = Vec::new();
+/// Says that each package of `programs` is compiled, once in a command: as cargo, of what is
+/// built and not of what was up to date. A program not built before is said before the build,
+/// which may be long; one the daemon rebuilt, after it answers.
+fn compiling<'a>(
+    asked: &Invocation,
+    programs: impl Iterator<Item = &'a Program>,
+    said: &mut Vec<cargo_metadata::PackageId>,
+) {
     for program in programs {
         let package = &program.package;
-        if said.contains(&&package.id) {
+        if said.contains(&package.id) {
             continue;
         }
-        said.push(&package.id);
+        said.push(package.id.clone());
         let at = super::state::package_dir(package);
         say::status(
             asked.flags.quiet,
@@ -419,13 +432,14 @@ fn turned_down(program: &Program, said: &crate::errors::Said) -> String {
         (Kind::Example, _) => format!("example \"{name}\""),
         (Kind::Test, _) => format!("test \"{name}\""),
     };
-    super::state::turned_down(said, &program.package.name.to_string(), &target)
+    super::state::turned_down(said, &program.package.name, &target)
 }
 
 /// Has the daemon build the `programs` of `checkout` whole, and puts each where cargo would.
 /// A worker of the daemon loads the workspace and links each program before it answers, and
-/// builds them again on what it has loaded when asked next. `Err` says why not.
-fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), Unbuilt> {
+/// builds them again on what it has loaded when asked next. `Ok` names the programs, by
+/// index, the daemon built rather than found up to date; `Err` says why not.
+fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<Vec<usize>, Unbuilt> {
     let reply = client::ask(Request::Build(super::asking(checkout)), Start::IfMissing)
         .map_err(|it| format!("{it:#}"))?;
     let built = match reply {
@@ -434,9 +448,12 @@ fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), Un
         None => return Err(client::why_none().into()),
         Some(other) => return Err(format!("the daemon answered {other:?}").into()),
     };
-    for ((program, plan), built) in std::iter::zip(programs, &checkout.programs).zip(built) {
+    let mut rebuilt = Vec::new();
+    let pairs = std::iter::zip(programs, &checkout.programs).zip(built).enumerate();
+    for (at, ((program, plan), built)) in pairs {
         match built {
-            Ok(_) => {}
+            Ok(said) if said == "ok unchanged" => {}
+            Ok(_) => rebuilt.push(at),
             Err(NotBuilt::Error(said)) => return Err(Unbuilt::Said(turned_down(program, &said))),
             Err(why) => {
                 return Err(format!("could not build `{}`: {}", program.name, why.why()).into());
@@ -469,7 +486,7 @@ fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), Un
         place(&plan.binary, &program.executable)
             .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
     }
-    Ok(())
+    Ok(rebuilt)
 }
 
 /// The daemon's checkout of a whole build of `programs`, each linked in its `dir`, by a
@@ -612,9 +629,9 @@ fn not_loaded(cwd: &Path, checkout: &Checkout, reason: &str) -> String {
             refused.join("\n  ")
         );
     }
-    let last = said.lines().rev().find(|it| it.starts_with("Error"));
-    let last = last.map_or(reason, |it| it.strip_prefix("Error: ").unwrap_or(it));
-    format!("could not build {named}: {last} (what blaze said is in {shown})")
+    let last = super::daemon::last_error(&said);
+    let last = last.as_deref().unwrap_or(reason).replace('\n', "\n  ");
+    format!("could not build {named}: {last}\n(what blaze said is in {shown})")
 }
 
 /// The log of the daemon's worker for the package in `project`.

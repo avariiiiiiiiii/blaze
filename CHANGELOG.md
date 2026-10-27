@@ -1016,12 +1016,6 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
-- `cargo blaze test --doc` runs an edited library's examples again: it took an example's
-  program from the run before while the example's own text was unchanged, since blaze's run
-  names no library with `--extern` for the key to stamp, so after an edit that broke them the
-  doc tests passed where cargo's failed. The key now has the cfgs of every crate the library is
-  built from and the files of those of the workspace. `cargo blaze test --doc -q` shows the
-  results tersely, as cargo's `-q` has libtest do (`harness/cargo_ra_jit.py`, flags group).
 - The daemon's own link passes the linker what `-C link-arg` and `-C link-args` say in
   `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or the configuration's `rustflags`, after the native
   libraries as rustc does; it left them out. A program linked with
@@ -1035,6 +1029,12 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   code that a build over ra-jit's prebuilt unit of the library kept: such an entry's calls
   into the unit (`ra-jit.<hash>.…` symbols) are now checked when it is taken, where its link
   failed on them as undefined (#328). Entries written before are not read (entry format 12).
+- `cargo blaze test --doc` runs an edited library's examples again: it took an example's
+  program from the run before while the example's own text was unchanged, since blaze's run
+  names no library with `--extern` for the key to stamp, so after an edit that broke them the
+  doc tests passed where cargo's failed. The key now has the cfgs of every crate the library is
+  built from and the files of those of the workspace. `cargo blaze test --doc -q` shows the
+  results tersely, as cargo's `-q` has libtest do (`harness/cargo_ra_jit.py`, flags group).
 
 - A load's proc macros with and without `RA_JIT_PROC_MACRO_SERVER=0` (#460): each mode has
   its own target directory, `target/rust-analyzer` with ra-jit's proc macros and

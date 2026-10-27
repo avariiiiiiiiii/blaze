@@ -167,7 +167,7 @@ fn two_matching_cfg_runners_are_an_error() {
         )],
     );
     let err = tree.config(&[]).target_runner(&CompileKind::Host, HOST, &macos()).unwrap_err();
-    let def = tree.root.join(".cargo/config.toml").display().to_string();
+    let def = tree.root.join(".cargo").join("config.toml").display().to_string();
     assert_eq!(
         err.to_string(),
         format!(
@@ -200,7 +200,7 @@ fn build_table_warns_of_keys_it_does_not_know() {
         config.build_config().unwrap().jobs,
         Some(blaze_manifest::config::JobsConfig::Integer(2))
     ));
-    let def = tree.root.join(".cargo/config.toml").display().to_string();
+    let def = tree.root.join(".cargo").join("config.toml").display().to_string();
     assert_eq!(
         config.take_warnings(),
         [format!("unused config key `build.target-dri` in `{def}`")]
@@ -263,7 +263,7 @@ fn source_replacement_follows_replace_with() {
 
 #[test]
 fn source_tables_refuse_what_cargo_refuses() {
-    let def = |tree: &Tree| tree.root.join(".cargo/config.toml").display().to_string();
+    let def = |tree: &Tree| tree.root.join(".cargo").join("config.toml").display().to_string();
     let cases: &[(&str, &str, &dyn Fn(&Tree) -> String)] = &[
         (
             "source-branch",
@@ -307,7 +307,7 @@ fn source_replacement_cycles_and_missing_names_are_errors() {
         )],
     );
     let config = tree.config(&[]);
-    let def = tree.root.join(".cargo/config.toml").display().to_string();
+    let def = tree.root.join(".cargo").join("config.toml").display().to_string();
     assert_eq!(
         config.replacement("a").unwrap_err().to_string(),
         format!(

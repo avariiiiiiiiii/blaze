@@ -2824,6 +2824,7 @@ impl Checkouts {
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
     ) -> anyhow::Result<()> {
+        let start = Instant::now();
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
@@ -2877,7 +2878,16 @@ impl Checkouts {
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
+        let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let files = start.elapsed() - workspaces_at;
+            eprintln!(
+                "load-us: workspaces={} files={}",
+                workspaces_at.as_micros(),
+                files.as_micros()
+            );
+        }
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
@@ -3169,9 +3179,11 @@ fn workspace_at(
     beside: Option<&mut Beside>,
     said: Option<Vec<String>>,
 ) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
+    let start = Instant::now();
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let metadata_at = start.elapsed();
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
     if workspace.sysroot.is_rust_lib_src_empty() {
@@ -3240,6 +3252,7 @@ fn workspace_at(
             cargo.set_primary(package, built.primary);
         }
     }
+    let planned_at = start.elapsed();
     if let Some(scripts) = scripts {
         workspace.set_build_scripts(scripts);
     } else if load_config.load_out_dirs_from_check {
@@ -3277,6 +3290,14 @@ fn workspace_at(
             anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));
         }
         workspace.set_build_scripts(build_scripts);
+    }
+    if std::env::var_os("RA_JIT_STATS").is_some() {
+        let us = |it: Duration| it.as_micros();
+        let (metadata, plan) = (us(metadata_at), us(planned_at - metadata_at));
+        eprintln!(
+            "load-us: metadata={metadata} plan={plan} scripts={}",
+            us(start.elapsed() - planned_at)
+        );
     }
     Ok((workspace, debug))
 }
@@ -8405,6 +8426,7 @@ fn run_holding(
             load(&projects, &cargo_config, load_config(), selection, beside, scripts_said)?
         }
     };
+    let loaded_at = start.elapsed();
     let listed = Arc::new(Listed::default());
     ide_db::base_db::set_process_env(&mut db, process::own());
     // What is compiled ahead is stored too, so the store is told the toolchain first. A build
@@ -8420,7 +8442,13 @@ fn run_holding(
     let shipped = (nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args))
         .then(|| shipped::fetch_ahead(emits.triple()))
         .flatten();
+    let following_at = start.elapsed();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
+    if std::env::var_os("RA_JIT_STATS").is_some() {
+        let (loaded, toolchain) = (loaded_at.as_micros(), (following_at - loaded_at).as_micros());
+        let cargo = (start.elapsed() - following_at).as_micros();
+        eprintln!("load-us: loaded={loaded} toolchain={toolchain} cargo={cargo}");
+    }
     let beside = built.is_some();
     let Parts { root, base, members, debug, lints_capped, link_args } =
         checkouts.parts(&args.project)?;

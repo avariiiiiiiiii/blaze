@@ -541,6 +541,8 @@ mod tests {
         _ = std::fs::remove_dir_all(&root);
     }
 
+    // The paths a sandbox records are a Unix machine's: there is one on Linux and macOS alone.
+    #[cfg(unix)]
     #[test]
     fn a_record_is_its_lines_in_order_once() {
         let spec = Spec {

@@ -375,7 +375,15 @@ fn colour(typed: &[String]) -> bool {
 }
 
 /// The columns of the terminal standard error is, which cargo passes rustc as
+/// `--diagnostic-width`. None on Windows, which has no `TIOCGWINSZ`.
+#[cfg(not(unix))]
+fn terminal_width() -> Option<usize> {
+    None
+}
+
+/// The columns of the terminal standard error is, which cargo passes rustc as
 /// `--diagnostic-width`.
+#[cfg(unix)]
 fn terminal_width() -> Option<usize> {
     if !std::io::stderr().is_terminal() {
         return None;

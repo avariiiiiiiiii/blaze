@@ -18,7 +18,9 @@
 # On every push to main and by hand. One train runs at a time; a push while it runs waits, and a
 # newer push replaces the one waiting, so the train runs on the newest commit of main as soon
 # as the one before is done. A run cancelled by each push (`cancel-in-progress`) would never end
-# while main takes a merge every few minutes, and a train takes about 45.
+# while main takes a merge every few minutes, and a train takes about 45. The group is per ref:
+# a train run by hand on a branch (contributing.md: before landing what the fast tier does not
+# cover) neither waits behind main's nor takes the place of main's waiting one.
 name: train
 on:
   push:
@@ -26,7 +28,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: train
+  group: train-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:

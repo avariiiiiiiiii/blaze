@@ -1702,9 +1702,11 @@ impl Base {
             });
             if std::env::var_os("RA_JIT_STATS").is_some() {
                 eprintln!(
-                    "places-base: {} named{}, {} roots and {} instances placed of {} bodies",
+                    "places-base: {} named{} (builds edits {}, edits follow {}), {} roots and {} instances placed of {} bodies",
                     named.len(),
                     if cg.places.is_none() { " (none kept)" } else { "" },
+                    super::backend::edits_follow(),
+                    super::do_edits_follow(),
                     placed_roots.len(),
                     placed_instances.len(),
                     placed_of_owner.len()

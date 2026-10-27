@@ -205,9 +205,10 @@ class Case:
         if whole:
             # The program is `deps/<name>-<hash>` in cargo's first layout of the build directory
             # and `build/<name>/<hash>/out/<name>` in its second, where the build script's
-            # line also has the package's directory in it.
+            # line also has the package's directory in it. On Windows rustc prints each argument
+            # quoted as Rust's Debug does, every `\` doubled.
             name = re.escape(self.artifact_name())
-            program = rf"[/\\]{name}-|[/\\]out[/\\]{name}(\.exe)?[\"'\s]"
+            program = rf"[/\\]{name}-|[/\\]+out[/\\]+{name}(\.exe)?[\"'\s]"
             printed = "\n".join(l for l in printed.splitlines() if re.search(program, l))
         try:
             # rustc's `symbols.o` asks for what the libraries need of one another, which a linker

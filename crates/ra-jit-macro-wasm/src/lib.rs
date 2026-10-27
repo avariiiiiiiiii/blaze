@@ -886,7 +886,7 @@ pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), S
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
-    let wasm = Wasm::compile(path, known, Some(&bytes), store)?;
+    let wasm = Wasm::known(path, known, Some(&bytes), store)?;
     list(path, &wasm, &wasm.list()?);
     if let Some(store) = store {
         store.seal();

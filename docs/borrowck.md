@@ -77,6 +77,8 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
 - Unaligned references (E0793): a `&` or `&mut` of a field a `#[repr(packed)]` struct may
   leave less aligned than its type needs, as rustc's `check_packed_ref` (not `&raw`, nor
   behind a pointer; a field of a type parameter or of a `dyn` tail may be unaligned).
+  `offset_of!`, which lowering computes as the address of a field of a value at address 0,
+  is rustc's `NullOp::OffsetOf` and takes no reference.
 - Builtin derives are checked as rustc expands them (`rustc_builtin_macros/src/deriving`;
   `ra-jit borrowck` expands them, as `ra-jit check` and builds do). The methods derived for
   a `#[repr(packed)]` struct copy each field out of it, `{ self.x }` at the field, rather

@@ -2340,6 +2340,20 @@ pub mod packed_drop {
     }
 }
 
+/// `offset_of!` of a field of a packed struct takes no reference to it.
+pub mod packed_offset_of {
+    #[repr(C, packed)]
+    pub struct Header {
+        pub magic: u16,
+        pub version: u8,
+        pub checksum: u32,
+    }
+
+    pub fn run(base: usize) -> usize {
+        base + core::mem::offset_of!(Header, checksum)
+    }
+}
+
 pub mod array_move {
     use std::cell::RefCell;
 

@@ -416,11 +416,19 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
 fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<Outline>> {
     let stats = std::env::var_os("RA_JIT_STATS").is_some();
     if files.len() > 1 {
+        let start = std::time::Instant::now();
         let mut crates: Vec<_> =
             files.iter().flat_map(|&file| relevant_crates(db, file).iter().copied()).collect();
         crates.sort_unstable();
         crates.dedup();
         crate::resolve_names(db, &crates);
+        if stats {
+            eprintln!(
+                "outlines-us: resolve={} for {} crates",
+                start.elapsed().as_micros(),
+                crates.len()
+            );
+        }
     }
     let start = std::time::Instant::now();
     let functions = listed.in_files(db, files);
@@ -484,6 +492,15 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
             outlines[at] = outline;
         }
     });
+    if stats {
+        let us = |it: std::time::Duration| it.as_micros();
+        eprintln!(
+            "outlines-us: list={} lower={} bodies={count} hash={}",
+            us(found),
+            us(lowered - found),
+            us(start.elapsed() - lowered)
+        );
+    }
     outlines
 }
 
@@ -1417,12 +1434,21 @@ fn key_of(func: &ast::Fn) -> Option<(String, bool)> {
 /// they were. What is compiled of it is the same but for where it is: the ids of its items
 /// are of their names, and an import's of the imports before it alone.
 pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
-    let parse = |text: &str| {
-        let parse = syntax::SourceFile::parse(text, edition);
-        parse.errors().is_empty().then(|| parse.syntax_node())
-    };
-    let (Some(was), Some(now)) = (parse(was), parse(now)) else { return false };
-    said(&was) == said(&now)
+    let was = syntax::SourceFile::parse(was, edition);
+    respaced_from(edition, &was, now)
+}
+
+/// [`respaced`], of a text the database has parsed already.
+pub(crate) fn respaced_from(
+    edition: Edition,
+    was: &syntax::Parse<syntax::SourceFile>,
+    now: &str,
+) -> bool {
+    let now = syntax::SourceFile::parse(now, edition);
+    if !was.errors().is_empty() || !now.errors().is_empty() {
+        return false;
+    }
+    said(&was.syntax_node()) == said(&now.syntax_node())
 }
 
 /// A part of what a file says: a token that says something, with whether it is punctuation

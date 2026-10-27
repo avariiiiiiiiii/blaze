@@ -5669,11 +5669,13 @@ fn broken_in(
 /// text or the positions of. Asked before the texts are the database's.
 fn respaced(db: &RootDatabase, texts: &[(vfs::FileId, String)]) -> Vec<vfs::FileId> {
     let one = |db: &RootDatabase, (file, text): &(vfs::FileId, String)| {
+        if load_cargo::places_read(*file) {
+            return None;
+        }
         let crates = ide_db::base_db::relevant_crates(db, *file);
         let edition = crates.first().map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
-        let was = db.file_text(*file).text(db);
-        let respaced = !load_cargo::places_read(*file) && outline::respaced(edition, &was, text);
-        respaced.then_some(*file)
+        let was = ide_db::base_db::EditionedFileId::new(db, *file, edition).parse(db);
+        outline::respaced_from(edition, &was, text).then_some(*file)
     };
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(texts.len());
     if threads <= 1 {
@@ -9122,7 +9124,9 @@ fn run_holding(
                 Watched::Included(path) => included.push(path.clone()),
             }
         }
+        let respacing = Instant::now();
         let respaced = respaced(&db, &texts);
+        let respacing = respacing.elapsed();
         let looked: Vec<vfs::FileId> =
             editing.iter().copied().filter(|it| !respaced.contains(it)).collect();
         // An edit that adds functions to a crate, or takes them away, is a patch when what
@@ -9161,7 +9165,12 @@ fn run_holding(
             program.known.before_edit(&db, &looked, &|count, each| fan(&db, count, each), moves);
         }
         if std::env::var_os("RA_JIT_STATS").is_some() {
-            eprintln!("respaced: {} of {} files", respaced.len(), editing.len());
+            eprintln!(
+                "respaced: {} of {} files in {} us",
+                respaced.len(),
+                editing.len(),
+                respacing.as_micros()
+            );
             eprintln!(
                 "read-us: texts={} homes={} outlines={} checked={} known={}",
                 homes.as_micros(),

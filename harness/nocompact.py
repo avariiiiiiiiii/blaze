@@ -84,9 +84,11 @@ def links(home):
 
 def address_of(program, name):
     """Where the code of the function `name` is, as the executable was linked: ra-jit's symbol
-    of it (rustc's is a jump there)."""
+    of it (rustc's is a jump there). The daemon's own link names it `ra-jit.<crate id>.<path>`,
+    and a splice moves that symbol to the new code."""
     listed = subprocess.run(["nm", program], capture_output=True, text=True).stdout
-    found = re.findall(rf"^([0-9a-f]+) [ts] _ra-jit::{name}::\d+$", listed, re.M)
+    own = rf"_ra-jit(?:::{name}::\d+|\.[0-9a-f]+\.\S*::{name})"
+    found = re.findall(rf"^([0-9a-f]+) [tTsS] {own}$", listed, re.M)
     return "0x" + found[0] if found else None
 
 

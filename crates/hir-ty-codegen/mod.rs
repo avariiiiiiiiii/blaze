@@ -251,6 +251,12 @@ pub const CARGO_HOME: &str = "/cargo";
 /// it (`docs/live.md#types`).
 pub const LASTING_STATIC: &str = "ra_jit::static::lasting::";
 
+/// What the name of a data object of a patch starts with that says the patch left the base's
+/// copy of a static behind, the rest of the name being that copy's: the patch has one of its
+/// own, and everything that refers to it (`patch::Base::moved`), so nothing that runs refers to
+/// the base's.
+pub const MOVED_STATIC: &str = "ra_jit::static::moved::";
+
 /// `path` with the directory `to` in place of the directory `from` it is under.
 pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
     let rest = path.strip_prefix(from)?;
@@ -7012,7 +7018,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(data);
         }
         let node = patch::Node::Static(id);
-        let known = self.base.and_then(|base| base.statics.get(&id));
+        let mut known = self.base.and_then(|base| base.statics.get(&id));
+        // One whose value no longer fits where the base has it is a static of the patch's own,
+        // named as one new since the base is.
+        if let Some(moved) = known.filter(|_| self.replaced.moved.contains(&id)) {
+            self.leave_behind(&moved.symbol)?;
+            known = None;
+        }
         // One with another value keeps its name, and what refers to it by that gets the new.
         let again = known.filter(|_| self.replaced.changed.contains(&node));
         if let Some(known) = known.filter(|_| again.is_none()) {
@@ -7760,6 +7772,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .define_data(data, &description)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
         Ok(data)
+    }
+
+    /// Says that the patch leaves the base's copy of a static, `symbol`, behind ([`MOVED_STATIC`]).
+    fn leave_behind(&mut self, symbol: &str) -> Result<()> {
+        if symbol.is_empty() {
+            return Ok(());
+        }
+        let name = format!("{MOVED_STATIC}{symbol}");
+        let data = self.declare_named_data(&name, Linkage::Hidden, false, false, true)?;
+        let mut description = DataDescription::new();
+        description.define_zeroinit(1);
+        self.module
+            .define_data(data, &description)
+            .map_err(|e| CodegenError::Backend(e.to_string()))
     }
 
     /// Writes rustc's hash of each type in `blob.type_ids` at its place in the bytes.

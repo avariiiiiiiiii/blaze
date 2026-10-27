@@ -48,7 +48,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     Spliced, Stamp,
-    lasting::{Lasting, Own, is_lasting},
+    lasting::{Lasting, Own, is_lasting, left_behind},
 };
 
 /// What segments are aligned to on AArch64.
@@ -1320,6 +1320,9 @@ impl<'a> Patch<'a> {
                 None => None,
                 // The executable's is the same static with the same value: it is kept.
                 Some(_) if is_lasting(name) => None,
+                // One that says what a patch left behind is of that patch, which the executable
+                // was linked with, and says nothing of this one's.
+                Some(_) if left_behind(name).is_some() => None,
                 Some(Named::One(old)) if old.kind == SymbolKind::Text && code => Some(*old),
                 Some(Named::One(old)) if old.kind == SymbolKind::Data && !code => {
                     let new = InPlace { offset, size, old: *old };
@@ -2073,11 +2076,7 @@ pub(super) fn live(
     lasting: &mut Lasting,
 ) -> anyhow::Result<(ra_jit_live::format::Code, Vec<(u64, u64)>)> {
     let mut patch = Patch::read(patch, image)?;
-    let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
-    ensure!(
-        baked.iter().all(|it| defined.contains(&**it)),
-        "a function the executable was linked with a patch of is as it first was"
-    );
+    super::has_baked(baked, patch.replaced.iter().map(|it| it.name))?;
     lasting.place(&patch.lasting_own()?)?;
     patch.keep_lasting(|name| lasting.address(name))?;
     patch.place_live(image, originals, base, lasting)
@@ -2291,11 +2290,7 @@ pub(super) fn splice(
     };
     let mut from = start;
     let patch = Patch::read(patch, image)?;
-    let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
-    ensure!(
-        baked.iter().all(|it| defined.contains(&**it)),
-        "a function the executable was linked with a patch of is as it first was"
-    );
+    super::has_baked(baked, patch.replaced.iter().map(|it| it.name))?;
     let addition = patch.place(image)?;
     step("place", &mut from);
 

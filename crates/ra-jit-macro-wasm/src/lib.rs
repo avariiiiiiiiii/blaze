@@ -1384,6 +1384,38 @@ mod tests {
     }
 
     #[test]
+    fn a_prepared_module_is_loaded_without_compiling_or_reading_it() {
+        let dir = scratch("prepared");
+        ra_jit_store::compiles_against("ra-jit-macro-wasm tests");
+        let store: &'static ra_jit_store::Store =
+            Box::leak(Box::new(ra_jit_store::Store::open_at(&dir.join("store")).unwrap()));
+        let path = dir.join("m.wasm");
+        let list = "0\tSerialize\tserde\n";
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        let name = exports::LIST_SECTION.as_bytes();
+        module.extend_from_slice(&[0, (1 + name.len() + list.len()) as u8, name.len() as u8]);
+        module.extend_from_slice(name);
+        module.extend_from_slice(list.as_bytes());
+        std::fs::write(&path, &module).unwrap();
+        prepare_soon(&path, Some(store)).unwrap();
+        let (known, text) = listing(&path).expect("the list is written before the compile ends");
+        assert_eq!(text, list);
+        assert_eq!(known.digest, keyed::sha256(&module));
+        // Waits for the compile `prepare_soon` started, which keeps the code beside the module
+        // and in the store, under a key of no path.
+        Wasm::known(&path, known, None, Some(store)).unwrap();
+        let key = code_key(&known.digest);
+        assert!(code_file(&path, &key).is_file());
+        assert!(store.get_lasting(&key).is_some());
+        // Another write of the module, even of the same bytes, is listed again.
+        std::fs::write(&path, &module).unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        assert!(listing(&path).is_none());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_subspan_is_of_the_span_and_within_it() {
         let it = span(10, 20);
         // Unbounded, included and excluded bounds as the module writes them.

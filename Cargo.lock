@@ -615,6 +615,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
+name = "bitmaps"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
+dependencies = [
+ "typenum",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -635,15 +644,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitmaps"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
-dependencies = [
- "typenum",
-]
-
-[[package]]
 name = "blaze-build-script"
 version = "0.1.0"
 dependencies = [
@@ -660,23 +660,6 @@ name = "blaze-core"
 version = "0.1.0"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "blaze-items"
-version = "0.1.0"
-dependencies = [
- "base-db",
- "blake3",
- "hir",
- "hir-def",
- "hir-expand",
- "hir-ty",
- "intern",
- "ra-ap-rustc_type_ir",
- "rustc-hash 2.1.2",
- "salsa",
- "syntax",
 ]
 
 [[package]]
@@ -725,6 +708,23 @@ dependencies = [
  "unicode-properties",
  "unicode-segmentation",
  "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "blaze-items"
+version = "0.1.0"
+dependencies = [
+ "base-db",
+ "blake3",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "intern",
+ "ra-ap-rustc_type_ir",
+ "rustc-hash 2.1.2",
+ "salsa",
+ "syntax",
 ]
 
 [[package]]
@@ -842,14 +842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-vfs"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "blaze-core",
-]
-
-[[package]]
 name = "blaze-tree"
 version = "0.1.0"
 dependencies = [
@@ -857,6 +849,15 @@ dependencies = [
  "blaze-manifest",
  "blaze-metadata",
  "blaze-resolve",
+ "rustc-hash 2.1.2",
+]
+
+[[package]]
+name = "blaze-vfs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "blaze-core",
  "rustc-hash 2.1.2",
 ]
 
@@ -3495,17 +3496,17 @@ dependencies = [
  "aws-smithy-http-client",
  "blaze-api",
  "blaze-core",
- "blaze-items",
  "blaze-doc",
  "blaze-fmt",
+ "blaze-items",
  "blaze-lints",
  "blaze-manifest",
- "blaze-vfs",
  "blaze-metadata",
  "blaze-new",
  "blaze-registry",
  "blaze-resolve",
  "blaze-tree",
+ "blaze-vfs",
  "cargo-platform",
  "cargo-util-schemas",
  "cargo_metadata",

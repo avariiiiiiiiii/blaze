@@ -186,6 +186,10 @@ pub(super) fn type_gone<'db>(
         gone: false,
         crates: FxHashSet::default(),
         bodies: Vec::new(),
+        coroutines: Vec::new(),
+        reveal: false,
+        revealing: 0,
+        hidden: Vec::new(),
         opaque: false,
         seen: FxHashSet::default(),
     };

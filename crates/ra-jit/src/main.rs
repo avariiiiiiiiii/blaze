@@ -4457,6 +4457,21 @@ thread_local! {
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Has the thread be one that probes for as long as it lives.
+pub(crate) struct Probing(bool);
+
+impl Probing {
+    pub(crate) fn new() -> Probing {
+        Probing(PROBING.replace(true))
+    }
+}
+
+impl Drop for Probing {
+    fn drop(&mut self) {
+        PROBING.set(self.0);
+    }
+}
+
 /// Whether the edits of the build are patches of an object that has the standard library in
 /// it. A whole build's (`--exe`) are patched over the library it links as a unit of its own.
 fn patches_its_library(args: &Args) -> bool {

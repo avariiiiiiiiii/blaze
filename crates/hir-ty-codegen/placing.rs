@@ -433,11 +433,16 @@ impl Places {
 }
 
 /// Each of `owners` lowered, on the threads `fan` has: `None` for one whose syntax is gone.
-/// Whether the file of `owner` still has it: one an edit took away has no body to lower. For
-/// an owner a macro wrote, this expands the macro, which panics once its item is gone.
+/// Whether the file of `owner` still has it: one an edit took away has no body to lower. Of
+/// one a macro wrote, the call is looked for first: expanding one whose call is gone panics.
 fn written(db: &dyn HirDatabase, owner: DefWithBodyId) -> bool {
     fn has<N: syntax::AstNode>(db: &dyn HirDatabase, id: hir_expand::AstId<N>) -> bool {
-        id.file_id.ast_id_map(db).try_get_erased(id.value.erase()).is_some()
+        let mut chain = vec![(id.file_id, id.value.erase())];
+        while let Some(call) = chain[chain.len() - 1].0.macro_file() {
+            let kind = call.loc(db).kind;
+            chain.push((kind.file_id(), kind.erased_ast_id()));
+        }
+        (chain.into_iter().rev()).all(|(file, at)| file.ast_id_map(db).try_get_erased(at).is_some())
     }
     use hir_def::Lookup;
     match owner {

@@ -138,12 +138,33 @@ fn is_named(names: &[&str], name: &str) -> bool {
     names.iter().any(|it| if it.ends_with('_') { name.starts_with(it) } else { name == *it })
 }
 
-/// The variables of this process of [`WORKER_ENV_EXACT`] that a worker of the build whose
-/// variables are `env` does not have: to be taken away from what it inherits.
+/// Whether the variable `name` is one of [`WORKER_ENV`], which a worker has from its build.
+fn worker_named(name: &str) -> bool {
+    is_named(WORKER_ENV, name) || target_rustflags(name)
+}
+
+/// Whether the variable `name` is blaze's own: where the daemon keeps its files, the store,
+/// its traces. The daemon's are what its workers run with.
+fn blazes(name: &str) -> bool {
+    name.starts_with("RA_JIT_") || name.starts_with("BLAZE_")
+}
+
+/// The variables of this process that a worker of the build whose variables are `env`
+/// ([`super::daemon::WorkerConfig::builds_env`]) does not have, to be taken away from what it
+/// inherits: of [`WORKER_ENV`], those of [`WORKER_ENV_EXACT`], and every other one that is not
+/// blaze's own. A build script reads the command's environment, as cargo's does, and a
+/// variable it says it reads (`rerun-if-env-changed`) the command left unset is unset.
 pub(crate) fn not_the_builds(env: &BTreeMap<String, String>) -> Vec<String> {
-    std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
-        .filter(|name| is_named(WORKER_ENV_EXACT, name) || target_rustflags(name))
+    taken_away(std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()), env)
+}
+
+/// Of the variables `names` a process has, the ones [`not_the_builds`] takes away.
+fn taken_away(names: impl Iterator<Item = String>, env: &BTreeMap<String, String>) -> Vec<String> {
+    names
+        .filter(|name| match worker_named(name) {
+            true => is_named(WORKER_ENV_EXACT, name) || target_rustflags(name),
+            false => !blazes(name),
+        })
         .filter(|name| !env.contains_key(name))
         .collect()
 }
@@ -535,6 +556,16 @@ pub(crate) fn worker_env() -> BTreeMap<String, String> {
     env
 }
 
+/// The variables of this process its build scripts may be given that [`worker_env`] leaves
+/// out: what a script says it reads or the root manifest's `build-script-env` names is the
+/// command's, not that of whoever started the daemon. Not blaze's own.
+pub(crate) fn command_env() -> BTreeMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| !worker_named(name) && !blazes(name))
+        .collect()
+}
+
 fn env_named(names: &[&str]) -> BTreeMap<String, String> {
     std::env::vars().filter(|(name, _)| is_named(names, name)).collect()
 }
@@ -558,6 +589,17 @@ mod tests {
         assert!(exact("CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS") && exact("CARGO_BUILD_RUSTFLAGS"));
         assert!(exact("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"));
         assert!(!exact("CARGO_TARGET_DIR") && !exact("PATH") && !exact("RUSTUP_TOOLCHAIN"));
+    }
+
+    #[test]
+    fn what_a_script_reads_is_the_commands() {
+        let daemons = ["SDK_DIR", "RUSTFLAGS", "PATH", "RUSTUP_TOOLCHAIN", "RA_JIT_CACHE", "CC"];
+        let builds = BTreeMap::from([
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("CC".to_owned(), "cc".to_owned()),
+        ]);
+        let taken = taken_away(daemons.into_iter().map(str::to_owned), &builds);
+        assert_eq!(taken, ["SDK_DIR", "RUSTFLAGS"]);
     }
 
     #[test]

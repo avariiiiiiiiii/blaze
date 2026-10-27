@@ -399,6 +399,7 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         cfg_test: asked.flags.dev_targets,
         selection: asked.selection(),
         env: worker_env(),
+        command_env: BTreeMap::new(),
         whole: false,
     };
     Ok(daemon::Ahead { config, crates, root })
@@ -752,6 +753,7 @@ impl State {
             cfg_test: unit_test,
             selection: asked.selection(),
             env: worker_env(),
+            command_env: BTreeMap::new(),
             whole: false,
         };
         let sysroot_libraries = sysroot_libraries();

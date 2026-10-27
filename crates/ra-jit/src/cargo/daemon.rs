@@ -174,6 +174,20 @@ pub(crate) enum Request {
     Stop,
 }
 
+impl Request {
+    /// The request, with the variables of this command its build's scripts are given
+    /// ([`WorkerConfig::command_env`]): set as it is sent, so that no state on disk keeps them.
+    pub(crate) fn of_this_command(mut self) -> Request {
+        if let Request::Sync(it) | Request::Warm(it) | Request::Build(it) = &mut self {
+            it.config.command_env = super::cli::command_env();
+        }
+        if let Request::Ahead(it) | Request::Check(it) | Request::Lint(it, _) = &mut self {
+            it.config.command_env = super::cli::command_env();
+        }
+        self
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) enum Reply {
     /// The daemon is of another version. It exits when the client said it replaces it.
@@ -272,6 +286,11 @@ pub(crate) struct WorkerConfig {
     pub(crate) selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
+    /// The rest of the variables of the command ([`super::cli::command_env`]), which its build
+    /// scripts are given of as cargo's are. Not what picks the worker ([`Self::id`]): one
+    /// loads the workspace again when a variable a script reads is another.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) command_env: BTreeMap<String, String>,
     /// Whether its programs are built whole, with nothing of rustc's ([`Plan::whole`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) whole: bool,
@@ -281,8 +300,16 @@ impl WorkerConfig {
     /// 16 hex digits: it names the worker's directory, and the path of the socket in it has
     /// to fit the 104 bytes macOS has for one, with the daemon's directory before it.
     pub(crate) fn id(&self) -> String {
-        let text = serde_json::to_vec(self).unwrap_or_default();
+        let picks = WorkerConfig { command_env: BTreeMap::new(), ..self.clone() };
+        let text = serde_json::to_vec(&picks).unwrap_or_default();
         Sha256::digest(text).iter().take(8).map(|it| format!("{it:02x}")).collect()
+    }
+
+    /// Every variable of the build: [`Self::env`] over [`Self::command_env`].
+    pub(crate) fn builds_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.command_env.clone();
+        env.extend(self.env.clone());
+        env
     }
 }
 
@@ -434,9 +461,6 @@ struct Worker {
     project: PathBuf,
     socket: PathBuf,
     log: PathBuf,
-    /// The variables the process runs with. A request says them with the ones of its
-    /// checkout over them.
-    env: ide_db::base_db::Env,
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
     asked: Mutex<Instant>,
@@ -523,16 +547,6 @@ impl Worker {
             args.push("--scripts-from".into());
             args.push(scripts.into());
         }
-        // Sent with each request, so the daemon's flags would reload the workspace with them.
-        let not_ours = super::cli::not_the_builds(&config.env);
-        let mut env: ide_db::base_db::Env = Vec::from(crate::process::own())
-            .into_iter()
-            .filter(|(name, _)| !not_ours.contains(name))
-            .collect();
-        for (name, value) in &config.env {
-            env.set(name, value);
-        }
-        env.set(ENDS_WITH_INPUT, "1");
         // What `env!` reads of the places cargo set, as each request has them: the load
         // compiles the crates before the first request is read, and an integration test
         // that names a program (`CARGO_BIN_EXE_<name>`) would not compile without them.
@@ -542,7 +556,7 @@ impl Worker {
             .filter(|(name, _)| super::wrapper::names_a_place(name))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
-        started.extend(config.env.clone());
+        started.extend(config.builds_env());
         let told = spare.and_then(|it| it.told(&args, &started, &checkout.root, false));
         let child = match told {
             Some(spare) => {
@@ -559,7 +573,7 @@ impl Worker {
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
                 command.envs(&started).env(ENDS_WITH_INPUT, "1");
-                exact_env(&mut command, &config.env);
+                exact_env(&mut command, &started);
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
@@ -575,7 +589,6 @@ impl Worker {
             project: checkout.project(),
             socket,
             log,
-            env,
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
             asked: Mutex::new(Instant::now()),
@@ -741,7 +754,7 @@ impl Worker {
             }
         };
         let mut stream = self.connected()?;
-        let mut env = self.env.clone();
+        let mut env = requests_env(&checkout.config);
         for (name, value) in &checkout.env {
             env.set(name, value);
         }
@@ -841,6 +854,23 @@ fn exact_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
+/// The variables a request of the build `config` says, under its checkout's: those a worker
+/// of it runs with. The worker loads the workspace again when the flags or a variable a
+/// build script reads are another than it loaded it with, and its `env!` reads them.
+fn requests_env(config: &WorkerConfig) -> ide_db::base_db::Env {
+    let builds = config.builds_env();
+    let not_ours = super::cli::not_the_builds(&builds);
+    let mut env: ide_db::base_db::Env = Vec::from(crate::process::own())
+        .into_iter()
+        .filter(|(name, _)| !not_ours.contains(name))
+        .collect();
+    for (name, value) in &builds {
+        env.set(name, value);
+    }
+    env.set(ENDS_WITH_INPUT, "1");
+    env
+}
+
 impl Spare {
     /// Starts one with its files in `dir`.
     fn start(dir: &Path) -> anyhow::Result<Spare> {
@@ -935,8 +965,9 @@ impl Checker {
         };
         let output =
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
-        command.envs(&ahead.config.env).env(ENDS_WITH_INPUT, "1");
-        exact_env(&mut command, &ahead.config.env);
+        let env = ahead.config.builds_env();
+        command.envs(&env).env(ENDS_WITH_INPUT, "1");
+        exact_env(&mut command, &env);
         command.current_dir(&ahead.root);
         command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
         own_group(&mut command);
@@ -1536,7 +1567,7 @@ impl Daemon {
         let Some(spare) = waiting.or_else(|| self.new_spare()) else { return };
         let mut args = ahead.config.args(&ahead.root, &ahead.crates);
         args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config.env, &ahead.root, true)
+        if let Some(spare) = spare.told(&args, &ahead.config.builds_env(), &ahead.root, true)
             && let Some(mut other) = lock(&self.ahead).insert(id, spare)
         {
             other.stop();

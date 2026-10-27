@@ -335,7 +335,15 @@ pkg-config's variables (`CC`, `CFLAGS_<target>`, `PKG_CONFIG_PATH`, `NIX_CFLAGS_
 what the root manifest's `build-script-env` names, and what it says it reads
 (`cargo:rerun-if-env-changed=OPENSSL_DIR`) as cargo has it; what else the shell had is not
 there. A run that said it reads a variable it was not given saw it unset, so the script runs
-again given it, and the store keeps that run under the variable's value. The machine is
+again given it, whether the first run succeeded or failed (`env::var("SDK_DIR").expect(..)`,
+or a download the sandbox refused), and the store keeps that run under the variable's value.
+The variables are the command's, not those of whoever started the daemon: `SDK_DIR=/opt/sdk
+blaze build` gives the script `SDK_DIR` with a daemon started without it, and a command
+without it, to a daemon started with it, gives it none. A command with another value of a
+variable a script read, or of one `build-script-env` names, has the worker run the scripts
+again and load the workspace with what they print
+([#720](https://github.com/indexable-inc/blaze/issues/720)). The root manifest is the one of
+the workspace built, also for a path dependency that is a workspace of its own. The machine is
 read-only; it writes
 its `OUT_DIR` for real, which is the one directory the Cargo book lets a script write ("Scripts
 should not modify any files outside of that directory"); the temporary directories start empty;

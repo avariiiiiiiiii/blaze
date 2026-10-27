@@ -204,10 +204,10 @@ pub(crate) fn run_as_cargo_does(
         }
         let script_sandbox::Ran { output, reads } =
             script_sandbox::run(&running, &plan, Stdio::inherit())?;
-        let unset = match output.status.success() {
-            true => script_sandbox::not_given(&output.stdout, &ran.env, &plan),
-            false => Vec::new(),
-        };
+        // A run that failed without what it said it reads (`env::var("X").expect(..)`, or a
+        // download the sandbox refused for want of the local copy `X` names) failed as cargo's
+        // would not: its failure is the one of the run given it.
+        let unset = script_sandbox::not_given(&output.stdout, &ran.env, &plan);
         let directives =
             directives::Ran { package_dir: &cwd, out_dir: &out_dir, link_dirs: &link_dirs };
         let refused = directives::refused(&output.stdout, &directives);

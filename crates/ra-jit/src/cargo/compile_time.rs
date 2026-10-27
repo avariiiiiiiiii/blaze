@@ -799,6 +799,8 @@ impl<'a> Driver<'a> {
         command.arg("build-script");
         env.apply(&mut command);
         command.env(super::script::REAL, &exe).current_dir(package.manifest.parent());
+        let root: &Path = self.cargo.workspace_root().as_ref();
+        command.env(super::script_sandbox::ROOT, root);
         let ran = script::run::run(&described, command).map_err(|it| anyhow::anyhow!(it.0))?;
         let cx = script::output::Context::of(&described, &self.inherited);
         let output = ran.finish(&described, &cx).map_err(|failed| {

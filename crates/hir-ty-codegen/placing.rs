@@ -439,7 +439,7 @@ fn written(db: &dyn HirDatabase, owner: DefWithBodyId) -> bool {
     fn has<N: syntax::AstNode>(db: &dyn HirDatabase, id: hir_expand::AstId<N>) -> bool {
         let mut chain = vec![(id.file_id, id.value.erase())];
         while let Some(call) = chain[chain.len() - 1].0.macro_file() {
-            let kind = call.loc(db).kind;
+            let kind = &call.loc(db).kind;
             chain.push((kind.file_id(), kind.erased_ast_id()));
         }
         (chain.into_iter().rev()).all(|(file, at)| file.ast_id_map(db).try_get_erased(at).is_some())

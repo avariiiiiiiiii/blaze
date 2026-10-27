@@ -3168,7 +3168,13 @@ fn workspace_at(
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
     if workspace.sysroot.is_rust_lib_src_empty() {
-        if let Some(error) = workspace.sysroot.error() {
+        // A library with its `Cargo.toml` is there and could not be read; without one it is
+        // not installed, whatever the stitched library's error says of it.
+        let read = workspace
+            .sysroot
+            .rust_lib_src_root()
+            .is_some_and(|it| std::fs::metadata(it.join("Cargo.toml")).is_ok());
+        if let Some(error) = workspace.sysroot.error().filter(|_| read) {
             anyhow::bail!("{}", error.trim_end());
         }
         let toolchain =

@@ -1411,38 +1411,125 @@ fn key_of(func: &ast::Fn) -> Option<(String, bool)> {
     Some((key.join("::"), alone))
 }
 
-/// Whether `now` is `was` written with other blank space and comments: the same tokens, each
-/// joined to the next as it was where a macro or the parser can tell, and the same doc
-/// comments, which are attributes. What is compiled of it is the same but for where it is.
+/// Whether `now` is `was` written otherwise and saying the same: other blank space and
+/// comments, and its imports in another order. Each token is joined to the next as it was
+/// where a macro or the parser can tell, and the doc comments, which are attributes, are as
+/// they were. What is compiled of it is the same but for where it is: the ids of its items
+/// are of their names, and an import's of the imports before it alone.
 pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
-    let (was, now) = (syntax::LexedStr::new(edition, was), syntax::LexedStr::new(edition, now));
-    if was.errors().next().is_some() || now.errors().next().is_some() {
-        return false;
-    }
-    said(&was).eq(said(&now))
+    let parse = |text: &str| {
+        let parse = syntax::SourceFile::parse(text, edition);
+        parse.errors().is_empty().then(|| parse.syntax_node())
+    };
+    let (Some(was), Some(now)) = (parse(was), parse(now)) else { return false };
+    said(&was) == said(&now)
 }
 
-/// The tokens of `lexed` that say something, with whether each punctuation is joined to the
-/// next: the spacing a token tree has of it.
-fn said<'a>(lexed: &'a syntax::LexedStr<'_>) -> impl Iterator<Item = (SyntaxKind, &'a str, bool)> {
-    // A delimiter has no spacing of its own.
-    fn spaced(kind: SyntaxKind) -> bool {
-        use SyntaxKind::*;
-        kind.is_punct()
-            && !matches!(kind, L_PAREN | R_PAREN | L_CURLY | R_CURLY | L_BRACK | R_BRACK)
-    }
-    let joins = |next: SyntaxKind| spaced(next) || next == SyntaxKind::LIFETIME_IDENT;
-    (0..lexed.len()).filter_map(move |at| {
-        let (kind, text) = (lexed.kind(at), lexed.text(at));
-        match kind {
-            SyntaxKind::WHITESPACE => None,
-            SyntaxKind::COMMENT if !is_doc(text) => None,
-            _ => {
-                let joint = spaced(kind) && at + 1 < lexed.len() && joins(lexed.kind(at + 1));
-                Some((kind, text, joint))
+/// A part of what a file says: a token that says something, with whether it is punctuation
+/// joined to the next (the spacing a token tree has of it), or imports one after the other,
+/// in an order of their own.
+enum Said {
+    Token(syntax::SyntaxToken, bool),
+    Uses(Vec<String>),
+}
+
+impl PartialEq for Said {
+    fn eq(&self, other: &Said) -> bool {
+        match (self, other) {
+            (Said::Token(a, joint), Said::Token(b, other)) => {
+                (a.kind(), a.text(), joint) == (b.kind(), b.text(), other)
             }
+            (Said::Uses(a), Said::Uses(b)) => a == b,
+            _ => false,
         }
-    })
+    }
+}
+
+fn said(tree: &SyntaxNode) -> Vec<Said> {
+    let mut said = Vec::new();
+    said_in(tree, &mut said);
+    said
+}
+
+fn said_in(node: &SyntaxNode, said: &mut Vec<Said>) {
+    let mut children = node.children_with_tokens().peekable();
+    while let Some(child) = children.next() {
+        match child {
+            syntax::NodeOrToken::Token(token) if says(&token) => {
+                let joint = spaced(token.kind())
+                    && token.next_token().is_some_and(|it| joins(it.kind()));
+                said.push(Said::Token(token, joint));
+            }
+            syntax::NodeOrToken::Token(_) => {}
+            syntax::NodeOrToken::Node(node) if node.kind() == SyntaxKind::USE => {
+                let mut uses = vec![use_written(&node)];
+                while let Some(next) = children.peek() {
+                    match next {
+                        syntax::NodeOrToken::Token(token) if !says(token) => {}
+                        syntax::NodeOrToken::Node(node) if node.kind() == SyntaxKind::USE => {
+                            uses.push(use_written(node));
+                        }
+                        _ => break,
+                    }
+                    children.next();
+                }
+                uses.sort_unstable();
+                said.push(Said::Uses(uses));
+            }
+            syntax::NodeOrToken::Node(node) => said_in(&node, said),
+        }
+    }
+}
+
+/// An import, or a tree of one, the same in every order of the trees in its lists.
+fn use_written(node: &SyntaxNode) -> String {
+    let mut written = String::new();
+    write_use(node, &mut written);
+    written
+}
+
+fn write_use(node: &SyntaxNode, written: &mut String) {
+    if node.kind() == SyntaxKind::USE_TREE_LIST {
+        let mut trees: Vec<String> = (node.children())
+            .filter(|it| it.kind() == SyntaxKind::USE_TREE)
+            .map(|it| use_written(&it))
+            .collect();
+        trees.sort_unstable();
+        written.push('{');
+        written.push_str(&trees.join(","));
+        written.push('}');
+        return;
+    }
+    for child in node.children_with_tokens() {
+        match child {
+            syntax::NodeOrToken::Token(token) if says(&token) => {
+                written.push_str(token.text());
+                written.push(' ');
+            }
+            syntax::NodeOrToken::Token(_) => {}
+            syntax::NodeOrToken::Node(node) => write_use(&node, written),
+        }
+    }
+}
+
+/// Whether a token says something: neither blank space nor a comment but a doc comment.
+fn says(token: &syntax::SyntaxToken) -> bool {
+    match token.kind() {
+        SyntaxKind::WHITESPACE => false,
+        SyntaxKind::COMMENT => is_doc(token.text()),
+        _ => true,
+    }
+}
+
+/// Whether a token has a spacing: punctuation but a delimiter.
+fn spaced(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    kind.is_punct() && !matches!(kind, L_PAREN | R_PAREN | L_CURLY | R_CURLY | L_BRACK | R_BRACK)
+}
+
+/// Whether punctuation followed by `next` is joined to it.
+fn joins(next: SyntaxKind) -> bool {
+    spaced(next) || next == SyntaxKind::LIFETIME_IDENT
 }
 
 /// Whether a comment is a doc comment, or could be: `////` and `/***` are not.
@@ -1467,6 +1554,13 @@ mod tests {
         assert!(!same("fn f() { \"a b\" }", "fn f() { \"a  b\" }"));
         assert!(!same("fn f() { 1 }", "fn f() { 2 }"));
         assert!(!same("fn f() { \"a }", "fn f() { \"a  }"));
+        assert!(same(
+            "use a::{c, b::{e, d}};\nuse z;\n// sorted\nuse y;\nfn f() {}",
+            "use y;\nuse a::{b::{d, e}, c,};\nuse z;\nfn f() {}"
+        ));
+        assert!(!same("use a;\nfn f() {}\nuse b;", "use b;\nfn f() {}\nuse a;"));
+        assert!(!same("use a::{b, c};", "use a::{b, d};"));
+        assert!(!same("use a::b;", "use a::b as c;"));
     }
 
     fn hash(text: &str) -> u64 {

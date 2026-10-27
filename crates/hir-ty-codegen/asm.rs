@@ -188,6 +188,17 @@ pub(super) fn vector_instruction(instruction: &str, result: &str) -> String {
     )
 }
 
+/// A function of machine code something else made: the helper LLVM compiled of an
+/// intrinsic (`llvm/intrinsic.rs`), whose bytes are its text.
+pub(super) fn machine_code(code: &[u8]) -> String {
+    let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\n");
+    for line in code.chunks(16) {
+        let bytes: Vec<String> = line.iter().map(|it| format!("{it:#04x}")).collect();
+        _ = writeln!(text, ".byte {}", bytes.join(","));
+    }
+    text
+}
+
 /// The same for AArch64, with the instructions of `extension`: `v0` to `v2` are loaded from
 /// where the three arguments point, and `v0` is written where the third does.
 pub(super) fn neon_instruction(extension: &str, instruction: &str) -> String {

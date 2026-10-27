@@ -39,6 +39,7 @@ use super::{
 };
 
 mod emitted;
+pub(super) mod intrinsic;
 mod lower;
 mod rebase;
 

@@ -610,6 +610,8 @@ fn main() {
     println!("lifetime_impl_consts {}", cases::lifetime_impl_consts::run());
     #[cfg(target_arch = "x86_64")]
     println!("simd_x86 {}", cases::simd_x86::run());
+    #[cfg(target_arch = "x86_64")]
+    println!("llvm_intrinsics_x86 {}", cases::llvm_intrinsics_x86::run());
     #[cfg(target_arch = "aarch64")]
     println!("simd_aarch64 {}", cases::simd_aarch64::run());
     // Threads.

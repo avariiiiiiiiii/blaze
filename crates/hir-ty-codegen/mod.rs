@@ -10553,27 +10553,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 AsmOperand::Const(value) => {
                     let value = self.assigned_constant(value).unwrap_or(value);
                     let ty = self.operand_ty(value)?;
-                    let bits = match &value.kind {
-                        OperandKind::Allocation { allocation }
-                            if matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_)) =>
-                        {
-                            let mut bytes = [0; 16];
-                            let memory = &allocation.as_ref().memory;
-                            bytes[..memory.len()].copy_from_slice(memory);
-                            Some(u128::from_le_bytes(bytes))
-                        }
-                        OperandKind::Constant { konst, .. }
-                            if matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_))
-                                && let ConstKind::Unevaluated(named) = konst.as_ref().kind() =>
-                        {
-                            let mut bytes = [0; 16];
-                            let memory = &self.eval_const(named)?.memory;
-                            bytes[..memory.len()].copy_from_slice(memory);
-                            Some(u128::from_le_bytes(bytes))
-                        }
-                        _ => self.const_bits(value),
-                    };
-                    let Some(bits) = bits else {
+                    let Some(bits) = self.immediate_bits(value)? else {
                         unsupported!("an `asm!` constant that is not a literal");
                     };
                     let unused = 128 - self.layout(ty)?.size.bits() as u32;
@@ -10650,10 +10630,34 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// The bits of an integer, `bool` or `char` operand known while compiling: a literal, a
+    /// named constant evaluated here, or a temporary that holds one ([`Self::assigned_constant`]).
+    /// What an `asm!` block's `const` and an LLVM intrinsic's `immarg` operand are.
+    fn immediate_bits(&mut self, operand: &Operand) -> Result<Option<u128>> {
+        let operand = self.assigned_constant(operand).unwrap_or(operand);
+        let ty = self.operand_ty(operand)?;
+        let int = matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_));
+        let memory = match &operand.kind {
+            OperandKind::Allocation { allocation } if int => allocation.as_ref().memory.clone(),
+            OperandKind::Constant { konst, .. }
+                if int && let ConstKind::Unevaluated(named) = konst.as_ref().kind() =>
+            {
+                self.eval_const(named)?.memory.clone()
+            }
+            _ => return Ok(self.const_bits(operand)),
+        };
+        let mut bytes = [0; 16];
+        bytes[..memory.len()].copy_from_slice(&memory);
+        Ok(Some(u128::from_le_bytes(bytes)))
+    }
+
     /// The constant a temporary holds, when `operand` reads one that was given a constant
-    /// and nothing else: a named constant is lowered to that.
+    /// and nothing else: a named constant or a const parameter is lowered to that, and read
+    /// by a move when its type is `Copy`.
     fn assigned_constant(&self, operand: &Operand) -> Option<&'db Operand> {
-        let OperandKind::Copy(place) = &operand.kind else { return None };
+        let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
+            return None;
+        };
         let mut assigned = self.body?.basic_blocks.iter().flat_map(|(_, block)| {
             block.statements.iter().filter_map(|it| match &it.kind {
                 StatementKind::Assign(to, rvalue) if to.local == place.local => Some((to, rvalue)),
@@ -15323,9 +15327,97 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("x86.avx.vzeroupper", []) => {}
             // A hint to the cache, which the program behaves the same without.
             ("prefetch.p0", [_address, _write, _locality, _cache]) => {}
-            _ => unsupported!("LLVM intrinsic `{name}`"),
+            #[cfg(feature = "llvm")]
+            _ => self.llvm_helper(name, args, dst, dst_ty)?,
+            #[cfg(not(feature = "llvm"))]
+            _ => unsupported!(
+                "LLVM intrinsic `{name}`: this ra-jit is built without LLVM, which compiles \
+                 what has no lowering here (`--features llvm`)"
+            ),
         }
         Ok(())
+    }
+
+    /// An LLVM intrinsic with no lowering here, as rustc has it: a call of LLVM's. The call
+    /// is in a function LLVM compiles of it (`llvm/intrinsic.rs`), which is passed where
+    /// each operand is and where `dst` is, for the target features of the function the
+    /// call is in.
+    #[cfg(feature = "llvm")]
+    fn llvm_helper(
+        &mut self,
+        name: &str,
+        args: &[Operand],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<()> {
+        use llvm::intrinsic;
+        let mut operands = Vec::with_capacity(args.len());
+        for arg in args {
+            let ty = self.operand_ty(arg)?;
+            operands.push(intrinsic::Operand {
+                shape: self.intrinsic_shape(ty)?,
+                size: self.layout(ty)?.size.bytes(),
+                constant: self.immediate_bits(arg)?,
+            });
+        }
+        let func = self.body.and_then(|it| it.owner.as_function());
+        let features = func.into_iter().flat_map(|it| AttrFlags::target_features(self.cg.db, it));
+        let mut features: Vec<String> = features.map(|it| it.as_str().to_owned()).collect();
+        features.sort_unstable();
+        let call = intrinsic::Call {
+            name: name.to_owned(),
+            operands,
+            result: self.intrinsic_shape(dst_ty)?,
+            result_size: self.layout(dst_ty)?.size.bytes(),
+            features,
+        };
+        let helper = intrinsic::helper(&call).map_err(|why| {
+            CodegenError::Unsupported(format!("LLVM intrinsic `{name}`: {why}"))
+        })?;
+        let mut addresses = Vec::with_capacity(args.len() + 1);
+        for (arg, passed) in args.iter().zip(&helper.passed) {
+            if *passed {
+                addresses.push(self.operand(arg)?.0);
+            }
+        }
+        if helper.returns {
+            addresses.push(dst);
+        }
+        let mut sig = self.cg.make_signature();
+        sig.params.extend(addresses.iter().map(|_| AbiParam::new(ptr())));
+        let callee = self.cg.assembly(helper.text.clone(), &sig);
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        self.builder.ins().call(callee, &addresses);
+        Ok(())
+    }
+
+    /// How a value of `ty` is laid out, as the helper of an LLVM intrinsic is told.
+    #[cfg(feature = "llvm")]
+    fn intrinsic_shape(&self, ty: Ty<'db>) -> Result<llvm::intrinsic::Shape> {
+        use llvm::intrinsic::{Scalar, Shape};
+        let layout = self.layout(ty)?;
+        if let TyKind::Tuple(tys) = ty.kind() {
+            if tys.is_empty() {
+                return Ok(Shape::Unit);
+            }
+            let mut fields = Vec::with_capacity(tys.len());
+            for (index, field) in tys.iter().enumerate() {
+                fields.push((layout.fields.offset(index).bytes(), self.layout(field)?.size.bytes()));
+            }
+            return Ok(Shape::Fields(fields));
+        }
+        let scalar = |scalar: rustc_abi::Scalar| match scalar.primitive() {
+            Primitive::Int(int, _) => Scalar::Int(int.size().bits() as u32),
+            Primitive::Float(float) => Scalar::Float(float.size().bits() as u32),
+            Primitive::Pointer(_) => Scalar::Pointer,
+        };
+        Ok(match layout.backend_repr {
+            BackendRepr::Scalar(it) => Shape::Scalar(scalar(it)),
+            BackendRepr::SimdVector { element, count } => {
+                Shape::Vector { lane: scalar(element), count: count.as_u64() as u32 }
+            }
+            _ => Shape::Bytes,
+        })
     }
 
     /// The lane type and lane count of a vector type. Lanes sit in memory in order.

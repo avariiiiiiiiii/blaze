@@ -4903,6 +4903,101 @@ pub mod simd_x86 {
     }
 }
 
+/// `core::arch` functions that call an LLVM intrinsic ra-jit has no lowering of, which a
+/// function LLVM compiles of the intrinsic runs (`llvm/intrinsic.rs`): the SSE ones glam and
+/// tiny_skia reach, crc_fast's CRC-32 and AVX-512, masks, immediates that are const generics,
+/// a result of two values, and the instructions of extensions a processor may lack.
+#[cfg(target_arch = "x86_64")]
+#[rustfmt::skip]
+pub mod llvm_intrinsics_x86 {
+    use core::arch::x86_64::*;
+    use core::mem::transmute;
+
+    fn floats(a: [f32; 4]) -> __m128 { unsafe { transmute(a) } }
+    pub fn sse(a: [f32; 4], b: [f32; 4], count: i64) -> ([f32; 4], [f32; 4], [u32; 4], [i32; 4], [i32; 4], [u32; 4]) { unsafe {
+        let (x, y) = (floats(a), floats(b));
+        let rcp: [f32; 4] = transmute(_mm_rcp_ps(x));
+        (transmute(_mm_min_ps(x, y)), transmute(_mm_max_ps(x, y)), rcp.map(f32::to_bits),
+         transmute(_mm_cvtps_epi32(x)), transmute(_mm_cvttps_epi32(y)),
+         transmute(_mm_srl_epi32(transmute(a), _mm_set_epi64x(0, count))))
+    } }
+    #[target_feature(enable = "sse4.2")]
+    pub unsafe fn crc(seed: u32, bytes: &[u8]) -> (u32, u32, u32, u64) {
+        let mut a = seed;
+        for &byte in bytes { a = _mm_crc32_u8(a, byte); }
+        let b = bytes.chunks_exact(2).fold(seed, |crc, it| _mm_crc32_u16(crc, u16::from_le_bytes([it[0], it[1]])));
+        let c = bytes.chunks_exact(4).fold(seed, |crc, it| _mm_crc32_u32(crc, u32::from_le_bytes(it.try_into().unwrap())));
+        let d = bytes.chunks_exact(8).fold(seed as u64, |crc, it| _mm_crc32_u64(crc, u64::from_le_bytes(it.try_into().unwrap())));
+        (a, b, c, d)
+    }
+    #[target_feature(enable = "sse4.1")]
+    pub unsafe fn round(a: [f32; 4], b: [f64; 2]) -> ([f32; 4], [f32; 4], [f64; 2]) {
+        let (x, y): (__m128, __m128d) = (transmute(a), transmute(b));
+        (transmute(_mm_round_ps::<_MM_FROUND_TO_NEG_INF>(x)), transmute(_mm_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(x)),
+         transmute(_mm_round_sd::<_MM_FROUND_TO_ZERO>(y, y)))
+    }
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn sign(a: [i8; 16], b: [i8; 16]) -> [i8; 16] { transmute(_mm_sign_epi8(transmute(a), transmute(b))) }
+    pub fn carry(a: u32, b: u32) -> (u8, u32, u8, u32) {
+        let (mut x, mut y) = (0, 0);
+        let c = unsafe { _addcarry_u32(0, a, b, &mut x) };
+        let d = unsafe { _addcarry_u32(1, b, a, &mut y) };
+        (c, x, d, y)
+    }
+    #[target_feature(enable = "aes")]
+    pub unsafe fn aes(a: [u8; 16], key: [u8; 16]) -> ([u8; 16], [u8; 16]) {
+        let (a, key) = (transmute(a), transmute(key));
+        (transmute(_mm_aesenc_si128(a, key)), transmute(_mm_aesdeclast_si128(a, key)))
+    }
+    #[target_feature(enable = "gfni")]
+    pub unsafe fn gf(a: [u8; 16], b: [u8; 16]) -> [u8; 16] { transmute(_mm_gf2p8mul_epi8(transmute(a), transmute(b))) }
+    #[target_feature(enable = "avx512f,avx512vl")]
+    pub unsafe fn ternary(a: [u64; 8], b: [u64; 8], c: [u64; 8]) -> ([u64; 2], [u64; 8], [u64; 8]) {
+        let (x, y, z): (__m512i, __m512i, __m512i) = (transmute(a), transmute(b), transmute(c));
+        let narrow = _mm_ternarylogic_epi64::<0x96>(_mm512_castsi512_si128(x), _mm512_castsi512_si128(y), _mm512_castsi512_si128(z));
+        (transmute(narrow), transmute(_mm512_ternarylogic_epi64::<0xe8>(x, y, z)), transmute(_mm512_ternarylogic_epi64::<0x1b>(x, y, z)))
+    }
+    #[target_feature(enable = "avx512bw")]
+    pub unsafe fn shuffle(table: [u8; 64], indices: [u8; 64]) -> [u8; 64] { transmute(_mm512_shuffle_epi8(transmute(table), transmute(indices))) }
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn masked(a: [i32; 16], b: [i32; 16], f: [f32; 16], d: [f64; 8], mask: u16) -> ([i32; 16], [i32; 16], [i32; 16], [f32; 8], [i8; 16], [i32; 16], u16, [u32; 16]) {
+        let (x, y): (__m512i, __m512i) = (transmute(a), transmute(b));
+        let g: __m512 = transmute(f);
+        let rcp: [f32; 16] = transmute(_mm512_maskz_rcp14_ps(mask, g));
+        (transmute(_mm512_mask_add_epi32(x, mask, x, y)), transmute(_mm512_mask_cvtps_epi32(y, mask, g)),
+         transmute(_mm512_cvt_roundps_epi32::<{ _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC }>(g)),
+         transmute(_mm512_cvtpd_ps(transmute(d))), transmute(_mm512_mask_cvtsepi32_epi8(transmute([7i8; 16]), mask, y)),
+         transmute(_mm512_permutexvar_epi32(y, x)), _mm512_cmp_ps_mask::<_CMP_LT_OQ>(g, _mm512_set1_ps(0.5)),
+         rcp.map(f32::to_bits))
+    }
+    pub fn run() -> String {
+        let a = [1.5, -0.0, f32::NAN, -7.25];
+        let b = [0.0, 0.0, 3.0, 2.5e9];
+        let mut out = format!("{:?}", sse(a, b, 3));
+        out += &format!(" {:?}", sse(b, a, 40));
+        let bytes: Vec<u8> = (0..64u32).map(|i| (i * 37 ^ 0x5a) as u8).collect();
+        let lanes: [i32; 16] = core::array::from_fn(|i| (i as i32 - 5) * 1_000_003);
+        let others: [i32; 16] = core::array::from_fn(|i| (i as i32 * 7919) ^ -300);
+        let singles: [f32; 16] = core::array::from_fn(|i| (i as f32 - 7.5) * 1.75);
+        let doubles: [f64; 8] = core::array::from_fn(|i| (i as f64 - 3.3) * 1e30);
+        let words: [u64; 8] = core::array::from_fn(|i| 0x0123_4567_89ab_cdef_u64.rotate_left(i as u32 * 9));
+        let table: [u8; 64] = bytes.clone().try_into().unwrap();
+        let indices: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ if i % 5 == 0 { 0x80 } else { 0 });
+        out += &format!(" {:?}", carry(u32::MAX - 3, 9));
+        if is_x86_feature_detected!("sse4.2") { out += &format!(" {:?}", unsafe { crc(0xffff_ffff, &bytes) }); }
+        if is_x86_feature_detected!("sse4.1") { out += &format!(" {:?}", unsafe { round([1.5, -2.5, 3.7, -0.2], [-8.9, 4.0]) }); }
+        if is_x86_feature_detected!("ssse3") { out += &format!(" {:?}", unsafe { sign(core::array::from_fn(|i| i as i8 * 9 - 60), core::array::from_fn(|i| i as i8 - 8)) }); }
+        if is_x86_feature_detected!("aes") { out += &format!(" {:?}", unsafe { aes(table[..16].try_into().unwrap(), table[16..32].try_into().unwrap()) }); }
+        if is_x86_feature_detected!("gfni") { out += &format!(" {:?}", unsafe { gf(table[..16].try_into().unwrap(), table[48..].try_into().unwrap()) }); }
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") {
+            out += &format!(" {:?}", unsafe { ternary(words, words.map(|it| it.rotate_left(17)), words.map(|it| !it)) });
+        }
+        if is_x86_feature_detected!("avx512bw") { out += &format!(" {:?}", unsafe { shuffle(table, indices) }); }
+        if is_x86_feature_detected!("avx512f") { out += &format!(" {:?}", unsafe { masked(lanes, others, singles, doubles, 0b1011_0110_0101_1001) }); }
+        out
+    }
+}
+
 /// `core::arch` vector functions of AArch64: lanes, immediates that are const generics, table
 /// lookups, reductions across a vector, and the narrowing shift a byte search ends with.
 #[cfg(target_arch = "aarch64")]

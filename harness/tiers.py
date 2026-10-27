@@ -193,7 +193,8 @@ async def main() -> None:
         source.write_text(text.replace(needle, "if n == 3 || n == 2 { age + 1 } else { 0 }"))
         await build("edit of next_age while it runs", project, env)
         deadline = time.monotonic() + 10
-        demoted = lambda: [it for it in program.events[events_before:] if it.startswith("next_age: back to Cranelift")]
+        # A function is shown by its path: `lifebench::next_age`.
+        demoted = lambda: [it for it in program.events[events_before:] if re.match(r"(?:\S*::)?next_age: back to Cranelift", it)]
         while not demoted() and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
         if not demoted():

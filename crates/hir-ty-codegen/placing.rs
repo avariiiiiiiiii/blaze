@@ -433,12 +433,29 @@ impl Places {
 }
 
 /// Each of `owners` lowered, on the threads `fan` has: `None` for one whose syntax is gone.
+/// Whether the file of `owner` still has it: one an edit took away has no body to lower.
+fn written(db: &dyn HirDatabase, owner: DefWithBodyId) -> bool {
+    fn has<N: syntax::AstNode>(db: &dyn HirDatabase, id: hir_expand::AstId<N>) -> bool {
+        id.file_id.ast_id_map(db).try_get_erased(id.value.erase()).is_some()
+    }
+    use hir_def::Lookup;
+    match owner {
+        DefWithBodyId::FunctionId(it) => has(db, it.lookup(db).id),
+        DefWithBodyId::ConstId(it) => has(db, it.lookup(db).id),
+        DefWithBodyId::StaticId(it) => has(db, it.lookup(db).id),
+        DefWithBodyId::VariantId(_) => true,
+    }
+}
+
 fn lowered_all(
     db: &dyn HirDatabase,
     owners: &[DefWithBodyId],
     fan: &Fan<'_>,
 ) -> Vec<Option<triomphe::Arc<Body>>> {
     let lowered = |db: &dyn HirDatabase, owner: DefWithBodyId| {
+        if !written(db, owner) {
+            return None;
+        }
         probe(|| match Body::relative(db, owner) {
             Some((body, _)) => body.clone(),
             None => Body::with_source_map(db, owner).0.clone(),

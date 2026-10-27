@@ -49,3 +49,15 @@ Reading it:
 Per workspace load: config get toml, --version, rustc --print cfg, rustc --print
 target-spec-json, sysroot metadata x2, build --unit-graph, config get json, check
 --compile-time-deps = 9, plus 2 per unit load.
+
+## Step 2: removal, in parallel sub-lanes (started 2026-10-27 ~02:15 PDT)
+Shared brief: /tmp/blaze-lanes/nocargo-sub-common.md. Each has worktree
+/Volumes/Projects/blaze-nocargo-<sub>-1027, branch nocargo-<sub>, VM nc-<sub>, own HANDOFF.md.
+- `sysroot`: sysroot.rs load_library_via_cargo (2 per load, biggest) -> blaze-metadata.
+- `toolq`: config get toml/json, --version, rustc --print cfg / target-spec-json; workspace.rs
+  "so cargo does" fallbacks -> errors.
+- `unitgraph`: plan.rs UnitGraph::of -> pure unit graph in cargo's schema (#458-shaped).
+- `ctdeps`: --compile-time-deps -> blaze's own build-script/proc-macro driver over the unit graph
+  (depends on unitgraph to land the switch).
+Parent: wait for them, re-trace after merges (r2), update docs/no-rustc.md, write
+/tmp/blaze-lanes/nocargo.result.md. Parent VM `nocargo` still up for re-traces.

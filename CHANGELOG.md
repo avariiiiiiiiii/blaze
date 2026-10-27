@@ -1001,6 +1001,11 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- A closure that captures nothing, coerced to `fn` and borrowed as part of a constant, is
+  promoted as rustc promotes it: minijinja's `type_erase!` vtable, so `tract-linalg`'s build
+  script runs. blaze lowered it as a temporary of the frame, so the reference outlived it: the
+  borrow checker said E0515, and without it the call through the table jumped to 0.
+  `harness/breakers` has the case (`promoted_closure_table`).
 - The borrow checker: lifetime elision counts none of the impl's lifetimes in a parameter
   that writes `Self`, as rustc counts only what a parameter's type writes or elides, so
   `fn store(self, db: &dyn Db) -> &Store` in `impl Id<'_>` returns a borrow of `db`. It

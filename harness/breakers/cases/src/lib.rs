@@ -40,6 +40,7 @@ cases![
     sha_ni,
     const_bytes_match,
     link_name_macro,
+    promoted_closure_table,
     const_pattern,
     cfg_variant_match,
     powi,

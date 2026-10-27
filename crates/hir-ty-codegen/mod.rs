@@ -1579,10 +1579,17 @@ impl Rejections {
     }
 
     /// After an edit of `files`, once what changed in them is noted: which bodies the base
-    /// finds the places of apart from their code lower otherwise now.
-    pub fn after_edit(&mut self, db: &dyn HirDatabase, files: &[base_db::FileId], fan: &Fan<'_>) {
+    /// finds the places of apart from their code lower otherwise now. Of `respaced` the edit
+    /// changed no token, and their bodies lower as they did.
+    pub fn after_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[base_db::FileId],
+        respaced: &[base_db::FileId],
+        fan: &Fan<'_>,
+    ) {
         if let Some(base) = &mut self.base {
-            base.after_edit(db, files, fan);
+            base.after_edit(db, files, respaced, fan);
         }
     }
 

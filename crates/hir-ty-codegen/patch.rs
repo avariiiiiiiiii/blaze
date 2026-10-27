@@ -2393,8 +2393,15 @@ impl Base {
 
     /// After an edit of `files`: which bodies of the code whose places are found apart from it
     /// lower otherwise now.
-    pub(super) fn after_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
+    pub(super) fn after_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[FileId],
+        respaced: &[FileId],
+        fan: &Fan<'_>,
+    ) {
         let start = std::time::Instant::now();
+        self.places.respaced(respaced);
         self.places.after_edit(db, files, fan);
         if std::env::var_os("RA_JIT_STATS").is_some() {
             eprintln!(

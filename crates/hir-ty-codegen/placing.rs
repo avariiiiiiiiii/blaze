@@ -235,6 +235,9 @@ pub(super) struct Places {
     /// The files edited since the base was built, whose places are found again for every
     /// patch.
     edited: FxHashSet<FileId>,
+    /// The files of `edited` that no edit since the base changed a token of: their bodies
+    /// lower as the base has them, and are taken in before the first edit that changes more.
+    unread: FxHashSet<FileId>,
     /// Each body of `edited` lowered as the spans of its places are of: the base's, or those
     /// the last look that asked its code found. `None` for one that a file edited without
     /// being looked at first has, or whose syntax is gone.
@@ -290,13 +293,24 @@ impl Places {
     /// Before an edit of `files`, of the revision before it: the bodies of those not edited
     /// since the base, lowered as the base has them.
     pub(super) fn before_edit(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>) {
-        let new: Vec<FileId> =
-            files.iter().copied().filter(|it| !self.edited.contains(it)).collect();
+        let new: Vec<FileId> = (files.iter().copied())
+            .filter(|it| !self.edited.contains(it) || self.unread.remove(it))
+            .collect();
         let owners = self.owners_of(&new);
         for (owner, written) in owners.iter().zip(lowered_all(db, &owners, fan)) {
             self.written.insert(*owner, written);
         }
         self.edited.extend(new);
+    }
+
+    /// After an edit that changed no token of `files`, only where they are: their places are
+    /// found again for every patch.
+    pub(super) fn respaced(&mut self, files: &[FileId]) {
+        for &file in files {
+            if self.edited.insert(file) {
+                self.unread.insert(file);
+            }
+        }
     }
 
     /// After an edit of `files`: which of their bodies lower otherwise now. A file edited

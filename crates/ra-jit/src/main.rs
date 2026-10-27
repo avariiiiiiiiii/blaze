@@ -5665,6 +5665,37 @@ fn broken_in(
     Some(errors::Said(said))
 }
 
+/// The files `texts` respace ([`outline::respaced`]), of those no proc macro has asked the
+/// text or the positions of. Asked before the texts are the database's.
+fn respaced(db: &RootDatabase, texts: &[(vfs::FileId, String)]) -> Vec<vfs::FileId> {
+    let one = |db: &RootDatabase, (file, text): &(vfs::FileId, String)| {
+        let crates = ide_db::base_db::relevant_crates(db, *file);
+        let edition = crates.first().map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
+        let was = db.file_text(*file).text(db);
+        let respaced = !load_cargo::places_read(*file) && outline::respaced(edition, &was, text);
+        respaced.then_some(*file)
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(texts.len());
+    if threads <= 1 {
+        return texts.iter().filter_map(|it| one(db, it)).collect();
+    }
+    let mut respaced: Vec<vfs::FileId> = std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads)
+            .map(|part| {
+                let db = db.clone();
+                let one = &one;
+                scope.spawn(move || {
+                    let mine = texts.iter().skip(part).step_by(threads);
+                    mine.filter_map(|it| one(&db, it)).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        parts.into_iter().flat_map(|it| it.join().unwrap_or_default()).collect()
+    });
+    respaced.sort_unstable();
+    respaced
+}
+
 /// The text of the source file at `path` as the database has it.
 fn source_on_disk(path: &Path) -> std::io::Result<String> {
     let text = std::fs::read_to_string(path)?;
@@ -9091,35 +9122,46 @@ fn run_holding(
                 Watched::Included(path) => included.push(path.clone()),
             }
         }
+        let respaced = respaced(&db, &texts);
+        let looked: Vec<vfs::FileId> =
+            editing.iter().copied().filter(|it| !respaced.contains(it)).collect();
         // An edit that adds functions to a crate, or takes them away, is a patch when what
         // rustc compiled of every file of the crate is known from before it.
         let homing = programs.iter().any(|it| it.known.homes());
-        let mut homed = outlines.adding(&db, &listed, if homing { &texts } else { &[] });
+        let adding: Vec<(vfs::FileId, String)> = match homing {
+            true => texts.iter().filter(|it| !respaced.contains(&it.0)).cloned().collect(),
+            false => Vec::new(),
+        };
+        let mut homed = outlines.adding(&db, &listed, &adding);
         homed.extend(&editing);
         homed.sort_unstable();
         homed.dedup();
         let homes = read.elapsed();
         home_in_rustcs(&db, &listed, &mut programs, &homed);
         let homed_in = read.elapsed();
-        outlines.before_edit(&db, &listed, &editing);
+        outlines.before_edit(&db, &listed, &looked);
+        outlines.before_respace(&db, &respaced);
         let outlined = read.elapsed();
         let mut checked = Duration::ZERO;
         // What moves would be found by is kept from before an edit only when its texts can move
         // an item between its files, and its push is not refused already: a file gone is
         // written empty.
-        let written: Vec<_> = (texts.iter().map(|(file, text)| (*file, text.as_str())))
+        let written: Vec<_> = (texts.iter())
+            .filter(|it| !respaced.contains(&it.0))
+            .map(|(file, text)| (*file, text.as_str()))
             .chain(emptied.iter().map(|&file| (file, "")))
             .collect();
-        let moves = editing.len() >= 2
-            && programs.iter().any(|it| it.known.keeps_moves_of(&editing))
+        let moves = looked.len() >= 2
+            && programs.iter().any(|it| it.known.keeps_moves_of(&looked))
             && blaze_items::moves_written(&db, &written);
         for program in &mut programs {
             let at = Instant::now();
-            program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);
+            program.checked.before_edit(&db, &listed, &looked, &program.unbuilt.edited);
             checked += at.elapsed();
-            program.known.before_edit(&db, &editing, &|count, each| fan(&db, count, each), moves);
+            program.known.before_edit(&db, &looked, &|count, each| fan(&db, count, each), moves);
         }
         if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!("respaced: {} of {} files", respaced.len(), editing.len());
             eprintln!(
                 "read-us: texts={} homes={} outlines={} checked={} known={}",
                 homes.as_micros(),
@@ -9206,7 +9248,10 @@ fn run_holding(
             let args = &program.args;
             let own = crates_named(&db, &args.krate, args).ok();
             let own = own.and_then(|it| it.first().map(|it| it.root_file(&db)));
-            let edited = sources.iter().filter(|it| !untouched.contains(it) || own == Some(**it));
+            // A file respaced has the errors it had, where the program was built from.
+            let edited = (sources.iter())
+                .filter(|it| !untouched.contains(it) || own == Some(**it))
+                .filter(|it| !respaced.contains(it));
             let unbuilt = &mut program.unbuilt;
             unbuilt.stale |= changed != 0;
             unbuilt.edited.extend(edited);
@@ -9222,8 +9267,11 @@ fn run_holding(
             .collect();
         let paths = Arc::new(Sources { paths });
         let before_outlines = start.elapsed();
+        let sources: Vec<vfs::FileId> =
+            sources.into_iter().filter(|it| !respaced.contains(it)).collect();
         let edited_sources = sources.clone();
-        let sources = outlines.after_edit(&db, &listed, sources);
+        let mut sources = outlines.after_edit(&db, &listed, sources);
+        sources.extend(outlines.respaced(&db, &respaced));
         let outlined = start.elapsed();
         // The files that changed in more than what the outline tells, and their crates: what
         // changed is told by their items, together, as an item moved from one to another is.
@@ -9297,7 +9345,9 @@ fn run_holding(
         }
         {
             let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
-            programs.iter_mut().for_each(|it| it.known.after_edit(&db, &edited_sources, fan));
+            for program in &mut programs {
+                program.known.after_edit(&db, &edited_sources, &respaced, fan);
+            }
         }
         if !moved.is_empty() {
             programs.iter_mut().for_each(|it| {

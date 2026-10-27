@@ -19,7 +19,7 @@ from cargo_ra_jit import Side, wait_warm
 from memsplit import logs, wait_own_base
 
 # What the daemon says of an edit with RA_JIT_STATS: how it took the change and what it looked at.
-SAID = re.compile(r"(bodies only|signatures only|functions added|items|items-us|items-made|items-before|items-pushed|items-refused|items-settled|items-moved|items-unmoved|items-codes|patch-made|places|places-base|places-after|read-us|check-all|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
+SAID = re.compile(r"(bodies only|signatures only|functions added|items|items-us|items-made|items-before|items-pushed|items-refused|items-settled|items-moved|items-unmoved|items-codes|patch-made|places|places-base|places-after|respaced|read-us|check-all|apply-us|check-us|steps|backend|stats|patch|asked|timeline-us|edit-to-binary): ")
 
 
 def wait_items(daemon, timeout=300):

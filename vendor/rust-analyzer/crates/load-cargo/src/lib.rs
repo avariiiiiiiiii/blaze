@@ -797,6 +797,7 @@ impl ProcMacroExpander for Expander {
                     ast_id,
                     TextRange::new(TextSize::from(start), TextSize::from(end)),
                 );
+                place_read(range.file_id.file_id(db));
                 let source = db.file_text(range.file_id.file_id(db)).text(db);
                 let text = source
                     .get(usize::from(range.range.start())..usize::from(range.range.end()))
@@ -808,6 +809,7 @@ impl ProcMacroExpander for Expander {
             SubRequest::LineColumn { file_id, ast_id, offset } => {
                 let range =
                     resolve_sub_span(db, file_id, ast_id, TextRange::empty(TextSize::from(offset)));
+                place_read(range.file_id.file_id(db));
                 let (line, column) = db
                     .line_column(range.file_id.file_id(db), range.range.start())
                     .map(|(line, col)| (line + 1, col + 1))
@@ -835,6 +837,7 @@ impl ProcMacroExpander for Expander {
                     ast_id,
                     TextRange::new(TextSize::from(start), TextSize::from(end)),
                 );
+                place_read(range.file_id.file_id(db));
 
                 Ok(SubResponse::ByteRangeResult { range: range.range.into() })
             }
@@ -964,6 +967,21 @@ fn resolve_sub_span(
         ctx: SyntaxContext::root(editioned_file_id.edition()),
     };
     hir_expand::resolve_span(db, span)
+}
+
+/// The files a proc macro has asked the text or the positions of: what it expands to can
+/// change with an edit that leaves every token of them as it was.
+static PLACES_READ: sync::Mutex<Option<FxHashSet<FileId>>> = sync::Mutex::new(None);
+
+fn place_read(file: FileId) {
+    let mut read = PLACES_READ.lock().unwrap_or_else(|e| e.into_inner());
+    read.get_or_insert_default().insert(file);
+}
+
+/// Whether a proc macro has asked the text or the positions of `file`, at any expansion.
+pub fn places_read(file: FileId) -> bool {
+    let read = PLACES_READ.lock().unwrap_or_else(|e| e.into_inner());
+    read.as_ref().is_some_and(|it| it.contains(&file))
 }
 
 /// The text of a Rust source file as rustc reads it: a line that ends in CR LF ends in LF.

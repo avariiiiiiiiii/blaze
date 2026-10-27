@@ -142,6 +142,49 @@ impl Outlines {
         self.files.extend(new.into_iter().zip(outlines));
     }
 
+    /// Takes note of the files about to be [`respaced`], as rustc compiled them.
+    pub(crate) fn before_respace(&mut self, db: &RootDatabase, files: &[FileId]) {
+        for &file in files {
+            self.copied.entry(file).or_insert_with(|| copied(db, file));
+        }
+    }
+
+    /// What the edit just applied changed of files it [`respaced`]: their bodies alone, as
+    /// nothing else of them changed but where it is. Their outlines are found again when an
+    /// edit changes more of them: an outline can tell blank space in what a macro is handed.
+    pub(crate) fn respaced(&mut self, db: &RootDatabase, files: &[FileId]) -> Vec<Changed> {
+        let changed = |was: &FxHashMap<String, u64>, now: &FxHashMap<String, u64>| {
+            let mut changed: Vec<String> = (was.keys().chain(now.keys()))
+                .filter(|it| was.get(*it) != now.get(*it))
+                .cloned()
+                .collect();
+            changed.sort_unstable();
+            changed.dedup();
+            changed
+        };
+        let respaced = files.iter().map(|&file| {
+            self.files.remove(&file);
+            let (copied, generics, inline) = match self.copied.get(&file) {
+                Some(was) => {
+                    let now = copied(db, file);
+                    let generics = changed(&was.generics, &now.generics);
+                    (was.others != now.others, generics, changed(&was.inline, &now.inline))
+                }
+                None => (true, Vec::new(), Vec::new()),
+            };
+            Changed {
+                file,
+                bodies_only: true,
+                copied,
+                generics,
+                inline,
+                added: None,
+                signatures: Vec::new(),
+            }
+        });
+        respaced.collect()
+    }
+
     /// The files of the crates of each file the edit about to give them `texts` adds functions
     /// to, when it changes nothing else of it but bodies that nothing else sees into, no other
     /// crate depends on those, and no file of them names any of the new functions yet. Only
@@ -1368,10 +1411,58 @@ fn key_of(func: &ast::Fn) -> Option<(String, bool)> {
     Some((key.join("::"), alone))
 }
 
+/// Whether `now` is `was` written with other blank space and comments: the same tokens, each
+/// joined to the next as it was where a macro or the parser can tell, and the same doc
+/// comments, which are attributes. What is compiled of it is the same but for where it is.
+pub(crate) fn respaced(edition: Edition, was: &str, now: &str) -> bool {
+    let (was, now) = (syntax::LexedStr::new(edition, was), syntax::LexedStr::new(edition, now));
+    if was.errors().next().is_some() || now.errors().next().is_some() {
+        return false;
+    }
+    said(&was).eq(said(&now))
+}
+
+/// The tokens of `lexed` that say something, with whether each punctuation is joined to the
+/// next: the spacing a token tree has of it.
+fn said<'a>(lexed: &'a syntax::LexedStr<'_>) -> impl Iterator<Item = (SyntaxKind, &'a str, bool)> {
+    let joins = |next: SyntaxKind| next.is_punct() || next == SyntaxKind::LIFETIME_IDENT;
+    (0..lexed.len()).filter_map(move |at| {
+        let (kind, text) = (lexed.kind(at), lexed.text(at));
+        match kind {
+            SyntaxKind::WHITESPACE => None,
+            SyntaxKind::COMMENT if !is_doc(text) => None,
+            _ => {
+                let joint =
+                    kind.is_punct() && at + 1 < lexed.len() && joins(lexed.kind(at + 1));
+                Some((kind, text, joint))
+            }
+        }
+    })
+}
+
+/// Whether a comment is a doc comment, or could be: `////` and `/***` are not.
+fn is_doc(text: &str) -> bool {
+    ["///", "//!", "/**", "/*!"].iter().any(|it| text.starts_with(it))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use syntax::SourceFile;
+
+    #[test]
+    fn respacing_is_told_from_what_a_token_tree_has() {
+        let same = |was: &str, now: &str| respaced(Edition::CURRENT, was, now);
+        assert!(same("fn f(){ g(a,b) }", "fn f() {\n    g(a, b)\n}\n"));
+        assert!(same("fn f() { 1 } // one", "// none\nfn f() {\n    1\n}"));
+        assert!(same("fn f() { m!(a + b) }", "fn f() { m!(a+b) }"));
+        assert!(!same("fn f() { m!(a - -b) }", "fn f() { m!(a --b) }"));
+        assert!(!same("fn f() { m!(<- a) }", "fn f() { m!(< - a) }"));
+        assert!(!same("/// one\nfn f() {}", "/// one \nfn f() {}"));
+        assert!(!same("fn f() { \"a b\" }", "fn f() { \"a  b\" }"));
+        assert!(!same("fn f() { 1 }", "fn f() { 2 }"));
+        assert!(!same("fn f() { \"a }", "fn f() { \"a  }"));
+    }
 
     fn hash(text: &str) -> u64 {
         let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();

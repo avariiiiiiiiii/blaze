@@ -57,6 +57,9 @@ GATE = ".github/workflows/blaze.yaml"
 BUILD = "linux x64 / build"
 # How often a wait asks again.
 POLL_SECS = 60
+# How long a pushed commit's gate run may take to appear before the push counts as having none.
+RUN_GRACE_SECS = 300
+STARTED = time.monotonic()
 
 
 @dataclass(frozen=True)
@@ -151,10 +154,11 @@ def build(sha, pushed=False):
     """Where main's build of `sha` is: "built" (`linux x64 / build` passed), "failed",
     "building", or "none" (the gate builds nothing for it: a change to nothing the build reads,
     or no gate run, which a commit pushed by a workflow's own token has). With `pushed`, `sha`
-    was just pushed and its run may not be there yet: no run is "building"."""
+    was just pushed and its run may not be there yet: no run is "building" for the first
+    `RUN_GRACE_SECS` of the wait, and "none" after."""
     gate = gate_run(sha)
     if gate is None:
-        return ("building" if pushed else "none"), None
+        return ("building" if pushed and time.monotonic() < STARTED + RUN_GRACE_SECS else "none"), None
     jobs = {j["name"]: j for j in json.loads(run("gh", "api", f"repos/{REPO}/actions/runs/{gate['id']}/jobs?filter=latest&per_page=100"))["jobs"]}
     if job := jobs.get(BUILD):
         if job["status"] != "completed":

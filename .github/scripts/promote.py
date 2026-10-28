@@ -6,8 +6,8 @@
         step outputs `tag`, `sha`, `prerelease`
     promote.py tested '{"tag": "v0.YYYYMMDD.N", "sha": "<its commit>", "wait_minutes": 300}'
         main's merge gate passed on the tag's commit: blaze.yaml's run on the push of that
-        commit to main (the build and every unit test on Linux x86-64, Linux AArch64 and
-        macOS) ended green. A canary is cut once that run's Linux x86-64 build passes, before
+        commit to main ended green, the whole run, with its unit tests (`<platform> / tests`)
+        run and passed on Linux x86-64, Linux AArch64 and macOS. A canary is cut once that run's Linux x86-64 build passes, before
         its tests; stable needs them. A run still going is waited for, at most `wait_minutes`;
         no run, a red one, or one still going after that is an error naming the commit and the
         run, and the release stays a canary

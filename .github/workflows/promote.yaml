@@ -51,7 +51,7 @@ on:
       - "harness/smoke.py"
       - "harness/smoke/**"
 
-# One gate at a time: with a canary per green main, a run waiting is replaced by a newer
+# One gate at a time: with a canary per built main, a run waiting is replaced by a newer
 # canary's, so the gate tests the newest canary when it is free (an untested canary just stays
 # a canary). A pull request's runs, and a dispatch on another branch (a check of the gate
 # itself), are a group of their own, so they never hold a canary up.

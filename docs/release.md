@@ -7,8 +7,8 @@ blaze has two release channels, made of the same releases:
   without waiting for the unit tests or the other platforms. It is published as a GitHub
   *prerelease*.
 - **stable** (the default): a canary that then passed the heavy tests, unchanged, and whose
-  commit passed main's whole merge gate: the build and the unit tests on Linux x86-64, Linux
-  ARM64 and macOS. Promotion builds nothing: the archives users get on stable are the bytes that
+  commit passed main's whole merge gate: its whole run green, with the unit tests on Linux
+  x86-64, Linux ARM64 and macOS. Promotion builds nothing: the archives users get on stable are the bytes that
   were tested as canary.
 
 ## Versions
@@ -113,7 +113,8 @@ published archives, installed with `install.sh --version <v>` as a user installs
 - the train (`train.yaml`, every tier on every platform), dispatched on the tag: built from the
   commit the archives were built from. A train on a tag releases nothing and opens no issue;
 - main's tests (`promote.py tested`): the merge gate's run on the push of the tag's commit to
-  main is green, and its unit tests (`linux x64 / tests`, `linux arm64 / tests`, `macos arm64 /
+  main is green (the whole run: every job of it, the smoke corpus's std cases and the script
+  checks too), and its unit tests (`linux x64 / tests`, `linux arm64 / tests`, `macos arm64 /
   tests`) ran and passed on that exact commit. The canary was cut before they finished, so the
   job waits for the run while it is going, polling every two minutes for up to five hours, beside
   the other jobs, which take longer. No run, a red run, a run that skipped the tests (a commit

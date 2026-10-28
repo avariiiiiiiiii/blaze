@@ -413,6 +413,47 @@ impl Build {
         strip
     }
 
+    /// Every step in the order it began, and the time spent at no step between them, as
+    /// `blaze why` lists them by `now_ns`: what it was, how long it took, and how many cores
+    /// the worker kept busy meanwhile.
+    pub fn why_steps(&self, now_ns: u64) -> Vec<String> {
+        // Shorter steps say nothing of where the time went.
+        const GAP_NS: u64 = 50_000_000;
+        const STEP_NS: u64 = 10_000_000;
+        let cores = |from: u64, to: u64| match self.busy_between(from, to) {
+            Some((busy, _)) => format!("  {busy:.1}/{} cores", self.cores_of),
+            None => String::new(),
+        };
+        let mut rows: Vec<(String, u64, String)> = Vec::new();
+        let mut free = 0;
+        for stepped in &self.steps {
+            if stepped.began_ns.saturating_sub(free) >= GAP_NS {
+                let gap = stepped.began_ns - free;
+                rows.push(("at no step".into(), gap, cores(free, stepped.began_ns)));
+            }
+            let ended = stepped.ended_ns.unwrap_or(now_ns);
+            free = free.max(ended);
+            let took_ns = ended.saturating_sub(stepped.began_ns);
+            if took_ns < STEP_NS {
+                continue;
+            }
+            let mut what = short(stepped.step, stepped.of.as_deref());
+            // `check 74 files` has its count already.
+            let of = stepped.of.as_deref().and_then(|it| it.rsplit(' ').next());
+            if let Some(count) = stepped.count().filter(|it| it.rsplit(' ').next() != of) {
+                what = format!("{what} {count}");
+            }
+            rows.push((what, took_ns, cores(stepped.began_ns, ended)));
+        }
+        if !rows.is_empty() && now_ns.saturating_sub(free) >= GAP_NS {
+            rows.push(("at no step".into(), now_ns - free, cores(free, now_ns)));
+        }
+        let width = rows.iter().map(|it| it.0.chars().count()).max().unwrap_or(0);
+        rows.iter()
+            .map(|(what, ns, cores)| format!("{what:<width$}  {:>6}{cores}", took(*ns)))
+            .collect()
+    }
+
     /// How many cores the worker kept busy at `at`, in hundredths: as it said last before.
     pub fn busy_at(&self, at: u64) -> Option<u32> {
         let after = self.cores.partition_point(|it| it.0 <= at);

@@ -62,6 +62,13 @@ struct Target {
 }
 
 impl Target {
+    /// Whether `-C target-feature=crt-static` changes how the target links, as its spec says.
+    fn respects_crt_static(&self) -> Option<bool> {
+        let spec: serde_json::Value =
+            serde_json::from_str(self.target_spec_json.values().next()?).ok()?;
+        Some(spec.get("crt-static-respected").and_then(|it| it.as_bool()).unwrap_or(false))
+    }
+
     /// The `target_feature`s of `cpu` with `features` turned on (`true`) and off in order,
     /// starting from `have`, the target's own; `None` for a CPU or feature rustc warns of or
     /// does not have.
@@ -190,16 +197,19 @@ struct Given<'a> {
     from_stdin: bool,
     extra_filename: bool,
     /// Whether a flag changes which warnings rustc shows, or how: its warnings are answered
-    /// only as they are shown with none.
+    /// only as they are shown with none, or when none are shown.
     diagnostics_set: bool,
+    /// `--cap-lints allow`, or `-A warnings` last of what is said of `warnings`: rustc shows
+    /// no warning at all.
+    warnings_hidden: bool,
+    lints_capped: bool,
 }
 
-/// The flags that change which warnings rustc shows, or how it shows them.
-const DIAGNOSTICS: [&str; 12] = [
-    "-A",
+/// The flags that change which warnings rustc shows, or how it shows them, but `-A` and
+/// `-W` of `warnings` and `--cap-lints allow`.
+const DIAGNOSTICS: [&str; 10] = [
     "-D",
     "-F",
-    "--allow",
     "--deny",
     "--forbid",
     "--force-warn",
@@ -292,9 +302,6 @@ impl<'a> Given<'a> {
                     _ => (word, None),
                 },
             };
-            if DIAGNOSTICS.contains(&flag) {
-                given.diagnostics_set = true;
-            }
             let mut value = || joined.or_else(|| words.next());
             match flag {
                 "-" => given.from_stdin = true,
@@ -342,7 +349,7 @@ impl<'a> Given<'a> {
                     _ => return None,
                 },
                 _ if LINTS.contains(&flag) || IGNORED_VALUED.contains(&flag) => {
-                    value()?;
+                    given.lint(flag, value()?);
                 }
                 // An input rustc does not read for what it is asked.
                 _ if !flag.starts_with('-') => {}
@@ -350,6 +357,16 @@ impl<'a> Given<'a> {
             }
         }
         Some(given)
+    }
+
+    fn lint(&mut self, flag: &str, value: &str) {
+        match (flag, value) {
+            ("--cap-lints", "allow") => self.lints_capped = true,
+            ("-A" | "--allow", "warnings") => self.warnings_hidden = true,
+            ("-W" | "--warn", "warnings") => self.warnings_hidden = false,
+            _ if DIAGNOSTICS.contains(&flag) => self.diagnostics_set = true,
+            _ => {}
+        }
     }
 
     fn debug_assertions(&self) -> bool {
@@ -572,6 +589,13 @@ pub fn answered(
                 cfgs.push(format!("panic=\"{panic}\""));
                 if given.crate_types.contains(&"proc-macro") {
                     cfgs.push("proc_macro".to_owned());
+                    // A proc macro is a dynamic library, which a target that respects
+                    // `crt-static` builds without it unless it is asked for.
+                    if !given.features.iter().any(|&(_, name)| name == "crt-static")
+                        && target.respects_crt_static()?
+                    {
+                        cfgs.retain(|it| it != "target_feature=\"crt-static\"");
+                    }
                 }
                 for cfg in &given.cfgs {
                     if !is_plain_cfg(cfg) {
@@ -593,7 +617,7 @@ pub fn answered(
         }
     }
     let mut warned = String::new();
-    if !dropped.is_empty() {
+    if !dropped.is_empty() && !given.lints_capped && !given.warnings_hidden {
         if given.diagnostics_set {
             return None;
         }
@@ -698,7 +722,23 @@ mod tests {
         );
         let args: Vec<OsString> = probe.split_whitespace().map(OsString::from).collect();
         assert_eq!(answer(&args, &[], &|_| None), None);
-        assert!(told(&format!("{probe} -A warnings")).is_none());
+        for hidden in ["-A warnings", "--cap-lints allow", "-Wwarnings -Awarnings"] {
+            let said = told(&format!("{probe} {hidden}")).expect("an answer with no warnings");
+            assert_eq!(said.stderr, b"");
+        }
+        assert!(told(&format!("{probe} -D warnings")).is_none());
+        assert!(
+            told(&format!("{probe} -A warnings -W warnings"))
+                .is_some_and(|it| !it.stderr.is_empty())
+        );
+        // A proc macro of a target that links statically by default has no `crt-static`.
+        let static_of = |kinds: &str| {
+            let said = told(&format!("--print cfg --target x86_64-unknown-linux-musl {kinds}"));
+            String::from_utf8(said.unwrap().stdout).unwrap().contains("\"crt-static\"")
+        };
+        assert!(static_of("--crate-type bin"));
+        assert!(!static_of("--crate-type bin --crate-type proc-macro"));
+        assert!(static_of("--crate-type proc-macro -C target-feature=+crt-static"));
     }
 
     #[test]

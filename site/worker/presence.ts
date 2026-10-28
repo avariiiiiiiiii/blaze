@@ -110,6 +110,7 @@ export async function handlePresence(request: Request, env: Env): Promise<Respon
 	headers.set('x-presence-country', /^[A-Z]{2}$/.test(country) && country !== 'XX' ? country : '');
 	headers.set('x-presence-ua', (request.headers.get('user-agent') ?? '').slice(0, 512));
 	headers.set('x-presence-signin', env.GITHUB_CLIENT_ID ? '1' : '');
+	headers.set('x-presence-built', String(buildJson.at));
 	const stub = env.PRESENCE.get(env.PRESENCE.idFromName('site'));
 	return stub.fetch(new Request(request.url, { headers }));
 }
@@ -176,6 +177,10 @@ export class Presence extends DurableObject<Env> {
 			this.broadcast(JSON.stringify({ t: 'comments', doc }));
 			return new Response(null, { status: 204 });
 		}
+		// Cloudflare doesn't restart a Durable Object with open sockets on a deploy, while the worker in front of it runs
+		// the new code at once: an object older than the worker that sent this resets itself, and the tab's retry (and
+		// everyone's next message) meets the new code, whose constructor tells the open tabs.
+		if (Number(request.headers.get('x-presence-built')) > buildJson.at) this.ctx.abort('A newer deploy.');
 		if (this.ctx.getWebSockets().length >= MAX_SOCKETS) return json({ error: 'Too many visitors right now.' }, 503);
 		const whoHeader = request.headers.get('x-presence-who');
 		const who: Who = whoHeader

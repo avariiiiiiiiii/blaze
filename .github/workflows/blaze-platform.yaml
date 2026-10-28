@@ -80,8 +80,12 @@ jobs:
     runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     steps:
+      # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
+      # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
       - if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
+        run: |
+          git config --global core.autocrlf false
+          echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       # Caches are written by main alone: a pull request reads main's and writes none.
@@ -106,8 +110,12 @@ jobs:
     outputs:
       parts: ${{ steps.parts.outputs.parts }}
     steps:
+      # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
+      # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
       - if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
+        run: |
+          git config --global core.autocrlf false
+          echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with:

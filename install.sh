@@ -351,7 +351,3 @@ say ""
 say "In a Rust project, run:"
 say ""
 say "    $run"
-if command -v cargo >/dev/null 2>&1; then
-    say ""
-    say "(blaze run is the same.)"
-fi

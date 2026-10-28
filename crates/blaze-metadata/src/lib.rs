@@ -1001,9 +1001,6 @@ fn fetch(
         let source = id.source_id();
         let source_text = source.as_url().to_string();
         let from = sources.map().replacement(source)?;
-        if from.is_remote_registry() && !from.is_sparse() {
-            bail!("{source_text} is read from a git index, which blaze does not read yet");
-        }
         let mut checksum = checksums.get(&id).cloned().flatten().unwrap_or_default();
         // A lock file of cargo before 1.53 may name no checksum: the index's.
         if checksum.is_empty() && from.is_remote_registry() {
@@ -1194,12 +1191,6 @@ pub fn vendored(
                      manifest as `cargo package` writes it, which blaze does not write yet"
                 ),
                 _ => bail!("blaze does not vendor `{id}` yet: it is read from {from}"),
-            }
-            if from.is_remote_registry() && !from.is_sparse() {
-                bail!(
-                    "{} is read from a git index, which blaze does not read yet",
-                    source.as_url()
-                );
             }
             let registry = sources.registry(from)?;
             let mut sum = checksum.clone().unwrap_or_default();

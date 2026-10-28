@@ -10,6 +10,7 @@ pub mod auth;
 pub mod directory;
 pub mod download;
 pub mod git;
+mod git_index;
 pub mod http;
 pub mod index;
 pub mod query;

@@ -10,6 +10,7 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Added
 
+- Git-index registries can be resolved and fetched, including offline use of Cargo's index and archive caches; failed index updates are reported instead of using an old tree (#316).
 - A build shows what it does while it does it. The daemon and its workers speak deterministic
   CBOR frames (RFC 8949 §4.2.1) instead of JSON lines, and a worker publishes the build as
   events: each step (loading the workspace, resolving names, compiling, checking, linking),

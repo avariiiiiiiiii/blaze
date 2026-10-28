@@ -110,7 +110,7 @@ pub fn workspace_root(
 
 /// A program a `cargo build` or `cargo test` links: a binary or an example of a member it
 /// builds, a `cdylib` or `staticlib` of its library, or a test of one.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Program {
     /// The id of its package, as `cargo metadata` spells it.
     pub package: String,
@@ -126,7 +126,7 @@ pub struct Program {
 }
 
 /// What kind of target a program is built of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Lib,
     Bin,

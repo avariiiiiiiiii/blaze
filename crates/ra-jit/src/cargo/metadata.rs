@@ -202,13 +202,145 @@ fn library_read(
 
 /// The programs a build of `selection` links of `targets`, asked for in `cwd` (of the package
 /// of `manifest`, when there is one), planned with blaze's own resolution for the triple
-/// `target` or the host's: what cargo's unit graph has.
+/// `target` or the host's: what cargo's unit graph has. The plan is kept in `kept_in` and
+/// used again while what it was made of is unchanged ([`Plan::made_of`]): resolving the
+/// workspace is most of what the client of a no-op build does.
 pub(crate) fn programs(
     selection: &crate::plan::Selection,
     cwd: &Path,
     manifest: Option<&Path>,
     targets: blaze_metadata::Targets<'_>,
+    kept_in: &Path,
 ) -> anyhow::Result<Vec<blaze_metadata::Program>> {
+    let key = plan_key(selection, cwd, manifest, targets);
+    let path = kept_in.join(format!("{key}.json"));
+    let kept = std::fs::read(&path).ok().and_then(|it| serde_json::from_slice::<Plan>(&it).ok());
+    if let Some(kept) = kept.filter(|it| it.key == key && it.is_current()) {
+        return Ok(kept.programs);
+    }
+    let started = std::time::SystemTime::now();
+    let (json, programs) = resolved_programs(selection, cwd, manifest, targets)?;
+    let plan = Plan { key, made_of: Plan::made_of(&json, cwd), programs };
+    // A file written while the plan was made may be newer than what was read of it.
+    let settled = plan.made_of.iter().all(|(_, stamp)| stamp.is_none_or(|it| it.0 < started));
+    if settled && std::fs::create_dir_all(kept_in).is_ok() {
+        let partial = path.with_extension(format!("{}.partial", std::process::id()));
+        let written = serde_json::to_vec(&plan).ok().map(|it| std::fs::write(&partial, it));
+        if written.is_some_and(|it| it.is_ok()) {
+            _ = std::fs::rename(&partial, &path);
+        }
+    }
+    Ok(plan.programs)
+}
+
+/// What the plan of a build is asked with, apart from the files it reads: the selection and
+/// targets, where it is asked, the variables cargo's configuration and the toolchain are read
+/// from, and the rustc the platform is asked of.
+fn plan_key(
+    selection: &crate::plan::Selection,
+    cwd: &Path,
+    manifest: Option<&Path>,
+    targets: blaze_metadata::Targets<'_>,
+) -> String {
+    use sha2::{Digest as _, Sha256};
+    let tests = targets.test.map(|it| (it.lib, it.test));
+    let named = (targets.bin, targets.example, targets.lib, tests);
+    let mut vars: Vec<(String, String)> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("CARGO") || name.starts_with("RUST") || name == "HOME")
+        .collect();
+    vars.sort_unstable();
+    let rustc = super::state::rustc_path();
+    let asked = serde_json::json!({
+        "selection": selection,
+        "cwd": cwd,
+        "manifest": manifest,
+        "targets": format!("{named:?}"),
+        "vars": vars,
+        "rustc": rustc.to_string_lossy(),
+        "release": crate::cargo::toolchain::ours_release(),
+    });
+    let digest = Sha256::digest(asked.to_string().as_bytes());
+    digest[..8].iter().map(|it| format!("{it:02x}")).collect()
+}
+
+/// When a file was last written and its length, or `None` where there is none.
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// A build's programs as [`programs`] keeps them, with the files they were planned from.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Plan {
+    key: String,
+    made_of: Vec<(PathBuf, Stamp)>,
+    programs: Vec<blaze_metadata::Program>,
+}
+
+impl Plan {
+    fn is_current(&self) -> bool {
+        self.made_of.iter().all(|(path, was)| stamp(path) == *was)
+    }
+
+    /// What a plan made with the metadata `json`, asked for in `cwd`, is made of: the lock
+    /// file and root manifest of the workspace; of each package not from a registry or git,
+    /// its manifest and the directories cargo finds its targets in, and the directory it is
+    /// in, which a `members` glob reads; the configuration and toolchain files cargo and
+    /// rustup read from `cwd` up and in cargo's home; and rustc.
+    fn made_of(json: &str, cwd: &Path) -> Vec<(PathBuf, Stamp)> {
+        let metadata: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+        let mut files = Vec::new();
+        if let Some(root) = metadata["workspace_root"].as_str().map(Path::new) {
+            files.extend([root.join("Cargo.lock"), root.join("Cargo.toml")]);
+        }
+        let packages = metadata["packages"].as_array().into_iter().flatten();
+        let local = packages.filter(|it| it["source"].is_null());
+        for manifest in local.filter_map(|it| it["manifest_path"].as_str()).map(Path::new) {
+            files.push(manifest.to_owned());
+            let Some(dir) = manifest.parent() else { continue };
+            files.extend(dir.parent().map(Path::to_owned));
+            files.push(dir.join("src"));
+            for found in ["src/bin", "examples", "tests", "benches"].map(|it| dir.join(it)) {
+                let entries = std::fs::read_dir(&found).into_iter().flatten().flatten();
+                files.extend(entries.map(|it| it.path()).filter(|it| it.is_dir()));
+                files.push(found);
+            }
+        }
+        for dir in cwd.ancestors() {
+            files.extend([".cargo/config", ".cargo/config.toml"].map(|it| dir.join(it)));
+            files.extend(["rust-toolchain", "rust-toolchain.toml"].map(|it| dir.join(it)));
+        }
+        let home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|it| PathBuf::from(it).join(".cargo")));
+        if let Some(home) = home {
+            files.extend(["config", "config.toml"].map(|it| home.join(it)));
+        }
+        let rustc = PathBuf::from(super::state::rustc_path());
+        if rustc.is_absolute() {
+            files.push(rustc);
+        }
+        files.sort_unstable();
+        files.dedup();
+        files
+            .into_iter()
+            .map(|it| {
+                let stamp = stamp(&it);
+                (it, stamp)
+            })
+            .collect()
+    }
+}
+
+/// [`programs`] resolved: the metadata of the build and its programs.
+fn resolved_programs(
+    selection: &crate::plan::Selection,
+    cwd: &Path,
+    manifest: Option<&Path>,
+    targets: blaze_metadata::Targets<'_>,
+) -> anyhow::Result<(String, Vec<blaze_metadata::Program>)> {
     {
         let rustc = super::state::rustc_path();
         let asked = |args: &[&str]| {
@@ -248,7 +380,7 @@ pub(crate) fn programs(
             store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
-        Ok(blaze_metadata::programs(&asked, targets)?.1)
+        blaze_metadata::programs(&asked, targets)
     }
 }
 
@@ -613,6 +745,46 @@ mod tests {
             nodes.iter().find(|it| it["id"].as_str().unwrap().contains("shared#")).unwrap();
         let features = shared["features"].as_array().unwrap().iter();
         Ok(features.map(|it| it.as_str().unwrap().to_owned()).collect())
+    }
+
+    /// A kept plan is used while nothing it was made of changes, and not once a target is
+    /// added, a manifest is written or a package is added beside the members.
+    #[test]
+    fn a_plan_is_kept_until_what_it_read_changes() {
+        let root = std::env::temp_dir().join(format!("ra-jit-plan-{}", std::process::id()));
+        let app = root.join("crates/app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\n").unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let json = serde_json::json!({
+            "workspace_root": root,
+            "packages": [
+                { "source": null, "manifest_path": app.join("Cargo.toml") },
+                { "source": "registry+https://github.com/rust-lang/crates.io-index",
+                  "manifest_path": "/nowhere/Cargo.toml" },
+            ],
+        })
+        .to_string();
+        let made = || super::Plan {
+            key: String::new(),
+            made_of: super::Plan::made_of(&json, &app),
+            programs: Vec::new(),
+        };
+        let plan = made();
+        assert!(plan.made_of.iter().any(|(it, _)| it == &root.join("crates")));
+        assert!(!plan.made_of.iter().any(|(it, _)| it == Path::new("/nowhere/Cargo.toml")));
+        assert!(plan.is_current());
+        std::fs::create_dir_all(app.join("src/bin")).unwrap();
+        assert!(!plan.is_current(), "a new `src/bin`");
+        let plan = made();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\nedition = \"2024\"\n")
+            .unwrap();
+        assert!(!plan.is_current(), "a manifest written");
+        let plan = made();
+        std::fs::create_dir_all(root.join("crates/more")).unwrap();
+        assert!(!plan.is_current(), "a package beside the members");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `resolver.feature-unification`, as nightly cargo reads it (#596): `workspace` resolves

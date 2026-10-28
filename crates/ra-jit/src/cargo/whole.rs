@@ -754,13 +754,14 @@ fn planned(
         lib: tests.is_none() && asked.typed("--lib"),
         test: tests,
     };
-    let planned = super::metadata::programs(&selection, dir, manifest.as_deref(), named)?;
+    let target = metadata.target_directory.as_std_path();
+    let kept_in = target.join("ra-jit/plans");
+    let planned = super::metadata::programs(&selection, dir, manifest.as_deref(), named, &kept_in)?;
     // cargo's directory of a profile: `dev`'s is `debug`.
     let profile = match selection.profile.as_str() {
         "dev" => "debug",
         other => other,
     };
-    let target = metadata.target_directory.as_std_path();
     let mut out = target.to_owned();
     if let Some(triple) = &selection.target {
         out.push(triple);

@@ -211,6 +211,8 @@ pub(crate) enum Asked {
     Stop,
     /// `why` and its arguments: what the last build compiled again and why.
     Why(Vec<String>),
+    /// `watch`: every build the daemon does, as it does it, until interrupted.
+    Watch,
     Enable,
     Disable,
     /// blaze's own toolchain, downloaded first when it has none; with `--path`, its directory
@@ -293,6 +295,7 @@ impl Asked {
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
             ("why", _) => Asked::Why(rest.to_vec()),
+            ("watch", _) => Asked::Watch,
             ("enable", _) => Asked::Enable,
             ("disable", _) => Asked::Disable,
             ("toolchain", _) => Asked::Toolchain { path: rest.iter().any(|it| it == "--path") },

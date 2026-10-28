@@ -167,6 +167,9 @@ pub(crate) struct Shown {
     held: Option<String>,
     /// Every record, for `blaze why` ([`super::why::keep`]).
     records: Vec<blaze_protocol::events::Record>,
+    /// Whether a build began: a command that watches the daemon's builds is shown each in
+    /// turn.
+    began: bool,
 }
 
 enum Rendering {
@@ -176,17 +179,8 @@ enum Rendering {
 
 impl Shown {
     pub(crate) fn new() -> Shown {
-        let terminal = std::io::stderr().is_terminal();
-        let to = match () {
-            () if QUIET.load(Ordering::Relaxed) => None,
-            () if terminal => {
-                let width = terminal_width().unwrap_or(80);
-                Some(Rendering::Live(blaze_ui::Live::new(width, colored())))
-            }
-            () => Some(Rendering::Plain(blaze_ui::Plain::new(colored()))),
-        };
-        let held = terminal.then(String::new);
-        Shown { asked: Instant::now(), to, held, records: Vec::new() }
+        let held = std::io::stderr().is_terminal().then(String::new);
+        Shown { asked: Instant::now(), to: rendering(), held, records: Vec::new(), began: false }
     }
 
     fn now_ns(&self) -> u64 {
@@ -195,6 +189,13 @@ impl Shown {
 
     pub(crate) fn record(&mut self, record: &blaze_protocol::events::Record) {
         event_out(record);
+        let began = matches!(record.event, blaze_protocol::events::Event::Began { .. });
+        if began && std::mem::replace(&mut self.began, true) {
+            self.finish();
+            let to = rendering();
+            *self =
+                Shown { asked: Instant::now(), to, held: None, records: Vec::new(), began: true };
+        }
         self.records.push(record.clone());
         let now_ns = self.now_ns();
         let out = match &mut self.to {
@@ -224,7 +225,13 @@ impl Shown {
     /// The answer came: the region is taken away, and what was held back of a quick build is
     /// its last line alone. The records are kept for `blaze why`.
     pub(crate) fn done(&mut self) {
-        super::why::keep(&std::mem::take(&mut self.records));
+        if !WATCHING.load(Ordering::Relaxed) {
+            super::why::keep(&std::mem::take(&mut self.records));
+        }
+        self.finish();
+    }
+
+    fn finish(&mut self) {
         let Some(Rendering::Live(live)) = &mut self.to else { return };
         // The record of the build's end drew its last line in the region's place already.
         let out = match live.build().finished {
@@ -254,6 +261,27 @@ impl Shown {
         }
         eprint!("{out}");
     }
+}
+
+/// How a command shows a build: on a terminal a region drawn again, elsewhere cargo's
+/// lines, nothing when quiet.
+fn rendering() -> Option<Rendering> {
+    match () {
+        () if QUIET.load(Ordering::Relaxed) => None,
+        () if std::io::stderr().is_terminal() => {
+            let width = terminal_width().unwrap_or(80);
+            Some(Rendering::Live(blaze_ui::Live::new(width, colored())))
+        }
+        () => Some(Rendering::Plain(blaze_ui::Plain::new(colored()))),
+    }
+}
+
+/// Whether this command watches the daemon's builds rather than asks for one: what it is
+/// shown is not kept for `blaze why`.
+static WATCHING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn watching() {
+    WATCHING.store(true, Ordering::Relaxed);
 }
 
 impl Drop for Shown {

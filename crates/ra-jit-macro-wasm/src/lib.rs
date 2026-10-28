@@ -13,8 +13,10 @@
 //! its package. Every read of the package is recorded, and an expansion is kept under what it
 //! was given and what it read ([`keyed`]), so that what one machine expanded every other
 //! finds, whatever it runs on: neither the module, which is the same bytes for every host, nor
-//! its expansions are kept under anything of the host's. An expansion that asked the database
-//! (a span's text, file or line) is not kept, as `ra-jit-expand` keeps none.
+//! its expansions are kept under anything of the host's. What an expansion asked the database
+//! of a span of its input (its text, file, line or bytes) is kept with it, each question with
+//! its answer, and it is found while the database answers each the same. One that was given a
+//! span it was not ([`Value`]) is not kept.
 
 pub mod bench;
 mod keyed;
@@ -27,7 +29,10 @@ use std::{
     fmt,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -106,9 +111,15 @@ pub(crate) struct State {
     buffer: Vec<u8>,
     output: Option<Vec<u8>>,
     panic: Option<String>,
-    /// Whether the expansion asked the database, or learned of a span what its key does not
-    /// say: then it is not kept.
+    /// Whether the expansion learned of a span what neither its key nor [`State::asks`] says:
+    /// then it is not kept.
     asked: bool,
+    /// The anchors and contexts of the input's spans, which a question is written against.
+    anchors: Vec<SpanAnchor>,
+    contexts: Vec<SyntaxContext>,
+    /// Each question the expansion asked of a span of its input and what it was answered, as a
+    /// read set has them ([`Value::read`]).
+    asks: Vec<(String, String)>,
     db: Option<Db>,
     limits: StoreLimits,
 }
@@ -123,6 +134,9 @@ impl State {
             output: None,
             panic: None,
             asked: false,
+            anchors: Vec::new(),
+            contexts: Vec::new(),
+            asks: Vec::new(),
             db: None,
             limits: StoreLimitsBuilder::new().memory_size(MEMORY).build(),
         }
@@ -139,6 +153,25 @@ impl State {
         self.spans.get(number)
     }
 
+    /// Asks the database `value` of `span`, and notes the question and its answer, or that
+    /// the expansion is not to be kept when the span has an anchor or a context the input has
+    /// not.
+    fn ask_value(&mut self, value: Value, span: Span) -> Option<SubResponse> {
+        // SAFETY: see `Db`.
+        let answer = self.db.map(|db| load_cargo::answer(unsafe { &*db.0 }, value.request(span)));
+        let anchor = self.anchors.iter().position(|it| *it == span.anchor);
+        let context = self.contexts.iter().position(|it| *it == span.ctx);
+        match anchor.zip(context) {
+            Some((anchor, context)) => {
+                let (start, end) = (span.range.start().into(), span.range.end().into());
+                let read = value.read([start, end, anchor as u32, context as u32]);
+                self.asks.push((read, value.said(answer.as_ref())));
+            }
+            None => self.asked = true,
+        }
+        answer
+    }
+
     fn give(&mut self, text: Option<String>) -> i32 {
         match text {
             Some(text) => {
@@ -146,6 +179,83 @@ impl State {
                 self.buffer.len() as i32
             }
             None => -1,
+        }
+    }
+}
+
+/// What an expansion asks the database of a span that is answered with a value, not a span:
+/// what an expansion is kept with, and asked again of the next call's spans to find it.
+#[derive(Clone, Copy, PartialEq)]
+enum Value {
+    LineColumn,
+    SourceText,
+    ByteRange,
+    File,
+    LocalFile,
+}
+
+impl Value {
+    const ALL: [(Value, char); 5] = [
+        (Value::LineColumn, 'l'),
+        (Value::SourceText, 't'),
+        (Value::ByteRange, 'b'),
+        (Value::File, 'f'),
+        (Value::LocalFile, 'p'),
+    ];
+
+    fn request(self, span: Span) -> SubRequest {
+        let (file_id, ast_id) = (span.anchor.file_id.as_u32(), span.anchor.ast_id.into_raw());
+        let (start, end) = (span.range.start().into(), span.range.end().into());
+        match self {
+            Value::LineColumn => SubRequest::LineColumn { file_id, ast_id, offset: start },
+            Value::SourceText => SubRequest::SourceText { file_id, ast_id, start, end },
+            Value::ByteRange => SubRequest::ByteRange { file_id, ast_id, start, end },
+            Value::File => SubRequest::FilePath { file_id: span.anchor.file_id.file_id().index() },
+            Value::LocalFile => {
+                SubRequest::LocalFilePath { file_id: span.anchor.file_id.file_id().index() }
+            }
+        }
+    }
+
+    /// The question of the span of `shape` (as [`Shapes`] writes one) as a read set has it:
+    /// a NUL first, which no path read has.
+    fn read(self, [start, end, anchor, context]: [u32; 4]) -> String {
+        let letter = Value::ALL.iter().find(|it| it.0 == self).map_or('?', |it| it.1);
+        format!("\0{letter}{start},{end},{anchor},{context}")
+    }
+
+    /// The question `read` (as [`Value::read`] wrote it) of the input that has the anchors and
+    /// contexts of `shapes`.
+    fn parse(read: &str, shapes: &Shapes) -> Option<(Value, Span)> {
+        let mut chars = read.strip_prefix('\0')?.chars();
+        let letter = chars.next()?;
+        let value = Value::ALL.iter().find(|it| it.1 == letter)?.0;
+        let mut fields = chars.as_str().split(',').map(|it| it.parse::<u32>().ok());
+        let mut next = || fields.next().flatten();
+        let (start, end, anchor, context) = (next()?, next()?, next()?, next()?);
+        let span = Span {
+            range: range(start, end),
+            anchor: *shapes.anchors.get(anchor as usize)?,
+            ctx: *shapes.contexts.get(context as usize)?,
+        };
+        Some((value, span))
+    }
+
+    /// What a read set has of `answer`: the same for the same answer, short.
+    fn said(self, answer: Option<&SubResponse>) -> String {
+        match answer {
+            Some(SubResponse::LineColumnResult { line, column }) => format!("{line}:{column}"),
+            Some(SubResponse::SourceTextResult { text: Some(text) }) => {
+                keyed::digest_bytes(text.as_bytes())
+            }
+            Some(SubResponse::ByteRangeResult { range }) => {
+                format!("{}..{}", range.start, range.end)
+            }
+            Some(SubResponse::FilePathResult { name }) => keyed::digest_bytes(name.as_bytes()),
+            Some(SubResponse::LocalFilePathResult { name: Some(name) }) => {
+                keyed::digest_bytes(name.as_bytes())
+            }
+            _ => "-".to_owned(),
         }
     }
 }
@@ -251,12 +361,7 @@ fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Span {
 }
 
 fn line_column(state: &mut State, span: Span) -> Option<(u32, u32)> {
-    let req = SubRequest::LineColumn {
-        file_id: span.anchor.file_id.as_u32(),
-        ast_id: span.anchor.ast_id.into_raw(),
-        offset: span.range.start().into(),
-    };
-    match state.ask(req)? {
+    match state.ask_value(Value::LineColumn, span)? {
         SubResponse::LineColumnResult { line, column } => Some((line, column)),
         _ => None,
     }
@@ -355,13 +460,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, a: u32, out: u32| -> wasmtime::Result<()> {
             let state = caller.data_mut();
             let Some(span) = state.span(a) else { return Ok(()) };
-            let req = SubRequest::ByteRange {
-                file_id: span.anchor.file_id.as_u32(),
-                ast_id: span.anchor.ast_id.into_raw(),
-                start: span.range.start().into(),
-                end: span.range.end().into(),
-            };
-            let range = match state.ask(req) {
+            let range = match state.ask_value(Value::ByteRange, span) {
                 Some(SubResponse::ByteRangeResult { range }) => range,
                 _ => usize::from(span.range.start())..usize::from(span.range.end()),
             };
@@ -393,8 +492,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "span_file", |mut caller: Caller<'_, State>, a: u32| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
-        let req = SubRequest::FilePath { file_id: span.anchor.file_id.file_id().index() };
-        let name = match state.ask(req) {
+        let name = match state.ask_value(Value::File, span) {
             Some(SubResponse::FilePathResult { name }) => name,
             _ => String::new(),
         };
@@ -403,8 +501,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "span_local_file", |mut caller: Caller<'_, State>, a: u32| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
-        let req = SubRequest::LocalFilePath { file_id: span.anchor.file_id.file_id().index() };
-        let name = match state.ask(req) {
+        let name = match state.ask_value(Value::LocalFile, span) {
             Some(SubResponse::LocalFilePathResult { name }) => name,
             _ => None,
         };
@@ -413,13 +510,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "span_source_text", |mut caller: Caller<'_, State>, a: u32| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
-        let req = SubRequest::SourceText {
-            file_id: span.anchor.file_id.as_u32(),
-            ast_id: span.anchor.ast_id.into_raw(),
-            start: span.range.start().into(),
-            end: span.range.end().into(),
-        };
-        let text = match state.ask(req) {
+        let text = match state.ask_value(Value::SourceText, span) {
             Some(SubResponse::SourceTextResult { text }) => text,
             _ => None,
         };
@@ -637,13 +728,13 @@ impl Wasm {
         let kept = was_kept.into();
         let wasm = Wasm { path: path.to_owned(), digest, identity, pre, compiled_in, kept };
         wasm.keep_code(store);
+        LOADED.add(start.elapsed());
         Ok(wasm)
     }
 
     /// Keeps its machine code in `store`, if it has not: a module compiled before the daemon
     /// told the store the toolchain is kept once it has.
     fn keep_code(&self, store: Option<&ra_jit_store::Store>) {
-        use std::sync::atomic::Ordering;
         let Some(store) = store else { return };
         if self.kept.swap(true, Ordering::Relaxed) {
             return;
@@ -715,66 +806,7 @@ impl Wasm {
         call: &Call<'_>,
         store: Option<&ra_jit_store::Store>,
     ) -> Ran {
-        let start = Instant::now();
-        let root = package_dir(call.env);
-        let env = guest_env(call.env);
-        // The module's `def_site`, `call_site` and `mixed_site` are 1, 2 and 3, the same
-        // spans or not.
-        let mut spans = Spans::default();
-        for span in [call.def_site, call.call_site, call.mixed_site] {
-            spans.push(span);
-        }
-        let mut writer = Writer { out: Vec::new(), spans: &mut spans };
-        writer.top(call.subtree);
-        let input = std::mem::take(&mut writer.out);
-        let attr = call.attrs.map(|it| {
-            writer.top(it);
-            std::mem::take(&mut writer.out)
-        });
-        // rust-analyzer gives an attribute written without arguments (`#[twice]`) none.
-        let attr = match listed.kind {
-            ProcMacroKind::Attr => Some(attr.unwrap_or_else(|| 0u32.to_le_bytes().to_vec())),
-            _ => attr,
-        };
-        let shapes = Shapes::of(spans.all());
-        let mut first = keyed::Key::new(DOMAIN);
-        first.field(&self.identity).field(listed.name.as_bytes()).field(&[listed.kind as u8]);
-        first.field(&input).field(attr.as_deref().unwrap_or(b"-")).field(&shapes.bytes);
-        for (name, value) in &env {
-            first.field(name.as_bytes()).field(value.as_bytes());
-        }
-        let first = first.done();
-        let restore = |trees: Vec<Tree>| {
-            let trees = match &root {
-                Some(root) => placed(trees, root),
-                None => trees,
-            };
-            wire::top_subtree(trees, call.call_site)
-        };
-        // A module given no package has nothing to read.
-        let now = |read: &str| root.as_deref().map_or("-".to_owned(), |it| keyed::now(it, read));
-        if let Some(store) = store
-            && let Some(kept) = keyed::find(store, &first, &now)
-            && let Some(trees) = shapes.read(&kept)
-        {
-            return Ran { output: Ok(restore(trees)), found: true, took: start.elapsed() };
-        }
-        let ran = self.run(index, root.as_deref(), env, spans, db, &input, attr.as_deref());
-        let output = ran.and_then(|(state, output)| {
-            let trees = Reader::new(&output, &state.spans)
-                .stream()
-                .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
-            if let Some(store) = store
-                && !state.asked
-                && let Some(value) = shapes.written(&state.spans, &output)
-            {
-                let reads: Vec<(String, String)> = state.files.reads.into_iter().collect();
-                keyed::keep(store, &first, &reads, &value);
-                KEPT.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(restore(trees))
-        });
-        Ran { output, found: false, took: start.elapsed() }
+        expand(&self.identity, &|| Ok(self), index, listed, db, call, store)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -784,6 +816,7 @@ impl Wasm {
         root: Option<&Path>,
         env: Vec<(String, String)>,
         spans: Spans,
+        shapes: &Shapes,
         db: Option<&dyn SourceDatabase>,
         input: &[u8],
         attr: Option<&[u8]>,
@@ -798,6 +831,8 @@ impl Wasm {
             })
         });
         let mut state = State::empty();
+        state.anchors = shapes.anchors.clone();
+        state.contexts = shapes.contexts.clone();
         state.spans = spans;
         state.files = wasi::Files::new(root);
         state.env = env;
@@ -1190,6 +1225,96 @@ impl Shapes {
     }
 }
 
+/// Expands the macro at `index` of a module whose expansions are kept under `identity`: what
+/// is kept of it when the store has it, else by running it in what `wasm` gives, which is
+/// asked for only then, and keeps what it made unless `store` is `None`.
+#[allow(clippy::too_many_arguments)]
+fn expand<'a>(
+    identity: &[u8; 32],
+    wasm: &dyn Fn() -> Result<&'a Wasm, String>,
+    index: u32,
+    listed: &Listed,
+    db: Option<&dyn SourceDatabase>,
+    call: &Call<'_>,
+    store: Option<&ra_jit_store::Store>,
+) -> Ran {
+    let start = Instant::now();
+    let root = package_dir(call.env);
+    let env = guest_env(call.env);
+    // The module's `def_site`, `call_site` and `mixed_site` are 1, 2 and 3, the same
+    // spans or not.
+    let mut spans = Spans::default();
+    for span in [call.def_site, call.call_site, call.mixed_site] {
+        spans.push(span);
+    }
+    let mut writer = Writer { out: Vec::new(), spans: &mut spans };
+    writer.top(call.subtree);
+    let input = std::mem::take(&mut writer.out);
+    let attr = call.attrs.map(|it| {
+        writer.top(it);
+        std::mem::take(&mut writer.out)
+    });
+    // rust-analyzer gives an attribute written without arguments (`#[twice]`) none.
+    let attr = match listed.kind {
+        ProcMacroKind::Attr => Some(attr.unwrap_or_else(|| 0u32.to_le_bytes().to_vec())),
+        _ => attr,
+    };
+    let shapes = Shapes::of(spans.all());
+    let mut first = keyed::Key::new(DOMAIN);
+    first.field(identity).field(listed.name.as_bytes()).field(&[listed.kind as u8]);
+    first.field(&input).field(attr.as_deref().unwrap_or(b"-")).field(&shapes.bytes);
+    for (name, value) in &env {
+        first.field(name.as_bytes()).field(value.as_bytes());
+    }
+    let first = first.done();
+    let restore = |trees: Vec<Tree>| {
+        let trees = match &root {
+            Some(root) => placed(trees, root),
+            None => trees,
+        };
+        wire::top_subtree(trees, call.call_site)
+    };
+    // A module given no package has nothing to read. A question asked of a span is asked of
+    // this call's span in its place.
+    let now = |read: &str| match Value::parse(read, &shapes) {
+        Some((value, span)) => {
+            value.said(db.map(|db| load_cargo::answer(db, value.request(span))).as_ref())
+        }
+        None if read.starts_with('\0') => "?".to_owned(),
+        None => root.as_deref().map_or("-".to_owned(), |it| keyed::now(it, read)),
+    };
+    if let Some(store) = store
+        && let Some(kept) = keyed::find(store, &first, &now)
+        && let Some(trees) = shapes.read(&kept)
+    {
+        FOUND.add(start.elapsed());
+        return Ran { output: Ok(restore(trees)), found: true, took: start.elapsed() };
+    }
+    let ran = wasm().map_err(ProcMacroExpansionError::System).and_then(|wasm| {
+        wasm.run(index, root.as_deref(), env, spans, &shapes, db, &input, attr.as_deref())
+    });
+    let output = ran.and_then(|(state, output)| {
+        let trees = Reader::new(&output, &state.spans)
+            .stream()
+            .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
+        if state.asked {
+            ASKED.add(Duration::ZERO);
+        }
+        if let Some(store) = store
+            && !state.asked
+            && let Some(value) = shapes.written(&state.spans, &output)
+        {
+            let mut reads: Vec<(String, String)> = state.files.reads.into_iter().collect();
+            reads.extend(state.asks);
+            keyed::keep(store, &first, &reads, &value);
+            KEPT.store(true, Ordering::Relaxed);
+        }
+        Ok(restore(trees))
+    });
+    RAN.add(start.elapsed());
+    Ran { output, found: false, took: start.elapsed() }
+}
+
 /// A macro of a module, as rust-analyzer expands it.
 pub struct Expander {
     wasm: AssertUnwindSafe<Arc<Lazy>>,
@@ -1232,10 +1357,59 @@ impl fmt::Debug for Expander {
 /// Whether an expansion was kept since [`flush`].
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How many, and the time they took on the threads that did them.
+struct Count {
+    calls: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl Count {
+    const fn new() -> Count {
+        Count { calls: AtomicU64::new(0), nanos: AtomicU64::new(0) }
+    }
+
+    fn add(&self, took: Duration) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> (u64, f64) {
+        (self.calls.load(Ordering::Relaxed), self.nanos.load(Ordering::Relaxed) as f64 / 1e9)
+    }
+}
+
+/// Expansions run in a module, with the time each took from its call.
+static RAN: Count = Count::new();
+/// Expansions the store had, with the time each took from its call.
+static FOUND: Count = Count::new();
+/// Expansions run that were not kept, as they asked the database.
+static ASKED: Count = Count::new();
+/// Modules made ready to run in this process (machine code loaded or compiled, linked).
+static LOADED: Count = Count::new();
+
+/// The expansions so far, for the daemon's log: `None` before the first.
+pub fn report() -> Option<String> {
+    let (ran, running) = RAN.get();
+    let (found, finding) = FOUND.get();
+    if ran + found == 0 {
+        return None;
+    }
+    let (loaded, loading) = LOADED.get();
+    let mut said = format!(
+        "wasm proc macros: {ran} ran in {running:.3}s, {found} from the store in \
+         {finding:.3}s, {loaded} modules loaded in {loading:.3}s"
+    );
+    let (asked, _) = ASKED.get();
+    if asked != 0 {
+        said += &format!("; {asked} not kept, as they asked the database");
+    }
+    Some(said)
+}
+
 /// Writes out the expansions kept since the last call, for the next process to find: the
 /// store holds what is added in memory until it is flushed.
 pub fn flush() {
-    if KEPT.swap(false, std::sync::atomic::Ordering::Relaxed)
+    if KEPT.swap(false, Ordering::Relaxed)
         && let Some(store) = store()
     {
         store.flush();
@@ -1264,10 +1438,19 @@ impl ProcMacroExpander for Expander {
         _current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         let call = Call { subtree, attrs, env, def_site, call_site, mixed_site };
-        match self.wasm.get() {
-            Ok(wasm) => wasm.expand(self.index, &self.listed, Some(db), &call, store()).output,
-            Err(e) => Err(ProcMacroExpansionError::System(e)),
-        }
+        // What its expansions are kept under is known without the module when the list file
+        // says: then one the store has neither loads nor compiles it.
+        let wasm = || self.wasm.get().map(|it| &**it);
+        let ran = match self.wasm.known.identity {
+            Some(identity) => {
+                expand(&identity, &wasm, self.index, &self.listed, Some(db), &call, store())
+            }
+            None => match wasm() {
+                Ok(wasm) => wasm.expand(self.index, &self.listed, Some(db), &call, store()),
+                Err(e) => return Err(ProcMacroExpansionError::System(e)),
+            },
+        };
+        ran.output
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
@@ -1423,6 +1606,24 @@ mod tests {
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
         assert!(listing(&path).is_none());
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_question_of_a_span_is_asked_again_of_the_span_in_its_place() {
+        let asked = span(3, 9);
+        let read = Value::LineColumn.read([3, 9, 0, 0]);
+        let (value, again) = Value::parse(&read, &Shapes::of(&[asked])).unwrap();
+        assert!(value == Value::LineColumn);
+        assert_eq!(again, asked);
+        // The next call's span in the same place, of another anchor.
+        let mut moved = asked;
+        moved.anchor.ast_id = ErasedFileAstId::from_raw(5);
+        assert_eq!(Value::parse(&read, &Shapes::of(&[moved])).unwrap().1, moved);
+        assert!(Value::parse(&Value::File.read([0, 0, 1, 0]), &Shapes::of(&[asked])).is_none());
+        assert!(Value::parse("src/lib.rs", &Shapes::of(&[asked])).is_none());
+        let answer = SubResponse::LineColumnResult { line: 3, column: 4 };
+        assert_eq!(Value::LineColumn.said(Some(&answer)), "3:4");
+        assert_eq!(Value::SourceText.said(None), "-");
     }
 
     #[test]

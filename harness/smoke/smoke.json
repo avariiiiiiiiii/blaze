@@ -1,0 +1,38 @@
+{
+  "cases": {
+    "hashmap": { "group": "std", "tests": 2 },
+    "threads": { "group": "std", "tests": 2 },
+    "thread_local": { "group": "std", "tests": 2 },
+    "statics": { "group": "std", "tests": 2 },
+    "envfs": { "group": "std", "tests": 2, "args": ["one", "two words"], "env": { "SMOKE_VAR": "smoke" } },
+    "tokio_echo": { "group": "crates", "tests": 1 },
+    "serde_json": { "group": "crates", "tests": 2 },
+    "derives": { "group": "crates", "tests": 3, "args": ["--count", "2", "--shout", "yes", "greet", "smoke"] }
+  },
+  "projects": {
+    "ripgrep": {
+      "repo": "BurntSushi/ripgrep",
+      "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+      "input": "alpha\nbeta\ngamma\nalphabet\n",
+      "runs": [
+        { "args": ["--version"], "contains": "ripgrep 15.1.0" },
+        { "args": ["-n", "--color", "never", "alpha", "{input}"], "stdout": "1:alpha\n4:alphabet\n" }
+      ],
+      "test": []
+    },
+    "anim": {
+      "repo": "indexable-inc/anim",
+      "rev": "92c64f7276b3444a518904eaad2e107b36f77e08",
+      "private": true,
+      "apt": ["libasound2-dev", "pkg-config"],
+      "runs": [{ "args": ["--wav", "{work}/intro.wav"], "file": "{work}/intro.wav", "starts": "RIFF" }],
+      "test": []
+    },
+    "blaze": {
+      "repo": "indexable-inc/blaze",
+      "rev": "{blaze}",
+      "runs": [{ "select": ["-p", "blaze-engine", "--bin", "blaze-engine"], "args": ["--version"], "contains": "blaze " }],
+      "test": ["-p", "syntax-tree"]
+    }
+  }
+}

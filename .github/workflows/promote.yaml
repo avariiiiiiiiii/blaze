@@ -174,7 +174,13 @@ jobs:
           python3 -I .github/scripts/promote.py promote "$RUNNER_TEMP/promote.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: an issue for what failed
         if: needs.smoke.result != 'success' || needs.train.result != 'success'
+        env:
+          FILE: ${{ inputs.promote }}
         run: |
+          if [ "$FILE" != true ]; then
+            echo "::error::$TAG did not pass the gate (a dry run: no issue)"
+            exit 1
+          fi
           jq -n --arg tag "$TAG" --arg run "$RUN" --argjson needs "$NEEDS" \
             '{tag: $tag, run: $run, results: "results", needs: $needs}' > "$RUNNER_TEMP/issue.json"
           python3 -I .github/scripts/promote.py issue "$RUNNER_TEMP/issue.json" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -12,7 +12,8 @@ cp -r "$ripgrep" "$work/ripgrep"
 rm -rf "$work/ripgrep/target"
 export BLAZE_HOME="$work/home"
 cd "$work/ripgrep"
-tty() { script -qfec "stty cols 100 rows 30; $*" "$out/$name.tty" >/dev/null; }
+tty() { script -qfec "stty cols 100 rows 30; $*" "$out/$name.tty" >/dev/null || echo "$name: exit $?" >>"$out/exits"; }
+said() { name=$1; shift; "$@" >"$out/$name" 2>&1 || echo "$name: exit $?" >>"$out/exits"; }
 name=cold tty "$blaze" build
 edit() {
   python3 - "$1" <<'EOF'
@@ -26,9 +27,9 @@ EOF
 edit 1
 name=edit tty "$blaze" build
 edit 2
-"$blaze" build >"$out/edit.piped" 2>&1
-"$blaze" why >"$out/why.txt" 2>&1
-"$blaze" why search >"$out/why-search.txt" 2>&1
-"$blaze" build --events json >"$out/noop-events.jsonl" 2>"$out/noop-events.stderr"
+said edit.piped "$blaze" build
+said why.txt "$blaze" why
+said why-search.txt "$blaze" why search
+said noop-events.jsonl "$blaze" build --events json
 "$blaze" stop >/dev/null 2>&1 || true
 rm -rf "$work"

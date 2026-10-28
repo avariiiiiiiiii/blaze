@@ -966,6 +966,16 @@ or a directory of `v<version>` directories of the assets. `blaze --version` says
 blaze runs and why: as the workspace pins it, or as nothing pins one. `--manifest-path`
 picks the workspace a command is for, as it does for cargo.
 
+The pin may name a channel instead of a version ([release.md](release.md)):
+`version = "stable"` runs the newest release that passed the heavy tests, and
+`version = "canary"` the newest release. blaze reads which release the channel names from its
+pointer (`<releases>/channels/<channel>`, one small download, through `BLAZE_RELEASES` too),
+keeps it in `~/.blaze/channels/<channel>` and reads it again after an hour; that release is
+then run as a pinned version is. When the pointer can't be read (offline), the release it named
+when last read runs, with a line saying so; with none read before, it is an error. A pin to a
+version stays on that release, whose bytes never change: promotion from canary to stable flips
+the same release.
+
 ## Environment variables
 
 These are read by `blaze` and passed to the worker it starts. They are part of which

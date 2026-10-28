@@ -1566,11 +1566,8 @@ impl<'db> Evaluator<'db> {
             Ok(u128::from_le_bytes(pad16(arg.get(self)?, IsSigned::No)))
         };
         if let "unchecked_shl" | "unchecked_shr" = name {
-            let amount = if signed(rhs) {
-                int(rhs)?
-            } else {
-                uint(rhs)?.min(i128::MAX as u128) as i128
-            };
+            let amount =
+                if signed(rhs) { int(rhs)? } else { uint(rhs)?.min(i128::MAX as u128) as i128 };
             if amount < 0 || amount >= i128::from(bits) {
                 return ub(format!("overflowing shift by {amount} in `{name}`"));
             }

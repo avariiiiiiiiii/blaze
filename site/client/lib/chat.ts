@@ -1,21 +1,26 @@
 /**
- * The site's chat (worker/presence.ts): one room for everyone on the site, a panel at the right that stays open from
- * page to page (it lives on `body`, outside what the client router swaps). It rides client/lib/presence.ts's socket:
+ * The site's chat (worker/presence.ts): one room for everyone on the site. It rides client/lib/presence.ts's socket:
  * presence hands over every chat frame (`message`), who the reader is (`setYou`) and who is online (`setPeople`), and
  * gives `setup` the function that sends.
  *
+ * It shows two ways. Like Minecraft's chat, every message passes through the overlay feed at the bottom left
+ * (client/lib/feed.ts), with the joins, leaves and the site's own word; T (or Enter) opens the feed's input, made here:
+ * what is typed shows live by the reader's pointer to the others on the page (client/lib/cursors.ts `say`), and Enter
+ * sends it to the chat (signed in) or leaves it as that bubble only (not signed in, not kept). For depth (threads,
+ * reactions, edits, the whole history) there is the panel at the right, shut until the top line's Chat button opens it
+ * (the choice is kept per browser, localStorage, wrapped like every storage access here because storage can refuse);
+ * it lives on `body`, outside what the client router swaps, so it stays open from page to page.
+ *
  * Anyone can read; signed-in readers talk (Enter sends, Shift+Enter is a new line) and take back their own messages,
- * admins anyone's. While the panel is shut the top line's Chat button counts what came in. It starts open where the
- * page makes room for it (a wide screen) until the reader closes it; that choice is kept per browser (localStorage),
- * wrapped like every storage access here because storage can refuse.
+ * admins anyone's. While the panel is shut the top line's Chat button counts what came in.
  *
  * Someone else's message in another language gets translated where the computer can do it (client/lib/translate.ts),
  * marked as translated with a way back to the original. Who is writing shows under the list, with their faces.
  *
  * Threads, like Slack's: any top-level message can be replied to in its thread, one level deep. The list shows the
  * top-level messages, each with a line for its replies (faces, count, when the last came); the thread opens over the
- * list, or beside it in full screen. Replies stay quiet (no bubbles, toasts or badge) unless they mention the reader
- * or come in a thread the reader is in (started or replied in): those pop up even when muted, and the thread's line
+ * list, or beside it in full screen. Replies stay quiet (no bubbles, feed lines or badge) unless they mention the reader
+ * or come in a thread the reader is in (started or replied in): those show in the feed even when muted, and the thread's line
  * counts the replies the reader hasn't seen (kept per browser, `SEEN_KEY`) until the thread is opened. A reply can
  * also go to the chat ("Also send to chat"): it shows in the list too, under a line naming its thread.
  *
@@ -24,16 +29,17 @@
  * (and admins) edit a message in place (Enter saves, Esc cancels; ↑ in an empty composer edits the reader's last
  * message there); an edited one says so.
  *
- * `@login` mentions: both composers complete GitHub logins (people online, recent authors), and a message that
- * mentions the reader is marked, and pops up and counts while the chat is shut, even when muted.
+ * `@login` mentions: every composer (the panel's, the feed's) completes GitHub logins (people online, recent authors),
+ * and a message that mentions the reader is marked, shows in the feed even when muted, and counts while the panel is shut.
  *
- * The pop-up stack also carries the site's own word (`notice`, for client/lib/update.ts: a new version is in or ready),
- * which shows whether the chat is open or muted. Before an update reloads the page, `save` hands over what the chat
- * has that the reader would miss (drafts, the open thread, full screen, the list's scroll) and `restore` puts it back.
+ * Before an update reloads the page, `save` hands over what the chat has that the reader would miss (drafts, the feed's
+ * input and whether it was open, the open thread, full screen, the list's scroll) and `restore` puts it back.
  */
 
 import { tipOn } from './tip';
 import { CHAT, handle } from './resize';
+import * as feed from './feed';
+import { CROSS, icon } from './feed';
 import * as tr from './translate';
 
 type Who = { key: string; login: string | null; avatar: string | null };
@@ -64,7 +70,8 @@ type Reaction = { kind: string; who: { key: string; login: string }[] };
 type Pane = 'list' | 'thread';
 type Summary = Required<Pick<Msg, 'replies' | 'last' | 'repliers'>>;
 
-const OPEN_KEY = 'blaze.chat.open';
+/** Whether the panel is open; a new key since it stopped opening by default (the old one, `blaze.chat.open`, is dropped). */
+const OPEN_KEY = 'blaze.chat.panel';
 const GROUP_MS = 5 * 60_000;
 const MAX = 500;
 /** How many of the history's latest messages get translated when the chat loads. */
@@ -85,6 +92,9 @@ let you: You | null = null;
 let base = '/';
 let face: (w: Who) => HTMLElement = () => document.createElement('span');
 let speak: (key: string, login: string, text: string | null) => void = () => {};
+let live: (text: string | null, done?: boolean) => void = () => {};
+/** How many of the chat's latest messages the feed's history holds. */
+const FEED_PAST = 50;
 let messages: Msg[] = [];
 let unread = 0;
 /** Signed-in people online now (client/lib/presence.ts), for completing mentions. */
@@ -104,6 +114,9 @@ export type Kept = {
 	/** The reply composer's "Also send to chat", and a message being edited. */
 	also?: boolean;
 	edit?: { id: number; pane: Pane; text: string };
+	/** The feed's input: what was typed, and whether it was open. */
+	say?: string;
+	sayOpen?: boolean;
 };
 /** Waiting to be put back, piece by piece as the socket brings the reader and the messages. */
 let restoring: Kept | null = null;
@@ -130,25 +143,13 @@ const close = el('button', 'chat-x');
 close.type = 'button';
 close.setAttribute('aria-label', 'Close the chat');
 close.textContent = '×';
-/** Line icons for the head's buttons (16px, stroked in currentColor). */
-function icon(d: string): SVGSVGElement {
-	const ns = 'http://www.w3.org/2000/svg';
-	const svg = document.createElementNS(ns, 'svg');
-	svg.setAttribute('viewBox', '0 0 16 16');
-	svg.setAttribute('aria-hidden', 'true');
-	const p = document.createElementNS(ns, 'path');
-	p.setAttribute('d', d);
-	svg.append(p);
-	return svg;
-}
+/** Line icons for the head's buttons (16px, stroked in currentColor, client/lib/feed.ts `icon`). */
 const BELL = 'M4 11V7a4 4 0 0 1 8 0v4l1 1.5H3L4 11ZM6.5 14h3';
 const BELL_OFF = 'M4 11V7a4 4 0 0 1 6.6-3M12 7v4l1 1.5H5M6.5 14h3M2.5 2.5l11 11';
 const GROW = 'M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9';
 const SHRINK = 'M13.5 6.5h-4v-4M2.5 9.5h4v4M9.5 6.5 14 2M6.5 9.5 2 14';
 const BUBBLE = 'M2.5 3.5h11v7.5H8l-3 2.5V11H2.5Z';
 const BACK = 'M10 3 5 8l5 5';
-const CROSS = 'M4 4l8 8M12 4l-8 8';
-const REFRESH = 'M13 8a5 5 0 1 1-1.6-3.7M13.5 2v3h-3';
 const PENCIL = 'M3 13l.6-2.8 6.8-6.8a1.4 1.4 0 0 1 2 0l.2.2a1.4 1.4 0 0 1 0 2l-6.8 6.8L3 13ZM9.4 4.4l2.2 2.2';
 /** The reactions (worker/presence.ts REACTIONS), drawn like the icons above: one stroke, currentColor, never emoji. */
 const REACTS: Record<string, { name: string; d: string }> = {
@@ -201,30 +202,12 @@ const badge = el('span', 'tl-badge');
 badge.hidden = true;
 button.append(el('span', 'tl-chat-icon'), el('span', 'tl-label', 'Chat'), badge);
 
-const MUTE_KEY = 'blaze.chat.mute';
-function muted(): boolean {
-	try {
-		return localStorage.getItem(MUTE_KEY) === '1';
-	} catch {
-		return false;
-	}
-}
 function drawMute(): void {
-	const m = muted();
+	const m = feed.muted();
 	mute.replaceChildren(icon(m ? BELL_OFF : BELL));
 	mute.classList.toggle('on', m);
-	tipOn(mute, m ? 'Muted: no pop-ups while the chat is shut, except mentions of you and replies in your threads' : 'Mute pop-ups while the chat is shut');
+	tipOn(mute, m ? 'Muted: no chat, joins or leaves in the feed, except mentions of you and replies in your threads' : 'Mute the chat, joins and leaves in the feed');
 	mute.setAttribute('aria-pressed', String(m));
-}
-function setMuted(m: boolean): void {
-	try {
-		if (m) localStorage.setItem(MUTE_KEY, '1');
-		else localStorage.removeItem(MUTE_KEY);
-	} catch {
-		// Storage refused: the choice lasts this page.
-	}
-	drawMute();
-	if (m) for (const t of [...toasts.children]) if (!t.matches('.mention, .yours, .chat-notice')) t.remove();
 }
 
 /** Full screen: the chat over the whole content pane, the sidebar still beside it. Esc or the button again leaves. */
@@ -239,84 +222,14 @@ function setFull(on: boolean): void {
 	if (on) toBottom();
 }
 
-/**
- * Pop-ups for messages that come while the chat is shut (not muted, or mentioning the reader, or a reply in a thread
- * they are in): the newest three.
- */
-const toasts = el('div', 'chat-toasts');
-toasts.setAttribute('aria-live', 'polite');
-const TOAST_MS = 5000;
-function toast(m: Msg, mention: boolean, yours = false): void {
-	if ((muted() && !mention && !yours) || !panel.hidden) return;
-	const t = el('button', mention ? 'chat-toast mention' : yours ? 'chat-toast yours' : 'chat-toast');
-	t.type = 'button';
-	const words = el('span', 'chat-toast-words');
-	words.append(el('b', '', m.parent === undefined ? m.login : `${m.login} in a thread`), el('span', '', m.text));
-	t.append(face(m), words);
-	tipOn(t, 'Open the chat');
-	t.addEventListener('click', () => {
-		setOpen(true);
-		if (m.parent !== undefined) openThread(m.parent);
-		t.remove();
-	});
-	toasts.prepend(t);
-	// The oldest messages go; the site's notices stay until they are done.
-	const msgs = [...toasts.children].filter((x) => !x.classList.contains('chat-notice'));
-	for (const x of msgs.slice(3)) x.remove();
-	fade(t, TOAST_MS);
-}
-
-/** A pop-up that someone arrived on the site (client/lib/presence.ts): not when muted; a click goes where they are. */
-export function arrived(f: HTMLElement, who: string, where: string, href: string | null): void {
-	if (muted()) return;
-	const t = el(href ? 'a' : 'div', 'chat-toast chat-arrived');
-	if (t instanceof HTMLAnchorElement && href) t.href = href;
-	const words = el('span', 'chat-toast-words');
-	words.append(el('b', '', `${who} joined`), el('span', '', where));
-	t.append(f, words);
-	toasts.prepend(t);
-	const msgs = [...toasts.children].filter((x) => !x.classList.contains('chat-notice'));
-	for (const x of msgs.slice(3)) x.remove();
-	fade(t, TOAST_MS);
-}
-
-function fade(t: Element, ms: number): void {
-	setTimeout(() => {
-		t.classList.add('out');
-		setTimeout(() => t.remove(), 250);
-	}, ms);
-}
-
-/**
- * A word from the site itself (not a chat message) in the pop-up stack: shown whether the chat is open or muted, with
- * an optional button. It fades after `ms`, or stays until the returned function is called.
- */
-export function notice(title: string, text: string, opts: { ms?: number; icon?: string; action?: { label: string; run: () => void } } = {}): () => void {
-	const t = el('div', 'chat-toast chat-notice');
-	t.setAttribute('role', 'status');
-	const words = el('span', 'chat-toast-words');
-	words.append(el('b', '', title), el('span', '', text));
-	t.append(icon(opts.icon ?? REFRESH), words);
-	if (opts.action) {
-		const b = el('button', 'chat-notice-act', opts.action.label);
-		b.type = 'button';
-		b.addEventListener('click', opts.action.run);
-		t.append(b);
-	}
-	toasts.prepend(t);
-	if (opts.ms) fade(t, opts.ms);
-	return () => t.remove();
-}
-
-/** Open on load: as the reader last left it, else open where the page makes room (styles/shell.css, 1280px). */
+/** Open on load as the reader last left it; shut until they open it. */
 function stored(): boolean {
-	let v: string | null = null;
 	try {
-		v = localStorage.getItem(OPEN_KEY);
+		localStorage.removeItem('blaze.chat.open');
+		return localStorage.getItem(OPEN_KEY) === '1';
 	} catch {
-		// Storage refused: the default below.
+		return false;
 	}
-	return v === null ? matchMedia('(min-width: 1280px)').matches : v === '1';
 }
 
 function setOpen(open: boolean): void {
@@ -330,7 +243,7 @@ function setOpen(open: boolean): void {
 	}
 	if (!open) setFull(false);
 	if (open) {
-		for (const t of [...toasts.children]) if (!t.classList.contains('chat-notice')) t.remove();
+		feed.close();
 		unread = 0;
 		drawBadge();
 		toBottom();
@@ -438,8 +351,48 @@ function pendingText(from: string): Node {
 	return f;
 }
 
-/** Swaps a drawn message's text for what it is now, wherever it shows (the list, the thread, or both). */
+/**
+ * A message's line in the feed: its writer and text (translated, when it has been), marked when it is for the reader;
+ * a click opens it in the panel (its thread, for a reply). `live` pops it up now; else it is only in the history.
+ */
+function feedLine(m: Msg, live: boolean): feed.Line {
+	const t = translations.get(m.id);
+	const tone = mentionsYou(m) ? 'mention' : inYours(m) ? 'yours' : undefined;
+	return {
+		id: `m${m.id}`,
+		kind: 'chat',
+		at: Date.parse(m.at) || Date.now(),
+		face: face(m),
+		who: m.parent !== undefined ? `${m.login} in a thread` : m.login,
+		text: t?.s === 'done' && !t.original ? t.text : m.text,
+		tone,
+		live,
+		open: () => {
+			setOpen(true);
+			if (m.parent !== undefined && !m.broadcast) openThread(m.parent);
+			else reveal(m.id);
+		},
+	};
+}
+
+/** Message `id` in the open panel's list, scrolled to and lit for a moment. */
+function reveal(id: number): void {
+	const row = list.querySelector<HTMLElement>(`.chat-msg[data-id="${id}"]`);
+	if (!row) return;
+	row.scrollIntoView({ block: 'center' });
+	row.classList.remove('lit');
+	void row.offsetWidth;
+	row.classList.add('lit');
+}
+
+/** Message `m`'s line in the feed, changed (an edit, a translation), if it has one. */
+function refeed(m: Msg): void {
+	if (feed.has(`m${m.id}`)) feed.push(feedLine(m, false));
+}
+
+/** Swaps a drawn message's text for what it is now, wherever it shows (the list, the thread, the feed). */
 function redraw(m: Msg): void {
+	refeed(m);
 	for (const row of panel.querySelectorAll<HTMLElement>(`.chat-msg[data-id="${m.id}"]`)) {
 		if (row.querySelector('.chat-edit')) continue;
 		const box = row.closest<HTMLElement>('.chat-list');
@@ -970,15 +923,19 @@ function candidates(q: string): Who[] {
 	return [...starts, ...inside].slice(0, PICKS);
 }
 
-/** A composer: Enter sends (a reply when `parent` is set), Shift+Enter is a new line, `@` offers logins to mention. */
-function composer(placeholder: string, parent: number | null, draft = '', alsoOn = false): HTMLElement {
+/**
+ * A composer: Enter sends (a reply when `parent` is set), Shift+Enter is a new line, `@` offers logins to mention.
+ * `onFeed` makes it the feed's input instead (`sayBox`): what is typed goes live by the pointer, and Enter hands the
+ * text to `onFeed`.
+ */
+function composer(placeholder: string, parent: number | null, draft = '', alsoOn = false, onFeed?: (text: string) => void): HTMLElement {
 	const box = el('div', 'chat-compose');
 	const form = el('form', 'chat-form');
 	const ta = el('textarea');
 	ta.rows = 1;
 	ta.maxLength = MAX;
 	ta.placeholder = placeholder;
-	ta.setAttribute('aria-label', parent === null ? 'Message' : 'Reply');
+	ta.setAttribute('aria-label', onFeed ? 'Chat' : parent === null ? 'Message' : 'Reply');
 	const err = el('p', 'chat-err');
 	err.hidden = true;
 	const go = el('button', 'chat-send');
@@ -1047,8 +1004,9 @@ function composer(placeholder: string, parent: number | null, draft = '', alsoOn
 		grow();
 		pick = 0;
 		drawPop();
+		if (onFeed) live(ta.value);
 		// Typing shows in the main room only: a reply's writer would show there as writing to everyone.
-		if (parent === null && ta.value.trim() && Date.now() - sentTyping > TYPING_SEND_MS) {
+		if (parent === null && you?.login && ta.value.trim() && Date.now() - sentTyping > TYPING_SEND_MS) {
 			sentTyping = Date.now();
 			send({ t: 'typing' });
 		}
@@ -1076,8 +1034,8 @@ function composer(placeholder: string, parent: number | null, draft = '', alsoOn
 				return shut();
 			}
 		}
-		// ↑ in an empty composer edits the reader's last message here, as in Slack.
-		if (e.key === 'ArrowUp' && !ta.value && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey && !e.isComposing) {
+		// ↑ in an empty composer edits the reader's last message here, as in Slack (the panel's composers).
+		if (!onFeed && e.key === 'ArrowUp' && !ta.value && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey && !e.isComposing) {
 			const pane: Pane = parent === null ? 'list' : 'thread';
 			const last = lastOwn(pane);
 			if (last) {
@@ -1094,10 +1052,13 @@ function composer(placeholder: string, parent: number | null, draft = '', alsoOn
 		e.preventDefault();
 		const text = ta.value.trim();
 		if (!text) return;
-		send(parent === null ? { t: 'say', text } : { t: 'say', text, parent, ...(also?.input.checked && { broadcast: true }) });
+		if (onFeed) onFeed(text);
+		else {
+			send(parent === null ? { t: 'say', text } : { t: 'say', text, parent, ...(also?.input.checked && { broadcast: true }) });
+			errAt = err;
+		}
 		if (also) also.input.checked = false;
 		tr.allow();
-		errAt = err;
 		sentTyping = 0;
 		ta.value = '';
 		shut();
@@ -1106,6 +1067,10 @@ function composer(placeholder: string, parent: number | null, draft = '', alsoOn
 	});
 	form.append(ta, go);
 	box.append(err, pop, form);
+	if (onFeed) {
+		ta.enterKeyHint = 'send';
+		ta.addEventListener('focus', () => feed.open());
+	}
 	const also = parent === null ? null : alsoBox(alsoOn);
 	if (also) box.append(also.box);
 	if (draft) {
@@ -1126,6 +1091,45 @@ function drawFoot(): void {
 	const draft = you?.login ? restoring?.main : undefined;
 	if (draft !== undefined) delete restoring!.main;
 	foot.replaceChildren(you?.login ? composer('Message everyone here…', null, draft) : signIn());
+	drawSay();
+}
+
+/** The feed's input (client/lib/feed.ts): the line being typed, to the chat with Enter (signed in), and a word under it. */
+const sayText = () => feed.input()?.value ?? '';
+function drawSay(): void {
+	const draft = restoring?.say ?? sayText();
+	if (restoring) delete restoring.say;
+	const signedIn = !!you?.login;
+	const box = composer(signedIn ? 'Message everyone…' : 'Say hi to this page…', null, draft, false, (text) => {
+		live(text, true);
+		if (you?.login) {
+			send({ t: 'say', text });
+			errAt = null;
+		} else feed.push({ kind: 'local', face: you ? face(you) : undefined, who: 'You', text, note: 'seen by readers on this page, not kept' });
+		feed.close();
+	});
+	const hint = el('p', 'feed-hint');
+	const panelBtn = el('button', '', 'Open the chat');
+	panelBtn.type = 'button';
+	panelBtn.addEventListener('click', () => setOpen(true));
+	if (signedIn) hint.append('↵ sends to everyone · Esc closes · ', panelBtn);
+	else {
+		hint.append('Readers on this page see it by your pointer; it is not kept. ');
+		if (you?.signIn) {
+			const a = signIn();
+			a.className = '';
+			a.textContent = 'Sign in to chat';
+			hint.append(a);
+		} else hint.append(panelBtn);
+	}
+	box.append(hint);
+	feed.setInput(box, {
+		open: () => {
+			if (sayText().trim()) live(sayText());
+		},
+		// Shut unsent: the bubble goes, the text stays for next time.
+		close: () => live(null),
+	});
 }
 
 function arrow(): SVGSVGElement {
@@ -1139,24 +1143,14 @@ function arrow(): SVGSVGElement {
 	return svg;
 }
 
-/**
- * Posts a top-level message as the reader, from outside the panel (client/lib/cursors.ts: a line said by the pointer
- * with T); false when the reader can't talk. A refusal shows under the panel's composer, and in a pop-up while the
- * panel is shut.
- */
-export function post(text: string): boolean {
-	if (!you?.login) return false;
-	send({ t: 'say', text });
-	errAt = null;
-	return true;
-}
-
 /** Wires the chat to the presence socket and the page. Called once. */
 export function setup(opts: {
 	send: (m: object) => void;
 	base: string;
 	face: (w: Who) => HTMLElement;
 	speak: (key: string, login: string, text: string | null) => void;
+	/** The line typed in the feed's input, live by the reader's pointer (client/lib/cursors.ts `say`). */
+	live: (text: string | null, done?: boolean) => void;
 }): void {
 	// A touch screen has no hover: a tap on a message (not on its links or buttons) shows its actions, one at a time.
 	if (matchMedia('(hover: none)').matches) {
@@ -1170,12 +1164,16 @@ export function setup(opts: {
 	}
 	send = opts.send;
 	speak = opts.speak;
+	live = opts.live;
 	base = opts.base;
 	face = opts.face;
-	document.body.append(panel, toasts);
+	document.body.append(panel);
 	drawMute();
 	setFull(false);
-	mute.addEventListener('click', () => setMuted(!muted()));
+	mute.addEventListener('click', () => {
+		feed.setMuted(!feed.muted());
+		drawMute();
+	});
 	full.addEventListener('click', () => setFull(!document.body.classList.contains('chat-full')));
 	back.addEventListener('click', closeThread);
 	typingRow.hidden = true;
@@ -1217,6 +1215,7 @@ export function setup(opts: {
 	drawFoot();
 	if (stored()) setOpen(true);
 	if (restoring?.full && !panel.hidden) setFull(true);
+	if (restoring?.sayOpen) feed.open();
 }
 
 export function setYou(w: You): void {
@@ -1253,12 +1252,11 @@ function reply(r: Msg): void {
 		void translateOne(r);
 		if (!panel.hidden && !document.hidden) markRead(t.id);
 	}
-	const mention = mentionsYou(r);
-	if (r.broadcast || !(mention || inYours(r))) return;
+	if (r.broadcast || !(mentionsYou(r) || inYours(r))) return;
 	speak(r.key, r.login, r.text);
+	feed.push(feedLine(r, panel.hidden === true));
 	if (panel.hidden) {
 		unread++;
-		toast(r, mention, !mention);
 		drawBadge();
 	}
 }
@@ -1270,6 +1268,7 @@ export function message(m: { t?: unknown }): boolean {
 		messages = Array.isArray(ms) ? (ms as Msg[]) : [];
 		takeMine((m as { mine?: unknown }).mine);
 		drawList();
+		feed.sync('m', messages.slice(-FEED_PAST).map((x) => feedLine(x, false)));
 		// The last of what the socket sends on connect: the list goes back where the reader left it, then nothing is left to restore.
 		if (restoring) {
 			if (restoring.list !== undefined && !restoring.bottom) list.scrollTop = restoring.list;
@@ -1298,11 +1297,10 @@ export function message(m: { t?: unknown }): boolean {
 		list.querySelector('.chat-empty')?.remove();
 		list.append(item(msg, messages[messages.length - 2]));
 		void translateOne(msg);
+		// While the panel is open it shows the message; the feed keeps it for its history.
+		feed.push(feedLine(msg, panel.hidden === true));
 		if (panel.hidden) {
-			if (!mine) {
-				unread++;
-				toast(msg, mentionsYou(msg), inYours(msg));
-			}
+			if (!mine) unread++;
 			drawBadge();
 			toBottom();
 		} else if (stick || mine) toBottom();
@@ -1336,6 +1334,7 @@ export function message(m: { t?: unknown }): boolean {
 			}
 			const ids = yours.get(u.parent);
 			if (ids) yours.set(u.parent, ids.filter((x) => x !== u.id));
+			feed.remove(`m${u.id}`);
 			// A reply also sent to the chat leaves the list too.
 			if (messages.some((x) => x.id === u.id)) {
 				messages = messages.filter((x) => x.id !== u.id);
@@ -1343,6 +1342,8 @@ export function message(m: { t?: unknown }): boolean {
 			}
 		} else {
 			// With its replies also sent to the chat.
+			for (const x of messages) if (x.id === u.id || x.parent === u.id) feed.remove(`m${x.id}`);
+			feed.remove(`m${u.id}`);
 			messages = messages.filter((x) => x.id !== u.id && x.parent !== u.id);
 			yours.delete(u.id);
 			drawList();
@@ -1366,7 +1367,10 @@ export function message(m: { t?: unknown }): boolean {
 		translations.delete(id);
 		again(id);
 		const now = copies(id)[0];
-		if (now) void translateOne(now);
+		if (now) {
+			refeed(now);
+			void translateOne(now);
+		}
 	} else if (m.t === 'react') {
 		const f = m as { id?: unknown; reactions?: unknown };
 		if (typeof f.id !== 'number') return true;
@@ -1377,14 +1381,12 @@ export function message(m: { t?: unknown }): boolean {
 		}
 		again(f.id);
 	} else if (m.t === 'error') {
-		const err = errAt?.isConnected ? errAt : foot.querySelector<HTMLElement>('.chat-err');
 		const why = String((m as { text?: unknown }).text ?? 'Not sent.');
-		if (err) {
-			err.textContent = why;
-			err.hidden = false;
-		}
-		// Shut, so it came from outside the panel (`post`): the reader would never see the line under the composer.
-		if (panel.hidden) notice('Not sent to the chat', why, { ms: TOAST_MS, icon: CROSS });
+		// Under the panel's composer that sent it; from the feed's input (or with the panel shut since), in the feed.
+		if (errAt?.isConnected && !panel.hidden) {
+			errAt.textContent = why;
+			errAt.hidden = false;
+		} else feed.push({ kind: 'error', face: icon(CROSS), who: 'Not sent to the chat', text: why });
 	} else return false;
 	return true;
 }
@@ -1400,6 +1402,8 @@ export function save(): Kept {
 		bottom: nearBottom(),
 		also: threadFoot.querySelector<HTMLInputElement>('.chat-also-to input')?.checked || undefined,
 		edit: editing ? { id: editing.id, pane: editing.pane, text: editing.draft } : undefined,
+		say: sayText() || undefined,
+		sayOpen: feed.isOpen() || undefined,
 	};
 }
 

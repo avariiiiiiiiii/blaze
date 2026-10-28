@@ -8,13 +8,14 @@ scope when rustc's verdict on its constants can be compared (docs/harness.md).
 |---|---|---|
 | before (main at 88ceec28eb) | **710 of 767** (92.6%) | 0 of 223 |
 | after #929, #933, #936, #938 | **720 of 767** (93.9%) | 0 of 223 |
+| main at 0c0ca43feb, with #943 and #961 | **727 of 767** (94.8%) | **222 of 222** (100%) |
 
-1729 units in 1595 tests; 962 are out of scope, each with a reason (`before.md`, `after.md`, the
-end). No file made blaze panic.
+1729 units in 1595 tests; 962 are out of scope, each with a reason (`before.md`, `after.md`,
+`main.md`, the end). No file made blaze panic.
 
-The run-pass values are 0 because `uitest.py` cannot build any test on main:
-`blaze has no answer to rustc --print link-args -C save-temps ...` (the pinned run-pass job of
-the train fails the same way). The numbers are those of the evaluation alone until it builds.
+In the first two runs the run-pass values are 0, because `uitest.py` built no test then:
+`blaze has no answer to rustc --print link-args -C save-temps ...`. That was fixed on main by
+#927. The train holds both numbers of the last row (`min_evaluation`, `min_run_pass`).
 
 ## What the fixes were
 
@@ -32,14 +33,18 @@ The classes of the first run, largest first, and what came of them:
   (`unchecked_div(-128i8, -1)`, `exact_div(7, 2)`).
 - 14 items in 11 units, the `gca!` built-in macro (const-generics/gca, mgca): #938.
 - 6 items, the `variant_count` intrinsic: #936.
+- 8 items in 6 units, a static's initializer writing to a static (another, or itself): #943.
+- consts/recursive.rs, endless recursion in a const fn. On main it took the train's runner down
+  (one process at 15 GB): calls were not counted against a frame limit, so evaluation ran until
+  #912's step budget of 10^9 was spent. #961 limits frames to the crate's `recursion_limit`, as
+  rustc does.
 
 ## What is left
 
-`after.md` lists every unit that differs. The largest classes are rustc's undefined-behavior
+`main.md` lists every unit that differs. The largest classes are rustc's undefined-behavior
 checks that blaze's evaluator does not make: pointer arithmetic out of an allocation
 (`offset`, `offset_from`), reading part of a pointer, writing through a shared reference,
-invalid values (an enum's tag, a `bool`, an uninhabited type), a static's initializer writing
-to a static. Then generic const items (`const ADD1<const N: usize>`), which the gca tests use.
+invalid values (an enum's tag, a `bool`, an uninhabited type). Then generic const items (`const ADD1<const N: usize>`), which the gca tests use.
 
 ## Again
 
@@ -52,4 +57,4 @@ built blaze:
 Runs: before https://github.com/indexable-inc/blaze/actions/runs/40665753306, after
 https://github.com/indexable-inc/blaze/actions/runs/40665753384 (the harness's branch and that
 branch with the four fixes; the after run's unit tests found the gca test's fixture lacking
-`len`, fixed in #938).
+`len`, fixed in #938). Main: https://github.com/indexable-inc/blaze/actions/runs/40682227369.

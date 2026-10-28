@@ -91,7 +91,7 @@ project only blaze builds, and rustc says so at the first use, not by doing some
   compile_error!("this crate's macros are blaze const macros (src/macros.rs): build it with blaze");
   ```
 
-  For this, blaze is to set `--cfg blaze_const_macros` for a package whose `const-macros` key
+  For this, blaze sets the cfg `blaze_const_macros` for a package whose `const-macros` key
   it honours. rustc's `unexpected_cfgs` lint warns about the name unless the package lists it
   (`[lints.rust] unexpected_cfgs = { level = "warn", check-cfg = ["cfg(blaze_const_macros)"] }`).
 

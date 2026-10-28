@@ -182,8 +182,10 @@ experimental = ["sandboxed-tests"]
 
 or where a package does, in its own manifest, with `tests = true` under
 `[package.metadata.blaze.sandbox]`. `experimental` lists, by name, the experiments a workspace
-opts into; `sandboxed-tests` is the one there is, and any other name, or a value that is not a
-list of names, is an error that names the manifest and the names known. A test that is not
+opts into: `sandboxed-tests`, and `const-macros` (proc macros written as functions of a file of
+the package, run by blaze's const evaluator: [future/const-macros.md](future/const-macros.md)).
+Any other name, or a value that is not a list of names, is an error that names the manifest and
+the names known. A test that is not
 sandboxed is not kept as passed under `BLAZE_TESTS=affected`
 ([below](#running-only-the-tests-that-have-not-passed)). Build scripts run in the sandbox
 whatever the workspace says ([below](#build-scripts-and-proc-macros-run-in-a-sandbox)), and

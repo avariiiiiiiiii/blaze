@@ -201,7 +201,7 @@ pub use {
     // FIXME: Properly encapsulate mir
     hir_ide::mir,
     hir_ide::{
-        CastError, PointerCast, attach_db, attach_db_allow_change,
+        CastError, PointerCast, attach_db, attach_db_allow_change, const_macro,
         consteval::ConstEvalError,
         diagnostics::UnsafetyReason,
         display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError, HirWrite},

@@ -70,7 +70,7 @@ use base_db::TargetKind;
 pub use crate::{
     build_dependencies::{ProcMacroDylibPath, WorkspaceBuildScripts},
     cargo_workspace::{
-        CargoConfig, CargoFeatures, CargoMetadataConfig, CargoWorkspace, OwnBuildAsked,
+        CONST_MACROS, CargoConfig, CargoFeatures, CargoMetadataConfig, CargoWorkspace, OwnBuildAsked,
         OwnBuildOutput, OwnBuildScripts, OwnMetadata, Package, PackageData, PackageDependency,
         RustLibSource, Target, TargetData, TargetDirectoryConfig,
     },

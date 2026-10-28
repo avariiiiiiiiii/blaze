@@ -6,19 +6,23 @@
 //! (`fn(&str) -> String` for a derive or a function-like macro, `fn(&str, &str) -> String`,
 //! attribute first, for an attribute), and every output token gets the call site's span.
 
-use std::any::Any;
+use std::{any::Any, sync::Arc};
 
 use base_db::{Crate, Env, SourceDatabase, all_crates};
 use hir_def::{FunctionId, MacroId, ModuleDefId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
     parse_to_token_tree_static_span,
-    proc_macro::{ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
+    proc_macro::{ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
     tt,
 };
 use hir_ty::db::HirDatabase;
 use intern::Symbol;
 use span::{FileId, Span};
+use syntax::{
+    AstNode, Edition, SyntaxKind,
+    ast::{self, HasAttrs, HasModuleItem, HasName},
+};
 
 use crate::{display::DisplayTarget, mir::call_with_strs, mir_pretty::MirEvalErrorPretty};
 
@@ -28,6 +32,38 @@ pub struct ConstMacroExpander {
     pub root: FileId,
     pub name: Symbol,
     pub kind: ProcMacroKind,
+}
+
+/// The macros of the macro crate whose root file is `root`, of text `text`: its root's functions
+/// marked `#[proc_macro_derive(Name)]`, `#[proc_macro_attribute]` or `#[proc_macro]`, as the
+/// def map collector exports them from a proc-macro crate.
+pub fn load(root: FileId, text: &str, edition: Edition) -> Vec<ProcMacro> {
+    let file = ast::SourceFile::parse(text, edition).tree();
+    let macros = file.items().filter_map(|item| {
+        let ast::Item::Fn(func) = item else { return None };
+        let fn_name = || Some(func.name()?.text().to_string());
+        func.attrs().find_map(|attr| match attr.simple_name()?.as_str() {
+            "proc_macro_derive" => {
+                let (_, args) = attr.as_simple_call()?;
+                let name = args
+                    .syntax()
+                    .children_with_tokens()
+                    .filter_map(|it| it.into_token())
+                    .find(|it| it.kind() == SyntaxKind::IDENT)?;
+                Some((name.text().to_owned(), ProcMacroKind::CustomDerive))
+            }
+            "proc_macro_attribute" => Some((fn_name()?, ProcMacroKind::Attr)),
+            "proc_macro" => Some((fn_name()?, ProcMacroKind::Bang)),
+            _ => None,
+        })
+    });
+    macros
+        .map(|(name, kind)| {
+            let name = Symbol::intern(&name);
+            let expander = ConstMacroExpander { root, name: name.clone(), kind };
+            ProcMacro { name, kind, expander: Arc::new(expander), disabled: false }
+        })
+        .collect()
 }
 
 /// Lets `db` run const macros: their expander is given the database as a `SourceDatabase`,

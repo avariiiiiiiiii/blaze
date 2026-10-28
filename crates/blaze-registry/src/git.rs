@@ -473,7 +473,11 @@ fn local(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
+        .env_remove("GIT_INDEX_FILE")
+        // With no configuration there is no name or email for the reflog, and git, making one
+        // up, asks DNS for the machine's domain name. Nothing here is committed.
+        .env("GIT_COMMITTER_NAME", "blaze")
+        .env("GIT_COMMITTER_EMAIL", "blaze@localhost");
     run(command.args(args))
 }
 

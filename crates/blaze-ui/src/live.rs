@@ -10,6 +10,9 @@ const SHOWN: usize = 6;
 /// The most lines of the tree of crates ([`Live::tree`]).
 const TREE: usize = 10;
 
+/// The most functions compiling shown under a crate ([`Live::functions`]).
+const FUNCTIONS: usize = 3;
+
 /// How many half seconds the line of how busy the cores were shows ([`Live::cores`]).
 const SPARK: usize = 20;
 
@@ -275,6 +278,8 @@ impl Live {
             };
             let rest = format!("{}{fns}  {}", krate.name, since(krate.began_ns));
             lines.push(self.fit(CYAN, &format!("{:>14}", branch), &rest));
+            let under = if at + 1 == shown && running.len() == shown { "" } else { "\u{2502}" };
+            lines.extend(self.functions(&krate.name, now_ns, &format!("{under:>13}")));
         }
         if running.len() > shown {
             let more = format!("{} more under way", running.len() - shown);
@@ -358,6 +363,16 @@ impl Live {
                 Some(_) => format!("{:13}{indent}{glyph}", ""),
             };
             lines.push(self.fit(CYAN, &word, &rest));
+            if it.is_busy() {
+                // Under the name, beside the branches its children hang from.
+                let under = match last {
+                    None => format!("{:12}", ""),
+                    Some(last) => {
+                        format!("{:13}{indent}{}", "", if last { "  " } else { "\u{2502} " })
+                    }
+                };
+                lines.extend(self.functions(&it.name, now_ns, &under));
+            }
             let mut deps: Vec<usize> = graph[node]
                 .deps
                 .iter()
@@ -409,6 +424,19 @@ impl Live {
         }
         lines.push(self.fit(DIM, &format!("{:12}", ""), &footer));
         lines
+    }
+
+    /// The functions of crate `krate` compiling longest ([`Build::compiling_of`]), the top
+    /// [`FUNCTIONS`] of them, each a line under the crate's starting with `under`.
+    ///
+    /// ```text
+    ///             ├─ regex_automata  compiling 7318 fns  2.55s
+    ///             │    regex_automata::meta::Regex::search 1.20s
+    /// ```
+    fn functions(&self, krate: &str, now_ns: u64, under: &str) -> Vec<String> {
+        let of = self.build.compiling_of(krate, now_ns);
+        let of = of.into_iter().take(FUNCTIONS);
+        of.map(|(name, ns)| self.fit(DIM, under, &format!("  {name} {}", took(ns)))).collect()
     }
 
     /// `word` painted and `rest` after it, cut to the width: a line that wrapped would be two

@@ -215,7 +215,7 @@ fn a_message_is_these_bytes() {
 /// A build's record is pinned the same way.
 #[test]
 fn an_event_is_these_bytes() {
-    use crate::events::{Cause, CrateState, Event, Fns, NodeKind, Record, Step};
+    use crate::events::{Cause, CrateState, Event, Fns, NodeKind, Record, Slow, Step};
     let records = [
         Record { at_ns: 0, event: Event::Started { step: Step::LoadWorkspace, of: None } },
         Record {
@@ -248,6 +248,16 @@ fn an_event_is_these_bytes() {
             event: Event::Node { id: 1, kind: NodeKind::Std, name: "std".into(), deps: vec![0] },
         },
         Record { at_ns: 0, event: Event::Cores { busy: 790, of: 8 } },
+        Record {
+            at_ns: 0,
+            event: Event::Compiling {
+                functions: vec![Slow {
+                    krate: "rg".into(),
+                    name: "rg::main".into(),
+                    ns: 300_000_000,
+                }],
+            },
+        },
     ];
     let hexes: Vec<String> = records.iter().map(|it| hex(&to_vec(it).unwrap())).collect();
     let expected = [
@@ -272,6 +282,10 @@ fn an_event_is_these_bytes() {
          646b696e64 63537464 646e616d65 63737464",
         // {"at_ns": 0, "event": {"Cores": {"of": 8, "busy": 790}}}
         "a2 6561745f6e73 00 656576656e74 a1 65436f726573 a2 626f66 08 6462757379 190316",
+        // {"at_ns": 0, "event": {"Compiling": {"functions": [{"ns": 300000000,
+        // "name": "rg::main", "krate": "rg"}]}}}
+        "a2 6561745f6e73 00 656576656e74 a1 69436f6d70696c696e67 a1 6966756e6374696f6e73 81 \
+         a3 626e73 1a11e1a300 646e616d65 6872673a3a6d61696e 656b72617465 627267",
     ];
     for ((hexed, expected), record) in hexes.iter().zip(expected).zip(&records) {
         assert_eq!(hexed, &expected.replace(' ', ""), "{record:?}");

@@ -1,5 +1,5 @@
 use blaze_protocol::events::{
-    Cache, Cause, CrateState, Event, Fns, NodeKind, NodeState, Record, Step, Summary,
+    Cache, Cause, CrateState, Event, Fns, NodeKind, NodeState, Record, Slow, Step, Summary,
 };
 
 use crate::{Live, Plain, summary_line, took};
@@ -359,6 +359,7 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
         unnamed,
         cores,
         cores_of: 0,
+        slowest: Vec::new(),
     };
     let lines = crate::last_lines(&finished, false, true);
     assert_eq!(
@@ -438,6 +439,44 @@ fn the_cores_kept_busy_show_as_it_goes_and_at_the_end() {
     let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
     assert!(drawn.contains("Took 4.00s: std 4.00s (2.7/8 cores)"), "{drawn:?}");
     assert_eq!(live.build().why_steps(4 * S), ["std   4.00s  2.7/8 cores"]);
+}
+
+/// Under each crate under way, the functions of it compiling longest so far, each over a
+/// moment; at the end the slowest five.
+#[test]
+fn the_functions_slow_to_compile_show_under_their_crate_and_at_the_end() {
+    let slow = |name: &str, ns| Slow { krate: "wgpu".into(), name: name.into(), ns };
+    let compiling = Event::Compiling {
+        functions: vec![slow("wgpu::Device::new", 300 * MS), slow("wgpu::Queue::submit", 100 * MS)],
+    };
+    let mut live = Live::new(120, false);
+    for record in graphed().into_iter().chain([at(2 * S, compiling)]) {
+        live.record(&record, record.at_ns);
+    }
+    let drawn = live.tick(3 * S);
+    let region: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    assert_eq!(
+        region[4..],
+        [
+            "             \u{251c}\u{2500} winit  resolving  1.50s",
+            "             \u{2514}\u{2500} wgpu  resolving  1.50s",
+            format!("{:18}wgpu::Device::new 1.30s", "").as_str(),
+            format!("{:18}wgpu::Queue::submit 1.10s", "").as_str(),
+            "             0 done \u{b7} 2 under way \u{b7} 3 waiting",
+        ]
+    );
+    let slowest =
+        vec![slow("wgpu::Device::new", 1400 * MS), slow("wgpu::Queue::submit", 1100 * MS)];
+    let end = [
+        at(3 * S, Event::Ended { step: Step::Resolve, of: None }),
+        at(3 * S, Event::Slowest { functions: slowest }),
+        at(3 * S, Event::Finished { ok: true, summary: Summary::default() }),
+    ];
+    let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
+    let said = "     Slowest fns: wgpu::Device::new 1.40s, wgpu::Queue::submit 1.10s";
+    assert!(drawn.contains(said), "{drawn:?}"); // A name too long keeps its end, which says which function it is.
+    let name = "<regex_syntax::unicode::SimpleCaseFolder>::new";
+    assert_eq!(crate::tail(name, 24), "\u{2026}:SimpleCaseFolder>::new");
 }
 
 /// The functions done of a crate whose total is not known yet count in no `done/total`, which

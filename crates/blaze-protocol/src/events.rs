@@ -53,6 +53,23 @@ pub enum Event {
     /// How busy the process was since it said this last, while at a step: `busy` hundredths
     /// of a core, of the `of` cores it may run on. Said when it moved by a tenth of a core.
     Cores { busy: u32, of: u32 },
+    /// The functions compiling for longer than a moment ([`SLOW_NS`]), longest first, each
+    /// for `ns` by this record: said when which they are changes, and empty once none is.
+    Compiling { functions: Vec<Slow> },
+    /// The functions the build took [`SLOW_NS`] or more to compile, longest first, each in
+    /// `ns`: said once, as it ends.
+    Slowest { functions: Vec<Slow> },
+}
+
+/// A function compiling longer than this is a slow one: [`Event::Compiling`] says it.
+pub const SLOW_NS: u64 = 200_000_000;
+
+/// A function slow to compile, of crate `krate`: `ns` is how long it took, or has so far.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Slow {
+    pub krate: String,
+    pub name: String,
+    pub ns: u64,
 }
 
 /// What a node of the build's graph does (docs/driver.md, "The graph").

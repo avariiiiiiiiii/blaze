@@ -8684,6 +8684,7 @@ fn run_holding(
     }
     events::at(events::Step::LoadWorkspace, None);
     events::cache_ahead();
+    events::flights();
     let start = Instant::now();
     let selection = args.selection.clone();
     blaze_store::identify_ahead();
@@ -10864,6 +10865,7 @@ impl Program {
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
         let named = shown_crate(db, args);
+        events::flights();
         let compiling = events::compiling(&named);
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.

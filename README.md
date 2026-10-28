@@ -7,7 +7,7 @@
 
 <h3 align="center">Rebuild Rust in milliseconds.</h3>
 
-<p align="center">Swap <code>cargo</code> for <code>blaze</code>.<br>Blazingly fast Rust, literally.</p>
+<p align="center">Type <code>blaze</code> wherever you'd type <code>cargo</code>.<br>Blazingly fast Rust, literally.</p>
 
 <p align="center">
   <a href="#install">Install</a> ·

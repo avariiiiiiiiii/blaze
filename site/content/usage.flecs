@@ -9,7 +9,7 @@ site {
     Intro: {"[warm] Using blaze, day to day. If you know cargo, you mostly know this already."}
     Outro: {"[warm] So: blaze wherever you'd type cargo, a daemon that keeps your project compiled, and a clear error whenever blaze can't do something yet. Thanks for listening."}
 
-    Lede lede("Swap `cargo` for `blaze`. Not installed yet: [Install](/install). Every command and setting in detail: [cargo.md](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md).") {
+    Lede lede("Type `blaze` wherever you'd type `cargo`. Not installed yet: [Install](/install). Every command and setting in detail: [cargo.md](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md).") {
       Say: {"[warm] The short version: type blaze wherever you'd type cargo. If it's not installed yet, the install page is one step back."}
     }
 

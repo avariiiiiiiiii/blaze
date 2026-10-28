@@ -872,7 +872,7 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_add" | "unchecked_add" => {
+            "wrapping_add" => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "wrapping_add args are not provided".into(),
@@ -901,7 +901,7 @@ impl<'db> Evaluator<'db> {
                 let ans = ans / size;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_sub" | "unchecked_sub" => {
+            "wrapping_sub" => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "wrapping_sub args are not provided".into(),
@@ -912,7 +912,7 @@ impl<'db> Evaluator<'db> {
                 let ans = lhs.wrapping_sub(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_mul" | "unchecked_mul" => {
+            "wrapping_mul" => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "wrapping_mul args are not provided".into(),
@@ -923,7 +923,7 @@ impl<'db> Evaluator<'db> {
                 let ans = lhs.wrapping_mul(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_shl" | "unchecked_shl" => {
+            "wrapping_shl" => {
                 // FIXME: signed
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
@@ -935,7 +935,7 @@ impl<'db> Evaluator<'db> {
                 let ans = lhs.wrapping_shl(rhs as u32);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_shr" | "unchecked_shr" => {
+            "wrapping_shr" => {
                 // FIXME: signed
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
@@ -953,48 +953,14 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "unchecked_rem" => {
-                // FIXME: signed
+            "unchecked_add" | "unchecked_sub" | "unchecked_mul" | "unchecked_shl"
+            | "unchecked_shr" | "unchecked_div" | "unchecked_rem" | "exact_div" => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
-                        "unchecked_rem args are not provided".into(),
+                        format!("{name} args are not provided").into(),
                     ));
                 };
-                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
-                let ans = if signed {
-                    let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
-                    let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::Yes));
-                    lhs.checked_rem(rhs).map(|it| it as u128)
-                } else {
-                    let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                    let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                    lhs.checked_rem(rhs)
-                };
-                let ans = ans.ok_or_else(|| {
-                    MirEvalError::UndefinedBehavior("unchecked_rem with bad inputs".to_owned())
-                })?;
-                destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
-            }
-            "unchecked_div" | "exact_div" => {
-                // FIXME: signed
-                let [lhs, rhs] = args else {
-                    return Err(MirEvalError::InternalError(
-                        "unchecked_div args are not provided".into(),
-                    ));
-                };
-                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
-                let ans = if signed {
-                    let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
-                    let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::Yes));
-                    lhs.checked_div(rhs).map(|it| it as u128)
-                } else {
-                    let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                    let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                    lhs.checked_div(rhs)
-                };
-                let ans = ans.ok_or_else(|| {
-                    MirEvalError::UndefinedBehavior("unchecked_rem with bad inputs".to_owned())
-                })?;
+                let ans = self.unchecked_int(name, lhs, rhs)?;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
             "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" => {
@@ -1559,6 +1525,88 @@ impl<'db> Evaluator<'db> {
             }
             _ => not_supported!("unsized type other than str, slice, struct and dyn"),
         })
+    }
+
+    /// An `unchecked_*` or `exact_div` of integers, as the bits of `lhs`'s type: what the
+    /// operation gives where it is defined, and the undefined behavior rustc's const eval
+    /// reports where it is not.
+    fn unchecked_int(
+        &self,
+        name: &str,
+        lhs: &IntervalAndTy<'db>,
+        rhs: &IntervalAndTy<'db>,
+    ) -> Result<'db, u128> {
+        let ub = |what: String| Err(MirEvalError::UndefinedBehavior(what));
+        let bits = lhs.interval.size as u32 * 8;
+        let signed = |arg: &IntervalAndTy<'db>| matches!(arg.ty.kind(), TyKind::Int(_));
+        let int = |arg: &IntervalAndTy<'db>| -> Result<'db, i128> {
+            Ok(i128::from_le_bytes(pad16(arg.get(self)?, IsSigned::Yes)))
+        };
+        let uint = |arg: &IntervalAndTy<'db>| -> Result<'db, u128> {
+            Ok(u128::from_le_bytes(pad16(arg.get(self)?, IsSigned::No)))
+        };
+        if let "unchecked_shl" | "unchecked_shr" = name {
+            let amount = if signed(rhs) {
+                int(rhs)?
+            } else {
+                uint(rhs)?.min(i128::MAX as u128) as i128
+            };
+            if amount < 0 || amount >= i128::from(bits) {
+                return ub(format!("overflowing shift by {amount} in `{name}`"));
+            }
+            return Ok(match (name, signed(lhs)) {
+                ("unchecked_shl", _) => uint(lhs)? << amount,
+                (_, true) => (int(lhs)? >> amount) as u128,
+                _ => uint(lhs)? >> amount,
+            });
+        }
+        let overflow = || format!("arithmetic overflow in `{name}`");
+        let by_zero = || match name {
+            "unchecked_rem" => "calculating the remainder with a divisor of zero".to_owned(),
+            _ => "dividing by zero".to_owned(),
+        };
+        if signed(lhs) {
+            let (a, b) = (int(lhs)?, int(rhs)?);
+            let (min, max) = (i128::MIN >> (128 - bits), i128::MAX >> (128 - bits));
+            let ans = match name {
+                "unchecked_add" => a.checked_add(b),
+                "unchecked_sub" => a.checked_sub(b),
+                "unchecked_mul" => a.checked_mul(b),
+                _ if b == 0 => return ub(by_zero()),
+                _ if a == min && b == -1 => return ub(overflow()),
+                "exact_div" if a % b != 0 => {
+                    return ub(format!(
+                        "exact_div: {a} cannot be divided by {b} without remainder"
+                    ));
+                }
+                "unchecked_rem" => Some(a % b),
+                _ => Some(a / b),
+            };
+            match ans {
+                Some(ans) if (min..=max).contains(&ans) => Ok(ans as u128),
+                _ => ub(overflow()),
+            }
+        } else {
+            let (a, b) = (uint(lhs)?, uint(rhs)?);
+            let max = u128::MAX >> (128 - bits);
+            let ans = match name {
+                "unchecked_add" => a.checked_add(b),
+                "unchecked_sub" => a.checked_sub(b),
+                "unchecked_mul" => a.checked_mul(b),
+                _ if b == 0 => return ub(by_zero()),
+                "exact_div" if a % b != 0 => {
+                    return ub(format!(
+                        "exact_div: {a} cannot be divided by {b} without remainder"
+                    ));
+                }
+                "unchecked_rem" => Some(a % b),
+                _ => Some(a / b),
+            };
+            match ans {
+                Some(ans) if ans <= max => Ok(ans),
+                _ => ub(overflow()),
+            }
+        }
     }
 
     fn exec_atomic_intrinsic(

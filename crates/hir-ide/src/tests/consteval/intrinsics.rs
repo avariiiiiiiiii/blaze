@@ -582,6 +582,48 @@ fn allocator() {
 }
 
 #[test]
+fn unchecked_arithmetic() {
+    let fixture = |goal: &str| {
+        format!(
+            r#"
+        #[rustc_intrinsic]
+        pub fn unchecked_add<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_mul<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_div<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_rem<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn exact_div<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_shl<T, U>(x: T, y: U) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_shr<T, U>(x: T, y: U) -> T;
+
+        {goal}
+        "#
+        )
+    };
+    let undefined = |e: ConstEvalError<'_>| {
+        matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_)))
+    };
+    check_number(&fixture("const GOAL: u8 = unchecked_add(200u8, 55);"), 255);
+    check_number(&fixture("const GOAL: i8 = unchecked_mul(-64i8, 2);"), -128);
+    check_number(&fixture("const GOAL: i32 = exact_div(-6i32, 3);"), -2);
+    check_number(&fixture("const GOAL: u8 = unchecked_shl(1u8, 7u32);"), 128);
+    check_number(&fixture("const GOAL: i8 = unchecked_shr(-128i8, 7u32);"), -1);
+    check_number(&fixture("const GOAL: u8 = unchecked_rem(7u8, 4);"), 3);
+    check_fail(&fixture("const GOAL: u8 = unchecked_add(200u8, 56);"), undefined);
+    check_fail(&fixture("const GOAL: i8 = unchecked_mul(-64i8, -2);"), undefined);
+    check_fail(&fixture("const GOAL: i8 = unchecked_div(-128i8, -1);"), undefined);
+    check_fail(&fixture("const GOAL: i32 = exact_div(7i32, 2);"), undefined);
+    check_fail(&fixture("const GOAL: u8 = unchecked_rem(7u8, 0);"), undefined);
+    check_fail(&fixture("const GOAL: u8 = unchecked_shl(1u8, 8u32);"), undefined);
+    check_fail(&fixture("const GOAL: u8 = unchecked_shr(1u8, -1i32);"), undefined);
+}
+
+#[test]
 fn overflowing_add() {
     check_number(
         r#"

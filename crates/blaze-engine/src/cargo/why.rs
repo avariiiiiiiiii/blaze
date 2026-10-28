@@ -1,5 +1,5 @@
 //! `blaze why [fn|crate]`: what the last build compiled again and why, from its records
-//! ([`crate::events`]), which the command that waited for it kept beside the daemon
+//! ([`blaze_protocol::events`]), which the command that waited for it kept beside the daemon
 //! ([`keep`]).
 
 use std::{io::Write as _, path::PathBuf};

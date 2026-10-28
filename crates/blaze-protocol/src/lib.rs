@@ -10,6 +10,7 @@
 
 pub mod cbor;
 pub mod events;
+pub mod follow;
 
 #[cfg(test)]
 mod tests;

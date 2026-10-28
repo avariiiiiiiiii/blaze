@@ -156,7 +156,7 @@ fn event_out(record: &blaze_protocol::events::Record) {
 const SHOWN_AFTER: Duration = Duration::from_millis(500);
 
 /// What a command that waits for the daemon shows of the build's records
-/// ([`crate::events`]). On a terminal: a region below the lines that stay, drawn again as
+/// ([`blaze_protocol::events`]). On a terminal: a region below the lines that stay, drawn again as
 /// records come and time passes, and at the end the build's last line in its place
 /// ([`blaze_ui::live`]). Elsewhere: cargo's lines, for a log ([`blaze_ui::plain`]). Nothing
 /// when the command is quiet.

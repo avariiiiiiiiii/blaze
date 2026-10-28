@@ -502,7 +502,7 @@ impl Worker {
         // is not the one to connect to.
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(errors_beside(&socket));
-        crate::events::forget_beside(&socket);
+        blaze_protocol::follow::forget_beside(&socket);
         let config = &checkout.config;
         let mut args = config.args(&checkout.root, &first.crates);
         let rustcs: [(&str, &Path); 5] = [
@@ -947,7 +947,7 @@ impl Checker {
         private_dir(dir)?;
         let (socket, log) = (dir.join("sock"), dir.join("log"));
         let _ = std::fs::remove_file(&socket);
-        crate::events::forget_beside(&socket);
+        blaze_protocol::follow::forget_beside(&socket);
         let mut args: Vec<OsString> = vec!["--check".into()];
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
@@ -1192,7 +1192,7 @@ pub(crate) enum Answer {
 }
 
 /// The answer `answering` gives, with the command that waits for it, request `id`, handed
-/// each record the process in `dir` writes meanwhile ([`crate::events`]), its times from
+/// each record the process in `dir` writes meanwhile ([`blaze_protocol::follow`]), its times from
 /// when the command asked, and last how the build went. A command that says nothing for
 /// the minute a load and a first build can take looks stuck.
 fn relaying(
@@ -1202,7 +1202,7 @@ fn relaying(
     command: &str,
     answering: impl FnOnce() -> Reply,
 ) -> Reply {
-    let began_ns = crate::events::now_ns();
+    let began_ns = blaze_protocol::follow::now_ns();
     let build = std::sync::Mutex::new(blaze_ui::Build::default());
     let gone = AtomicBool::new(false);
     let send = |event: Event, at_ns: u64| {
@@ -1216,9 +1216,9 @@ fn relaying(
             gone.store(true, Relaxed);
         }
     };
-    let follow = std::sync::Mutex::new(crate::events::Follow::new());
+    let follow = std::sync::Mutex::new(blaze_protocol::follow::Follow::default());
     let relay = || {
-        let Some(path) = crate::events::written_in(dir) else { return };
+        let Some(path) = blaze_protocol::follow::written_in(dir) else { return };
         for record in lock(&follow).read(&path, true) {
             send(record.event, record.at_ns);
         }
@@ -1249,7 +1249,7 @@ fn relaying(
         _ => None,
     };
     let ok = error.is_none();
-    let now_ns = crate::events::now_ns();
+    let now_ns = blaze_protocol::follow::now_ns();
     let summary = lock(&build).summary(now_ns.saturating_sub(began_ns), error);
     send(Event::Finished { ok, summary }, now_ns);
     reply
@@ -1353,8 +1353,8 @@ impl Daemon {
     }
 
     /// The directory of the process that answers `request`, whose records the command that
-    /// asks is handed ([`crate::events`]), and what the request is: a build, which may load
-    /// the workspace first, and a check, which can take long.
+    /// asks is handed ([`blaze_protocol::follow`]), and what the request is: a build, which
+    /// may load the workspace first, and a check, which can take long.
     fn followed_in(&self, request: &Request) -> Option<(PathBuf, &'static str)> {
         match request {
             Request::Build(checkout) => {

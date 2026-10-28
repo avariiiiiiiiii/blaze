@@ -26,18 +26,8 @@ impl Spans {
         })
     }
 
-    /// Numbers `span` next, as a kept output's table has it, the same as an earlier or not.
-    pub(crate) fn push(&mut self, span: Span) {
-        self.all.push(span);
-        self.numbers.entry(span).or_insert(self.all.len() as u32);
-    }
-
     pub(crate) fn get(&self, number: u32) -> Option<Span> {
         self.all.get((number as usize).checked_sub(1)?).copied()
-    }
-
-    pub(crate) fn all(&self) -> &[Span] {
-        &self.all
     }
 }
 

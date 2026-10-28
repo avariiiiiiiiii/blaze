@@ -22,6 +22,11 @@ pub enum ProcMacroKind {
 
 /// A proc-macro expander implementation.
 pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
+    /// Whether calls share mutable state within one calling crate's compilation.
+    fn requires_session(&self) -> bool {
+        false
+    }
+
     /// Run the expander with the given input subtree, optional attribute input subtree (for
     /// [`ProcMacroKind::Attr`]), environment variables, and span information.
     fn expand(
@@ -35,6 +40,22 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         mixed_site: Span,
         current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
+
+    /// Run in the calling crate's compilation session. Native expanders use `expand`.
+    fn expand_in(
+        &self,
+        db: &dyn SourceDatabase,
+        _calling_crate: Crate,
+        subtree: &tt::TopSubtree,
+        attrs: Option<&tt::TopSubtree>,
+        env: &Env,
+        def_site: Span,
+        call_site: Span,
+        mixed_site: Span,
+        current_dir: String,
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        self.expand(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir)
+    }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool;
 }
@@ -192,6 +213,18 @@ impl CrateProcMacros {
     }
 }
 
+/// Whether this crate can call a macro whose state belongs to a compilation session,
+/// including macros reexported by a dependency.
+#[salsa::tracked(returns(copy))]
+pub fn may_have_session_macros(db: &dyn SourceDatabase, krate: Crate) -> bool {
+    ProcMacros::get_for_crate(db, krate)
+        .and_then(|it| {
+            it.macros().map(|macros| macros.iter().any(|it| it.expander.requires_session()))
+        })
+        .unwrap_or(false)
+        || krate.data(db).dependencies.iter().any(|dep| may_have_session_macros(db, dep.crate_id))
+}
+
 /// A loaded proc-macro.
 #[derive(Debug, Clone, Eq)]
 pub struct ProcMacro {
@@ -280,6 +313,14 @@ impl CustomProcMacroExpander {
         self.proc_macro_id == Self::PROC_MACRO_ATTR_DISABLED
     }
 
+    /// Whether this resolved macro shares mutable guest state with earlier calls.
+    pub fn requires_session(self, db: &dyn SourceDatabase, def_crate: Crate) -> bool {
+        ProcMacros::get_for_crate(db, def_crate)
+            .and_then(|it| it.macros())
+            .and_then(|it| it.get(self.proc_macro_id as usize))
+            .is_some_and(|it| it.expander.requires_session())
+    }
+
     pub fn as_expand_error(&self, def_crate: Crate) -> Option<ExpandErrorKind> {
         match self.proc_macro_id {
             Self::PROC_MACRO_ATTR_DISABLED => Some(ExpandErrorKind::ProcMacroAttrExpansionDisabled),
@@ -347,8 +388,9 @@ impl CustomProcMacroExpander {
                 // FIXME: Can we avoid the string allocation here?
                 let current_dir = calling_crate.data(db).proc_macro_cwd.to_string();
 
-                match proc_macro.expander.expand(
+                match proc_macro.expander.expand_in(
                     db,
+                    calling_crate,
                     tt,
                     attr_arg,
                     env,

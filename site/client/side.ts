@@ -5,7 +5,9 @@
  * - Folds: a section the reader folded stays folded on the next page (localStorage), except the one holding the page.
  *   A fold slides open and shut as the ix sidebar's (svelte/transition slide, 180 ms). The sidebar's scroll carries
  *   over too (sessionStorage, written on pagehide); keep.ts puts both back before the next page's first paint.
- * - Rows: ix's hover pill (lib/site/glide.ts) slides from row to row under the pointer.
+ * - Rows: ix's hover pill (lib/site/glide.ts) slides from row to row under the pointer. A lesson row's mark shows the
+ *   reader's progress (client/lib/progress.ts), painted on every page.
+ * - Reference folds in the phone drawer until the reader opens it there (blaze.side.opened; keep.ts applies it).
  * - The drawer: Menu opens it, the scrim, the close button and Escape close it, without touching the URL.
  * - Search: the pill (and ⌘K, Ctrl K or /) opens a dialog over `search.json` (gen/build.ts writes it: one entry per
  *   page and per section, with its text); every word typed must appear, title and heading matches rank first.
@@ -16,14 +18,18 @@
  */
 
 import { PAGE, onPage } from './lib/page';
+import { KEY as PROGRESS, load, stateOf, stateWords } from './lib/progress';
 
 type Entry = { u: string; t: string; h: string; x: string };
 
 const FOLDED = 'blaze.side.folded';
+/** FoldOnPhone sections (Reference) the reader opened in the phone drawer: they stay open there. */
+const OPENED = 'blaze.side.opened';
+const phone = matchMedia('(max-width: 800px)');
 
-function readFolded(): Set<string> {
+function readFolded(key = FOLDED): Set<string> {
 	try {
-		const raw = localStorage.getItem(FOLDED);
+		const raw = localStorage.getItem(key);
 		const v: unknown = raw === null ? [] : JSON.parse(raw);
 		return new Set(Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 	} catch {
@@ -31,9 +37,9 @@ function readFolded(): Set<string> {
 	}
 }
 
-function writeFolded(s: Set<string>) {
+function writeFolded(s: Set<string>, key = FOLDED) {
 	try {
-		localStorage.setItem(FOLDED, JSON.stringify([...s]));
+		localStorage.setItem(key, JSON.stringify([...s]));
 	} catch {
 		// Private mode or storage off: folds just don't carry over.
 	}
@@ -84,6 +90,13 @@ function folds() {
 	for (const sec of document.querySelectorAll<HTMLDetailsElement>('details.sec[data-sec]')) {
 		const key = sec.dataset.sec!;
 		sec.addEventListener('toggle', () => {
+			if (phone.matches && 'phoneFold' in sec.dataset) {
+				const opened = readFolded(OPENED);
+				if (sec.open) opened.add(key);
+				else opened.delete(key);
+				writeFolded(opened, OPENED);
+				return;
+			}
 			const now = readFolded();
 			if (sec.open) now.delete(key);
 			else now.add(key);
@@ -335,3 +348,18 @@ glide();
 drawer();
 search();
 onPage(spy);
+
+/** Each lesson row's mark: not started, started, finished, or every question right the first time. */
+function marks(signal: AbortSignal) {
+	const paint = () => {
+		const saved = load();
+		for (const row of document.querySelectorAll<HTMLAnchorElement>('.navlist .row[data-lesson]')) {
+			const state = stateOf(saved.lessons[row.dataset.lesson!], (row.dataset.quizzes ?? '').split(' ').filter(Boolean));
+			row.dataset.state = state;
+			row.setAttribute('aria-label', `${row.title}, ${stateWords[state]}`);
+		}
+	};
+	paint();
+	addEventListener('storage', (e) => e.key === PROGRESS && paint(), { signal });
+}
+onPage(marks);

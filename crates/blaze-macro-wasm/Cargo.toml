@@ -21,6 +21,7 @@ sha2 = "0.10"
 wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
 
 base-db.workspace = true
+salsa.workspace = true
 hir-expand.workspace = true
 intern.workspace = true
 load-cargo.workspace = true

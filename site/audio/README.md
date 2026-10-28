@@ -117,8 +117,8 @@ Safari 18.4.
 The files should not be in the Worker's static assets (they change as pages change, and the asset count is limited).
 The plan, none of it done (each step needs approval):
 
-1. `wrangler r2 bucket create blaze-audio`.
-2. In `wrangler.jsonc`: `"r2_buckets": [{ "binding": "AUDIO", "bucket_name": "blaze-audio" }]`. `worker/audio.ts`
+1. `wrangler r2 bucket create ra-jit-audio`.
+2. In `wrangler.jsonc`: `"r2_buckets": [{ "binding": "AUDIO", "bucket_name": "ra-jit-audio" }]`. `worker/audio.ts`
    already serves `/audio/<sha>.webm` from `AUDIO` when it is bound (with Range, which Safari needs, and
    `immutable` caching), and from the assets otherwise.
 3. Upload from the Mac after generating: for each file in `.audio/files/`,

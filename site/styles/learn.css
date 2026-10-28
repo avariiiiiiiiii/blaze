@@ -1,0 +1,356 @@
+/* The course (/learn and its lessons; client/learn.ts, client/lib/diagrams.ts). Without JS a lesson is a page of steps
+   under each other and each question shows its answer in a fold. With it (`main.lesson[data-on]`), the lesson is a
+   screen of its own: the site's chrome steps aside, one step shows at a time between a thin bar at the top and the
+   big button at the bottom, within thumb reach on a phone. The diagrams are pixel cells in the page's inks, as the
+   home page's drawings are (art.css), with the fire orange for the one part that changed. */
+
+/* ---------- Without JS, and before learn.ts starts ---------- */
+
+main.lesson > section.step { padding: 8px 0 20px; border-top: 1px solid var(--line); }
+main.lesson > section.step > h2 { margin: 20px 0 10px; font-size: 22px; }
+.quiz { margin: 14px 0; padding: 16px 18px; border-radius: 14px; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line); }
+.quiz .prompt { margin: 0 0 12px; color: var(--ink-1); font-size: 17px; font-weight: 500; line-height: 1.45; }
+.quiz .choices { margin: 0; padding: 0 0 0 20px; }
+.quiz .choice { margin: 4px 0; }
+.quiz .choice .why { display: none; }
+.quiz .hint { color: var(--ink-3); font-size: 15px; }
+.quiz details.answer summary { color: var(--ink-3); font-size: 14px; cursor: pointer; }
+.quiz details.answer p { margin: 8px 0 0; font-size: 15px; }
+figure.diagram { margin: 16px 0; }
+figure.diagram figcaption { color: var(--ink-3); font-size: 15px; }
+
+/* A module runs after the page is parsed: hold the stacked lesson back for a moment so it doesn't flash before the
+   player takes over. If the script never comes, the lesson shows anyway after 1.5 s. */
+@media (scripting: enabled) {
+	body:has(main.lesson:not([data-on])) .frame { animation: lp-reveal 0s 1.5s both; }
+}
+@keyframes lp-reveal {
+	from { visibility: hidden; }
+	to { visibility: visible; }
+}
+
+/* ---------- The player ---------- */
+
+body:has(main.lesson[data-on]) :is(.side, .scrim, .mbar, .toc) { display: none; }
+body:has(main.lesson[data-on]) .frame { display: block; padding: 0; }
+body:has(main.lesson[data-on]) .pane { border-radius: 0; box-shadow: none; }
+body:has(main.lesson[data-on]) .grid { display: block; padding: 0 16px; }
+main.lesson[data-on] {
+	--foot-h: 96px;
+	display: flex;
+	flex-direction: column;
+	max-width: 600px;
+	min-height: 100svh;
+	padding: 0 0 calc(var(--foot-h) + 24px);
+}
+main.lesson[data-on] > :is(.head, .pager) { display: none; }
+main.lesson[data-on] > section.step:not([data-cur]) { display: none; }
+main.lesson[data-on] > section.step {
+	padding: 28px 0 0;
+	border: 0;
+}
+main.lesson[data-on] > section.step > h2 {
+	margin: 0 0 16px;
+	font-size: clamp(25px, 5.2vw, 30px);
+	line-height: 1.15;
+	letter-spacing: -0.025em;
+	color: var(--ink-1);
+}
+main.lesson[data-on] > section.step > h2:focus { outline: none; }
+main.lesson[data-on] > section.step > :is(p, .lede) { font-size: 18px; line-height: 1.6; color: var(--ink-2); }
+main.lesson[data-on] > section.step strong { color: var(--ink-1); font-weight: 600; }
+main.lesson[data-on] > section.step > p.dim { font-size: 15.5px; line-height: 1.55; color: var(--ink-3); }
+main.lesson[data-on] > section.step .art { margin: 18px 0; }
+
+/* Sliding in: a short move from the side the reader is going, and a fade. */
+main.lesson[data-on] > section.step.in-fwd { animation: lp-in 260ms cubic-bezier(0.2, 0.7, 0.3, 1); }
+main.lesson[data-on] > section.step.in-back { animation: lp-in-back 260ms cubic-bezier(0.2, 0.7, 0.3, 1); }
+@keyframes lp-in { from { opacity: 0; transform: translateX(28px); } }
+@keyframes lp-in-back { from { opacity: 0; transform: translateX(-28px); } }
+
+/* The top bar: back to the course, how far along, step k of n. */
+.lp-top {
+	position: sticky;
+	top: 0;
+	z-index: 10;
+	display: grid;
+	grid-template-columns: 40px 1fr auto 40px;
+	align-items: center;
+	gap: 12px;
+	margin: 0 -16px;
+	padding: calc(8px + env(safe-area-inset-top)) 16px 8px;
+	background: var(--bg);
+}
+.lp-x { display: grid; place-items: center; width: 40px; height: 40px; margin-left: -8px; border-radius: 10px; color: var(--ink-3); }
+.lp-x:hover { background: var(--s-tint); color: var(--ink-1); }
+.lp-bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.lp-bar i { display: block; height: 100%; width: calc(var(--p, 0) * 100%); border-radius: 3px; background: var(--ink-1); transition: width 0.4s cubic-bezier(0.2, 0.7, 0.3, 1); }
+.lp-top[data-cover='true'] .lp-bar { visibility: hidden; }
+.lp-snd { display: grid; place-items: center; width: 40px; height: 40px; margin-right: -8px; padding: 0; border: 0; border-radius: 10px; background: none; color: var(--ink-3); cursor: pointer; }
+.lp-snd:hover { background: var(--s-tint); color: var(--ink-1); }
+.lp-snd:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 1px; }
+.lp-count { min-width: 44px; font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-3); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* The bottom bar: feedback, Back and the big button. */
+.lp-foot {
+	position: fixed;
+	z-index: 10;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	padding: 12px max(16px, env(safe-area-inset-left)) calc(14px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-right));
+	background: color-mix(in srgb, var(--bg) 92%, transparent);
+	backdrop-filter: blur(12px);
+	-webkit-backdrop-filter: blur(12px);
+	border-top: 1px solid var(--line);
+}
+.lp-foot > * { max-width: 600px; margin-inline: auto; }
+.lp-row { display: flex; gap: 10px; }
+.lp-back, .lp-go { height: 54px; border: 0; border-radius: 14px; font: inherit; cursor: pointer; transition: background-color 0.15s, color 0.15s, opacity 0.15s, transform 0.1s; }
+.lp-back { display: grid; place-items: center; flex: none; width: 54px; background: none; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-2); }
+.lp-back:hover:not(:disabled) { background: var(--s-tint); color: var(--ink-1); }
+.lp-back:disabled { opacity: 0.35; cursor: default; }
+.lp-go { flex: 1; background: var(--ink-1); color: var(--bg); font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+.lp-go:hover:not(:disabled) { opacity: 0.9; }
+.lp-go:active:not(:disabled), .lp-back:active:not(:disabled) { transform: scale(0.985); }
+.lp-go:disabled { background: var(--line); color: var(--ink-4); cursor: default; }
+.lp-go:focus-visible, .lp-back:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 2px; }
+
+.lp-fb { margin-bottom: 12px; padding: 12px 14px; border-radius: 12px; }
+.lp-fb[hidden] { display: none; }
+.lp-fb[data-tone='ok'] { background: color-mix(in srgb, var(--ok) 13%, var(--bg)); }
+.lp-fb[data-tone='no'] { background: color-mix(in srgb, var(--danger) 12%, var(--bg)); }
+.lp-fb p { margin: 0; }
+.lp-fb-t { font-weight: 600; font-size: 15.5px; }
+.lp-fb[data-tone='ok'] .lp-fb-t { color: var(--ok); }
+.lp-fb[data-tone='no'] .lp-fb-t { color: var(--danger); }
+.lp-fb-w { margin-top: 2px !important; font-size: 15px; line-height: 1.5; color: var(--ink-1); }
+.lp-reveal { margin-left: 2px; padding: 0; border: 0; background: none; color: var(--ink-1); font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+
+/* The cover: which lesson, its line, and its steps as a row of cells (filled once seen; taps go back to one). */
+main.lesson[data-on] > .lp-cover { display: flex; flex-direction: column; justify-content: center; flex: 1; padding-bottom: 8vh; }
+.lp-eyebrow { margin: 0 0 10px; font-family: var(--font-mono); font-size: 12.5px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); }
+main.lesson[data-on] > .lp-cover > h2 { font-size: clamp(32px, 7vw, 40px); }
+main.lesson[data-on] > .lp-cover > .lp-line { margin: 0 0 14px; font-size: 19px; color: var(--ink-2); }
+.lp-meta { margin: 0 0 22px; font-family: var(--font-mono); font-size: 13px; color: var(--ink-3); }
+.lp-map { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.lp-map button { display: block; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 3px; background: var(--line); cursor: pointer; }
+.lp-map button[data-q] { background: none; box-shadow: inset 0 0 0 2px var(--line-2); }
+.lp-map button[data-state='seen'] { background: var(--ink-1); box-shadow: none; }
+.lp-map button[data-state='seen'][data-q] { background: var(--ink-3); }
+.lp-map button:disabled { cursor: default; }
+.lp-map button:hover:not(:disabled) { opacity: 0.8; }
+
+/* The end: a check in pixel cells (fire when every question was right the first time), the score, what's next. */
+main.lesson[data-on] > .lp-end { display: flex; flex-direction: column; justify-content: center; flex: 1; padding-bottom: 8vh; }
+.lp-seal { width: 72px; height: 56px; margin: 0 0 22px; }
+.lp-seal svg { display: block; width: 100%; height: 100%; shape-rendering: crispEdges; }
+.lp-seal rect { fill: var(--line); }
+.lp-seal rect.on { fill: var(--ink-1); }
+.lp-seal.all rect.on { fill: #e0461a; }
+.lp-score { font-size: 18px !important; color: var(--ink-1) !important; }
+.lp-next { color: var(--ink-3) !important; font-size: 16px !important; }
+.lp-next a { color: var(--ink-1); }
+
+/* ---------- Questions in the player ---------- */
+
+main.lesson[data-on] .quiz { margin: 0; padding: 0; background: none; box-shadow: none; }
+main.lesson[data-on] .quiz .prompt { margin: 0 0 18px; font-size: 19px; line-height: 1.45; }
+main.lesson[data-on] .quiz :is(details.answer, .hint) { display: none; }
+main.lesson[data-on] .quiz .choices { display: grid; gap: 10px; padding: 0; list-style: none; }
+main.lesson[data-on] .quiz .choice { margin: 0; }
+.pick {
+	display: flex;
+	align-items: flex-start;
+	gap: 12px;
+	width: 100%;
+	min-height: 56px;
+	padding: 15px 16px;
+	border: 0;
+	border-radius: 14px;
+	background: var(--bg-3);
+	box-shadow: inset 0 0 0 1.5px var(--line-2);
+	color: var(--ink-1);
+	font: inherit;
+	font-size: 16.5px;
+	line-height: 1.4;
+	text-align: left;
+	cursor: pointer;
+	transition: box-shadow 0.15s, background-color 0.15s, opacity 0.15s;
+	-webkit-tap-highlight-color: transparent;
+}
+.pick .k { display: grid; place-items: center; flex: none; width: 24px; height: 24px; margin-top: -1px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; transition: background-color 0.15s, color 0.15s; }
+.pick:hover:not(:disabled) { background: var(--bg-4); }
+.pick[aria-pressed='true'] { box-shadow: inset 0 0 0 2px var(--ink-1); }
+.pick[aria-pressed='true'] .k { background: var(--ink-1); color: var(--bg); box-shadow: none; }
+.pick:disabled { cursor: default; }
+.pick[data-mark='right'] { background: color-mix(in srgb, var(--ok) 10%, var(--bg-3)); box-shadow: inset 0 0 0 2px var(--ok); }
+.pick[data-mark='right'] .k { background: var(--ok); color: var(--bg); box-shadow: none; }
+.pick[data-mark='wrong'] { opacity: 0.55; box-shadow: inset 0 0 0 1.5px var(--danger); animation: lp-nudge 0.28s; }
+.pick[data-mark='wrong'] .text { text-decoration: line-through; text-decoration-color: var(--danger); }
+.pick[data-mark='wrong'] .k { color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
+.pick:disabled:not([data-mark]) { opacity: 0.7; }
+.pick:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 2px; }
+@keyframes lp-nudge {
+	25% { transform: translateX(-4px); }
+	75% { transform: translateX(4px); }
+}
+
+/* ---------- Diagrams ---------- */
+
+.diagram[data-drawn] { margin: 20px 0 4px; padding: 16px 14px 14px; border-radius: 16px; background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line); }
+.quiz .diagram[data-drawn] { margin-top: 0; }
+.dg-box { position: relative; width: 100%; }
+.dg-wires { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; shape-rendering: crispEdges; }
+.dg-wires rect { fill: var(--ink-4); transition: fill 0.25s; }
+.dg-wire.lit rect { fill: var(--ink-1); }
+.dg-wire.quiet:not(.lit) { display: none; }
+.dg-part {
+	position: absolute;
+	transform: translate(-50%, -50%);
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	width: max-content;
+	max-width: 48%;
+	min-height: 34px;
+	padding: 6px 11px 6px 9px;
+	border: 0;
+	border-radius: 9px;
+	background: var(--bg-3);
+	box-shadow: inset 0 0 0 1px var(--line-2);
+	color: var(--ink-2);
+	font: inherit;
+	font-size: 13.5px;
+	line-height: 1.2;
+	text-align: left;
+	cursor: pointer;
+	transition: box-shadow 0.2s, color 0.2s, background-color 0.2s, opacity 0.3s;
+	-webkit-tap-highlight-color: transparent;
+}
+.dg-part[data-at='l'] { transform: translate(0, -50%); }
+.dg-part[data-at='r'] { transform: translate(-100%, -50%); }
+.dg-part.code { font-family: var(--font-mono); font-size: 13px; }
+.dg-part .led { flex: none; width: 8px; height: 8px; background: var(--ink-4); transition: background-color 0.2s; }
+.dg-part:hover:not(:disabled) { background: var(--bg-4); color: var(--ink-1); }
+/* Focus shows as the hover does, not as a second ring round a part's own (one selected style). */
+.dg-part:focus { outline: none; }
+.dg-part:focus-visible { background: var(--bg-4); color: var(--ink-1); }
+.dg-part:focus-visible span { text-decoration: underline; text-underline-offset: 3px; }
+.dg-part.fixed { cursor: default; background: var(--bg-2); color: var(--ink-1); font-weight: 500; }
+.dg-part.fixed .led { background: var(--ink-1); }
+.dg-part[data-state='lit'] { color: var(--ink-1); box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+.dg-part[data-state='lit'] .led { background: var(--ink-1); }
+.dg-part[data-state='edit'] { color: var(--ink-1); box-shadow: inset 0 0 0 1.5px #e0461a; }
+.dg-part[data-state='edit'] .led { background: #e0461a; }
+.dg-part[data-state='hit'] { color: var(--ink-1); box-shadow: inset 0 0 0 1.5px var(--ok); }
+.dg-part[data-state='hit'] .led { background: var(--ok); }
+/* Replaced: still opaque (a wire never shows through a part), its label muted and struck through. */
+.dg-part[data-state='old'] { color: var(--ink-3); }
+.dg-part[data-state='old'] span { text-decoration: line-through; text-decoration-color: var(--ink-3); }
+.dg-part[data-state='hide'] { opacity: 0; visibility: hidden; }
+.dg-part[aria-pressed='true'] { color: var(--ink-1); box-shadow: inset 0 0 0 2px var(--ink-1); }
+.dg-part[aria-pressed='true'] .led { background: var(--ink-1); }
+.dg-part[data-mark='right'] { box-shadow: inset 0 0 0 2px var(--ok); }
+.dg-part[data-mark='right'] .led { background: var(--ok); }
+.dg-part[data-mark='wrong'] { box-shadow: inset 0 0 0 2px var(--danger); }
+.dg-part[data-mark='wrong'] .led { background: var(--danger); }
+.dg-part:disabled:not(.fixed) { cursor: default; }
+@media (prefers-color-scheme: light) {
+	.dg-part[data-state='edit'] { box-shadow: inset 0 0 0 1.5px #d63c12; }
+	.dg-part[data-state='edit'] .led, .lp-seal.all rect.on { background: #d63c12; fill: #d63c12; }
+}
+
+.dg-say { min-height: 2.9em; margin: 12px 2px 0; font-size: 14.5px; line-height: 1.45; color: var(--ink-2); }
+.dg-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.dg-tools:first-child { margin: 0 0 14px; }
+.dg-act { height: 36px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--ink-1); color: var(--bg); font: inherit; font-size: 14px; font-weight: 500; cursor: pointer; }
+.dg-act:hover { opacity: 0.88; }
+.dg-modes { display: inline-flex; padding: 3px; border-radius: 10px; background: var(--bg); box-shadow: inset 0 0 0 1px var(--line); }
+.dg-modes button { height: 30px; padding: 0 12px; border: 0; border-radius: 7px; background: none; color: var(--ink-3); font: inherit; font-size: 13.5px; cursor: pointer; }
+.dg-modes button[aria-pressed='true'] { background: var(--bg-4); color: var(--ink-1); }
+
+@media (max-width: 400px) {
+	.dg-part { gap: 6px; padding: 5px 8px 5px 7px; font-size: 12.5px; }
+	.dg-part.code { font-size: 12.5px; }
+	.diagram[data-drawn] { padding: 14px 10px 12px; }
+}
+
+/* ---------- The course map (the home page) ---------- */
+
+/* The way in: the next lesson to start or finish (client/learn.ts points it; the first lesson without JS). */
+.course-go { margin: 22px 0 0 !important; }
+.doc .course-go .go { display: inline-grid; gap: 2px; min-width: min(100%, 320px); padding: 14px 22px 15px; border-radius: 16px; background: var(--ink-1); color: var(--bg); text-decoration: none; transition: transform 0.12s; }
+.course-go .k { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.course-go .k::after { content: ' →'; }
+.course-go .t { color: color-mix(in srgb, var(--bg) 70%, var(--ink-1)); font-size: 14.5px; }
+.doc .course-go .go:hover { transform: translateY(-1px); }
+.doc .course-go .go:active { transform: translateY(1px); }
+.doc .course-go .go:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 3px; }
+@media (max-width: 560px) { .doc .course-go .go { display: grid; width: 100%; } }
+@media (prefers-reduced-motion: reduce) { .doc .course-go .go { transition: none; } }
+
+/* The sidebar's lesson rows: a mark where the icon would be. Hollow: not started; a dot: started; solid: finished;
+   solid with the orange cell: every question right the first time (client/side.ts sets data-state). */
+.row .mark { position: relative; flex: none; display: grid; place-items: center; width: 16px; height: 16px; }
+.row .mark::before { content: ''; width: 10px; height: 10px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--line-2); box-sizing: border-box; }
+.row[data-state='doing'] .mark::before { box-shadow: inset 0 0 0 1.5px var(--ink-2); background: radial-gradient(circle, var(--ink-2) 0 2px, transparent 2.5px); }
+.row[data-state='done'] .mark::before, .row[data-state='mastered'] .mark::before { background: var(--ink-2); box-shadow: none; }
+.row[data-state='mastered'] .mark::after { content: ''; position: absolute; top: 1px; right: 0; width: 5px; height: 5px; background: #e0461a; box-shadow: 0 0 0 1.5px var(--bg); }
+.row[aria-current='page'] .mark::before { box-shadow: inset 0 0 0 1.5px var(--ink-1); }
+
+.course { margin: 28px 0 8px; padding: 0; list-style: none; }
+.course .node { position: relative; padding: 0 0 14px 0; }
+/* The path: a dotted line of cells down the left, between the numbers. */
+.course .node:not(:last-child)::before { content: ''; position: absolute; left: 21px; top: 50px; bottom: -2px; width: 4px; background: repeating-linear-gradient(var(--line-2) 0 4px, transparent 4px 9px); }
+.course .node[data-state='done']:not(:last-child)::before, .course .node[data-state='mastered']:not(:last-child)::before { background: repeating-linear-gradient(var(--ink-3) 0 4px, transparent 4px 9px); }
+.doc .course a { display: flex; align-items: flex-start; gap: 16px; padding: 4px 12px 10px 0; border-radius: 14px; color: inherit; text-decoration: none; }
+.course .n {
+	position: relative;
+	display: grid;
+	place-items: center;
+	flex: none;
+	width: 46px;
+	height: 46px;
+	border-radius: 50%;
+	background: var(--bg-3);
+	box-shadow: inset 0 0 0 1.5px var(--line-2);
+	color: var(--ink-3);
+	font-family: var(--font-mono);
+	font-size: 15px;
+	transition: background-color 0.2s, color 0.2s;
+}
+/* In progress: a ring round the number, as far as the reader has come. */
+.course .node[data-state='doing'] .n { color: var(--ink-1); box-shadow: none; background: radial-gradient(closest-side, var(--bg-3) calc(100% - 3px), transparent calc(100% - 2.5px)), conic-gradient(var(--ink-1) calc(var(--p) * 1turn), var(--line-2) 0); }
+.course .node[data-state='done'] .n, .course .node[data-state='mastered'] .n { background: var(--ink-1); color: var(--bg); box-shadow: none; }
+.course .node[data-state='mastered'] .n::after { content: ''; position: absolute; top: 1px; right: 1px; width: 9px; height: 9px; background: #e0461a; box-shadow: 0 0 0 2px var(--bg); }
+.course .node[data-next] .n { box-shadow: inset 0 0 0 2px var(--ink-1); color: var(--ink-1); }
+.course .node[data-next][data-state='doing'] .n { box-shadow: none; }
+.course .body { display: grid; gap: 3px; min-width: 0; padding-top: 3px; }
+.course .t { color: var(--ink-1); font-size: 17.5px; font-weight: 600; letter-spacing: -0.015em; }
+.course .l { color: var(--ink-2); font-size: 15px; line-height: 1.45; }
+.course .m { color: var(--ink-3); font-family: var(--font-mono); font-size: 12.5px; }
+.course .go { justify-self: start; margin-top: 8px; padding: 7px 16px; border-radius: 999px; background: var(--ink-1); color: var(--bg); font-size: 14px; font-weight: 600; }
+.doc .course a:hover .t { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+.doc .course a:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 4px; }
+
+/* Mastery: one cell per question, grouped by lesson. Solid: right the first time; mid: right later; faint: not yet. */
+.mastery { margin: 26px 0 0; padding: 16px 18px; border-radius: 16px; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line); }
+.m-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; }
+.m-t { color: var(--ink-1); font-size: 14px; font-weight: 600; }
+.m-n { color: var(--ink-3); font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.m-cells { display: flex; flex-wrap: wrap; gap: 10px; }
+.m-group { display: flex; gap: 3px; }
+.m-group i { display: block; width: 14px; height: 14px; background: var(--line-2); transition: background-color 0.3s; }
+.m-group i[data-state='later'] { background: var(--ink-3); }
+.m-group i[data-state='first'] { background: var(--ink-1); }
+.m-sub { margin: 12px 0 0 !important; color: var(--ink-3); font-size: 13.5px !important; line-height: 1.45; }
+.m-reset { display: block; margin: 6px 0 0; padding: 4px 0; border: 0; background: none; color: var(--ink-4); font: inherit; font-size: 13px; cursor: pointer; }
+.m-reset:hover { color: var(--ink-2); text-decoration: underline; text-underline-offset: 3px; }
+.m-reset[data-armed] { color: var(--danger); }
+.m-reset[hidden] { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+	main.lesson[data-on] > section.step.in-fwd, main.lesson[data-on] > section.step.in-back, .pick[data-mark='wrong'] { animation: none; }
+	.lp-bar i, .pick, .dg-part, .dg-wires rect, .m-group i { transition: none; }
+}

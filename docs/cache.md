@@ -69,7 +69,9 @@ change still prints what cargo's build prints.
 ### Proc-macro expansions
 
 The store also keeps what derive and attribute macros expand to, so a daemon that loads a
-workspace again does not run them again (`crates/blaze-expand`). The key is a SHA-256 of
+workspace again does not run them again (`crates/blaze-expand`). This output cache applies
+to native proc macros. Default WASM proc macros retain session state and rerun expansions
+at every new database revision, including client requests without source changes ([cargo.md](cargo.md#proc-macros-run-as-webassembly)). The key is a SHA-256 of
 the macro library's content, the macro's name and kind, its input with each span replaced
 by its place in the call's table of spans, that table (each span's byte range within the
 item it is anchored to, and which of the call's anchors and hygiene contexts it has), the

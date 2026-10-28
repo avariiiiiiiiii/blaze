@@ -93,9 +93,17 @@ type Who = { key: string; login: string | null; avatar: string | null; admin?: b
 type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string; parent?: number };
 type Summary = { replies: number; last: string | null; repliers: Who[] };
 /** Kept on each socket (`serializeAttachment`), so it survives hibernation. */
-type Tab = Who & { path: string | null; away: boolean; country: string | null; seen?: number; since?: number };
+type Tab = Who & { path: string | null; away: boolean; country: string | null; device?: Device; seen?: number; since?: number };
+/** What a tab runs on, from its user agent (an iPad asking for the desktop site counts as a computer). */
+type Device = 'computer' | 'phone' | 'tablet';
 /** `country` is Cloudflare's two-letter guess from the IP (`request.cf.country`), shown as a flag; null when unknown or Tor. */
-type Person = Who & { country: string | null; since: number; pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; since: number; devices: Device[]; pages: { path: string; away: boolean }[] };
+
+function deviceOf(ua: string): Device {
+	if (/iPad|Tablet|PlayBook|Silk|Android(?!.*Mobile)/i.test(ua)) return 'tablet';
+	if (/iPhone|iPod|Android|Mobile|Windows Phone/i.test(ua)) return 'phone';
+	return 'computer';
+}
 
 /** The worker side of GET /api/presence. */
 export async function handlePresence(request: Request, env: Env): Promise<Response> {
@@ -207,7 +215,7 @@ export class Presence extends DurableObject<Env> {
 		const before = this.arrived.get(who.key);
 		const since = before && (before.gone === null || now - before.gone < RETURN_MS) ? before.at : now;
 		this.arrived.set(who.key, { at: since, gone: null });
-		const tab: Tab = { ...who, path: null, away: false, since, country: request.headers.get('x-presence-country') || null };
+		const tab: Tab = { ...who, path: null, away: false, since, country: request.headers.get('x-presence-country') || null, device: deviceOf(request.headers.get('x-presence-ua') ?? '') };
 		server.serializeAttachment(tab);
 		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, admin: !!who.admin, signIn: request.headers.get('x-presence-signin') === '1' }));
 		server.send(this.snapshot());
@@ -447,10 +455,11 @@ export class Presence extends DurableObject<Env> {
 			if (!tab) continue;
 			let p = people.get(tab.key);
 			if (!p) {
-				p = { key: tab.key, login: tab.login, avatar: tab.avatar, country: tab.country ?? null, since: tab.since ?? Date.now(), pages: [] };
+				p = { key: tab.key, login: tab.login, avatar: tab.avatar, country: tab.country ?? null, since: tab.since ?? Date.now(), devices: [], pages: [] };
 				people.set(tab.key, p);
 			}
 			if (tab.since && tab.since < p.since) p.since = tab.since;
+			if (tab.device && !p.devices.includes(tab.device)) p.devices.push(tab.device);
 			if (!tab.path) continue;
 			const same = p.pages.find((x) => x.path === tab.path && x.away === tab.away);
 			if (same) seen.set(same, Math.max(seen.get(same) ?? 0, tab.seen ?? 0));

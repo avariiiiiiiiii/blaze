@@ -88,10 +88,16 @@ pub enum NodeState {
     /// Done, by doing its work.
     Built,
     /// Done, by taking what the store had: this machine's, or the remote's.
-    Cached { remote: bool },
-    Failed { why: String },
+    Cached {
+        remote: bool,
+    },
+    Failed {
+        why: String,
+    },
     /// Never run: `because` failed, and it waited for it, or the build stopped there.
-    Skipped { because: u32 },
+    Skipped {
+        because: u32,
+    },
 }
 
 impl NodeState {

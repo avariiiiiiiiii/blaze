@@ -78,9 +78,7 @@ pub enum Input {
 impl Input {
     pub fn at_ns(&self) -> u64 {
         match self {
-            Input::Add { at_ns, .. } | Input::Close { at_ns } | Input::Done { at_ns, .. } => {
-                *at_ns
-            }
+            Input::Add { at_ns, .. } | Input::Close { at_ns } | Input::Done { at_ns, .. } => *at_ns,
         }
     }
 }
@@ -111,7 +109,10 @@ pub struct Config {
 pub enum Error {
     NoThreads(Pool),
     Twice(NodeId),
-    UnknownDep { node: NodeId, dep: NodeId },
+    UnknownDep {
+        node: NodeId,
+        dep: NodeId,
+    },
     /// Nodes of one input that wait for one another.
     Cycle(Vec<NodeId>),
     NotRunning(NodeId),

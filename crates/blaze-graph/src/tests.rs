@@ -155,7 +155,10 @@ fn the_longest_path_runs_first() {
 fn a_node_added_later_moves_what_it_waits_for_ahead() {
     let mut machine = Machine::new(ONE).unwrap();
     let out = machine
-        .step(Input::Add { at_ns: 0, nodes: vec![work(1, &[], 1), work(2, &[], 1), work(3, &[], 1)] })
+        .step(Input::Add {
+            at_ns: 0,
+            nodes: vec![work(1, &[], 1), work(2, &[], 1), work(3, &[], 1)],
+        })
         .unwrap();
     assert_eq!(runs(&out), [1]);
     let out = machine
@@ -221,10 +224,20 @@ fn keep_going_runs_what_does_not_wait_for_the_failure() {
     assert_eq!(out.last(), Some(&Output::Finished { ok: false }));
     // A node found after the failure that waits for a skipped one is skipped for the failure.
     let mut machine = Machine::new(Config { io: 1, work: 1, keep_going: true }).unwrap();
-    machine.step(Input::Add { at_ns: 0, nodes: vec![work(1, &[], 1), work(2, &[1], 1), work(3, &[], 0)] }).unwrap();
+    machine
+        .step(Input::Add {
+            at_ns: 0,
+            nodes: vec![work(1, &[], 1), work(2, &[1], 1), work(3, &[], 0)],
+        })
+        .unwrap();
     machine.step(done(1, 1, Outcome::Failed { why: "no".to_owned() })).unwrap();
     machine
-        .step(Input::Done { at_ns: 2, id: NodeId(3), outcome: Outcome::Built, added: vec![work(4, &[2], 1)] })
+        .step(Input::Done {
+            at_ns: 2,
+            id: NodeId(3),
+            outcome: Outcome::Built,
+            added: vec![work(4, &[2], 1)],
+        })
         .unwrap();
     assert_eq!(machine.state(NodeId(4)), Some(&NodeState::Skipped { because: 1 }));
 }
@@ -258,7 +271,12 @@ fn inputs_it_cannot_take_are_refused_and_change_nothing() {
         (done(1, 2, Outcome::Built), Error::NotRunning(NodeId(2))),
         (done(1, 9, Outcome::Built), Error::NotRunning(NodeId(9))),
         (
-            Input::Done { at_ns: 1, id: NodeId(1), outcome: Outcome::Built, added: vec![work(2, &[], 1)] },
+            Input::Done {
+                at_ns: 1,
+                id: NodeId(1),
+                outcome: Outcome::Built,
+                added: vec![work(2, &[], 1)],
+            },
             Error::Twice(NodeId(2)),
         ),
     ];
@@ -301,8 +319,10 @@ fn random_builds_keep_the_rules() {
         };
         let mut specs = Vec::new();
         for id in 0..nodes {
-            let deps: FxHashSet<u32> =
-                (0..random.below(4)).filter(|_| id > 0).map(|_| random.below(id.into()) as u32).collect();
+            let deps: FxHashSet<u32> = (0..random.below(4))
+                .filter(|_| id > 0)
+                .map(|_| random.below(id.into()) as u32)
+                .collect();
             let mut deps: Vec<u32> = deps.into_iter().collect();
             deps.sort();
             let pool = if random.below(3) == 0 { Pool::Io } else { Pool::Work };
@@ -339,7 +359,9 @@ fn random_builds_keep_the_rules() {
                         }
                         states.insert(id, state);
                     }
-                    Output::Said(Record { event: Event::Critical { path }, .. }) => *critical = path,
+                    Output::Said(Record { event: Event::Critical { path }, .. }) => {
+                        *critical = path
+                    }
                     Output::Said(_) => {}
                     Output::Finished { ok } => *finished = Some(ok),
                 }
@@ -436,7 +458,10 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
     let mut ran = ran.into_inner().unwrap();
     ran.sort();
     assert_eq!(ran, [0, 1, 2]);
-    assert_eq!(machine.state(NodeId(2)), Some(&NodeState::Failed { why: "panicked: no def map".to_owned() }));
+    assert_eq!(
+        machine.state(NodeId(2)),
+        Some(&NodeState::Failed { why: "panicked: no def map".to_owned() })
+    );
     assert_eq!(machine.state(NodeId(3)), Some(&NodeState::Skipped { because: 2 }));
     // The trace replays to what the build said.
     let trace = Trace { config: machine.config(), inputs: trace };

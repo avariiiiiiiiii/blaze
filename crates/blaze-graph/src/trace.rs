@@ -57,18 +57,18 @@ pub fn render(outputs: &[Output]) -> String {
         _ = match output {
             Output::Said(record) => match &record.event {
                 Event::Node { id, kind, name, deps } => {
-                    writeln!(text, "{:>9} node #{id} {kind:?} {name} deps {deps:?}", record.at_ns)
+                    writeln!(text, "{} node #{id} {kind:?} {name} deps {deps:?}", record.at_ns)
                 }
                 Event::Moved { id, state } => {
-                    writeln!(text, "{:>9} #{id} {state:?}", record.at_ns)
+                    writeln!(text, "{} #{id} {state:?}", record.at_ns)
                 }
                 Event::Critical { path } => {
-                    writeln!(text, "{:>9} critical {path:?}", record.at_ns)
+                    writeln!(text, "{} critical {path:?}", record.at_ns)
                 }
-                other => writeln!(text, "{:>9} {other:?}", record.at_ns),
+                other => writeln!(text, "{} {other:?}", record.at_ns),
             },
-            Output::Run { id, pool } => writeln!(text, "          run {id} on {pool:?}"),
-            Output::Finished { ok } => writeln!(text, "          finished ok={ok}"),
+            Output::Run { id, pool } => writeln!(text, "  run {id} on {pool:?}"),
+            Output::Finished { ok } => writeln!(text, "  finished ok={ok}"),
         };
     }
     text

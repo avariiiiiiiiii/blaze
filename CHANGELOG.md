@@ -21,6 +21,11 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 - `blaze why [fn|crate]` says what the last build rebuilt and why.
 - `--events json|cbor` writes the build's events to stdout, one record a line or frame.
 
+### Fixed
+
+- A workspace the daemon could not load because it reaches functions blaze could not compile
+  names those functions and why; the message stopped at "so it is not built:".
+
 ## [0.20261028.2] - 2026-10-28
 
 ### Added

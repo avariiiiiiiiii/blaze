@@ -1932,7 +1932,9 @@ fn last_words(log: &Path) -> String {
         return format!("panicked at {place} {message}");
     }
     match last_error(&log) {
-        Some(error) => format!("Error: {}", error.replace('\n', "; ")),
+        Some(error) => {
+            format!("Error: {}", error.lines().map(str::trim).collect::<Vec<_>>().join("; "))
+        }
         None => lines.last().copied().unwrap_or("no output").to_owned(),
     }
 }
@@ -1944,17 +1946,24 @@ pub fn last_error(log: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let at = lines.iter().rposition(|it| it.starts_with("Error"))?;
     let mut said = lines[at].strip_prefix("Error: ").unwrap_or(lines[at]).to_owned();
-    let mut rest = lines[at + 1..].iter().skip_while(|it| it.trim().is_empty());
+    // An error of more than one line (`refused_error`'s functions) goes on until a blank line.
+    let more = lines[at + 1..].iter().take_while(|it| !it.trim().is_empty()).count();
+    for line in &lines[at + 1..at + 1 + more] {
+        said.push_str(&format!("\n{line}"));
+    }
+    let mut rest = lines[at + 1 + more..].iter().skip_while(|it| it.trim().is_empty());
     if rest.next().is_some_and(|it| it.trim() == "Caused by:") {
+        let mut caused = false;
         for line in rest.take_while(|it| it.starts_with("    ")) {
             let line = line.trim();
             // `0: what`, or a line more of the cause before it.
             let numbered = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
             match line.split_once(": ").filter(|(n, _)| numbered(n)) {
                 Some((_, cause)) => said.push_str(&format!("\n{cause}")),
-                None if said.contains('\n') => said.push_str(&format!("\n  {line}")),
+                None if caused => said.push_str(&format!("\n  {line}")),
                 None => said.push_str(&format!("\n{line}")),
             }
+            caused = true;
         }
     }
     Some(said)
@@ -2069,6 +2078,17 @@ mod tests {
         );
         assert_eq!(last_error("Error: one\n\nCaused by:\n    two\n").unwrap(), "one\ntwo");
         assert_eq!(last_error("Error: alone\n").unwrap(), "alone");
+        let refused = "Error: `src/main.rs` reaches 1 function blaze could not compile, so it is not built:\n  \
+            main: unsupported: callee `f`\n";
+        assert_eq!(
+            last_error(refused).unwrap(),
+            "`src/main.rs` reaches 1 function blaze could not compile, so it is not built:\n  \
+             main: unsupported: callee `f`"
+        );
+        assert_eq!(
+            last_error("Error: two lines:\n  first\n\nCaused by:\n    why\n").unwrap(),
+            "two lines:\n  first\nwhy"
+        );
         assert_eq!(last_error("nothing wrong\n"), None);
     }
 }

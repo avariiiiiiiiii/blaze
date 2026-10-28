@@ -198,4 +198,5 @@ cases![
     trait_method_of_closure,
     const_float_min_max,
     guard_nested_guard,
+    attr_on_prefix_expr,
 ];

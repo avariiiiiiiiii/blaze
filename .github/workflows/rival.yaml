@@ -4,7 +4,7 @@
 # hold while the absolute seconds are a shared runner's (docs/harness.md: a dedicated machine's
 # numbers are the ones to publish; lane astral re-runs them on an ix VM). The report job merges
 # the projects into one README, which is the run's summary and the `rival` artifact; lane astral
-# copies it to bench/results/<date>-rival/.
+# copies it to tools/bench/results/<date>-rival/.
 name: rival
 on:
   schedule:

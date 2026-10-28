@@ -50,12 +50,13 @@ use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     mir::{
-        AggregateKind, CastKind, MirBody, MirSpan, Operand, OperandKind, ProjectionElem, Rvalue,
-        StatementKind, TerminatorKind,
+        AggregateKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
+        TerminatorKind,
     },
     next_solver::{DbInterner, GenericArgs, ParamEnv, Ty, TyKind},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
+use hir_ty_mir::mir::purity::{is_const_pure, operands, raw_use};
 
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
@@ -1400,6 +1401,13 @@ impl<'db> Walk<'db> {
             if let Some(why) = &self.nodes[at as usize].why {
                 return Some(self.told(at, &parent, why));
             }
+            // A `const fn` with no generic arguments that is const-pure reaches nothing that is
+            // not: what a generic one calls by a trait can be a non-const `impl` at run time.
+            if let Node::Root(func) = self.nodes[at as usize].node
+                && is_const_pure(self.db, func)
+            {
+                continue;
+            }
             for (i, edge) in self.nodes[at as usize].edges.iter().enumerate() {
                 if !edge.codec && seen.insert(edge.to) {
                     parent.insert(edge.to, (at, i));
@@ -1922,57 +1930,6 @@ pub(super) fn location(
         .map(|it| it.trim_start_matches('/').to_owned())
         .unwrap_or(path);
     Some(format!("{path}:{line}:{column}"))
-}
-
-fn operands(rvalue: &Rvalue) -> Vec<&Operand> {
-    match rvalue {
-        Rvalue::Use(it)
-        | Rvalue::Repeat(it, _)
-        | Rvalue::Cast(_, it, _)
-        | Rvalue::UnaryOp(_, it) => {
-            vec![it]
-        }
-        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => vec![a, b],
-        Rvalue::Aggregate(_, it) => it.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The first use of a raw pointer in `body` that makes what it gives depend on more than
-/// its arguments: a dereference, or an address taken as a number.
-fn raw_use(body: &MirBody<'_>) -> Option<(&'static str, MirSpan)> {
-    let raw = |place: &hir_ty_mir::mir::StoredPlace| {
-        matches!(place.projection.as_slice().first(), Some(ProjectionElem::Deref))
-            && matches!(body.locals[place.local].ty.as_ref().kind(), TyKind::RawPtr(..))
-    };
-    let operand_raw = |operand: &Operand| match &operand.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => raw(place),
-        _ => false,
-    };
-    for (_, block) in body.basic_blocks.iter() {
-        for statement in &block.statements {
-            let StatementKind::Assign(place, rvalue) = &statement.kind else {
-                if let StatementKind::InlineAsm(_) = &statement.kind {
-                    return Some(("has assembly in it", statement.span));
-                }
-                continue;
-            };
-            if let Rvalue::Cast(CastKind::PointerExposeAddress, ..) = rvalue {
-                return Some(("takes an address as a number", statement.span));
-            }
-            let read = match rvalue {
-                Rvalue::Ref(_, it)
-                | Rvalue::Len(it)
-                | Rvalue::Discriminant(it)
-                | Rvalue::CopyForDeref(it) => raw(it),
-                _ => operands(rvalue).into_iter().any(operand_raw),
-            };
-            if raw(place) || read {
-                return Some(("dereferences a raw pointer", statement.span));
-            }
-        }
-    }
-    None
 }
 
 /// What `body`, of core or alloc, does itself that is not pure; else the bodies of core and

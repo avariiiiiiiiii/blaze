@@ -17,6 +17,10 @@ depended on its library alone.
 
 `nativespans.py`: A native proc macro asks for a span's source text, line, column, byte range and file; edits and a daemon restart must agree with Cargo, under native and wasm expansion (#823).
 
+`gitindex.py`: A local git-index registry fetches two packages with Cargo-equal paths, source trees, archives and index cache bytes; each tool then reads the other's cache offline (#316).
+
+`deriveerrors.py`: Unused invalid built-in derives fail check and build as Cargo's do; a valid edit and a daemon restart preserve the verdict (#751).
+
 ## Running them
 
 You need Python 3, the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`) with

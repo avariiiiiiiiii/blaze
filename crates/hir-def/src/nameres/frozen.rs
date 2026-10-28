@@ -1734,6 +1734,11 @@ impl Enc<'_> {
                         self.u8(5);
                         self.str(message)?;
                     }
+                    ExpandErrorKind::BuiltinDerive(message) => {
+                        self.u8(6);
+                        self.str(message)?;
+                    }
+                    ExpandErrorKind::DefaultNoVariant => self.u8(7),
                     _ => return Err(format!("a macro error: {err:?}")),
                 }
             }
@@ -2851,6 +2856,8 @@ impl Dec<'_> {
                     3 => ExpandErrorKind::MacroDefinition,
                     4 => ExpandErrorKind::RecursionOverflow,
                     5 => ExpandErrorKind::Other(self.str()?.into()),
+                    6 => ExpandErrorKind::BuiltinDerive(self.str()?.into()),
+                    7 => ExpandErrorKind::DefaultNoVariant,
                     it => return Err(format!("macro error {it}")),
                 };
                 DefDiagnosticKind::MacroError { ast, path, err }

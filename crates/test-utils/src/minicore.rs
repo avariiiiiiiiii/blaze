@@ -1527,7 +1527,7 @@ pub mod fmt {
             Arguments { message: Some(s) }
         }
 
-        pub fn as_str(&self) -> Option<&'static str> {
+        pub const fn as_str(&self) -> Option<&'static str> {
             match self.message {
                 Some(s) => unsafe { Some(&*(s as *const str)) },
                 None => None,

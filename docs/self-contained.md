@@ -376,3 +376,9 @@ nothing are the whole build above, no `cargo build` ([cargo.md](cargo.md#what-a-
 dev-aws-8 (loaded): ripgrep 22.2 s against 6.0 s, fd 48.4 against 28.6, hyperfine 24.5 against
 5.8, just 29.2 against 8.3, bat 33.2 against 10.5, nushell 102.4 against 36.2. **read**. Off by
 default until axum's and biome's builds are whole and the cold times are near cargo's.
+
+Git-index registry support (#316) reads `config.json` and package entries directly from
+the fetched Git tree and shares Cargo's index caches. `harness/gitindex.py` checks source
+trees, archive bytes, paths and index-cache bytes against the pinned Cargo, then swaps
+the tools' cache homes offline. `blaze-registry` tests also cover updates, removed entries,
+old commit-versioned caches and a failed fetch that must not answer from an older tree.

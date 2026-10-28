@@ -336,9 +336,9 @@ fn arch(tuple: &str) -> &str {
 const UNSET: [&str; 2] = ["RUSTC_OVERRIDE_VERSION_STRING", "RUST_TARGET_PATH"];
 
 /// The variables of Apple's SDK and deployment targets, which a shell of nixpkgs on macOS
-/// sets. rustc reads them to link and for the target's spec, which says the deployment
-/// target; its version, cfgs, sysroot and file names are the same with them, and are
-/// answered with them set.
+/// sets. rustc reads them to link and for an Apple target's spec, which says the deployment
+/// target; its version, cfgs, sysroot and file names, and every other target's spec, are the
+/// same with them, and are answered with them set.
 const APPLE: [&str; 6] = [
     "SDKROOT",
     "MACOSX_DEPLOYMENT_TARGET",
@@ -533,7 +533,7 @@ pub fn answer(
             "target-spec-json"
                 if given.unstable_options
                     && nightly
-                    && APPLE.iter().all(|it| var(it).is_none()) =>
+                    && (!tuple.contains("-apple-") || APPLE.iter().all(|it| var(it).is_none())) =>
             {
                 out += target.target_spec_json.get(toolchain.host)?;
             }
@@ -588,5 +588,19 @@ mod tests {
         let zed = [&zed[..], &["--cfg", "tokio_unstable", "--print", "cfg"]].concat();
         let given = Given::of(&zed).unwrap();
         assert_eq!(given.cfgs, ["tokio_unstable"]);
+    }
+
+    #[test]
+    fn a_spec_besides_apples_is_answered_in_a_shell_of_the_sdk() {
+        let spec = |target: &str| {
+            let args =
+                ["-Z", "unstable-options", "--print", "target-spec-json", "--target", target];
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let sdk = |name: &str| (name == "SDKROOT").then(|| OsString::from("/sdk"));
+            answer(&args, &[], &sdk)
+        };
+        let wasm = spec("wasm32-wasip1").expect("wasm32-wasip1's spec under SDKROOT");
+        assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
+        assert!(spec("aarch64-apple-darwin").is_none());
     }
 }

@@ -433,8 +433,9 @@ class Case:
     def doctests(self, env):
         """`cargo test --doc` with rustdoc, and `blaze test --doc`."""
         def tested(target_dir, blaze=False):
-            command = [*(["blaze"] if blaze else ["cargo"]), "test", "--doc"]
             path = os.path.dirname(BLAZE) + os.pathsep + env.get("PATH", os.environ["PATH"])
+            # Windows looks a program up in this process's PATH, not the child's.
+            command = [shutil.which("blaze", path=path) or "blaze" if blaze else "cargo", "test", "--doc"]
             run = subprocess.run([*command, *self.select[:2], *self.cargo_args, "--", *self.spec.get("args", [])],
                                  cwd=self.ws, capture_output=True, text=True, timeout=900,
                                  env={**env, "PATH": path, "CARGO_TARGET_DIR": os.path.join(self.ws, target_dir)})

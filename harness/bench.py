@@ -12,7 +12,8 @@ result with the machine, the commit and the date, for benchreport.py's runtime t
 
 Each project is one pinned checkout (cloned into `BLAZE_PROJECTS` as blaze_cli.py does, and
 copied; the clone is never written to). A project with `prepare` (bun) is copied from the tree
-that module's `prepare` makes beside the clone, and is measured only when named. Under each
+that module's `prepare` makes beside the clone, and is measured only when named, as is one with
+`named` (dynamo, whose build needs protoc and libclang). Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
 into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
   cold       `blaze build` from nothing, then the wait until the daemon has the
@@ -261,6 +262,21 @@ PROJECTS = {
                                       "const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process']"
                                       ".map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; "
                                       "for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)"]),
+    ),
+    # NVIDIA Dynamo's Rust: the CPU-only vLLM mocker server over dynamo-llm, the runtime, the KV
+    # router and the mocker, without a GPU (CUDA is loaded at run time, NIXL is nixl-sys's
+    # stubs). Its build scripts need protoc and libclang. cargo builds with the project's pin
+    # (rust-toolchain.toml), as its users do: blaze's nightly does not compile dynamo-llm
+    # (E0277 in block_manager, bench/results/2026-10-27-dynamo).
+    "dynamo": dict(
+        repo="ai-dynamo/dynamo", tag="v1.6.1", rev="0d9c24a8bf6db13c1a1223cf15fcbee9140d1ac3",
+        env=dict(RUSTUP_TOOLCHAIN="1.96.1"), named=True,
+        build=["-p", "dynamo-vllm-mocker", "--bin", "dynamo-vllm-mocker-server"], run=["--help"],
+        edits=dict(
+            body=body("lib/mocker/servers/vllm/src/main.rs", "async fn main() -> anyhow::Result<()> {"),
+            leaf=body("lib/tokens/src/lib.rs", "    pub fn remaining(&self) -> usize {"),
+        ),
+        test=["-p", "dynamo-tokens"],
     ),
     # A game: built, not run (it opens a window). Its own code is small; the engine is ~400 crates.
     "bevy": dict(
@@ -805,9 +821,9 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     print(f"  store {store_mb(ours.env['BLAZE_CACHE'])} MB, {added / 1e6:.0f} MB of it not stored by a project before", flush=True)
     result = dict(phases=phases, wrong=wrong, tag=spec["tag"], rev=spec["rev"], store_mb=store_mb(ours.env["BLAZE_CACHE"]),
                   store_added_mb=round(added / 1e6), cold_runs=cold_runs, resident=resident, disk_mb=end_disk)
-    if "RUSTUP_TOOLCHAIN" in prepared:
-        # The project's own toolchain, not the one blaze is pinned to.
-        result["toolchain"] = prepared["RUSTUP_TOOLCHAIN"]
+    # The project's own toolchain, which cargo builds with, not the one blaze is pinned to.
+    if own := prepared.get("RUSTUP_TOOLCHAIN") or spec.get("env", {}).get("RUSTUP_TOOLCHAIN"):
+        result["toolchain"] = own
     if "runtime" in spec:
         result["runtime"] = runtime(name, spec, theirs, ws, build, max(runs, 10), wrong)
     return result
@@ -1042,7 +1058,7 @@ def main():
     if unknown:
         raise SystemExit(f"no setup {unknown}: the setups are {', '.join(SETUPS)}")
     keep, tests = "--keep" in argv, "--tests" in argv
-    names = [a for a in argv if not a.startswith("--")] or [n for n, spec in PROJECTS.items() if "prepare" not in spec]
+    names = [a for a in argv if not a.startswith("--")] or [n for n, spec in PROJECTS.items() if "prepare" not in spec and not spec.get("named")]
     os.makedirs(work, exist_ok=True)
     os.makedirs(reference_dir, exist_ok=True)
     result = dict(toolchain=TOOLCHAIN, machine=platform.machine(), cores=os.cpu_count(), runs=runs, cold_runs=cold_runs,

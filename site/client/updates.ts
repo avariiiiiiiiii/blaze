@@ -1,4 +1,9 @@
-/** The /updates signup form (SignupForm in renderer/core/src/render.rs), sent with fetch so the page stays put. */
+/**
+ * The /updates signup form (SignupForm in renderer/core/src/render.rs), sent with fetch so the page stays put. Set up
+ * again on every page (client/lib/page.ts). With Turnstile on, /updates is always a full load (client/nav.ts: its
+ * script is from another origin), so `window.turnstile` is this page's own.
+ */
+import { onPage } from './lib/page';
 
 declare global {
 	interface Window {
@@ -6,7 +11,7 @@ declare global {
 	}
 }
 
-function init() {
+function init(signal: AbortSignal) {
 	const form = document.querySelector<HTMLFormElement>('form.signup');
 	if (!form) return;
 	const button = form.querySelector<HTMLButtonElement>('button[type=submit]');
@@ -52,10 +57,7 @@ function init() {
 			}
 			window.turnstile?.reset();
 		}
-	});
+	}, { signal });
 }
 
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-else init();
-
-export {};
+onPage(init);

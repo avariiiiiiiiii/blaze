@@ -18,12 +18,13 @@
  *      site.wasm, site.cbor   the renderer and the snapshot (worker/renderer.ts)
  *      pages.json             every page: [{url, file, doc, discussable}] (what the worker routes)
  *      discussable.json       doc -> title and each block's text (what comments may attach to)
- *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key)
+ *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key), and
+ *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts)
  *      spoken.json            every page's spoken lines and their hash (the input of audio/generate.py)
  *      site.json              {origin, base}: where the site is served (`Served` on `site` in content/site.flecs)
  *
- *    and dist/sitemap.xml, every page but the 404 at its full URL (origin + base + path), and dist/install.sh, the
- *    repo's installer.
+ *    and dist/sitemap.xml, every page but the 404 at its full URL (origin + base + path), dist/install.sh, the
+ *    repo's installer, and dist/search.json, what the sidebar's search (client/side.ts) looks through.
  *
  * SITE_WASM_DIR names another directory holding site.wasm and site-snapshot.wasm (default renderer/target/site/).
  *
@@ -31,7 +32,7 @@
  *   bun gen/build.ts --watch   # again on every change under content/, gen/, client/, styles/
  */
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
 import { benchHistory } from './bench';
@@ -44,10 +45,10 @@ const dist = path.join(root, 'dist');
 const gen = path.join(root, '.gen');
 const modules = process.env.SITE_WASM_DIR ? path.resolve(process.env.SITE_WASM_DIR) : path.join(root, 'renderer/target/site');
 
-/** Every .flecs file under content/, relative to it: schema.flecs first, then refs.flecs, then the rest in path order. */
+/** Every .flecs file under content/, relative to it: schema.flecs, refs.flecs and nav.flecs first, then the rest in path order. */
 function scripts(): string[] {
 	const files = readdirSync(content, { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.flecs'));
-	const rank = (f: string) => (f === 'schema.flecs' ? 0 : f === 'refs.flecs' ? 1 : 2);
+	const rank = (f: string) => (f === 'schema.flecs' ? 0 : f === 'refs.flecs' ? 1 : f === 'nav.flecs' ? 2 : 3);
 	return files.sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
 }
 
@@ -108,7 +109,7 @@ function narration(pages: Page[], spoken: Map<string, { hash: string; lines: Spo
 	return bakes;
 }
 
-const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css'];
+const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css'];
 
 type Baked = SnapshotInput['bakes'];
 
@@ -168,6 +169,41 @@ function served(tree: Map<string, Node>): { origin: string; base: string } {
 	return { origin: String(v?.origin ?? ''), base: String(v?.base ?? '') };
 }
 
+/** Text of an HTML fragment: tags (and the comment and narration buttons' markup) out, entities in, spaces collapsed. */
+function textOf(html: string): string {
+	return html
+		.replace(/<(script|style|svg|button|form)\b[\s\S]*?<\/\1>/g, ' ')
+		.replace(/<[^>]+>/g, ' ')
+		.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+		.replace(/\s+/g, ' ')
+		.trim();
+}
+
+/**
+ * search.json: per page (not the 404), one entry for the page (its text before the first section) and one per
+ * top-level section, from the page as rendered: `{u: URL with the base, t: page title, h: section title, x: text}`.
+ */
+function searchIndex(pages: Page[], html: Map<string, string>, tree: Map<string, Node>, base: string) {
+	const out: { u: string; t: string; h: string; x: string }[] = [];
+	for (const p of pages) {
+		if (p.url === '/404') continue;
+		const page = html.get(p.url) ?? '';
+		const main = /<main\b[^>]*>([\s\S]*)<\/main>/.exec(page)?.[1] ?? '';
+		const title = String(tree.get(entityOf(p))?.values.get('Title')?.text ?? p.url);
+		const parts = main.split(/(?=<section id=")/);
+		const href = (hash: string) => `${base}${p.url}${hash}`;
+		out.push({ u: href(''), t: title, h: '', x: textOf(parts[0]!.replace(/<nav class="pager"[\s\S]*$/, '')).slice(0, 800) });
+		for (const part of parts.slice(1)) {
+			const id = /^<section id="([^"]+)"/.exec(part)?.[1];
+			const h = /<h2[^>]*>([\s\S]*?)<\/h2>/.exec(part)?.[1];
+			if (!id || h === undefined) continue;
+			const body = part.replace(/<h2[^>]*>[\s\S]*?<\/h2>/, '').replace(/<nav class="pager"[\s\S]*$/, '');
+			out.push({ u: href(`#${id}`), t: title, h: textOf(h), x: textOf(body).slice(0, 800) });
+		}
+	}
+	return out;
+}
+
 const xmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 function write(file: string, data: string | Uint8Array) {
@@ -202,11 +238,33 @@ async function build() {
 	}
 
 	const client = readdirSync(path.join(root, 'client')).filter((f) => f.endsWith('.ts')).map((f) => path.join(root, 'client', f));
-	const bundled = await Bun.build({ entrypoints: client, outdir: path.join(dist, 'js'), minify: true, target: 'browser' });
+	// What the pages run and look with: the client router swaps in a page only when its build had the same (nav.ts).
+	const assetsHash = createHash('sha256');
+	for (const dir of ['client', 'styles', 'gen/bench']) {
+		for (const f of (readdirSync(path.join(root, dir), { recursive: true }) as string[]).sort()) {
+			const file = path.join(root, dir, f);
+			if (statSync(file).isFile()) assetsHash.update(`${dir}/${f}`).update(readFileSync(file));
+		}
+	}
+	const assets = assetsHash.digest('hex').slice(0, 16);
+	// `root` keeps the output flat (dist/js/<name>.js): bench.ts imports from gen/, which would otherwise widen it to site/.
+	const bundled = await Bun.build({
+		entrypoints: client,
+		root: path.join(root, 'client'),
+		outdir: path.join(dist, 'js'),
+		minify: true,
+		target: 'browser',
+		define: { BLAZE_ASSETS: JSON.stringify(assets) },
+	});
 	if (!bundled.success) throw new AggregateError(bundled.logs, 'client bundle failed');
 
 	rmSync(path.join(dist, 'rfcs'), { recursive: true, force: true });
-	for (const p of pages) write(path.join(dist, p.file), site.render(p.url, [], { viewer: null, signIn: true }));
+	const rendered = new Map<string, string>();
+	for (const p of pages) {
+		const html = site.render(p.url, [], { viewer: null, signIn: true });
+		rendered.set(p.url, html);
+		write(path.join(dist, p.file), html);
+	}
 	writeFileSync(path.join(dist, 'site.css'), STYLES.map((s) => readFileSync(path.join(root, 'styles', s), 'utf8')).join('\n'));
 	cpSync(path.join(root, 'static'), dist, { recursive: true });
 	// The installer, at <base>/install.sh, from the repo root; the worker also answers <base>/ with it for curl
@@ -222,11 +280,12 @@ async function build() {
 		const urls = pages.filter((p) => p.url !== '/404').map((p) => `<url><loc>${xmlEsc(at.origin + at.base + p.url)}</loc></url>`);
 		write(path.join(dist, 'sitemap.xml'), `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join('\n')}\n</urlset>\n`);
 	}
+	write(path.join(dist, 'search.json'), JSON.stringify(searchIndex(pages, rendered, tree, at.base)));
 	write(path.join(gen, 'discussable.json'), JSON.stringify(site.discussable(), null, '\t'));
 	const hash = createHash('sha256');
 	for (const f of ['site.cbor', 'site.wasm']) hash.update(f).update(readFileSync(path.join(gen, f)));
 	for (const f of readdirSync(path.join(dist, 'js')).sort()) hash.update(f).update(readFileSync(path.join(dist, 'js', f)));
-	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16) }));
+	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets }));
 	const narrated = Object.keys(audio).length ? `, ${Object.keys(audio).length} with audio` : '';
 	console.log(`built ${pages.length} pages${narrated} (snapshot ${snap.length} bytes) in ${Math.round(performance.now() - t0)} ms`);
 }

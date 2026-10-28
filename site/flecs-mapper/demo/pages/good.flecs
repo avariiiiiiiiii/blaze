@@ -2,7 +2,7 @@
 site {
   demo_good : Doc {
     Title: {text: "Charter"}
-    Lede intro("What ra-jit is for, after [[zig_016]].")
+    Lede intro("What blaze is for, after [[zig_016]].")
     P why(text: "Because [the release notes][zig_016] say so.")
     Ul list {
       Li one("first")

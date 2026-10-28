@@ -14,7 +14,7 @@ import pagesJson from '../.gen/pages.json';
 import { currentUser, hasSessionCookie, isAdmin } from './auth';
 import { outer } from './base';
 import type { Env } from './env';
-import { csp, methodNotAllowed, plain } from './http';
+import { ASSETS, ASSETS_HEADER, csp, methodNotAllowed, plain } from './http';
 import { renderPage, type CommentRow, type Discussion } from './renderer';
 import type { Page } from './site-wasm';
 
@@ -92,6 +92,7 @@ function headers(cacheControl: string, how: string): Headers {
 		'referrer-policy': 'strict-origin-when-cross-origin',
 		// Which path served it: cache hit, cache miss (rendered and stored), anonymous but not cacheable, or per user.
 		'x-render': how,
+		[ASSETS_HEADER]: ASSETS,
 	});
 }
 

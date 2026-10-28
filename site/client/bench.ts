@@ -1,14 +1,17 @@
 /**
  * /bench (the BenchHistory widget, gen/bench/index.ts): redraws a part of the page from the embedded history when
- * a choice is clicked, or when the pointer or the arrow keys pick another run on a chart.
+ * a choice is clicked, or when the pointer or the arrow keys pick another run on a chart. Set up again on every page
+ * (client/lib/page.ts); its listeners are on the widget, which goes with the page.
  */
 import type { History } from '../gen/bench/data';
 import { GROUP_PART, M, PARTS, PW, W, choose, initial } from '../gen/bench/view';
+import { onPage } from './lib/page';
 
-const root = document.querySelector<HTMLElement>('.bench');
-const json = document.getElementById('bench-data')?.textContent;
+onPage((signal) => {
+	const root = document.querySelector<HTMLElement>('.bench');
+	const json = document.getElementById('bench-data')?.textContent;
+	if (!root || !json) return;
 
-if (root && json) {
 	const data: History = JSON.parse(json);
 	const state = initial();
 	const part = (name: string) => root.querySelector<HTMLElement>(`[data-part="${name}"]`);
@@ -45,7 +48,7 @@ if (root && json) {
 		if (!button) return;
 		choose(state, button.dataset.set!, button.dataset.value!);
 		draw(['latest', 'time', 'live']);
-	});
+	}, { signal });
 
 	const onPointer = (e: PointerEvent) => {
 		const svg = (e.target as Element).closest<SVGSVGElement>('svg[data-group]');
@@ -55,8 +58,8 @@ if (root && json) {
 		const px = ((e.clientX - box.left) / box.width) * W;
 		pick(svg, n <= 1 ? 0 : Math.round(((px - M.l) / PW) * (n - 1)));
 	};
-	root.addEventListener('pointermove', onPointer);
-	root.addEventListener('pointerdown', onPointer);
+	root.addEventListener('pointermove', onPointer, { signal });
+	root.addEventListener('pointerdown', onPointer, { signal });
 
 	root.addEventListener('keydown', (e) => {
 		const svg = (e.target as Element).closest<SVGSVGElement>('svg[data-group]');
@@ -66,5 +69,5 @@ if (root && json) {
 		if (to === undefined) return;
 		e.preventDefault();
 		pick(svg, to);
-	});
-}
+	}, { signal });
+});

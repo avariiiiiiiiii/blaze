@@ -11,7 +11,12 @@
  *   block's thread and focuses its form.
  *
  * Nothing here builds HTML from strings: text goes in with textContent, markup comes parsed from the worker's page.
+ *
+ * Set up again on every page (client/lib/page.ts). The page the client router swapped in was fetched with the reader's
+ * cookie, so its threads, forms and sign-in state are the reader's, as on a load.
  */
+
+import { onPage } from './lib/page';
 
 const PAGE_THREAD = 'block-_page';
 
@@ -59,7 +64,7 @@ function relativeTimes(root: ParentNode) {
 	}
 }
 
-function start(main: HTMLElement) {
+function start(main: HTMLElement, signal: AbortSignal) {
 	const threadOf = (id: string) => document.getElementById(id) as HTMLElement | null;
 	const buttonOf = (threadId: string) => main.querySelector<HTMLAnchorElement>(`.c-btn[aria-controls="${CSS.escape(threadId)}"]`);
 
@@ -189,7 +194,7 @@ function start(main: HTMLElement) {
 		e.preventDefault();
 		if (thread.hidden) open(thread, true);
 		else setOpen(thread, false);
-	});
+	}, { signal });
 	main.addEventListener('submit', (e) => {
 		const f = e.target;
 		if (!(f instanceof HTMLFormElement)) return;
@@ -200,7 +205,7 @@ function start(main: HTMLElement) {
 			e.preventDefault();
 			void remove(f);
 		}
-	});
+	}, { signal });
 	main.addEventListener('keydown', (e) => {
 		const ta = e.target;
 		if (!(ta instanceof HTMLTextAreaElement) || !(e.key === 'Enter' && (e.metaKey || e.ctrlKey))) return;
@@ -208,17 +213,12 @@ function start(main: HTMLElement) {
 		if (!f) return;
 		e.preventDefault();
 		void post(f);
-	});
-	window.addEventListener('hashchange', followHash);
+	}, { signal });
+	window.addEventListener('hashchange', followHash, { signal });
 	followHash();
 }
 
-function init() {
+onPage((signal) => {
 	const main = document.querySelector<HTMLElement>('main[data-doc]');
-	if (main) start(main);
-}
-
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-else init();
-
-export {};
+	if (main) start(main, signal);
+});

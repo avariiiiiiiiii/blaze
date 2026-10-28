@@ -9,7 +9,7 @@
 // backtick string, its indent stripped. Strings interpolate, so write \{ and \$ for { and $, and \` in
 // a backtick string.
 //
-// Read by gen/ (TS), which turns the tree into HTML: render/render.ts says what each type becomes.
+// Rendered by the Rust renderer (renderer/core): render.rs says what each type becomes, side.rs the sidebar.
 using flecs.meta
 
 // Page metadata, set on the page entity.
@@ -17,8 +17,15 @@ struct Title(text: string)              // <title> and the page's <h1>
 struct Tab(text: string)                // the <title>, when it is not Title
 struct Description(text: string)        // <meta name="description">
 struct Number(value: i32)               // an RFC's number
-struct Nav(label: string, order: i32)   // a page linked from the top bar, left to right by order
-struct Link(label: string, href: string, order: i32) // an outside link in the top bar (children of nav)
+struct Nav(label: string, order: i32)   // a page's row in the sidebar: its label, top to bottom by order in its section
+struct Link(label: string, href: string, order: i32) // a sidebar row that goes elsewhere (a child of a section)
+// The sidebar (nav.flecs; renderer core side.rs): its sections are the children of `nav`, each with a Group and an
+// Icon. A page joins one with Nav, Icon and (InGroup, nav.<section>); its RFCs are its row's kids.
+struct Group(title: string, order: i32) // a sidebar section, top to bottom by order
+struct Icon(name: string)               // a row's or section's icon: a key of renderer/core/src/icons.rs
+// The logo, set on `site`: animated pixel-fire WebP, the dark file on a dark page, the light one on a light page.
+// The still files are its first frame, which the sidebar shows until the pointer is on it.
+struct Brand(dark: string, light: string, width: i32, height: i32, still_dark: string, still_light: string)
 // Where the site is served, set on `site`: the origin and the path every page sits under (no trailing slash, or
 // empty for the root). A link written /rfcs/x becomes <base>/rfcs/x; canonical and og:url are origin + base + path.
 struct Served(origin: string, base: string)
@@ -33,17 +40,20 @@ struct Th(text: string)
 struct Td(text: string)
 struct Code(lang: string, text: string) // a code block; lang is rust, toml, bash or empty
 struct Command(text: string)            // one shell command with a copy button
+struct Art(piece: string, label: string) // an animated drawing (client/art.ts draws `piece`); label is its alt text, never read out
 struct Img(src: string, alt: string, width: i32, height: i32)
 
 // Containers: their children are their content, in order.
 struct Section(title: string)           // <section> with an <h2>
 struct Issue(title: string)             // an open question in an RFC, with (Status, Open|Resolved)
+struct Goal(title: string, line: string) // one of blaze's goals, folded to its title and one line until opened
 Ul {}
 Ol {}
 Table {}
 Tr {}
 Section { (With, flecs.core.OrderedChildren) }
 Issue { (With, flecs.core.OrderedChildren) }
+Goal { (With, flecs.core.OrderedChildren) }
 Ul { (With, flecs.core.OrderedChildren) }
 Ol { (With, flecs.core.OrderedChildren) }
 Table { (With, flecs.core.OrderedChildren) }
@@ -78,11 +88,13 @@ Open {}                                 // an issue nobody has settled
 Resolved {}
 Cites {}                                // (Cites, ref): a block leans on that reference
 DependsOn {}                            // (DependsOn, page): read that page first
+InGroup { Exclusive }                   // (InGroup, nav.<section>): the page's sidebar row is in that section
 
 // Page kinds.
 Discussable {}                          // signed-in readers comment on each block
-Narrow {}                               // a 560px column instead of 720px
-Wide {}                                 // a 960px column
+Narrow {}                               // a 560px column instead of 820px
+Wide {}                                 // a wide column, no outline beside it
+Hero {}                                 // the page's title is the logo, large (the home page)
 
 prefab Page {
   OrderedChildren

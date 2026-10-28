@@ -13,7 +13,12 @@
  * - every block gets a "play from here" button among its hover controls.
  *
  * Nothing plays until the reader presses something. DOM is built with createElement and textContent only.
+ *
+ * Set up again on every page (client/lib/page.ts). Moving to another page stops the narration: it reads this page and
+ * highlights its blocks, so it has nothing to follow on the next one (as a load would stop it).
  */
+
+import { onPage } from './lib/page';
 
 type Word = [string, number, number];
 type ManifestLine = { id: string; block: string; src: string; duration: number; words: Word[] };
@@ -130,7 +135,7 @@ function follows(spoken: Word[], found: (Range | null)[]): boolean {
 	return said > 0 && hit / said >= MIN_MATCHED;
 }
 
-function start(root: HTMLElement, m: Manifest, base: URL) {
+function start(root: HTMLElement, m: Manifest, base: URL): () => void {
 	const main = root.closest('main') ?? document.body;
 	const lines = m.lines;
 	const total = lines.reduce((s, l) => s + l.duration, 0);
@@ -388,23 +393,42 @@ function start(root: HTMLElement, m: Manifest, base: URL) {
 	if (lines.length > 1) load(1, 1);
 	showTime();
 	showPlaying();
+
+	return () => {
+		playing = false;
+		cancelAnimationFrame(raf);
+		for (const a of players) {
+			a.pause();
+			a.removeAttribute('src');
+			a.load(); // drops what it was loading
+		}
+		highlights?.delete('say-word');
+		shown?.classList.remove('say-now');
+		if ('mediaSession' in navigator) {
+			for (const action of ['play', 'pause', 'previoustrack', 'nexttrack'] as const) navigator.mediaSession.setActionHandler(action, null);
+			navigator.mediaSession.metadata = null;
+		}
+	};
 }
 
-async function init() {
+onPage((signal) => {
 	const root = document.querySelector<HTMLElement>('.listen[data-audio]');
 	if (!root) return;
 	const url = new URL(root.dataset.audio!, location.href);
-	try {
-		const res = await fetch(url, { credentials: 'same-origin' });
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const m = (await res.json()) as Manifest;
-		if (!m.lines?.length) return;
-		start(root, m, url);
-	} catch (e) {
-		root.textContent = '';
-		root.append(el('p', 'dim', 'The narration could not be loaded.'));
-		console.warn('listen:', e);
-	}
-}
-
-void init();
+	let stop: (() => void) | undefined;
+	void (async () => {
+		try {
+			const res = await fetch(url, { credentials: 'same-origin', signal });
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const m = (await res.json()) as Manifest;
+			if (signal.aborted || !m.lines?.length) return;
+			stop = start(root, m, url);
+		} catch (e) {
+			if (signal.aborted) return;
+			root.textContent = '';
+			root.append(el('p', 'dim', 'The narration could not be loaded.'));
+			console.warn('listen:', e);
+		}
+	})();
+	return () => stop?.();
+});

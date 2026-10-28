@@ -174,15 +174,16 @@ else
             fail "the list of blaze's releases could not be read; is the network up?" \
                 "$(cat "$tmp/error")
 $releases.atom"
+        grep -o 'releases/tag/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' "$tmp/releases.atom" |
+            sed 's/^releases\/tag\/v//; s/"$//' | sort -t . -k 1,1nr -k 2,2nr -k 3,3nr > "$tmp/candidates" || true
         tag=""
-        for candidate in $(grep -o 'releases/tag/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' "$tmp/releases.atom" |
-            sed 's/^releases\/tag\/v//; s/"$//' | sort -t . -k 1,1nr -k 2,2nr -k 3,3nr); do
+        while read -r candidate; do
             if fetch "$releases/download/v$candidate/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
                 tag="v$candidate"
                 break
             fi
             step "v$candidate has no release yet"
-        done
+        done < "$tmp/candidates"
         [ -n "$tag" ] || fail "blaze has no canary release yet." "Releases: $releases"
     else
         latest=$(landing "$releases/latest" 2>/dev/null || true)

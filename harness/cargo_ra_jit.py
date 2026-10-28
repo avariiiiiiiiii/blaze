@@ -174,6 +174,10 @@ STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Down
 
 def base_env(home):
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never")
+    # Every side's cargo lays out a build as stable cargo does, as a user's does and as blaze
+    # places a test: in nightly's second layout a test is in its unit's directory, from where
+    # fd's, ripgrep's and just's tests find no program beside them.
+    env["CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT"] = "false"
     # The store is on by default, in the user's cache directory: a run has one of its own.
     env["BLAZE_CACHE"] = os.path.join(home, "store")
     env["PATH"] = os.path.dirname(RA_JIT) + os.pathsep + env["PATH"]
@@ -267,11 +271,7 @@ class Side:
 
     def __init__(self, ws, env, ra_jit):
         self.ws, self.ra_jit, self.plain = ws, bool(ra_jit), ra_jit == "plain"
-        # The reference is laid out as stable cargo lays out a build, which is what a user compares
-        # with and where blaze puts a test: in nightly's second layout a test is in its unit's
-        # directory, from where fd's, ripgrep's and just's tests find no program beside them.
-        self.env = env if ra_jit else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"),
-                                           CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT="false")
+        self.env = env if ra_jit else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
         self.tally = os.path.join(env["BLAZE_HOME"], "plain-cargo.log")
         self.read = 0
 

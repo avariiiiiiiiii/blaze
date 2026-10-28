@@ -20,8 +20,10 @@
  *
  * Without JS, or with the socket down, the page is as it was.
  *
- * Signed-in people are their GitHub avatar; anonymous ones a GitHub-style identicon of the key the worker gives them
- * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
+ * Signed-in people are their GitHub avatar. Anonymous ones are named and drawn from the key the worker gives them (a
+ * hash, new every day): "Quiet Otter", and an otter's face (gen/animals.ts, compiled into one sprite by gen/build.ts)
+ * in their hue, the colour of their cursor too (client/lib/cursors.ts). Someone whose tab is hidden is drawn faded
+ * ("away").
  */
 
 import { tipOn } from './tip';
@@ -72,15 +74,11 @@ const ADJECTIVES = [
 	'Happy', 'Jolly', 'Kind', 'Lucky', 'Merry', 'Mighty', 'Nimble', 'Quiet', 'Rapid', 'Rusty', 'Shiny', 'Sleepy',
 	'Snappy', 'Sunny', 'Swift', 'Tidy', 'Witty', 'Zesty', 'Plucky', 'Cozy',
 ];
-const ANIMALS = [
-	'Otter', 'Fox', 'Panda', 'Koala', 'Falcon', 'Badger', 'Heron', 'Lynx', 'Moose', 'Owl', 'Penguin', 'Rabbit', 'Raven',
-	'Seal', 'Sparrow', 'Tiger', 'Turtle', 'Walrus', 'Whale', 'Wombat', 'Yak', 'Zebra', 'Crab', 'Gecko', 'Hedgehog',
-	'Lemur', 'Llama', 'Narwhal', 'Octopus', 'Puffin', 'Squid', 'Crane',
-];
-const anonName = (key: string) => {
-	const n = parseInt(key.slice(1, 7), 16) || 0;
-	return `${ADJECTIVES[n % ADJECTIVES.length]} ${ANIMALS[Math.floor(n / ADJECTIVES.length) % ANIMALS.length]}`;
-};
+/** The animals (gen/animals.ts, the one table of names and faces) and the sprite they are drawn in, from gen/build.ts. */
+declare const BLAZE_ANIMALS: { sprite: string; names: string[] };
+const ANIMALS = BLAZE_ANIMALS.names;
+const anonAnimal = (key: string) => ANIMALS[Math.floor((parseInt(key.slice(1, 7), 16) || 0) / ADJECTIVES.length) % ANIMALS.length];
+const anonName = (key: string) => `${ADJECTIVES[(parseInt(key.slice(1, 7), 16) || 0) % ADJECTIVES.length]} ${anonAnimal(key)}`;
 const name = (w: Who) => (w.login ? `@${w.login}` : anonName(w.key));
 const awayOn = (p: Person, path: string) => p.pages.filter((x) => x.path === path).every((x) => x.away);
 
@@ -91,27 +89,14 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''):
 	return e;
 }
 
-/** GitHub's identicon: a 5x5 grid mirrored left to right, cells and hue from the key. */
-function identicon(key: string): SVGSVGElement {
-	const hex = key.slice(1).padEnd(12, '0');
-	const nib = [...hex].map((c) => parseInt(c, 16) || 0);
+/** An anonymous reader's animal, from the sprite (its symbols are `animal-<name>`, gen/animals.ts `symbolId`). */
+function animalFace(key: string): SVGSVGElement {
 	const svg = document.createElementNS(SVG, 'svg');
-	svg.setAttribute('viewBox', '-0.5 -0.5 6 6');
+	svg.setAttribute('viewBox', '0 0 32 32');
 	svg.setAttribute('aria-hidden', 'true');
-	const hue = ((nib[0] << 4) | nib[1]) * (360 / 256);
-	svg.style.setProperty('--id-ink', `hsl(${hue.toFixed(0)} 55% 58%)`);
-	for (let y = 0; y < 5; y++)
-		for (let x = 0; x < 3; x++) {
-			if ((nib[(y * 3 + x) % 12] + y) % 2 === 0) continue;
-			for (const cx of x === 2 ? [2] : [x, 4 - x]) {
-				const r = document.createElementNS(SVG, 'rect');
-				r.setAttribute('x', String(cx));
-				r.setAttribute('y', String(y));
-				r.setAttribute('width', '1');
-				r.setAttribute('height', '1');
-				svg.append(r);
-			}
-		}
+	const use = document.createElementNS(SVG, 'use');
+	use.setAttribute('href', `${BASE}${BLAZE_ANIMALS.sprite}#animal-${anonAnimal(key).toLowerCase()}`);
+	svg.append(use);
 	return svg;
 }
 
@@ -126,7 +111,12 @@ function face(w: Who, away = false): HTMLElement {
 		img.referrerPolicy = 'no-referrer';
 		img.loading = 'lazy';
 		f.append(img);
-	} else f.append(identicon(w.key));
+	} else {
+		// The hue cursors.ts's `hueOf` gives the same key, so their face and their pointer match.
+		f.classList.add('animal');
+		f.style.setProperty('--h', ((parseInt(w.key.slice(1, 3), 16) || 0) * (360 / 256)).toFixed(0));
+		f.append(animalFace(w.key));
+	}
 	return f;
 }
 

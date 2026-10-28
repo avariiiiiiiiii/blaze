@@ -70,7 +70,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''):
 	return e;
 }
 
-/** A person's colour: an anonymous key's is its identicon's hue (client/lib/presence.ts), anyone else's a hash. */
+/** A person's colour: an anonymous key's is its animal's hue (client/lib/presence.ts), anyone else's a hash. */
 function hueOf(key: string): number {
 	if (/^a[0-9a-f]{12}$/.test(key)) return parseInt(key.slice(1, 3), 16) * (360 / 256);
 	let h = 2166136261;

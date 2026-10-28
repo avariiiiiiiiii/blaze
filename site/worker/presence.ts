@@ -5,7 +5,7 @@
  * GET /api/presence (a WebSocket upgrade, same Origin only) is checked here in the worker: the session cookie gives
  * the GitHub user, if any. The object gets the request with `x-presence-who` (the user, or nothing) and
  * `x-presence-ip`, and names an anonymous visitor by an HMAC of their IP and user agent under a random key it keeps
- * per UTC day: the same browser is the same identicon all day, the next day it is another, and neither the IP nor the
+ * per UTC day: the same browser is the same animal all day, the next day it is another, and neither the IP nor the
  * key leaves the object. Signed-in readers are their GitHub login.
  *
  * Protocol (JSON text frames):

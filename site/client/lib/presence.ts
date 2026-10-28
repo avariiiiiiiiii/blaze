@@ -3,20 +3,27 @@
  * client router's swaps (client/nav.ts). One WebSocket per tab tells the site which page the tab shows and whether it
  * is hidden; what comes back is everyone on the site, drawn three places:
  *
- * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it): the page's discussion
+ * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
+ *   phone bar instead): the page's discussion
  *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
- *   and where), and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
- * - the sidebar: a small stack of faces on each page's row that someone else is reading;
- * - nothing else changes: without JS, or with the socket down, the page is as it was.
+ *   and where), the chat (client/lib/chat.ts, which rides this socket), and the reader: their GitHub avatar and login
+ *   with Sign out, or Sign in with GitHub;
+ * - the sidebar: a small stack of faces on each page's row that someone else is reading, and when one of them says
+ *   something in the chat, a speech bubble out of their face for a few seconds (`speak`);
+ * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
+ *   threads of that doc if it is the page shown.
+ *
+ * Without JS, or with the socket down, the page is as it was.
  *
  * Signed-in people are their GitHub avatar; anonymous ones a GitHub-style identicon of the key the worker gives them
  * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
  */
 
-import { PAGE, onPage } from './page';
+import * as chat from './chat';
+import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -79,6 +86,7 @@ function identicon(key: string): SVGSVGElement {
 
 function face(w: Who, away = false): HTMLElement {
 	const f = el('span', `face${away ? ' away' : ''}`);
+	f.dataset.key = w.key;
 	f.title = away ? `${name(w)} (away)` : name(w);
 	if (w.avatar && w.avatar.startsWith('https://avatars.githubusercontent.com/')) {
 		const img = el('img');
@@ -111,29 +119,41 @@ bar.setAttribute('aria-label', 'Discussion and who is here');
 const discussSlot = el('span', 'tl-discuss');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-bar.append(discussSlot, hereSlot, meSlot);
+const chatSlot = el('span', 'tl-chatslot');
+chatSlot.append(chat.button);
+bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
+bar.append(list);
+const phone = matchMedia('(max-width: 800px)');
 
+/** In the pane above the page, or on a phone in the phone bar, before its search button. */
 function mount(): void {
+	const mbar = document.querySelector('.mbar');
 	const pane = document.querySelector('.pane');
-	if (!pane || bar.isConnected) return;
-	const grid = pane.querySelector(':scope > .grid');
-	pane.insertBefore(bar, grid);
-	bar.after(list);
+	if (phone.matches && mbar) {
+		if (bar.parentElement !== mbar) mbar.insertBefore(bar, mbar.querySelector('.msearch'));
+	} else if (pane && bar.parentElement !== pane) pane.insertBefore(bar, pane.querySelector(':scope > .grid'));
+}
+phone.addEventListener('change', mount);
+
+function closeList(): void {
+	if (list.hidden) return;
+	list.hidden = true;
+	hereSlot.querySelector('button')?.setAttribute('aria-expanded', 'false');
 }
 
 /** The page's discussion: its comments, counted from the threads the page was rendered with. */
 function drawDiscuss(): void {
 	discussSlot.replaceChildren();
-	const section = document.querySelector<HTMLElement>('main .discussion');
-	if (!section) return;
-	section.id ||= 'discussion';
+	if (!document.querySelector('main #discussion')) return;
 	const n = document.querySelectorAll('main .c-item').length;
 	const a = el('a', 'tl-btn');
 	a.href = '#discussion';
-	a.append(el('span', 'tl-bubble'), el('span', '', n === 0 ? 'Discuss' : n === 1 ? '1 comment' : `${n} comments`));
+	a.title = n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`;
+	a.append(el('span', 'tl-bubble'), el('span', 'tl-label', n === 0 ? 'Discuss' : n === 1 ? 'comment' : 'comments'));
+	if (n > 0) a.insertBefore(el('span', 'tl-n', String(n)), a.lastChild);
 	discussSlot.append(a);
 }
 
@@ -148,12 +168,31 @@ function drawHere(): void {
 	b.setAttribute('aria-controls', list.id);
 	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
 	b.title = `${on.length} on this page, ${total} on the site`;
-	b.addEventListener('click', () => {
-		list.hidden = !list.hidden;
-		b.setAttribute('aria-expanded', String(!list.hidden));
+	b.addEventListener('click', (e) => {
+		e.stopPropagation();
+		if (!list.hidden) return closeList();
+		list.hidden = false;
+		b.setAttribute('aria-expanded', 'true');
 		drawList();
 	});
 	hereSlot.append(b);
+}
+
+const regions = (() => {
+	try {
+		return new Intl.DisplayNames(undefined, { type: 'region' });
+	} catch {
+		return null;
+	}
+})();
+
+/** A country's flag: its two letters as regional indicator symbols, named in a tooltip. */
+function flag(cc: string): HTMLElement {
+	const f = el('span', 'flag', String.fromCodePoint(...[...cc].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)));
+	const n = regions?.of(cc) ?? cc;
+	f.title = n;
+	f.setAttribute('aria-label', n);
+	return f;
 }
 
 function drawList(): void {
@@ -168,6 +207,7 @@ function drawList(): void {
 			who.rel = 'nofollow noopener';
 		}
 		li.append(face(p, p.pages.length > 0 && p.pages.every((x) => x.away)), who);
+		if (p.country) li.append(flag(p.country));
 		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
 		const where = el('span', 'where');
 		for (const pg of p.pages) {
@@ -187,6 +227,7 @@ function drawMe(): void {
 	if (!you) return;
 	if (you.login) {
 		const a = el('a', 'tl-btn tl-user');
+		a.setAttribute('aria-label', `Signed in as ${you.login}`);
 		a.href = `https://github.com/${encodeURIComponent(you.login)}`;
 		a.rel = 'noopener';
 		a.title = 'Your GitHub profile';
@@ -203,7 +244,9 @@ function drawMe(): void {
 		form.append(next, out);
 		meSlot.append(a, form);
 	} else if (you.signIn) {
-		const a = el('a', 'tl-btn tl-signin', 'Sign in with GitHub');
+		const a = el('a', 'tl-btn tl-signin');
+		a.append(el('span', 'tl-label', 'Sign in with GitHub'));
+		a.setAttribute('aria-label', 'Sign in with GitHub');
 		a.href = `${BASE}auth/github?next=${encodeURIComponent(sitePath() + location.hash)}`;
 		a.prepend(githubMark());
 		meSlot.append(a);
@@ -245,6 +288,47 @@ function drawSide(): void {
 	}
 }
 
+const SAY_MS = 6000;
+const bubbles = new Map<string, HTMLElement>();
+
+/** A bubble with `text` out of `key`'s face on the sidebar row of the page they are on, if it is in view. */
+function speak(key: string, login: string, text: string): void {
+	bubbles.get(key)?.remove();
+	const p = people.find((x) => x.key === key);
+	// The page they are looking at first, then any other tab of theirs.
+	let at: Element | null = null;
+	const pages = p ? [...p.pages].sort((a, b) => Number(a.away) - Number(b.away)) : [];
+	for (const pg of pages) {
+		const row = `.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`;
+		at = document.querySelector(`${row} > .face[data-key="${CSS.escape(key)}"]`) ?? document.querySelector(row);
+		if (at) break;
+	}
+	at ??= document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
+	const r = at?.getBoundingClientRect();
+	if (!at || !r || r.width === 0 || r.bottom < 0 || r.top > innerHeight) return;
+	const b = el('div', 'say-bubble');
+	b.setAttribute('aria-hidden', 'true');
+	b.append(el('b', '', login), el('span', '', text));
+	b.style.left = `${Math.round(r.right + 10)}px`;
+	b.style.top = `${Math.round(r.top + r.height / 2 - 14)}px`;
+	document.body.append(b);
+	bubbles.set(key, b);
+	at.classList.add('talking');
+	setTimeout(() => {
+		b.classList.add('out');
+		at.classList.remove('talking');
+		setTimeout(() => {
+			b.remove();
+			if (bubbles.get(key) === b) bubbles.delete(key);
+		}, 300);
+	}, SAY_MS);
+}
+// The sidebar scrolling or the page swapping moves the faces from under a bubble: let it go.
+for (const t of ['scroll', LEAVE] as const) addEventListener(t, () => {
+	for (const b of bubbles.values()) b.remove();
+	bubbles.clear();
+}, { capture: true, passive: true });
+
 function draw(): void {
 	mount();
 	drawDiscuss();
@@ -281,11 +365,21 @@ function connect(): void {
 		}
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
-		if (msg.t === 'you') you = m as You;
+		if (chat.message(msg)) return;
+		if (msg.t === 'comments') {
+			const doc = (m as { doc?: unknown }).doc;
+			if (typeof doc === 'string') dispatchEvent(new CustomEvent(COMMENTS, { detail: doc }));
+			return;
+		}
+		if (msg.t === 'you') {
+			you = m as You;
+			chat.setYou(you);
+		}
 		else if (msg.t === 'here') {
 			const h = m as { people?: Person[]; total?: number };
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
+			chat.setOnline(total);
 		} else return;
 		draw();
 	});
@@ -308,14 +402,17 @@ addEventListener('pageshow', (e) => {
 });
 document.addEventListener('visibilitychange', send);
 addEventListener(PAGE, send);
+addEventListener(THREADS, drawDiscuss);
 document.addEventListener('keydown', (e) => {
-	if (e.key === 'Escape' && !list.hidden) {
-		list.hidden = true;
-		drawHere();
-	}
+	if (e.key === 'Escape') closeList();
+});
+document.addEventListener('click', (e) => {
+	if (!(e.target instanceof Node && list.contains(e.target))) closeList();
 });
 
+chat.setup({ send: (m) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m)), base: BASE, face, speak });
 onPage(() => {
+	closeList();
 	draw();
 });
 connect();

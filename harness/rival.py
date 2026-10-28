@@ -90,7 +90,7 @@ PROJECTS = {
              "crates/ruff_linter/resources/test/fixtures/pyflakes"],
         edits=dict(
             body=bench.body("crates/ty/src/lib.rs", "fn run_check(args: CheckCommand) -> anyhow::Result<ExitStatus> {"),
-            signature=bench.parameter("crates/ty_module_resolver/src/path.rs", "is_standard_library", "bool", "crates/**/*.rs"),
+            signature=bench.parameter("crates/ty_module_resolver/src/path.rs", "is_site_packages", "bool", "crates/**/*.rs"),
         ),
         test=["-p", "ty_module_resolver"],
     ),
@@ -383,19 +383,39 @@ def measure(name, spec, arms, given, log):
         if not changes:
             continue
         samples = {a.name: [] for a in arms}
+        rejected = {}
         for round_ in range(given.runs):
             for arm in turns(arms, round_):
-                if not live(arm):
+                if not live(arm) or arm.name in rejected:
                     continue
-                bench.write_edit(runners[arm.name].ws, changes, False)
-                made = timed_build(arm)
+                r = runners[arm.name]
+                bench.write_edit(r.ws, changes, False)
+                took, ran = r.run("build", *build)
+                if ran.returncode != 0:
+                    rejected[arm.name] = (ran.stderr or ran.stdout)[-1500:]
+                    print(f"    {arm.name}: {kind} edit rejected\n" + "".join(f"      {l}\n" for l in rejected[arm.name].strip().splitlines()[-8:]), flush=True)
+                    made = None
+                else:
+                    made = round(took, 3), r.built(ran)
+                    if made[1].startswith("cargo:") or made[1] == "unknown":
+                        r.ready()
                 if made and round_ == 0:
                     output_is_right(arm, kind) if arm.kind != "cargo" else None
-                bench.write_edit(runners[arm.name].ws, changes, True)
-                back = timed_build(arm) if made else None
+                bench.write_edit(r.ws, changes, True)
+                back = timed_build(arm)
                 if made and back:
                     samples[arm.name].append((made[0], made[1], back[0]))
         phase(kind, samples)
+        for arm in arms:
+            if arm.kind == "cargo" or not live(arm):
+                continue
+            if (cargo_arm.name in rejected) != (arm.name in rejected):
+                said = "builds" if arm.name not in rejected else "rejects"
+                row(arm)["wrong"].append(f"{kind}: {said} the edit cargo {'rejects' if said == 'builds' else 'builds'}"[:400])
+            if arm.name in rejected:
+                row(arm)["phases"][kind] = dict(rejected=rejected[arm.name][-400:])
+        if cargo_arm.name in rejected:
+            row(cargo_arm)["phases"][kind] = dict(rejected=rejected[cargo_arm.name][-400:])
 
     if given.tests and spec.get("test") is not None:
         args = spec["test"]
@@ -457,7 +477,7 @@ def report(out):
              + ", ".join(f"{a['name']} ({a['kind']}) `{a['commit'][:10]}`" for a in info["arms"]) + ".", "",
              "Seconds, median. cold = first build + the wait until the daemon is ready. tests = the second `test` run. "
              f"gap = {ours} / fastest other arm: above 1.00x someone beats us. A cell with `!` was built by cargo "
-             "(the daemon declined); `x` failed.", "",
+             "(the daemon declined); `x` failed; `rejected`: the edit did not build.", "",
              "| project | phase | " + " | ".join(names) + " | gap |", "|---|---|" + "---:|" * (len(names) + 1)]
     for r in rows:
         for label in PHASES:
@@ -467,6 +487,9 @@ def report(out):
                 p = arm.get("phases", {}).get(label)
                 if p is None:
                     cells.append("x" if arm.get("failed") else "")
+                    continue
+                if "rejected" in p:
+                    cells.append("rejected")
                     continue
                 times[n] = p["wall_s"]
                 built = p.get("built")

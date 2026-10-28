@@ -41,6 +41,12 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- Build scripts run on a stock Ubuntu 23.10 or later, where AppArmor keeps a user from making a
+  user namespace: every crate with a build script failed with `the sandbox could not be made:
+  /proc/self/setgroups: Permission denied`. Where no user namespace can be made, the sandbox is
+  confined with Landlock and the seccomp supervisor instead: writes only to `OUT_DIR` and a
+  `TMPDIR` of its own, no network, signals only to its own processes, reads recorded as before
+  (docs/cargo.md says what it does not hide). Sandboxed tests still need user namespaces.
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
 - Native proc macros receive real source positions, text and file paths through the bidirectional server protocol; a server that cannot enable source spans is refused (#823).
 - Invalid built-in derives now fail `blaze check` and `blaze build`, including `Default` on an enum without a default variant and derives on unsupported item shapes (#751).

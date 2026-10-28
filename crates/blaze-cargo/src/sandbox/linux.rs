@@ -27,6 +27,19 @@
 //! only about the calls that can write (an `open` only when its flags ask to write), the
 //! network's and the test marker's, so that a program pays for nothing it reads. The program
 //! runs as the user who ran it, with no capability left.
+//!
+//! Where a user may not make a user namespace (Ubuntu 23.10 on keeps them from it through
+//! AppArmor, a container's seccomp profile may), a sandbox without a view or overlays is
+//! confined instead ([`confined`]): the first process makes no namespace and has Landlock
+//! refuse every write but to the writable directories, a `TMPDIR` of its own and the terminal
+//! and null devices, and every TCP `bind` and `connect`; the filter asks the supervisor about
+//! every call of the network and every signal too, and the supervisor refuses each address that
+//! is not a Unix socket of the sandbox's own (the loopback and the abstract sockets are the
+//! machine's here) and each signal to a process outside the sandbox. The first process reaps
+//! every process the program leaves (`PR_SET_CHILD_SUBREAPER`) and kills those still there when
+//! it ends. What a namespace hides and this does not: the machine's temporary directories and
+//! processes are seen, read-only, and SysV IPC and the mode, owner and times of a file are
+//! not refused.
 
 use std::{
     ffi::{CString, OsString},
@@ -38,6 +51,21 @@ use super::{Recorder, Spec, View, tidy};
 
 /// The directories that are the sandbox's own: the kernel's views and the empty ones.
 const OWN: &[&str] = &["/proc", "/sys", "/dev", "/tmp", "/var/tmp", "/run"];
+
+/// The directories a confined sandbox has as its own besides its `TMPDIR`: the kernel's
+/// views, which it sees as the machine has them.
+const CONFINED_OWN: &[&str] = &["/proc", "/sys", "/dev"];
+
+/// What a sandbox's program sees, for the supervisor.
+#[derive(Clone, Copy)]
+enum Around {
+    /// The machine, in namespaces.
+    Namespaces,
+    /// A view, in namespaces ([`Spec::view`]).
+    View,
+    /// The machine, confined ([`confined`]), by the sandbox's first process.
+    Confined(libc::pid_t),
+}
 
 /// The directories the sandbox mounts empty besides `/tmp`, where they are: the machine's
 /// sockets live in `/run` (`/var/run` is a link to it, or one more), and the Nix daemon's,
@@ -67,6 +95,20 @@ enum Does {
     SendTo,
     /// `sendmsg`: the address in the message the second argument points to.
     SendMsg,
+    /// Sends a signal to the process this argument names: asked about only in a confined
+    /// sandbox, which has no PID namespace to keep it to its own.
+    Signal(Target),
+}
+
+/// How a signal's call names the process it goes to.
+#[derive(Clone, Copy)]
+enum Target {
+    /// `kill`'s: a process, `0` the caller's group, `-1` every process, below it a group.
+    Kill,
+    /// A process or thread in the first argument (`tkill`, `tgkill`, `rt_sigqueueinfo`, ...).
+    Process,
+    /// A pidfd in the first argument (`pidfd_send_signal`).
+    Pidfd,
 }
 
 /// A system call the filter may ask about: its number, which of its arguments are the
@@ -122,6 +164,12 @@ const CALLS: &[Call] = &[
     call(44, NO_PATH, Does::SendTo),                // sendto
     call(46, NO_PATH, Does::SendMsg),               // sendmsg
     call(49, NO_PATH, Does::Address),               // bind
+    call(62, NO_PATH, Does::Signal(Target::Kill)),  // kill
+    call(129, NO_PATH, Does::Signal(Target::Process)), // rt_sigqueueinfo
+    call(200, NO_PATH, Does::Signal(Target::Process)), // tkill
+    call(234, NO_PATH, Does::Signal(Target::Process)), // tgkill
+    call(297, NO_PATH, Does::Signal(Target::Process)), // rt_tgsigqueueinfo
+    call(424, NO_PATH, Does::Signal(Target::Pidfd)), // pidfd_send_signal
 ];
 #[cfg(target_arch = "x86_64")]
 const ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
@@ -153,6 +201,12 @@ const CALLS: &[Call] = &[
     call(203, NO_PATH, Does::Connect),              // connect
     call(206, NO_PATH, Does::SendTo),               // sendto
     call(211, NO_PATH, Does::SendMsg),              // sendmsg
+    call(129, NO_PATH, Does::Signal(Target::Kill)), // kill
+    call(130, NO_PATH, Does::Signal(Target::Process)), // tkill
+    call(131, NO_PATH, Does::Signal(Target::Process)), // tgkill
+    call(138, NO_PATH, Does::Signal(Target::Process)), // rt_sigqueueinfo
+    call(240, NO_PATH, Does::Signal(Target::Process)), // rt_tgsigqueueinfo
+    call(424, NO_PATH, Does::Signal(Target::Pidfd)), // pidfd_send_signal
 ];
 #[cfg(target_arch = "aarch64")]
 const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
@@ -234,18 +288,126 @@ fn c(path: &Path) -> CString {
 /// Runs `program` sandboxed as `spec` says, or with `None` makes the sandbox and runs
 /// nothing in it. What it ends with, as [`super::backend`] says.
 pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
+    let unshared = match spec.view {
+        Some(_) => None,
+        None => namespaces().err(),
+    };
+    run_as(spec, program, unshared)
+}
+
+/// [`run`], in namespaces or, with why they can't be made, [`confined`].
+fn run_as(
+    spec: &Spec,
+    program: Option<&[OsString]>,
+    unshared: Option<String>,
+) -> Result<i32, String> {
     if let Some(view) = &spec.view {
         check_view(spec, view)?;
     }
+    if let Some(why) = &unshared
+        && !spec.overlays.is_empty()
+    {
+        return Err(format!(
+            "{why}, and a sandbox with overlays (a sandboxed test's workspace) is made in one"
+        ));
+    }
+    if let Some(why) = &unshared
+        && let Err(no) = landlock::abi()
+    {
+        return Err(format!("{why}; and it can't be confined without one: {no}"));
+    }
+    // The confined program's own temporary directory, where a namespace would have its own
+    // empty `/tmp`.
+    let scratch = match unshared {
+        Some(_) => {
+            let dir = std::env::temp_dir()
+                .join(format!("blaze-sandbox-tmp-{}-{}", std::process::id(), unique()));
+            std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+            Some(dir)
+        }
+        None => None,
+    };
+    let ran = run_in(spec, program, scratch.as_deref());
+    if let Some(dir) = &scratch {
+        _ = std::fs::remove_dir_all(dir);
+    }
+    ran
+}
+
+/// A number no other run of this process has.
+fn unique() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether this user may make a user namespace and map itself in it, which a sandbox in
+/// namespaces needs, tried in a process of its own; why not when it may not.
+fn namespaces() -> Result<(), String> {
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let maps = [
+        (c"/proc/self/setgroups", "deny".to_owned()),
+        (c"/proc/self/uid_map", format!("{uid} {uid} 1")),
+        (c"/proc/self/gid_map", format!("{gid} {gid} 1")),
+    ];
+    // SAFETY: the child only makes system calls and exits.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(os("fork"));
+    }
+    if child == 0 {
+        // What failed, as the step in the high bits (0 `unshare`, then each file) and the
+        // error in the low six.
+        let failed = |step: i32| {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+            unsafe { libc::_exit((step << 6) | (errno & 63).max(1)) }
+        };
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } < 0 {
+            failed(0);
+        }
+        for (step, (file, text)) in (1..).zip(&maps) {
+            let fd = unsafe { libc::open(file.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+            if fd < 0 || unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) } < 0 {
+                failed(step);
+            }
+            unsafe { libc::close(fd) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    while unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(os("waitpid"));
+        }
+    }
+    let code = ended(status);
+    if code == 0 {
+        return Ok(());
+    }
+    let what = match (code >> 6) as usize {
+        0 => "unshare".to_owned(),
+        step => maps[(step - 1).min(2)].0.to_string_lossy().into_owned(),
+    };
+    Err(format!("a user namespace ({what}): {}", std::io::Error::from_raw_os_error(code & 63)))
+}
+
+/// [`run`], confined in `scratch` when it is given ([`confined`]), in namespaces otherwise.
+fn run_in(
+    spec: &Spec,
+    program: Option<&[OsString]>,
+    scratch: Option<&Path>,
+) -> Result<i32, String> {
     // Everything the processes of the sandbox use is made before the first fork.
     let argv: Vec<CString> = program
         .unwrap_or_default()
         .iter()
         .map(|it| CString::new(it.as_bytes()).unwrap_or_default())
         .collect();
+    let tmp = scratch.map(|it| ("TMPDIR".to_owned(), it.display().to_string()));
     let env: Vec<CString> = spec
         .env
         .iter()
+        .filter(|(name, _)| tmp.is_none() || name != "TMPDIR")
+        .chain(tmp.as_ref())
         .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap_or_default())
         .collect();
     let mut sockets = [0; 2];
@@ -262,7 +424,9 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
         return Err(os("socketpair"));
     }
     let recorded = program.is_some() && spec.record.is_some();
-    let filter = program.map(|_| filter_program(recorded, spec.record_reads, sockets[1]));
+    let confining = scratch.is_some();
+    let filter =
+        program.map(|_| filter_program(recorded, spec.record_reads, confining, sockets[1]));
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     // Before the fork, so that no signal ends this process before it passes them on; the
     // sandbox's processes that run no program keep the handlers, and pass nothing on.
@@ -288,7 +452,11 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
             filter: filter.as_deref(),
             viewed: spec.view.is_some(),
         };
-        let code = match sandbox(spec, uid, gid, &made, program.is_none()) {
+        let made_it = match scratch {
+            Some(scratch) => confined(spec, scratch, &made, program.is_none()),
+            None => sandbox(spec, uid, gid, &made, program.is_none()),
+        };
+        let code = match made_it {
             Ok(code) => code,
             Err(error) => {
                 eprintln!("blaze: the sandbox could not be made: {error}");
@@ -301,9 +469,19 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     unsafe { libc::close(sockets[1]) };
     let listener = received(sockets[0]);
     unsafe { libc::close(sockets[0]) };
-    let mut recorder = Recorder::new(spec, OWN);
+    let scratch_dir = scratch.map(tidy);
+    let own: Vec<&str> = match &scratch_dir {
+        Some(dir) => CONFINED_OWN.iter().copied().chain([dir.as_str()]).collect(),
+        None => OWN.to_vec(),
+    };
+    let mut recorder = Recorder::new(spec, &own);
+    let around = match (&spec.view, confining) {
+        (Some(_), _) => Around::View,
+        (None, true) => Around::Confined(first),
+        (None, false) => Around::Namespaces,
+    };
     if let Some(listener) = listener {
-        supervise(listener, first, &mut recorder, spec.view.is_some());
+        supervise(listener, first, &mut recorder, around);
         unsafe { libc::close(listener) };
     }
     let mut status = 0;
@@ -413,6 +591,215 @@ fn sandbox(
         }
     }
     Ok(ended(status))
+}
+
+/// The first process of a sandbox confined where no user namespace can be made: it keeps
+/// itself and what it runs from gaining privileges (`no_new_privs`, which Landlock and an
+/// unprivileged seccomp filter need), reaps every process the program leaves, has Landlock
+/// refuse every write but to the writable directories and `scratch`, and every TCP `bind` and
+/// `connect`, runs the program and waits for it, and kills what it left when it ends.
+fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result<i32, String> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+        return Err(os("no new privileges (prctl)"));
+    }
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
+        return Err(os("reaping what the program leaves (prctl)"));
+    }
+    let mut writable = spec.writable.clone();
+    writable.push(scratch.to_owned());
+    for dir in &spec.writable {
+        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    }
+    landlock::restrict(&writable)?;
+    let cwd = c(&spec.cwd);
+    if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
+        return Err(os(&format!("the working directory {}", cwd.to_string_lossy())));
+    }
+    if probe {
+        return Ok(0);
+    }
+    let program = unsafe { libc::fork() };
+    if program < 0 {
+        return Err(os("fork"));
+    }
+    if program == 0 {
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        let error = exec(made);
+        eprintln!("blaze: could not run {}: {error}", made.argv[0].to_string_lossy());
+        unsafe { libc::_exit(127) };
+    }
+    unsafe { libc::close(made.socket) };
+    let mut code = None;
+    let mut status = 0;
+    while code.is_none() {
+        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if pid == program {
+            code = Some(ended(status));
+        } else if pid < 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            return Err(os("waitpid"));
+        }
+    }
+    // What the program left is killed, as the end of a PID namespace would: each child, and
+    // each process that comes to this one as its parent ends, until none is left.
+    let me = unsafe { libc::getpid() };
+    let children = format!("/proc/{me}/task/{me}/children");
+    loop {
+        let listed = std::fs::read_to_string(&children).unwrap_or_default();
+        for pid in listed.split_whitespace().filter_map(|it| it.parse::<libc::pid_t>().ok()) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        if unsafe { libc::waitpid(-1, &mut status, 0) } < 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            break;
+        }
+    }
+    Ok(code.unwrap_or(1))
+}
+
+/// Landlock, which lets a process without privileges restrict itself and what it runs.
+mod landlock {
+    use std::path::{Path, PathBuf};
+
+    const CREATE_RULESET: libc::c_long = 444;
+    const ADD_RULE: libc::c_long = 445;
+    const RESTRICT_SELF: libc::c_long = 446;
+    const CREATE_RULESET_VERSION: libc::c_uint = 1;
+    const RULE_PATH_BENEATH: libc::c_int = 1;
+
+    const WRITE_FILE: u64 = 1 << 1;
+    const REMOVE_DIR: u64 = 1 << 4;
+    const REMOVE_FILE: u64 = 1 << 5;
+    const MAKE_CHAR: u64 = 1 << 6;
+    const MAKE_DIR: u64 = 1 << 7;
+    const MAKE_REG: u64 = 1 << 8;
+    const MAKE_SOCK: u64 = 1 << 9;
+    const MAKE_FIFO: u64 = 1 << 10;
+    const MAKE_BLOCK: u64 = 1 << 11;
+    const MAKE_SYM: u64 = 1 << 12;
+    /// ABI 2 on.
+    const REFER: u64 = 1 << 13;
+    /// ABI 3 on.
+    const TRUNCATE: u64 = 1 << 14;
+    /// ABI 4 on.
+    const BIND_TCP: u64 = 1 << 0;
+    const CONNECT_TCP: u64 = 1 << 1;
+    /// ABI 6 on.
+    const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+    const SCOPE_SIGNAL: u64 = 1 << 1;
+
+    /// The devices of `/dev` a program writes as it would anywhere, without writing the machine.
+    const DEVICES: &[&str] = &["null", "zero", "full", "tty", "random", "urandom", "pts"];
+
+    #[repr(C)]
+    struct RulesetAttr {
+        handled_access_fs: u64,
+        handled_access_net: u64,
+        scoped: u64,
+    }
+
+    #[repr(C, packed)]
+    struct PathBeneath {
+        allowed_access: u64,
+        parent_fd: i32,
+    }
+
+    /// The version of Landlock this kernel has, or why it has none.
+    pub(super) fn abi() -> Result<i64, String> {
+        let abi = unsafe {
+            libc::syscall(
+                CREATE_RULESET,
+                std::ptr::null::<RulesetAttr>(),
+                0usize,
+                CREATE_RULESET_VERSION,
+            )
+        };
+        if abi >= 1 {
+            return Ok(abi);
+        }
+        let error = std::io::Error::last_os_error();
+        Err(match error.raw_os_error() {
+            Some(libc::ENOSYS) => "this kernel has no Landlock (Linux 5.13 on has it)".to_owned(),
+            Some(libc::EOPNOTSUPP) => "this kernel has Landlock turned off (`lsm=`)".to_owned(),
+            _ => format!("Landlock: {error}"),
+        })
+    }
+
+    /// Restricts this process and what it runs: no write but below `writable` and to
+    /// [`DEVICES`], and, where the kernel has them, no TCP `bind` or `connect`, no abstract Unix
+    /// socket and no signal outside.
+    pub(super) fn restrict(writable: &[PathBuf]) -> Result<(), String> {
+        let abi = abi()?;
+        let mut file = WRITE_FILE;
+        let mut dir = WRITE_FILE
+            | REMOVE_DIR
+            | REMOVE_FILE
+            | MAKE_CHAR
+            | MAKE_DIR
+            | MAKE_REG
+            | MAKE_SOCK
+            | MAKE_FIFO
+            | MAKE_BLOCK
+            | MAKE_SYM;
+        if abi >= 2 {
+            dir |= REFER;
+        }
+        if abi >= 3 {
+            file |= TRUNCATE;
+            dir |= TRUNCATE;
+        }
+        let attr = RulesetAttr {
+            handled_access_fs: dir,
+            handled_access_net: if abi >= 4 { BIND_TCP | CONNECT_TCP } else { 0 },
+            scoped: if abi >= 6 { SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL } else { 0 },
+        };
+        // The structure as long as this version knows it.
+        let size: usize = match abi {
+            1..=3 => 8,
+            4 | 5 => 16,
+            _ => 24,
+        };
+        let ruleset =
+            unsafe { libc::syscall(CREATE_RULESET, &attr as *const RulesetAttr, size, 0) };
+        if ruleset < 0 {
+            return Err(super::os("a Landlock ruleset"));
+        }
+        let ruleset = ruleset as libc::c_int;
+        let add = |path: &Path, required: bool| -> Result<(), String> {
+            let at = super::c(path);
+            let fd = unsafe { libc::open(at.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            if fd < 0 {
+                return match required {
+                    true => Err(super::os(&path.display().to_string())),
+                    false => Ok(()),
+                };
+            }
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let statted = unsafe { libc::fstat(fd, &mut stat) } == 0;
+            let is_dir = statted && stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+            // A device's directory (`/dev/pts`) is given what its devices are.
+            let allowed = if is_dir && required { dir } else { file };
+            let rule = PathBeneath { allowed_access: allowed, parent_fd: fd };
+            let rule = &rule as *const PathBeneath;
+            let added = unsafe { libc::syscall(ADD_RULE, ruleset, RULE_PATH_BENEATH, rule, 0u32) };
+            let error = super::os(&format!("{} written (landlock_add_rule)", path.display()));
+            unsafe { libc::close(fd) };
+            if added < 0 { Err(error) } else { Ok(()) }
+        };
+        for it in writable {
+            add(it, true)?;
+        }
+        for it in DEVICES {
+            add(&Path::new("/dev").join(it), false)?;
+        }
+        if unsafe { libc::syscall(RESTRICT_SELF, ruleset, 0u32) } < 0 {
+            return Err(super::os("restricting the sandbox (landlock_restrict_self)"));
+        }
+        unsafe { libc::close(ruleset) };
+        Ok(())
+    }
 }
 
 /// Puts the machine's file system in place for a sandbox without a view: every mount
@@ -1005,8 +1392,15 @@ fn exec(made: &Made<'_>) -> String {
 /// descriptor reaches the supervisor, after the filter is installed and before anything
 /// listens. (A program that later has a socket of the same number sends on it unasked; the
 /// network namespace has only the loopback, so it reaches no address outside, and a Unix
-/// socket of the machine's by `sendmsg` is the residual docs/cargo.md names.)
-fn filter_program(recorded: bool, reads: bool, socket: libc::c_int) -> Vec<libc::sock_filter> {
+/// socket of the machine's by `sendmsg` is the residual docs/cargo.md names.) A `confined` run
+/// has no network namespace and no PID namespace: it asks about every call of the network, as
+/// a recorded run does, and about every signal.
+fn filter_program(
+    recorded: bool,
+    reads: bool,
+    confined: bool,
+    socket: libc::c_int,
+) -> Vec<libc::sock_filter> {
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
     const JGE_K: u16 = 0x35;
@@ -1047,14 +1441,17 @@ fn filter_program(recorded: bool, reads: bool, socket: libc::c_int) -> Vec<libc:
         allow,
         notify,
     ];
+    let sendmsg =
+        vec![insn(LD_W_ABS, 0, 0, low(0)), insn(JEQ_K, 0, 1, socket as u32), allow, notify];
     for call in CALLS {
         let block = match (recorded, reads, call.does) {
+            (_, _, Does::Signal(_)) if confined => vec![notify],
+            (_, _, Does::Signal(_)) => continue,
             (_, _, Does::Connect) => vec![notify],
+            (false, _, Does::SendMsg) if confined => sendmsg.clone(),
             (false, _, Does::SendTo) => sendto_with_address.clone(),
             (false, _, _) => continue,
-            (true, _, Does::SendMsg) => {
-                vec![insn(LD_W_ABS, 0, 0, low(0)), insn(JEQ_K, 0, 1, socket as u32), allow, notify]
-            }
+            (true, _, Does::SendMsg) => sendmsg.clone(),
             (true, true, _) | (true, false, Does::Change | Does::Address) => vec![notify],
             (true, false, Does::Look | Does::Run) => continue,
             (true, false, Does::Open(flags)) => {
@@ -1079,7 +1476,7 @@ fn filter_program(recorded: bool, reads: bool, socket: libc::c_int) -> Vec<libc:
 fn install(program: &[libc::sock_filter]) -> Result<libc::c_int, String> {
     let prog = libc::sock_fprog { len: program.len() as u16, filter: program.as_ptr().cast_mut() };
     // The process holds every capability of its user namespace until it runs the program, so
-    // it may install a filter without `no_new_privs`.
+    // it may install a filter without `no_new_privs`; a confined one has set it.
     let listener = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
@@ -1155,9 +1552,9 @@ fn received(socket: libc::c_int) -> Option<libc::c_int> {
 }
 
 /// Answers the kernel's notifications through `listener`, noting what each call reached,
-/// until the process `first` has ended, or no process is left that the filter is on. When
-/// `viewed`, the program sees a view, and what is at a path is looked at there.
-fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder, viewed: bool) {
+/// until the process `first` has ended, or no process is left that the filter is on, the
+/// program seeing what `around` says.
+fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder, around: Around) {
     let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, first, 0) } as libc::c_int;
     let mut fds = vec![libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 }];
     if pidfd >= 0 {
@@ -1173,7 +1570,7 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
             break;
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            answer(listener, recorder, viewed);
+            answer(listener, recorder, around);
             continue;
         }
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
@@ -1188,14 +1585,14 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
 }
 
 /// Takes one notification, notes what its call reached and lets the call go on.
-fn answer(listener: libc::c_int, recorder: &mut Recorder, viewed: bool) {
+fn answer(listener: libc::c_int, recorder: &mut Recorder, around: Around) {
     let mut notif = Notif::default();
     // SAFETY: `notif` is a zeroed `struct seccomp_notif`.
     if unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif) } < 0 {
         return;
     }
     let refused = match CALLS.iter().find(|it| it.nr as i32 == notif.nr) {
-        Some(call) => noted(&notif, call, recorder, viewed),
+        Some(call) => noted(&notif, call, recorder, around),
         None => None,
     };
     let resp = match refused {
@@ -1211,9 +1608,14 @@ fn answer(listener: libc::c_int, recorder: &mut Recorder, viewed: bool) {
 
 /// Notes in `recorder` what the call `notif` of `call` reaches, and the error the sandbox
 /// refuses it with, if it does: a connection or a message to a Unix socket outside the
-/// sandbox's own directories, which no namespace hides.
-fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, viewed: bool) -> Option<i32> {
+/// sandbox's own directories, which no namespace hides; confined, any other address too, and a
+/// signal to a process outside the sandbox.
+fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, around: Around) -> Option<i32> {
     let (pid, thread) = (notif.pid, u64::from(notif.pid));
+    if let Does::Signal(target) = call.does {
+        let Around::Confined(first) = around else { return None };
+        return signal_outside(pid, target, notif.args[0], first).then_some(libc::EPERM);
+    }
     let address = |at: usize, len: usize| sockaddr(pid, notif.args[at], len);
     let reached = match call.does {
         Does::Address | Does::Connect => address(1, notif.args[2] as usize),
@@ -1234,8 +1636,19 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, viewed: bool) -> O
     };
     // `bind`'s Unix socket is a file it makes, which the mounts refuse where it may not.
     let to_unix = matches!(call.does, Does::Connect | Does::SendTo | Does::SendMsg);
+    let confined = matches!(around, Around::Confined(_));
     match reached {
-        Some(Address::Ip(address)) => recorder.refused_net(thread, &address),
+        // Confined, the loopback is the machine's, and every address a call reaches is refused
+        // as a network namespace with only its own loopback answers it.
+        Some(Address::Ip { at, local }) if confined && to_unix => {
+            recorder.refused_net(thread, &at);
+            return Some(if local { libc::ECONNREFUSED } else { libc::ENETUNREACH });
+        }
+        Some(Address::Ip { at, local: false }) => recorder.refused_net(thread, &at),
+        Some(Address::Abstract(name)) if confined => {
+            recorder.refused_net(thread, &format!("unix:@{}", String::from_utf8_lossy(&name)));
+            return Some(if to_unix { libc::ECONNREFUSED } else { libc::EACCES });
+        }
         Some(Address::Unix(path)) if to_unix => {
             let path = whole(pid, None, path).and_then(|it| resolved(pid, &it));
             match path {
@@ -1262,9 +1675,9 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, viewed: bool) -> O
         let dir = dir.map(|it| notif.args[it] as i32);
         let Some(path) = whole(pid, dir, raw) else { continue };
         // In a view what is there is seen through the program's root, not the machine's.
-        let seen = match viewed {
-            true => format!("/proc/{pid}/root{path}"),
-            false => path.clone(),
+        let seen = match around {
+            Around::View => format!("/proc/{pid}/root{path}"),
+            Around::Namespaces | Around::Confined(_) => path.clone(),
         };
         if writes && written && !recorder.may_write(&path) && refused_write(&seen) {
             recorder.refused_write(thread, &path);
@@ -1287,15 +1700,17 @@ fn refused_write(path: &str) -> bool {
 
 /// An address a call names that the sandbox minds.
 enum Address {
-    /// An IPv4 or IPv6 address that is neither the loopback nor unspecified, as
-    /// `address:port`: the network namespace refuses it.
-    Ip(String),
+    /// An IPv4 or IPv6 address as `address:port`, and whether it is the loopback or
+    /// unspecified: a network namespace refuses every other.
+    Ip { at: String, local: bool },
     /// A Unix socket's path, as the program named it.
     Unix(Vec<u8>),
+    /// An abstract Unix socket's name (a nul first, not kept): the network namespace's own,
+    /// the machine's when there is none.
+    Abstract(Vec<u8>),
 }
 
-/// The address of `len` bytes at `at` in `pid`, when it is one the sandbox minds. An abstract
-/// Unix socket's (a name with a nul first) is not: it is the network namespace's own.
+/// The address of `len` bytes at `at` in `pid`, when it is one the sandbox minds.
 fn sockaddr(pid: u32, at: u64, len: usize) -> Option<Address> {
     if at == 0 || len < 2 {
         return None;
@@ -1306,23 +1721,79 @@ fn sockaddr(pid: u32, at: u64, len: usize) -> Option<Address> {
     match family {
         libc::AF_INET if bytes.len() >= 8 => {
             let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
-            (!ip.is_loopback() && !ip.is_unspecified())
-                .then(|| Address::Ip(format!("{ip}:{}", port())))
+            let local = ip.is_loopback() || ip.is_unspecified();
+            Some(Address::Ip { at: format!("{ip}:{}", port()), local })
         }
         libc::AF_INET6 if bytes.len() >= 24 => {
             let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).ok()?);
             let local = ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.to_ipv4_mapped().is_some_and(|it| it.is_loopback() || it.is_unspecified());
-            (!local).then(|| Address::Ip(format!("[{ip}]:{}", port())))
+            Some(Address::Ip { at: format!("[{ip}]:{}", port()), local })
         }
-        libc::AF_UNIX => {
-            let path = bytes.get(2..)?;
-            let path = &path[..path.iter().position(|&it| it == 0).unwrap_or(path.len())];
-            (!path.is_empty()).then(|| Address::Unix(path.to_vec()))
-        }
+        libc::AF_UNIX => match bytes.get(2..)? {
+            [0, name @ ..] => Some(Address::Abstract(name.to_vec())),
+            path => {
+                let path = &path[..path.iter().position(|&it| it == 0).unwrap_or(path.len())];
+                (!path.is_empty()).then(|| Address::Unix(path.to_vec()))
+            }
+        },
         _ => None,
     }
+}
+
+/// Whether the signal a call of `caller` sends, to the process `target` reads its first
+/// argument `arg` as naming, goes outside the confined sandbox whose first process is `first`:
+/// to every process, or to one (or the group of one) that is not `first` or below it. A
+/// process the sandbox can't follow counts as outside.
+fn signal_outside(caller: u32, target: Target, arg: u64, first: libc::pid_t) -> bool {
+    let to = match target {
+        // The caller's own group is the sandbox's: its first process is a session of its own.
+        Target::Kill => match arg as i32 {
+            0 => return false,
+            -1 => return true,
+            group if group < 0 => -group,
+            it => it,
+        },
+        Target::Process => arg as i32,
+        Target::Pidfd => {
+            let info = std::fs::read_to_string(format!("/proc/{caller}/fdinfo/{}", arg as i32));
+            let pid = info.ok().and_then(|it| {
+                it.lines().find_map(|it| it.strip_prefix("Pid:")?.trim().parse::<i32>().ok())
+            });
+            match pid {
+                Some(pid) => pid,
+                None => return true,
+            }
+        }
+    };
+    // What the kernel turns down itself.
+    if to <= 0 {
+        return false;
+    }
+    !below(to, first)
+}
+
+/// Whether the process (or thread) `pid` is `first` or one of its descendants, by the parents
+/// `/proc` has. The first process reaps the orphans, so a program's daemon stays below it.
+fn below(pid: libc::pid_t, first: libc::pid_t) -> bool {
+    let mut at = pid;
+    for _ in 0..4096 {
+        if at == first {
+            return true;
+        }
+        if at <= 1 {
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{at}/stat")) else { return false };
+        // `pid (comm) state ppid ...`, the name being anything up to the last `)`.
+        let parent = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1));
+        match parent.and_then(|it| it.parse().ok()) {
+            Some(parent) => at = parent,
+            None => return false,
+        }
+    }
+    false
 }
 
 /// `path`, whole, as the process `pid` of the sandbox sees it, with every link on the way
@@ -1446,12 +1917,93 @@ mod tests {
     #[test]
     fn every_run_refuses_terminal_input_and_io_uring() {
         for (recorded, reads) in [(false, false), (true, false), (true, true)] {
-            let program = super::filter_program(recorded, reads, 3);
-            let has = |k: u32| program.iter().any(|it| it.k == k);
-            assert!(has(super::TIOCSTI) && has(super::TIOCLINUX));
-            assert!(has(super::NR_IO_URING_SETUP) && has(super::X32));
-            assert!(program.len() < u16::MAX as usize);
+            for confined in [false, true] {
+                let program = super::filter_program(recorded, reads, confined, 3);
+                let has = |k: u32| program.iter().any(|it| it.k == k);
+                assert!(has(super::TIOCSTI) && has(super::TIOCLINUX));
+                assert!(has(super::NR_IO_URING_SETUP) && has(super::X32));
+                assert!(program.len() < u16::MAX as usize);
+            }
         }
+    }
+
+    /// A sandbox confined as it is where no user namespace can be made (Ubuntu's AppArmor):
+    /// it writes its writable directory, its own `TMPDIR` and `/dev/null` and nothing else,
+    /// reaches no address, not even the machine's loopback, signals only its own processes,
+    /// and what it leaves running is killed as it ends. Skipped where the kernel has no
+    /// Landlock, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing() {
+        if let Err(why) = super::landlock::abi() {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let bash = std::env::split_paths(&path).map(|it| it.join("bash")).find(|it| it.exists());
+        let Some(bash) = bash else {
+            eprintln!("skipped: no bash on PATH");
+            return;
+        };
+        let dir = scratch("confined");
+        let (out, outside) = (dir.join("out"), dir.join("outside"));
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shown = |it: &Path| it.display().to_string();
+        let env = [
+            ("PATH", std::env::var("PATH").unwrap_or_default()),
+            ("OUT", shown(&out)),
+            ("OUTSIDE", shown(&outside)),
+            ("PORT", port.to_string()),
+            ("OUTER", std::process::id().to_string()),
+            ("TMPDIR", "/tmp".to_owned()),
+        ];
+        let script = format!(
+            "{FAIL}{}",
+            r#"
+echo hi > "$OUT/written" || fail "it wrote nothing in OUT"
+mkdir "$OUT/d" && mv "$OUT/written" "$OUT/d/moved" || fail "it moved nothing in OUT"
+if (echo x > "$OUTSIDE/x") 2>/dev/null; then fail "it wrote outside"; fi
+if (mkdir "$OUTSIDE/d") 2>/dev/null; then fail "it made a directory outside"; fi
+echo x > /dev/null || fail "it wrote no /dev/null"
+[ "$TMPDIR" != /tmp ] && echo x > "$TMPDIR/x" || fail "it has no TMPDIR of its own"
+echo "$TMPDIR" > "$OUT/tmpdir"
+if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then fail "it reached the loopback"; fi
+if kill -0 "$OUTER" 2>/dev/null; then fail "it signalled a process outside"; fi
+sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
+( sleep 60 & echo "$!" > "$OUT/left" )
+"#
+        );
+        let env = env.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect();
+        let record = dir.join("record");
+        let spec = Spec {
+            cwd: out.clone(),
+            env,
+            writable: vec![out.clone()],
+            record: Some(record.clone()),
+            record_reads: true,
+            ..Spec::default()
+        };
+        let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
+        let forced = Some("a user namespace: not made in this test".to_owned());
+        assert_eq!(super::run_as(&spec, Some(&program), forced), Ok(0));
+        let read = |it: &str| std::fs::read_to_string(out.join(it)).unwrap();
+        assert_eq!(read("d/moved"), "hi\n");
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(!Path::new(read("tmpdir").trim()).exists(), "its TMPDIR is left");
+        let left = read("left");
+        assert!(!Path::new(&format!("/proc/{}", left.trim())).exists(), "process {left} is left");
+        assert!(listener.accept().is_err(), "the loopback was reached");
+        let lines = read_record(&record).expect("a record");
+        let has =
+            |reached, what: &str| lines.iter().any(|it| it.reached == reached && it.what == what);
+        assert!(has(Reached::Write, &format!("{}/x", shown(&outside))), "{lines:?}");
+        assert!(has(Reached::Net, &format!("127.0.0.1:{port}")), "{lines:?}");
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A bash of the Nix store and the store paths it runs with: its own and those its

@@ -1,5 +1,5 @@
 //! library/coretests slice.rs, `test_slice_from_raw_parts_in_const`: an empty slice made in a
-//! constant at an address that is a number keeps the number. ra-jit put the alignment of the
+//! constant at an address that is a number keeps the number. blaze put the alignment of the
 //! element there, as for an empty slice of an allocation of the evaluator's.
 
 const EMPTY: &[i32] = unsafe { std::slice::from_raw_parts(std::ptr::without_provenance(123456), 0) };

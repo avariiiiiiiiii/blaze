@@ -3,14 +3,14 @@
 # rust-lang/rust at commit 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0, unchanged. It takes the
 # place of the crates.io `ra-ap-rustc_abi`, whose snapshots are of no stable release.
 [package]
-name = "ra-ap-rustc_abi"
-version = "0.166.0"
+name = "rustc_abi"
+version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [lib]
-name = "ra_ap_rustc_abi"
+name = "rustc_abi"
 
 [features]
 # Both need the compiler's own crates.

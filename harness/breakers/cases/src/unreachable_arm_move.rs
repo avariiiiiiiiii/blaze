@@ -2,7 +2,7 @@
 //! with an arm that would move elements out and that no value reaches, because an arm
 //! before it takes every value it matches (rustc warns of an unreachable pattern). rustc
 //! makes one tree of tests of all the arms, and when no edge of it leads to such an arm it
-//! knows the array is whole where it is dropped, and drops it front to back. ra-jit tried
+//! knows the array is whole where it is dropped, and drops it front to back. blaze tried
 //! the arms one after the other, saw a way through the move, and dropped the array as one
 //! that has lost elements: from the back. Which arms the tree leads to is not which arms a
 //! value can reach: the cases named `still_*` have an arm that nothing reaches and that
@@ -105,7 +105,7 @@ fn still_behind_a_range(log: &Log, last: char) -> u8 {
 /// Finding 21 (`fuzz/found/differs-checksum-L12-18-c0.rs`): an arm that is only an
 /// or-pattern is expanded into its alternatives before the test of the arm in front of it is
 /// made, and the alternatives are sorted by that test like any other arm. So the range test
-/// of the first arm sends the third arm with it, and the third is never reached. ra-jit
+/// of the first arm sends the third arm with it, and the third is never reached. blaze
 /// expanded the or-pattern only when its arm came first, and the third arm was tested on
 /// its own after the second.
 fn covered_past_an_alternative(log: &Log, first: char) -> u8 {

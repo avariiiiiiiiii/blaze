@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """rustcsites.py: the places in crates/ that start rustc, rustdoc or cargo, or read which one
-to start, counted per file against norustc/sites.json. One more in a file fails: ra-jit is to
+to start, counted per file against norustc/sites.json. One more in a file fails: blaze is to
 run no rustc (docs/no-rustc.md), so no new place may start one, and a place that goes lowers
 the count.
 

@@ -3,7 +3,7 @@
 Fetched 2026-10-20 from `https://raw.githubusercontent.com/rust-lang/rust/<rev>/<path>`.
 
 - `1.99.0/`: rev `b940084d7eb6a299eb4bfeb8e34901bc051e7ac4`, the 1.99.0 release, which is the toolchain
-  ra-jit pins (`rust-toolchain.toml`). Paths under `compiler/rustc_mir_transform/src/`, except
+  blaze pins (`rust-toolchain.toml`). Paths under `compiler/rustc_mir_transform/src/`, except
   `session-excerpt.rs`: three functions cut from `compiler/rustc_session/src/session.rs`
   (`emit_lifetime_markers`, `mir_opt_level`, `ub_checks`).
 - `master/`: `main` on the same day (19833af722), `lib.rs` and `tail_copy_to_move.rs` only.
@@ -22,9 +22,9 @@ Fetched 2026-10-20 from `https://raw.githubusercontent.com/rust-lang/rust/<rev>/
   blocks reached from the start through gotos, calls, drops and asserts.
 
 What `1.99.0/` holds: `lib.rs` (the pipeline, `run_optimization_passes`), `pass_manager.rs`
-(how a pass is turned on, validated and dumped) and the source of every pass ra-jit ports
+(how a pass is turned on, validated and dumped) and the source of every pass blaze ports
 (`vendor/rust-analyzer/crates/hir-ty/src/mir/optimize/`), plus `ssa.rs`, which copy propagation
-is built on, and `prettify.rs` (block and local reordering, which ra-jit doesn't port).
+is built on, and `prettify.rs` (block and local reordering, which blaze doesn't port).
 
 ## The pipeline at 1.99.0 (read, `lib.rs` `run_optimization_passes`)
 
@@ -32,7 +32,7 @@ The level comes from `-Zmir-opt-level`, by default 1 at `-Copt-level=0` and 2 ab
 (`session-excerpt.rs`). Each pass says when it runs in `fn policy`; the pipeline lifts a few to
 level 1 or more with `o1(..)`. "Always" means at every level, 0 included. In order:
 
-| Pass | Runs | ra-jit |
+| Pass | Runs | blaze |
 | --- | --- | --- |
 | CheckAlignment, CheckNull, CheckEnums | when UB checks are on (`debug_assertions` by default) | not ported |
 | LowerSliceLenCalls | 1 and up | ported |
@@ -63,7 +63,7 @@ level 1 or more with `o1(..)`. "Always" means at every level, 0 included. In ord
 | EarlyOtherwiseBranch | 2 and up | not ported |
 | SimplifyComparisonIntegral | 2 and up | not ported |
 | SimplifyConstCondition (Final) | 1 and up | ported |
-| RemoveNoopLandingPads | 1 and up, when panics unwind | ported (ra-jit had it) |
+| RemoveNoopLandingPads | 1 and up, when panics unwind | ported (blaze had it) |
 | SimplifyCfg (Final) | 1 and up | ported |
 | StripDebugInfo | with `-Zmir-strip-debuginfo` | not needed |
 | CopyProp | 1 and up | ported |

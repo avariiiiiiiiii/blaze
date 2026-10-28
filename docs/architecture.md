@@ -1,7 +1,7 @@
-# How ra-jit works
+# How blaze works
 
 This is a map of the code for someone who wants to read or change it. Paths are those of the
-published tree: `crates/ra-jit` is the daemon, `crates/hir-ty-codegen` is the code generator
+published tree: `crates/blaze-engine` is the daemon, `crates/hir-ty-codegen` is the code generator
 (a crate over `hir-ty`'s MIR, see [contributing.md](contributing.md)), and the front end is
 the crates derived from rust-analyzer (`hir-def`, `hir-ty`, `syntax`, `parser` and the rest), with
 the borrow checker as its crate `hir-ty-borrowck` ([borrowck.md](borrowck.md)).
@@ -19,40 +19,40 @@ recomputes only what an edit invalidates. It already lowers function bodies to M
 monomorphises them, computes type layouts and evaluates constants, because the IDE needs
 those for const evaluation and hover.
 
-ra-jit adds the missing last step, from rust-analyzer's MIR to machine code, and keeps the
+blaze adds the missing last step, from rust-analyzer's MIR to machine code, and keeps the
 process running as a build daemon. An edit then costs what the database has to redo plus
 the code of the functions that actually changed.
 
 ## The rule
 
-**rustc is the reference.** A program built with ra-jit's code must behave as the one rustc
-built. Where they differ, ra-jit is wrong.
+**rustc is the reference.** A program built with blaze's code must behave as the one rustc
+built. Where they differ, blaze is wrong.
 
 **Never guess; refuse visibly.** The code generator returns "unsupported" with a reason for
-anything it has no explicit lowering for. Under `cargo ra-jit` a refused function fails the
-build, which names it (`cargo/whole.rs`); plain cargo after `ra-jit enable` still has rustc
-build what ra-jit does not ([no-rustc.md](no-rustc.md#today)). A refusal is printed, counted
-and listed (`--report`, `cargo ra-jit status`); it is treated as a bug to fix, not as a
+anything it has no explicit lowering for. Under `blaze` a refused function fails the
+build, which names it (`cargo/whole.rs`); plain cargo after `blaze enable` still has rustc
+build what blaze does not ([no-rustc.md](no-rustc.md#today)). A refusal is printed, counted
+and listed (`--report`, `blaze status`); it is treated as a bug to fix, not as a
 normal path. What must not happen is a best-effort lowering of input the generator does not
 understand, because that is wrong code nobody sees.
 
-Leaning on rustc under plain cargo is how ra-jit works today, not how it is meant to:
-ra-jit is to compile everything itself and never run rustc, and each place it still does is a
+Leaning on rustc under plain cargo is how blaze works today, not how it is meant to:
+blaze is to compile everything itself and never run rustc, and each place it still does is a
 bug to remove ([no-rustc.md](no-rustc.md)).
 
 The same rule shapes the smaller pieces. `type_id.rs` computes `TypeId` hashes the way the
 pinned rustc does and returns `None` for a type whose hash needs something it does not
 reproduce. The splice returns an error for anything it has no answer for and the caller
-links in full. `cargo ra-jit` fails a build that needs what it does not model, with the
+links in full. `blaze` fails a build that needs what it does not model, with the
 reason (`refused` in `cargo/whole.rs`), and hands nothing to cargo.
 
 ## Processes
 
-    cargo ra-jit build ──► ra-jit cargo (client) ──► ra-jit daemon ──► worker: ra-jit <project> --socket
+    blaze build ──► blaze-engine cargo (client) ──► blaze-engine daemon ──► worker: blaze <project> --socket
                                                         │                │
                                                         └── more workers └── one database
 
-The **client** (`crates/ra-jit/src/cargo/`, entry in `mod.rs`) is what `cargo ra-jit` runs.
+The **client** (`crates/blaze-engine/src/cargo/`, entry in `mod.rs`) is what `blaze` runs.
 It parses the command line (`cli.rs`), decides whether the daemon can serve it (`state.rs`),
 and asks the daemon; `build`, `run` and `test` are whole builds (`whole.rs`) and run no cargo.
 
@@ -60,7 +60,7 @@ The **daemon** (`cargo/daemon.rs`) is one process per user on a Unix socket
 (`socket.rs`). It loads nothing. It starts workers, passes requests to them, and stops them
 and itself when idle. Requests and answers are one JSON object per line.
 
-A **worker** is `ra-jit <project> --socket <path>`, the long-running mode of `main.rs`. It
+A **worker** is `blaze <project> --socket <path>`, the long-running mode of `main.rs`. It
 holds one rust-analyzer database. A worker is keyed by repository, toolchain, target,
 feature set and whether libraries are built with `cfg(test)`, because those are inputs of
 loading. Checkouts of one repository join the same worker; another repository gets its own,
@@ -68,8 +68,8 @@ so a crash or reload of one does not cost the other its state. A worker exits wh
 daemon's end of its standard input closes.
 
 The same worker binary is what the harnesses drive directly, without cargo's wrapper:
-`ra-jit <project> --crate <name> --out <object> --symbols <rlib>... --link-cmd <cmd>
---socket <path>`, then `ra-jit sync <socket>` to ask for a build. There is no `--help`; the
+`blaze <project> --crate <name> --out <object> --symbols <rlib>... --link-cmd <cmd>
+--socket <path>`, then `blaze sync <socket>` to ask for a build. There is no `--help`; the
 flags are parsed in `main.rs`.
 
 ## The database and what worktrees share
@@ -77,7 +77,7 @@ flags are parsed in `main.rs`.
 A worker loads a cargo workspace through rust-analyzer's `load-cargo` and
 `project-model`, including build script output and proc-macro expansion through
 rust-analyzer's proc-macro server. Source changes arrive either from a file watcher or,
-under `cargo ra-jit`, are looked for when a build is requested (`tree.rs` finds added and
+under `blaze`, are looked for when a build is requested (`tree.rs` finds added and
 removed files by directory timestamps).
 
 A second checkout of the same repository is added to the same database (`--also`, or a
@@ -112,7 +112,7 @@ other: [reports/INCREMENTAL.md](reports/INCREMENTAL.md).
 The code generator is `crates/hir-ty-codegen`. `codegen.rs` lowers one monomorphised MIR
 body to Cranelift IR. Every local lives in memory. Layout comes from rustc's own
 `rustc_abi` crate, and calls follow rustc's unstable Rust ABI for the pinned toolchain, so
-that ra-jit's functions and rustc's can call each other. Vtables (`vtable.rs`), `TypeId`s
+that blaze's functions and rustc's can call each other. Vtables (`vtable.rs`), `TypeId`s
 (`type_id.rs`) and unwind tables (`unwind.rs`, with `unwind/seh.rs` for Windows) have to
 agree with rustc's for the same reason: objects, trait objects and panics cross between the
 two compilers' code in both directions.
@@ -154,20 +154,20 @@ Cranelift backend does (`asm.rs`).
 
 The target is an input of the process (`target.rs`): `--target <triple>`, else the host.
 Everything platform-dependent asks the `Target` for architecture, object format, calling
-convention and unwind format, and never asks what ra-jit itself was built for. The parser
+convention and unwind format, and never asks what blaze itself was built for. The parser
 accepts x86-64, AArch64 and wasm32 with ELF, Mach-O, COFF or wasm objects. What has been
 run on each is in [support.md](support.md), and how each port works is in
 [platforms.md](platforms.md).
 
 ## Linking and splicing
 
-ra-jit does not produce a program from nothing. rustc and cargo build it once, and ra-jit
+blaze does not produce a program from nothing. rustc and cargo build it once, and blaze
 replaces the code of the crates it was asked to compile.
 
-**Full link.** ra-jit writes one object with its functions and runs rustc's own link line
+**Full link.** blaze writes one object with its functions and runs rustc's own link line
 with that object placed ahead of rustc's rlibs for the same crates. Both define the same
-symbols and ra-jit's must win. An ELF linker and `link.exe` can be told to keep the first
-definition. Apple's linker cannot, so there `ra-jit weaken` makes copies of rustc's objects
+symbols and blaze's must win. An ELF linker and `link.exe` can be told to keep the first
+definition. Apple's linker cannot, so there `blaze-engine weaken` makes copies of rustc's objects
 whose definitions are weak (`weaken.rs`). `symbols.rs` maps Rust paths to the mangled names
 rustc used, read from rustc's rlibs and objects.
 
@@ -176,7 +176,7 @@ object holding the changed functions is linked ahead of it (`patch.rs`). Anythin
 cannot express starts a full object again.
 
 **Splice.** Linking still rewrites the whole executable. The splice
-(`crates/ra-jit/src/splice.rs`) leaves the executable of the last full link as it is and
+(`crates/blaze-engine/src/splice.rs`) leaves the executable of the last full link as it is and
 appends the patch: it lays the patch out behind everything the linker loaded, resolves its
 references against the executable's symbols, and writes a jump to the new code over the
 entry of each replaced function. Calls, vtables and function pointers still arrive at the
@@ -222,7 +222,7 @@ Each place, and how it is covered:
 | What | Fixed width | Covered by |
 |---|---|---|
 | Where the patch goes (ELF) | Every distance from the patch to the program is 4 bytes on x86-64 and AArch64 (calls, the unwind search table's entries, `adrp`) | The patch goes behind the loaded segments, as far into memory as into the file. When the file is longer than four bytes of distance reach (a debug build of bevy is 2 GB past its 200 MB of code), it goes right behind what is loaded instead (#79). |
-| The jump over a replaced function | x86-64 `jmp rel32`, 5 bytes. AArch64 `b`, 4 bytes, reaching 128 MB; beyond that `adrp`, `add`, `br`, 12 bytes | ra-jit makes no function shorter than the longest jump it may need: 5 bytes on x86-64, 12 on AArch64 (`Arch::shortest_function`). Mach-O measures a function to the next symbol, PE by its `.pdata`. A function of rustc's executable (the first edits) is as rustc made it. One shorter than the long jump is linked in full once, by ra-jit, and every edit after is spliced into that link. |
+| The jump over a replaced function | x86-64 `jmp rel32`, 5 bytes. AArch64 `b`, 4 bytes, reaching 128 MB; beyond that `adrp`, `add`, `br`, 12 bytes | blaze makes no function shorter than the longest jump it may need: 5 bytes on x86-64, 12 on AArch64 (`Arch::shortest_function`). Mach-O measures a function to the next symbol, PE by its `.pdata`. A function of rustc's executable (the first edits) is as rustc made it. One shorter than the long jump is linked in full once, by blaze, and every edit after is spliced into that link. |
 | Calls out of the patch | AArch64 `bl`, 128 MB | A stub for each call out of reach. |
 | The unwinder's search table (ELF) | Entries of 4 bytes from the table | The table is in the patch, within the reach of the placement above. |
 | `__unwind_info` (Mach-O) | 24-bit offsets into `__eh_frame` | Three layouts: the patch's frames behind the program's, in front of them, or both tables in the room the header leaves. The last has no limit but that room, which each full link checks. It links again with room for both tables and a quarter more when the room is short, or the program has so many frames that none can go in front of them. |
@@ -231,7 +231,7 @@ Each place, and how it is covered:
 
 ## The disk store
 
-`crates/ra-jit-store` is a content-addressed key-value store of compiled functions,
+`crates/blaze-store` is a content-addressed key-value store of compiled functions,
 independent of Rust: a key is a hash of what the value was made from. There is one per user
 and machine, shared by every daemon and checkout, unless `BLAZE_CACHE` names another
 directory or `off`. `stable.rs` gives function instances names that are the same in every run on
@@ -246,7 +246,7 @@ locking, integrity checks and size limits are in [cache.md](cache.md).
 
 ## The remote store
 
-`crates/ra-jit/src/remote.rs` and `remote/` keep a local store in step with a directory or
+`crates/blaze-engine/src/remote.rs` and `remote/` keep a local store in step with a directory or
 an S3 bucket. Because packs are immutable and named by their hash, a remote is a set of
 pack files, a key list per pack, and a manifest per project. `transfer.rs` moves one object
 so that the local file is either complete or absent; `s3.rs` is the bucket through the AWS
@@ -257,14 +257,14 @@ does the same for what cargo built of registry dependencies.
 ## The cargo drop-in and the unit graph
 
 Since 2026-10-27 ([#408](https://github.com/indexable-inc/blaze/pull/408),
-[#571](https://github.com/indexable-inc/blaze/pull/571)), `cargo ra-jit build`, `run` and `test`
+[#571](https://github.com/indexable-inc/blaze/pull/571)), `blaze build`, `run` and `test`
 are whole builds: every crate is compiled from source over the shipped standard library and
-linked by ra-jit, with no cargo build and no rustc (`cargo/whole.rs`). This section and the next
-describe the model `cargo ra-jit` had before, a first build by cargo and rustc that the daemon
-took over from. The wrapper part of it remains for plain cargo after `ra-jit enable`, until step
+linked by blaze, with no cargo build and no rustc (`cargo/whole.rs`). This section and the next
+describe the model `blaze` had before, a first build by cargo and rustc that the daemon
+took over from. The wrapper part of it remains for plain cargo after `blaze enable`, until step
 M of [no-rustc.md](no-rustc.md#the-plan) removes it.
 
-`cargo ra-jit` needs three things from cargo for every program: the rlibs and objects rustc
+`blaze` needs three things from cargo for every program: the rlibs and objects rustc
 built, the line rustc ran the linker with, and which workspace crates are in the program.
 It gets them by being cargo's `RUSTC_WORKSPACE_WRAPPER` on the first build
 (`cargo/wrapper.rs`). Cargo runs the wrapper in place of rustc for every workspace crate
@@ -276,7 +276,7 @@ build beside it never changes a file under it.
 
 From those records `cargo/plan.rs` works out what the daemon is asked to build a program
 from: its workspace crates, the files to read symbols from, and rustc's link line with the
-daemon's objects ahead of rustc's. `crates/ra-jit/src/plan.rs` computes the units of a build
+daemon's objects ahead of rustc's. `crates/blaze-engine/src/plan.rs` computes the units of a build
 with the features and profile settings of each, which `cargo metadata` does not give per
 build.
 
@@ -293,7 +293,7 @@ file rustc read is newer than that, and discards the worker if one is.
 ### The first edits patch what rustc linked
 
 The daemon is ready once it has loaded the workspace and read the symbols of the executable
-rustc linked; it compiles nothing of its own first ([#11](https://github.com/indexable-inc/ra-jit/issues/11)).
+rustc linked; it compiles nothing of its own first ([#11](https://github.com/indexable-inc/blaze/issues/11)).
 The first edits are patches of that executable (`patch::Base::of_rustc`), spliced into it as
 later edits are spliced into the daemon's own links. To link a body against code it did not
 compile, the resolver also uses rustc's private local symbols (`symbols::Linked`), which it
@@ -343,9 +343,9 @@ executable: what the build computed stays in the database, so the bound is on wh
 worker keeps (`BLAZE_OWN_BASE_MEMORY`, a size such as `40G`, or `off`). The daemon's
 `BLAZE_MEMORY_MAX` does not stand for it: that stops the worker asked longest ago, never the
 one asked last, which is the one building its base. zed's base outgrows it, on
-the debuginfo types of [#55](https://github.com/indexable-inc/ra-jit/issues/55).
+the debuginfo types of [#55](https://github.com/indexable-inc/blaze/issues/55).
 
-An edit is never linked in full for want of a base ([#159](https://github.com/indexable-inc/ra-jit/issues/159)).
+An edit is never linked in full for want of a base ([#159](https://github.com/indexable-inc/blaze/issues/159)).
 Once the own base is given up, or before it is done, an edit that needs a build in full is
 built onto rustc's executable: its names are rustc's where the program has no other
 (`Resolver::onto`), and the object, all of the program, is spliced into that executable as a
@@ -365,7 +365,7 @@ nushell's signature edit with its base given up at 2 GB is spliced whole in 1.5 
 full link of it took 1.3 s; the point is macOS's and the largest programs', which take
 minutes), and the edits after it splice in about 10 ms. Such a build keeps
 nothing in the store: it names rustc's private symbols, which no other link has. rustc's link
-on Linux keeps the compiler-builtins functions ra-jit's code calls (`--undefined`,
+on Linux keeps the compiler-builtins functions blaze's code calls (`--undefined`,
 `hir_ty_codegen::BUILTINS`), which it would otherwise drop as unused. A splice that fails, of
 the whole or of a patch after it (a library function the executable does not import, a
 static of the whole that grows), has the daemon start again from what cargo builds and link, as when the
@@ -376,20 +376,20 @@ there wanted (`headerpad_ahead`), so it is not linked twice.
 `BLAZE_RUSTC_BASE=0` makes the first build the daemon's own, as before. `harness/rustcbase.py` checks every kind of edit against cargo.
 
 An alternative wrapper exists in `stub.rs` (`BLAZE_WRAPS_RUSTC`), where rustc compiles only
-a stub for each workspace crate and all code is ra-jit's. It makes the first build faster,
-but a function ra-jit refuses then has no rustc copy to fall back on, so it is used by
-`harness/alone.py` and not by `cargo ra-jit`.
+a stub for each workspace crate and all code is blaze's. It makes the first build faster,
+but a function blaze refuses then has no rustc copy to fall back on, so it is used by
+`harness/alone.py` and not by `blaze`.
 
 ## Debug info
 
-`debuginfo.rs` writes DWARF 4 for ra-jit's functions: line tables, a subprogram entry per
+`debuginfo.rs` writes DWARF 4 for blaze's functions: line tables, a subprogram entry per
 function, and under Cranelift the parameters and locals. Debug info is written for ELF
 targets. It is not written for Windows, and has not been checked on macOS. See
 [support.md](support.md).
 
-## ra-jit in the browser
+## blaze in the browser
 
-`crates/ra-jit-wasm` is an experiment that builds the compiler itself for wasm and runs it in
+`crates/blaze-wasm` is an experiment that builds the compiler itself for wasm and runs it in
 a web page. It is excluded from the workspace and is not part of the daemon. See
 [reports/WASM.md](reports/WASM.md). The website runs a small
 version of it: [playground.md](playground.md).

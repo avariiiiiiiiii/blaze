@@ -7,7 +7,7 @@ fn main() {
             Err(err) => println!("{pattern} => error: {err}"),
         }
     }
-    let text = r#"{"name": "ra-jit", "tags": ["a", "b\n", 1.5, -3, null, true], "nested": {"k": [1e10, 0.1, 18446744073709551615]}}"#;
+    let text = r#"{"name": "blaze", "tags": ["a", "b\n", 1.5, -3, null, true], "nested": {"k": [1e10, 0.1, 18446744073709551615]}}"#;
     let value: Value = serde_json::from_str(text).unwrap();
     println!("{}", value);
     println!("{}", serde_json::to_string_pretty(&value).unwrap());

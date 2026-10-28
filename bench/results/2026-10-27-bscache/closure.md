@@ -1,8 +1,8 @@
 # Build scripts of the bench corpus in their closure, and their runs on another machine
 
-Every build script ran with `BLAZE_SCRIPT_VIEW=on` (`crates/ra-jit/src/cargo/hermetic`): a
+Every build script ran with `BLAZE_SCRIPT_VIEW=on` (`crates/blaze-engine/src/cargo/hermetic`): a
 root of its own with its package read-only, its `OUT_DIR` writable, the dependencies' `OUT_DIR`s
-it is handed (`DEP_*`), the toolchain and ra-jit's own rustc, and the pinned nixpkgs closure at
+it is handed (`DEP_*`), the toolchain and blaze's own rustc, and the pinned nixpkgs closure at
 `/nix/store` (clang, lld, binutils, glibc, linux headers, pkg-config, bash, coreutils, make,
 sed, awk, grep, diff, find, plus a crate's libraries from `libs.toml` or
 `[workspace.metadata.blaze.system-deps]`). No `/usr`, no `$HOME`, no network. Its environment
@@ -14,9 +14,9 @@ closure path's NarHash, and the dependencies' `OUT_DIR` trees.
 
 Made by `harness/bscache.py closure` and `closure-report`, `--jobs 4`, two ix VMs (arm64, 16 cpus):
 host A `bscache4` (8 GB), host B `bscache` (4 GB). The closure was fetched from
-cache.nixos.org once by `ra-jit closure fetch` (no nix binary: 203 store paths, 2.68 GB, 23.2 s)
+cache.nixos.org once by `blaze-engine closure fetch` (no nix binary: 203 store paths, 2.68 GB, 23.2 s)
 and pushed to a directory remote as project `nix-closure` (0.67 s); each host lays it out from
-that remote (`ra-jit closure materialize`, 4.4 to 5.7 s). The seconds are the whole
+that remote (`blaze-engine closure materialize`, 4.4 to 5.7 s). The seconds are the whole
 `cargo check --compile-time-deps` of the project, most of it compiling scripts and proc macros
 (cargo's rustc compiles here, `BLAZE_ONLY_ASKS`), not the runs.
 
@@ -64,7 +64,7 @@ All 423 runs that succeeded came from the store (the run before the last fixes:
 ## Host B, host A's store pulled from the remote (closure-b/)
 
 Host A's store was pushed to the directory remote as project `runs3`
-(`ra-jit cache push`, 0.54 s); host B pulled it into an empty store (`ra-jit cache pull`,
+(`blaze-engine cache push`, 0.54 s); host B pulled it into an empty store (`blaze-engine cache pull`,
 7.5 s), laid out the closure from the remote into a home of its own, and ran the projects with
 the same checkout path as host A, as CI runners have.
 

@@ -10,7 +10,7 @@ Then, in a project of yours:
 blaze run
 ```
 
-Change a function and run `blaze run` again: the `Finished` line now says `[ra-jit]`
+Change a function and run `blaze run` again: the `Finished` line now says `[blaze]`
 (blaze's engine), which means blaze built it instead of cargo. What to do next:
 [usage.md](usage.md).
 
@@ -51,30 +51,29 @@ with rustc's error and a note saying which toolchain built it.
 
 The installer downloads the build for your machine from the
 [releases](https://github.com/indexable-inc/blaze/releases), checks it against the checksums
-published with it, puts `blaze`, `cargo-blaze` and the programs they run in `~/.cargo/bin`, and
+published with it, puts `blaze` and the programs it runs in `~/.cargo/bin`, and
 has blaze download its Rust. It asks nothing. On Linux the build has `blaze-proc-macro-srv` too,
 blaze's own proc-macro server, which a build from crates.io (below) does not have. Run it again
 to upgrade. Releases are dated, `0.YYYYMMDD.N`, and the release train publishes one when main is
 green and has changed since the last. To install a given release, end the line with
 `| sh -s -- --version 0.YYYYMMDD.N`;
 `--no-toolchain` leaves the download to the first build, and `--help` says what else it takes.
-`cargo blaze <command>` is the same as `blaze <command>`. Until the first dated release, it
+Over a blaze from before 2026-10-28 it removes the programs with their old names and says so.
+Until the first dated release, it
 installs the `nightly` prerelease, a build of 2026-10-20 that nothing updates any more.
 
 ## From crates.io
 
 ```sh
-cargo +nightly-2026-10-25 install --locked cargo-blaze
+cargo +nightly-2026-10-25 install --locked blaze-engine
 ```
 
 This compiles blaze from source with the nightly it is pinned to, which takes a few minutes (blaze
 is built and tested with that nightly only; `rustup toolchain install nightly-2026-10-25` gets
-it), and puts six
-programs in `~/.cargo/bin`: `blaze`, `cargo-blaze` (what `cargo blaze` runs), `ra-jit` (blaze's
-engine), `ra-jit-rustc`, `ra-jit-rustc-first` and `cargo-ra-jit` (the old name). They find each other by being in the same
-directory, so keep them together. If you installed `ra-jit` with cargo before, run
-`cargo uninstall ra-jit` first: cargo does not replace programs another package installed.
-`cargo binstall cargo-blaze` installs a release's build instead of compiling it.
+it), and puts three
+programs in `~/.cargo/bin`: `blaze`, `blaze-engine` (blaze's engine) and `blaze-rustc`. They find each other by being in the same directory, so
+keep them together.
+`cargo binstall blaze-engine` installs a release's build instead of compiling it.
 
 ## With Nix
 
@@ -83,7 +82,7 @@ nix profile install github:indexable-inc/blaze
 ```
 
 Or try it without installing anything: in a project, `nix run github:indexable-inc/blaze -- build`
-is `cargo blaze build`. In a flake, take the package from the input:
+is `blaze build`. In a flake, take the package from the input:
 
 ```nix
 {
@@ -94,11 +93,11 @@ is `cargo blaze build`. In a flake, take the package from the input:
 
 Nix compiles blaze from source; there is no binary cache yet.
 
-## The old name
+## The old names
 
-blaze was called ra-jit until 2026-10-24. `cargo ra-jit` keeps working as another name for
-`cargo blaze`. Its settings are `BLAZE_*`: one set by its old name, `RA_JIT_*`, stops it with
-a line saying what it is called now.
+blaze had another name and another command before 2026-10-28, and no longer answers to either:
+[rename.md](rename.md) maps them to the new ones and says what the installer does over a blaze
+from before.
 
 Building blaze itself from a checkout, and every way to build it the release way:
 [cargo.md](cargo.md#install) and [contributing.md](contributing.md).

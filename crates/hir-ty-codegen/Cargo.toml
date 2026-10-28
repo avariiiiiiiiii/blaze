@@ -1,6 +1,6 @@
 [package]
 name = "hir-ty-codegen"
-description = "ra-jit's code generator: rust-analyzer's MIR to machine code through Cranelift, LLVM or wasm"
+description = "blaze's code generator: rust-analyzer's MIR to machine code through Cranelift, LLVM or wasm"
 publish = false
 
 version.workspace = true
@@ -29,10 +29,10 @@ triomphe.workspace = true
 rustc-demangle = "0.1.28"
 rustc-stable-hash = "0.1.2"
 
-ra-ap-rustc_abi.workspace = true
+rustc_abi.workspace = true
 ra-ap-rustc_ast_ir.workspace = true
 ra-ap-rustc_index.workspace = true
-ra-ap-rustc_type_ir.workspace = true
+rustc_type_ir.workspace = true
 
 base-db.workspace = true
 cfg.workspace = true
@@ -44,7 +44,7 @@ span.workspace = true
 stdx.workspace = true
 syntax.workspace = true
 
-ra-jit-store.workspace = true
+blaze-store.workspace = true
 
 cranelift-codegen = { version = "0.136", features = ["incremental-cache", "x86", "arm64"] }
 cranelift-frontend = "0.136"
@@ -60,11 +60,11 @@ sha2 = "0.10"
 inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1-prefer-static", "target-x86", "target-aarch64", "no-libffi-linking"], optional = true }
 
 [dev-dependencies]
-ra-jit-fuzz.workspace = true
+blaze-fuzz.workspace = true
 
 [features]
 llvm = ["dep:inkwell"]
-# The compiler as a WebAssembly module itself: see `crates/ra-jit-wasm`.
+# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`.
 wasm = []
 
 [lints]

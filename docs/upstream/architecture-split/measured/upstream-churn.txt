@@ -1,5 +1,5 @@
-# upstream commits (no merges) since 2026-04-21 touching each upstream file ra-jit modified | lines ra-jit added | removed | file
-# upstream rust-lang/rust-analyzer master ea09c7b724; ra-jit main 22b1267233; base 0b21bd6596
+# upstream commits (no merges) since 2026-04-21 touching each upstream file blaze modified | lines blaze added | removed | file
+# upstream rust-lang/rust-analyzer master ea09c7b724; blaze main 22b1267233; base 0b21bd6596
 74 1 1 crates/hir-ty/src/infer.rs
 73 62 25 crates/hir/src/lib.rs
 63 144 18 crates/hir-def/src/expr_store/lower.rs

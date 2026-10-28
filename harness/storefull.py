@@ -9,11 +9,11 @@ middle of the records, and when it seals. Each time:
   - the daemon has to build a program that prints what cargo's does, on its first build and
     after an edit;
   - it has to say that it keeps nothing, and why;
-  - `ra-jit cache verify` has to find nothing in the store that is not what was written.
+  - `blaze-engine cache verify` has to find nothing in the store that is not what was written.
 
 Then room is made under a running daemon, and what the next daemon compiles has to be kept
-again. `ra-jit cache pull` into the full store has to fail with the reason and leave no part
-of a pack behind, and `ra-jit cache gc` has to make room.
+again. `blaze-engine cache pull` into the full store has to fail with the reason and leave no part
+of a pack behind, and `blaze-engine cache gc` has to make room.
 
     python3 storefull.py
 """
@@ -54,7 +54,7 @@ class Disk:
 
     def empty_store(self):
         """The store's directory, empty and the user's alone. A volume just formatted lets
-        every user of a Windows machine write to what is made at its top, and ra-jit takes
+        every user of a Windows machine write to what is made at its top, and blaze takes
         no store that others can write to."""
         shutil.rmtree(self.store, ignore_errors=True)
         os.mkdir(self.store)
@@ -177,7 +177,7 @@ UNSIGNED = {"BLAZE_REMOTE_UNSIGNED": "1"}
 
 
 def commands(checkout, disk, work):
-    """`ra-jit cache` on a full disk: pull fails cleanly, gc makes room."""
+    """`blaze-engine cache` on a full disk: pull fails cleanly, gc makes room."""
     remote = os.path.join(work, "remote")
     status, out = cache(disk.store, "push", remote)
     if status != 0:
@@ -213,7 +213,7 @@ def commands(checkout, disk, work):
 
 def main():
     start = time.time()
-    work = scratch("ra-jit-storefull-")
+    work = scratch("blaze-storefull-")
     checkout = Checkout(work)
     disk = Disk(work)
     try:

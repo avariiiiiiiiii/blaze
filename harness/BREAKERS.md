@@ -1,19 +1,19 @@
-# What breaks ra-jit's codegen: a sweep of 93 crates and 7 binaries
+# What breaks blaze's codegen: a sweep of 93 crates and 7 binaries
 
-Branch `ra-jit-breakers`, off `ra-jit-spike`. Everything below was measured on one 8-core, 31 GB
+Branch `blaze-breakers`, off `blaze-spike`. Everything below was measured on one 8-core, 31 GB
 VM with `nightly-2026-05-10` (`harness/toolchain`). Each number is from a single run unless it
-says otherwise, and each is followed by the command that printed it. "ra-jit-14" is
-`cargo build -p ra-jit --release` at commit `4219d84566`, the end of the first pass;
-"ra-jit-30" is the same at `1c293327c1`, the end of the second.
+says otherwise, and each is followed by the command that printed it. "blaze-14" is
+`cargo build -p blaze-engine --release` at commit `4219d84566`, the end of the first pass;
+"blaze-30" is the same at `1c293327c1`, the end of the second.
 
 ## Summary
 
-| | before (as found) | first pass (ra-jit-14) | second pass (ra-jit-30) | command |
+| | before (as found) | first pass (blaze-14) | second pass (blaze-30) | command |
 |---|---|---|---|---|
 | crates with a result (the other 7 are under "Not tested") | | 86 of 93 | 86 of 93 | `cratesweep.sh ~/sweep/out15 $(cat versions.txt)` |
 | crates whose tests behave as rustc's | not measured on the whole list, see below | 84 of 86 | 86 of 86 | `sweepreport.py ~/sweep/out15` |
 | tests run and compared | | 10746 | 10746 | same |
-| functions compiled by ra-jit | | 41597 of 41692 (95 left to rustc) | 41682 of 41697 (15 left, all generic-array) | same |
+| functions compiled by blaze | | 41597 of 41692 (95 left to rustc) | 41682 of 41697 (15 left, all generic-array) | same |
 | binaries, command lines the same | 25 of 29 on the 3 that ran, 4 did not run | 68 of 68 over 7 binaries | 68 of 68 | `bintest.py <name>` |
 | tokio `--features full`, tests differing | | 8 of 1018 | 0 of 1018 (2 of 3273 functions left) | `cratetest.py vendor/tokio --features full` |
 | `harness/corpus` | 661 of 662, MATCH | 661 of 662, MATCH | 661 of 662, MATCH | `difftest.py corpus --bin runner --crate cases` |
@@ -21,7 +21,7 @@ says otherwise, and each is followed by the command that printed it. "ra-jit-14"
 | reduced breakers | | 13 of 13 right, 3 open | 25 of 25 right, 0 open | `breakers.py` |
 
 "Before" has no single number for the 93 crates: I stopped the first sweep with the
-unmodified ra-jit after 29 crates, to restart it with the first fixes in. In those 29, ra-jit
+unmodified blaze after 29 crates, to restart it with the first fixes in. In those 29, blaze
 crashed on futures, pin-project-lite and tokio and failed to link serde_json. Of those 29: 4965 tests, 9039 of 9539 functions, 7 crates failing
 (`sweepreport.py ~/sweep/out1`). A full sweep with the first four fixes in gave 40986 of 41212
 functions and 6 failing crates (`sweepreport.py ~/sweep/out2`); the final one is the table
@@ -41,7 +41,7 @@ $(versions)`, then `sweepreport.py ~/sweep/out99`.
 |---|---|
 | crates whose tests behave as rustc's | 86 of 86 |
 | tests run and compared | 10745 |
-| functions compiled by ra-jit, as the sweep ran | 41958 of 41987 (29 left to rustc) |
+| functions compiled by blaze, as the sweep ran | 41958 of 41987 (29 left to rustc) |
 | the same after the fixes below, rerun on the four crates they touch | 15 left, all generic-array |
 
 What the 29 were:
@@ -50,7 +50,7 @@ What the 29 were:
 |---|---|---|---|
 | `spin_loop` reaches `_mm_pause`, an LLVM intrinsic with no body, on 1.99 | 5 | crossbeam-channel, futures-util | a one-instruction helper; corpus case `spin_hint` |
 | A member of the workspace and the registry's copy of the same version (ahash, through hashbrown's dev-dependency) were given each other's features, so the copy named a dependency it does not have | 1 | ahash | features are keyed by the package's directory too |
-| The test names nothing of the crate, so the crate is not linked, but the standard library's own `hashbrown` rlib made the harness think it was | 8 | hashbrown | the harness's check; not ra-jit's |
+| The test names nothing of the crate, so the crate is not linked, but the standard library's own `hashbrown` rlib made the harness think it was | 8 | hashbrown | the harness's check; not blaze's |
 | The next trait solver on `GenericArray<T, N>` (as above) | 15 | generic-array | open |
 
 crossbeam-channel's `tick` test binary differed once in the rerun with the same test results
@@ -64,14 +64,14 @@ all matching, and no function left to rustc (296,088 of 296,088, counting a func
 
 - Libraries: `harness/cratesweep.sh <out> <crate-version>...` downloads each crate from
   crates.io and runs `harness/cratetest.py` on it, which builds every test binary of the
-  crate with cargo, builds it again with ra-jit's object linked in front, runs both and
+  crate with cargo, builds it again with blaze's object linked in front, runs both and
   compares the result of every test by name. `sweepreport.py <out>` adds up the JSON files.
-  The final run: `BLAZE_BIN=~/sweep/ra-jit-30 CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out15
+  The final run: `BLAZE_BIN=~/sweep/blaze-30 CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out15
   $(cat ~/sweep/versions.txt)`, 60 minutes of wall time including base64's 1800 s timeout
   (`stat` of the log's birth and last write), with `breakers.py` just before it and nothing
   else on the machine.
 - Binaries: `harness/bintest.py <name>` (new) clones the repository named in
-  `harness/breakers/bins.json`, builds it with cargo and with ra-jit, runs each command line
+  `harness/breakers/bins.json`, builds it with cargo and with blaze, runs each command line
   listed there with both and compares status, stdout and stderr.
 - Reduced cases: `harness/breakers.py` (new) builds `harness/breakers/cases` with both and
   compares each case's output, then runs `cratetest.py` on the crates under
@@ -105,7 +105,7 @@ already in `harness/corpus` (661 functions) and came up again only through the c
 
 ## Binaries
 
-| binary | command lines the same | functions from ra-jit | codegen ms |
+| binary | command lines the same | functions from blaze | codegen ms |
 |---|---|---|---|
 | fd | 10 of 10 | 148 of 148 | 3329 |
 | just | 12 of 12 | 822 of 822 | 8093 |
@@ -115,15 +115,15 @@ already in `harness/corpus` (661 functions) and came up again only through the c
 | bat | 10 of 10 | 321 of 321 | 5806 |
 | tokei | 8 of 8 | 141 of 141 | 4870 |
 
-`BLAZE_BIN=~/sweep/ra-jit-30 harness/bintest.py <name> --json ~/sweep/bins30/<name>.json` for
+`BLAZE_BIN=~/sweep/blaze-30 harness/bintest.py <name> --json ~/sweep/bins30/<name>.json` for
 each (`~/sweep/bins30.log`); the function counts and times are the sums of `compiled`,
 `roots` and `codegen_ms` over the crates in that JSON. The counts are higher than with
-ra-jit-14 (fd 143, just 553, ripgrep 1742, ...) because the second pass stopped taking generic
-helpers in `const _` blocks for rustc's symbol, so more functions are ra-jit's to compile.
+blaze-14 (fd 143, just 553, ripgrep 1742, ...) because the second pass stopped taking generic
+helpers in `const _` blocks for rustc's symbol, so more functions are blaze's to compile.
 
-The first run with the unmodified ra-jit (`~/sweep/bins1.log`) gave fd 9 of 10, ripgrep 9 of
+The first run with the unmodified blaze (`~/sweep/bins1.log`) gave fd 9 of 10, ripgrep 9 of
 12, zoxide 9 of 9, hyperfine 7 of 7, and no result for just, tokei and bat. Two of those were
-ra-jit: fd returned status 1 where rustc's build returns 130 (cause 7 below), and tokei had 0
+blaze: fd returned status 1 where rustc's build returns 130 (cause 7 below), and tokei had 0
 functions compiled (cause 2). The rest was the new harness, which did not yet pick the right
 binary of a package with several, and compared `argv[0]` in help texts. I did not separate
 the two more finely than that.
@@ -150,13 +150,13 @@ entry instead). The first pass:
 | 13 | Unsizing a struct whose last field is an associated type of a parameter | heapless | 22 functions left | `unsize_assoc_field` | `35715f72aa` |
 | 14 | Const eval had no `bswap` or `bitreverse` | bitvec | 5 functions left | `const_bswap` | `35715f72aa` |
 
-On 6: these methods are generic, they were never functions ra-jit could compile alone (11 of
+On 6: these methods are generic, they were never functions blaze could compile alone (11 of
 them were listed, 10 failed and one happened to compile because it never touched `T`). The fix
 stops counting them as roots, which is why the total number of functions went from 41703
 (`sweepreport.py ~/sweep/out3`, the sweep before this fix) to 41692 while the number compiled
 went up. Their instances are compiled where they are used, as before.
 
-The second pass, in the order fixed. "crates" and "effect" are from the ra-jit-14 sweep
+The second pass, in the order fixed. "crates" and "effect" are from the blaze-14 sweep
 (`sweepreport.py ~/sweep/out6`) and the focused reruns of each crate noted in the commits.
 
 | # | cause | crates | effect before | reduced case | commit |
@@ -172,7 +172,7 @@ The second pass, in the order fixed. "crates" and "effect" are from the ra-jit-1
 | 23 | An impl in a function body of the workspace was an impl of its crate only where its type or trait was declared in the same block | zerocopy | 1 function left (`into` with no body) | `impl_in_fn` | `dd79e2f4ec` |
 | 24 | An `$e:expr`, `$t:ty` or `$p:path` passed on to another macro was spliced as its tokens, so `0` matched a literal rule and a type of several tokens was not one `$x:tt` | bitvec | 20 functions left | `fragment_token` | `ac42999014` |
 | 25 | A blanket impl in a function was given to the solver twice, through the block and through the crate: ambiguous, and the associated const fell back to the trait's declaration | zerocopy (`trailing_slice_layout`) | const eval `IncompleteExpr` | `blanket_in_fn` | `f395f5f19d` |
-| 26 | A function generic only over lifetimes was compiled by ra-jit instead of calling rustc's copy, with a frame several times the size: `Debug` for a nested value overflowed a 2 MiB stack | simd-json (1 test) | `limit_fits_in_a_default_thread_stack` aborts | `lifetime_only_callee` | `40992f988e` |
+| 26 | A function generic only over lifetimes was compiled by blaze instead of calling rustc's copy, with a frame several times the size: `Debug` for a nested value overflowed a 2 MiB stack | simd-json (1 test) | `limit_fits_in_a_default_thread_stack` aborts | `lifetime_only_callee` | `40992f988e` |
 | 27 | An instance that names types of two crates is compiled from the one that sees the other; "sees" was every transitive dependency, where the impls known are those of the crates the source names (as 21) | async-channel | 5 tests' functions left (`poll` with no body) | none reduced, see below | `1c293327c1` |
 
 On 27: a reduction in `breakers/devdep` (a dev-dependency's generic `block_on` polling the
@@ -197,10 +197,10 @@ Open. 15 functions in one crate in the sweep, and 2 in tokio with `full` (above)
 | static_assertions | has no functions and no tests that run | sweep log: 1 test binary, 0 tests |
 | base64 (unit tests only) | did not finish in the 1800 s the sweep allows; its integration tests are the same (107 of 107 functions) | see below |
 
-tokio with `--features full` (`BLAZE_BIN=~/sweep/ra-jit-30 cratetest.py harness/vendor/tokio
+tokio with `--features full` (`BLAZE_BIN=~/sweep/blaze-30 cratetest.py harness/vendor/tokio
 --features full --json ~/sweep/tokio-full30.json`, one run, after the sweep): MATCH, 155 test
-binaries, 1018 tests, none differing (8 differed with ra-jit-14, all on the size of a future),
-3271 of 3273 functions from ra-jit (`sweepreport.py` on that JSON). The 2 functions left are
+binaries, 1018 tests, none differing (8 differed with blaze-14, all on the size of a future),
+3271 of 3273 functions from blaze (`sweepreport.py` on that JSON). The 2 functions left are
 `io_join::method_delegation` and `io_split::method_delegation` (`layout of Runtime:
 HasErrorType`: rust-analyzer does not infer a type in `Runtime` here; not reduced). 18
 further test binaries, the library's unit tests among them, do not build with cargo under
@@ -214,10 +214,10 @@ whether it would finish. It is counted among the 7 without a result, not among t
 
 ## Every crate
 
-`harness/sweepreport.py ~/sweep/out15 --md`. "codegen ms" is the time ra-jit spent in codegen
+`harness/sweepreport.py ~/sweep/out15 --md`. "codegen ms" is the time blaze spent in codegen
 over the crate's test binaries, not wall time.
 
-| crate | result | test binaries | tests | functions from ra-jit | codegen ms | left to rustc, or differing |
+| crate | result | test binaries | tests | functions from blaze | codegen ms | left to rustc, or differing |
 |---|---|---|---|---|---|---|
 | adler2 | same | 1 | 6 | 23/23 | 683 |  |
 | ahash | same | 3 | 38 | 185/185 | 2824 |  |
@@ -311,7 +311,7 @@ over the crate's test binaries, not wall time.
 At `1c293327c1` unless it says otherwise.
 
 - `cargo fmt --all -- --check`: clean.
-- `cargo clippy -p hir-ty -p ra-jit --all-targets -- --cap-lints warn`: exit 0, with the
+- `cargo clippy -p hir-ty -p blaze-engine --all-targets -- --cap-lints warn`: exit 0, with the
   warnings the base branch already has (deprecated `*_imm` Cranelift builders, `eprintln!`,
   elidable `'db`); I did not diff the whole warning list against the base.
 - `cargo xtask tidy`: exit 0.
@@ -319,25 +319,25 @@ At `1c293327c1` unless it says otherwise.
   touches only `codegen/home.rs`): hir-ty 4, mbe 7 + 33, hir-def 511, syntax-bridge 9,
   span 9, hir 0, ide 1342, ide-completion 764, ide-diagnostics 744, parser 330 passed,
   0 failed. `tt`'s unit tests do not compile (`SyntaxContext::is_root` is not a method on
-  this branch), and do not on `ra-jit-spike` either (checked in a worktree of it): not this
+  this branch), and do not on `blaze-spike` either (checked in a worktree of it): not this
   branch's.
-- `harness/breakers.py` with ra-jit-30: 25 of 25 right, 0 open, 0 functions skipped
+- `harness/breakers.py` with blaze-30: 25 of 25 right, 0 open, 0 functions skipped
   (`~/sweep/breakers30.log`).
-- `harness/difftest.py corpus --bin runner --crate cases` with ra-jit-30:
+- `harness/difftest.py corpus --bin runner --crate cases` with blaze-30:
   661 of 662 functions, MATCH. The one left is the `TypeId` of a function pointer type rustc
   has no symbol for, as on the base branch.
-- `harness/stress.py` with ra-jit-30: 99 of 99 right, 0 restarts (`~/sweep/stress30.log`).
+- `harness/stress.py` with blaze-30: 99 of 99 right, 0 restarts (`~/sweep/stress30.log`).
 
 ## Unverified or open
 
 - The dx benchmark (1839 of 1839 functions) was not rerun on this branch. The Dioxus target
   directory was wiped for disk space, and a rebuild did not fit beside the sweeps. Causes 2,
-  3, 6, 17, 21 and 27 change which functions ra-jit names, which impls it knows and which
+  3, 6, 17, 21 and 27 change which functions blaze names, which impls it knows and which
   crate it compiles an instance from, so that number should be rechecked before this is
   merged anywhere.
 - Cause 27 has no reduced case: the reduction I wrote compiled before the fix too. The
   async-channel sweep entry is its only regression test.
-- Timing: only ra-jit's codegen time per crate was recorded. I did not measure ra-jit's wall
+- Timing: only blaze's codegen time per crate was recorded. I did not measure blaze's wall
   time against cargo's per crate.
 - The crate versions are the ones listed at the end of this report. The binaries are the
   default branch of each repository as cloned during the session, not pinned to a commit.

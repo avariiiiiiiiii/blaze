@@ -1,6 +1,6 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L2-463-c8.rs`): an array that an `if let`
 //! would move an element out of, where the pattern does not match. Nothing was moved out
-//! then, so the array is dropped front to back like any other. ra-jit took the two ways out
+//! then, so the array is dropped front to back like any other. blaze took the two ways out
 //! of the pattern through one block, lost track of which it was on, and dropped the array as
 //! one that has lost elements: from the back.
 

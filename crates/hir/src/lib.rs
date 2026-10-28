@@ -20,7 +20,7 @@
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![recursion_limit = "512"]
 
-extern crate ra_ap_rustc_type_ir as rustc_type_ir;
+extern crate rustc_type_ir;
 
 mod attrs;
 mod from_id;

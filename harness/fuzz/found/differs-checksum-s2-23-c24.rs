@@ -5,7 +5,7 @@
 // panic: panicked at src/main.rs:366:271:
 // called `Option::unwrap()` on a `None` value
 // c24 96891f8561ae43eb ok
-// ra-jit:
+// blaze:
 // panic: panicked at src/main.rs:366:271:
 // called `Option::unwrap()` on a `None` value
 // c24 b3d5124b1345f240 ok

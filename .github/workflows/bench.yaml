@@ -1,4 +1,4 @@
-# Microbenchmarks of the store's hot paths (crates/ra-jit-bench), run by tango in pairs: on a
+# Microbenchmarks of the store's hot paths (crates/blaze-bench), run by tango in pairs: on a
 # pull request the binary of the change against the binary of its base, interleaved on one
 # runner, so that the runner's own drift cancels out. A benchmark fails the run only when it
 # is slower beyond doubt (tango's z-score) and by more than NOISE percent, twice in a row.
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # As ra-jit.yaml: a pull request's newer push cancels its run, every push to main finishes.
+  # As blaze.yaml: a pull request's newer push cancels its run, every push to main finishes.
   group: bench-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -48,15 +48,15 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           git checkout -q --detach ${{ github.event.pull_request.base.sha }}
-          if [ -d crates/ra-jit-bench ]; then
-            cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
+          if [ -d crates/blaze-bench ]; then
+            cargo bench -p blaze-bench --bench store --no-run --message-format=json \
               | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
               | xargs -I{} cp {} "$RUNNER_TEMP/bench-base"
           fi
           git checkout -q --detach ${{ github.sha }}
       - name: Build the change
         run: |
-          cargo bench -p ra-jit-bench --bench store --no-run --message-format=json \
+          cargo bench -p blaze-bench --bench store --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
             | xargs -I{} cp {} "$RUNNER_TEMP/bench-head"
       - name: Compare with the base

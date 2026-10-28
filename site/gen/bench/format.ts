@@ -83,7 +83,7 @@ export const MODES: Record<string, string> = {
 	socket: 'One edit, sent to the daemon',
 	burst: 'Typing, keystroke to running',
 	replay: 'Replayed edits',
-	cargo: 'Save, then cargo blaze build',
+	cargo: 'Save, then blaze build',
 };
 
 export const projectName = (project: string, tag: string | undefined) =>

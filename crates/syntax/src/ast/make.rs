@@ -16,7 +16,7 @@ mod quote;
 use either::Either;
 use itertools::Itertools;
 use parser::{Edition, T};
-use rowan::NodeOrToken;
+use syntax_tree::NodeOrToken;
 use stdx::{format_to, format_to_acc, never};
 
 use crate::{
@@ -589,8 +589,8 @@ pub fn hacky_block_expr(
     let mut buf = "{\n".to_owned();
     for node_or_token in elements.into_iter() {
         match node_or_token {
-            rowan::NodeOrToken::Node(n) => format_to!(buf, "    {n}\n"),
-            rowan::NodeOrToken::Token(t) => {
+            syntax_tree::NodeOrToken::Node(n) => format_to!(buf, "    {n}\n"),
+            syntax_tree::NodeOrToken::Token(t) => {
                 let kind = t.kind();
                 if kind == SyntaxKind::COMMENT {
                     format_to!(buf, "    {t}\n")

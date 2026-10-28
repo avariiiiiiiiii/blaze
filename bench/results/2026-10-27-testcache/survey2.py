@@ -8,7 +8,7 @@ import json, os, re, shutil, subprocess, sys, time
 
 sys.path.insert(0, "/root/tc/src/harness")
 import bench  # noqa: E402
-import cargo_ra_jit  # noqa: E402
+import blaze_cli  # noqa: E402
 
 BIN = "/root/tc/target/release"
 APPS = "/root/apps"
@@ -22,7 +22,7 @@ DENIED = re.compile(r"fails: the sandbox denied it")
 
 def run(ws, env, args, log):
     start = time.monotonic()
-    out = subprocess.run(["cargo", "ra-jit", "test", *args, "--no-fail-fast"], cwd=ws, env=env,
+    out = subprocess.run(["blaze", "test", *args, "--no-fail-fast"], cwd=ws, env=env,
                          capture_output=True, text=True, timeout=3600)
     took = time.monotonic() - start
     said = out.stdout + out.stderr
@@ -33,11 +33,11 @@ def run(ws, env, args, log):
                 failed=sum(1 for _, e in ran if e == "FAILED"),
                 cached=sum(int(n) for n, _ in cached), cached_from=sorted({f for _, f in cached}),
                 verified=VERIFIED.findall(said), denied=len(DENIED.findall(said)),
-                served="[ra-jit]" in said)
+                served="[blaze]" in said)
 
 
 def fresh(ws, env):
-    subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+    subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
 
 
@@ -47,7 +47,7 @@ def main():
     for name in names:
         if name in results:
             continue
-        spec = cargo_ra_jit.PROJECTS[name]
+        spec = blaze_cli.PROJECTS[name]
         ws = os.path.join(APPS, name)
         if not os.path.isdir(ws):
             subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", spec["tag"],
@@ -77,7 +77,7 @@ def main():
             fresh(ws, env)
             rows[f"pr {mode}"] = run(ws, dict(pr_env, BLAZE_TESTS=mode), args, f"{APPS}/{name}.pr-{mode}.log")
             print(name, "pr", mode, json.dumps(rows[f"pr {mode}"]), flush=True)
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         subprocess.run(["git", "checkout", "-q", "--", "."], cwd=ws)
         results[name] = {"edit": f"{path}: {old}", **rows}
         json.dump(results, open(OUT, "w"), indent=1)

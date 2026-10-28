@@ -1,7 +1,7 @@
-//! What `#[ra_jit::cache]` keeps the results of a function by: a hash of the code of its body
-//! and of everything that code can reach, as ra-jit compiled it. The attribute keeps the body
-//! in a closure and has the function ask `ra_jit::__private::__ra_jit_cache_code` for the code
-//! of that closure, which rustc answers with nothing, and so caches nothing. ra-jit compiles
+//! What `#[blaze::cache]` keeps the results of a function by: a hash of the code of its body
+//! and of everything that code can reach, as blaze compiled it. The attribute keeps the body
+//! in a closure and has the function ask `blaze::__private::__blaze_cache_code` for the code
+//! of that closure, which rustc answers with nothing, and so caches nothing. blaze compiles
 //! the call into the answer: the hash, or why the function can't be cached.
 //!
 //! The hash is of the compiled code without what tells where it was written, so comments,
@@ -27,7 +27,7 @@
 //! counts of an `Rc` or an `Arc` in an argument change behind a shared reference, so what reads
 //! them is refused rather than the argument. The seed std's `HashMap` and `HashSet` make
 //! orders their entries alone, so a seed made for one is pure and what gives the entries in
-//! that order, or the seed, is not; `ra_jit` writes their entries sorted in a key for the
+//! that order, or the seed, is not; `blaze` writes their entries sorted in a key for the
 //! same reason.
 
 use std::hash::{Hash, Hasher};
@@ -65,10 +65,10 @@ use super::{
 };
 
 /// The function a cached function asks for the code of its body.
-const CODE: &str = "__ra_jit_cache_code";
+const CODE: &str = "__blaze_cache_code";
 /// The function whose instance names how the arguments and the result are written: reached
 /// for the hash, though what it does is not the cached function's.
-const CODEC: &str = "__ra_jit_codec";
+const CODEC: &str = "__blaze_codec";
 /// Changes when what is hashed does, so no hash of before means anything now.
 const FORMAT: u32 = 1;
 
@@ -81,7 +81,7 @@ fn is_codec(db: &dyn HirDatabase, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).name.as_str() == CODEC
 }
 
-/// The closure that `#[ra_jit::cache]` put the body of `func` in, when it is a cached
+/// The closure that `#[blaze::cache]` put the body of `func` in, when it is a cached
 /// function: the one it asks for the code of.
 pub(super) fn cached_closure(db: &dyn HirDatabase, func: FunctionId) -> Option<salsa::Id> {
     if !uses_cache(db, func.krate(db)) {
@@ -90,7 +90,7 @@ pub(super) fn cached_closure(db: &dyn HirDatabase, func: FunctionId) -> Option<s
     cached_closure_of(db, func).map(|it| it.as_id())
 }
 
-/// Whether `krate` can have cached functions: the attribute calls into the `ra_jit` crate, so
+/// Whether `krate` can have cached functions: the attribute calls into the `blaze` crate, so
 /// a crate without it as a dependency has none, and costs nothing to look through.
 pub(super) fn uses_cache(db: &dyn HirDatabase, krate: Crate) -> bool {
     krate.data(db).dependencies.iter().any(|dep| {
@@ -98,7 +98,7 @@ pub(super) fn uses_cache(db: &dyn HirDatabase, krate: Crate) -> bool {
             .extra_data(db)
             .display_name
             .as_ref()
-            .is_some_and(|name| name.crate_name().symbol().as_str() == "ra_jit")
+            .is_some_and(|name| name.crate_name().symbol().as_str() == "blaze")
     })
 }
 
@@ -175,7 +175,7 @@ pub(super) fn cache_code(
 /// For each of `roots`, the functions a test harness runs, a hash of the code of the function
 /// and of everything it reaches, as [`cache_code`] hashes a cached body, for a test to be run
 /// again only once that changed. `Err` says why what the test does is not all in its code, and
-/// by what calls: it reaches what ra-jit can't compile, and is run every time. A test that
+/// by what calls: it reaches what blaze can't compile, and is run every time. A test that
 /// reaches the world outside the program (files, the environment, processes, the network) has
 /// its hash and [`Reach::outside`] says how: what it read there is the rest of what it is,
 /// which a sandbox that records it can tell.
@@ -654,7 +654,7 @@ struct Walk<'db> {
     /// that can change is gone into, and a segment leaves out where its edges go, which
     /// each root hashes in an order of its own.
     tests: bool,
-    /// The nodes ra-jit can't compile, whose code tells nothing of what they do.
+    /// The nodes blaze can't compile, whose code tells nothing of what they do.
     uncompiled: FxHashSet<u32>,
     /// An argument holds a reference count, which what reads one gives and the key does not
     /// tell: two arguments can share a value or not.
@@ -1875,8 +1875,8 @@ fn hash_code(hasher: &mut impl Hasher, code: &Code) {
 }
 
 impl<'db> FunctionCx<'_, 'db> {
-    /// A call of `__ra_jit_cache_code::<F>`: writes the code of the closure `F` to `dst`, as
-    /// the `Code` of `ra_jit::__private` has it. That is two words of hash, then the name of
+    /// A call of `__blaze_cache_code::<F>`: writes the code of the closure `F` to `dst`, as
+    /// the `Code` of `blaze::__private` has it. That is two words of hash, then the name of
     /// the function, or why it can't be cached when the hash is zero.
     pub(super) fn cache_code(&mut self, generic_args: GenericArgs<'db>, dst: Value) -> Result<()> {
         let db = self.cg.db;
@@ -1895,7 +1895,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let (hash, text) = match cache_code(db, closure.clone(), env) {
             Ok(hash) => (*hash, cached_name(db, &closure)),
             Err(why) => {
-                tracing::info!(target: "ra_jit", "{why}");
+                tracing::info!(target: "blaze", "{why}");
                 (0, why.clone())
             }
         };

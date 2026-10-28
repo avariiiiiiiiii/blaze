@@ -47,11 +47,11 @@ def arg(*more):
     return lambda ws, env, args: args.extend(more)
 
 
-# What ra-jit says of a function it leaves to rustc because the copy of an instance it calls
-# is one rustc picked and ra-jit cannot tell which.
+# What blaze says of a function it leaves to rustc because the copy of an instance it calls
+# is one rustc picked and blaze cannot tell which.
 REFUSED = "overflow checks"
 
-# What ra-jit does not do yet: these differ, and are told apart when they do.
+# What blaze does not do yet: these differ, and are told apart when they do.
 OPEN = set()
 
 # (name, the change, the line of the program's output it has to show in or None for no line)
@@ -92,14 +92,14 @@ def size(directory):
 
 
 def build(ws, env, args):
-    """What cargo's program prints and what ra-jit's does, and the functions that were left to rustc."""
+    """What cargo's program prints and what blaze's does, and the functions that were left to rustc."""
     saved = dict(os.environ)
     os.environ.update(env)
     try:
         fx = Fixture(ws, ["kapp", "klib", "kdep"], ["-p", "kapp", *args])
-        fx.ra_jit_args = list(args)
+        fx.blaze_args = list(args)
         fx.rustc_build()
-        fx.ra_jit_build()
+        fx.blaze_build()
         skipped = [row for rows in fx.reports.values() for row in rows if row[0] == "skipped" and "no rustc symbol" not in row[2]]
         return fx.behaviour(fx.reference), fx.behaviour(fx.binary), skipped
     finally:
@@ -109,7 +109,7 @@ def build(ws, env, args):
 
 
 def main():
-    work = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-keys-"))
+    work = os.path.realpath(tempfile.mkdtemp(prefix="blaze-keys-"))
     chosen, shard = sys.argv[1:], (1, 1)
     if "--shard" in chosen:
         at = chosen.index("--shard")
@@ -140,9 +140,9 @@ def main():
             problems.append("the second build differs")
         if line and before == want:
             problems.append("cargo's program is the same after the change")
-        # Where the crates differ in overflow checks, ra-jit leaves to rustc a function that
+        # Where the crates differ in overflow checks, blaze leaves to rustc a function that
         # calls a copy it cannot tell the checks of. The function the case is about has to
-        # be ra-jit's all the same, or the case shows nothing.
+        # be blaze's all the same, or the case shows nothing.
         refused = [row for row in left if REFUSED in row[2] and row[1].split("::")[-1] != line]
         if len(left) > len(refused):
             problems.append(f"{len(left) - len(refused)} functions left to rustc")
@@ -159,9 +159,9 @@ def main():
             ours, theirs = (it[1].decode(errors="replace").splitlines() for it in (got, want))
             for a, b in zip(theirs, ours):
                 if a != b:
-                    print(f"    rustc: {a}\n    ra-jit: {b}")
+                    print(f"    rustc: {a}\n    blaze: {b}")
             if len(ours) != len(theirs):
-                print(f"    ra-jit: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}")
+                print(f"    blaze: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}")
     still = sum(1 for name, _, _, _ in runs if name in OPEN) - fixed
     print(f"{total - wrong - still} of {total - still} right, {still} open, {refusals} functions refused; {work}")
     if fixed:

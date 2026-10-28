@@ -5,18 +5,18 @@
 
 Each row copies the `soak/` workspace (a build script, three kinds of proc macro, a program
 and its tests), has a daemon of its own load it, does the thing the row is named for, and
-then compares `cargo ra-jit run` (or `test`) with a cold `cargo run` of the same tree. A row
+then compares `blaze run` (or `test`) with a cold `cargo run` of the same tree. A row
 is right when the two agree at every comparison and neither the daemon nor a worker logged
-a panic; who built each one, the daemon or cargo with the reason ra-jit gave, is in the
+a panic; who built each one, the daemon or cargo with the reason blaze gave, is in the
 table. A build cargo did in place of the daemon is right: that is the contract.
 
 Writes SOAKROWS.md next to this file.
 """
 import argparse, glob, os, re, shutil, signal, subprocess, sys, tempfile, time
 
-from cargo_ra_jit import HERE, RA_JIT, TOOLCHAIN, Side, base_env, difference, how_built, program_output, test_results, wait_warm
+from blaze_cli import HERE, BLAZE, TOOLCHAIN, Side, base_env, difference, how_built, program_output, test_results, wait_warm
 
-GIT = ["git", "-c", "user.name=ra-jit", "-c", "user.email=ra-jit@localhost", "-c", "advice.detachedHead=false"]
+GIT = ["git", "-c", "user.name=blaze", "-c", "user.email=blaze@localhost", "-c", "advice.detachedHead=false"]
 OTHER_TOOLCHAIN = "1.94.0"
 # The pinned nightly CI uses for borrowck_ui.py.
 NIGHTLY = TOOLCHAIN
@@ -80,7 +80,7 @@ class Row:
         return states
 
     def both(self, label, command="run", ws=None, env=None, args=(), want=None, reference_env=None):
-        """Compares `cargo ra-jit COMMAND` with a cold `cargo COMMAND` of the tree, the latter
+        """Compares `blaze COMMAND` with a cold `cargo COMMAND` of the tree, the latter
         with `reference_env` over `env`."""
         ws, env = ws or self.ws, dict(self.env, **(env or {}))
         _, ours = Side(ws, env, True).cargo(command, *args, timeout=1800)
@@ -388,7 +388,7 @@ def non_utf8_root(row):
     shutil.copytree(row.ws.encode(), ws, ignore=lambda _, names: [it for it in names if it.startswith(b"target")])
     run = lambda argv, env: subprocess.run(argv, cwd=ws, env=env, capture_output=True, text=True, errors="replace", timeout=1800)
     for label in ("cold", "edited"):
-        ours = run(["cargo", "ra-jit", "run"], row.env)
+        ours = run(["blaze", "run"], row.env)
         theirs = run(["cargo", "run"], dict(row.env, CARGO_TARGET_DIR=os.path.join(ws, b"target-ref")))
         how = how_built(ours.stderr)
         row.built.append(f"{label}: {how}" + ("" if theirs.returncode == 0 else f" (cargo itself exits {theirs.returncode})"))
@@ -430,7 +430,7 @@ def says_its_rustc(row):
 
 def toolchain_switched(row):
     """The toolchain file of the directory changes under a live daemon, as `rustup
-    override` or a checkout does. `cargo ra-jit` builds with the release it compiles whatever
+    override` or a checkout does. `blaze` builds with the release it compiles whatever
     the file says (#269), so what it builds is cargo's under that release, and the daemon's."""
     says_its_rustc(row)
     file = row.path("rust-toolchain.toml")
@@ -438,7 +438,7 @@ def toolchain_switched(row):
     ours(row.env["RUSTUP_TOOLCHAIN"])
     row.env.pop("RUSTUP_TOOLCHAIN")
     row.warm()
-    row.both("the toolchain ra-jit is built for", want=f"rustc {TOOLCHAIN}")
+    row.both("the toolchain blaze is built for", want=f"rustc {TOOLCHAIN}")
     ours(OTHER_TOOLCHAIN)
     as_ours = {"RUSTUP_TOOLCHAIN": TOOLCHAIN}
     row.both(f"the file now says {OTHER_TOOLCHAIN}", reference_env=as_ours, want=f"rustc {TOOLCHAIN}")
@@ -454,7 +454,7 @@ def toolchain_switched(row):
 
 
 def toolchains_in_turn(row):
-    """Two toolchains named by the environment of the client, turn by turn: `cargo ra-jit`
+    """Two toolchains named by the environment of the client, turn by turn: `blaze`
     builds with the release it compiles under both (#269)."""
     says_its_rustc(row)
     row.warm()
@@ -488,12 +488,12 @@ def pinned_to_a_nightly(row):
 
 
 # The programs of one build, which run each other from next to themselves: with one missing,
-# `cargo ra-jit` is cargo's.
-PROGRAMS = ("ra-jit", "cargo-ra-jit", "ra-jit-rustc", "ra-jit-rustc-first")
+# `blaze` is cargo's.
+PROGRAMS = ("blaze-engine", "blaze", "blaze-rustc")
 
 
 def another_build(source, bin):
-    """A ra-jit that is another build: the same program with bytes after its end."""
+    """A blaze that is another build: the same program with bytes after its end."""
     for name in PROGRAMS:
         other = os.path.join(bin, name + ".new")
         shutil.copy(os.path.join(source, name), other)
@@ -503,7 +503,7 @@ def another_build(source, bin):
 
 
 def binary_replaced(row):
-    source, bin, old = os.path.dirname(RA_JIT), os.path.join(row.dir, "bin"), os.path.join(row.dir, "bin-old")
+    source, bin, old = os.path.dirname(BLAZE), os.path.join(row.dir, "bin"), os.path.join(row.dir, "bin-old")
     for dir in (bin, old):
         os.makedirs(dir)
         for name in PROGRAMS:
@@ -541,7 +541,7 @@ def binary_replaced(row):
     twin = os.path.join(row.dir, "bin-twin")
     shutil.copytree(bin, twin, copy_function=shutil.copy2)
     daemon = row.status()[0]
-    os.remove(os.path.join(bin, "ra-jit"))
+    os.remove(os.path.join(bin, "blaze-engine"))
     second_ws = os.path.join(row.dir, "ws2")
     row.copy(second_ws)
     apart = {"PATH": twin + os.pathsep + path}
@@ -822,7 +822,7 @@ def show_in_main(row, shown):
 def beside_one_left(row):
     """A function left to rustc from the first build, `seven` (for the constant
     `breakers.py caller_in_constant` is about): an item added to another file of its crate
-    could change what rustc's copy of it would be, and the build failed ("has an error ra-jit
+    could change what rustc's copy of it would be, and the build failed ("has an error blaze
     cannot say more of"). It and a body edited after it are built, each by the daemon or by
     cargo: which depends on whether rustc's copy is from before the crate's last edit. `seven`
     is said to be left to rustc once an edit has compiled its crate: a daemon that starts from
@@ -859,7 +859,7 @@ pub mod later;
 
 def through_a_blanket_impl(row):
     """`layout::<Well>` reaches `Well::render` through `impl<T: RenderOnce> View for T`, both
-    returning `impl Value` (#25). ra-jit could not lay out the type, left `layout::<Well>` and
+    returning `impl Value` (#25). blaze could not lay out the type, left `layout::<Well>` and
     `main` to rustc without a word, and rustc's copies call rustc's `Well::render`: every edit
     of it was "applied: 0 functions", and the program on disk ran the code from before."""
     with open(row.path("app/src/main.rs"), "a") as main:
@@ -912,7 +912,7 @@ fn layout<V: View>(view: V) -> u32 {
 
 
 def reached_from_one_left(row):
-    """What rustc's copy of a function left to rustc calls is rustc's copy too where ra-jit's
+    """What rustc's copy of a function left to rustc calls is rustc's copy too where blaze's
     can't take its place: a function private to rustc's object (`offset`, which only `seven`
     calls) and a generic one (`scaled::<u8>`). An edit of either, or of `seven` before the
     daemon had a build of its own, was not in the program the daemon built. Each is built by
@@ -987,7 +987,7 @@ def statics_one_unit_uses(row):
     """Statics written by a function left to rustc (`left`, for the constant `breakers.py
     caller_in_constant` is about) that only the functions of one codegen unit use, as bun's
     `SHOULD_ABORT` and the `FLAG` of a method of `impl<const SSL: bool, ..> NewServer<SSL, ..>`
-    are: rustc makes them local to the unit. ra-jit can't walk `left`, so rustc's copy of it
+    are: rustc makes them local to the unit. blaze can't walk `left`, so rustc's copy of it
     may reach any static of its crate, also `FLAG` through rustc's copy of `flag`. The base the
     daemon builds of its own after the first patch can't link to a local symbol: it took the
     `FLAG` in a body as its own, apart from the one rustc's `left` counts with, and a patch of
@@ -1111,12 +1111,12 @@ def main():
     parser.add_argument("--other-fs", default="/dev/shm")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
-    if not shutil.which("cargo-ra-jit", path=os.path.dirname(RA_JIT)):
-        sys.exit("no cargo-ra-jit beside the ra-jit of BLAZE_BIN")
+    if not shutil.which("blaze", path=os.path.dirname(BLAZE)):
+        sys.exit("no blaze beside the blaze of BLAZE_BIN")
     unknown = [wanted for wanted in args.rows if not any(wanted in name for name in ROWS)]
     if unknown:
         sys.exit(f"no row is named like {unknown}; the rows are: {', '.join(ROWS)}")
-    work = args.work or tempfile.mkdtemp(prefix="ra-jit-soakrows-")
+    work = args.work or tempfile.mkdtemp(prefix="blaze-soakrows-")
     table, failed = [], 0
     for name, (run, env) in ROWS.items():
         if args.rows and not any(wanted in name for wanted in args.rows):
@@ -1124,7 +1124,7 @@ def main():
         slug = re.sub(r"\W+", "-", name)
         at = None
         if run is other_filesystem:
-            at = os.path.join(tempfile.mkdtemp(prefix="ra-jit-soakrows-", dir=args.other_fs), "ws")
+            at = os.path.join(tempfile.mkdtemp(prefix="blaze-soakrows-", dir=args.other_fs), "ws")
         row, began = Row(work, slug, env, at), time.time()
         try:
             run(row)

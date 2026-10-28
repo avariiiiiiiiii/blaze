@@ -8,7 +8,7 @@
   "cargo": [
     "--release"
   ],
-  "ra-jit": [
+  "blaze": [
     "--release"
   ],
   "steps": [

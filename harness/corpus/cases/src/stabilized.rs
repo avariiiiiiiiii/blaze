@@ -415,7 +415,7 @@ pub fn c_variadic_stack() -> (f64, f64, f64) {
 }
 
 /// Named parameters that the registers do not hold: the variable arguments follow them on
-/// the stack. Only where ra-jit compiles such a function.
+/// the stack. Only where blaze compiles such a function.
 #[cfg(target_vendor = "apple")]
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn crowded(

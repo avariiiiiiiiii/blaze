@@ -13,7 +13,7 @@ audio/manifests/<doc>.json, which the build (gen/build.ts) turns into the page's
     uv run --script audio/generate.py --check /charter        # Whisper transcripts of a page's audio against its text
 
 The lines come from `.gen/spoken.json`, which `bun gen/build.ts` writes (run first, unless --no-build). Before
-synthesis each line goes through audio/lexicon.toml (how to say rustc, ra-jit, 1.99.0, ...): the model gets the spoken
+synthesis each line goes through audio/lexicon.toml (how to say rustc, blaze, 1.99.0, ...): the model gets the spoken
 form, the manifest keeps the page's words, each with the merged timing of the spoken words it became. A line is
 generated once per cache key: sha256 of (spoken text, voice reference, model revision, engine, quantisation, seed), so
 a lexicon edit regenerates only the lines it changes; the seed is fixed per line (from its page text), so a rerun on an
@@ -130,7 +130,7 @@ def has_word(token: str) -> bool:
 @dataclass(frozen=True)
 class Lexicon:
     """audio/lexicon.toml: how to say a word the voice gets wrong. `words` are whole-word and case-sensitive (a word
-    edge is anything but a letter, digit or underscore, so `ra-jit's` and `(rustc)` match, `rustcx` does not); `rules`
+    edge is anything but a letter, digit or underscore, so `blaze's` and `(rustc)` match, `rustcx` does not); `rules`
     are regexes applied after them. Both work inside one whitespace-separated word, and never inside a [direction]."""
 
     table: dict[str, str]
@@ -590,7 +590,7 @@ def number(n: int) -> list[str]:
 
 def words_of(text: str) -> list[str]:
     """A line as comparable words: lowercase, punctuation dropped, numbers in words ("6.33" is six point three three),
-    and a run of single letters as one word ("R A jit", "RA jit" and "ra-jit" are all `ra jit`), so the transcript and
+    and a run of single letters as one word ("R A jit", "blaze" and "blaze" are all `blaze`), so the transcript and
     the text compare however Whisper spells what it heard."""
     out: list[str] = []
     for w in speakable(text).replace("-", " ").replace("/", " ").split():

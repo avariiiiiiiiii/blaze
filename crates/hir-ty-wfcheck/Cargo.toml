@@ -16,7 +16,7 @@ doctest = false
 rustc-hash.workspace = true
 salsa.workspace = true
 
-ra-ap-rustc_type_ir.workspace = true
+rustc_type_ir.workspace = true
 
 # local deps
 hir-def.workspace = true

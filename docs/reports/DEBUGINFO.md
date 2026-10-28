@@ -1,19 +1,19 @@
 # Debug info
 
-Branch `ra-jit-debuginfo`. Everything of mine here is Linux x86-64 ELF. Mach-O is a design
+Branch `blaze-debuginfo`. Everything of mine here is Linux x86-64 ELF. Mach-O is a design
 note at the end; Windows has lines and procedures in CodeView from the Windows work, which
-came in with the merge of `ra-jit-collate-next` (WINDOWS.md). Rounds one and two (line tables, backtraces, the splice path, variables and
-types under both backends, profile settings) are in `ra-jit-collate`. Round three is on top of
-`ra-jit-collate-next` at 1b022ff6f2 and is described in "Round three" below; the sections marked
+came in with the merge of `blaze-collate-next` (WINDOWS.md). Rounds one and two (line tables, backtraces, the splice path, variables and
+types under both backends, profile settings) are in `blaze-collate`. Round three is on top of
+`blaze-collate-next` at 1b022ff6f2 and is described in "Round three" below; the sections marked
 "round two" are kept as written then, and where they say something else about scopes,
 closures, split debug info, the LLVM counts or cost, "Round three" is right.
 
 ## What there is now
 
-Every function ra-jit compiles is described in DWARF 4: a `DW_TAG_subprogram` per function
+Every function blaze compiles is described in DWARF 4: a `DW_TAG_subprogram` per function
 with its name, linkage name, declaration file and line and its range of code, and a
 `.debug_line` program that gives a file, line and column to every instruction that came from
-a statement. The producer string starts with `ra-jit`, which is how the harness tells ra-jit's
+a statement. The producer string starts with `blaze`, which is how the harness tells blaze's
 units from the ones rustc wrote for the dependencies.
 
 Round two: an object now has one compilation unit per 256 functions instead of one for the
@@ -35,7 +35,7 @@ produces `.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`, `.debug_li
 
 LLVM: the lowering from Cranelift IR to LLVM IR creates a `DISubprogram` per function through
 LLVM's DIBuilder and puts a debug location on every instruction, with the same span index in
-the place of the line number. LLVM writes a `.debug_line` for its module, ra-jit reads it back
+the place of the line number. LLVM writes a `.debug_line` for its module, blaze reads it back
 with gimli into the same (offset, span) rows, and from there the path is the one Cranelift
 uses. So the optimizer decides which instruction belongs to which statement, and the final
 sections are written by the same code for both backends.
@@ -53,7 +53,7 @@ Debug info follows the profile; see "Profile settings" below.
 
 ### At this head
 
-This head has `ra-jit-collate-next` 1b022ff6f2 merged in (a plain merge). The gate below was
+This head has `blaze-collate-next` 1b022ff6f2 merged in (a plain merge). The gate below was
 run once on it, on Linux x86-64, under both backends. What `debuginfo.py` printed:
 
 | part | Cranelift | LLVM -O2 |
@@ -76,17 +76,17 @@ breakers 94 of 94 with 6 open, unwinds 8 of 8, splices 71 of 71, asmedits 10 of 
 9 of 9, worktrees 62 of 62, keys 46 of 46 with 0 open, buildmodel 194 of 194 as expected, the
 five store harnesses (`storekills`, `storecorrupts`, `storefull`, `storeshared`,
 `storeguards`) pass, `selects.py` 3 of 3, `fuzz/fuzz.py smoke` and `fuzz/edits.py smoke`
-exit 0, `backends.py` under LLVM exits 0, `cargo_ra_jit.py --small` PASS under both; `cargo fmt` clean, `cargo test`
+exit 0, `backends.py` under LLVM exits 0, `blaze_cli.py --small` PASS under both; `cargo fmt` clean, `cargo test`
 1015 passed, 0 failed, 1 ignored. `realdebug.py` (ripgrep and axum) was last run on the
 head before this merge and not on this one.
 
-`cargo_ra_jit.py` did not pass where the gate first ran it and passed when run again alone,
+`blaze_cli.py` did not pass where the gate first ran it and passed when run again alone,
 under both backends, for reasons of this machine: a scratch `TMPDIR` long enough to put
 the daemon's socket past the length a socket path may have, and then a full disk.
 
 ### What the merge of 1b022ff6f2 needed
 
-`ra-jit-collate-next` had made `DebugContext` an enum of two writers, DWARF for ELF and
+`blaze-collate-next` had made `DebugContext` an enum of two writers, DWARF for ELF and
 CodeView for COFF, where this branch had one DWARF writer that had grown since (indexed
 types, scopes, units of 256 functions, split DWARF). The writer of this branch is now the
 `Dwarf` of that enum, unchanged inside; `emit` returns the files kept apart, which CodeView
@@ -98,14 +98,14 @@ ELF ones; the parts that ask gdb, lldb and `llvm-dwarfdump` for what only DWARF 
 say `not run` on Windows. That Windows side of the script was merged by reading and was not
 run: there was no Windows machine in this session.
 
-The script in `ra-jit-collate-next` before this merge is the one of round one. The row that
+The script in `blaze-collate-next` before this merge is the one of round one. The row that
 failed on the AArch64 runner is explained below and is fixed by this branch's script. Of the
 one failure under LLVM in the coordinator's gate I do not know the row; the script that
 failed is replaced whole by this one, which passed under LLVM each time it was run here.
 
 ### What the merge of 14ee89181b needed
 
-`ra-jit-collate` had come to guard the reading of a stored entry against debug types nested
+`blaze-collate` had come to guard the reading of a stored entry against debug types nested
 deeper than a stack can follow, on the types as round two had them, each holding the ones
 inside it. Round three keeps a function's types in one list and names them by index, so
 reading them cannot recurse and that guard is not needed there; the depth is checked
@@ -114,19 +114,19 @@ inside each other, the rest left out), and the lexical blocks of a function are 
 without recursion and a scope that is inside itself is left out. The test in `cached.rs`
 reads back an entry with types 40,000 deep, and writes the tables for it, for a scope that
 is its own parent and for scopes 40,000 deep, and sees each end. In `cargo/state.rs` the
-packed debug info (`.dwp`) is installed beside the program where `ra-jit-collate`'s new code
-installs the program; no harness builds `packed` through `cargo ra-jit`, so that path is
+packed debug info (`.dwp`) is installed beside the program where `blaze-collate`'s new code
+installs the program; no harness builds `packed` through `blaze`, so that path is
 compiled and not measured.
 
 ### The AArch64 runner's `wrong: 1`
 
-In CI on `ra-jit-collate` 14ee89181b (run 39086041463, `harness (cranelift, aarch64)`),
+In CI on `blaze-collate` 14ee89181b (run 39086041463, `harness (cranelift, aarch64)`),
 `debuginfo.py` failed on one row: `corpus: .eh_frame and the ranges  DISAGREE  11735
 functions, 1 without an entry, ... 5 of assembly alone`. It is the harness and not the debug
 info, and it is the miscount this branch had already fixed for x86-64: a `#[naked]`
 function has no unwinding entry and no line, and the script took the row that ends the line
 sequence of the function before it, which is at the address the naked one begins at, for a
-line of the naked one. `ra-jit-collate` has the script from before that fix. Measured here by
+line of the naked one. `blaze-collate` has the script from before that fix. Measured here by
 building the corpus for `aarch64-unknown-linux-gnu` with Cranelift on the x86-64 host
 (`BLAZE_TARGET=aarch64-unknown-linux-gnu python3 debuginfo.py --only corpus`) and running
 this branch's script on it: `11735 functions, 0 without an entry, ... 6 of assembly alone`,
@@ -135,11 +135,11 @@ that cross run that execute the program (panics, gdb) do not apply under qemu an
 counted.
 
 Refused, with a reason, when the build is planned: a `debug`, `strip` or `split-debuginfo`
-value ra-jit does not know. A splice into an executable with compressed debug sections is
-refused and ra-jit links in full. Nothing else in debug info is refused; `packed` and
+value blaze does not know. A splice into an executable with compressed debug sections is
+refused and blaze links in full. Nothing else in debug info is refused; `packed` and
 `unpacked` were until this round.
 
-Merging `ra-jit-collate` 8f21942505 changed where an out-of-bounds index is reported, and the
+Merging `blaze-collate` 8f21942505 changed where an out-of-bounds index is reported, and the
 line row of the check no longer followed it, so a backtrace had the line of the statement
 where the message had the line of the index expression. The row is now set with the place the
 message uses.
@@ -182,7 +182,7 @@ in `rustc -O -g` as well.
 
 ### LLVM and optimized-out values
 
-Before the default passes ra-jit now runs `sroa,instsimplify,sroa` on each function, so that
+Before the default passes blaze now runs `sroa,instsimplify,sroa` on each function, so that
 a stack slot the optimizer takes apart is described piece by piece (`DW_OP_piece`) instead
 of being dropped; constants read from read-only data are given to LLVM as constants. With
 that the `types` part is 21 of 21 under LLVM (was 20) and `locals` is 8 of 9 (was 6).
@@ -195,15 +195,15 @@ makes the row `behind rustc`, which is counted as open in the last line of the s
 
 What is open by that measure, under LLVM -O2:
 
-| part | value | why ra-jit loses it |
+| part | value | why blaze loses it |
 |---|---|---|
-| locals | `width` at `main.rs:11` | an argument that is dead after its one use. rustc inlines `area` into `main`, where `width` is the constant 10. ra-jit compiles `area` alone and its register is reused. |
-| scopes | `step` at `main.rs:16` | the loop variable is the second half of what `Range::next` returns and is never read. rustc inlines `next` and knows the value; ra-jit calls it, and LLVM drops the unused half of the result. |
+| locals | `width` at `main.rs:11` | an argument that is dead after its one use. rustc inlines `area` into `main`, where `width` is the constant 10. blaze compiles `area` alone and its register is reused. |
+| scopes | `step` at `main.rs:16` | the loop variable is the second half of what `Range::next` returns and is never read. rustc inlines `next` and knows the value; blaze calls it, and LLVM drops the unused half of the result. |
 | scopes | `value` at `main.rs:16` | `[step, total]`: the `total` half is described (`DW_OP_piece`), the `step` half is the value above, so gdb shows the array as partly optimized out. |
 
-All three have one cause: ra-jit compiles every function in a module of its own and does not
+All three have one cause: blaze compiles every function in a module of its own and does not
 inline, so a value that rustc's inlining turns into a constant or a known register is, for
-ra-jit's LLVM, the dead result of a call. I tried keeping named locals of up to 16 bytes
+blaze's LLVM, the dead result of a call. I tried keeping named locals of up to 16 bytes
 alive to the end of the function with `llvm.fake.use`; the values stayed alive but LLVM
 still marked them unknown inside the loop, and one more value was lost, so it is not in the
 tree. The other five optimized-out answers in `scopes` and the one in `rich` are lost by
@@ -213,7 +213,7 @@ tree. The other five optimized-out answers in `scopes` and the one in `rich` are
 
 `split-debuginfo = "unpacked"` and `"packed"` are now done rather than refused.
 
-- `unpacked`: each unit of ra-jit's is a skeleton in the object (`DW_AT_GNU_dwo_name`,
+- `unpacked`: each unit of blaze's is a skeleton in the object (`DW_AT_GNU_dwo_name`,
   `DW_AT_GNU_dwo_id`, the ranges and the address table) and a `.dwo` file beside the object,
   named `<object>.<n>.dwo`, with the `.debug_*.dwo` sections. This is the GNU extension to
   DWARF 4, which is what rustc writes at this version.
@@ -247,19 +247,19 @@ inferred and not measured.
 
 `harness/realdebug.py` clones ripgrep (15.1.0) and axum (`axum-v0.8.6`, the
 `example-hello-world` server), puts one panic into each, builds with cargo and with
-`cargo ra-jit` in the dev profile, and compares:
+`blaze` in the dev profile, and compares:
 
     cd harness
-    BLAZE_BIN=$PWD/../target/release/ra-jit python3 realdebug.py ripgrep axum
+    BLAZE_BIN=$PWD/../target/release/blaze-engine python3 realdebug.py ripgrep axum
 
 | | ripgrep | axum hello-world |
 |---|---|---|
-| `llvm-dwarfdump --verify`, ra-jit's units | 91 units, 0 errors | 31 units, 0 errors |
+| `llvm-dwarfdump --verify`, blaze's units | 91 units, 0 errors | 31 units, 0 errors |
 | gdb: stop at each place, name the same arguments and locals as the cargo build, same plain values | 6 places, all as cargo's | 6 places, all as cargo's |
 | panic with `RUST_BACKTRACE=1`, frames of the workspace by file:line | 5 frames, same | 6 frames, same |
-| `perf record --call-graph dwarf`, `perf report` | 151 symbols, 58 of ra-jit's functions, 0 without a name | 128 symbols, 74 of ra-jit's, 0 without a name |
-| `perf script` lines | 163 frames in ra-jit's functions, 0 without a line | 80 frames, 0 without a line |
-| `addr2line` at the start of every ra-jit function | 23,255 functions, 0 without a name, 0 without a line | 7,696 functions, 0 and 0 |
+| `perf record --call-graph dwarf`, `perf report` | 151 symbols, 58 of blaze's functions, 0 without a name | 128 symbols, 74 of blaze's, 0 without a name |
+| `perf script` lines | 163 frames in blaze's functions, 0 without a line | 80 frames, 0 without a line |
+| `addr2line` at the start of every blaze function | 23,255 functions, 0 without a name, 0 without a line | 7,696 functions, 0 and 0 |
 
 These are Cranelift numbers, taken at this head.
 
@@ -267,11 +267,11 @@ Under LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`), at this head:
 
 | | ripgrep | axum hello-world |
 |---|---|---|
-| `llvm-dwarfdump --verify`, ra-jit's units | 91 units, 0 errors | 30 units, 0 errors |
+| `llvm-dwarfdump --verify`, blaze's units | 91 units, 0 errors | 30 units, 0 errors |
 | gdb places | 5 of 6 as cargo's; at one, `let mut searched = false;`, the optimizer left the line no code | 6 places, all as cargo's; 2 values optimized out |
 | panic frames | 5, same | 6, same |
-| `perf report` | 94 symbols, 10 of ra-jit's functions, 0 without a name | 59 symbols, 15 of ra-jit's, 0 without a name |
-| `perf script` lines | 88 frames in ra-jit's functions, 0 without a line | 33 frames, 0 without a line |
+| `perf report` | 94 symbols, 10 of blaze's functions, 0 without a name | 59 symbols, 15 of blaze's, 0 without a name |
+| `perf script` lines | 88 frames in blaze's functions, 0 without a line | 33 frames, 0 without a line |
 | `addr2line` | 23,260 functions, 0 and 0 | 7,581 functions, 0 and 0 |
 
 A place where optimized code has no instruction is reported as `no code` and passes only
@@ -289,11 +289,11 @@ half-way had the line of the `async` block and was laid out first, so a breakpoi
 handler's line stopped in the drop path (that code, and the blocks that panic when a
 finished future is polled again, are now cold and laid out behind the body); and perf could not unwind through spliced
 code, because the segment a splice appends was not as far from the unwind table in the file
-as in memory. `Image::behind` in `crates/ra-jit/src/splice.rs` now places it so.
+as in memory. `Image::behind` in `crates/blaze-engine/src/splice.rs` now places it so.
 
 ### A line for every instruction
 
-`debuginfo.py` walks every function of ra-jit's against `.debug_line` in every binary it
+`debuginfo.py` walks every function of blaze's against `.debug_line` in every binary it
 builds and fails if any byte of one has no row (`a line for every instruction`). Before the
 fix 1,056 of 11,647 corpus functions had no row at all: drop glue, `call_once` and reify
 shims, and functions with no statement of their own such as the outer half of an
@@ -316,7 +316,7 @@ with `BLAZE_DEBUGINFO=0` and without.
 | Binary, no debug | 86,995,944 | 83,613,408 |
 | Binary, debug | 91,645,816 | 88,434,528 |
 
-Measured at the head before the merge of `ra-jit-collate-next`. With it merged, the one run
+Measured at the head before the merge of `blaze-collate-next`. With it merged, the one run
 inside the whole `debuginfo.py` gave 6.09 s and 7.42 s (+21.9%, object +21.6%) for
 Cranelift and 6.99 s and 7.87 s (+12.5%, object +26.8%) for LLVM. The sizes are exact; the
 time is not. Each backend was measured
@@ -347,10 +347,10 @@ LLVM: the lowering gives every such slot an `alloca` and a `dbg.declare` through
 under a made-up variable named after the slot number and with a made-up integer type of the
 slot's size. LLVM then does what it does for clang: where the optimizer keeps the slot in
 memory it writes a frame offset, where it moves the value into registers or drops it, it
-writes a location list or nothing. ra-jit reads LLVM's `.debug_info` back (frame base, each
+writes a location list or nothing. blaze reads LLVM's `.debug_info` back (frame base, each
 slot's `DW_AT_location`, location lists resolved to ranges of the function) and throws LLVM's
 unit away. The real names, types and scopes are then written by the same writer as for
-Cranelift. So LLVM decides where a value is and whether it still exists, and ra-jit never
+Cranelift. So LLVM decides where a value is and whether it still exists, and blaze never
 guesses: a slot LLVM says nothing about is described with no location, and gdb prints
 `<optimized out>` for it.
 
@@ -399,17 +399,17 @@ optimizes: a three-function copy of this shape with `#[inline(never)]`, built wi
 build only because that is a dev build. Turning tail
 calls off for LLVM (`disable-tail-calls`) would bring the frame back and cost what the
 optimization saves in every build, so the harness proves the explanation instead of the code
-changing: for every frame that is in the cargo build's backtrace and not in ra-jit's, it finds
-the function's range in ra-jit's debug info, disassembles it, and requires a jump out of the
+changing: for every frame that is in the cargo build's backtrace and not in blaze's, it finds
+the function's range in blaze's debug info, disassembles it, and requires a jump out of the
 function. A function that is missing and has no such jump is reported as `FRAMES LOST` and
 fails the run. Under Cranelift nothing may be missing at all.
 
 Inlining. Both backends compile one function per module (`llvm::emit` creates a module with
-the one function), so no ra-jit function is inlined into another and there are no
+the one function), so no blaze function is inlined into another and there are no
 `DW_TAG_inlined_subroutine` entries to write. The new `callers` part of the harness checks
 what follows from that: a chain of an `#[inline(always)]` function inside an `#[inline]`
 one, which rustc inlines even in a dev build and reports as inlined frames, prints the same
-three frames from ra-jit, where they are real frames.
+three frames from blaze, where they are real frames.
 
 `#[track_caller]`. The same part panics through two nested `#[track_caller]` functions,
 through one that reads `Location::caller()` into its message, through a `#[track_caller]`
@@ -425,33 +425,33 @@ bounds check now takes its location from the index expression.
 
 ## Profile settings (round two)
 
-The settings come from the build-model's plan (`crates/ra-jit/src/plan.rs`, which takes them
+The settings come from the build-model's plan (`crates/blaze-engine/src/plan.rs`, which takes them
 from cargo's unit graph); `Cargo.toml` is not parsed again and `profile.rs` is not touched.
 `Profile::described` turns `debuginfo`, `split_debuginfo` and `strip` into one of three
 answers, nothing, lines, or full, with where it is kept, or into a refusal:
 
-| setting | what ra-jit does |
+| setting | what blaze does |
 |---|---|
 | `debug = false`, `0`, `"none"` | no debug sections |
 | `debug = 1`, `"limited"`, `"line-tables-only"`, `"line-directives-only"` | line tables and subprograms, no variables or types |
 | `debug = true`, `2`, `"full"` | everything |
-| any other `debug` value | refused: "ra-jit does not know the level" |
+| any other `debug` value | refused: "blaze does not know the level" |
 | `strip = "debuginfo"` or `"symbols"` (`true`) | no debug sections, whatever `debug` says |
 | `split-debuginfo = "off"`, or not set | as above |
 | `split-debuginfo = "unpacked"` with debug info on | a `.dwo` beside each object (round three) |
 | `split-debuginfo = "packed"` with debug info on | the same, and a `.dwp` beside the executable (round three) |
-| any other `split-debuginfo` or `strip` value | refused: "ra-jit does not know the setting" |
+| any other `split-debuginfo` or `strip` value | refused: "blaze does not know the setting" |
 | `split-debuginfo` set with debug info off or stripped | accepted, there is nothing to split |
 
 Round two refused `packed` and `unpacked`; they are done now, see "Split DWARF" under "Round
-three". What is still refused is a value of `debug`, `strip` or `split-debuginfo` that ra-jit
+three". What is still refused is a value of `debug`, `strip` or `split-debuginfo` that blaze
 does not know, and the build fails with that reason when it is planned.
 
 `strip = "symbols"` also asks for the symbol table to go. That is the linker's work and is
 not done by this code.
 
 When several packages are built with different profiles, the most any of the packages cargo
-was asked to build wants is used for all of ra-jit's code. The harness changes the setting
+was asked to build wants is used for all of blaze's code. The harness changes the setting
 nine times in one workspace and checks the object after each. `BLAZE_DEBUGINFO=0|lines|1`
 overrides it for measuring. Since the build model's second round `profile.rs` is gone: the
 setting is a `plan::Described` read from the unit graph and kept through a reload, and a
@@ -471,7 +471,7 @@ There are three layers.
    `crates/hir-ty/src/mir/codegen/debuginfo.rs`: its name and linkage name, where it is
    declared, the rows with file, line and column looked up, a table of types (`DebugType`:
    base, pointer, array, aggregate with fields, tags and variants), variables with a type
-   index and a place, and scopes. `debuginfo/types.rs` builds the type table from ra-jit's
+   index and a place, and scopes. `debuginfo/types.rs` builds the type table from blaze's
    types and layouts. This layer is the format-independent part: it is the same for ELF,
    Mach-O and COFF, and it is what a CodeView writer would consume. The one DWARF-shaped
    thing in it is the location expression bytes of a variable that is not at a plain frame
@@ -496,7 +496,7 @@ section symbols.
   `FunctionDebug` values and writes `.debug$S`; `DebugContext` is the enum of the two
   writers, picked from the target's binary format in `DebugContext::new`. A Mach-O writer
   is a third arm there.
-- The splice path appends debug sections to a linked ELF (`crates/ra-jit/src/splice`); that
+- The splice path appends debug sections to a linked ELF (`crates/blaze-engine/src/splice`); that
   code is per format already and is separate from the above.
 
 The harness is split the same way. In `harness/debuginfo.py` the comparison of backtraces
@@ -535,23 +535,23 @@ and `e_shnum` updated. Until this round that was refused. It happens with split 
 under LLVM, where the executable's location lists are in the `.dwo` files and the patch,
 which is not split, has a `.debug_loc`; three of the six edits of the `kept apart` run were
 linked in full for it before. If a section is compressed (`SHF_COMPRESSED`), the splice is
-refused with that reason and ra-jit links in full instead.
+refused with that reason and blaze links in full instead.
 
 A function is put in the patch again not only when its code changes but when any of its
 lines change, so adding a line at the top of a file re-describes the functions below it. Its
 compiled code comes from the cache; only the line lookup is redone.
 
-The code is in `crates/ra-jit/src/splice/debug.rs`.
+The code is in `crates/blaze-engine/src/splice/debug.rs`.
 
 ## What was measured
 
 All on one machine, Linux x86-64, Rust 1.99.0, LLVM 20, at the head of this branch.
 
-    cargo build -p ra-jit --release
-    LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm --target-dir target-llvm
+    cargo build -p blaze-engine --release
+    LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p blaze-engine --release --features llvm --target-dir target-llvm
     cd harness
-    BLAZE_BIN=$PWD/../target/release/ra-jit python3 debuginfo.py
-    BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast BLAZE_BIN=$PWD/../target-llvm/release/ra-jit python3 debuginfo.py
+    BLAZE_BIN=$PWD/../target/release/blaze-engine python3 debuginfo.py
+    BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast BLAZE_BIN=$PWD/../target-llvm/release/blaze-engine python3 debuginfo.py
 
 `debuginfo.py` exits 0 under both backends ("all right").
 `--only corpus|stress|rung2|edits|callers|locals|types|scopes|rich|profile|cost` runs one part. The
@@ -560,7 +560,7 @@ small programs the script writes itself.
 
 What it checks, and what it printed:
 
-Backtraces. Each program is built by cargo and by ra-jit, each deliberate panic is run with
+Backtraces. Each program is built by cargo and by blaze, each deliberate panic is run with
 `RUST_BACKTRACE=1`, and the frames that belong to the workspace's crates are compared by
 name, file, line and column. The panic location itself is compared as well, which is the
 `#[track_caller]` check: the corpus and the edits program panic through `#[track_caller]`
@@ -573,17 +573,17 @@ functions.
 | rung2 | 1 panic, 3 frames, same | same |
 | callers (round two) | 6 panics, 19 frames, same | 6 panics, 18 frames; one short (`sline::inner`, which ends in `expect`), seen to leave by a jump |
 
-Under Cranelift the comparison is exact. Under LLVM at -O2 a panic passes if ra-jit's frames
+Under Cranelift the comparison is exact. Under LLVM at -O2 a panic passes if blaze's frames
 are the cargo build's with some left out and every function left out is one that leaves by a
 jump; see "Tail calls" above.
 
 One name is normalized by the script: rustc calls the code that drops a coroutine
-`core::ptr::drop_glue::<X>` and ra-jit has the coroutine's own poll function do it, so the
+`core::ptr::drop_glue::<X>` and blaze has the coroutine's own poll function do it, so the
 frame is named `X`. The file, line and column agree. This affects 14 of the 84 corpus panics.
 
 `llvm-dwarfdump --verify`: "No errors." for every binary, including after each splice.
 
-Unwind tables against debug ranges. For every range in a ra-jit unit the script looks for the
+Unwind tables against debug ranges. For every range in a blaze unit the script looks for the
 frame the unwinder would find (through `PT_GNU_EH_FRAME` and the search table, not the
 section header) and checks that it starts at the same address and does not end after the
 range. Corpus: 11647 functions, 0 without a frame, 0 where the frame ends past the range.
@@ -592,13 +592,13 @@ assembly only. Stress: 1834 functions, rung2: 3039, edits: 71 to 79 after each s
 agree.
 
 gdb, batch mode: break at the file:line of the call into the panicking function, check gdb
-stops there, that the pc is in a ra-jit unit, that `info line` gives that line, then `step`
+stops there, that the pc is in a blaze unit, that `info line` gives that line, then `step`
 four times and check it reaches other lines. Passes for corpus, stress, rung2 and for the
 binary after the last splice under both backends. `print` of locals is the `locals` part
 below.
 
 perf: `perf record -F 5000 --call-graph dwarf` on the corpus runner, then
-`perf script -F ip,sym,srcline`. Cranelift: 79 frames of ra-jit functions in 36 samples, none
+`perf script -F ip,sym,srcline`. Cranelift: 79 frames of blaze functions in 36 samples, none
 without a line, 24 samples unwound back to `main`. LLVM: 46 frames in 22 samples, none without a line, 15 back to `main`. The machine needed
 `sudo sysctl kernel.perf_event_paranoid=1`; where perf is not allowed the script says "not
 run" and does not fail. No flamegraph tool is installed here, so no SVG was produced; the
@@ -614,16 +614,16 @@ Variables (`locals`): gdb stops in a function with three parameters and six loca
 prints each (`u32`, `f32`, `&str`, a struct, a tuple struct, an array, a tuple, and a
 dereferenced reference). A value passes if it is right or if gdb says `<optimized out>`; a
 wrong value or an unknown name fails. Cranelift: 9 of 9 right. LLVM -O2: 6 of 9 right and 3
-`<optimized out>` in round two, 8 of 9 now. In the larger programs ra-jit describes 15,946 parameters and locals across
+`<optimized out>` in round two, 8 of 9 now. In the larger programs blaze describes 15,946 parameters and locals across
 11,647 functions in the corpus, 3,006 in 1,834 for stress, 3,139 in 3,039 for rung2, the same
 count under both backends.
 
-Types (`types`, round two): the same program is built by cargo and by ra-jit, `rust-gdb` stops
+Types (`types`, round two): the same program is built by cargo and by blaze, `rust-gdb` stops
 at the same line in both and prints 21 values: a `u32`, a `&str`, a `[u64; 5]` passed by
 value, a struct, a tuple struct, a tuple, three variants of an enum with fields (struct-like,
 tuple-like, unit), a fieldless enum with explicit discriminants, `Some(42)`, `None`,
 `Option<&Point>` both ways (a niche), `Result<u8, String>`, a `Vec<i32>`, a `String`, a slice
-of the `Vec`, a union, a dereferenced reference and a sum. What ra-jit's binary prints has to
+of the `Vec`, a union, a dereferenced reference and a sum. What blaze's binary prints has to
 be what the cargo build's prints, character for character apart from addresses. Cranelift:
 21 of 21. LLVM -O2: 20 of 21 in round two with one `<optimized out>` (the second field of the
 tuple struct, which the optimizer splits apart), 21 of 21 now.
@@ -710,7 +710,7 @@ on this machine did not have those two targets installed during the full run and
 itself could not build the cases.
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p ra-jit`: 930 passed, 0 failed, 1 ignored. `cargo clippy -p hir-ty -p ra-jit` has
+-p syntax -p blaze-engine`: 930 passed, 0 failed, 1 ignored. `cargo clippy -p hir-ty -p blaze-engine` has
 no warning in the files this branch added.
 
 ## The gdb rows on the GitHub runner
@@ -744,18 +744,18 @@ runner and every gdb row is `stopped`: corpus `lib.rs:1962`, stress, rung2 `main
 the binary after the last splice, with locals 9 of 9 and types 21 of 21 under Cranelift and
 6 of 9 with 3 optimized out and 20 of 21 with 1 optimized out under LLVM, the same as here.
 No row is skipped on CI. The `Coverage` workflow fails on this branch as it does on
-`ra-jit-collate`; I did not look into it.
+`blaze-collate`; I did not look into it.
 
 ## What is open
 
 Inline frames. There are no `DW_TAG_inlined_subroutine` entries because nothing is inlined;
-see "Tail calls, inlining and `#[track_caller]`". If ra-jit starts inlining (LLVM across
+see "Tail calls, inlining and `#[track_caller]`". If blaze starts inlining (LLVM across
 functions, or MIR inlining) the entries have to be added at the same time, or backtraces
 will lose frames.
 
 Under LLVM -O2 three values that `rustc -O -g` shows are `<optimized out>`: `width` in the
 `locals` part, `step` and the `step` half of `value` in `scopes`. The cause and what was
-tried are under "LLVM and optimized-out values". Closing it needs ra-jit's LLVM to see the
+tried are under "LLVM and optimized-out values". Closing it needs blaze's LLVM to see the
 callee, that is inlining, which also needs `DW_TAG_inlined_subroutine` (above).
 
 Locals that Cranelift keeps in a register and unsized locals are not described. I did not
@@ -792,17 +792,17 @@ std objects and is the same for the cargo build.
 
 ## Where the work stopped, and what I would do next
 
-Done: everything in "At this head", on ELF under both backends, with `ra-jit-collate-next`
+Done: everything in "At this head", on ELF under both backends, with `blaze-collate-next`
 merged and the gate run once on that.
 
 Half done: split DWARF (`unpacked` is checked through a splice, `packed` only on the
-fixture and never through `cargo ra-jit`); the cost, which is measured and not yet profiled
+fixture and never through `blaze`); the cost, which is measured and not yet profiled
 for this round; the Windows side of `debuginfo.py`, merged and not run.
 
 Next, in this order: run `debuginfo.py` on the Windows and AArch64 runners and read the
 rows; write the debug sections with fewer relocations (one symbol a unit, DWARF 5
 `addrx`), since the relocations are as large as the sections; a `packed` program through a
-splice and through `cargo ra-jit`; the three LLVM values, which need inlining and the
+splice and through `blaze`; the three LLVM values, which need inlining and the
 inlined-subroutine entries with it; variables and types in CodeView; Mach-O.
 
 ## Mach-O (design only)
@@ -816,7 +816,7 @@ For a full link this is mostly free: the gimli writer already produces the secti
 they need to go into `__DWARF,__debug_*` with Mach-O relocations (`object` supports this; the
 relocation kinds for section-relative references differ, `X86_64_RELOC_UNSIGNED` /
 `ARM64_RELOC_UNSIGNED` and subtractor pairs). The backtrace in a Rust binary on macOS reads
-the dSYM or the objects through the debug map, so ra-jit's object has to stay on disk where
+the dSYM or the objects through the debug map, so blaze's object has to stay on disk where
 `N_OSO` says or `dsymutil` has to be run after the link.
 
 For a splice the debug map is the natural place: add an `N_OSO` entry for the patch object
@@ -839,7 +839,7 @@ MSVC targets use CodeView: `.debug$S` (symbols and line tables per function) and
 (types) in the COFF object, which `link.exe` or `lld-link` merge into a PDB.
 
 LLVM can write CodeView itself (module flag `CodeView`, the same DIBuilder metadata), so the
-LLVM backend is the short path, but today ra-jit reads LLVM's line table back and writes the
+LLVM backend is the short path, but today blaze reads LLVM's line table back and writes the
 sections itself, and that part would need a CodeView reader or a mode where LLVM's sections
 are kept as they are. Cranelift has no CodeView writer, and as far as I know rustc's Cranelift
 backend does not have one either. Writing `.debug$S` line tables and `S_GPROC32` records by hand is

@@ -2,7 +2,7 @@
 """latelisted.py: what a file an `include!` names declares is listed in its crate, though the
 file is loaded only once the names are resolved.
 
-usage: latelisted.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: latelisted.py    (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 bun's crates `include!` the code its generators write, from a directory a build script names in
 a variable (`BUN_CODEGEN_DIR`). The VFS has none of those files when the daemon first lists a
@@ -20,8 +20,8 @@ import glob, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import cargo_ra_jit
-from cargo_ra_jit import Side
+import blaze_cli
+from blaze_cli import Side
 
 EXPORTS = 64
 FILES = {
@@ -66,15 +66,15 @@ def build(side, step, home):
 
 def main():
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
-    if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
+    if not os.path.exists(os.path.join(bin_dir, "blaze")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
     # Short, for the daemon's sockets under its home.
-    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-ll-", dir="/tmp"))
+    root = os.path.realpath(tempfile.mkdtemp(prefix="blaze-ll-", dir="/tmp"))
     ws, home = (os.path.join(root, n) for n in ("ws", "home"))
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    env = cargo_ra_jit.base_env(home)
+    env = blaze_cli.base_env(home)
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
     for name in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL"):
         env.pop(name, None)

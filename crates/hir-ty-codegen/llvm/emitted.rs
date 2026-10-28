@@ -3,7 +3,7 @@
 //!
 //! The code of a function is its section. Constants LLVM put in sections of their own (jump
 //! tables, float literals) are laid out after it in the same bytes, and what the code says
-//! about where they are is filled in here, so that the rest of ra-jit sees one piece of code
+//! about where they are is filled in here, so that the rest of blaze sees one piece of code
 //! that refers to nothing but what the function asked for. What the functions of a unit call
 //! of each other they call by the names of requests, as they call anything else; constants
 //! more than one of them uses are a data object of their own.

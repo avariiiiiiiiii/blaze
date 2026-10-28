@@ -24,7 +24,7 @@
   "project": "axum",
   "crate": "aws-lc-sys v0.32.1",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 2 functions ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 2 functions blaze could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:",
   "out_dir": "/root/bsw/work/target/axum/debug/build/aws-lc-sys/c28cc39e646d9bc8/out"
  },
  {
@@ -402,7 +402,7 @@
   "project": "bat",
   "crate": "bat v0.26.0",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/bat/debug/build/bat/fbcd8de39ad40460/out"
  },
  {
@@ -1095,7 +1095,7 @@
   "project": "biome",
   "crate": "biome_aria_metadata v0.7.0",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/biome/debug/build/biome_aria_metadata/48af6c0bccfb6884/out"
  },
  {
@@ -1214,7 +1214,7 @@
   "project": "biome",
   "crate": "encoding_rs v0.8.42",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/biome/debug/build/encoding_rs/98f5a5c4b6c4cc53/out"
  },
  {
@@ -1501,7 +1501,7 @@
   "project": "biome",
   "crate": "wasm-bindgen v0.2.117",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/biome/debug/build/wasm-bindgen/7080e4931bec7c7c/out"
  },
  {
@@ -1921,7 +1921,7 @@
   "project": "helix",
   "crate": "helix-term v25.7.1",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `env!(\"BUILD_TARGET\")` in helix_loader names a variable that is not set",
+  "why": "blaze did not build it (exit status: 1): Error: `env!(\"BUILD_TARGET\")` in helix_loader names a variable that is not set",
   "out_dir": "/root/bsw/work/target/helix/debug/build/helix-term/c06f63a75ec38cc6/out"
  },
  {
@@ -2586,7 +2586,7 @@
   "project": "nushell",
   "crate": "oem_cp v2.1.0",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/nushell/debug/build/oem_cp/c9554c0490cff1c3/out"
  },
  {
@@ -3475,7 +3475,7 @@
   "project": "zed",
   "crate": "livekit_api v0.1.0",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions blaze could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:",
   "out_dir": "/root/bsw/work/target/zed/debug/build/livekit_api/96ba0393dac60dd6/out"
  },
  {
@@ -3587,7 +3587,7 @@
   "project": "zed",
   "crate": "octocrab v0.49.7",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/zed/debug/build/octocrab/538bfe909e353c6c/out"
  },
  {
@@ -3629,7 +3629,7 @@
   "project": "zed",
   "crate": "pbjson-types v0.9.0",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/zed/debug/build/pbjson-types/9ba2dddd0f6e1ba3/out"
  },
  {
@@ -3699,7 +3699,7 @@
   "project": "zed",
   "crate": "proto v0.1.0",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions blaze could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:",
   "out_dir": "/root/bsw/work/target/zed/debug/build/proto/4bc5f284d705a338/out"
  },
  {
@@ -4133,7 +4133,7 @@
   "project": "zed",
   "crate": "wasmtime v48.0.1",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/zed/debug/build/wasmtime/1430994b745cbdf1/out"
  },
  {
@@ -4175,7 +4175,7 @@
   "project": "zed",
   "crate": "wasmtime-internal-fiber v48.0.1",
   "category": "other: not built for wasm32-wasip1",
-  "why": "ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
+  "why": "blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:",
   "out_dir": "/root/bsw/work/target/zed/debug/build/wasmtime-internal-fiber/bec90c44c4b2f48f/out"
  },
  {

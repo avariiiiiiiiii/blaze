@@ -35,4 +35,4 @@ Cited from memory or common knowledge and marked **reported** where used: git's 
 object format, the Nix store, REAPI's `Directory` digests (the proto is in
 [../ci-runner/remote_execution.proto](../ci-runner/remote_execution.proto)), Unison's
 content-addressed codebase, io_uring's registered files and buffers, FSKit on macOS 15.4 and later,
-and makepad's Relax (read for [#232](https://github.com/indexable-inc/ra-jit/issues/232)).
+and makepad's Relax (read for [#232](https://github.com/indexable-inc/blaze/issues/232)).

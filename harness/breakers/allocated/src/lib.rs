@@ -1,6 +1,6 @@
 //! bun keeps slices in arenas: `Box<[T], &MimallocArena>`. A `Box` beside an allocator that has
 //! a size is not a pointer (and a length) alone, and its pointer is a field wherever the layout
-//! put it: ra-jit read it at the start, and left a deref of one to rustc. `allocator_api` is a
+//! put it: blaze read it at the start, and left a deref of one to rustc. `allocator_api` is a
 //! nightly feature, so breakers.py runs this crate's tests with RUSTC_BOOTSTRAP=1.
 #![feature(allocator_api)]
 

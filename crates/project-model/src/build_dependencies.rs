@@ -674,7 +674,7 @@ impl WorkspaceBuildScripts {
                     cmd.env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly");
                     cmd.arg("-Zunstable-options");
                 }
-                // ra-jit: what this cargo asks rustc is answered as the embedder answers it.
+                // blaze: what this cargo asks rustc is answered as the embedder answers it.
                 crate::ready_question(&mut cmd);
                 Ok((lockfile_copy, cmd))
             }

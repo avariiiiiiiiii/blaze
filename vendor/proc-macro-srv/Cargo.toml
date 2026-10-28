@@ -1,5 +1,5 @@
-# The proc-macro server of the toolchain in `harness/toolchain`, built by ra-jit, which loads the
-# libraries ra-jit links (docs/no-rustc.md, step J1). `crates/` is `src/tools/rust-analyzer/crates`
+# The proc-macro server of the toolchain in `harness/toolchain`, built by blaze, which loads the
+# libraries blaze links (docs/no-rustc.md, step J1). `crates/` is `src/tools/rust-analyzer/crates`
 # and `compiler/rustc_lexer` is `compiler/rustc_lexer` of rust-lang/rust at the toolchain's commit
 # (nightly-2026-10-27, 16d1ffac17ad8b739e32483ac2e65fe7e1804977), the crates the toolchain's
 # `rust-analyzer-proc-macro-srv` is built from, without their tests; `Cargo.lock` holds the
@@ -7,7 +7,7 @@
 # server in rustc's tree, against rustc's own crates; what is changed is what takes their place:
 #
 # - `proc-macro-srv/src/dylib.rs` loads a library with `dlopen` and reads the list of its macros
-#   that ra-jit writes into it (`crates/ra-jit/src/macro_list.rs`), where the toolchain's reads
+#   that blaze writes into it (`crates/blaze-engine/src/macro_list.rs`), where the toolchain's reads
 #   rustc's metadata with `rustc_metadata`; `dylib/proc_macros.rs` matches that list.
 # - `rustc_proc_macro` is the standard library's `proc_macro` (rustc's tree builds the one as the
 #   other), and `rustc_lexer` the vendored crate, not the compiler's.

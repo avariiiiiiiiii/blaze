@@ -1,5 +1,5 @@
 //! A proc-macro crate of a load and what it depends on, as a `rust-project.json`: what a
-//! caller builds it from itself (ra-jit, as a WebAssembly module), whoever compiled its library.
+//! caller builds it from itself (blaze, as a WebAssembly module), whoever compiled its library.
 
 use cfg::CfgAtom;
 use ide_db::{

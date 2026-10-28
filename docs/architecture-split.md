@@ -9,10 +9,10 @@ to 3) still holds.
 Date: 2026-10-21. A design and a plan, being carried out: steps 0 (the rebuild times, 3.3), 2
 (the code generator a crate), 3 (the store a crate), 4 (the borrow checker into the subtree)
 and 5 (the fork builds alone, checked in CI) are done, see their
-rows in section 4. The rest of this text describes the tree before them. Read against ra-jit `main` at
-`22b1267233`, the fork `indexable-inc/rust-analyzer` `ra-jit` at `c0dabc5588`, and upstream
+rows in section 4. The rest of this text describes the tree before them. Read against blaze `main` at
+`22b1267233`, the fork `indexable-inc/rust-analyzer` `blaze` at `c0dabc5588`, and upstream
 `rust-lang/rust-analyzer` `master` at `ea09c7b724`. The fork last met upstream at
-`0b21bd6596` (2026-10-20), so "ra-jit's changes to rust-analyzer" below means
+`0b21bd6596` (2026-10-20), so "blaze's changes to rust-analyzer" below means
 `git diff 0b21bd6596 main:vendor/rust-analyzer`.
 
 Each claim carries a mark, as in [research/](research/README.md): **(read)** checked in the
@@ -22,15 +22,15 @@ code, a command's output or a document cited; **(reported)** someone else says s
 
 ## The recommendation, in short
 
-The question was whether more of ra-jit should live inside the rust-analyzer subtree so that
+The question was whether more of blaze should live inside the rust-analyzer subtree so that
 the code outside it gets simpler. The finding is that the boundary is blurred the other way:
-**most of ra-jit's compiler already lives inside rust-analyzer's `hir-ty` crate.**
+**most of blaze's compiler already lives inside rust-analyzer's `hir-ty` crate.**
 `crates/hir-ty-codegen` (37,000 lines, Cranelift, LLVM, the wasm writer, the disk store,
 tiers, the fn-cache hash) and `crates/hir-ty-borrowck` (6,000 lines) are not crates. They are
 modules of `hir-ty`, pulled in by two `#[path]` lines in the fork's `mir.rs` that climb out of
 `vendor/` (read: `crates/hir-ty/src/mir.rs:35-39`). `hir-ty` carries 15
 dependencies for them, Cranelift and inkwell among them, and the fork cannot build without
-ra-jit around it.
+blaze around it.
 
 So the fix is to make the split real, in both directions:
 
@@ -46,20 +46,20 @@ So the fix is to make the split real, in both directions:
    have to sit at or below it; a separate pass crate would have to take the interpreter and
    const eval with it.
 4. **The fn-cache "code hash" stays with the code generator.** It hashes the machine code
-   ra-jit compiled, not the source or the MIR (read: `crates/hir-ty-codegen/fncache.rs:1-12`).
+   blaze compiled, not the source or the MIR (read: `crates/hir-ty-codegen/fncache.rs:1-12`).
 5. **The disk store moves out of the code generator** into a small crate of its own
-   (`crates/ra-jit-store`). It knows nothing about Rust, and today `remote.rs` and the store
+   (`crates/blaze-store`). It knows nothing about Rust, and today `remote.rs` and the store
    benchmark depend on `hir-ty` to reach it.
 
 What this buys: one-way dependencies (the subtree never points into `crates/`, and a fork
 that builds and tests alone); `hir-ty`'s `Cargo.toml` diff against upstream shrinks from 36
 added lines to about 4; codegen work stops rebuilding the rust-analyzer stack; and the
-interface between ra-jit and `hir-ty` becomes an explicit list of public items instead of
+interface between blaze and `hir-ty` becomes an explicit list of public items instead of
 "anything in the crate".
 
 What it does not buy, and this is the main trade-off: **moving code into `vendor/` does not
 make upstream merges cheaper.** A file upstream does not have conflicts with nothing, whether
-it is under `crates/` or under `vendor/`. Merge cost comes only from ra-jit's edits to
+it is under `crates/` or under `vendor/`. Merge cost comes only from blaze's edits to
 upstream's own files, which today are about 10,700 added and 2,300 removed lines in 169
 files, 157 of which upstream itself changed in the last six months (read:
 [measured/upstream-churn.txt](upstream/architecture-split/measured/upstream-churn.txt)). The
@@ -70,12 +70,12 @@ new behaviour in new files rather than in upstream's. That is a separate, ongoin
 
 The rule for new code is in [AGENTS.md](../AGENTS.md) and
 [contributing.md](contributing.md#where-new-code-goes): language semantics go in the subtree,
-as a new crate or a new file there in preference to edits to upstream's files; ra-jit's
+as a new crate or a new file there in preference to edits to upstream's files; blaze's
 machinery stays in `crates/`.
 
 ## 1. What there is today
 
-### 1.1 ra-jit's code, and what it uses of rust-analyzer
+### 1.1 blaze's code, and what it uses of rust-analyzer
 
 Line counts are of `.rs` files (read: `wc -l`).
 
@@ -83,13 +83,13 @@ Line counts are of `.rs` files (read: `wc -l`).
 |---|---|---|---|
 | `crates/hir-ty-codegen` (module `hir_ty::mir::codegen`) | 36,808 | MIR to Cranelift IR (`mod.rs`, 14,036), producers (Cranelift, LLVM in `llvm*`, wasm in `wasm*.rs`), the per-function query and stitching (`fragment.rs`), patches (`patch.rs`), the disk store (`store.rs`, `store/`), stable names and cached entries (`stable.rs`, `cached.rs`), tiers (`tier.rs`), fn-cache (`fncache.rs`), debug info, unwind tables, `asm!`, targets, vtables, `TypeId`s, panic locations (`places.rs`), which crate an instance is compiled as (`home.rs`, `settled.rs`) | Everything in `hir-ty`, private items included: MIR types, `runtime_`/`optimized_`/`monomorphized_` MIR queries, `interpret_mir`, layout, `lookup_impl_method`, `field_types`, const eval, the next solver's inference context, `type_name`, `MemoryMap` internals. About 30 salsa tracked functions of its own (read: `rg '#\[salsa::tracked'`). |
 | `crates/hir-ty-borrowck` (module `hir_ty::mir::borrowck`) | 6,010 | rustc's NLL and Polonius-alpha borrow checker on rust-analyzer's MIR ([borrowck.md](borrowck.md)) | `hir-ty`'s built MIR, move paths from the fork's `mir/transform/move_paths.rs`, `drop`, the next solver, variances, closure captures; private `return_slot` and `for_each_operand`. Called from `hir`'s diagnostics (`hir/src/diagnostics.rs:1314`). |
-| `crates/ra-jit` | 31,574 | The worker (`main.rs`, 6,874), the cargo drop-in (`cargo/`), daemon and sockets, the splice for ELF, Mach-O, PE and wasm (`splice*`), symbols from rlibs, the remote store (`remote*`), crate identity by content (`content.rs`), body-only edit detection (`outline.rs`), build inputs (`inputs.rs`, `tree.rs`, `process.rs`), doctests, tiering's sampler side (`tier.rs`), `ra-jit mir` and `ra-jit borrowck` | `hir`, `hir-def`, `ide-db`, `ide-diagnostics`, `load-cargo`, `project-model`, `vfs`, `syntax`; about 30 items of `hir_ty::mir::codegen`; `hir_ty::mir::print_mir_body` and `MirOptLevel` (`mirdump.rs`); `hir_ty::method_resolution::{TraitImpls, InherentImpls, impl_work}` |
-| `crates/ra-jit-live` | 1,596 | The runtime library a live program links: the daemon's file protocol, Mach-O patching in memory, sampling | nothing |
-| `crates/ra-jit-cache`, `-macros` | 899 | `#[ra_jit::cache]`: the attribute and the result store | nothing |
-| `crates/ra-jit-wasm` (outside the workspace) | ~4,000 | The compiler built for wasm, for the playground | `hir`, `hir-def`, `hir-ty` with feature `wasm`, `ide-db`, ... |
-| `crates/ra-jit-bench` | 64 | Microbenchmarks | `hir-ty`, only to reach the store |
+| `crates/blaze-engine` | 31,574 | The worker (`main.rs`, 6,874), the cargo drop-in (`cargo/`), daemon and sockets, the splice for ELF, Mach-O, PE and wasm (`splice*`), symbols from rlibs, the remote store (`remote*`), crate identity by content (`content.rs`), body-only edit detection (`outline.rs`), build inputs (`inputs.rs`, `tree.rs`, `process.rs`), doctests, tiering's sampler side (`tier.rs`), `blaze-engine mir` and `blaze-engine borrowck` | `hir`, `hir-def`, `ide-db`, `ide-diagnostics`, `load-cargo`, `project-model`, `vfs`, `syntax`; about 30 items of `hir_ty::mir::codegen`; `hir_ty::mir::print_mir_body` and `MirOptLevel` (`mirdump.rs`); `hir_ty::method_resolution::{TraitImpls, InherentImpls, impl_work}` |
+| `crates/blaze-live` | 1,596 | The runtime library a live program links: the daemon's file protocol, Mach-O patching in memory, sampling | nothing |
+| `crates/blaze-cache`, `-macros` | 899 | `#[blaze::cache]`: the attribute and the result store | nothing |
+| `crates/blaze-wasm` (outside the workspace) | ~4,000 | The compiler built for wasm, for the playground | `hir`, `hir-def`, `hir-ty` with feature `wasm`, `ide-db`, ... |
+| `crates/blaze-bench` | 64 | Microbenchmarks | `hir-ty`, only to reach the store |
 
-### 1.2 Where ra-jit reaches into rust-analyzer's internals
+### 1.2 Where blaze reaches into rust-analyzer's internals
 
 - **The two `#[path]` modules.** Being modules of `hir-ty`, codegen and borrowck see every
   `pub(crate)` and private item of it, and nothing records which they use. A static look
@@ -105,19 +105,19 @@ Line counts are of `.rs` files (read: `wc -l`).
   `wasm`, which only codegen reads (read: the `Cargo.toml` diff; `rg 'feature = "(wasm|llvm)"'`
   finds them only in `crates/hir-ty-codegen`).
 - **Builds that know about it.** `nix/units.nix:37-45` special-cases `hir-ty` so its source
-  tree carries both directories; `crates/ra-jit/Cargo.toml` turns on LLVM as `hir-ty/llvm`;
-  the root `Cargo.toml` excludes `ra-jit-wasm` because its feature is on `hir-ty`; and
+  tree carries both directories; `crates/blaze-engine/Cargo.toml` turns on LLVM as `hir-ty/llvm`;
+  the root `Cargo.toml` excludes `blaze-wasm` because its feature is on `hir-ty`; and
   `harness/unittests.py` runs codegen's 52 tests as part of `-p hir-ty` (read).
 - **The store through codegen.** `remote.rs`, `remote/transfer.rs`, `remote/signed.rs` and
-  `ra-jit-bench` import `STORE_FORMAT`, `write_file_whole`, `name_file_whole`, `pack_keys`,
+  `blaze-bench` import `STORE_FORMAT`, `write_file_whole`, `name_file_whole`, `pack_keys`,
   `parse_size` and the like from `hir_ty::mir::codegen` (read), though the store's own
   documentation says nothing in it knows about Rust (`store.rs:1-4`).
 
-ra-jit's own crate reaches rust-analyzer through public API (`hir`, `ide_db`, `hir_def`,
+blaze's own crate reaches rust-analyzer through public API (`hir`, `ide_db`, `hir_def`,
 `load_cargo`) and through `hir_ty::mir::codegen`. It does not reach into `hir-ty`'s
 privates (read).
 
-### 1.3 Where ra-jit duplicates rust-analyzer
+### 1.3 Where blaze duplicates rust-analyzer
 
 - **`outline.rs` (672 lines)** decides from syntax whether an edit changed only bodies no
   other item can see into. rust-analyzer's `ItemTree` exists for the same purpose ("stable
@@ -135,10 +135,10 @@ privates (read).
   (`ComplexMemoryMap::type_ids`), and the object's data gets `type_id.rs`'s hash of it there
   (read: the corpus' `type_id_in_constant`).
 - **`doctest/extract.rs`** finds doc examples as rustdoc does. rust-analyzer's runnables find
-  doctests for the IDE with looser rules; ra-jit needs rustdoc's exactly, so this is not a
+  doctests for the IDE with looser rules; blaze needs rustdoc's exactly, so this is not a
   duplicate to remove (unverified judgment).
 
-### 1.4 ra-jit's changes to `vendor/rust-analyzer`, by purpose
+### 1.4 blaze's changes to `vendor/rust-analyzer`, by purpose
 
 198 files, +18,656 −2,252 (read: `git diff --shortstat`). 29 files are new to the fork (7,995
 lines) and cannot conflict with upstream. The other 169 are edits to upstream's files. Groups
@@ -153,15 +153,15 @@ are by path, so a file with two purposes counts once (read: from
 | D. Types, traits and layout as rustc has them: method resolution, the next solver, layout, drop, opaques, specialization, type names as rustc spells them | 25 | +2,134 −212 | `hir-ty/src/*`, new `mir/type_name.rs` | Mostly bug fixes, so yes, under their rules (unverified) |
 | E. Incrementality: a body lowered from its own item, queries free of positions, closures keyed so an edit keeps them | 16 | +1,115 −183 | `hir-def/src/expr_store*`, `nameres.rs`, `hir-ty/src/db.rs` (closure keys) | Fits upstream's own invariant ("typing inside a function's body never invalidates global derived data", read: `architecture.md`); large (unverified) |
 | F. Front-end parity: parser, `macro_rules!`, built-in macros, derives, name resolution, `tt`, `span`, `syntax` | 80 | +2,587 −685 | `parser`, `mbe`, `hir-expand`, `hir-def`, `tt`, `span`, `syntax*` | Yes, most of it: these are rust-analyzer bugs against rustc (unverified per fix) |
-| G. Hooks the daemon needs: checkouts seen through another (`Files::set_view`), `include_bytes!` files, `env!` reads, the process environment, several workspaces in one database, build scripts from given output, query counting | 25 | +1,087 −299 | `base-db`, `ide-db`, `load-cargo`, `project-model`, `paths`, `proc-macro-api`, `stdx` | `include_bytes!` and `env!` tracking maybe; the rest is ra-jit's (unverified) |
+| G. Hooks the daemon needs: checkouts seen through another (`Files::set_view`), `include_bytes!` files, `env!` reads, the process environment, several workspaces in one database, build scripts from given output, query counting | 25 | +1,087 −299 | `base-db`, `ide-db`, `load-cargo`, `project-model`, `paths`, `proc-macro-api`, `stdx` | `include_bytes!` and `env!` tracking maybe; the rest is blaze's (unverified) |
 | H. Borrowck hooked into diagnostics | 3 | +118 −2 | `hir/src/diagnostics.rs`, `ide-diagnostics` | No: upstream deleted its own borrowck on 2026-08-05 as "both hopeless and not important" (reported: [research/borrowck.md](research/borrowck.md), finding 8) |
 | I. Codegen's dependencies | 1 | +36 | `hir-ty/Cargo.toml` | No |
 | J. Tests | 20 | +609 −77 | `hir-ide/src/tests` | With what they test |
 
 Where the conflicts will come from (read: [measured/upstream-churn.txt](upstream/architecture-split/measured/upstream-churn.txt),
-upstream commits since 2026-04-21 to each file ra-jit edits): `hir-ty/src/infer.rs` 74,
+upstream commits since 2026-04-21 to each file blaze edits): `hir-ty/src/infer.rs` 74,
 `hir/src/lib.rs` 73, `hir-def/src/expr_store/lower.rs` 63, `hir-ty/src/lower.rs` 46,
-`hir-ty/src/mir/lower.rs` 40 (where ra-jit's +2,356 −278 is), `next_solver/interner.rs` 37,
+`hir-ty/src/mir/lower.rs` 40 (where blaze's +2,356 −278 is), `next_solver/interner.rs` 37,
 `mir/eval.rs` 32, `db.rs` 30, the root `Cargo.toml` 22, `mir.rs` 18. Upstream is also
 breaking `hir-ty` into crates: step 1 moved display, extra diagnostics and tests into
 `hir-ide` (merged 2026-10-12), "according to the plan outlined in Zulip" (reported:
@@ -184,7 +184,7 @@ rename detection carries edits across a move only while the file stays half the 
   are a conflict waiting for the next bump of a neighbouring line.
 - **Dependencies point one way: `crates/` depends on `vendor/`, never back.** Today the
   subtree reaches out (`#[path]`), so the fork cannot be built or tested alone, nix needs a
-  special case, and the fork's history holds a crate that only compiles inside ra-jit.
+  special case, and the fork's history holds a crate that only compiles inside blaze.
 - **Salsa queries can live in any crate below which the database trait is defined, but not
   above what calls them.** With current salsa a `#[salsa::tracked]` function taking
   `&dyn HirDatabase` can be in any crate that depends on `hir-ty`; codegen's ~30 tracked
@@ -201,7 +201,7 @@ rename detection carries edits across a move only while the file stays half the 
 - **Compile time follows crate boundaries.** Cargo rebuilds every crate downstream of a
   changed one. Codegen inside `hir-ty` means a one-line codegen edit rebuilds `hir-ty` (75,000
   lines of its own plus the 43,000 of the two modules), then `hir-ide`, `hir`, `ide-db`,
-  `ide-diagnostics`, `load-cargo` and `ra-jit` (read: the dependency edges; what it cost is
+  `ide-diagnostics`, `load-cargo` and `blaze` (read: the dependency edges; what it cost is
   in 3.3: 2.4 times the CPU of the same edit with codegen a crate). rustc's guide gives the same reason for its split: "we try to have
   as few dependencies between crates as possible so that we don't have to rebuild as many
   crates if you change one" (read, same file). Upstream rust-analyzer is splitting `hir-ty`
@@ -210,9 +210,9 @@ rename detection carries edits across a move only while the file stays half the 
   borrowck in August 2026; it has no consumer for MIR optimization; and since 2026-08-26 it
   requires a rustc citation for analysis changes made with AI (reported:
   [pr-23233](upstream/architecture-split/rust-analyzer/pr-23233-ai-rustc-citation.md)), which
-  ra-jit's changes, written against rustc's sources, can meet. So the reason to put borrowck
+  blaze's changes, written against rustc's sources, can meet. So the reason to put borrowck
   in the subtree is that it is semantics `hir` calls, not that upstream will take it soon.
-- **Keeping ra-jit's outside code simple** means a narrow, named interface: ra-jit should
+- **Keeping blaze's outside code simple** means a narrow, named interface: blaze should
   name what it needs of `hir-ty` (public items, a short list), not have all of it.
 
 ### 2.2 How rustc splits the same pieces
@@ -220,7 +220,7 @@ rename detection carries edits across a move only while the file stays half the 
 At 1.99.0 (read: the `Cargo.toml` files in
 [rustc-1.99.0/](upstream/architecture-split/rustc-1.99.0/)):
 
-| rustc crate | Depends on | ra-jit's counterpart today | After this plan |
+| rustc crate | Depends on | blaze's counterpart today | After this plan |
 |---|---|---|---|
 | `rustc_middle` (MIR types, the query system, layout queries) | early crates | `hir-ty` (`mir.rs`, `db.rs`, `layout`) | same |
 | `rustc_mir_build` (THIR to MIR) | `rustc_middle` | `hir-ty/src/mir/lower*` | same |
@@ -230,10 +230,10 @@ At 1.99.0 (read: the `Cargo.toml` files in
 | `rustc_borrowck` | `rustc_middle`, `rustc_mir_dataflow`, `rustc_trait_selection` | `crates/hir-ty-borrowck`, compiled inside `hir-ty` | `crates/hir-ty-borrowck`, its own crate |
 | `rustc_monomorphize` (collection, partitioning) | `rustc_middle` | in `crates/hir-ty-codegen` (`mod.rs`, `home.rs`, `settled.rs`) | same, in the codegen crate |
 | `rustc_codegen_ssa`, `rustc_codegen_cranelift` (backends; cg_clif is also kept in a repository of its own and synced into rust-lang/rust, reported) | `rustc_middle`, `rustc_mir_transform`, `rustc_symbol_mangling` | `crates/hir-ty-codegen`, compiled inside `hir-ty` | `crates/hir-ty-codegen`, its own crate |
-| `rustc_interface`, `rustc_driver` | everything | `crates/ra-jit` | same |
+| `rustc_interface`, `rustc_driver` | everything | `crates/blaze-engine` | same |
 
 The match is close, with one deliberate difference: rustc keeps the passes in their own crate
-because its interpreter does not need them; ra-jit's does. And rustc's guide is candid that
+because its interpreter does not need them; blaze's does. And rustc's guide is candid that
 the split is for compile time and organisation, not a law: "Ideally there would be fewer,
 more cohesive crates" (read).
 
@@ -247,7 +247,7 @@ rustc keeps in `rustc_middle`, `rustc_mir_build`, `rustc_mir_dataflow`, `rustc_c
 new file declared with one line, rather than in edits through upstream's files, and a fix to
 an upstream bug goes upstream.
 
-New code stays in `crates/` when it is ra-jit's machinery: code generation and its backends,
+New code stays in `crates/` when it is blaze's machinery: code generation and its backends,
 object, debug-info and unwind writing, which crate an instance is compiled as, the splice,
 the daemon and sockets, the cargo drop-in, the store and the remote, tiers and sampling,
 fn-cache (it hashes compiled code), the live runtime and the harnesses.
@@ -257,18 +257,18 @@ The subtree never depends on `crates/`.
 ## 3. The target layout
 
     crates/
-      hir-def, hir-expand, base-db, ...   upstream, with ra-jit's fixes (groups E, F, G)
+      hir-def, hir-expand, base-db, ...   upstream, with blaze's fixes (groups E, F, G)
       hir-ty                              upstream + MIR building, runtime phase, passes, interpreter (A-D)
                                           loses: #[path] modules, 15 dependencies, features llvm and wasm
                                           gains: a short list of items made public for the crates below
       hir-ty-borrowck        NEW          from crates/hir-ty-borrowck; depends on hir-ty
       hir-ide, hir, ide-*                 upstream; hir's diagnostics call hir_ty_borrowck
     crates/
-      hir-ty-codegen         NOW A CRATE  same directory and files; depends on hir-ty, ra-jit-store
+      hir-ty-codegen         NOW A CRATE  same directory and files; depends on hir-ty, blaze-store
                                           features llvm, wasm; Cranelift, inkwell, object, ... move here
-      ra-jit-store           NEW          from hir-ty-codegen/store.rs, store/, the file helpers
-      ra-jit                              depends on hir-ty-codegen, ra-jit-store
-      ra-jit-live, ra-jit-cache, ra-jit-cache-macros, ra-jit-wasm, ra-jit-bench
+      blaze-store           NEW          from hir-ty-codegen/store.rs, store/, the file helpers
+      blaze                              depends on hir-ty-codegen, blaze-store
+      blaze-live, blaze-cache, blaze-cache-macros, blaze-wasm, blaze-bench
 
 The name `hir-ty-codegen` stays: renaming the directory would move every file under
 in-flight branches for no gain. Its crate root is `mod.rs` (`[lib] path = "mod.rs"`), so no
@@ -278,8 +278,8 @@ file moves at all.
 
 | Change | Lines touched (estimate, unverified) | What gets simpler |
 |---|---|---|
-| Codegen as a crate | ~290 import lines in 26 files (`crate::mir::codegen::` → `crate::`, `crate::`/`super::` → `hir_ty::`, `hir_ty::mir::`; read: `rg -c`), 29 paths in `crates/ra-jit` (`hir_ty::mir::codegen` → `hir_ty_codegen`), ~10-20 visibility words in `hir-ty`, a new `Cargo.toml` | `hir-ty/Cargo.toml` diff vs upstream from +36 to about +4 lines; the `#[path]` lines go; `nix/units.nix`'s `hir-ty` special case (9 lines) goes; `ra-jit`'s `llvm` feature points at its own dependency; a codegen edit rebuilds two crates instead of eight; codegen's use of `hir-ty` becomes a list someone can read |
-| Store as a crate | ~2,560 lines moved unchanged, ~15 import lines | `remote*` and `ra-jit-bench` no longer depend on `hir-ty` for files and packs; the store's tests and fuzz run without building a compiler |
+| Codegen as a crate | ~290 import lines in 26 files (`crate::mir::codegen::` → `crate::`, `crate::`/`super::` → `hir_ty::`, `hir_ty::mir::`; read: `rg -c`), 29 paths in `crates/blaze-engine` (`hir_ty::mir::codegen` → `hir_ty_codegen`), ~10-20 visibility words in `hir-ty`, a new `Cargo.toml` | `hir-ty/Cargo.toml` diff vs upstream from +36 to about +4 lines; the `#[path]` lines go; `nix/units.nix`'s `hir-ty` special case (9 lines) goes; `blaze`'s `llvm` feature points at its own dependency; a codegen edit rebuilds two crates instead of eight; codegen's use of `hir-ty` becomes a list someone can read |
+| Store as a crate | ~2,560 lines moved unchanged, ~15 import lines | `remote*` and `blaze-bench` no longer depend on `hir-ty` for files and packs; the store's tests and fuzz run without building a compiler |
 | Borrowck into the subtree | 6,010 lines moved unchanged, ~70 import lines, `hir/Cargo.toml` +1, `hir/src/diagnostics.rs` 1 line, `mir.rs` −2 lines | The fork builds and tests alone; the last `#[path]` goes; a borrowck edit no longer rebuilds `hir-ty` and `hir-ide` |
 
 Lines removed outright are few (the two `#[path]` lines, ~32 manifest lines, the nix special
@@ -298,7 +298,7 @@ case); the gain is in what each crate can see and what each edit rebuilds, not i
 - **The fn-cache hash into `hir-ty`.** It is a hash of compiled code; it needs the code
   generator. A hash of a function's MIR and its callees, if one is ever wanted, would be a
   `hir-ty` query in a new file.
-- **`ContentId`, stable names, `home.rs`, `settled.rs`.** They decide how ra-jit names,
+- **`ContentId`, stable names, `home.rs`, `settled.rs`.** They decide how blaze names,
   shares and caches compiled code across checkouts and runs; nothing in the language says so.
 - **The daemon's hooks in `base-db`, `ide-db`, `load-cargo`, `project-model` (group G).** They
   are edits to upstream types and must stay where the types are. They can be made smaller
@@ -309,7 +309,7 @@ case); the gain is in what each crate can see and what each edit rebuilds, not i
 
 ### 3.3 What the rebuild costs, measured
 
-`cargo build --release -p ra-jit` after a one-line edit, twice per file, on the M5 Max while
+`cargo build --release -p blaze-engine` after a one-line edit, twice per file, on the M5 Max while
 other lanes kept its load average between 45 and 110 (read:
 [measured/rebuild-times.txt](upstream/architecture-split/measured/rebuild-times.txt), which
 has each run, its load and the crates compiled). The load makes wall time noisy; CPU time
@@ -317,21 +317,21 @@ has each run, its load and the crates compiled). The load makes wall time noisy;
 
 | Edit in | Before step 2: wall, CPU (s) | After step 2: wall, CPU (s) | Crates compiled, before → after |
 |---|---|---|---|
-| `crates/hir-ty-codegen/mod.rs` | 186, 152; 366, 369 | 80, 113; 146, 145 | 7 → 2 (`hir-ty-codegen`, `ra-jit`) |
+| `crates/hir-ty-codegen/mod.rs` | 186, 152; 366, 369 | 80, 113; 146, 145 | 7 → 2 (`hir-ty-codegen`, `blaze`) |
 | `crates/hir-ty-codegen/store.rs` | 146, 118; 346, 338 | 100, 103; 146, 155 | 7 → 2 |
 | `crates/hir-ty-borrowck/check.rs` (still a `hir-ty` module in both) | 132, 181; 377, 380 | 133, 130; 329, 330 | 7 → 8 (`hir-ty-codegen` joins) |
-| `crates/ra-jit/src/main.rs` | 47, 22; 91, 86 | 51, 37; 88, 90 | 1 → 1 |
+| `crates/blaze-engine/src/main.rs` | 47, 22; 91, 86 | 51, 37; 88, 90 | 1 → 1 |
 
 After steps 3 and 4 (`after-step3` in the file, at a lower load, 26 to 42):
 
 | Edit in | Wall, CPU (s) | Crates compiled |
 |---|---|---|
-| `crates/ra-jit-store/src/lib.rs` | 45, 52; 138, 145 | 3 (`ra-jit-store`, `hir-ty-codegen`, `ra-jit`) |
-| `crates/hir-ty-borrowck/src/check.rs` | 30, 55; 148, 153 | 6 (`hir-ty-borrowck`, `hir`, `ide-db`, `load-cargo`, `ide-diagnostics`, `ra-jit`) |
+| `crates/blaze-store/src/lib.rs` | 45, 52; 138, 145 | 3 (`blaze-store`, `hir-ty-codegen`, `blaze`) |
+| `crates/hir-ty-borrowck/src/check.rs` | 30, 55; 148, 153 | 6 (`hir-ty-borrowck`, `hir`, `ide-db`, `load-cargo`, `ide-diagnostics`, `blaze`) |
 
 So a code generator edit costs 2.5 times less CPU (366 to 146 s) and about 1.7 times less
 wall time under this load, and a borrow checker edit, now a crate under `hir`, 2.5 times less
-(379 to 150 s): neither rebuilds `hir-ty` and `hir-ide` any more. The floor is `ra-jit`
+(379 to 150 s): neither rebuilds `hir-ty` and `hir-ide` any more. The floor is `blaze`
 itself, about 88 s of CPU. A store edit still rebuilds the code generator, which uses it;
 what step 3 bought is that the store's tests and benchmark no longer build a compiler.
 
@@ -343,7 +343,7 @@ mv`, 100% similar), so that branches still editing the old paths merge through g
 detection; the edits that make it build come in the commits after.
 
 The gate named below is, unless a step says otherwise:
-`cargo test --release -p hir-ty -p hir-ty-codegen -p hir-ty-borrowck -p hir-def -p parser -p syntax -p ra-jit`
+`cargo test --release -p hir-ty -p hir-ty-codegen -p hir-ty-borrowck -p hir-def -p parser -p syntax -p blaze-engine`
 (the crates that exist at that step; `harness/unittests.py` runs them in one `cargo test`),
 `cargo test --release -p hir-ide` failing exactly the 18
 known tests, the corpus under Cranelift and LLVM (with `--layouts`), `mixfutures`, `growth.py`,
@@ -352,12 +352,12 @@ known tests, the corpus under Cranelift and LLVM (with `--layouts`), `mixfutures
 
 | Step | Change | Verification beyond the gate | Effort (unverified) |
 |---|---|---|---|
-| 0 | Measure: on the dev host, time `cargo build --release -p ra-jit` after a one-line change in `crates/hir-ty-codegen/mod.rs`, in `crates/hir-ty-borrowck/check.rs` and in `crates/ra-jit/src/main.rs`; write the numbers into this document. Done, with `store.rs` too, before and after step 2: 3.3 | none | done |
+| 0 | Measure: on the dev host, time `cargo build --release -p blaze-engine` after a one-line change in `crates/hir-ty-codegen/mod.rs`, in `crates/hir-ty-borrowck/check.rs` and in `crates/blaze-engine/src/main.rs`; write the numbers into this document. Done, with `store.rs` too, before and after step 2: 3.3 | none | done |
 | 1 | **Rule and docs.** Done: the AGENTS.md rule and the "Where new code goes" section of contributing.md are on `main` (`1c8d34b056`) | none | done |
-| 2 | **Codegen becomes a crate.** Done on `codegen-crate`, 2026-10-21, in two commits (no file moved, so no rename commit). The compile found what the text search in 1.2 missed, in the other direction too: `hir-ty` itself called into the code generator, its interpreter and MIR lowering asking `Target::current().word()`, `body_checks_overflow` and `placed` (where `line!()`, `column!()` and `file!()` are as written). Those semantics moved into three new fork-owned files of `hir-ty`: `mir/target.rs` (the target's word size, which the code generator's `Target::select` sets), `mir/overflow.rs` and `mir/location.rs` (about 270 lines out of codegen's `mod.rs`). Made `pub` in fork-owned code: `is_builtin_index`, `monomorphized`, the `type_name` module and its functions, `loaded_crates`, `MemoryMap::{static_at, memory_at, align_at}`. Four upstream lines changed one word each: `Generics::{iter_self, len_parent}`, `layout::struct_tail_erasing_lifetimes`, `StoredPlace::walk_places`. As step 4 did, `return_slot` is copied, `Operand::span()` used, and `ParamEnv`'s private `clauses` read through `caller_bounds()`. `hir-ty/Cargo.toml`'s diff against upstream went from 36 added lines to 5 (`unicode-width`, now `location.rs`'s, `cfg` and `stacker`). The crate's root `mod.rs` aliases `ra_ap_rustc_*` to the names `hir-ty` gives them; `publish_crates.py` stages it as `ra-jit-hir-ty-codegen` (any crate of `crates/` not named `ra-jit*` gets the prefix); `ra-jit-wasm` turns on `hir-ty-codegen/wasm` and selects its target before lowering MIR; `harness/unittests.py` and CI's fmt run `-p hir-ty-codegen` (45 of its 52 tests on macOS; the rest need LLVM, Windows or Linux); `nix/units.nix` has no special case left | rebuild times again (3.3); `cargo build --release -p ra-jit --features llvm`; `ra-jit-wasm` builds | done |
-| 3 | **Store becomes a crate.** Done on `store-crate`, 2026-10-21: commit 1 the `git mv` alone of `store.rs` (now `crates/ra-jit-store/src/lib.rs`), `store/acl.rs`, `store/bench.rs` and the corpora `pack` and `name`, and of `fuzz.rs`, the inputs and counting allocator the store's and codegen's reader tests share, as `crates/ra-jit-fuzz` (a dev-dependency only, since it sets the global allocator); commit 2 the manifests and imports. What stays in the code generator is what knows about code: the stored entry (`cached.rs`), Cranelift's incremental cache over the store, and the entry key the store bench uses (`hir_ty_codegen::bench::entry_key`). `crc32fast`, `memmap2`, `libc` and `windows-sys` moved with it. `ra-jit`'s remote, signing, keeper and daemon, and `ra-jit-bench`, import `ra_jit_store`; the store's tests run as `-p ra-jit-store` without building a compiler | `cargo test --release -p ra-jit-store`; `remote.py`; the store bench builds | done |
-| 4 | **Borrowck into the subtree.** Done on `borrowck-3`, 2026-10-21, as the plan said: commit 1 the `git mv` alone (100% similar), commit 2 the crate. What the compile needed of `hir-ty` was smaller than 1.2's text search (read: the compile errors): the four `for_each_operand` methods (fork-owned) made `pub`; `Operand` gained a `span()` accessor instead of widening upstream's private field; `return_slot` copied into the crate; `GenericPredicates` was already public at the crate root; `transform::move_paths` was not needed. `hir` depends on the crate and calls `hir_ty_borrowck::borrowck`. `nix/units.nix` lost the borrowck half of its special case (the code generator half goes with step 2), `nix/units/daemon.json` regenerated (one package added), `harness/unittests.py` runs `-p hir-ty-borrowck` (it has no unit tests; its tests are `borrowck_ui.py`), `publish_crates.py` stages it as `ra-jit-hir-ty-borrowck` unchanged (before, the published `hir-ty` lacked the checker's files). The fork still cannot build alone until step 2 removes the `#[path] codegen` line, so step 5 waits for step 2 too | `borrowck_ui.py` scores unchanged in both modes; `ra-jit borrowck --project` on ripgrep, fd, bat, hyperfine, just, axum and nushell finds nothing; the corpus, `mixfutures`, `hir-ide`'s 18 known failures, `cargo test --release -p ra-jit` | done |
-| 5 | **Fork check.** Withdrawn 2026-10-28 with the fork (one workspace). Was done on `fork-check`, 2026-10-21: CI's job `fork alone` copies `vendor/rust-analyzer` out of the repository, which is the tree `fork sync` pushes, and runs `cargo test -p hir-ty -p hir-ty-borrowck && cargo check -p hir` there; `ci` needs it. Copying rather than cloning the fork catches a dependency on `crates/` before it merges, not after. The fork alone needed two fixes: its workspace patched `ra-ap-rustc_abi` from `lib/rustc_abi`, a directory the fork never had, and now takes it from `indexable-inc/rustc_abi` `main` (the subtree of `crates/rustc_abi`, identical to it at `8f6db283fd`; ra-jit's own workspace still patches it by path); and its `Cargo.lock` was brought up to date (it lacked `hir-ty-borrowck`, `stacker`, `unicode-width`) | the job's commands, run in a copy of the subtree | done |
+| 2 | **Codegen becomes a crate.** Done on `codegen-crate`, 2026-10-21, in two commits (no file moved, so no rename commit). The compile found what the text search in 1.2 missed, in the other direction too: `hir-ty` itself called into the code generator, its interpreter and MIR lowering asking `Target::current().word()`, `body_checks_overflow` and `placed` (where `line!()`, `column!()` and `file!()` are as written). Those semantics moved into three new fork-owned files of `hir-ty`: `mir/target.rs` (the target's word size, which the code generator's `Target::select` sets), `mir/overflow.rs` and `mir/location.rs` (about 270 lines out of codegen's `mod.rs`). Made `pub` in fork-owned code: `is_builtin_index`, `monomorphized`, the `type_name` module and its functions, `loaded_crates`, `MemoryMap::{static_at, memory_at, align_at}`. Four upstream lines changed one word each: `Generics::{iter_self, len_parent}`, `layout::struct_tail_erasing_lifetimes`, `StoredPlace::walk_places`. As step 4 did, `return_slot` is copied, `Operand::span()` used, and `ParamEnv`'s private `clauses` read through `caller_bounds()`. `hir-ty/Cargo.toml`'s diff against upstream went from 36 added lines to 5 (`unicode-width`, now `location.rs`'s, `cfg` and `stacker`). The crate's root `mod.rs` aliases `ra_ap_rustc_*` to the names `hir-ty` gives them; `publish_crates.py` stages it as `blaze-hir-ty-codegen` (any crate of `crates/` not named `blaze*` gets the prefix); `blaze-wasm` turns on `hir-ty-codegen/wasm` and selects its target before lowering MIR; `harness/unittests.py` and CI's fmt run `-p hir-ty-codegen` (45 of its 52 tests on macOS; the rest need LLVM, Windows or Linux); `nix/units.nix` has no special case left | rebuild times again (3.3); `cargo build --release -p blaze-engine --features llvm`; `blaze-wasm` builds | done |
+| 3 | **Store becomes a crate.** Done on `store-crate`, 2026-10-21: commit 1 the `git mv` alone of `store.rs` (now `crates/blaze-store/src/lib.rs`), `store/acl.rs`, `store/bench.rs` and the corpora `pack` and `name`, and of `fuzz.rs`, the inputs and counting allocator the store's and codegen's reader tests share, as `crates/blaze-fuzz` (a dev-dependency only, since it sets the global allocator); commit 2 the manifests and imports. What stays in the code generator is what knows about code: the stored entry (`cached.rs`), Cranelift's incremental cache over the store, and the entry key the store bench uses (`hir_ty_codegen::bench::entry_key`). `crc32fast`, `memmap2`, `libc` and `windows-sys` moved with it. `blaze`'s remote, signing, keeper and daemon, and `blaze-bench`, import `blaze_store`; the store's tests run as `-p blaze-store` without building a compiler | `cargo test --release -p blaze-store`; `remote.py`; the store bench builds | done |
+| 4 | **Borrowck into the subtree.** Done on `borrowck-3`, 2026-10-21, as the plan said: commit 1 the `git mv` alone (100% similar), commit 2 the crate. What the compile needed of `hir-ty` was smaller than 1.2's text search (read: the compile errors): the four `for_each_operand` methods (fork-owned) made `pub`; `Operand` gained a `span()` accessor instead of widening upstream's private field; `return_slot` copied into the crate; `GenericPredicates` was already public at the crate root; `transform::move_paths` was not needed. `hir` depends on the crate and calls `hir_ty_borrowck::borrowck`. `nix/units.nix` lost the borrowck half of its special case (the code generator half goes with step 2), `nix/units/daemon.json` regenerated (one package added), `harness/unittests.py` runs `-p hir-ty-borrowck` (it has no unit tests; its tests are `borrowck_ui.py`), `publish_crates.py` stages it as `blaze-hir-ty-borrowck` unchanged (before, the published `hir-ty` lacked the checker's files). The fork still cannot build alone until step 2 removes the `#[path] codegen` line, so step 5 waits for step 2 too | `borrowck_ui.py` scores unchanged in both modes; `blaze-engine borrowck --project` on ripgrep, fd, bat, hyperfine, just, axum and nushell finds nothing; the corpus, `mixfutures`, `hir-ide`'s 18 known failures, `cargo test --release -p blaze-engine` | done |
+| 5 | **Fork check.** Withdrawn 2026-10-28 with the fork (one workspace). Was done on `fork-check`, 2026-10-21: CI's job `fork alone` copies `vendor/rust-analyzer` out of the repository, which is the tree `fork sync` pushes, and runs `cargo test -p hir-ty -p hir-ty-borrowck && cargo check -p hir` there; `ci` needs it. Copying rather than cloning the fork catches a dependency on `crates/` before it merges, not after. The fork alone needed two fixes: its workspace patched `rustc_abi` from `lib/rustc_abi`, a directory the fork never had, and now takes it from `indexable-inc/rustc_abi` `main` (the subtree of `crates/rustc_abi`, identical to it at `8f6db283fd`; blaze's own workspace still patches it by path); and its `Cargo.lock` was brought up to date (it lacked `hir-ty-borrowck`, `stacker`, `unicode-width`) | the job's commands, run in a copy of the subtree | done |
 | 6 | **Shrink the edit surface.** Withdrawn 2026-10-28: nothing is sent upstream any more. Was: send group F upstream in small pull requests, parser and `macro_rules!` first, each with the rustc source it follows (upstream's AI rule); when one merges, the next `vendor/subtree.py upstream` takes upstream's version. Move group G's additions to new files where they are additive (`Files`'s view, include and env fields behind one field of a type defined in a new `base-db` module). Watch upstream's `hir-ty` split and put new MIR code where upstream's plan will put MIR | each pull request under upstream's CI; the gate here when each comes back through a merge | a day per batch, spread out |
 | 7 | **Optional.** `type_id.rs` and `vtable.rs` into `hir-ty` when the interpreter needs them; a look at whether `outline.rs` can be an `ItemTree` comparison | the corpus' `TypeId` and `dyn` cases; `growth.py`, `movedlines.py` for `outline.rs` | a day each |
 
@@ -372,7 +372,7 @@ import are left out):
   borrowck lane itself, as the first commit of `borrowck-3`, so no borrowck branch ever
   rebases over the move. If `borrowck-3` is already under way, the move's pure-rename commit
   lets its edits follow; only edits to the `use` blocks at the top of each file conflict.
-- **`cold-start-2`** (`crates/ra-jit`, two codegen files), **`runtime-parity`** (MIR lowering
+- **`cold-start-2`** (`crates/blaze-engine`, two codegen files), **`runtime-parity`** (MIR lowering
   and codegen) and the **tiers / live-latency** branches: step 2 moves no file, so they
   conflict with it only where they edit a `use` block of a codegen file or one of the `hir-ty`
   items made public. Merge whichever of them is ready first; land step 2 between merges, not

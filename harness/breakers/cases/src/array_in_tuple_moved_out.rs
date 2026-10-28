@@ -1,6 +1,6 @@
 //! Found by the fuzzer (`edits.py smoke`, the second program): an array that is one field of
 //! a matched tuple, where one arm moves its elements out with `[x, m @ ..]` and a later one
-//! takes the whole array. The arm that took all of it drops all of it, once. ra-jit went on to
+//! takes the whole array. The arm that took all of it drops all of it, once. blaze went on to
 //! drop the elements again on the way out, from the back, as of an array that had lost some.
 
 use std::cell::RefCell;

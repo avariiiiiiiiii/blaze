@@ -784,7 +784,7 @@ impl Fused {
 /// `lane`, as the instruction LLVM selects for it (`neon-fma-llvm.txt`). rustc compiles core's
 /// optimized MIR of it, with what it calls built in, so LLVM sees the negation and the splat
 /// of `c` and picks the instruction by them: which factor comes first, and which one `fmls`
-/// or `fmsub` negates. Built of its calls, as ra-jit's MIR has it, it keeps another NaN or
+/// or `fmsub` negates. Built of its calls, as blaze's MIR has it, it keeps another NaN or
 /// flips the sign of another.
 pub(super) fn fused(name: &str, lane: Option<u32>) -> Option<Lowered> {
     Some(Fused::parse(name, lane)?.instruction())

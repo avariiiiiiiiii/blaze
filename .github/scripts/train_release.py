@@ -6,7 +6,7 @@
 
 Versions are dated, and still semver, as cargo and crates.io need: `0.YYYYMMDD.N`, N counting
 the releases of that day (UTC) from 0, so 0.20261026.0, then 0.20261026.1; the tag is
-`v0.20261026.0`, and `blaze --version` says `blaze 0.20261026.0 (fb82b09)` (crates/ra-jit's
+`v0.20261026.0`, and `blaze --version` says `blaze 0.20261026.0 (fb82b09)` (crates/blaze-engine's
 build.rs adds the commit).
 
 `prepare`: when main has commits since the last release, the workspace version of today's next

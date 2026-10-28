@@ -1,6 +1,6 @@
 # The borrow checker's time on the bench apps, before and after a goal whose answer names a placeholder is proven by the query
 
-Made by `harness/borrowck_speed.py --jobs 1` (one `ra-jit borrowck --project DIR --timings`
+Made by `harness/borrowck_speed.py --jobs 1` (one `blaze-engine borrowck --project DIR --timings`
 per app, see docs/borrowck.md "Speed"), in an arm64 ix VM (32 vCPUs, 32 GiB), inside
 `nix develop`. `before.*` is main 0861a8f4; `after.*` is main 0861a8f4 with `prove_query`
 answering a goal whose answer names a placeholder of a `for<'a>`, or a variable of a universe

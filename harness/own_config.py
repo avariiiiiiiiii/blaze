@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""own_config.py: `cargo blaze config` against `cargo config`. cargo is the oracle; blaze never
+"""own_config.py: `blaze config` against `cargo config`. cargo is the oracle; blaze never
 runs it outside this harness.
 
 usage: own_config.py [--blaze BIN] [--out FILE]
 
 A made-up workspace has a `.cargo/config.toml` and one in a member below it, the second
 enabling the unstable options, and each case runs `cargo config ARGS` and, as a user runs
-blaze's, `cargo blaze config ARGS` with the `cargo-blaze` beside BIN (`ra-jit`, default
-`target/release/ra-jit`) first on the path, in the workspace or the member, with `CARGO_BUILD_JOBS` and `CARGO_ENV_X` set, comparing the exit status,
+blaze's, `blaze config ARGS` with the `blaze` beside BIN (`blaze`, default
+`target/release/blaze-engine`) first on the path, in the workspace or the member, with `CARGO_BUILD_JOBS` and `CARGO_ENV_X` set, comparing the exit status,
 standard output and standard error. A case may first change the files: a configuration that
 is not TOML.
 """
@@ -98,13 +98,13 @@ CASES = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     opts = ap.parse_args()
     cases = []
     for args, first in CASES:
         outs = {}
-        for who in ("cargo", "blaze"):
+        for who in ("blaze"):
             work = tempfile.mkdtemp(prefix="own-config-")
             top = os.path.join(work, "ws")
             write(os.path.join(top, ".cargo", "config.toml"), TOP)
@@ -113,7 +113,7 @@ def main():
                    if not k.startswith("CARGO_") or k == "CARGO_HOME"}
             env.update({"CARGO_BUILD_JOBS": "4", "CARGO_ENV_X": "it's"})
             cwd = os.path.join(top, (first(top) if first else None) or "")
-            argv = ["cargo"] + (["blaze"] if who == "blaze" else []) + ["config", *args.split()]
+            argv = (["blaze"] if who == "blaze" else ["cargo"]) + ["config", *args.split()]
             if who == "blaze":
                 env["PATH"] = os.path.dirname(os.path.abspath(opts.blaze)) + os.pathsep + env["PATH"]
             done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=env)

@@ -1,13 +1,13 @@
 //! `_mm_fmadd_ps` and `_mm_fmadd_sd`, in a function with FMA, are LLVM's `vfmadd213ps` and
 //! `vfmadd213sd` with the factors the other way round from libm's `fmaf` and `fma`, which
-//! ra-jit called lane by lane: of two NaN factors rustc's kept the first and ra-jit's the
+//! blaze called lane by lane: of two NaN factors rustc's kept the first and blaze's the
 //! second. At `-O0` LLVM also folds the negations around such a call into it, or not, by the
 //! code after it in its block (`_mm_fnmadd_ss` is one `vfnmadd213ss`, `_mm_fmsub_ps` a
 //! `vpxor` and a `vfmadd213ps`), and a negation it folds keeps a NaN's sign where one it does
 //! not flips it. Each FMA wrapper of `f32` and `f64` here, on lanes of NaNs of either sign,
 //! quiet and signaling, and of numbers, under masks of every kind, hashed. In a breaker the
-//! wrappers are rustc's, the crate's instances of them; `allrajit.py` builds this as a program
-//! of its own, the standard library ra-jit's, where they are ra-jit's.
+//! wrappers are rustc's, the crate's instances of them; `allblaze.py` builds this as a program
+//! of its own, the standard library blaze's, where they are blaze's.
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 
 #[cfg(target_arch = "x86_64")]

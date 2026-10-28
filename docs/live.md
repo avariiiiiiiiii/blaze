@@ -1,24 +1,24 @@
 # Live edits
 
-A program that links `ra-jit-live` takes each edit while it runs. This is what happens between
+A program that links `blaze-live` takes each edit while it runs. This is what happens between
 the save and the new code running, and what is refused.
 
 ## The two halves
 
-- **The daemon** (`crates/ra-jit/src/live.rs`, `crates/ra-jit/src/splice/macho.rs`). Every edit
+- **The daemon** (`crates/blaze-engine/src/live.rs`, `crates/blaze-engine/src/splice/macho.rs`). Every edit
   it answers with a patch (the functions that changed, linked against the executable of the
-  last full link) is spliced into the executable on disk as ra-jit always did. If a program
+  last full link) is spliced into the executable on disk as blaze always did. If a program
   that runs that executable has said where it wants patches, the daemon also lays the same
   patch out for that place (`Patch::place_live`) and writes it next to the program.
-- **The program** (`crates/ra-jit-live`). `Live::start` reads the executable's `LC_UUID`,
+- **The program** (`crates/blaze-live`). `Live::start` reads the executable's `LC_UUID`,
   sets aside 512 MB right behind the image (within `adrp`'s 4 GB, so new code reaches all of
   the old), says so in a file, and watches for patches on a thread. `Live::poll`, called
   between frames, applies the newest one; `Live::apply_as_they_come` applies each on that
   thread the moment it arrives instead.
 
-They meet in `~/.cache/ra-jit/live/<uuid>/`: `process` (written by the program: pid, uuid,
+They meet in `~/.cache/blaze/live/<uuid>/`: `process` (written by the program: pid, uuid,
 when it started, the next free address and the end of its room), `patch` (written by the
-daemon, `RAJITLV1` followed by the encoding in `crates/ra-jit-live/src/format.rs`) and `wake`,
+daemon, `BLAZELV1` followed by the encoding in `crates/blaze-live/src/format.rs`) and `wake`,
 a datagram socket the program listens on, which the daemon sends a byte once it renamed a new
 `patch` into place (the program also looks at `patch` every 30 ms, for a daemon that could not
 wake it). The directory is keyed by the UUID because the daemon's path for the executable and
@@ -26,15 +26,15 @@ the program's (cargo's hard link in `target/debug`, a clone on macOS) differ.
 
 ## Edits from an editor
 
-An editor need not save for the daemon to build. `ra_jit_live::edit(path, text)` sends the
+An editor need not save for the daemon to build. `blaze_live::edit(path, text)` sends the
 daemon (`daemon.sock`) one line, `edit\t<path>\t<text>` with backslash, newline, tab and
 carriage return escaped, the way an editor tells a language server `didChange`. The daemon
 hands it to the worker that has the file's checkout loaded; the worker sets the text into
 rust-analyzer's database, builds the programs that have the file from it, publishes the patch
-and answers as it answers `cargo blaze build` (`ok patch=... ms=N`, `ok unchanged`, `error:
+and answers as it answers `blaze build` (`ok patch=... ms=N`, `ok unchanged`, `error:
 ...`). An edit that comes while the last one of the file is being built waits, and one typed
 over before it was built is answered `ok superseded`. The editor writes the file afterwards;
-the worker sees the same text it built and builds nothing for the write. `cargo blaze build`
+the worker sees the same text it built and builds nothing for the write. `blaze build`
 is still the first build and link, and works as before. The Game of Life demo
 (`demo/life`) does this on every key, and `harness/live_latency.py socket` times it.
 
@@ -65,7 +65,7 @@ code calls the `#[global_allocator]`'s methods, which it has inlined into them f
 up, so no copy of those methods is left for a patch to replace. A build over rustc's code
 (a patch of rustc's executable, or a build in full linked with rustc's objects) defines those
 entries itself, as calls of the functions rust-analyzer's expansion of the attribute exports
-(`__ra_jit_global_alloc` and the rest), so an edit of the allocator reaches them (#386).
+(`__blaze_global_alloc` and the rest), so an edit of the allocator reaches them (#386).
 
 ## Statics
 
@@ -165,7 +165,7 @@ A static new since the base, as the `static INDEX: AtomicU32` that `#[derive(Com
 writes in a function for each type, interior mutability or not, is in every patch after the
 one it is new in, since a patch holds all that differs from the base. It has to stay the one
 static: the program writes to it (a component's id, a counter, a cache), and the next patch's
-code has to read what it wrote. So the codegen names it `ra_jit::static::lasting::<print>`,
+code has to read what it wrote. So the codegen names it `blaze::static::lasting::<print>`,
 the print of its path (a crate of the checkout by its root file, a macro call by its text,
 which an edit above it leaves alone), its declaration and its first value
 (`hir_ty_codegen::LASTING_STATIC`), the same in every patch while it stays the same. The
@@ -208,7 +208,7 @@ edit's. See [tiers.md](tiers.md).
 On macOS the linker signs ad hoc. A package with
 
 ```toml
-[package.metadata.ra-jit]
+[package.metadata.blaze]
 entitlements = "jit.entitlements"
 ```
 
@@ -222,10 +222,10 @@ are recomputed from what it put back.
 
 ## In den
 
-den's native app takes edits to its own code this way: `just dev --ra-jit` in den builds it
-through the daemon, starts it with `DEN_RA_JIT=1`, watches its crates, builds again after an
-edit, and starts it again when it is asked to. den's module crates keep their own hot reload,
-which ra-jit does not touch. Measured on 2026-10-20 on an M-series Mac:
+den's native app takes edits to its own code this way: a mode of `just dev` in den builds it
+through the daemon, starts it, watches its crates, builds again after an edit, and starts it
+again when it is asked to (den names the mode and its variable). den's module crates keep their own hot reload,
+which blaze does not touch. Measured on 2026-10-20 on an M-series Mac:
 
 - a cold build of den-native (5,076 of 5,193 functions of its own compiled, 190,067 instances)
   takes about 70 to 95 seconds, once per daemon;
@@ -238,11 +238,11 @@ which ra-jit does not touch. Measured on 2026-10-20 on an M-series Mac:
 ## Latency under typing
 
 `harness/live_latency.py` times an edit from the keystroke to the running program having code
-at least as new, on four programs that link `ra-jit-live`: `harness/live` (probe, a generic
+at least as new, on four programs that link `blaze-live`: `harness/live` (probe, a generic
 function and a struct), `demo/life` (the Game of Life, headless), `harness/live-bevy` (bevy
 0.20, 600 lines of generic systems, components and messages) and `harness/live-egui` (egui
 0.37, 580 lines of generic widgets over an invoice ledger, a frame every 11 ms). Three modes
-time edits ([#9](https://github.com/indexable-inc/ra-jit/issues/9)):
+time edits ([#9](https://github.com/indexable-inc/blaze/issues/9)):
 
 - **socket**: one edit at a time, the whole file sent as the demo's editor sends it, each
   waited for;
@@ -251,11 +251,11 @@ time edits ([#9](https://github.com/indexable-inc/ra-jit/issues/9)):
   a word, with a typo and its backspace now and then, the whole file sent on each key with one
   edit in flight. Most texts in between do not compile; n is the keys whose text does. A key
   is run by a patch, or by a restart: a program told to restart, or whose executable the daemon
-  linked again, is built (`cargo blaze build`) and started again as a launcher would, and the
+  linked again, is built (`blaze build`) and started again as a launcher would, and the
   keys up to the text built are timed to it.
 
 Measured on 2026-10-20 on a MacBook Pro (Mac17,6, Apple M5 Max, 18 cores, 128 GiB, macOS
-27.0.1) on AC power at 100%, ra-jit at `ad07271066` (the second bevy pass and the later
+27.0.1) on AC power at 100%, blaze at `ad07271066` (the second bevy pass and the later
 passes at `140f90a582`, which changes only the harness). Two passes per program in opposite
 orders, each with a daemon, home and store of its own; other agents' builds held the load
 average at 11 to 56 throughout, so these are a busy laptop's numbers. All times in ms; every
@@ -292,20 +292,20 @@ A key that is typed over before it is sent is not sent; whether its text compile
 the daemon after the round, off the clock. One probe key was never run.
 
 **Restarts.** `restart` sends a session of edits one at a time, mostly bodies and a few type
-changes, and times each restart (the edit, `cargo blaze build`, the program to its first
+changes, and times each restart (the edit, `blaze build`, the program to its first
 answer) against plain incremental `cargo build` of the same source and its start (`cargo
 run`), in a target directory of its own:
 
-| program | session edits | answered Restart | ra-jit restart p50 (max) | `cargo run` p50 (max) |
+| program | session edits | answered Restart | blaze restart p50 (max) | `cargo run` p50 (max) |
 |---|---|---|---|---|
 | probe | 16 | 4 of 4 type changes | 186 (202) | 370 (401) |
 | life | 24 | 4 of 6 type changes | 451 (484) | 1,424 (2,014) |
 | egui | 20 | 6 of 6 type changes | 405 (524) | 1,136 (1,275) |
-| bevy | 6 | none: refused | `cargo blaze build` fails | 2,303 and 1,631 |
+| bevy | 6 | none: refused | `blaze build` fails | 2,303 and 1,631 |
 
 Every body edit of a session was applied live (probe 4 to 9 ms, life 11 to 29, egui 13 to 78).
 life's two type changes that did not restart add a struct no running code has values of.
-The ra-jit restart is mostly the start: the build takes 15 to 90 ms, the program 110 to 400
+The blaze restart is mostly the start: the build takes 15 to 90 ms, the program 110 to 400
 ms to its first answer (it reserves its patch room and reads its executable first).
 
 **What fails under typing.**
@@ -314,7 +314,7 @@ ms to its first answer (it reserves its patch room and reads its executable firs
   measurements: the text that did not compile was built whole, the executable linked again
   and the running program told to restart, and the next key was a patch of that build, so
   nearly every key was run by a restart: 168 of 173 on probe and all 84 on egui
-  ([#31](https://github.com/indexable-inc/ra-jit/issues/31)). Now a text that does not
+  ([#31](https://github.com/indexable-inc/blaze/issues/31)). Now a text that does not
   compile is not built whole, and a whole build refused once it is made is undone, so the
   next key that compiles is a patch of the last build that did. One replay pass of each,
   before (`5f26408566`) and after, on 2026-10-21 on the same MacBook under other agents'
@@ -324,23 +324,23 @@ ms to its first answer (it reserves its patch room and reads its executable firs
   life's other keys are restarts the worker asks for (``the edit changes `struct Life`, which
   the running program may have values of``), before as after.
 - The program is not always told. The daemon relinks its own copy of the executable; the copy
-  in `target/debug`, whose `LC_UUID` `ra-jit-live` watches, changes only with a build through
+  in `target/debug`, whose `LC_UUID` `blaze-live` watches, changes only with a build through
   cargo. probe's program said `restart needed` for 36 of 82 relinks; the harness restarts on
   the answer too, which an editor's launcher would also have to.
 - bevy's `main` is left to rustc (`callee add_systems: ... writable static INTERNER without a
   rustc symbol`). Every edit that reaches it is answered `` error: `main` is not compiled by
-  ra-jit`` though the text compiles: 108 of its 180 compiling keys, run only by the restart
-  after the next key ra-jit takes. A type change its systems use (a field of `Ship`) makes
-  `cargo blaze build` itself fail with the same error, so the program cannot be started again
-  through ra-jit at all; the session stops there, and plain cargo builds the same source in 1.3
+  blaze`` though the text compiles: 108 of its 180 compiling keys, run only by the restart
+  after the next key blaze takes. A type change its systems use (a field of `Ship`) makes
+  `blaze build` itself fail with the same error, so the program cannot be started again
+  through blaze at all; the session stops there, and plain cargo builds the same source in 1.3
   to 2.0 s.
 - `error: no program built has <file>` answered 22 keys on probe and 15 on egui, right after a
-  relink, while the restart's `cargo blaze build` and the next edits arrived together
-  ([#32](https://github.com/indexable-inc/ra-jit/issues/32)). The program was being built
+  relink, while the restart's `blaze build` and the next edits arrived together
+  ([#32](https://github.com/indexable-inc/blaze/issues/32)). The program was being built
   for that build, in the background, and an edit asked meanwhile saw it as never built; now
   it waits for that build. The passes above went from 4 such answers on probe and 1 on egui
   to none.
-- life has errors ra-jit has no diagnostic for (`` `step` has an error ra-jit cannot say more
+- life has errors blaze has no diagnostic for (`` `step` has an error blaze cannot say more
   of: frontend: mir: IncompleteExpr``, `UnresolvedName`): the text does not compile, and the
   answer has no line to show.
 - egui's error answers take 13 to 21 ms at p50 but 320 to 390 ms at p90, up to 1.6 s: an

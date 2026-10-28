@@ -4,11 +4,11 @@
 usage: backends.py WORKSPACE PACKAGE CRATE[,CRATE...] [--bin NAME] [--project DIR]
                    [--levels 0,2] [--runs N] [--kernels] [--out FILE] [-- ARGS]
 
-Builds the program with cargo, then has ra-jit compile the crates once with Cranelift and once
+Builds the program with cargo, then has blaze compile the crates once with Cranelift and once
 with LLVM at each level, links each object ahead of rustc's and compares what the program prints
 with cargo's. Reports, for each producer: how many functions it compiled and how many LLVM left
 to Cranelift and why, the time spent producing code (summed over threads) and per function, the
-size of the code, and ra-jit's wall time and peak memory. With `--kernels` the program is
+size of the code, and blaze's wall time and peak memory. With `--kernels` the program is
 harness/corpus/kernels: each kernel is then run `--runs` times and its best time reported, next
 to cargo's debug and release builds.
 """
@@ -16,11 +16,11 @@ import os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RA_JIT, sysroot_rlibs
+from difftest import Fixture, BLAZE, sysroot_rlibs
 
 
 class Compiled:
-    """One run of ra-jit over the crates with one producer."""
+    """One run of blaze over the crates with one producer."""
 
     def __init__(self, fx, name, env, project):
         self.name = name
@@ -28,7 +28,7 @@ class Compiled:
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         crates = [x for c in fx.crates for x in ("--crate", c)]
         start = time.monotonic()
-        child = subprocess.Popen([RA_JIT, project, *crates, "--out", obj, *symbols],
+        child = subprocess.Popen([BLAZE, project, *crates, "--out", obj, *symbols],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                  env={**os.environ, "BLAZE_STATS": "1", **env})
         self.stderr = child.stderr.read()
@@ -42,9 +42,9 @@ class Compiled:
             status, self.rss_mb = child.wait(), 0
         self.wall = time.monotonic() - start
         if status != 0:
-            raise SystemExit(f"ra-jit failed with {name}:\n{self.stderr[-3000:]}")
+            raise SystemExit(f"blaze failed with {name}:\n{self.stderr[-3000:]}")
         open(os.path.join(fx.work, name.replace(" ", "") + ".stderr"), "w", encoding="utf-8").write(self.stderr)
-        # A program ra-jit cannot link with any producer still says what each producer costs.
+        # A program blaze cannot link with any producer still says what each producer costs.
         try:
             fx.link([obj])
             self.binary = os.path.join(fx.work, "bin-" + name.replace(" ", ""))
@@ -116,7 +116,7 @@ def main():
         compiled = Compiled(fx, name, env, project)
         built.append(compiled)
         print(f"{name}: {compiled.wall:.1f} s", file=sys.stderr)
-    lines += ["| producer | functions | share by this producer | producing code, s (all threads) | µs per function | code bytes | ra-jit wall, s | ra-jit peak RSS, MB |",
+    lines += ["| producer | functions | share by this producer | producing code, s (all threads) | µs per function | code bytes | blaze wall, s | blaze peak RSS, MB |",
               "|---|---:|---:|---:|---:|---:|---:|---:|"]
     lines += [it.row() for it in built]
     lines.append("")

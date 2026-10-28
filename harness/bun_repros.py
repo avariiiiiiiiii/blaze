@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the small nightly fixtures for Bun's whole-program blockers.
 
-Each fixture is built by the pinned nightly, then linked again with ra-jit. The
+Each fixture is built by the pinned nightly, then linked again with blaze. The
 fixture's output must match cargo's, and its report must contain the refusal the
 fixture was added to measure. Change ``expect`` below to ``compiled`` when the
 corresponding frontend or MIR support lands.
@@ -21,9 +21,9 @@ NIGHTLY = open(os.path.join(HERE, "toolchain")).read().strip()
 sys.path.insert(0, HERE)
 
 # difftest.py reads RUSTUP_TOOLCHAIN when it is imported. Keep this assignment
-# before importing it so cargo, rustc and ra-jit inspect the same nightly tree.
+# before importing it so cargo, rustc and blaze inspect the same nightly tree.
 os.environ["RUSTUP_TOOLCHAIN"] = NIGHTLY
-from difftest import Fixture, RA_JIT  # noqa: E402
+from difftest import Fixture, BLAZE  # noqa: E402
 
 
 CASES = {
@@ -51,7 +51,7 @@ CASES = {
         "expected": "compiled",
         "reasons": (),
     },
-    # Every crate ra-jit's, as in bun's whole-program link: no rustc copy defines the statics.
+    # Every crate blaze's, as in bun's whole-program link: no rustc copy defines the statics.
     "exported_statics": {
         "package": "runner",
         "crate": "runner,exported_statics",
@@ -72,7 +72,7 @@ CASES = {
         "alone": True,
         "cargo_args": ["--release"],
         # Without difftest's `-C link-dead-code`, as runbench builds bun: rustc's link takes
-        # out what nothing reaches, and so does the link of ra-jit's object.
+        # out what nothing reaches, and so does the link of blaze's object.
         "rustflags": "",
         "expected": "compiled",
         "reasons": (),
@@ -99,7 +99,7 @@ CASES = {
         "expected": "compiled",
         "reasons": (),
     },
-    # Read with `ra-jit mir`, which lowers every crate `--crate` names.
+    # Read with `blaze-engine mir`, which lowers every crate `--crate` names.
     "std_copies": {
         "package": "runner",
         "crate": "foldhash",
@@ -131,9 +131,9 @@ def rows_for(fx):
 
 def run_mir_case(name, case, workspace, json_path):
     """Every function of the crates `--crate` names lowers to MIR."""
-    run = subprocess.run([RA_JIT, "mir", workspace, "--crate", case["crate"]], capture_output=True, text=True)
+    run = subprocess.run([BLAZE, "mir", workspace, "--crate", case["crate"]], capture_output=True, text=True)
     if run.returncode != 0:
-        raise SystemExit(f"{name}: ra-jit mir failed:\n{run.stderr[-2000:]}")
+        raise SystemExit(f"{name}: blaze-engine mir failed:\n{run.stderr[-2000:]}")
     reasons = re.findall(r"^// blaze: no MIR: (.*)$", run.stdout, re.M)
     lowered = len(re.findall(r"^fn ", run.stdout, re.M))
     print(f"{name}: {lowered} lowered, {len(reasons)} refused")
@@ -154,7 +154,7 @@ def run_case(name, root, json_path=None):
     workspace = os.path.join(root, name)
     if case.get("mir"):
         return run_mir_case(name, case, workspace, json_path)
-    target = tempfile.mkdtemp(prefix=f"ra-jit-bun-{name}-")
+    target = tempfile.mkdtemp(prefix=f"blaze-bun-{name}-")
     os.environ["CARGO_TARGET_DIR"] = target
     env = dict(case.get("env", {}))
     if "rustflags" in case:
@@ -178,7 +178,7 @@ def build_case(name, case, workspace, json_path):
     if case.get("alone"):
         fx.alone = True
         fx.rustc_build()
-    fx.ra_jit_build()
+    fx.blaze_build()
     actual = fx.behaviour(fx.binary)
     rows = rows_for(fx)
     skipped = [row for row in rows if row[0] == "skipped"]
@@ -199,7 +199,7 @@ def build_case(name, case, workspace, json_path):
     for reason in sorted(set(reasons)):
         print(f"  {reason}")
     if actual != expected:
-        raise SystemExit(f"{name}: ra-jit output differs from cargo's")
+        raise SystemExit(f"{name}: blaze output differs from cargo's")
     if case["expected"] == "compiled" and skipped:
         raise SystemExit(f"{name}: expected every function to compile, {len(skipped)} remain refused")
     if case["expected"] == "refused" and matched_reason is None:
@@ -221,7 +221,7 @@ def main():
     for name in args.cases or sorted(CASES):
         path = os.path.join(args.json_dir, f"{name}.json") if args.json_dir else None
         results.append(run_case(name, root, path))
-    print(json.dumps({"toolchain": NIGHTLY, "ra_jit": RA_JIT, "cases": results}, indent=1))
+    print(json.dumps({"toolchain": NIGHTLY, "blaze": BLAZE, "cases": results}, indent=1))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ usage: growth.py [ARMS [FIELDS]]
 
 Builds a program whose `serialize` is the shape `#[derive(Serialize)]` gives an internally tagged
 enum: a match of ARMS arms (default 160), each opening a value with a destructor through `?`, then
-`?` on every field of the variant. It is built again with twice the arms, and ra-jit's `serialize`
+`?` on every field of the variant. It is built again with twice the arms, and blaze's `serialize`
 in the second has to be less than GROWTH_RATIO (default 2.6) times the size of the first. A
 straight line doubles; issue #5 was 4 KB per arm squared, 329 MB of code for 285 arms, out of
 reach of an AArch64 branch.
@@ -175,23 +175,23 @@ def code_size(shapes, function):
 
 
 def build(source, function, what):
-    ws = tempfile.mkdtemp(prefix="ra-jit-growth-")
+    ws = tempfile.mkdtemp(prefix="blaze-growth-")
     os.makedirs(os.path.join(ws, "src"))
     open(os.path.join(ws, "Cargo.toml"), "w").write(CARGO_TOML)
     open(os.path.join(ws, "src/main.rs"), "w").write(source)
     fx = Fixture(ws, ["growth"], ["-p", "growth"])
     # What is quadratic takes minutes and gigabytes: past this it has failed already.
-    fx.ra_jit_timeout = 600
+    fx.blaze_timeout = 600
     fx.rustc_build()
     shapes = os.path.join(fx.work, "shapes.tsv")
     os.environ["BLAZE_SHAPES"] = shapes
     try:
-        fx.ra_jit_build()
+        fx.blaze_build()
     finally:
         del os.environ["BLAZE_SHAPES"]
     expected, got = fx.behaviour(fx.reference), fx.behaviour(fx.binary)
     if expected != got:
-        raise SystemExit(f"{what}: ra-jit's program differs from cargo's:\n  rustc: {expected}\n  ra-jit: {got}")
+        raise SystemExit(f"{what}: blaze's program differs from cargo's:\n  rustc: {expected}\n  blaze: {got}")
     size = code_size(shapes, function)
     shutil.rmtree(ws, ignore_errors=True)
     return size

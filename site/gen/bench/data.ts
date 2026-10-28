@@ -176,8 +176,8 @@ function column(values: (number | undefined)[]): Column {
 	return values.some((v) => v !== undefined) ? values.map((v) => v ?? null) : [];
 }
 
-/** A run's CI link; runs from before the rename name the repo indexable-inc/ra-jit, which GitHub redirects to blaze. */
-const runUrl = (v: unknown): string | undefined => str(v)?.replace('github.com/indexable-inc/ra-jit/', 'github.com/indexable-inc/blaze/');
+/** A run's CI link; runs from before the rename name the repo indexable-inc/blaze, which GitHub redirects to blaze. */
+const runUrl = (v: unknown): string | undefined => str(v)?.replace('github.com/indexable-inc/blaze/', 'github.com/indexable-inc/blaze/');
 const point = (line: Json): Point => ({ date: str(line.date) ?? '', commit: str(line.commit), runUrl: runUrl(line.run_url) });
 
 /** The lines of every file, in file order, that are an object with a known suite and results. */

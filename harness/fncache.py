@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""fncache.py: `#[ra_jit::cache]` keeps what a pure function returns across runs, by the code
-ra-jit compiled for it and everything that code reaches (docs/fn-cache.md).
+"""fncache.py: `#[blaze::cache]` keeps what a pure function returns across runs, by the code
+blaze compiled for it and everything that code reaches (docs/fn-cache.md).
 
-usage: fncache.py            (BLAZE_BIN names the ra-jit built)
+usage: fncache.py            (BLAZE_BIN names the blaze built)
        fncache.py --live     (macOS on AArch64: a live edit drops what the old code kept;
-                              cargo-ra-jit and ra-jit-rustc are found next to BLAZE_BIN)
+                              blaze and blaze-rustc are found next to BLAZE_BIN)
 
 A crate with cached functions is built by a daemon a step at a time, and each step runs the
 program the daemon linked and the one `cargo build` linked, which have to print the same.
@@ -17,7 +17,7 @@ in memory, found on disk or computed, and each step says which it has to be:
 - `width::<u8>` and `width::<u64>` are kept apart though their arguments are the same bytes;
 - `counted`, `noisy` and `addressed` are refused: a static that changes, printing and an
   address formatted (`{:p}`), the first two said with where they are written;
-- `exposed` is refused for `addr`, a method ra-jit would build into its caller but for that;
+- `exposed` is refused for `addr`, a method blaze would build into its caller but for that;
 - `shared` takes an `Rc`, `looked` makes a `HashMap` and `given` takes one, and are kept: the
   second run finds them on disk, `given`'s though its map's entries are in another order;
 - `holders` reads an `Rc`'s count and `ordered` a `HashMap`'s order, and are refused;
@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 TOML = f"""[package]
 name = "fcache"
@@ -40,7 +40,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ra-jit-cache = {{ path = "{ROOT}/crates/ra-jit-cache" }}
+blaze-cache = {{ path = "{ROOT}/crates/blaze-cache" }}
 serde = {{ version = "1", features = ["rc"] }}
 
 [workspace]
@@ -61,7 +61,7 @@ fn step(acc: u64, i: u64) -> u64 {
 }
 
 /// Pure, and slow enough to see.
-#[ra_jit::cache]
+#[blaze::cache]
 fn slow(rounds: u64) -> u64 {
     let mut acc = 1;
     for i in 0..rounds {
@@ -70,82 +70,82 @@ fn slow(rounds: u64) -> u64 {
     acc
 }
 
-#[ra_jit::cache]
+#[blaze::cache]
 fn fib(n: u64) -> u64 {
     if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
 }
 
-#[ra_jit::cache]
+#[blaze::cache]
 fn width<T>(n: u64) -> u64 {
     n * std::mem::size_of::<T>() as u64
 }
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
-#[ra_jit::cache]
+#[blaze::cache]
 fn counted(n: u64) -> u64 {
     CALLS.fetch_add(1, Ordering::Relaxed);
     n + 1
 }
 
-#[ra_jit::cache]
+#[blaze::cache]
 fn noisy(n: u64) -> u64 {
     println!("noisy {n}");
     n * 2
 }
 
 /// What it gives holds an address, another in every run.
-#[ra_jit::cache]
+#[blaze::cache]
 fn addressed(n: u64) -> bool {
     format!("{:p}", &n).len() > 2
 }
 
 /// An address as a number, by a method small enough to be built in where it is called.
-#[ra_jit::cache]
+#[blaze::cache]
 fn exposed(n: u64) -> bool {
     std::ptr::from_ref(&n).addr() > 0
 }
 
 /// An `Rc` is its value: its count is not read.
-#[ra_jit::cache]
+#[blaze::cache]
 fn shared(values: Rc<Vec<u64>>) -> u64 {
     values.iter().sum()
 }
 
 /// What it gives is how many hold the value, which the arguments don't tell.
-#[ra_jit::cache]
+#[blaze::cache]
 fn holders(value: Rc<u64>) -> usize {
     Rc::strong_count(&value)
 }
 
 /// A map made and looked into: the seed it is made with orders its entries alone.
-#[ra_jit::cache]
+#[blaze::cache]
 fn looked(n: u64) -> u64 {
     let squares: HashMap<u64, u64> = (0..n).map(|i| (i, i * i)).collect();
     squares[&(n / 2)] + squares.len() as u64
 }
 
 /// What it gives is in the order of a map's entries, another in every run.
-#[ra_jit::cache]
+#[blaze::cache]
 fn ordered(n: u64) -> Vec<u64> {
     let map: HashMap<u64, u64> = (0..n).map(|i| (i, i)).collect();
     map.keys().copied().collect()
 }
 
 /// A map given: what it is looked up by is its entries, whatever their order.
-#[ra_jit::cache]
+#[blaze::cache]
 fn given(map: HashMap<u64, u64>) -> u64 {
     map[&3] + map.len() as u64
 }
 
 /// Formatting, all of it core's: what it reaches there is pure.
-#[ra_jit::cache]
+#[blaze::cache]
 fn spelled(n: u64) -> String {
     format!("{n:>8}|{:.3}|{:e}", n as f64 / 7.0, n as f32)
 }
 
 /// The processor's cycle counter, read by a function of core known by its name.
-#[ra_jit::cache]
+#[blaze::cache]
 fn ticks(n: u64) -> bool {
     #[cfg(target_arch = "x86_64")]
     let read: unsafe fn() -> u64 = core::arch::x86_64::_rdtsc;
@@ -230,17 +230,17 @@ def said(stderr):
 
 
 def main():
-    ws = tempfile.mkdtemp(prefix="ra-jit-fncache-")
+    ws = tempfile.mkdtemp(prefix="blaze-fncache-")
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", TOML), (MAIN, MAIN_TEXT)):
         open(os.path.join(ws, path), "w").write(text)
-    work = tempfile.mkdtemp(prefix="ra-jit-fncache-out-")
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = tempfile.mkdtemp(prefix="blaze-fncache-out-")
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     reference, store = os.path.join(work, "reference"), os.path.join(work, "fn-cache")
     fx = Fixture(ws, ["fcache"], ["-p", "fcache"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"fcache.{n}") for n in ("o", "patch.o", "bin"))
-    link = linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], RA_JIT), binary)
+    link = linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], BLAZE), binary)
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     ask = ["--crate", "fcache", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link),
            "--binary", binary, *symbols]
@@ -249,7 +249,7 @@ def main():
     def start():
         seen = len(open(log_path).read()) if os.path.exists(log_path) else 0
         out = open(log_path, "a")
-        daemon = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
+        daemon = subprocess.Popen([BLAZE, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
         while "watching" not in open(log_path).read()[seen:]:
             if daemon.poll() is not None:
                 raise SystemExit(f"the daemon did not start: {log_path}")
@@ -262,7 +262,7 @@ def main():
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else ""), ran.stderr, time.time() - began
 
     def sync():
-        reply = subprocess.run([RA_JIT, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
+        reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
         return (reply.stdout + reply.stderr).strip()
 
     def cargo():
@@ -322,10 +322,10 @@ def main():
         found = said(stderr)
         verdict("a daemon started again finds the results", reply.startswith("ok") and found.get("slow") == "found on disk",
                 f"{took * 1000:.0f} ms, slow {found.get('slow')}" + ("" if reply.startswith("ok") else f", the daemon said {reply[:200]}"))
-        # `cargo ra-jit cache` lists what each function kept, by its code and the older ones;
+        # `blaze cache` lists what each function kept, by its code and the older ones;
         # `clear --stale` leaves the code's alone, and the next run still finds them.
-        cargo_ra_jit = os.path.join(os.path.dirname(os.path.abspath(RA_JIT)), "cargo-ra-jit")
-        listed = lambda *args: subprocess.run([cargo_ra_jit, "ra-jit", "cache", *args], capture_output=True, text=True,
+        blaze_cli = os.path.join(os.path.dirname(os.path.abspath(BLAZE)), "blaze")
+        listed = lambda *args: subprocess.run([blaze_cli, "blaze", "cache", *args], capture_output=True, text=True,
                                               env={**os.environ, "BLAZE_FN_CACHE_DIR": store}, timeout=60).stdout
         before = listed()
         cleared = listed("clear", "--stale")
@@ -337,7 +337,7 @@ def main():
                 f"{slow[0].strip() if slow else before[:120]!r}; {cleared.strip()}")
         # Under cargo the attribute does nothing: every call runs, and nothing is kept.
         theirs, stderr, cargo_took = run(cargo(), {**os.environ, "BLAZE_FN_CACHE_LOG": "1", "BLAZE_FN_CACHE_DIR": store})
-        verdict("cargo's build caches nothing", "ra-jit" not in stderr and theirs == ours, f"{cargo_took * 1000:.0f} ms")
+        verdict("cargo's build caches nothing", "blaze" not in stderr and theirs == ours, f"{cargo_took * 1000:.0f} ms")
     finally:
         daemon.kill()
     entries = sum(len(files) for _, _, files in os.walk(store))
@@ -353,13 +353,13 @@ fn base() -> u64 {
     1
 }
 
-#[ra_jit::cache]
+#[blaze::cache]
 fn answer(n: u64) -> u64 {
     base() * n
 }
 
 fn main() {
-    let live = match ra_jit_live::Live::start() {
+    let live = match blaze_live::Live::start() {
         Ok(live) => live,
         Err(why) => {
             println!("no live edits: {why}");
@@ -392,29 +392,29 @@ def live():
     import live_e2e as e2e
 
     async def go():
-        bin_dir = os.path.dirname(os.path.abspath(RA_JIT))
-        work = tempfile.mkdtemp(prefix="ra-jit-fncache-live-")
+        bin_dir = os.path.dirname(os.path.abspath(BLAZE))
+        work = tempfile.mkdtemp(prefix="blaze-fncache-live-")
         # A socket's path is short: the daemon's home is too.
         probe, home = None, tempfile.mkdtemp(prefix="rjfc-", dir="/tmp")
         try:
-            for crate in ("ra-jit-live", "ra-jit-cache", "ra-jit-cache-macros"):
+            for crate in ("blaze-live", "blaze-cache", "blaze-cache-macros"):
                 shutil.copytree(os.path.join(ROOT, "crates", crate), os.path.join(work, "crates", crate),
                                 ignore=shutil.ignore_patterns("target"))
             project = os.path.join(work, "app")
             os.makedirs(os.path.join(project, "src"))
             open(os.path.join(project, "Cargo.toml"), "w").write(
                 '[package]\nname = "fcachelive"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n'
-                'ra-jit-live = { path = "../crates/ra-jit-live" }\nra-jit-cache = { path = "../crates/ra-jit-cache" }\n\n[workspace]\n')
+                'blaze-live = { path = "../crates/blaze-live" }\nblaze-cache = { path = "../crates/blaze-cache" }\n\n[workspace]\n')
             source = os.path.join(project, MAIN)
             open(source, "w").write(LIVE_TEXT)
             env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
                        CARGO_TARGET_DIR=os.path.join(work, "target"), BLAZE_HOME=home,
                        BLAZE_FN_CACHE_LOG="1", BLAZE_FN_CACHE="memory")
             env.pop("CARGO_INCREMENTAL", None)
-            build = ["cargo-ra-jit", "ra-jit", "build"]
+            build = ["blaze", "build"]
             subprocess.run(["cargo", "generate-lockfile"], cwd=project, env=env, check=True, capture_output=True)
 
-            async def cargo_ra_jit(step):
+            async def blaze_cli(step):
                 proc = await asyncio.create_subprocess_exec(*build, cwd=project, env=env, stdout=asyncio.subprocess.PIPE,
                                                             stderr=asyncio.subprocess.PIPE)
                 out, err = await proc.communicate()
@@ -423,9 +423,9 @@ def live():
                     raise e2e.StepError(f"{step}: {text[-3000:]}")
                 return text
 
-            await cargo_ra_jit("first build")
+            await blaze_cli("first build")
             for _ in range(120):
-                if "[blaze]" in await cargo_ra_jit("wait for the daemon"):
+                if "[blaze]" in await blaze_cli("wait for the daemon"):
                     break
                 await asyncio.sleep(0.5)
             else:
@@ -438,7 +438,7 @@ def live():
                 open(source, "w").write(text.replace(needle, f"fn base() -> u64 {{\n    {new}\n}}"))
 
             edit(1, 2)
-            await cargo_ra_jit("edit before start")
+            await blaze_cli("edit before start")
             probe = await asyncio.create_subprocess_exec(
                 os.path.join(work, "target", "debug", "fcachelive"), cwd=project, env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -449,7 +449,7 @@ def live():
             for new in (3, 4):
                 edit(new - 1, new)
                 since = len(log)
-                await cargo_ra_jit(f"base {new} while running")
+                await blaze_cli(f"base {new} while running")
                 applied = await e2e.wait_for(f"patch of base {new}", lines, "outcome:", log)
                 if "applied" not in applied:
                     raise e2e.StepError(f"the program did not take the patch: {applied}")
@@ -461,8 +461,8 @@ def live():
             if probe is not None and probe.returncode is None:
                 probe.terminate()
                 await probe.wait()
-            subprocess.run(["cargo-ra-jit", "ra-jit", "stop"], env=dict(os.environ, BLAZE_HOME=home,
-                           PATH=f"{os.path.dirname(os.path.abspath(RA_JIT))}{os.pathsep}{os.environ['PATH']}"),
+            subprocess.run(["blaze", "stop"], env=dict(os.environ, BLAZE_HOME=home,
+                           PATH=f"{os.path.dirname(os.path.abspath(BLAZE))}{os.pathsep}{os.environ['PATH']}"),
                            capture_output=True)
             shutil.rmtree(work, ignore_errors=True)
             shutil.rmtree(home, ignore_errors=True)

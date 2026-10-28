@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""heap.py FOLDED [ROWS] [--syntax]: attributes a heap profile to salsa queries and to ra-jit's own structures.
+"""heap.py FOLDED [ROWS] [--syntax]: attributes a heap profile to salsa queries and to blaze's own structures.
 
 FOLDED is what `jeprof --collapsed` makes of a profile the daemon wrote (on macOS, what
 `heapfold.py` makes of it): build it with `--features heap-profile`, run it with
@@ -8,9 +8,9 @@ FOLDED is what `jeprof --collapsed` makes of a profile the daemon wrote (on macO
 Each allocation goes to the innermost salsa ingredient on its stack: a query's `value` (what the
 memo keeps, which an `lru` can let go of), its `record` (the dependencies and revisions salsa keeps
 of the memo, which stay when the value goes), an `interned` value, or a tracked struct or input.
-What no ingredient made goes to ra-jit's own structures by the function that allocated it.
+What no ingredient made goes to blaze's own structures by the function that allocated it.
 
-`--syntax` also says what of it is syntax: rowan's green nodes (the trees, which a memo of
+`--syntax` also says what of it is syntax: syntax-tree's green nodes (the trees, which a memo of
 `parse` or anything holding a `GreenNode` keeps), its flat trees (the same, as arrays), its
 red nodes (cursors over a tree), the
 lexer's and parser's buffers, ast id maps and span maps, each by the ingredient that made it.
@@ -22,13 +22,13 @@ EXECUTE = re.compile(r"<(.+?) as salsa::function::Configuration>::execute")
 RECORD = ("pop_into_revisions", "OriginAndExtra", "LazyMemoEntries", "insert_memo", "MemoTable",
           "QueryRevisions", "add_read", "report_tracked_read")
 OWN = [("symbol table", "SymbolTable"), ("vfs / file loading", "vfs::"), ("vfs / file loading", "load_cargo"),
-       ("project model", "project_model"), ("splice", "ra_jit::splice"), ("checkouts", "ra_jit::Checkouts"),
+       ("project model", "project_model"), ("splice", "blaze::splice"), ("checkouts", "blaze::Checkouts"),
        ("object emission", "cranelift_object"), ("object emission", "object::write"),
-       ("codegen driver (outside queries)", "hir_ty_codegen::"), ("ra-jit main (other)", "ra_jit::")]
+       ("codegen driver (outside queries)", "hir_ty_codegen::"), ("blaze main (other)", "blaze::")]
 # What of an allocation is syntax, by the innermost frame that says so.
-SYNTAX = [("flat trees", ("rowan::flat", "FlatTree")),
-          ("green nodes", ("rowan::green", "rowan::arc", "GreenNodeBuilder", "SyntaxTreeBuilder")),
-          ("red nodes", ("rowan::cursor", "rowan::api")),
+SYNTAX = [("flat trees", ("syntax_tree::flat", "FlatTree")),
+          ("green nodes", ("syntax_tree::green", "syntax_tree::arc", "GreenNodeBuilder", "SyntaxTreeBuilder")),
+          ("red nodes", ("syntax_tree::cursor", "syntax_tree::api")),
           ("lexer and parser buffers", ("parser::", "LexedStr", "rustc_lexer")),
           ("ast id maps", ("AstIdMap",)),
           ("span maps", ("RealSpanMap", "span::map::", "SpanMap")),

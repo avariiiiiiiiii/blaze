@@ -43,7 +43,7 @@ The edges, in the order an edit goes through them:
    (`backdate_if_appropriate` in salsa 0.28.5 needs `old_memo.value()`), so a query that runs
    again after its value was evicted counts as changed, and everything that read it runs again.
    The file's 1,310 macro calls were expanded again on every edit for this reason.
-3. **ra-jit read positions where it needed none.** `mir_body` checked for failed expansions
+3. **blaze read positions where it needed none.** `mir_body` checked for failed expansions
    (`check_expansions`) through `Body::with_source_map`, and type names of closures
    (`closures_around`) ordered them through it. Neither result depends on where the body is,
    but both took the source map as an input, so MIR was lowered again for every function of the
@@ -71,7 +71,7 @@ Each step is a commit, measured on its own:
    every edit of the file (cheap: one walk of the anchor) and stays equal unless the anchor's
    own text changed. `Body::relative` lowers from it; `Body::of` is its body;
    `Body::with_source_map` moves its source map to where the anchor is in the file, so a body
-   is lowered once and the IDE's map and ra-jit's agree on every id (a `BlockId` is a tracked
+   is lowered once and the IDE's map and blaze's agree on every id (a `BlockId` is a tracked
    struct of the query that lowers it, so two lowerings would not). `RA_CHECK_RELATIVE_BODIES`
    compares every moved map with the body lowered in its file.
 3. Places are found from the body alone (`places.rs`): a row and column in the anchor, from
@@ -126,7 +126,7 @@ of the object) are most, and they are per program, not per file. A file of long 
 checkout on this machine, and the real-project job pins it.
 
 Tests: `cargo test --release -p hir-ide` fails the 18 tests it failed before
-(`/tmp/rajit-verify/base.txt`), after two query-log snapshots were updated: in
+(`/tmp/blaze-verify/base.txt`), after two query-log snapshots were updated: in
 `typing_inside_a_function_should_not_invalidate_types_in_another` the untouched function now
 runs `body_syntax` and no longer `Body::with_source_map` and `Body::of`. `difftest.py corpus
 --mixed 8`, `difftest.py mixfutures --mixed 16 --layouts` and `growth.py` pass as before; the
@@ -152,6 +152,6 @@ corpus also passes with `BLAZE_CHECK_PLACES=1 RA_CHECK_RELATIVE_BODIES=1` with n
   with attributes and a function in a body are lowered with their anchor's text, so an edit
   elsewhere in that anchor lowers them again.
 - **Upstream.** The body lowering and the moved source map are in the fork
-  (indexable-inc/rust-analyzer, branch `ra-jit`). Upstream made `AstId`s stable by hashing an
+  (indexable-inc/rust-analyzer, branch `blaze`). Upstream made `AstId`s stable by hashing an
   item's kind, name and parent (read: PR #19837, 2025), which is what lets `body_syntax`'s
   part of the `AstIdMap` stay equal; it has nothing like lowering a body from its own tree.

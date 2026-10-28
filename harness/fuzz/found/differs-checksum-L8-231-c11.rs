@@ -5,7 +5,7 @@
 // panic: panicked at src/main.rs:364:695:
 // attempt to divide by zero
 // c11 d88a79ed2d66c13e ok
-// ra-jit:
+// blaze:
 // panic: panicked at src/main.rs:364:695:
 // attempt to divide by zero
 // c11 8a400fca52e41ce1 ok

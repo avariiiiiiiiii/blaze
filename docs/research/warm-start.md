@@ -1,6 +1,6 @@
 # A daemon's start on a warm store, with nothing of rustc's
 
-2026-10-24, for [#41](https://github.com/indexable-inc/ra-jit/issues/41) (the workspace's own
+2026-10-24, for [#41](https://github.com/indexable-inc/blaze/issues/41) (the workspace's own
 state on disk). Measured on dev-aws-7 (c7i.16xlarge, 64 cores, 124 GiB, Linux x86-64),
 Cranelift, `BLAZE_RUSTC_BASE=0`, with `harness/warmstart.py` on bench.py's helix, ripgrep and
 nushell. Before is main at `b6e58ceab9`; after is the warm-manifest branch on it. Each claim is
@@ -38,7 +38,7 @@ inference).
   store), `warm` (a second checkout of the same commit on that store), `restart` (the second
   checkout's daemon stopped and started) and `again` (once more). After each it makes a body
   edit and undoes it, and checks the program's output against cargo's (**read**).
-- The time of a step is `cargo ra-jit build` plus the wait until `cargo ra-jit status` says
+- The time of a step is `blaze build` plus the wait until `blaze status` says
   the checkout is no longer loading, so a rebuild for the first edit is in it. What each worker
   said is in `WORK/said-STEP.txt`, and for the edits in `said-STEP-edit.txt` (**read**).
 - The stacks are from `gdb -p` on the worker every 3 s (`thread apply all bt 45`). Frames are
@@ -47,7 +47,7 @@ inference).
 
 ## Before and after
 
-Seconds, Cranelift, one run each (**read**). "ready" is the wait after `cargo ra-jit build`;
+Seconds, Cranelift, one run each (**read**). "ready" is the wait after `blaze build`;
 "build" includes it for the daemon's own builds (`restart`, `again`).
 
 | | helix before | helix after | nushell before | nushell after | ripgrep before | ripgrep after |
@@ -142,7 +142,7 @@ Measured on dev-aws-5 (c8i.16xlarge, 64 vCPUs, Linux x86-64), each run pinned to
 | frozen crates from the store / written | 0 / 1,297 parts | 374 / 0 |
 | proc macros expanded / from the store | 1,605 / 0 | 16 / 1,586 |
 | cold compile | 17.9 s | 11.9 s |
-| `cargo ra-jit build`, ready included | 31.3 s | 30.7 s |
+| `blaze build`, ready included | 31.3 s | 30.7 s |
 
 ripgrep's `restart` went from 0 found and 16,826 added to 9,640 found and 0 added, and from 0
 of 51 frozen crates to 51 (5.47 s and 5.55 s) (**read**).
@@ -150,7 +150,7 @@ of 51 frozen crates to 51 (5.47 s and 5.55 s) (**read**).
 The wall time stays because what came from the store is of no use to the first edit: once the
 cold build has answered, the worker compiles all it took of the checkout again ("compiling what
 the store had of the checkout, for the first edit to patch", 73,586 functions in 8.0 s on
-nushell), and the `sync` that `cargo ra-jit build` sends when the worker is ready waits for it:
+nushell), and the `sync` that `blaze build` sends when the worker is ready waits for it:
 it arrived as that build began and was answered 9.4 s later. A restart that found nothing
 compiled the checkout with marks the first time and had no such build (**read**, the
 `request: sync` lines in the worker's log). So the next lever is the one below: marks from
@@ -199,9 +199,9 @@ dev-aws-5, `warmstart.py`, main at `b26f32ee88` against the stable-marks branch 
   table has rustc's libraries, so `roots_from_store` is off ("base from the store: 0 roots"),
   and every start compiles 3,618 functions of ripgrep and 30,040 of nushell (**read**, the
   `compiled` column; that those are the roots is **unverified**).
-- Adopting the executable ra-jit linked last as a base, as `Base::of_rustc` adopts rustc's,
+- Adopting the executable blaze linked last as a base, as `Base::of_rustc` adopts rustc's,
   needs the symbols as linked. A function's symbol in a build with nothing of rustc's is
-  `ra-jit.{crate id}.{path}`, and the crate's id changes with its contents, so an edit renames
+  `blaze.{crate id}.{path}`, and the crate's id changes with its contents, so an edit renames
   the symbols of its crate. Generic instances are named per build (**read**, `main.rs`
   `function_named_in`).
 

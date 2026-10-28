@@ -1,9 +1,9 @@
 # NIGHTLY: blaze on the latest nightly (2026-10-25 handoff)
 
-Andrew, 2026-10-25: "ra jit should only support latest nightly"; "you can add features to ra
+Andrew, 2026-10-25: "blaze should only support latest nightly"; "you can add features to ra
 jit, it is not dependent on rustc anymore, to allow nightly things". The goal: the space game
 (`#![feature(allocator_api)]`, `-Zthreads=8`, `cargo-features = ["profile-rustflags"]`,
-edition 2024) builds with `cargo blaze build`.
+edition 2024) builds with `blaze build`.
 
 ## What landed (PR #372)
 
@@ -19,7 +19,7 @@ Seven lanes (`rjn-abi`, `rjn-deref`, `rjn-layout`, `rjn-macro`, `rjn-pms`, `rjn-
   new name (`abort_immediate`); `TypeId`'s DefPathData numbering (Ctor 11, AnonConst 12); the
   `llvm.x86.*` intrinsics the nightly's `core::arch` calls, lowered lane by lane.
 - Deref patterns lowered as `rustc_mir_build` lowers them (`box` patterns are gone upstream).
-- `crates/ra-jit/src/unstable.rs`: every `-Z` flag of the nightly's `rustc -Z help` classed
+- `crates/blaze-engine/src/unstable.rs`: every `-Z` flag of the nightly's `rustc -Z help` classed
   as ignored, modelled (`ub-checks`/`contract-checks` off) or refused with a reason.
   `-Zthreads=N` is ignored: no warning, no refusal, no fallback (tests `treatments`,
   `a_refusal_names_the_flag`).
@@ -40,7 +40,7 @@ Fixes CI asked for on the batch:
 - AArch64: a one-lane 64-bit SIMD vector (NEON's `*x1_t`, LLVM's legal `v1i64`/`v1f64`) by
   value in the Rust ABI goes in a D register (`hir-ty-codegen` `rust_simd_pass_mode`); the
   nightly's memchr and hashbrown pass them, and every aarch64 harness main differed without it.
-- The fork's own workspace (`fork alone`) takes `ra-ap-rustc_abi` from `vendor/rustc_abi`
+- The fork's own workspace (`fork alone`) takes `rustc_abi` from `vendor/rustc_abi`
   beside it (a path patch), not the fork's git main, which only main's sync moves.
 - `build_release.py` builds without PGO, with a warning, while `pgo/profiles.json` is of
   another toolchain (not `--strict`); `nix/units` regenerated for rust-version 1.101;
@@ -53,19 +53,19 @@ quick-3 passed; quick-2 failed only `storefull.py` (sudo not setuid under system
 host, not the code); quick-1 failed `live_types.py` under load (5 jobs at once) and passed when
 run alone. `wholeprogram.py` takes ~650 s, as on main's CI (696 s), not a hang.
 `macroserver.py` PASS; `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p
-ra-jit -p blaze-build-script` pass; `cargo fmt` needed the nightly's rustfmt on
+blaze -p blaze-build-script` pass; `cargo fmt` needed the nightly's rustfmt on
 `toolchain/own.rs` (committed). The cargo-features change: `cargo test -p blaze-manifest` on
 the Mac only. Not run by me: the LLVM backend, macOS, aarch64; CI's fast tier (workflow_dispatch on the
 branch) ran them.
 An earlier lane ran the game's `rgb-arena` crate (allocator_api, `-Zthreads=8`) through
-`cargo blaze build/test/run` with an edit: all builds by the daemon, 0 by cargo.
+`blaze build/test/run` with an edit: all builds by the daemon, 0 by cargo.
 
 ## Still refused or missing for the game
 
 - `-Zshare-generics=no` in the game's `[profile.max]`, `dist`, `pgo-*` rustflags: refused
-  (`EXPORTS`). The dev profile has only `-Zthreads=8`, so `cargo blaze build` (dev) is not
+  (`EXPORTS`). The dev profile has only `-Zthreads=8`, so `blaze build` (dev) is not
   affected; a `--profile max` build is. `=no` is the default at opt-level 3 and could be
-  `OffOnly`, if ra-jit never shares generics with rustc's code: decide and test.
+  `OffOnly`, if blaze never shares generics with rustc's code: decide and test.
 - `-Cllvm-args=-fp-contract=fast` and `-Ctarget-cpu=apple-m5` in `max`: not checked here.
 - `allocator_api` is "partially stabilized since 1.100.0, succeeded by `allocator_ext`" on this
   nightly: a warning from rustc, the game builds.
@@ -76,5 +76,5 @@ An earlier lane ran the game's `rgb-arena` crate (allocator_api, `-Zthreads=8`) 
   do not parse; blaze-resolve's docs and fixtures still name cargo 1.99.0.
 - `pgo/profiles.json` still names 1.99.0: the `pgo` workflow retrains on the toolchain change;
   until it has, releases build without PGO (and `--strict` refuses).
-- The whole game has not been built with `cargo blaze build` yet. That is the next check
+- The whole game has not been built with `blaze build` yet. That is the next check
   (on the Mac, after it moves to nightly-2026-10-25).

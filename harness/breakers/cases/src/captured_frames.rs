@@ -2,7 +2,7 @@
 //! captures a synthesizer of about 240 KB by value, and cpal wraps it in two more closures,
 //! each calling the one inside through `&mut`. rust-analyzer's MIR gives a closure's body a
 //! local for each capture and for each binding of the function the closure is written in;
-//! in a closure called by reference nothing reads or writes them, but ra-jit gave each a
+//! in a closure called by reference nothing reads or writes them, but blaze gave each a
 //! slot, so each of the two frames had room for the synthesizer twice. CoreAudio calls the
 //! callback on a thread of 512 KB, and it overflowed. rustc's frames here are a few hundred
 //! bytes; a local nothing mentions now has no slot.

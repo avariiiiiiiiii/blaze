@@ -10,7 +10,7 @@
     "--features",
     "weak,with-opt"
   ],
-  "ra-jit": [
+  "blaze": [
     "--features",
     "weak,with-opt"
   ]

@@ -58,7 +58,7 @@ cargo rejects is rejected with cargo's message. Part of the self-contained blaze
 - A manifest that does not parse or fit the schema is shown as cargo shows it, a snippet with
   the place marked (`blaze_manifest::diagnostic`).
 
-`cargo blaze` reads the workspace with it (`crates/ra-jit/src/cargo/metadata.rs`): every
+`blaze` reads the workspace with it (`crates/blaze-engine/src/cargo/metadata.rs`): every
 command's `cargo metadata --no-deps`, with `--manifest-path` and `--config` as the command was
 given them. A manifest cargo refuses ends the command with cargo's message and status 101.
 
@@ -83,7 +83,7 @@ sharing pass of `rebuild_unit_graph_shared`, made from blaze-metadata's resolve,
 resolution and blaze-manifest's profiles, and printed in cargo's `--unit-graph` schema
 (version 1). It reads no file and runs no process, and builds for wasm32-wasip1 (issue #458;
 wasm32-unknown-unknown waits on blaze-resolve's `url` file paths). `blaze_metadata::units`
-does the reading and the resolve around it, and ra-jit's `plan.rs` plans every load from it:
+does the reading and the resolve around it, and blaze's `plan.rs` plans every load from it:
 no `cargo build --unit-graph` is run. A build it does not port (cargo's `-Z` flags,
 `-Zbuild-std`, artifact dependencies, multiple build scripts, per-package targets) is an error
 naming it, not a cargo run.
@@ -182,15 +182,15 @@ crates.io with `library/vendor`) as rust-analyzer's `Sysroot::load_workspace` as
 `--filter-platform` and with each target of `harness/answers.py`. cargo reads the full metadata
 against a copy of the lock file (`CARGO_RESOLVER_LOCKFILE_PATH`); blaze-metadata's
 `metadata_locked` never writes it and refuses a lock file the manifests no longer agree with, as
-`--locked` does. ra-jit answers rust-analyzer with these (`ra-jit/src/cargo/metadata.rs`
+`--locked` does. blaze answers rust-analyzer with these (`blaze/src/cargo/metadata.rs`
 `library`, through `OwnMetadata.library`), so loading a workspace runs no cargo for the sysroot.
 
 On VM nc-sysroot (Linux arm64), 2026-10-27, with the pinned nightly: 26 of 26 equal (no platform and
 the 12 targets, each `--no-deps` and full; 15 packages without dependencies, 30 to 50 with).
 
 The `toolchain` part asks what a workspace load asked cargo of the toolchain and the
-configuration, of cargo and of `ra-jit cargo-answer`, which answers it with no cargo run
-(`crates/ra-jit/src/answers/cargo.rs` over blaze-manifest): `cargo --version`, `cargo config
+configuration, of cargo and of `blaze-engine cargo-answer`, which answers it with no cargo run
+(`crates/blaze-engine/src/answers/cargo.rs` over blaze-manifest): `cargo --version`, `cargo config
 get` as TOML with `--show-origin` and as JSON, `cargo rustc --print cfg -- -O` and `--print
 target-spec-json` for the host and five other targets (and for `build.target`), comparing exit
 code and stdout as text, and, in a tree with a package, the flags cargo hands rustc for each
@@ -206,7 +206,7 @@ refused by both (the config fixtures have no package, and some have broken files
 The `units` part runs `cargo <run> --unit-graph -Zunstable-options` (with `RUSTC_BOOTSTRAP=1`)
 and blaze-metadata's `units` example (blaze-units' graph) for `build`, `build --all-targets`,
 `build --release`, `build --profile test --all-targets`, `build --profile bench --all-targets`
-(what ra-jit's `plan.rs` asks for its builds, tests and benchmarks) and `test --no-run`, on
+(what blaze's `plan.rs` asks for its builds, tests and benchmarks) and `test --no-run`, on
 harness/norustc/fixture and the bench projects, and compares the whole JSON: every unit in
 order, with its package, target, profile, platform, mode, features and dependencies, and the
 roots. A build both refuse must be refused with cargo's error text. One order is not compared:
@@ -224,12 +224,12 @@ missing `vendor/lolhtml` first, blaze-metadata the missing `vendor/rust-argon2`,
 path packages in another order than cargo's resolver asks for them.
 
 The `ctdeps` part (named only: it builds what it compares) holds blaze's own build of a load's
-build scripts and proc macros (`crates/ra-jit/src/cargo/compile_time.rs`, in place of
+build scripts and proc macros (`crates/blaze-engine/src/cargo/compile_time.rs`, in place of
 rust-analyzer's `cargo check --compile-time-deps`) to cargo's. For harness/norustc/fixture and
 each bench project, copied into a directory of its own, and for a build and a test load (the
 test adds `--cfg-test`, cargo's `--all-targets`, and the project's `test=[...]` flags of
 `bench.py`), it runs `cargo check --compile-time-deps --message-format=json` as rust-analyzer's
-`build_command` does and reads the messages as `WorkspaceBuildScripts` does, then `ra-jit
+`build_command` does and reads the messages as `WorkspaceBuildScripts` does, then `blaze
 compile-time-deps` with the same flags, which loads the workspace as a build's daemon does
 (`--own-target`) and prints what the load read. Per package it compares the script's cfgs and
 variables (`OUT_DIR` and other paths replaced), every file of `OUT_DIR` by sha256 (its own path
@@ -239,7 +239,7 @@ the offsets in a C library the same. An object or archive is hashed without its 
 whose string table gcc orders by the strings' hashes, so another `OUT_DIR` reorders it; a
 configure log's temporary file names (`ccXXXXXX.o`) and `config.status`'s split strings are
 read as one; a probe's output (autocfg's `autocfg_<random>_N`, `probeN.ll` before autocfg 1.2)
-only has to be there, as ra-jit writes it empty. When both fail, they count as the same
+only has to be there, as blaze writes it empty. When both fail, they count as the same
 failure when blaze names the package cargo named, and the result says why when each stopped at
 something the machine or checkout lacks (a program a script spawns, the linker, a path package).
 
@@ -248,7 +248,7 @@ cargo, bat, hyperfine, just, axum, nushell, helix and bevy. fd differs only in j
 `config.log` and `config.status`, which record `SHELL`: the build-script sandbox gives a script
 only the variables `script_sandbox.rs` `given` lets through, so `configure` records its own
 `/bin/sh` where cargo's run had the shell's; with `BLAZE_SANDBOX=off` its 9 packages are equal.
-biome stops at a syn-1 proc macro ra-jit cannot compile (`darling_macro`, #327). zed fails for
+biome stops at a syn-1 proc macro blaze cannot compile (`darling_macro`, #327). zed fails for
 both (cargo at gcc's missing `-fuse-ld=lld`, blaze at `cmake`), and bun for both at a path
 package its own build makes (`harness/bunprep.py`).
 

@@ -3,12 +3,12 @@
 
 ARM   cargo (warm target dir of main, tree /root/rb/c), cold (blaze, empty store), warm (blaze,
       a copy of the store main's cold run of the same JOB left), remote (blaze, empty store filled by
-      `ra-jit cache pull` from the gateway, where main's cold run pushed it; the pull is timed apart
+      `blaze-engine cache pull` from the gateway, where main's cold run pushed it; the pull is timed apart
       and counted in the total), fill (blaze, the store /root/rb/fill-JOB kept across runs: repeated
       until one succeeds, it becomes main's store and is pushed, as cold a 1 does).
 /root/rb/bench.env (KEY=VALUE lines) is added to every blaze arm's environment.
 SHAPE a (no edit), b (body.patch: Symbol::intern's body), c (sig.patch: Symbol::empty's signature).
-JOB   build (cargo build -p ra-jit --release --features llvm) or test (the unit tests, as
+JOB   build (cargo build -p blaze-engine --release --features llvm) or test (the unit tests, as
       harness/unittests.py runs them: one cargo test of its crates).
 
 Blaze runs are each a fresh CI job: a fresh copy of the tree, an empty target dir, a new
@@ -19,7 +19,7 @@ from pathlib import Path
 RB = Path("/root/rb")
 SRC, BIN, CTREE = RB / "src", RB / "bin", RB / "c"
 PATCH = {"a": None, "b": RB / "body.patch", "c": RB / "sig.patch"}
-CRATES = ["hir-ty-codegen", "ra-jit-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "ra-jit",
+CRATES = ["hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-engine",
           "hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics"]
 # Stack overflows of blaze-built hir-ide (selfhost lane's), skipped in both arms.
 SKIP = ["--", "--skip", "infer_std_crash_5", "--skip", "recursive_vars"]
@@ -52,7 +52,7 @@ def sh(argv, cwd, env, log):
 
 def commands(tree, tool):
     if JOB == "build":
-        return [(tree, [*tool, "build", "-p", "ra-jit", "--release", "--features", "llvm"] + (["--locked"] if tool == ["cargo"] else []))]
+        return [(tree, [*tool, "build", "-p", "blaze-engine", "--release", "--features", "llvm"] + (["--locked"] if tool == ["cargo"] else []))]
     test = [*tool, "test", "--release", "--no-fail-fast"]
     return [(tree, [*test, *(f"-p{c}" for c in CRATES), *SKIP])]
 
@@ -123,10 +123,10 @@ def main():
         knobs = RB / "bench.env"
         if knobs.exists():
             env.update(line.split("=", 1) for line in knobs.read_text().split() if "=" in line)
-        tool = ["cargo", "blaze"]
+        tool = ["blaze"]
     total, rcs = 0.0, []
     if ARM == "remote":
-        rc, secs = sh(["ra-jit", "cache", "pull", SPEC, f"blaze-bench-{JOB}"], tree, remote_env(env), log)
+        rc, secs = sh(["blaze-engine", "cache", "pull", SPEC, f"blaze-bench-{JOB}"], tree, remote_env(env), log)
         total += secs
         rcs.append(f"pull{rc}:{secs:.1f}")
     if ARM != "cargo":
@@ -149,7 +149,7 @@ def main():
         base = RB / f"store-{JOB}-main"
         shutil.rmtree(base, ignore_errors=True)
         shutil.copytree(store, base, symlinks=True)
-        rc, secs = sh(["ra-jit", "cache", "push", SPEC, f"blaze-bench-{JOB}"], tree, remote_env(env), log)
+        rc, secs = sh(["blaze-engine", "cache", "push", SPEC, f"blaze-bench-{JOB}"], tree, remote_env(env), log)
         row = [time.strftime("%Y-%m-%dT%H:%M:%S"), "push", SHAPE, JOB, rnd, f"{secs:.1f}", f"{rc}:{secs:.1f}", str(size), "", "push of main's store"]
         with open(RB / "results.tsv", "a") as f:
             f.write("\t".join(row) + "\n")

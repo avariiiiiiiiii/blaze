@@ -1,6 +1,6 @@
 //! tests/ui/associated-consts/associated-const-match-patterns.rs and
 //! tests/ui/rfcs/rfc-2302-self-struct-ctor: a pattern that is a path starting at a type,
-//! `<T>::C` or `<T as Trait>::C`, and a unit struct matched as `Self`. ra-jit resolved neither
+//! `<T>::C` or `<T as Trait>::C`, and a unit struct matched as `Self`. blaze resolved neither
 //! as a pattern and left the function to rustc.
 
 trait Named {

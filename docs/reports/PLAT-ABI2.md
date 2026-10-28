@@ -1,8 +1,8 @@
 # The three platform rounds as one implementation
 
-Branch `ra-jit-plat-abi2`. It began at 080a93e19d (the collated branch with
-`ra-jit-windows-abi2` merged in), then took `ra-jit-aarch64-abi2` (bb4e16badb),
-`ra-jit-macos-abi2` (ec9a15955f) and `ra-jit-collate` at 91c7292532 (7a8d881f44).
+Branch `blaze-plat-abi2`. It began at 080a93e19d (the collated branch with
+`blaze-windows-abi2` merged in), then took `blaze-aarch64-abi2` (bb4e16badb),
+`blaze-macos-abi2` (ec9a15955f) and `blaze-collate` at 91c7292532 (7a8d881f44).
 
 Where each number comes from is said next to it. "CI" is GitHub Actions run 39057174862 on
 888e87df74, the last commit that changes code or harnesses; what follows it is this file.
@@ -31,10 +31,10 @@ wrong, both in reading the assembler's object back. The operand's name was looke
 an underscore taken off, which an assembler does not add to a name the text has. And
 `object` says of every Mach-O relocation that what is added is in the field, which is so
 for an address that is data and not for an instruction, where the field is the instruction
-and what is added comes apart. With a254756b77 both are compiled by ra-jit: 828 of 828 on
+and what is added comes apart. With a254756b77 both are compiled by blaze: 828 of 828 on
 macOS under both backends.
 
-The ELF rows on both architectures are compiled by ra-jit and not left to rustc: the corpus
+The ELF rows on both architectures are compiled by blaze and not left to rustc: the corpus
 has no function left to rustc on Linux x86-64 (822 of 822), on native AArch64 (825 of 825)
 or under qemu (825 of 825), and the `sym` cases are among them.
 
@@ -52,7 +52,7 @@ One model: `VariableArguments` for a call, `Variadic` for a definition, with
 `VariadicRegisters::all_in_registers` is gone, and `va_arg` out of a homed list (Windows)
 and out of a stack list (Apple) is one arm.
 
-`ra-jit-collate`'s change to how a `VaList` is passed in a C ABI touched AArch64 and
+`blaze-collate`'s change to how a `VaList` is passed in a C ABI touched AArch64 and
 Windows x64 without having run there. After the merge the variadic cases match on all
 four: they are in the corpus counts below.
 
@@ -71,7 +71,7 @@ to more than sixteen bytes is refused.
 Measured on native AArch64 (CI run 39043901289, a temporary step since removed),
 `backends.py` on the corpus, three runs each, 11,813 functions:
 
-| | producing code, s (all threads) | µs per function | ra-jit wall, s |
+| | producing code, s (all threads) | µs per function | blaze wall, s |
 |---|---:|---:|---:|
 | -O0 fast emit, machine and context kept | 9.7 to 9.9 | 821 to 838 | 7.9 to 8.0 |
 | -O0 fast emit, one per function | 13.9 to 14.0 | 1177 to 1185 | 8.9 |
@@ -97,7 +97,7 @@ LLVM is `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`.
 
 ### CI, run 39057174862
 
-| platform | functions from ra-jit | layouts that differ | LLVM compiled | left to Cranelift |
+| platform | functions from blaze | layouts that differ | LLVM compiled | left to Cranelift |
 |---|---|---|---|---|
 | Linux x86-64 | 822 of 822, both backends | 0 of 893 | 11,787 of 11,787 | 0 |
 | Linux AArch64, native | 825 of 825, both backends | 0 of 903 | 11,813 of 11,813 | 0 |
@@ -178,4 +178,4 @@ LLVM was not rerun locally on the last commits; the CI legs are what ran it.
 - `breakers.py`'s `list_by_address` declares `vsnprintf`, which MSVC has out of line only
   in `legacy_stdio_definitions`; the case links it there.
 - `backends.py` ran on nothing but Unix (`os.wait4`, `resource`, the platform's encoding
-  for what ra-jit prints); on Windows it now runs, without the peak memory.
+  for what blaze prints); on Windows it now runs, without the peak memory.

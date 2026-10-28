@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""check_apps.py: `cargo blaze check` against `cargo check` on the applications of apps/apps.json.
+"""check_apps.py: `blaze check` against `cargo check` on the applications of apps/apps.json.
 
-usage: check_apps.py [NAME...] [--bin ra-jit] [--apps-dir dir] [--work dir] [--json out.json]
+usage: check_apps.py [NAME...] [--bin blaze-engine] [--apps-dir dir] [--work dir] [--json out.json]
                      [--skip NAME] [--timeout secs]
 
 Each application (cloned and prepared as borrowck_apps.py does it) is checked twice with
 `check --workspace --all-targets --message-format=json`, which is every crate and target
-`cargo blaze check` looks at: by plain cargo (rustc), the reference, and by `cargo blaze`
+`blaze check` looks at: by plain cargo (rustc), the reference, and by `blaze`
 (the daemon's checker, which runs no rustc), each into a target directory and a daemon home
 of its own. The errors and warnings of the workspace's files are compared by file, line and
 code (rustc's `E` code, or the lint's name):
 
-  invented  an error or warning `cargo blaze check` reports that rustc does not: an invented
+  invented  an error or warning `blaze check` reports that rustc does not: an invented
             error fails a build rustc accepts
-  missed    one rustc reports that `cargo blaze check` does not
+  missed    one rustc reports that `blaze check` does not
 
 Errors come first. An error of blaze's with no code (a lint a source denies, whose name blaze
 does not write) is taken for rustc's lint error on the same line. The differences are printed
@@ -126,7 +126,7 @@ def check(name, spec, args):
     shutil.rmtree(work, ignore_errors=True)
     bin_dir = os.path.dirname(args.bin)
     result = {}
-    for side, argv in (("rustc", ["cargo", *ARGS]), ("blaze", ["cargo", "blaze", *ARGS])):
+    for side, argv in (("rustc", ["cargo", *ARGS]), ("blaze", ["blaze", *ARGS])):
         home = os.path.join(work, side + "-home")
         os.makedirs(home)
         environ = env(home, os.path.join(work, side + "-target"), bin_dir)
@@ -153,7 +153,7 @@ def check(name, spec, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
-    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "blaze-engine"))
     ap.add_argument("--apps-dir", default=os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps"))
     ap.add_argument("--work", default=os.path.join(os.environ.get("TMPDIR", "/tmp"), "check-apps"))
     ap.add_argument("--timeout", type=int, default=3600)

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Scores the lints rust-analyzer finds, at the level the source sets, against rustc's UI tests.
 
-usage: lints_ui.py <rust checkout> [--bin ra-jit] [--work dir] [--jobs N] [--filter substr]
+usage: lints_ui.py <rust checkout> [--bin blaze-engine] [--work dir] [--jobs N] [--filter substr]
                    [--json out.json] [--toolchain nightly-YYYY-MM-DD] [--list wrong|out]
                    [--deny LINT]
 
 A lint a crate denies, with `#![deny(..)]`, `#[forbid(..)]` or `deny(warnings)`, fails rustc's
-build, so ra-jit may only build what it is denied in if it fails the build too, and may only
+build, so blaze may only build what it is denied in if it fails the build too, and may only
 fail one when rustc would. The tests are the `tests/ui` files that set a lint level with
 `deny` or `forbid`; each revision is a unit, as `borrowck_ui.py` reads them.
 
@@ -16,9 +16,9 @@ reason, when rustc reports an error that is no lint (it may stop before the lint
 `borrowck_ui.py` puts it out (a nightly feature, an auxiliary crate, another file, a flag that
 is not inert), or when it sets a lint level on the command line.
 
-Each lint is scored on its own, by the (lint, line) of every error: one ra-jit reports that
-rustc does not is wrong, one rustc reports that ra-jit does not is missed. A lint whose
-errors ra-jit may fail a build with must have none wrong. What ra-jit finds in a macro's
+Each lint is scored on its own, by the (lint, line) of every error: one blaze reports that
+rustc does not is wrong, one rustc reports that blaze does not is missed. A lint whose
+errors blaze may fail a build with must have none wrong. What blaze finds in a macro's
 expansion is not counted: it fails no build.
 
 `--deny LINT` scores one lint over every `tests/ui` file, not only those that set a level: rustc
@@ -29,7 +29,7 @@ would in a crate; a file that begins with a `#!` line that is no attribute is ou
 import argparse, collections, concurrent.futures, hashlib, json, os, re, subprocess, sys, tempfile, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from borrowck_ui import DEFAULT_TOOLCHAIN, classify, ra_jit_run  # noqa: E402
+from borrowck_ui import DEFAULT_TOOLCHAIN, classify, blaze_run  # noqa: E402
 
 LEVEL = re.compile(r"#!?\[(?:cfg_attr\([^\]]*)?\b(deny|forbid)\(")
 LINT_FLAG = re.compile(r"^(-[AWDF]|--cap-lints|--force-warn)")
@@ -126,7 +126,7 @@ def rustc_errors(toolchain, unit, cache, work):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("rust")
-    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "blaze-engine"))
     ap.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "lints-ui"))
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
     ap.add_argument("--filter")
@@ -177,7 +177,7 @@ def score(args, units, files, cache, cache_path):
 
     inscope = [u for u in units if not u.out]
     started = time.time()
-    actual = ra_jit_run(args.bin, inscope, "polonius", args.jobs, args.work)
+    actual = blaze_run(args.bin, inscope, "polonius", args.jobs, args.work)
     took = time.time() - started
     per = collections.defaultdict(lambda: {"right": 0, "wrong": 0, "missed": 0})
     wrong, missed, panics = [], [], []
@@ -186,8 +186,8 @@ def score(args, units, files, cache, cache_path):
         if "panic" in got:
             panics.append((unit.label, got["panic"].splitlines()[0][:120]))
             continue
-        # A lint in what a macro expands to fails no build of ra-jit's (`broken_in`), so it is
-        # not ra-jit's verdict to score.
+        # A lint in what a macro expands to fails no build of blaze's (`broken_in`), so it is
+        # not blaze's verdict to score.
         have = {(d["code"], d["line"]) for d in got.get("diagnostics", [])
                 if d["severity"] == "Error" and LINT.match(d["code"]) and scored(d["code"])
                 and not d.get("expanded")}
@@ -203,7 +203,7 @@ def score(args, units, files, cache, cache_path):
 
     out = collections.Counter(u.out for u in units if u.out)
     print(f"{len(files)} files, {len(units)} units: {len(inscope)} in scope, {len(units) - len(inscope)} out; "
-          f"ra-jit took {took:.0f}s, panicked on {len(panics)}")
+          f"blaze took {took:.0f}s, panicked on {len(panics)}")
     print(f"\n{'lint':40} {'right':>6} {'wrong':>6} {'missed':>7}")
     for lint, n in sorted(per.items(), key=lambda it: (-it[1]["right"] - it[1]["wrong"], it[0])):
         if n["right"] or n["wrong"]:

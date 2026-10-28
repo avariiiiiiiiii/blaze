@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""testselect.py: `cargo ra-jit test` with `BLAZE_TESTS=affected` runs the tests that have not
+"""testselect.py: `blaze test` with `BLAZE_TESTS=affected` runs the tests that have not
 passed as they are now, and no others: a pass is kept in the store under what the test is a
 function of, and travels with it through a remote.
 
-usage: testselect.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: testselect.py    (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 A package has a library with unit tests and an integration test of it, and a library of the
 workspace beside it that both link, which says under `cfg(test)` what it does not otherwise
@@ -193,7 +193,7 @@ WRITES = "tests::writes_a_file"
 SANDBOXED = sys.platform in ("linux", "darwin") and os.environ.get("BLAZE_SANDBOX") not in ("off", "0")
 OUTSIDE_TEST = "tests::writes_outside"
 # A directory outside the package and the temporary ones, which the sandbox keeps read-only.
-OUTSIDE = os.path.join(os.path.expanduser("~"), ".cache", f"ra-jit-testselect-{os.getpid()}")
+OUTSIDE = os.path.join(os.path.expanduser("~"), ".cache", f"blaze-testselect-{os.getpid()}")
 # The test that reads a file, in a step that did not change the file: where it runs sandboxed,
 # it is skipped like any other unchanged test.
 F = set() if SANDBOXED else {FILE}
@@ -439,12 +439,12 @@ def beside(root, env):
             if ran != {"tests::in_deps", "finds_the_program"} or code != 0:
                 return f"`{args}`: ENDED {code} HAVING PASSED {', '.join(sorted(ran)) or 'nothing'}"
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     return "ok"
 
 
 def test(ws, env, mode):
-    """`mode` is BLAZE_TESTS's value, then `cargo ra-jit test`'s arguments and NAME=VALUE for the
+    """`mode` is BLAZE_TESTS's value, then `blaze test`'s arguments and NAME=VALUE for the
     environment. `remote` pushes the store to a directory, pulls that into an empty store and
     runs `affected` with it."""
     if mode == "remote":
@@ -458,27 +458,27 @@ def test(ws, env, mode):
                 return moved.returncode, f"cache {verb} failed:\n{moved.stdout}{moved.stderr}"
         return test(ws, dict(env, BLAZE_CACHE=pulled), "affected")
     if mode == "fresh":
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=TIMEOUT)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=TIMEOUT)
         shutil.rmtree(os.path.join(ws, "target"))
         return test(ws, env, "affected")
     mode, *args = mode.split()
     more = dict(it.split("=", 1) for it in args if "=" in it)
     args = [it for it in args if "=" not in it]
-    ran = subprocess.run(["cargo", "ra-jit", "test", *args], cwd=ws, env=dict(env, BLAZE_TESTS=mode, **more),
+    ran = subprocess.run(["blaze", "test", *args], cwd=ws, env=dict(env, BLAZE_TESTS=mode, **more),
                          capture_output=True, text=True, timeout=TIMEOUT)
     return ran.returncode, ran.stdout + ran.stderr
 
 
 def main():
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
-    if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
+    if not os.path.exists(os.path.join(bin_dir, "blaze")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
     if SANDBOXED:
         probe = subprocess.run([os.environ["BLAZE_BIN"], "sandbox", "--probe"], capture_output=True, text=True)
         if probe.returncode != 0:
             raise SystemExit(f"there is no sandbox for the tests here (`BLAZE_SANDBOX=off` tests without):\n"
                              f"{probe.stderr.strip()}")
-    root = tempfile.mkdtemp(prefix="ra-jit-testselect-")
+    root = tempfile.mkdtemp(prefix="blaze-testselect-")
     os.makedirs(OUTSIDE, exist_ok=True)
     # The daemon's sockets are under its home, and a socket's path is short (104 bytes on macOS).
     ws, home = os.path.join(root, "tsel"), tempfile.mkdtemp(prefix="rj-ts-", dir="/tmp")
@@ -546,7 +546,7 @@ def main():
         wrong += verdict != "ok"
         print(f"{'a test finds its program from deps':34} {verdict}", flush=True)
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         shutil.rmtree(OUTSIDE, ignore_errors=True)
     print(f"{len(STEPS) + 2 - wrong} of {len(STEPS) + 2} right; under {root}, the daemon's home {home}")
     if wrong:

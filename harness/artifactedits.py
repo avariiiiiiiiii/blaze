@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""artifactedits.py: an edit of a dependency reaches the file `cargo blaze build` says it built,
+"""artifactedits.py: an edit of a dependency reaches the file `blaze build` says it built,
 for each kind of artifact a package can ask for: a program (`bin`), a `cdylib`, a `dylib` and a
 `staticlib` (#730). A build that cannot write the artifact fails saying why; it never reports
 success over the bytes of before.
 
 usage: artifactedits.py [case ...] [--release] [--keep]
-       (BLAZE_BIN names the ra-jit built; cargo-blaze is found next to it)
+       (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 Each case is a workspace of two packages: `dep`, a library, and `top`, of the case's kind,
 which calls it. It is built cold, again with nothing changed, after an edit of a body of `dep`
@@ -152,7 +152,7 @@ def run_case(name, root, env, release):
     env = dict(env, **extra, CARGO_TARGET_DIR=os.path.join(root, f"{name}-target"))
     profile = "release" if release else "debug"
     artifact = os.path.join(env["CARGO_TARGET_DIR"], profile, file)
-    args = ["cargo", "blaze", "build", *(["--release"] if release else [])]
+    args = ["blaze", "build", *(["--release"] if release else [])]
     wrong, before = [], None
     for what, edit, want in STEPS:
         if edit:
@@ -200,9 +200,9 @@ def main():
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--keep", action="store_true")
     opts = parser.parse_args()
-    bin_dir = os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "../target/release/ra-jit"))))
-    if not os.path.exists(os.path.join(bin_dir, "cargo-blaze")):
-        raise SystemExit(f"no cargo-blaze in {bin_dir}")
+    bin_dir = os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "../target/release/blaze-engine"))))
+    if not os.path.exists(os.path.join(bin_dir, "blaze")):
+        raise SystemExit(f"no blaze in {bin_dir}")
     root = tempfile.mkdtemp(prefix="rj-artifactedits-")
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
                BLAZE_HOME=os.environ.get("BLAZE_HOME") or os.path.join(root, "home"))
@@ -213,7 +213,7 @@ def main():
         for name in opts.cases:
             wrong[name] = run_case(name, root, env, opts.release)
     finally:
-        subprocess.run(["cargo", "blaze", "stop"], cwd=root, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=root, env=env, capture_output=True, timeout=120)
     bad = {name: steps for name, steps in wrong.items() if steps}
     print(f"{len(wrong) - len(bad)} of {len(wrong)} cases right ({'release' if opts.release else 'dev'}); under {root}")
     for name, steps in bad.items():

@@ -1,7 +1,7 @@
 // Found by fuzz.py: seed told-rpa-29, case c12, edition 2021, backend llvm.
 // differs: died
 // Reduced in 61 builds. Again: fuzz.py check differs-died-told-rpa-29-c12.rs
-// ra-jit's program ended with status -11 in this case
+// blaze's program ended with status -11 in this case
 // 
 mod c12 {
     use super::*;

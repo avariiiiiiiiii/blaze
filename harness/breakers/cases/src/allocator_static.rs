@@ -1,7 +1,7 @@
 //! tests/ui/threads-sendsync/tls-in-global-alloc.rs: the methods of the `#[global_allocator]`
 //! are called through symbols rustc writes, not by anything the program names. They were left
 //! to rustc without being counted, and wrote to rustc's copy of a static the program read
-//! ra-jit's copy of.
+//! blaze's copy of.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -87,9 +87,9 @@ fn dummy_attr_expand(
 }
 
 /// The static, and what calls it in the allocator's place: rustc's expansion defines `__rg_alloc`
-/// and the others, which its allocator shim calls. These have names of ra-jit's, which the
-/// stand-in rustc builds for a crate whose code is ra-jit's calls from a `#[global_allocator]`
-/// of its own (ra-jit's `stub.rs`).
+/// and the others, which its allocator shim calls. These have names of blaze's, which the
+/// stand-in rustc builds for a crate whose code is blaze's calls from a `#[global_allocator]`
+/// of its own (blaze's `stub.rs`).
 fn global_allocator_expand(
     _db: &dyn SourceDatabase,
     _id: MacroCallId,
@@ -108,8 +108,8 @@ fn global_allocator_expand(
     let name = &name;
     let result = quote::quote! { span=>
         #tt
-        #[export_name = "__ra_jit_global_alloc"]
-        unsafe extern "C" fn __ra_jit_global_alloc(size: usize, align: usize) -> *mut u8 {
+        #[export_name = "__blaze_global_alloc"]
+        unsafe extern "C" fn __blaze_global_alloc(size: usize, align: usize) -> *mut u8 {
             unsafe {
                 ::core::alloc::GlobalAlloc::alloc(
                     &#name,
@@ -117,8 +117,8 @@ fn global_allocator_expand(
                 )
             }
         }
-        #[export_name = "__ra_jit_global_dealloc"]
-        unsafe extern "C" fn __ra_jit_global_dealloc(ptr: *mut u8, size: usize, align: usize) {
+        #[export_name = "__blaze_global_dealloc"]
+        unsafe extern "C" fn __blaze_global_dealloc(ptr: *mut u8, size: usize, align: usize) {
             unsafe {
                 ::core::alloc::GlobalAlloc::dealloc(
                     &#name,
@@ -127,8 +127,8 @@ fn global_allocator_expand(
                 )
             }
         }
-        #[export_name = "__ra_jit_global_realloc"]
-        unsafe extern "C" fn __ra_jit_global_realloc(
+        #[export_name = "__blaze_global_realloc"]
+        unsafe extern "C" fn __blaze_global_realloc(
             ptr: *mut u8,
             size: usize,
             align: usize,
@@ -143,8 +143,8 @@ fn global_allocator_expand(
                 )
             }
         }
-        #[export_name = "__ra_jit_global_alloc_zeroed"]
-        unsafe extern "C" fn __ra_jit_global_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+        #[export_name = "__blaze_global_alloc_zeroed"]
+        unsafe extern "C" fn __blaze_global_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
             unsafe {
                 ::core::alloc::GlobalAlloc::alloc_zeroed(
                     &#name,

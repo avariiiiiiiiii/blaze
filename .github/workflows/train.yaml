@@ -1,10 +1,10 @@
-# The release train: everything the merge gate (ra-jit.yaml) leaves out, on main after the merge,
+# The release train: everything the merge gate (blaze.yaml) leaves out, on main after the merge,
 # and a release of main when it is all green. What runs where, and how long it takes, is in
 # docs/harness.md ("CI").
 #
 #   every harness of harness/ci.py's full tier, on Linux x86-64, Linux AArch64, macOS arm64 and
 #       Windows x86-64, under both producers; Bun's fixtures, rustc's borrow-check tests and the
-#       pinned run-pass tests (Linux x86-64; those on macOS too); `cargo ra-jit` on
+#       pinned run-pass tests (Linux x86-64; those on macOS too); `blaze` on
 #       small projects (Linux x86-64, macOS) and the larger ones (AArch64); harness/wasm32.py,
 #       programs built for wasm32 and run under wasmtime (Linux x86-64); and the ripgrep
 #       bench (not blocking). nix-live.yaml (the flake's builds, the demo and live edits on macOS)
@@ -40,21 +40,21 @@ permissions:
 jobs:
   linux-x64:
     name: linux x64
-    uses: ./.github/workflows/ra-jit-platform.yaml
+    uses: ./.github/workflows/blaze-platform.yaml
     with:
       platform: linux-x64
       os: ubuntu-24.04
       tier: full
       borrowck: true
       pinned-ui: true
-      cargo-ra-jit: true
+      blaze-cli: true
       bench: true
       bun-e2e: true
       wasm32: true
 
   linux-arm64:
     name: linux arm64
-    uses: ./.github/workflows/ra-jit-platform.yaml
+    uses: ./.github/workflows/blaze-platform.yaml
     with:
       platform: linux-arm64
       os: ubuntu-24.04-arm
@@ -63,17 +63,17 @@ jobs:
 
   macos:
     name: macos arm64
-    uses: ./.github/workflows/ra-jit-platform.yaml
+    uses: ./.github/workflows/blaze-platform.yaml
     with:
       platform: macos-arm64
       os: macos-15
       tier: full
       pinned-ui: true
-      cargo-ra-jit: true
+      blaze-cli: true
 
   windows:
     name: windows x64
-    uses: ./.github/workflows/ra-jit-platform.yaml
+    uses: ./.github/workflows/blaze-platform.yaml
     with:
       platform: windows-x64
       os: windows-2025
@@ -109,7 +109,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       # cargo and nix/unit_graph.py from the flake's dev shell, as nix-live.yaml's unit graphs.
       - uses: DeterminateSystems/nix-installer-action@v23
       - uses: DeterminateSystems/magic-nix-cache-action@v15

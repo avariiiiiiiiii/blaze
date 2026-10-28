@@ -1,6 +1,6 @@
 #!/bin/bash
 # cratesweep.sh <out-dir> <name-version>...: vendors each crate and runs its own tests against
-# ra-jit, JOBS crates at a time, under each backend of BACKENDS (`cranelift` unless set; `llvm`
+# blaze, JOBS crates at a time, under each backend of BACKENDS (`cranelift` unless set; `llvm`
 # is run at BLAZE_OPT=2 BLAZE_EMIT=fast). Every crate is run under one backend before any is
 # run under the next, so two backends never build in one checkout at once. One log, one json
 # and one status line per crate in <out-dir>/<backend>. A crate that already has a status there

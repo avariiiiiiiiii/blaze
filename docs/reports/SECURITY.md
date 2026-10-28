@@ -1,6 +1,6 @@
 # Security review of the store, the remote and the daemon's boundaries
 
-Branch `ra-jit-security`, on top of `ra-jit-collate` at ce52276cf5, which has the S3 remote
+Branch `blaze-security`, on top of `blaze-collate` at ce52276cf5, which has the S3 remote
 with its signed lists, compressed packs and `cache gc --remote`, and the platform ABI merge. Everything below was
 measured on Linux x86-64 with Rust 1.99.0 and LLVM 20. Where something is an argument and
 not a measurement it says so. The Windows code in this round was compiled for Windows and
@@ -8,25 +8,25 @@ never run; that is said again where it matters.
 
 ## Threat model
 
-ra-jit compiles a user's code and keeps the result, on that user's disk and optionally on
+blaze compiles a user's code and keeps the result, on that user's disk and optionally on
 a remote that other machines read. What it keeps is machine code that later builds link
 and run. So the question for every party is the same: can they decide what ends up in a
 program the user builds, and can they read what the user built?
 
 ### Who is trusted
 
-**The user.** ra-jit runs as the user and can do nothing the user cannot. Every process
+**The user.** blaze runs as the user and can do nothing the user cannot. Every process
 running as the same user is inside the boundary: it can write the store, the `target`
-directory and the sources, and talk to the daemon. ra-jit does not defend against it and
+directory and the sources, and talk to the daemon. blaze does not defend against it and
 does not claim to. In particular there is no isolation between two checkouts of the same
 user: one can find what the other stored, by design.
 
 **The user's checkouts, with their build scripts and proc macros.** A build script and a
 proc macro are programs that the checkout, or a crate it depends on, has cargo compile and
 run during a build. They run with the user's full rights under cargo, and they run with
-exactly the same rights under ra-jit. ra-jit adds no sandbox and removes none. Building a
-checkout with ra-jit is as much an act of trust in it as building it with cargo, and no
-more. What ra-jit guarantees is narrower and is checked (see "Build scripts and proc
+exactly the same rights under blaze. blaze adds no sandbox and removes none. Building a
+checkout with blaze is as much an act of trust in it as building it with cargo, and no
+more. What blaze guarantees is narrower and is checked (see "Build scripts and proc
 macros" below): it does not run a build script or a proc macro that cargo, given the same
 selection of packages, features, profile and target, would not have run. It also does
 not run them with different arguments, a different environment or a different working
@@ -37,8 +37,8 @@ record of it.
 (`BLAZE_REMOTE_TRUST`). A holder of one of those keys can make every
 machine that trusts it run any code, by signing a list that names a pack of their making.
 That is what the trust means. A signer vouches that its packs were compiled by an honest
-ra-jit from the sources their keys name, on a machine whose store nobody else could write
-to. ra-jit guarantees that nothing reaches a build from a signed remote unless a trusted
+blaze from the sources their keys name, on a machine whose store nobody else could write
+to. blaze guarantees that nothing reaches a build from a signed remote unless a trusted
 key signed the list naming it, for the project it was signed for, and that a machine
 never goes back to an older list than one it has already taken. A machine that has taken
 none can be given any list a trusted key ever signed; see "Rollback protection for signed
@@ -47,7 +47,7 @@ lists".
 ### Who is not trusted
 
 **Other users of the machine.** They must not be able to change what the user's builds
-run, nor read what the user built. ra-jit guarantees: the store directory is created for
+run, nor read what the user built. blaze guarantees: the store directory is created for
 the user alone (0700, files 0600; on Windows it has the access list of the directory it
 is made in), and a
 store or a file in it that belongs to someone else, or that someone else could write to,
@@ -55,13 +55,13 @@ is refused with the reason and the build goes on without it. On Unix this is the
 the mode, read from the open handle. On Windows it is the owner and every entry of the
 access control list, written this round and not yet run. The daemon's socket is in a 0700
 directory, is 0600, and the daemon checks that the peer is the same user (that code is
-`crates/ra-jit/src/socket.rs`, reviewed and not changed here). What ra-jit does not
+`crates/blaze-engine/src/socket.rs`, reviewed and not changed here). What blaze does not
 guarantee: that timing tells another user nothing (they cannot reach the daemon or the
 store, so they would have to infer it from machine load), and anything at all against
 root or, on Windows, the system and the administrators.
 
 **An unsigned remote, and anyone who can write to a remote without a trusted key.** They
-decide the bytes of every object and every list. ra-jit guarantees:
+decide the bytes of every object and every list. blaze guarantees:
 
 - Nothing is pulled from a remote whose lists nobody trusted signed, unless the user sets
   `BLAZE_REMOTE_UNSIGNED=1`, which is the user saying that everyone who can write there
@@ -72,12 +72,12 @@ decide the bytes of every object and every list. ra-jit guarantees:
   put back an older signed list only for a machine that has not yet taken a newer one.
 - No answer of a remote is read past a bound, and no pull writes more than a bound,
   whatever the remote sends (see "Bounds on what a remote sends").
-- No bytes from a remote make ra-jit panic, index out of range or write outside the place
+- No bytes from a remote make blaze panic, index out of range or write outside the place
   they belong: the parsers are fuzzed and dependency archives are unpacked only as plain
   files and directories of their own unit.
 
 **Readers of a remote.** Whoever can read a remote learns what was pushed: machine code,
-names of functions and crates, source lines in debug info. ra-jit guarantees that the
+names of functions and crates, source lines in debug info. blaze guarantees that the
 paths of the pusher's machine are not among it: files of the checkout are named relative
 to it, the standard library's as `/rustc/<commit>/...`, and, from this round, files cargo
 fetched as `/cargo/registry/...` and `/cargo/git/...`. `storeguards.py` looks through
@@ -85,7 +85,7 @@ every byte of a store and of the remote it was pushed to for the checkout, the h
 directory and the cargo home.
 
 **A damaged disk.** Bytes that are not what was written: a torn write, a truncated file,
-flipped bits, a file from another version. ra-jit guarantees that damaged bytes are
+flipped bits, a file from another version. blaze guarantees that damaged bytes are
 detected (SHA-256 per pack on first read, CRC per record on every read, a format version
 in the store and in each pack), discarded and recompiled, never linked. Stored entries
 that pass the checksum are still validated structurally before use. A disk that is
@@ -96,7 +96,7 @@ is covered by the paragraphs above.
 
 The local store is as sensitive as `target/`: whoever writes it owns the user's builds.
 The remote is as sensitive as its signing keys. Everything else, including the content of
-any file ra-jit reads from a store or a remote, is treated as hostile input.
+any file blaze reads from a store or a remote, is treated as hostile input.
 
 ## This round
 
@@ -108,7 +108,7 @@ Each with its test. The findings list below has them under the numbers given her
 | H5 | A signed list that was put back is not taken again | eight tests in `signed::tests` and `remote::tests`; `remote.py` |
 | M6 | Files cargo fetched are stored under `/cargo`, not the pusher's cargo home | `cached::tests::a_fetched_file_is_stored_under_the_same_name_from_every_cargo_home` and two more; `storeguards.py` |
 | M7 | Every read from a remote is bounded, and so is what a pull writes | eleven tests in `remote::tests` and `deps::tests`; fuzz loops; `remote.py` |
-| M8 | ra-jit ran build scripts of dev-dependencies that cargo would not have | `harness/selects.py` |
+| M8 | blaze ran build scripts of dev-dependencies that cargo would not have | `harness/selects.py` |
 | L6 | Windows: owner and access list checked | compiled for `x86_64-pc-windows-msvc`; three tests for the Windows session |
 
 ## Findings, by severity
@@ -122,7 +122,7 @@ that is a birthday bound of about 2^32 crates for an accidental wrong-code hit, 
 chosen collision is within reach of someone who wants to plant code for a crate they do
 not control. The id is now `ContentId`, all 32 bytes, printed in full into the name. The
 hashes that feed it were also changed to hash their dependencies' full ids, and the entry
-key now length-prefixes each field (`ra-jit entry 6`) so that no two field lists are the
+key now length-prefixes each field (`blaze entry 6`) so that no two field lists are the
 same bytes. Test: `cached::tests::a_crate_is_named_by_all_of_its_hash_and_a_key_by_all_of_a_name`
 builds two ids that agree in every byte the old id kept and checks the names and keys
 differ, and that debug, overflow checks and a trailing byte each change the key.
@@ -132,8 +132,8 @@ store or what its mode was, and files were created with the process umask (typic
 0644 in a 0755 directory). Now: created 0700/0600; an existing directory that is readable
 by others is closed to them; one that is another user's or group/world-writable is refused
 by the daemon (`store: not used`, with the reason, and the build succeeds uncached) and by
-`ra-jit cache stats`, `gc` and `verify`. Files are checked with `fstat` on the handle that
-is then read, so there is no window between check and use. `ra-jit cache verify` lists a
+`blaze-engine cache stats`, `gc` and `verify`. Files are checked with `fstat` on the handle that
+is then read, so there is no window between check and use. `blaze-engine cache verify` lists a
 pack others can write to as corrupt; a daemon removes it. Tests in `store::tests`:
 `the_store_and_its_files_are_the_users_alone`, `a_store_others_could_read_is_closed_to_them`,
 `a_store_others_can_write_to_is_refused`, `a_pack_others_can_write_to_is_not_read`,
@@ -144,15 +144,15 @@ only does anything as root; I ran it with `sudo` and it passed). End to end:
 **H3. Unsigned remotes were pulled from without asking. Fixed.** A machine that names no
 key in `BLAZE_REMOTE_TRUST` takes no list from a remote, and so fetches nothing, unless
 `BLAZE_REMOTE_UNSIGNED=1`. Only the exact value `1` counts, and it does not undo naming
-keys. The refusal is in `Trust::open` (`crates/ra-jit/src/remote/signed.rs`), which every
-list a pull reads goes through: `ra-jit cache pull`, `ra-jit deps pull`, the daemon's pull
+keys. The refusal is in `Trust::open` (`crates/blaze-engine/src/remote/signed.rs`), which every
+list a pull reads goes through: `blaze-engine cache pull`, `blaze-engine deps pull`, the daemon's pull
 before a build and its lazy fetching. Pushing asks for nothing; it reads the list it adds
 to through `open_to_extend`, which takes nothing from it. Tests:
 `signed::tests::a_list_nobody_signed_is_taken_only_when_asked_for`, `harness/remote.py`
 (refused with empty, `0` and `true`, nothing fetched; taken with `1`; a push with nothing
 set goes through), `harness/storeguards.py`, `harness/deps.py`, `harness/storefull.py`.
 
-**H4. A dependency archive could write outside its unit. Fixed.** `ra-jit deps pull`
+**H4. A dependency archive could write outside its unit. Fixed.** `blaze-engine deps pull`
 unpacked tar archives from the remote. Entries were only checked by path prefix, so a
 symlink entry followed by a file through it, or a hard link, could place files elsewhere,
 and the boolean `unpack_in` returns for a skipped `..` path was ignored. Now only plain
@@ -211,7 +211,7 @@ read from the environment, so it is what cargo actually used), and:
 
 - stable names, and so store keys, are made from the path with `/cargo` in place of the
   home (`StableNames::stored`);
-- the content id of an outside crate hashes its root the same way (`ra-jit library 4`);
+- the content id of an outside crate hashes its root the same way (`blaze library 4`);
 - an entry on its way to the store has every path it carries rewritten (`Entry::leave`):
   panic locations, `file!()` strings and the file table of its debug info;
 - an entry on its way out of the store has them rewritten to the cargo home of the
@@ -248,7 +248,7 @@ code that names them stays local as before.
 read whole into memory whatever their size, and a pack or an archive was written to disk
 for as long as the remote kept sending. See "Bounds on what a remote sends".
 
-**M8. ra-jit ran build scripts cargo would not have. Fixed.** See "Build scripts and proc
+**M8. blaze ran build scripts cargo would not have. Fixed.** See "Build scripts and proc
 macros".
 
 ### Low, not changed
@@ -264,7 +264,7 @@ there already owns the build. Inside the hashes of checkout crates the id is mix
 to the name and version, under SHA-256. This is an argument, not a test.
 
 **L2. `own_crate_id` is 64 bits of a SHA-256.** It stands for a checkout crate that rustc
-built nothing of, in two places: linker symbol names (`ra-jit.<id>.<path>`) and `TypeId`s,
+built nothing of, in two places: linker symbol names (`blaze.<id>.<path>`) and `TypeId`s,
 where it sits in the slot rustc's 64-bit id would. Neither decides which stored code is
 used: stable names of checkout crates use the full `ContentId`. A collision needs two
 crates of one checkout with the same name hash and would be a duplicate symbol at link
@@ -294,7 +294,7 @@ by others.
 With write access to the local store directory: anything. They compute the key of any
 function (names are derivable from public sources), write a pack with their code under it,
 and the next build links it. This is by design the same as write access to `target/`. The
-fix is H2: ra-jit refuses to be in that position.
+fix is H2: blaze refuses to be in that position.
 
 With write access to an unsigned remote, before this round: the same, for every machine
 that pulls. After: nothing, unless the user set `BLAZE_REMOTE_UNSIGNED=1`.
@@ -338,7 +338,7 @@ in it is out of range.
 What fell out: M1, M2, M3 and M5 above. Accepted manifest lines are checked to be exactly
 64 hex digits and `.pack`, with no path separator.
 
-The remote-facing parsers have the same loops, in `crates/ra-jit`, with the same mutator:
+The remote-facing parsers have the same loops, in `crates/blaze-engine`, with the same mutator:
 
 | Target | Test | Inputs | What is asserted of every input |
 |---|---|---|---|
@@ -367,7 +367,7 @@ how much. Now:
 | All the keys a lazy daemon holds in memory | 512 MiB | `BLAZE_REMOTE_MAX` |
 | A pack a lazy daemon fetches | its listed size, and the store's limit | `BLAZE_CACHE_MAX` |
 | The archive of one unit | 512 MiB | `BLAZE_REMOTE_MAX` |
-| All that one `ra-jit deps pull` unpacks | 64 GiB | `BLAZE_DEPS_MAX` (`off` for none) |
+| All that one `blaze-engine deps pull` unpacks | 64 GiB | `BLAZE_DEPS_MAX` (`off` for none) |
 
 How each is held:
 
@@ -411,8 +411,8 @@ pull and for a push, and the list not overwritten),
 `an_archive_longer_than_is_taken_is_refused`,
 `a_list_of_units_longer_than_is_read_is_refused` and
 `an_archive_that_unpacks_to_more_than_is_taken_is_refused`. Against MinIO, `remote.py`
-does, through `ra-jit cache pull`: a pack listed as 0, 1 and one byte short unpacked, and
-as 0 and one byte short as sent; 2,115 bytes that `ra-jit cache push` made of a 64 MiB
+does, through `blaze-engine cache pull`: a pack listed as 0, 1 and one byte short unpacked, and
+as 0 and one byte short as sent; 2,115 bytes that `blaze-engine cache push` made of a 64 MiB
 pack, listed as 1 MiB; and the manifest of 16 MiB and of one byte more.
 
 Not covered: with `BLAZE_CACHE_MAX=off` the sum of what a pull writes has no bound, which
@@ -420,7 +420,7 @@ is what the setting says. The lazy path's two bounds have no test of their own.
 
 ## What was applied on top of the S3 remote
 
-`ra-jit-collate` has `ra-jit-s3`, in two merges while this round ran (526f2963ba, then
+`blaze-collate` has `blaze-s3`, in two merges while this round ran (526f2963ba, then
 2da3d6a792 with compressed packs, `cache gc --remote` and the daemon that stays). The
 first replaced `remote.rs` and
 `deps.rs` wholesale (the remote is now asynchronous, streams packs to files and has
@@ -454,7 +454,7 @@ to the old remote was done again on the new one, not merged:
   `BLAZE_REMOTE_UNSIGNED=1`) wrote it without a signature, over a signed one. Every
   machine that trusts the signer then takes nothing, and the signer's next push starts
   the list again from what it sends. That is a writer to the remote doing through
-  ra-jit what it could do with the bucket's own tools, so no new power, but ra-jit should
+  blaze what it could do with the bucket's own tools, so no new power, but blaze should
   not do it by accident. Now `rewrite_list` refuses: "is signed, and this machine has no
   key in BLAZE_REMOTE_SIGN: it is left as it is". A collection counts such a manifest
   with the ones it does not trust and goes on. A signer that collects signs what is
@@ -475,19 +475,19 @@ to the old remote was done again on the new one, not merged:
 ## Rollback protection for signed lists
 
 Designed before the signed lists were on this branch, and applied when they arrived. The
-code is in `crates/ra-jit/src/remote/signed.rs` (`Turns`, and the turn in `seal` and
+code is in `crates/blaze-engine/src/remote/signed.rs` (`Turns`, and the turn in `seal` and
 `verify`) and in `Remote::read_list` and `Remote::extend_list` in `remote.rs`.
 
 **What it is for.** A list is signed, so a remote cannot invent one. It could serve an
 old one. Every pack an old list names was vouched for once, so this never gave code
 nobody signed. It matters when a signer has taken something back: a pack built by a
-ra-jit with a miscompilation, or pushed from a machine later found to be compromised,
+blaze with a miscompilation, or pushed from a machine later found to be compromised,
 removed from the list by signing a new one. Without this the remote, or anyone who can
 write to it, could keep handing out the old list for ever.
 
 **The signed body.** Every signed list has a number, its turn. The last line is
 `signed <key> <turn> <signature>`, and the signature is over
-`ra-jit list 2\n<name>\n<turn>\n<body>`. The domain line was `ra-jit list 1`, so a
+`blaze list 2\n<name>\n<turn>\n<body>`. The domain line was `blaze list 1`, so a
 signature of the old kind verifies under no key, and a list signed without a turn is
 "not signed". The turn is a decimal `u64` written the one way there is to write it (no
 sign, no leading zero); anything else is "not signed". It is inside the signed bytes, so
@@ -511,11 +511,11 @@ one second must still be ordered, and over a plain counter because of the reset 
 and a newline. It is written like every file of the store (temporary file, fsync,
 rename, directory fsync), in a directory made 0700. Where:
 
-- For `ra-jit cache` and the daemon, in the store (`BLAZE_CACHE`). The store is what the
+- For `blaze-engine cache` and the daemon, in the store (`BLAZE_CACHE`). The store is what the
   list fills, it is already private to the user and checked for that, and removing the
   store forgets the turns together with the packs they protected. The store's own code
   leaves a name it does not know alone, which `turns` is.
-- For `ra-jit deps`, in the store when `BLAZE_CACHE` is set, and otherwise in `.ra-jit/`
+- For `blaze-engine deps`, in the store when `BLAZE_CACHE` is set, and otherwise in `.blaze/`
   of the target directory the units are unpacked into. `cargo clean` forgets them with
   the units.
 
@@ -535,10 +535,10 @@ processes cannot interleave a read and a write:
 | Equal | Taken. Two machines that push at once can sign the same turn over different lines; both are signed by trusted keys, and a remote choosing between them gains nothing it could not by withholding. |
 | Lower | Refused: "`manifests/default` is turn N, and this machine has taken turn M of it: an older list is not taken". Nothing is fetched, and the list is counted as rejected. |
 | Signed without a turn, or under the old domain | Refused as not signed. There is no released version to stay compatible with. |
-| The remembered file cannot be read, or does not hold a turn | Refused, naming the file and `ra-jit cache forget REMOTE`. It is not taken for nothing remembered: what keeps an old list out must not be something damage removes quietly. The file is left as it is. |
+| The remembered file cannot be read, or does not hold a turn | Refused, naming the file and `blaze-engine cache forget REMOTE`. It is not taken for nothing remembered: what keeps an old list out must not be something damage removes quietly. The file is left as it is. |
 | The turn cannot be written (full disk, read-only store) | The pull fails before fetching. |
 
-`ra-jit cache forget REMOTE` (new) removes what is remembered of one remote. It is for a
+`blaze-engine cache forget REMOTE` (new) removes what is remembered of one remote. It is for a
 damaged memory, and for a remote that was deliberately started again by a signer whose
 clock is behind the old lists.
 
@@ -548,7 +548,7 @@ untrusted list already got: "it is written anew", with only what this push sent,
 turn above everything the signer remembers. After a write goes through, the signer
 remembers its own turn. A damaged memory stops a push as it stops a pull, and the list
 on the remote is not touched. A machine with `BLAZE_REMOTE_UNSIGNED=1` and no keys has
-no turns and no protection; that is the meaning of the setting. The lists of `ra-jit
+no turns and no protection; that is the meaning of the setting. The lists of `blaze
 deps` go through the same code.
 
 **What it does not do.** A machine that has never pulled remembers nothing, so it can be
@@ -580,20 +580,20 @@ through `Remote` on a directory with one machine that signs and one that trusts 
 `a_list_that_was_put_back_is_not_taken`,
 `a_signer_does_not_add_to_a_list_that_was_put_back`,
 `a_memory_that_is_damaged_stops_a_push_and_a_pull`. In `harness/remote.py`, against
-MinIO, through the `ra-jit` binary: A signs and pushes twice, C takes both, the first
+MinIO, through the `blaze` binary: A signs and pushes twice, C takes both, the first
 manifest is put back in the bucket and C's pull is refused with nothing fetched; a
 machine that never pulled takes it; `cache forget` has C take it; A, pushing over it,
 writes a new list with a later turn; C takes that and then refuses the second list.
 
 ## Build scripts and proc macros
 
-They are the checkout's programs and run as the user, under ra-jit exactly as under cargo;
-ra-jit neither confines them nor gives them anything cargo would not. The thing to check
-was that ra-jit never runs one cargo would not have. I read every place ra-jit starts a
-process (`grep -n "Command::new" crates/ra-jit/src`) and every place a build script or a
+They are the checkout's programs and run as the user, under blaze exactly as under cargo;
+blaze neither confines them nor gives them anything cargo would not. The thing to check
+was that blaze never runs one cargo would not have. I read every place blaze starts a
+process (`grep -n "Command::new" crates/blaze-engine/src`) and every place a build script or a
 proc macro can come to run. There are three.
 
-1. **`ra-jit DIR ...` loading a workspace** (`main.rs`, through `project-model`). ra-jit
+1. **`blaze DIR ...` loading a workspace** (`main.rs`, through `project-model`). blaze
    does not run build scripts or compile proc macros itself here. It has cargo do it:
    `cargo check --compile-time-deps` with the profile, packages, features and target the
    build was asked for. Proc macros are then expanded by the toolchain's own proc-macro
@@ -605,22 +605,22 @@ proc macro can come to run. There are three.
    examples, those bring in dev-dependencies, and cargo then runs the build scripts of
    dev-dependencies and builds their proc macros. Measured on a workspace where every
    script and macro writes a line when it runs: `cargo build -p app` ran one build script
-   (of `dep`); the command ra-jit gave cargo for the same selection ran two (of `dep` and
+   (of `dep`); the command blaze gave cargo for the same selection ran two (of `dep` and
    of the dev-dependency `devdep`). A crate that is only a dev-dependency is exactly what
    someone building a release binary does not expect to execute. Fixed in
    `project-model`: `--all-targets` is passed with `--compile-time-deps` only when the
-   configuration asks for all targets, and ra-jit asks only when the build has tests in it
+   configuration asks for all targets, and blaze asks only when the build has tests in it
    (`--cfg-test` or `--dev-deps`).
 
-2. **`cargo ra-jit ...`** (`crates/ra-jit/src/cargo`). Cargo is run as itself with ra-jit as
+2. **`blaze ...`** (`crates/blaze-engine/src/cargo`). Cargo is run as itself with blaze as
    `RUSTC_WORKSPACE_WRAPPER` (`cargo/state.rs`), so cargo decides what is compiled and
    run. The wrapper renames a linked build script to `<script>.real` and leaves a
-   two-line shell script in its place that runs `ra-jit build-script`, which writes down
+   two-line shell script in its place that runs `blaze-engine build-script`, which writes down
    the environment and directory cargo gave it and then `exec`s the real script with the
    same arguments. Nothing runs that cargo did not start.
 
 3. **The daemon running a build script again** (`cargo/script.rs`, `rerun_is_same`, called
-   from `Guard::broken` in `state.rs`). This is the one place ra-jit starts a build script
+   from `Guard::broken` in `state.rs`). This is the one place blaze starts a build script
    itself. It does so only for a script cargo has already run in this target directory,
    only when one of the files the script named with `rerun-if-changed` has changed (or
    any file of the package, if it named none), which is when cargo would run it again,
@@ -628,29 +628,29 @@ proc macro can come to run. There are three.
    and executable. If its output differs the build is handed back to cargo. A change to
    a `rerun-if-env-changed` variable is never handled this way; that is cargo's.
 
-   The record (`ra-jit-ran.json`) is in the target directory and names the executable to
+   The record (`blaze-ran.json`) is in the target directory and names the executable to
    run. Whoever can write there can already replace the script itself, or any rlib, so it
    is no new way in; the target directory is as trusted as the checkout.
 
-The other processes ra-jit starts are cargo, rustc (as the wrapper, with cargo's
-arguments), the linker line cargo's rustc printed, the built program for `cargo ra-jit
+The other processes blaze starts are cargo, rustc (as the wrapper, with cargo's
+arguments), the linker line cargo's rustc printed, the built program for `blaze
 run` and `test`, and itself as daemon or worker.
 
 **The test** is `harness/selects.py`, new and in the workflow. A workspace has an `app`
 with a dependency, a dev-dependency and a dev-only proc macro, and another member nothing
 depends on; each build script and the macro append a line to a file when they run. For
-three selections the same thing is asked of cargo and of ra-jit, each on a fresh copy, and
-every line ra-jit's build wrote has to be one cargo's wrote:
+three selections the same thing is asked of cargo and of blaze, each on a fresh copy, and
+every line blaze's build wrote has to be one cargo's wrote:
 
-| Selection | cargo ran | ra-jit ran |
+| Selection | cargo ran | blaze ran |
 |---|---|---|
 | `build -p app` / `--package app` | script of `dep` | the same 1 |
 | `test --no-run -p app` / `--package app --cfg-test` | scripts of `dep`, `devdep`; macro `devmacro` | the same 3 |
 | `build --workspace` / `--workspace` | scripts of `dep`, `devdep`, `other` | the same 3 |
 
 Before the fix the first row fails, by the measurement above. Not covered by the harness:
-the `cargo ra-jit` path, where the argument is that cargo is the one running; and a
-`ra-jit DIR` with no package selected at the root of a workspace, which builds every
+the `blaze` path, where the argument is that cargo is the one running; and a
+`blaze DIR` with no package selected at the root of a workspace, which builds every
 member as `cargo build` there does.
 
 ## Windows
@@ -700,15 +700,15 @@ rights in `WRITES` is from the documentation.
 elevated) shell, then the first line again in an elevated one:
 
     cargo test --release -p hir-ty --lib -- store::tests
-    cargo build -p ra-jit --release
-    mkdir C:\ra-jit-store-check
-    set BLAZE_CACHE=C:\ra-jit-store-check
-    target\release\ra-jit.exe cache stats
-    icacls C:\ra-jit-store-check /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"
-    target\release\ra-jit.exe cache stats
-    mkdir %LOCALAPPDATA%\ra-jit-store-check
-    set BLAZE_CACHE=%LOCALAPPDATA%\ra-jit-store-check
-    target\release\ra-jit.exe cache stats
+    cargo build -p blaze-engine --release
+    mkdir C:\blaze-store-check
+    set BLAZE_CACHE=C:\blaze-store-check
+    target\release\blaze.exe cache stats
+    icacls C:\blaze-store-check /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"
+    target\release\blaze.exe cache stats
+    mkdir %LOCALAPPDATA%\blaze-store-check
+    set BLAZE_CACHE=%LOCALAPPDATA%\blaze-store-check
+    target\release\blaze.exe cache stats
 
 Expected: the tests pass, among them the three written for Windows
 (`a_store_under_the_users_profile_is_taken`,
@@ -727,7 +727,7 @@ and making the store private on creation.
 
 ## The daemon socket: findings to forward
 
-Read at `origin/ra-jit-cargo` 13054e50d6 (`socket.rs`, `cargo/daemon.rs`, `cargo/client.rs`,
+Read at `origin/blaze-cargo` 13054e50d6 (`socket.rs`, `cargo/daemon.rs`, `cargo/client.rs`,
 and the socket parts of `main.rs`). Nothing was edited. What is already right: the
 directory is made 0700 and refused if it is not a directory, is another user's, or has any
 group/other bit, using `symlink_metadata` so a link is not followed; the socket is 0600;
@@ -736,8 +736,8 @@ is read; the lock is taken before a stale socket is removed, so two daemons star
 together cannot unlink each other's socket; requests are capped at 16 MiB and 10 seconds;
 each connection has its own thread so a slow one blocks nobody.
 
-Read again this round at `ra-jit-collate` 1547078a30, where the file is now
-`crates/ra-jit/src/socket.rs`; still not edited. The list below was forwarded last round.
+Read again this round at `blaze-collate` 1547078a30, where the file is now
+`crates/blaze-engine/src/socket.rs`; still not edited. The list below was forwarded last round.
 Of it, finding 1 still stands as written (`main.rs` calls `Served::bind(path)` on a
 `--socket` path with no `private_dir`; the daemon's home and the worker directories do
 call it, in `cargo/daemon.rs` and `cargo/client.rs`), and so do 2, 3 (no
@@ -748,9 +748,9 @@ Findings:
 
 1. **Medium. A daemon started with `--socket PATH` does not check PATH's directory.**
    `private_dir` is only called for the daemon's home and the worker directories. The
-   plain `ra-jit … --socket /tmp/x.sock` path (`main.rs`, `Served::bind(path)`) binds
+   plain `blaze … --socket /tmp/x.sock` path (`main.rs`, `Served::bind(path)`) binds
    wherever it is told. The server side is still safe on Unix because of the peer check.
-   The client side is not: `ra-jit sync SOCKET` connects to whatever is at that path and
+   The client side is not: `blaze sync SOCKET` connects to whatever is at that path and
    sends its request and, for workers, the whole environment of the client process
    (`read_request_and_env`). In a shared directory another user can be listening there
    first. Either call `private_dir` on the socket's parent in both the daemon and the
@@ -795,7 +795,7 @@ Findings:
 Across users, after this round, I found nothing:
 
 - The store is 0700/0600 and refused otherwise, so another user cannot read it, list it,
-  time it or run `ra-jit cache stats` on it. Before H2 they could do all four, and from the
+  time it or run `blaze-engine cache stats` on it. Before H2 they could do all four, and from the
   names in a pack learn the relative paths of the source files, item positions and the
   types functions were instantiated with.
 - The socket turns away other users (on Unix), so status, diagnostics and build timing are
@@ -820,7 +820,7 @@ Across machines, through a remote, for anyone who can read it:
 Between two checkouts of the same user, which is inside the trust boundary and was not
 changed:
 
-- `ra-jit cache stats` gives counts, sizes and how long ago the store was used, not
+- `blaze-engine cache stats` gives counts, sizes and how long ago the store was used, not
   contents.
 - A cache hit is faster than a miss, so one checkout can tell that another built the same
   function from the same source.
@@ -852,7 +852,7 @@ changed:
 - **Private registry names** are in the remapped path (`/cargo/registry/src/<index>/`).
 - **`a_store_of_another_user_is_refused` needs root** to do anything, so CI as a normal
   user does not exercise it.
-- **L1 and L4** are arguments. If ra-jit ever names an outside crate without its path, L1
+- **L1 and L4** are arguments. If blaze ever names an outside crate without its path, L1
   stops holding.
 - **Same-user isolation** (one checkout's daemon against another's) is not a goal and
   nothing here provides it.
@@ -861,24 +861,24 @@ changed:
 ## Validation
 
 All of this is on Linux x86-64, with stable 1.99.0, LLVM 20.1.8 and MinIO
-RELEASE.2026-09-22T19-25-18Z, on the head of this branch after the merge of `ra-jit-collate`
+RELEASE.2026-09-22T19-25-18Z, on the head of this branch after the merge of `blaze-collate`
 at ce52276cf5. Nothing else was run.
 
 Builds and checks:
 
     cargo fmt --all -- --check                                      clean
-    cargo build -p ra-jit --release                                  builds
+    cargo build -p blaze-engine --release                                  builds
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 CARGO_TARGET_DIR=target-llvm \
-      cargo build -p ra-jit --release --features llvm                builds
-    cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p ra-jit -p project-model
+      cargo build -p blaze-engine --release --features llvm                builds
+    cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p blaze-engine -p project-model
                                                                     1022 passed, 0 failed, 1 ignored
-    cargo test --release -p ra-jit -- remote:: deps::                33 passed
+    cargo test --release -p blaze-engine -- remote:: deps::                33 passed
     cargo check -p hir-ty --tests --target x86_64-pc-windows-msvc   checks
 
 `cargo xtask tidy` fails, and not from this branch: it objects to two `#[should_panic]`
-tests in `crates/ra-jit/src/main.rs` that came with the build model merge and are on
-`ra-jit-collate` as it is. `cargo clippy -p ra-jit --all-targets` has no warning in
-`remote.rs`, `remote/` or `deps.rs` that `ra-jit-collate` does not have (the prints, an
+tests in `crates/blaze-engine/src/main.rs` that came with the build model merge and are on
+`blaze-collate` as it is. `cargo clippy -p blaze-engine --all-targets` has no warning in
+`remote.rs`, `remote/` or `deps.rs` that `blaze-collate` does not have (the prints, an
 `Arc<Vec<u8>>` and two `chunks_exact`).
 
 The harnesses, from `harness/`, one backend after the other, with `BLAZE_BIN` at the
@@ -909,7 +909,7 @@ BLAZE_EMIT=fast`:
 | `backends.py corpus runner cases --bin runner --levels 2f` | | exit 0 |
 | `buildmodel.py` (runs both backends itself) | | 194 of 194, 0 WRONG |
 
-The 5 open of `breakers.py` are the ones it lists as open on `ra-jit-collate`. Of the 117
+The 5 open of `breakers.py` are the ones it lists as open on `blaze-collate`. Of the 117
 checks of `remote.py`, 25 are new here.
 
 Things in the gate that changed because of this branch, said here so they are not taken

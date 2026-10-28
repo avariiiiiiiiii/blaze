@@ -19,7 +19,7 @@ smallvec.workspace = true
 salsa.workspace = true
 
 ra-ap-rustc_ast_ir.workspace = true
-ra-ap-rustc_type_ir.workspace = true
+rustc_type_ir.workspace = true
 
 # local deps
 base-db.workspace = true

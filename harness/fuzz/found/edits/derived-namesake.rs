@@ -2,7 +2,7 @@
 // The edit (regen.fn): a second block with a type of the name the first block's has, each
 // with a derived `impl`.
 // Again: edits.py check derived-namesake.rs
-// refused: `default` is not compiled by ra-jit and rustc's copy is from before the edit, build
+// refused: `default` is not compiled by blaze and rustc's copy is from before the edit, build
 // with cargo: backend: Duplicate definition of identifier
 mod c0 {
     use super::*;

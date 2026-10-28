@@ -6,9 +6,9 @@ SCRIPT is what `perf script` prints of a `perf record -g` of the daemon (frame p
 the share of the samples with a frame of that kind on their stack: a parse asked for by an
 item tree counts in both. The second gives each sample to one kind, that of its innermost
 frame that is of a kind: what the time was spent doing itself, which adds up to 100%.
-`--comm` keeps the samples of processes whose name starts with NAME (default `ra-jit`), and
+`--comm` keeps the samples of processes whose name starts with NAME (default `blaze`), and
 `--dso PATH` those with a frame in a binary whose path has PATH in it, for a profile of the
-whole machine (`perf record -a`) that other ra-jit builds ran beside. `--phases FILE` reads the
+whole machine (`perf record -a`) that other blaze builds ran beside. `--phases FILE` reads the
 phases leanprof.py wrote (a profile recorded with `-k CLOCK_MONOTONIC`) and gives both tables
 for each phase, with a third: of the samples revalidating salsa's memos, which query's memo was
 being verified (the innermost `IngredientImpl<...>` on the stack) and which query asked
@@ -28,7 +28,7 @@ KINDS = [
     ("ast id maps", ("AstIdMap>::from_source",)),
     ("span maps", ("real_span_map",)),
     ("item trees", ("hir_def::item_tree::lower", "file_item_tree_query", "block_item_tree_query")),
-    ("body syntax (ra-jit)", ("hir_def::expr_store::body::body_syntax",)),
+    ("body syntax (blaze)", ("hir_def::expr_store::body::body_syntax",)),
     ("a body's anchor parsed again", ("BodySyntax>::reparse", "BodySyntax::reparse")),
     ("places in bodies (line tables, panic locations)", ("hir_ty_codegen::places::",)),
     ("bodies and signatures lowered", ("hir_def::expr_store::lower",)),
@@ -41,7 +41,7 @@ KINDS = [
     ("layout", ("hir_ty::layout",)),
     ("code generation", ("hir_ty_codegen::", "cranelift", "llvm")),
     ("debug types described", ("hir_ty_codegen::debuginfo",)),
-    ("the store read and written", ("ra_jit_store::",)),
+    ("the store read and written", ("blaze_store::",)),
     ("diagnostics collected", ("diagnostic", "Diagnostic")),
     ("salsa revalidating memos", ("maybe_changed_after",)),
     ("salsa interning", ("salsa::interned::",)),
@@ -57,9 +57,9 @@ SALSA = [
 
 # What a frame itself does, the first that matches.
 OWN = [
-    ("flat trees built (rowan's flat builder)", ("FlatTreeBuilder", "rowan::flat::FlatTree>::subtree")),
-    ("green trees built (rowan's builder and node cache)", ("GreenNodeBuilder", "node_cache::NodeCache", "SyntaxTreeBuilder", "rowan::green::")),
-    ("trees walked (rowan's cursor, green or flat)", ("rowan::cursor", "rowan::api", "rowan::flat", "<rowan::")),
+    ("flat trees built (syntax-tree's flat builder)", ("FlatTreeBuilder", "syntax_tree::flat::FlatTree>::subtree")),
+    ("green trees built (syntax-tree's builder and node cache)", ("GreenNodeBuilder", "node_cache::NodeCache", "SyntaxTreeBuilder", "syntax_tree::green::")),
+    ("trees walked (syntax-tree's cursor, green or flat)", ("syntax_tree::cursor", "syntax_tree::api", "syntax_tree::flat", "<syntax_tree::")),
     ("lexed and parsed (events)", ("parser::", "LexedStr", "rustc_lexer")),
     ("anchors hashed", ("hir_def::expr_store::body::tree_hash",)),
     ("ast id maps", ("span::ast_id::",)),
@@ -67,12 +67,12 @@ OWN = [
     ("token trees (syntax to and from)", ("syntax_bridge::", "tt::")),
     ("macro expansion", ("mbe::", "proc_macro_api::", "hir_expand::")),
     ("item trees", ("hir_def::item_tree",)),
-    ("body syntax (ra-jit)", ("hir_def::expr_store::body::",)),
+    ("body syntax (blaze)", ("hir_def::expr_store::body::",)),
     ("bodies and signatures lowered", ("hir_def::expr_store::lower",)),
     ("name resolution", ("hir_def::nameres",)),
     ("inference and traits", ("hir_ty::infer", "hir_ty::next_solver", "rustc_next_trait_solver", "rustc_type_ir")),
     ("MIR", ("hir_ty::mir",)),
-    ("code generation", ("hir_ty_codegen::", "cranelift", "llvm", "ra_jit_codegen")),
+    ("code generation", ("hir_ty_codegen::", "cranelift", "llvm", "blaze_codegen")),
     ("salsa", ("salsa::",)),
 ]
 
@@ -129,7 +129,7 @@ def salsa_part(frames):
 
 QUERY = re.compile(r"IngredientImpl<(.+?)> as salsa::ingredient::Ingredient>::maybe_changed_after|IngredientImpl<(.+?)>>::fetch")
 NAMED = re.compile(r"(.*)::_::(\w+?)_*Configuration_$")
-CALLER = re.compile(r"\bra_jit::([\w:]+)")
+CALLER = re.compile(r"\bblaze::([\w:]+)")
 
 
 def query_of(frame):
@@ -145,7 +145,7 @@ def query_of(frame):
 
 
 def caller_of(frames):
-    """The innermost frame of the ra-jit crate itself: the code that asked salsa."""
+    """The innermost frame of the blaze-engine crate itself: the code that asked salsa."""
     for frame in frames:
         found = CALLER.search(frame)
         if found:
@@ -193,13 +193,13 @@ class Fold:
             print("revalidating, by the query that asked (outermost), of all samples:")
             for label, count in self.asked.most_common(15):
                 print(f"{share(count)}  {label}")
-            print("revalidating, by the ra-jit code that asked, of all samples:")
+            print("revalidating, by the blaze code that asked, of all samples:")
             for label, count in self.callers.most_common(10):
                 print(f"{share(count)}  {label}")
 
 
 def main():
-    comm = sys.argv[sys.argv.index("--comm") + 1] if "--comm" in sys.argv else "ra-jit"
+    comm = sys.argv[sys.argv.index("--comm") + 1] if "--comm" in sys.argv else "blaze"
     dso = sys.argv[sys.argv.index("--dso") + 1] if "--dso" in sys.argv else None
     if "--phases" not in sys.argv:
         fold = Fold()

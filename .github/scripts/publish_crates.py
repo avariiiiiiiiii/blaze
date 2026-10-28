@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Publish blaze (the crate `cargo-blaze`) and the forked crates it depends on to crates.io.
+"""Publish blaze (the crate `blaze-engine`) and the forked crates it depends on to crates.io.
 
   publish_crates.py --stage DIR          # write the crates to publish into DIR, nothing else
   publish_crates.py --dry-run            # stage, then `cargo package --workspace` (builds each)
   publish_crates.py --publish            # stage, verify as above, then publish what is missing
 
-blaze's crate, `crates/ra-jit` in the repository, is published as `cargo-blaze`, so that
-`cargo install cargo-blaze` installs it; its binaries keep their names. It depends by path on
+blaze's crate, `crates/blaze-engine` in the repository, is published as `blaze-engine`, so that
+`cargo install blaze-engine` installs it and its programs (`blaze` among them). It depends by path on
 the front end's crates, derived from rust-analyzer's (crates/hir-ty, hir-def and the rest), and
 on rustc's rustc_abi (crates/rustc_abi), which crates.io does not have in this form. Each one in
-ra-jit's dependency closure is published as `ra-jit-<name>` at the workspace version, without
+blaze's dependency closure is published as `blaze-<name>` at the workspace version, without
 touching the tree: every crate is copied into a staging workspace and its manifest is
 rewritten there (name, version, metadata, path dependencies pinned with `=<version>` and
-renamed with `package = ...`, so `use hir::...` still compiles). A crate of ra-jit's own whose
-name does not start with `ra-jit` (hir-ty-codegen) is published as `ra-jit-<name>` the same way.
+renamed with `package = ...`, so `use hir::...` still compiles). A crate of blaze's own whose
+name does not start with `blaze` (hir-ty-codegen) is published as `blaze-<name>` the same way.
 Dev-dependencies, tests and benches are left out. One file outside a crate is copied into it:
-ra-jit's pinned toolchain (harness/toolchain).
+blaze's pinned toolchain (harness/toolchain).
 
 Idempotent: a version already on crates.io is skipped, so a run that stopped can be run again.
 Publishing goes in dependency order and waits out crates.io's rate limit on new crates (a burst,
@@ -46,9 +46,9 @@ from typing import Any, NoReturn
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
-ROOT_CRATE = ROOT / "crates" / "ra-jit"
+ROOT_CRATE = ROOT / "crates" / "blaze-engine"
 # The root crate's name on crates.io.
-ROOT_NAME = "cargo-blaze"
+ROOT_NAME = "blaze-engine"
 REPOSITORY = "https://github.com/indexable-inc/blaze"
 USER_AGENT = "blaze-publish (https://github.com/indexable-inc/blaze)"
 DEP_TABLES = ("dependencies", "build-dependencies")
@@ -76,8 +76,12 @@ class Extra:
     new: str
 
 
+# Forks whose name with the prefix another project has on crates.io: each is published as
+# `<prefix>fork-<name>` instead.
+TAKEN = {"macros"}
+
 EXTRAS: dict[str, list[Extra]] = {
-    "ra-jit": [
+    "blaze-engine": [
         Extra(
             "harness/toolchain",
             "toolchain",
@@ -124,7 +128,7 @@ class Crate:
 
     @property
     def requirement(self) -> str:
-        # A fork is pinned exactly: ra-jit is only known to work with the one it was built with.
+        # A fork is pinned exactly: blaze is only known to work with the one it was built with.
         return f"={self.version}" if self.fork else self.version
 
 
@@ -208,20 +212,16 @@ class Repo:
             manifest = load(d / "Cargo.toml")
             package = manifest["package"]
             orig = package["name"]
-            # Forks: vendor/, the crates in crates/ derived from rust-analyzer (which keep its version,
-            # 0.0.0), and rowan and rustc_abi, forks of crates on crates.io.
-            fork = (
-                not d.is_relative_to(ROOT / "crates")
-                or package["version"] == "0.0.0"
-                or orig in ("rowan", "ra-ap-rustc_abi")
-            )
+            # Forks: vendor/, and the crates in crates/ derived from others (rust-analyzer's, syntax-tree,
+            # rustc_abi), which are at version 0.0.0.
+            fork = not d.is_relative_to(ROOT / "crates") or package["version"] == "0.0.0"
             if fork:
-                name, version = "ra-jit-" + orig.removeprefix("ra-ap-"), self.version
+                name, version = "blaze-" + ("fork-" if orig in TAKEN else "") + orig, self.version
             else:
                 if d == ROOT_CRATE.resolve():
                     name = ROOT_NAME
                 else:
-                    name = orig if orig.startswith("ra-jit") else "ra-jit-" + orig
+                    name = orig if orig.startswith("blaze") else "blaze-" + orig
                 version = package["version"]
                 if isinstance(version, dict):
                     version = self.version
@@ -229,7 +229,7 @@ class Repo:
             for table in dep_tables(manifest):
                 for key, spec in table.items():
                     # An optional local crate is left out with the features that name it:
-                    # ra-jit enables none (proc-macro-srv, for `in-rust-tree`, is one).
+                    # blaze enables none (proc-macro-srv, for `in-rust-tree`, is one).
                     if isinstance(spec, dict) and spec.get("optional"):
                         if (dep := self.local_dir(d, key, spec)) is not None:
                             crate.optional.add(dep)
@@ -371,16 +371,16 @@ def copy_tree(src: Path, dest: Path, skip_dirs: set[str]) -> None:
 
 def fork_readme(c: Crate) -> str:
     upstream = f"rust-analyzer's `{c.orig}` crate"
-    if c.orig == "ra-ap-rustc_abi":
+    if c.orig == "rustc_abi":
         upstream = "rustc's `rustc_abi` (as in the pinned nightly, harness/toolchain)"
     elif c.dir in REPO.upstream.values():
         upstream = (
-            f"`{c.orig}` {REPO.lock[c.orig]['version']}, built on `ra-jit-rustc_abi`,"
+            f"`{c.orig}` {REPO.lock[c.orig]['version']}, built on `blaze-rustc_abi`,"
         )
     return (
         f"# {c.name}\n\n"
         f"A fork of {upstream}, published only so that [blaze]({REPOSITORY}) can be installed "
-        "with `cargo install cargo-blaze`. It is not a supported API and follows blaze's version, "
+        "with `cargo install blaze-engine`. It is not a supported API and follows blaze's version, "
         "not upstream's. For rust-analyzer's crates as a library, use the `ra_ap_*` crates.\n\n"
         "Licensed under MIT or Apache-2.0, as upstream.\n"
     )
@@ -394,10 +394,10 @@ def staged_manifest(c: Crate, by_dir: dict[Path, Crate], stage: Path) -> dict[st
     package.pop("publish", None)
     if c.fork:
         upstream = f"rust-analyzer's {c.orig} crate"
-        if c.orig == "ra-ap-rustc_abi":
+        if c.orig == "rustc_abi":
             upstream = "rustc's rustc_abi"
         elif c.dir in REPO.upstream.values():
-            upstream = f"{c.orig} {REPO.lock[c.orig]['version']} on ra-jit-rustc_abi"
+            upstream = f"{c.orig} {REPO.lock[c.orig]['version']} on blaze-rustc_abi"
         package["description"] = f"Fork of {upstream}, used by blaze"
         package["repository"] = REPOSITORY
         package["authors"] = ["rust-analyzer team", "blaze contributors"]
@@ -405,7 +405,7 @@ def staged_manifest(c: Crate, by_dir: dict[Path, Crate], stage: Path) -> dict[st
         package["license"] = "MIT OR Apache-2.0"
         for key in ("homepage", "documentation", "keywords", "categories"):
             package.pop(key, None)
-    if c.name != c.orig and c.orig != "ra-jit":
+    if c.name != c.orig and c.orig != "blaze-engine":
         # Its crate name stays the original one, which is what the code that uses it says. The
         # root crate has no library, and its binaries are named in its manifest.
         lib = m.setdefault("lib", {})
@@ -452,8 +452,8 @@ def staged_manifest(c: Crate, by_dir: dict[Path, Crate], stage: Path) -> dict[st
 
 
 def shipped_profiles() -> dict[str, Any]:
-    """The profiles `cargo install` builds ra-jit with. Cargo reads profiles only from the root
-    manifest, and an installed crate is its own root, so ra-jit's carries them: `--profile dist`
+    """The profiles `cargo install` builds blaze with. Cargo reads profiles only from the root
+    manifest, and an installed crate is its own root, so blaze's carries them: `--profile dist`
     is the build a release ships (docs/reports/RELEASE-BUILD.md), short of its PGO."""
     profiles = load(ROOT / "Cargo.toml")["profile"]
     return {name: profiles[name] for name in ("release", "dist")}
@@ -469,7 +469,7 @@ def staged_workspace(crates: list[Crate], by_dir: dict[Path, Crate]) -> dict[str
             deps[key] = spec
             continue
         if d not in by_dir:
-            continue  # a local crate outside ra-jit's closure: not published, not needed
+            continue  # a local crate outside blaze's closure: not published, not needed
         dep = by_dir[d]
         rest = {
             k: v for k, v in spec.items() if k not in ("path", "version", "package")
@@ -521,7 +521,7 @@ def stage(dest: Path) -> list[Crate]:
                     )
                 f.write_text(text.replace(extra.old, extra.new))
         m = staged_manifest(c, by_dir, dest)
-        if c.orig == "ra-jit":
+        if c.orig == "blaze-engine":
             m["package"]["readme"] = "README.md"
             m["profile"] = shipped_profiles()
         (out / "Cargo.toml").write_text(toml_dump(m))
@@ -690,7 +690,7 @@ def main() -> None:
     if args.stage:
         stage(args.stage)
         return
-    dest = args.dir or Path(tempfile.mkdtemp(prefix="ra-jit-publish-"))
+    dest = args.dir or Path(tempfile.mkdtemp(prefix="blaze-publish-"))
     crates = stage(dest)
     if args.publish and all(published(c.name, c.version) for c in crates):
         log("every crate is on crates.io already")

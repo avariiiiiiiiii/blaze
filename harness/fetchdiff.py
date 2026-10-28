@@ -61,7 +61,7 @@ GIT_DEPS = [
 
 def projects():
     """bench.py's PROJECTS as name -> (repo, rev, prepare), read from its source: importing
-    bench.py asks for the toolchain ra-jit builds with."""
+    bench.py asks for the toolchain blaze builds with."""
     tree = ast.parse(open(os.path.join(HERE, "bench.py")).read())
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(getattr(it, "id", None) == "PROJECTS" for it in node.targets):
@@ -460,7 +460,7 @@ def main():
             registry |= found
             git |= from_git
         if name == "authmirror":
-            auth = {client: auth_asked(client) for client in ("cargo", "blaze")}
+            auth = {client: auth_asked(client) for client in ("blaze")}
     total, unequal, dirs = compare(cargo_home, blaze_home)
     git_total, git_unequal, git_dirs = compare_git(cargo_home, blaze_home)
     dirs.update({f"git/{part}": it for part, it in git_dirs.items()})

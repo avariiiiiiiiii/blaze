@@ -10,12 +10,12 @@ res=/root/perf/res/$tag-$backend.json
 mkdir -p /root/perf/res /root/perf/logs
 [ -s "$res" ] && { echo "have $res"; exit 0; }
 bin=${BIN:-/root/perf/bin/$tag}
-if [ ! -x $bin/ra-jit ] && [ -s /root/perf/tars/$rev.tar ]; then mkdir -p $bin && tar -C $bin -xf /root/perf/tars/$rev.tar; fi
-[ -x $bin/ra-jit ] || { echo "no binary for $rev"; exit 125; }
+if [ ! -x $bin/blaze-engine ] && [ -s /root/perf/tars/$rev.tar ]; then mkdir -p $bin && tar -C $bin -xf /root/perf/tars/$rev.tar; fi
+[ -x $bin/blaze-engine ] || { echo "no binary for $rev"; exit 125; }
 [ -d /root/perf/wt ] || git -C /root/perf/blaze worktree add -q --detach /root/perf/wt "$rev"
 cd /root/perf/wt && git checkout -q --force --detach "$rev"
-export BLAZE_PROJECTS=/root/ra-jit-projects
-export BLAZE_BIN=$bin/ra-jit BLAZE_LLVM_BIN=$bin/ra-jit
+export BLAZE_PROJECTS=/root/blaze-projects
+export BLAZE_BIN=$bin/blaze-engine BLAZE_LLVM_BIN=$bin/blaze-engine
 work=/root/perf/work/$tag-$backend
 rm -rf "$work"; mkdir -p "$work"
 cd harness

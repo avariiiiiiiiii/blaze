@@ -1,5 +1,5 @@
 //! Where the checker's time goes: [`measure`] runs a check with each phase of it timed and the
-//! sizes it worked on counted, for `ra-jit borrowck --project DIR --timings`. Outside of
+//! sizes it worked on counted, for `blaze-engine borrowck --project DIR --timings`. Outside of
 //! [`measure`] a phase costs a thread-local read.
 
 use std::{

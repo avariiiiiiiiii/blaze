@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""wholeprogram.py: programs ra-jit builds whole, with a `main` of its own, run as cargo's do.
+"""wholeprogram.py: programs blaze builds whole, with a `main` of its own, run as cargo's do.
 
 usage: wholeprogram.py [CASE...] [--release] [--keep]
 
 Each case is a program of the workspace `harness/wholeprogram`, copied to a directory of
-its own. Cargo builds it as it is, and again with ra-jit as `RUSTC_WRAPPER` and
+its own. Cargo builds it as it is, and again with blaze as `RUSTC_WRAPPER` and
 `RUSTC_WORKSPACE_WRAPPER` as `runbench.py` builds a program: rustc builds the registry's
-crates and stand-ins of no code for the workspace's, and ra-jit compiles every crate of the
+crates and stand-ins of no code for the workspace's, and blaze compiles every crate of the
 program into one object, with the C `main` of it, which is linked in their place. Both
 programs run, and what they print on either stream and the status they exit with have to be
-the same. ra-jit then builds the object once more, and it has to be the same bytes: a whole
+the same. blaze then builds the object once more, and it has to be the same bytes: a whole
 program's layout follows the order its functions were asked for, not the order the threads
 finished them (#200).
 
@@ -38,12 +38,12 @@ NOT_WHOLE = ("a body larger than LLVM is given in a build", "a handler LLVM lowe
 def check(ws, case, release):
     spec = {"package": case, "cargo_args": ["--release"] if release else []}
     fx = apps.App(ws, spec, alone=True)
-    fx.ra_jit_args = ["--release"] if release else []
+    fx.blaze_args = ["--release"] if release else []
     try:
         fx.rustc_build()
-        fx.ra_jit_build()
+        fx.blaze_build()
     except SystemExit as failed:
-        return f"  ra-jit's build failed: {str(failed)[-800:]}"
+        return f"  blaze's build failed: {str(failed)[-800:]}"
     log = open(os.path.join(fx.work, "all.stderr")).read()
     left = [line.strip() for line in log.splitlines() if line.strip().endswith(NOT_WHOLE)]
     if left:
@@ -53,16 +53,16 @@ def check(ws, case, release):
     lines = []
     for what, a, b in zip(("status", "stdout", "stderr"), theirs, ours):
         if a != b:
-            lines.append(f"  {what}: cargo's {a!r}, ra-jit's {b!r}")
+            lines.append(f"  {what}: cargo's {a!r}, blaze's {b!r}")
     if lines:
         return "\n".join(lines)
     # The same source has to give the same object every build, whichever thread compiled
     # which function first (#200).
     first = open(fx.objects[0], "rb").read()
     try:
-        fx.ra_jit_build()
+        fx.blaze_build()
     except SystemExit as failed:
-        return f"  ra-jit's second build failed: {str(failed)[-800:]}"
+        return f"  blaze's second build failed: {str(failed)[-800:]}"
     if open(fx.objects[0], "rb").read() != first:
         return f"  built differently the second time: {fx.objects[0]} ({len(first)} bytes the first)"
     return None
@@ -74,7 +74,7 @@ def main():
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the copy of the workspace")
     args = parser.parse_args()
-    work = tempfile.mkdtemp(prefix="ra-jit-wholeprogram-")
+    work = tempfile.mkdtemp(prefix="blaze-wholeprogram-")
     ws = os.path.join(work, "ws")
     shutil.copytree(os.path.join(HERE, "wholeprogram"), ws, ignore=shutil.ignore_patterns("target*"))
     failed = 0

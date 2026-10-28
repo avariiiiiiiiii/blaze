@@ -7,7 +7,7 @@ use std::{fmt, iter::successors};
 
 use itertools::Itertools;
 use parser::SyntaxKind;
-use rowan::TextSize;
+use syntax_tree::TextSize;
 use smallvec::{SmallVec, smallvec};
 
 use crate::{

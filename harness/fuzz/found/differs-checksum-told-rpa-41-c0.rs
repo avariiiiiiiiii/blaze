@@ -3,7 +3,7 @@
 // Reduced in 91 builds. Again: fuzz.py check differs-checksum-told-rpa-41-c0.rs
 // rustc:
 // c0 795515227a652b03 ok
-// ra-jit:
+// blaze:
 // c0 12e121b328193b36 ok
 mod c0 {
     use super::*;

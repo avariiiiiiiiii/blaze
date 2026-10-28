@@ -1,5 +1,5 @@
 //! tests/ui/const-generics/promotion.rs: `&(3 + N)` is borrowed for `'static` though `N` is a
-//! const parameter, since each instance knows its `N`. ra-jit kept the sum in the frame, and
+//! const parameter, since each instance knows its `N`. blaze kept the sum in the frame, and
 //! the reference outlived it: Cranelift happened to leave the bytes alone, LLVM did not.
 
 #[inline(never)]

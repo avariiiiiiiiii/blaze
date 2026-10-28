@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""How complete `cargo blaze doc` is next to rustdoc's `cargo doc`, crate by crate.
+"""How complete `blaze doc` is next to rustdoc's `cargo doc`, crate by crate.
 
 usage: docdiff.py <workspace> [<cargo doc flags>...] [--show N] [--json FILE] [--keep]
 
-Runs stock `cargo +<toolchain> doc` (the oracle, into `target/doc-oracle`) and `ra-jit cargo
+Runs stock `cargo +<toolchain> doc` (the oracle, into `target/doc-oracle`) and `blaze-engine cargo
 doc` (into `target/doc`) on the workspace with the same flags, times both, and compares what
 they wrote, for every crate both documented:
 
@@ -15,14 +15,14 @@ they wrote, for every crate both documented:
   warnings   the `unresolved link to` warnings each printed
 
 and prints, per crate, what each side has and what blaze misses or adds, with up to `--show`
-examples of each. Exit status is 0 unless a side fails. BLAZE_BIN names the ra-jit binary.
+examples of each. Exit status is 0 unless a side fails. BLAZE_BIN names the blaze binary.
 """
 import argparse, collections, html, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 
 NOT_CRATES = {"src", "static.files", "search-index", "search.index", "trait.impl", "type.impl",
               "implementors", "settings.html", "help.html"}
@@ -132,16 +132,16 @@ def main():
         if done.returncode != 0:
             sys.exit(f"cargo doc failed:\n{done.stderr[-4000:]}")
     shutil.rmtree(blaze_doc, ignore_errors=True)
-    done, blaze_wall = run([RA_JIT, "cargo", "doc", *flags], ws, env)
+    done, blaze_wall = run([BLAZE, "cargo", "doc", *flags], ws, env)
     blaze_err = done.stderr
     if done.returncode != 0:
         # blaze's error is the first line, what a build script said follows it.
         said = done.stderr if len(done.stderr) <= 6000 else f"{done.stderr[:3000]}\n...\n{done.stderr[-3000:]}"
-        sys.exit(f"cargo blaze doc failed:\n{said}")
+        sys.exit(f"blaze doc failed:\n{said}")
 
     report, only = compare(oracle_doc, blaze_doc, asked.show)
     print(f"{os.path.basename(ws)}: cargo doc {oracle_wall and f'{oracle_wall:.1f}s' or '(kept)'}, "
-          f"cargo blaze doc {blaze_wall:.1f}s")
+          f"blaze doc {blaze_wall:.1f}s")
     if only["oracle"]:
         print(f"  crates only rustdoc documented: {', '.join(only['oracle'])}")
     if only["blaze"]:

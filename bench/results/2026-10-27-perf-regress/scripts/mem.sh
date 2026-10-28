@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# mem.sh REV: cold `cargo ra-jit build` of ripgrep with BLAZE_MEMORY set (salsa ingredient tables and
-# resident/live checkpoints per step), sampling every ra-jit process's RSS each 200 ms for the peak by
+# mem.sh REV: cold `blaze build` of ripgrep with BLAZE_MEMORY set (salsa ingredient tables and
+# resident/live checkpoints per step), sampling every blaze process's RSS each 200 ms for the peak by
 # process kind. Out: /root/perf/mem/REV/.
 set -uo pipefail
 export PATH=/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:$PATH
@@ -8,7 +8,7 @@ rev=$(git -C /root/perf/blaze rev-parse --short=10 "$1")
 bin=/root/perf/bin/$rev
 out=/root/perf/mem/$rev; rm -rf "$out"; mkdir -p "$out/tables"
 p=/root/perf/mem-ws/$rev; rm -rf "$p"; mkdir -p "$p"
-cp -r /root/ra-jit-projects/ripgrep "$p/rg"; rm -rf "$p/rg/target" "$p/rg/.git"
+cp -r /root/blaze-projects/ripgrep "$p/rg"; rm -rf "$p/rg/target" "$p/rg/.git"
 wt=/root/perf/wt-prof
 [ -d $wt ] || git -C /root/perf/blaze worktree add -q --detach $wt "$rev"
 git -C $wt checkout -q --force --detach "$rev"
@@ -31,12 +31,12 @@ cd $p/rg
   done ) > $out/rss.samples &
 sampler=$!
 s=$(date +%s%N)
-taskset -c 0-3 cargo ra-jit build > $out/cold.out 2> $out/cold.err; echo "cold exit $? in $(( ($(date +%s%N) - s) / 1000000 ))ms"
-for i in $(seq 600); do cargo ra-jit status 2>&1 | grep -q "$p/rg: ready" && break; sleep 0.5; done
+taskset -c 0-3 blaze build > $out/cold.out 2> $out/cold.err; echo "cold exit $? in $(( ($(date +%s%N) - s) / 1000000 ))ms"
+for i in $(seq 600); do blaze status 2>&1 | grep -q "$p/rg: ready" && break; sleep 0.5; done
 sleep 3
-taskset -c 0-3 cargo ra-jit build > $out/noop.out 2>&1
+taskset -c 0-3 blaze build > $out/noop.out 2>&1
 kill $sampler
 for w in $BLAZE_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log 2>/dev/null; done
 cp $BLAZE_HOME/*.log $out/ 2>/dev/null
-cargo ra-jit stop >/dev/null 2>&1
+blaze stop >/dev/null 2>&1
 echo done

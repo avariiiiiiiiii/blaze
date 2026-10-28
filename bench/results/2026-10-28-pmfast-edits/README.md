@@ -5,8 +5,8 @@ ix VM, arm64, 16 vCPU, 32 GB, the flake's nightly. The corpus is the one of
 strum in one binary), plus a plain `helper()` function and `asker`, a path-dependency derive
 that asks where its item is (`Span::line`, `column`, `source_text`) and prints it.
 
-Each run starts the daemon as `cargo blaze build` does (`ra-jit <ws> --own-target --crate
-pmcorpus --out .. --exe .. --watch`, `RA_JIT_STATS=1`, an empty store), waits for the cold
+Each run starts the daemon as `blaze build` does (`blaze <ws> --own-target --crate
+pmcorpus --out .. --exe .. --watch`, `BLAZE_STATS=1`, an empty store), waits for the cold
 build, then makes each one-line edit four times (on, off, on, off) and reads the daemon's
 `edit-to-binary` and its proc-macro counters (`proc macros:` for native, `wasm proc macros:`
 for wasm). Then it starts the daemon again on the warm store (restart). cargo is `cargo build`

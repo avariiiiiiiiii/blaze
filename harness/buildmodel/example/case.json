@@ -9,7 +9,7 @@
     "--example",
     "demo"
   ],
-  "ra-jit": [
+  "blaze": [
     "--dev-deps"
   ]
 }

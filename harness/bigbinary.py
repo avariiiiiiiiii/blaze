@@ -14,7 +14,7 @@ further from the code than four bytes of distance reach. Each step is compared w
 build` of the same source prints, and has to have been spliced: a function shorter than the long
 jump, one that panics through its replacement, and one added.
 
-usage: bigbinary.py   (BLAZE_BIN names the ra-jit built). About 20 GB of disk on Linux.
+usage: bigbinary.py   (BLAZE_BIN names the blaze built). About 20 GB of disk on Linux.
 """
 import os, sys, tempfile
 
@@ -31,7 +31,7 @@ DEBUG = 4300 << 20
 
 
 def assembly(path):
-    """Writes the object's source to `path`: `ra_jit_big`, the functions of a frame each, and
+    """Writes the object's source to `path`: `blaze_big`, the functions of a frame each, and
     the code behind them in pieces. Apple's linker keeps a frame of each symbol's and puts
     islands for branches between them, so on macOS each function and piece is one, and none is
     dead-stripped."""
@@ -45,19 +45,19 @@ def assembly(path):
         return f"{kept}{prefix}{name}:\n"
 
     with open(path, "w") as out:
-        out.write(f"\t.text\n\t.globl {prefix}ra_jit_big\n\t.p2align 4\n")
-        out.write(symbol("ra_jit_big") + "\t.cfi_startproc\n\tret\n\t.cfi_endproc\n")
+        out.write(f"\t.text\n\t.globl {prefix}blaze_big\n\t.p2align 4\n")
+        out.write(symbol("blaze_big") + "\t.cfi_startproc\n\tret\n\t.cfi_endproc\n")
         for nth in range(FRAMES):
-            out.write(symbol(f"ra_jit_frame_{nth}") + f"\t.cfi_startproc\n\tnop\n\t{frame}\n\tret\n\t.cfi_endproc\n")
+            out.write(symbol(f"blaze_frame_{nth}") + f"\t.cfi_startproc\n\tnop\n\t{frame}\n\tret\n\t.cfi_endproc\n")
         for nth in range(PIECES):
-            out.write(symbol(f"ra_jit_code_{nth}") + f"\t.fill {CODE // PIECES}, 1, {fill}\n")
+            out.write(symbol(f"blaze_code_{nth}") + f"\t.fill {CODE // PIECES}, 1, {fill}\n")
         if APPLE:
             out.write("\t.subsections_via_symbols\n")
 
 
 MAIN = "src/main.rs"
 MAIN_TEXT = """extern "C" {
-    fn ra_jit_big();
+    fn blaze_big();
 }
 
 #[inline(never)]
@@ -96,7 +96,7 @@ fn risky(x: u64) -> u64 {
 
 fn main() {
     if std::env::args().count() > 99 {
-        unsafe { ra_jit_big() };
+        unsafe { blaze_big() };
     }
     std::panic::set_hook(Box::new(|_| {}));
     nothing();
@@ -130,7 +130,7 @@ STEPS = [
 if __name__ == "__main__":
     if sys.platform not in ("linux", "darwin"):
         raise SystemExit("bigbinary.py: an ELF or Mach-O program, on Linux or macOS")
-    scratch = tempfile.mkdtemp(prefix="ra-jit-bigbinary-")
+    scratch = tempfile.mkdtemp(prefix="blaze-bigbinary-")
     source = os.path.join(scratch, "big.s")
     assembly(source)
     args = [os.path.join(scratch, "big.o")]
@@ -143,7 +143,7 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 """
-    # Room in the header for both tables of the unwinder, which `cargo ra-jit` gives a link.
+    # Room in the header for both tables of the unwinder, which `blaze` gives a link.
     links = [*args, "-Wl,-headerpad,0x2400000"] if APPLE else args
     links = "".join(f'    println!("cargo:rustc-link-arg-bins={it}");\n' for it in links)
     build = f"""fn main() {{

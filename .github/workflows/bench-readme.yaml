@@ -73,7 +73,7 @@ jobs:
     timeout-minutes: 420
     env:
       # Outside the checkout: the checkout is cleaned each run, these are kept between runs so
-      # that ra-jit itself builds incrementally and the projects are cloned once.
+      # that blaze itself builds incrementally and the projects are cloned once.
       BENCH_HOME: ${{ github.workspace }}/../bench-state
       # macOS: the daemon's socket path has to fit in 104 bytes, so the work is under /tmp.
       BENCH_WORK: ${{ matrix.work }}
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # bench.py runs the projects' tests with `cargo ra-jit test`, which sandboxes them in
+      # bench.py runs the projects' tests with `blaze test`, which sandboxes them in
       # namespaces a user makes; Ubuntu's AppArmor keeps users from that unless told otherwise.
       - name: user namespaces
         if: runner.os == 'Linux'
@@ -92,18 +92,18 @@ jobs:
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
             sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      # The Cranelift tier is measured with ra-jit as it is installed and released, without
+      # The Cranelift tier is measured with blaze as it is installed and released, without
       # the `llvm` feature: on Linux a binary that links libLLVM spends about 6 ms loading it
-      # each time it starts, which every `cargo ra-jit` does.
-      - name: Build ra-jit (as released, and with the llvm feature)
+      # each time it starts, which every `blaze` does.
+      - name: Build blaze (as released, and with the llvm feature)
         run: |
           mkdir -p "$BENCH_HOME"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p ra-jit --release
-          CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p ra-jit --release --features llvm
+          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p blaze-engine --release
+          CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p blaze-engine --release --features llvm
       - name: Bench
         id: bench
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target/release/ra-jit" BLAZE_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit"
+          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine" BLAZE_LLVM_BIN="$BENCH_HOME/target-llvm/release/blaze-engine"
           export BLAZE_PROJECTS="$BENCH_HOME/projects"
           work=${BENCH_WORK:-$BENCH_HOME/work}
           rm -rf "$work" "$BENCH_HOME/reference"
@@ -114,12 +114,12 @@ jobs:
             ripgrep fd bat hyperfine just axum nushell helix bevy biome --runs 5 --cold-runs 5 "${full[@]}" \
             --work "$work" --reference "$BENCH_HOME/reference" --out "$RUNNER_TEMP/results/bench.json" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
-      # How fast the built programs run: harness/runbench.py, ra-jit's LLVM against
+      # How fast the built programs run: harness/runbench.py, blaze's LLVM against
       # `cargo build --release`, into the runtime table.
       - name: Runtime bench
         continue-on-error: true
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
+          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/blaze-engine" APPS_DIR="$BENCH_HOME/apps"
           nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime \
             --runs 5 --out "$RUNNER_TEMP/results/runtime.json"
       - uses: actions/upload-artifact@v7
@@ -131,7 +131,7 @@ jobs:
       - name: Fail on a wrong result
         if: steps.bench.outputs.wrong == 'true'
         run: |
-          echo "::error::under ra-jit a program or a test suite ended otherwise than under cargo: see the Bench step and the tests table"
+          echo "::error::under blaze a program or a test suite ended otherwise than under cargo: see the Bench step and the tests table"
           exit 1
 
   # Every platform's results into the README, docs/benchmarks.md and the history, in one commit:
@@ -149,7 +149,7 @@ jobs:
           fetch-depth: 0
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v8
         with:
           pattern: bench-*

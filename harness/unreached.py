@@ -2,7 +2,7 @@
 """unreached.py: an edit that calls what the program did not call when it was linked is
 spliced all the same, or the program is built in full. Linux and macOS.
 
-usage: unreached.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: unreached.py    (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 A patch calls the code of the executable by name, also code the executable's own did not
 reach when it was linked: here `<u16 as Debug>::fmt` and the formatting it calls, which a
@@ -11,7 +11,7 @@ nothing reaches (`-dead_strip` on macOS, `--gc-sections` on Linux), and a splice
 not find what the patch calls declines ("... is not in the executable"): the worker then
 builds the program in full and links it again, as the object alone does not have the edit.
 
-The program is built with `cargo ra-jit build`, then edited. Every edit after the first one
+The program is built with `blaze build`, then edited. Every edit after the first one
 (which writes the whole object again) has to be spliced or built in full, as the worker's
 log says, and the program has to print what the source says.
 
@@ -52,7 +52,7 @@ STEPS = [
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["cargo", "ra-jit", "build"], cwd=ws, env=env, capture_output=True, text=True,
+    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
                          timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
@@ -80,11 +80,11 @@ def full_builds(home):
 
 def main():
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
-    if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
+    if not glob.glob(os.path.join(bin_dir, "blaze*")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
     # The daemon's sockets are under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start.
-    root = tempfile.mkdtemp(prefix="ra-jit-unreached-", dir=None if os.name == "nt" else "/tmp")
+    root = tempfile.mkdtemp(prefix="blaze-unreached-", dir=None if os.name == "nt" else "/tmp")
     ws, home = os.path.join(root, "ws"), os.path.join(root, "h")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
@@ -125,7 +125,7 @@ def main():
             wrong += verdict != "ok"
             print(f"{what:42} {verdict:12} {how[:140]}", flush=True)
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     print(f"{len(STEPS) - wrong} of {len(STEPS)} right; under {root}")
     if wrong:
         sys.exit(1)

@@ -1,8 +1,8 @@
 //! A function that hands a large value to one call after another, and recurses. A callee
-//! owns the argument it is handed, so the caller gives it a copy; ra-jit kept a copy per
+//! owns the argument it is handed, so the caller gives it a copy; blaze kept a copy per
 //! call for as long as the caller ran, and a frame was twice what rustc's is. just's
 //! `recursion_limit::bugfix` parses 255 nested parentheses on the main thread's 8 MiB: a
-//! level of its parser was 19 KiB as rustc builds it and 33 KiB as ra-jit did, which
+//! level of its parser was 19 KiB as rustc builds it and 33 KiB as blaze did, which
 //! overflowed. Here a level is 16 values of 2 KiB, and 150 levels fit the stack once.
 
 pub struct Wide([u64; 256]);

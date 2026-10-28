@@ -1,9 +1,9 @@
 # Flat syntax trees for files nobody edits
 
-2026-10-22, for [#42](https://github.com/indexable-inc/ra-jit/issues/42) (Glancer item 4,
+2026-10-22, for [#42](https://github.com/indexable-inc/blaze/issues/42) (Glancer item 4,
 [glancer.md](glancer.md#item-4-a-flat-syntax-tree-for-files-nobody-edits)). Measured on an
 ephemeral AWS host (64 vCPU, Linux, release builds with mimalloc; `heap-profile` builds with
-jemalloc for the heap profiles), ra-jit at `c43c6443bd` (main) and the `flat-syntax` branch,
+jemalloc for the heap profiles), blaze at `c43c6443bd` (main) and the `flat-syntax` branch,
 and for steps (b) and (c) main at `74fb27b7ed` (step (a) merged) and the `flat-cursor` branch on it,
 Cranelift, the `bench.py` projects ripgrep, nushell and helix, each a cold start then the
 first request. Each claim is **read** (measured, or read in a source), or **unverified**
@@ -26,7 +26,7 @@ first request. Each claim is **read** (measured, or read in a source), or **unve
 - The time syntax costs is CPU, not memory: building green trees and walking red ones are
   16% of ripgrep's cold start to the first request and 7% of nushell's on main, 19% and 9%
   with (a), which parses anchors again (**read**).
-- Steps (b) and (c), merged: a fork of rowan whose cursor has a second, flat kind of tree
+- Steps (b) and (c), merged: a fork of syntax-tree whose cursor has a second, flat kind of tree
   (arrays in preorder), so `syntax::ast` and all lowering are unchanged and the compiler path
   builds no green tree. Building trees falls from 12.1% of ripgrep's cold-start CPU to 1.9%,
   from 5.4% to 1.1% on nushell and from 2.2% to 0.4% on helix; walking them takes more, and
@@ -66,9 +66,9 @@ it is what their lru of 512 holds when the report is taken (an earlier run of (c
 held 3 MB of them, this one 186 MB). The (c) rows are flat trees (steps (b) and (c) below);
 the few MB of green nodes in them are parts of expansions that something asked a green tree
 of (**unverified**: the syntax editor builtin derives use). Red nodes are
-under 4 MB everywhere: rowan's cursors are transient. After warm-up, before the first request, nushell's syntax is 689 MB on main and
+under 4 MB everywhere: syntax-tree's cursors are transient. After warm-up, before the first request, nushell's syntax is 689 MB on main and
 419 MB with (a), helix's 434 and 176 MB. On helix 5.3 GB of the 10.8 GB is `described`
-([#55](https://github.com/indexable-inc/ra-jit/issues/55)), not syntax.
+([#55](https://github.com/indexable-inc/blaze/issues/55)), not syntax.
 
 What is left after (a) is mostly macro expansions (`parse_macro_expansion`, lru 512, with
 their span maps) and ast id maps that `body_syntax` makes for an anchor parsed alone. With (c)
@@ -79,12 +79,12 @@ expansions' trees hold is within that spread, and the rest of syntax is not tree
 
 ## What syntax costs (step 1, time)
 
-`harness/cpufold.py --dso <ra-jit>` folds `perf record -g` of a cold start through the first
-request (ra-jit's own samples only) by what the innermost frame of a kind does:
+`harness/cpufold.py --dso <blaze>` folds `perf record -g` of a cold start through the first
+request (blaze's own samples only) by what the innermost frame of a kind does:
 
 | work | ripgrep (8,516 samples) | nushell (56,607) |
 |---|---:|---:|
-| walking red nodes (rowan's cursor) | 8.5% | 3.7% |
+| walking red nodes (syntax-tree's cursor) | 8.5% | 3.7% |
 | building green trees (builder and node cache) | 7.8% | 3.6% |
 | lexing and parsing to events | 6.7% | 3.1% |
 | token trees (syntax to and from) | 6.5% | 3.9% |
@@ -106,7 +106,7 @@ All **read**. A flat tree replaces the first two rows; the parser's events stay.
 | `real_span_map` | ranges of items, no tree | none |
 | `file_item_tree_query` | the item tree, no tree | none |
 | `macro_arg` | the token tree of a macro call, no tree | none |
-| `body_syntax` (ra-jit) | on main the anchor's green node; with (a) its text range and a hash | none |
+| `body_syntax` (blaze) | on main the anchor's green node; with (a) its text range and a hash | none |
 | `Body::with_source_map` | the body and its source map (pointers) | 512 |
 | `Body::relative` | the body lowered relative to its anchor | 4,096 |
 
@@ -118,7 +118,7 @@ resolved against a parse when asked.
 
 - **Diagnostics with spans** (type errors, borrowck, wfcheck): a source map gives an
   `AstPtr`, and `to_node` resolves it against the file's parse, made again when evicted.
-  ra-jit's diagnostics go through `with_source_map`, which with (a) finds the anchor by its
+  blaze's diagnostics go through `with_source_map`, which with (a) finds the anchor by its
   start and hash in the file's parse.
 - **Places** (`hir-ty-codegen/places.rs`, panic locations and debug lines): the anchor's
   text, for its row starts. With (a) that is a slice of the file's text, no tree.
@@ -161,18 +161,18 @@ allocator returns what the build let go of), and what stays is 0.1 to 0.3 GB les
 is the build's, which (a) does not touch: trees are made and let go of during it as before.
 
 **Cost.** Parsing an anchor again costs CPU: on nushell's cold start to the first request,
-building green trees goes from 3.6% to 5.4% of ra-jit's samples, lexing and parsing from 3.1%
+building green trees goes from 3.6% to 5.4% of blaze's samples, lexing and parsing from 3.1%
 to 3.7% (helix 1.2% to 2.2%) (**read**, perf runs beside other work). That is the cost the
 flat tree removes.
 
-**Gate.** Unit tests (ra-jit 138, hir-ty-codegen 13), hir-ide (its 18 known failures),
+**Gate.** Unit tests (blaze 138, hir-ty-codegen 13), hir-ide (its 18 known failures),
 corpus `--mixed 8` under Cranelift and LLVM (MATCH, 0 of 902 layouts differ), the corpus
 again with `RA_CHECK_RELATIVE_BODIES=1 BLAZE_CHECK_PLACES=1`, mixfutures `--mixed 16
 --layouts` under both, growth, movedlines (6 of 6), borrowck_ui (as main), the pinned ui
 tests (15 of 15) and the ui run-pass claims against `ui-known.txt`: the differences are the
 host's (main has the same five).
 
-## Steps (b) and (c): a flat tree behind rowan's cursor
+## Steps (b) and (c): a flat tree behind syntax-tree's cursor
 
 **Representation.** Every node and token in preorder, as arrays: a kind (`u16`), a start
 (`u32`), the number after the subtree (`u32`) and the parent (`u32`, its top bit for a
@@ -180,12 +180,12 @@ token), 14 bytes an element. The end of an element is the start of the one after
 slice of the tree's text, kept once. This is the layout of Carbon's parse tree and Zig's AST,
 and what Glancer keeps.
 
-**How the parser emits it.** The same `LexedStr::intersperse_trivia` steps rowan's builder
+**How the parser emits it.** The same `LexedStr::intersperse_trivia` steps syntax-tree's builder
 takes: an enter pushes a node and remembers it, an exit writes where its subtree ends, a
 token pushes a token. The parser does not change.
 
 **How lowering consumes it.** Unchanged. rowan 0.17's cursor is about 35 functions over
-`NodeData` (a green pointer, a parent, an offset). A fork in `crates/rowan`
+`NodeData` (a green pointer, a parent, an offset). A fork in `crates/syntax-tree`
 (we pin every layer; inside the subtree so that the fork builds alone) gives the cursor a second kind of tree: a `SyntaxNode` that is a flat tree's root and an
 element's number, with nothing allocated per node, and moves that are arithmetic on the
 arrays. `syntax::ast`, `AstPtr`, ast id maps, item trees and body lowering compile and run as
@@ -225,7 +225,7 @@ events, which both share); walking through the cursor is 1.4 to 1.6 times faster
 a node from its pointer 3.5 times. A prototype that walked the arrays without the cursor was
 10 times faster: the rest is the cursor's values and reference counts. With a parent for
 every element, which the cursor needs, a flat tree is 14 bytes an element and 10% larger here
-than rowan's, whose node cache shares equal tokens and small nodes.
+than syntax-tree's, whose node cache shares equal tokens and small nodes.
 
 **Measured, the daemon.** On a cold start to the first request, by what the innermost frame
 of a kind does (`harness/cpufold.py`, perf runs of `heap-profile` builds):
@@ -234,11 +234,11 @@ of a kind does (`harness/cpufold.py`, perf runs of `heap-profile` builds):
 |---|---:|---:|---:|---:|---:|---:|
 | samples | 8,482 | 8,060 | 64,592 | 52,422 | 106,101 | 99,935 |
 | building trees (green, flat) | 12.1% | 1.9% | 5.4% | 1.1% | 2.2% | 0.4% |
-| walking them (rowan's cursor) | 7.3% | 12.7% | 3.8% | 5.2% | 1.4% | 2.1% |
+| walking them (syntax-tree's cursor) | 7.3% | 12.7% | 3.8% | 5.2% | 1.4% | 2.1% |
 | lexing and parsing to events | 6.5% | 7.4% | 3.7% | 3.6% | 1.3% | 1.4% |
 
 All **read**; the nushell (a) run had other work beside it, so its sample count is not
-comparable. Building trees all but goes; walking takes a larger share than rowan's cursor
+comparable. Building trees all but goes; walking takes a larger share than syntax-tree's cursor
 did, which the benchmark above does not show (why: [below](#walking-the-arrays-without-the-cursor);
 the two columns are builds at two commits, and building had been most of the rest. Elements as one array of
 16-byte structs, tried, were no faster on one thread and 12% larger, so they are not used). Together they fall from 19.4% to 14.7% of ripgrep's samples, from 9.2% to 6.3% of
@@ -265,7 +265,7 @@ not yet returned to the system, because with `MIMALLOC_PURGE_DELAY=0` ripgrep se
 seconds (**unverified** why: the CPU it saves is spread over 64 threads, and what decides
 when the daemon is ready is elsewhere).
 
-**Gate.** Unit tests (ra-jit 139, hir-ty-codegen 13), hir-ide (its 18 known failures),
+**Gate.** Unit tests (blaze 139, hir-ty-codegen 13), hir-ide (its 18 known failures),
 corpus `--mixed 8` under Cranelift and LLVM (MATCH, 0 of 908 layouts differ), the corpus with
 `RA_CHECK_RELATIVE_BODIES=1 BLAZE_CHECK_PLACES=1`, mixfutures `--mixed 16 --layouts` under
 both, growth, movedlines (6 of 6), borrowck_ui (Polonius 1,363 and NLL 1,358, as main), the
@@ -308,7 +308,7 @@ samples).
 **What changed.** The compiler path's hot walks read the arrays and make a cursor only of
 what they keep:
 
-- rowan: a flat tree's elements by number (kind, parent, end, range, a token's text,
+- syntax-tree: a flat tree's elements by number (kind, parent, end, range, a token's text,
   children, descendants); `hash_subtree`, which hashes a subtree in place as its copy would be
   hashed; on the cursor `flat()` (the tree and the number), `flat_element`, `to_flat()` (a
   green tree's twin), and `child_where`, `child_token`, `children_where` and `ancestor_where`,
@@ -382,7 +382,7 @@ start spread over 64 threads, and as with (c) it does not shorten the path to th
 answer.
 
 **Gate.** Unit tests, rust-analyzer's tests of `parser`, `syntax`, `mbe`, `syntax-bridge`,
-`hir-expand`, `hir-def`, `span` and `rowan` (the new test compares the array walks with the
+`hir-expand`, `hir-def`, `span` and `syntax-tree` (the new test compares the array walks with the
 cursor's on green and flat trees, and `hash_subtree` in place with the copy's hash), hir-ide
 (its 18 known failures), the corpus under Cranelift and LLVM (MATCH, 0 of 910 layouts
 differ), the corpus with `RA_CHECK_RELATIVE_BODIES=1 BLAZE_CHECK_PLACES=1`, mixfutures under
@@ -396,4 +396,4 @@ host (**read**).
 - bun: not run. Its workspace builds only after bun's own build has made its C and C++
   (`harness/bunprep.py` under `nix develop .#bench-bun`), which the host did not have.
 - Files being edited keep a flat tree too: the daemon has no editor's buffers, so nothing
-  in ra-jit tells an edited file from another. `BLAZE_GREEN_TREES=1` makes every tree green.
+  in blaze tells an edited file from another. `BLAZE_GREEN_TREES=1` makes every tree green.

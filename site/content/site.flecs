@@ -3,7 +3,7 @@
 // The sidebar's sections are in nav.flecs; a page joins one with Nav, Icon and (InGroup, nav.<section>).
 site {
   OrderedChildren
-  // https://ix.dev/blaze/ (the worker answers there; ra-jit.ix.dev and blaze.ix.dev redirect to it).
+  // https://ix.dev/blaze/ (the worker answers there; blaze.ix.dev and blaze.ix.dev redirect to it).
   Served: {"https://ix.dev", "/blaze"}
   // The pixel-fire wordmark (docs/brand/fire/gen.py), copied to static/brand/.
   Brand: {"/brand/blaze-dark.webp", "/brand/blaze-light.webp", 688, 368, "/brand/blaze-dark-still.webp", "/brand/blaze-light-still.webp"}
@@ -70,7 +70,7 @@ site {
 
     Section live(title: "Change a running program") {
       Say: {"[warm] One more thing blaze can do. A program that links the live edits crate takes each edit while it runs, with its state intact: save, build, and the next poll swaps in the changed functions, usually in under a millisecond. It's great for games, GUIs, anything slow to get back to where you were. [short pause] It works on macOS on Apple silicon today, and Linux and Windows support comes with the next release."}
-      P what("A program that links the `ra-jit-live` crate takes each edit while it runs, state intact: save, build, and the next `poll` swaps in the functions that changed, usually in under a millisecond. For games, GUIs and anything slow to get back to where you were. It works on macOS on Apple silicon; Linux x86-64 and Windows x86-64 support is on main and comes with the next release. [How to use it](/usage#live).")
+      P what("A program that links the `blaze-live` crate takes each edit while it runs, state intact: save, build, and the next `poll` swaps in the functions that changed, usually in under a millisecond. For games, GUIs and anything slow to get back to where you were. It works on macOS on Apple silicon; Linux x86-64 and Windows x86-64 support is on main and comes with the next release. [How to use it](/usage#live).")
     }
 
     Section next(title: "Designed in the open") {

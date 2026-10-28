@@ -1,13 +1,13 @@
 //! The tiers island under the grid. The daemon samples the window while it runs and compiles
 //! the functions it spends its time in again with LLVM; this shows what it says of that
-//! (`ra_jit_live::tiers`): the hottest functions with the level each runs at, the ladder of
+//! (`blaze_live::tiers`): the hottest functions with the level each runs at, the ladder of
 //! levels, and what the daemon did of late, a promotion lit for a moment as it lands.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Align2, Color32, FontId, Galley, Painter, Rect, Sense, pos2, vec2};
-use ra_jit_live::format::{LEVELS, Tiers};
+use blaze_live::format::{LEVELS, Tiers};
 
 use crate::theme::Theme;
 
@@ -46,7 +46,7 @@ impl TiersPanel {
             return;
         }
         self.read_at = Instant::now();
-        self.tiers = ra_jit_live::tiers();
+        self.tiers = blaze_live::tiers();
         let now = now_ms();
         if let Some(tiers) = &self.tiers {
             for event in &tiers.events {
@@ -186,7 +186,7 @@ impl TiersPanel {
 
             let level = match function.level {
                 0 => "not compiled by the daemon".to_owned(),
-                level => format!("level {level}, {}", ra_jit_live::format::level_name(level)),
+                level => format!("level {level}, {}", blaze_live::format::level_name(level)),
             };
             let mut about =
                 format!("{}\n{level}   ·   {} samples", function.name, thousands(function.samples));

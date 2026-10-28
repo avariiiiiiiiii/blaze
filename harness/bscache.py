@@ -2,21 +2,21 @@
 """bscache.py: what the build scripts of the bench corpus reach, as the sandbox records it, and
 what a hermetic sandbox would refuse them.
 
-usage: bscache.py record [PROJECT...] --ra-jit BIN [--work DIR] [--out DIR] [--jobs N]
+usage: bscache.py record [PROJECT...] --blaze BIN [--work DIR] [--out DIR] [--jobs N]
        bscache.py report --out DIR
        bscache.py directives [--work DIR] --out DIR
-       bscache.py closure [PROJECT...] --ra-jit BIN --store DIR [--work DIR] [--out DIR] [--jobs N]
+       bscache.py closure [PROJECT...] --blaze BIN --store DIR [--work DIR] [--out DIR] [--jobs N]
        bscache.py closure-report --out DIR
 
 `record` fetches each project of harness/bench.py at its pinned revision (all of them when none
 is named) and runs the step of a workspace load that builds and runs its build scripts and proc
-macros, `cargo check --compile-time-deps --workspace --all-targets`, through ra-jit's wrapper
-(RUSTC_WRAPPER=ra-jit-rustc beside BIN, BLAZE_ONLY_ASKS), with an empty store (BLAZE_CACHE of its own), so every
-script runs, and runs in the sandbox (cargo/script_sandbox.rs) through `ra-jit build-script`.
+macros, `cargo check --compile-time-deps --workspace --all-targets`, through blaze's wrapper
+(RUSTC_WRAPPER=blaze-rustc beside BIN, BLAZE_ONLY_ASKS), with an empty store (BLAZE_CACHE of its own), so every
+script runs, and runs in the sandbox (cargo/script_sandbox.rs) through `blaze-engine build-script`.
 Proc macros are rustc's here (BLAZE_PROC_MACRO_SERVER=0): what is measured is the scripts'
 runs. The sandbox leaves beside each script's OUT_DIR the record of what it reached
-(`ra-jit-record`: R read, W write refused, N network refused, X record not whole) and how cargo
-ran it (`ra-jit-ran.json`). Each project's are collected into `<out>/<project>.json`.
+(`blaze-record`: R read, W write refused, N network refused, X record not whole) and how cargo
+ran it (`blaze-ran.json`). Each project's are collected into `<out>/<project>.json`.
 
 `report` classifies every line of every record and writes `<out>/README.md` and, every
 would-be denial by package, `<out>/denied.json`:
@@ -25,7 +25,7 @@ would-be denial by package, `<out>/denied.json`:
   writes      every W line: a write outside OUT_DIR, refused now
   executables an R line of a regular file with the executable bit and an ELF or `#!` start (the
               record does not tell a run from a look, so a script that looks for a program on
-              PATH without running it counts too), outside the toolchain (its sysroot, ra-jit),
+              PATH without running it counts too), outside the toolchain (its sysroot, blaze),
               the Nix closure of the C compiler (`cc`, `c++`, `ar`) and pkg-config, and the
               package (its own configure and scripts are inputs)
   reads       every other R line outside the package, its OUT_DIR, the toolchain and that
@@ -49,8 +49,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from resolve import BENCH_PROJECT, fetch_git, option  # noqa: E402
 
-RECORD = "ra-jit-record"
-RAN = "ra-jit-ran.json"
+RECORD = "blaze-record"
+RAN = "blaze-ran.json"
 
 
 def projects():
@@ -66,7 +66,7 @@ def run_dirs(target):
             dirs[:] = [d for d in dirs if d == "out"]
 
 
-def record(name, repo, rev, work, ra_jit, jobs):
+def record(name, repo, rev, work, blaze, jobs):
     source = os.path.join(work, "src", name)
     fetch_git(repo, rev, source)
     target = os.path.join(work, "target", name)
@@ -78,7 +78,7 @@ def record(name, repo, rev, work, ra_jit, jobs):
         if key.startswith(("CARGO_", "BLAZE_", "RUSTC_")) and key != "CARGO_HOME":
             del env[key]
     env.update(
-        RUSTC_WRAPPER=os.path.join(os.path.dirname(ra_jit), "ra-jit-rustc"),
+        RUSTC_WRAPPER=os.path.join(os.path.dirname(blaze), "blaze-rustc"),
         BLAZE_ONLY_ASKS="1",
         BLAZE_PROC_MACRO_SERVER="0",
         BLAZE_CACHE=store,
@@ -191,7 +191,7 @@ def classify(project, allowed):
         if env is None and os.path.exists(os.path.join(run_dir, RAN)):
             env = dict(json.load(open(os.path.join(run_dir, RAN)))["env"])
         env = env or {}
-        toolchain = [allowed["sysroot"], allowed["ra_jit_dir"], os.path.dirname(script["real"]), run_dir]
+        toolchain = [allowed["sysroot"], allowed["blaze_dir"], os.path.dirname(script["real"]), run_dir]
         toolchain += allowed["closure"]
         # What the dev shell has the C compiler and pkg-config search.
         searched = flag_dirs(env.get("NIX_CFLAGS_COMPILE"), env.get("NIX_LDFLAGS"), env.get("CFLAGS"), env.get("LDFLAGS"))
@@ -231,7 +231,7 @@ def classify(project, allowed):
             elif name.endswith(".so") or ".so." in name or what in ("/etc/ld-nix.so.preload", "/etc/ld.so.cache", "/etc/ld.so.preload"):
                 classes["allowed: shared libraries and the loader's files"].append(what)
             elif name == ".cargo" or name in ("config", "config.toml") and "/.cargo/" in what or what == "/etc/_rjem_malloc.conf":
-                classes["allowed: cargo's configuration, read by ra-jit as rustc"].append(what)
+                classes["allowed: cargo's configuration, read by blaze as rustc"].append(what)
             elif under(what, target):
                 classes["reads: target directory"].append(what)
             elif under(what, source):
@@ -469,7 +469,7 @@ def said_by_cargo(stderr, package):
     return rest[: min(ends)] if ends else rest
 
 
-def in_closure(name, repo, rev, work, ra_jit, jobs, store):
+def in_closure(name, repo, rev, work, blaze, jobs, store):
     """Runs `name`'s compile-time step with every build script in its closure alone
     (BLAZE_SCRIPT_VIEW=on), keeping going past a failed script, with `store` as the store: what
     each script did, from its run directory."""
@@ -482,7 +482,7 @@ def in_closure(name, repo, rev, work, ra_jit, jobs, store):
         if key.startswith(("CARGO_", "RUSTC_")) and key != "CARGO_HOME":
             del env[key]
     env.update(
-        RUSTC_WRAPPER=os.path.join(os.path.dirname(ra_jit), "ra-jit-rustc"),
+        RUSTC_WRAPPER=os.path.join(os.path.dirname(blaze), "blaze-rustc"),
         BLAZE_ONLY_ASKS="1",
         BLAZE_PROC_MACRO_SERVER="0",
         BLAZE_SCRIPT_VIEW="on",
@@ -571,14 +571,14 @@ def main():
     if mode == "closure-report":
         return closure_report(out_dir)
     if mode == "closure":
-        ra_jit = os.path.abspath(option(argv, "--ra-jit") or sys.exit("--ra-jit BIN"))
+        blaze = os.path.abspath(option(argv, "--blaze") or sys.exit("--blaze BIN"))
         work = option(argv, "--work", os.path.join(os.environ.get("TMPDIR", "/tmp"), "blaze-bscache"))
         store = option(argv, "--store") or sys.exit("--store DIR")
         jobs = int(option(argv, "--jobs", "8"))
         corpus = projects()
         for name in argv or list(corpus):
             repo, rev = corpus[name]
-            result = in_closure(name, repo, rev, work, ra_jit, jobs, store)
+            result = in_closure(name, repo, rev, work, blaze, jobs, store)
             json.dump(result, open(os.path.join(out_dir, f"{name}.json"), "w"), indent=1)
             ok = sum(s["ok"] for s in result["scripts"])
             kept = sum(s["kept"] for s in result["scripts"])
@@ -586,16 +586,16 @@ def main():
         return
     if mode == "directives":
         return directives(option(argv, "--work", os.path.join(os.environ.get("TMPDIR", "/tmp"), "blaze-bscache")), out_dir)
-    ra_jit = os.path.abspath(option(argv, "--ra-jit") or sys.exit("--ra-jit BIN"))
+    blaze = os.path.abspath(option(argv, "--blaze") or sys.exit("--blaze BIN"))
     work = option(argv, "--work", os.path.join(os.environ.get("TMPDIR", "/tmp"), "blaze-bscache"))
     jobs = int(option(argv, "--jobs", "8"))
     corpus = projects()
     names = argv or list(corpus)
     sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip()
-    allowed = dict(sysroot=sysroot, ra_jit_dir=os.path.dirname(ra_jit), closure=closure(["cc", "c++", "ar", "pkg-config"]))
+    allowed = dict(sysroot=sysroot, blaze_dir=os.path.dirname(blaze), closure=closure(["cc", "c++", "ar", "pkg-config"]))
     for name in names:
         repo, rev = corpus[name]
-        result = record(name, repo, rev, work, ra_jit, jobs)
+        result = record(name, repo, rev, work, blaze, jobs)
         result["allowed"] = allowed
         json.dump(result, open(os.path.join(out_dir, f"{name}.json"), "w"), indent=1)
         print(f"{name}: cargo {result['status']}, {len(result['scripts'])} scripts, failed {result['failed']}", flush=True)

@@ -46,7 +46,7 @@ refs {
   Ref perceus(href: "https://www.microsoft.com/en-us/research/publication/perceus-garbage-free-reference-counting-with-reuse/", label: "Perceus: garbage-free reference counting with reuse", note: "Unique values updated in place by pure code.")
 
   // blaze.
-  Ref fn_cache(href: "https://github.com/indexable-inc/blaze/blob/main/docs/fn-cache.md", label: "blaze: the function cache", note: "#[ra_jit::cache], and what makes a function ineligible.")
+  Ref fn_cache(href: "https://github.com/indexable-inc/blaze/blob/main/docs/fn-cache.md", label: "blaze: the function cache", note: "#[blaze::cache], and what makes a function ineligible.")
   Ref sandbox(href: "https://github.com/indexable-inc/blaze/issues/147", label: "indexable-inc/blaze#147: sandbox build scripts and proc macros", note: "")
   Ref borrowck(href: "https://github.com/indexable-inc/blaze/blob/main/docs/borrowck.md", label: "blaze: borrow checking", note: "")
   Ref salsa(href: "https://github.com/salsa-rs/salsa", label: "salsa", note: "")

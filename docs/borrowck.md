@@ -1,6 +1,6 @@
 # The borrow checker
 
-ra-jit has its own borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree
+blaze has its own borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree
 (`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR rust-analyzer
 lowers, the same MIR the code generator compiles, and it is meant to give exactly rustc's
 verdict: the same errors, on the same lines, and none where rustc gives none. It gives
@@ -8,19 +8,19 @@ rustc's verdict on 95% of rustc's own borrow-check tests today, and on every one
 accepts; how they are scored and what is left is below.
 
 It runs as part of rust-analyzer's diagnostics, so the daemon computes it for every edited
-file, and `ra-jit borrowck` prints what it finds. The daemon refuses an edit it finds a
+file, and `blaze-engine borrowck` prints what it finds. The daemon refuses an edit it finds a
 borrow-check error in (below), but the checker still misses about a sixth of the errors
 rustc gives, so `cargo check` stays the final word.
 
 ## Refusing builds
 
 An edit with a borrow-check error fails its build, with the file, line and error, as an edit
-with a type error does; under `cargo ra-jit`, cargo then runs and rustc reports it.
+with a type error does; under `blaze`, cargo then runs and rustc reports it.
 `BLAZE_BORROWCK_REFUSE=0` in the daemon's environment turns this off.
 
 This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
 fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
-borrow-check error ra-jit reports where rustc reports none is a bug; `BLAZE_BORROWCK_REFUSE=0`
+borrow-check error blaze reports where rustc reports none is a bug; `BLAZE_BORROWCK_REFUSE=0`
 works around it until it is fixed. What it does not do: it misses about a sixth of the
 errors rustc gives (it accepts code rustc rejects, listed below), so code with such an error
 still builds and runs from memory.
@@ -59,7 +59,7 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   in the function whose moves have the numbers of an error the closure gave, of a place that
   is a prefix of the closure's (the variable `_1` and the capture `_1.0`), is not reported,
   and one of another place replaces the closure's: `drop(x); spawn(move || { drop(x);
-  drop(x); })` is one error, in the closure. ra-jit numbers each move as rustc's MIR would,
+  drop(x); })` is one error, in the closure. blaze numbers each move as rustc's MIR would,
   leaving out the moves its lowering adds (a capture copied into a local of the closure, an
   operand moved into a temporary first, a drop), and names a capture as the closure's field.
 - Match guards (E0510): rustc fake-borrows, through every guard of a `match`, what its arms
@@ -80,7 +80,7 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   `offset_of!`, which lowering computes as the address of a field of a value at address 0,
   is rustc's `NullOp::OffsetOf` and takes no reference.
 - Builtin derives are checked as rustc expands them (`rustc_builtin_macros/src/deriving`;
-  `ra-jit borrowck` expands them, as `ra-jit check` and builds do). The methods derived for
+  `blaze-engine borrowck` expands them, as `blaze check` and builds do). The methods derived for
   a `#[repr(packed)]` struct copy each field out of it, `{ self.x }` at the field, rather
   than borrow it, so one that is not `Copy` is E0507 where the field is written; `Debug`
   takes the last field by one more reference, so an unsized one still becomes a
@@ -326,7 +326,7 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   type has its lifetime inferred, and a borrowed capture of a closure or `async` block
   returned through an `impl Trait` that captures no lifetime is E0597, not E0373, as rustc's.
   rustc picks the captured lifetime a
-  region becomes and checks the body with that choice; ra-jit only tests that one exists, so
+  region becomes and checks the body with that choice; blaze only tests that one exists, so
   it reports E0700 where rustc does and leaves the errors that choice causes unreported.
 - A return type with `_` in it is rustc's E0121, which takes the type the body infers: the
   return slot is checked as any other local, its regions inferred, not tied to a signature.
@@ -397,7 +397,7 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   Trait>` and `impl<X: 'static> Trait for (X,)` needs `X: 'static`. A type that outlives a
   region only if a lifetime in it does is E0477 ("does not fulfill the required lifetime"):
   `foo: Foo<(&str,)>` there. As rustc, an item that also needs a lifetime to outlive one
-  it does not (E0491) gets only that error, which ra-jit does not report yet. A function's
+  it does not (E0491) gets only that error, which blaze does not report yet. A function's
   signature, with its impl's header, is normalized as rustc's `WfCheckingCtxt` normalizes it,
   in an inference context of its own, once for what it implies and once for its
   well-formedness, so a lifetime normalizing makes is a region variable of its own in each:
@@ -467,7 +467,7 @@ unit should give is what the pinned nightly rustc gives on it, once with Poloniu
 without; those runs are checked against the tests' own `//~ ERROR` annotations so that a
 harness mistake shows.
 
-A unit passes when ra-jit's set of borrow-check errors, as (error code, line), is rustc's
+A unit passes when blaze's set of borrow-check errors, as (error code, line), is rustc's
 set. Errors rustc gives no code are named by their message. A unit is out of scope, with a
 counted reason, when it cannot say anything about the borrow checker: it needs a nightly
 feature, an auxiliary crate or another file, a `-Z` flag other than Polonius, rustc
@@ -490,7 +490,7 @@ For those, rust-analyzer's type checking follows rustc's in what it reports:
 
 With no borrow checker, the 246 units rustc accepts would pass. Now:
 
-| Mode | In scope | Pass | rustc accepts, ra-jit too | rustc rejects, same errors |
+| Mode | In scope | Pass | rustc accepts, blaze too | rustc rejects, same errors |
 |---|---|---|---|---|
 | Polonius | 1590 | 1587 (99.8%) | 246 of 246 | 1341 of 1344 |
 | NLL | 1588 | 1585 (99.8%) | 227 of 227 | 1358 of 1361 |
@@ -501,7 +501,7 @@ and fails below a floor a few units under the count there, on any error in a uni
 accepts, and on any unit the checker panics on, as a panic hides every error in its file.
 
 The other check is that it finds nothing in code rustc accepts.
-`ra-jit borrowck --project DIR` checks a cargo workspace; its last line counts the files,
+`blaze-engine borrowck --project DIR` checks a cargo workspace; its last line counts the files,
 errors and files it panicked on; a panic makes it fail. It refuses a workspace `cargo metadata`
 fails on: rust-analyzer would read it with `--no-deps`, whose crates have no dependencies, and
 every type of another crate would be an error the bodies using it do not show.
@@ -514,7 +514,7 @@ long enough") and rust-analyzer (1, E0515) got errors rustc does not give.
 
 ## What is left
 
-Three units fail in each mode, all an error rustc gives that ra-jit does not:
+Three units fail in each mode, all an error rustc gives that blaze does not:
 `higher-ranked-auto-trait-11#no_assumptions` and `implementation-not-general-enough-ice-133252`
 (the first cause below) and `supertrait-mentions-GAT` (the second; rustc reports it on the dummy
 span of an obligation of its own, where no item's well-formedness check is). The other causes
@@ -639,7 +639,7 @@ changes to rust-analyzer were needed, each made as rustc does it:
   or not, as rustc's `stmt_expr` does, and so is an operand (`[a[..]]`), so moving out of a
   borrowed `str`, slice or `dyn` is E0507 or E0508 (`dst/dst-index-fail.rs`,
   `unsized/issue-115203.rs`). rust-analyzer refused to lower a body with one, and only
-  fake-read an unsized statement. rustc reports E0161 there too, which ra-jit does not.
+  fake-read an unsized statement. rustc reports E0161 there too, which blaze does not.
 
 These are differences still open, each the cause of some failures, all of them errors
 missed rather than errors made up:
@@ -652,7 +652,7 @@ missed rather than errors made up:
   rustc does not).
 - Unwind paths are not lowered. rustc's MIR gives every call and drop a cleanup path ending
   at `resume`, where any borrow still live that outlives the function's own regions is an
-  error (E0597 for `let x = ...; let r: &'a _ = &x; f();`). ra-jit checks that at each call,
+  error (E0597 for `let x = ...; let r: &'a _ = &x; f();`). blaze checks that at each call,
   drop and assert as if the path were there; it would be exact if the lowering added them.
 
 ## What it costs
@@ -671,7 +671,7 @@ small: an edit re-checks only the bodies it changed (the query reads each body's
 relative to its item, which moving the body does not change), and each check should cost a
 small fraction of type inference, which it needs anyway.
 
-`ra-jit borrowck --project DIR --timings OUT.jsonl` goes through every body of a project's own
+`blaze-engine borrowck --project DIR --timings OUT.jsonl` goes through every body of a project's own
 crates on one thread. It infers and checks each body once cold, paying for the queries the body
 is the first to need (`infer_us`, `first_us`), then infers it and checks it in each mode as an
 edit of it costs in the daemon: the rest of the workspace answered and the trait solver's cache
@@ -800,7 +800,7 @@ is 0.3 ms now. Nothing else moves (bench/results/2026-10-27-borrowck-speed-place
 
 ## Debugging
 
-- `echo file.rs | ra-jit borrowck --edition 2021` prints a file's diagnostics as JSON.
+- `echo file.rs | blaze-engine borrowck --edition 2021` prints a file's diagnostics as JSON.
 - `BLAZE_BORROWCK_MIR=<function>` with that command, or with `--project`, prints the MIR
   of a top-level function and its closures.
 - `BLAZE_BORROWCK_DEBUG=1` prints each body's locals, universal regions, constraints and

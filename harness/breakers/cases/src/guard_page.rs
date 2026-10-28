@@ -3,7 +3,7 @@
 //! their way down except on Windows, so a large frame stepped over the guard page and its
 //! first write landed in whatever was mapped below: rgb's game client died of a SIGILL on
 //! CoreAudio's thread. rustc's code touches every page of such a frame on the way down
-//! (`probe-stack=inline-asm`), and ra-jit's does now. The frame here writes only its lowest
+//! (`probe-stack=inline-asm`), and blaze's does now. The frame here writes only its lowest
 //! byte: one that wrote all of it upwards would reach the guard page from below.
 
 #[inline(never)]

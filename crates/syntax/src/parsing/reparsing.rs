@@ -82,7 +82,7 @@ fn reparse_token(
                 new_text.pop();
             }
 
-            let new_token = GreenToken::new(rowan::SyntaxKind(prev_token_kind.into()), &new_text);
+            let new_token = GreenToken::new(syntax_tree::SyntaxKind(prev_token_kind.into()), &new_text);
             let range = TextRange::up_to(TextSize::of(&new_text));
             Some((
                 prev_token.replace_with(new_token),

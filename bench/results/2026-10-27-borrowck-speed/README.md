@@ -1,6 +1,6 @@
 # The borrow checker's time on the bench apps, before and after a trait reference is proven by a query
 
-Made by `harness/borrowck_speed.py --jobs 1` (one `ra-jit borrowck --project DIR --timings`
+Made by `harness/borrowck_speed.py --jobs 1` (one `blaze-engine borrowck --project DIR --timings`
 per app, see docs/borrowck.md "Speed"), in an arm64 ix VM (32 vCPUs, 32 GiB), inside
 `nix develop`. `before.*` is main a4c6dd3c with #576 (timings as an edit pays them, inferred
 outlives a query, `is_copy` once per type); `after.*` is main 3db5b233 with the trait reference

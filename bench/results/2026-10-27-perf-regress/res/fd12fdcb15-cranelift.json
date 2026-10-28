@@ -71,7 +71,7 @@
      },
      "started_over": [],
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 3137,
        "peak_max_mb": 3137,
        "largest_mb": 3015,
@@ -102,7 +102,7 @@
     },
     "no-op": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 2347,
        "peak_max_mb": 2367,
        "largest_mb": 2077,
@@ -133,7 +133,7 @@
     },
     "body": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 2094,
        "peak_max_mb": 2374,
        "largest_mb": 1869,
@@ -201,7 +201,7 @@
     },
     "signature": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 2022,
        "peak_max_mb": 2063,
        "largest_mb": 1872,
@@ -269,7 +269,7 @@
     },
     "leaf": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 2034,
        "peak_max_mb": 2122,
        "largest_mb": 1856,
@@ -337,7 +337,7 @@
     },
     "generic": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 2106,
        "peak_max_mb": 2108,
        "largest_mb": 1866,
@@ -405,7 +405,7 @@
     },
     "struct": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 2134,
        "peak_max_mb": 2149,
        "largest_mb": 1875,
@@ -473,7 +473,7 @@
     },
     "newfn": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 2099,
        "peak_max_mb": 2120,
        "largest_mb": 1877,
@@ -604,7 +604,7 @@
      "\\w+_unchecked\\(|unsafe \\{",
      "{library}"
     ],
-    "ra-jit": {
+    "blaze": {
      "median_s": 2.3638,
      "min_s": 2.3551,
      "max_s": 2.3767,

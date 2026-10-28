@@ -2,7 +2,7 @@
 
 2026-10-24. What the compiling threads share and read together: whether the store's cache of
 unpacked blocks is what a warm start waits on (measured), and what bbtree, a concurrent B+tree
-posted that week, and papaya, a concurrent hash map, would change for ra-jit's maps. Each claim
+posted that week, and papaya, a concurrent hash map, would change for blaze's maps. Each claim
 is **read** (measured, or read in the source), **reported** (someone says so) or **unverified**
 (our inference). What was fetched is in [docs/upstream/concurrent-maps/](../upstream/concurrent-maps/).
 
@@ -18,19 +18,19 @@ is **read** (measured, or read in the source), **reported** (someone says so) or
   220 KB each, 33 GB inflated. Even at 1 GiB, unpacking is 19 s of the 107 s of
   "store read" thread time, and "store read" is spread over 64 threads (**read**). The rest of
   "store read" is not unpacking: it is the decoding and interning of what was read
-  ([warm-start](https://github.com/indexable-inc/ra-jit/blob/warm-manifest/docs/research/warm-start.md),
+  ([warm-start](https://github.com/indexable-inc/blaze/blob/warm-manifest/docs/research/warm-start.md),
   not on main yet, says each set of types is interned type by type) (**unverified** how much).
 - bbtree is ordered; papaya, DashMap and the interner's shards are hash maps. For point lookups
   hashbrown does a u64 get in 17 ns where bbtree takes 130 ns one key a call and 75 ns batched,
-  10M entries, on bbtree's own single-thread numbers (**reported**). ra-jit's shared maps (the
+  10M entries, on bbtree's own single-thread numbers (**reported**). blaze's shared maps (the
   interner, salsa's tables, `Entries`) are looked up by key, not scanned in order
-  (**unverified** beyond `cached.rs` and the interner), so bbtree has no place in ra-jit today.
+  (**unverified** beyond `cached.rs` and the interner), so bbtree has no place in blaze today.
 
 ## The store's block cache, measured
 
 A sealed pack keeps its values in zstd blocks of at least `BLOCK` (128 KiB) of values; a value read
 from one unpacks its whole block into a cache of `UNPACKED` (32 MiB) shared by every thread,
-under one lock, the least recently used block evicted first (**read**, `ra-jit-store`). The
+under one lock, the least recently used block evicted first (**read**, `blaze-store`). The
 change tried: the first thread to ask for a block unpacks it and the others wait for that copy
 (a `OnceLock` per block, filled outside the lock), eviction in batches down to 7/8 of the
 size, the size from `BLAZE_CACHE_UNPACKED`, and a line in `BLAZE_STATS` counting blocks
@@ -63,7 +63,7 @@ together kept in the same block. Unpacking is under a second of the build's wall
 threads (**unverified**: 19-44 s of thread time spread evenly), so neither is worth it before
 the rest of "store read" is.
 
-## bbtree, papaya and ra-jit's maps
+## bbtree, papaya and blaze's maps
 
 bbtree ([XiangpengHao/bbtree](https://github.com/XiangpengHao/bbtree) at 8adae97, 0.1.5, MIT OR
 Apache-2.0) (**read** unless marked):
@@ -91,9 +91,9 @@ hash map for read-heavy work: a read pins a `seize` guard and gets `&V`, memory 
 once no guard can see it, and the table resizes incrementally (**read**, README). Unordered,
 so no ranges.
 
-For ra-jit (**unverified**, from the above): a map read by key from every core wants a hash
+For blaze (**unverified**, from the above): a map read by key from every core wants a hash
 map whose reads write nothing shared (papaya, or shards under read locks, as the interner now
 does on `warm-manifest`); bbtree only where order or ranges are needed, which no shared map in
-ra-jit is today. Batching lookups to overlap their cache misses would apply to a hash map too,
+blaze is today. Batching lookups to overlap their cache misses would apply to a hash map too,
 more simply (every bucket's address is known from its hash up front), but no measured cost in
-ra-jit is a map's cache misses.
+blaze is a map's cache misses.

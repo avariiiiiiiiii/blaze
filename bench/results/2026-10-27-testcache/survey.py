@@ -4,7 +4,7 @@ warm store skips. Runs in the lane's VM: nix develop /root/tc/src -c python3 /ro
 import json, os, re, shutil, subprocess, sys, time
 
 sys.path.insert(0, "/root/tc/src/harness")
-import cargo_ra_jit  # noqa: E402
+import blaze_cli  # noqa: E402
 
 BIN = "/root/tc/target/release"
 APPS = "/root/apps"
@@ -17,7 +17,7 @@ CACHED = re.compile(r"Cached (\d+) tests? from")
 
 def run(ws, env, args, log):
     start = time.monotonic()
-    out = subprocess.run(["cargo", "ra-jit", "test", *args, "--no-fail-fast"], cwd=ws, env=env,
+    out = subprocess.run(["blaze", "test", *args, "--no-fail-fast"], cwd=ws, env=env,
                          capture_output=True, text=True, timeout=3600)
     took = time.monotonic() - start
     said = out.stdout + out.stderr
@@ -27,7 +27,7 @@ def run(ws, env, args, log):
     return dict(code=out.returncode, secs=round(took, 1), ran=len(ran),
                 failed=sorted(n for n, e in ran if e == "FAILED"), cached=cached,
                 denied=DENIED.findall(said), denied_all=DENIED_ALL.findall(said),
-                served="[ra-jit]" in said)
+                served="[blaze]" in said)
 
 
 def main():
@@ -38,7 +38,7 @@ def main():
     for name in names:
         if name in results:
             continue
-        spec = cargo_ra_jit.PROJECTS[name]
+        spec = blaze_cli.PROJECTS[name]
         ws = os.path.join(APPS, name)
         if not os.path.isdir(ws):
             subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", spec["tag"],
@@ -55,12 +55,12 @@ def main():
         # Cold, then as a CI runner after main's: a fresh target and daemon with the store.
         for i in range(2):
             if i:
-                subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+                subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
                 shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
             r = run(ws, env, args, f"{APPS}/{name}.{i}.log")
             runs.append(r)
             print(name, i, json.dumps({k: v for k, v in r.items() if k not in ("failed",)})[:600], flush=True)
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         results[name] = runs
         json.dump(results, open(f"{APPS}/survey.json", "w"), indent=1)
     print("DONE")

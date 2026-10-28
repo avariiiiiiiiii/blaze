@@ -25,7 +25,7 @@ The edits:
   fn.add, fn.signature, fn.remove    a function of the edit's own, and the call of it
   undo              the source of an earlier step again
 
-BLAZE_BIN names the ra-jit under test. The exit status is 1 when there is a finding.
+BLAZE_BIN names the blaze under test. The exit status is 1 when there is a finding.
 """
 import argparse, collections, concurrent.futures, copy, json, os, random, re, shutil, subprocess, sys, tempfile, time
 
@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gen, linkline
-from difftest import Fixture, RA_JIT, TARGET_ARGS, built, sysroot_rlibs, minimize
+from difftest import Fixture, BLAZE, TARGET_ARGS, built, sysroot_rlibs, minimize
 from fuzz import BACKENDS, FOUND, MANIFEST, differences, edition_of, run
 
 EDITS = os.path.join(FOUND, "edits")
@@ -229,12 +229,12 @@ class Daemon:
         self.fx = Fixture(self.ws, ["fz"], ["-p", "fz"], touch=self.main)
         self.fx.rustc_build()
         obj, patch, self.binary = (os.path.join(self.work, f"fz.{name}") for name in ("o", "patch.o", "bin"))
-        link = linkline.with_output(linkline.ahead(list(self.fx.link_args), [patch, obj], RA_JIT), self.binary)
+        link = linkline.with_output(linkline.ahead(list(self.fx.link_args), [patch, obj], BLAZE), self.binary)
         symbols = [x for rlib in self.fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         self.ask = ["--crate", "fz", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), "--binary", self.binary, *symbols]
-        self.socket, self.log = os.path.join(self.work, "ra-jit.sock"), os.path.join(self.work, "daemon.log")
+        self.socket, self.log = os.path.join(self.work, "blaze.sock"), os.path.join(self.work, "daemon.log")
         out = open(self.log, "a")
-        self.process = subprocess.Popen([RA_JIT, self.ws, *TARGET_ARGS, "--socket", self.socket, *self.ask], stderr=out, stdout=out, env=self.env)
+        self.process = subprocess.Popen([BLAZE, self.ws, *TARGET_ARGS, "--socket", self.socket, *self.ask], stderr=out, stdout=out, env=self.env)
         began = time.time()
         while "watching" not in open(self.log).read():
             if self.process.poll() is not None or time.time() - began > 600:
@@ -246,7 +246,7 @@ class Daemon:
         open(self.main, "w").write(text)
         seen = len(open(self.log).read())
         try:
-            reply = subprocess.run([RA_JIT, "sync", self.socket, *self.ask], capture_output=True, text=True, timeout=600, env=self.env)
+            reply = subprocess.run([BLAZE, "sync", self.socket, *self.ask], capture_output=True, text=True, timeout=600, env=self.env)
             said = (reply.stdout + reply.stderr).strip()
         except subprocess.TimeoutExpired:
             said = "no reply after 600s"
@@ -490,8 +490,8 @@ def main():
         sys.exit(1 if report(args.targets[0]) else 0)
     if args.mode == "smoke":
         args.seed, args.rounds, args.cases, args.steps = (SMOKE[name] for name in ("seed", "rounds", "cases", "steps"))
-    out = args.out or tempfile.mkdtemp(prefix="ra-jit-edits-out-")
-    work = args.work or tempfile.mkdtemp(prefix="ra-jit-edits-")
+    out = args.out or tempfile.mkdtemp(prefix="blaze-edits-out-")
+    work = args.work or tempfile.mkdtemp(prefix="blaze-edits-")
     os.makedirs(out, exist_ok=True)
     os.makedirs(work, exist_ok=True)
     if args.mode == "check":

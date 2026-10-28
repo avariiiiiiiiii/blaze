@@ -10,7 +10,7 @@
     "it"
   ],
   "verb": "test",
-  "ra-jit": [
+  "blaze": [
     "--dev-deps",
     "--profile",
     "test"

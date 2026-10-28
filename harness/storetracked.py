@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """storetracked.py: a daemon that starts on a store holding the checkout's code takes that
 code as it is and patches the first edit to it, with nothing of rustc's (#105). Linux and
-macOS: on Windows `cargo ra-jit` hands builds to cargo.
+macOS: on Windows `blaze` hands builds to cargo.
 
-usage: storetracked.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: storetracked.py    (BLAZE_BIN names the blaze built; blaze and blaze-rustc
                            are found next to it)
 
 A patch is cut from what changed since the build it patches, and it knew that by marks
@@ -12,7 +12,7 @@ it, so the daemon built everything of the checkout the store gave it again befor
 edit could be patched ("compiling what the store had of the checkout"), all of nushell's
 73,586 functions for a start with nothing changed. Each function of the checkout now goes
 into the store with a mark of its code and of what it names by stable names, the same in any
-process, checkout or build of ra-jit, so the base takes what it found as it is and an edit
+process, checkout or build of blaze, so the base takes what it found as it is and an edit
 recompiles only what it touched.
 
 A daemon builds the workspace into an empty store and stops. A second one on the same
@@ -147,7 +147,7 @@ UNKEPT = "rustc's copy of a function of the checkout"
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["cargo", "ra-jit", "build"], cwd=ws, env=env, capture_output=True, text=True,
+    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
                          timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
@@ -209,7 +209,7 @@ def serve(ws, env, label):
     else:
         raise SystemExit(f"{label}: no build said `[blaze]`; the daemon's log is in {env['BLAZE_HOME']}")
     for _ in range(40):
-        status = subprocess.run(["cargo", "ra-jit", "status"], cwd=ws, env=env, capture_output=True,
+        status = subprocess.run(["blaze", "status"], cwd=ws, env=env, capture_output=True,
                                 text=True, timeout=120).stdout
         if "loading" not in status and "building" not in status:
             break
@@ -278,11 +278,11 @@ def restart(ws, env, label, steps):
 
 def main():
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
-    if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
+    if not glob.glob(os.path.join(bin_dir, "blaze*")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
     # The daemon's sockets are under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start.
-    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-tracked-", dir="/tmp"))
+    root = os.path.realpath(tempfile.mkdtemp(prefix="blaze-tracked-", dir="/tmp"))
     ws, copy, store = os.path.join(root, "ws"), os.path.join(root, "copy"), os.path.join(root, "store")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
@@ -299,15 +299,15 @@ def main():
     wrong = 0
     try:
         serve(ws, here, "filling the store")
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=here, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=here, capture_output=True, timeout=120)
         shutil.copytree(ws, copy, ignore=shutil.ignore_patterns("target"))
         wrong += restart(ws, here, "restart", STEPS)
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=here, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=here, capture_output=True, timeout=120)
         wrong += restart(copy, dict(there, BLAZE_CHECK_ALL="1"), "another checkout", STEPS)
     finally:
         for at, env in ((ws, here), (copy, there)):
             if os.path.isdir(at):
-                subprocess.run(["cargo", "ra-jit", "stop"], cwd=at, env=env, capture_output=True, timeout=120)
+                subprocess.run(["blaze", "stop"], cwd=at, env=env, capture_output=True, timeout=120)
     print(f"{wrong} wrong; under {root}")
     if wrong:
         sys.exit(1)

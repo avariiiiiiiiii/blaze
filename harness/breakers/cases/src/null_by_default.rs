@@ -1,5 +1,5 @@
 //! library/coretests ptr.rs, `test_ptr_default`: a raw pointer is null by default, which
-//! `core` says for any `T: ?Sized + Thin`. `Thin` is a trait alias, and ra-jit asked that an
+//! `core` says for any `T: ?Sized + Thin`. `Thin` is a trait alias, and blaze asked that an
 //! alias hold of the type before its own bounds could show that it does, so the impl was never
 //! found and the call was left to rustc.
 

@@ -9,11 +9,11 @@ A daemon fills a store and ends. Then:
     whoever reads the remote;
   - a pack that other users can write to has to be removed, said so, and the program
     built from the rest has to print what cargo's does;
-  - a store directory that other users can write to has to be refused by `ra-jit cache`
+  - a store directory that other users can write to has to be refused by `blaze-engine cache`
     with the reason, and a daemon on it has to say it is not used, build the right
     program, and neither read nor write anything in it;
-  - `ra-jit cache pull` from a remote whose lists nobody signed has to be refused, with
-    nothing fetched, unless BLAZE_REMOTE_UNSIGNED=1; `ra-jit cache push` asks for nothing.
+  - `blaze-engine cache pull` from a remote whose lists nobody signed has to be refused, with
+    nothing fetched, unless BLAZE_REMOTE_UNSIGNED=1; `blaze-engine cache push` asks for nothing.
 
   - a crate cargo fetched from a registry is kept under `/cargo`, not under the cargo home
     of whoever built it: a second user with another cargo home has to find what the first
@@ -182,7 +182,7 @@ def fetched_workspace(top):
 
 
 def built_with_home(ws, home, store):
-    """Builds the program with `home` as cargo's; returns what ra-jit said of the store."""
+    """Builds the program with `home` as cargo's; returns what blaze said of the store."""
     were = {name: os.environ.get(name) for name in ("CARGO_HOME", "BLAZE_CACHE", "PATH")}
     cargo_bin = os.path.dirname(shutil.which("cargo"))
     os.environ.update(CARGO_HOME=home, BLAZE_CACHE=store, PATH=cargo_bin + os.pathsep + os.environ["PATH"],
@@ -190,7 +190,7 @@ def built_with_home(ws, home, store):
     try:
         fx = Fixture(ws, ["dep", "app"], ["-p", "app"])
         fx.rustc_build()
-        fx.ra_jit_build()
+        fx.blaze_build()
     finally:
         for name, value in were.items():
             os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
@@ -200,7 +200,7 @@ def built_with_home(ws, home, store):
     said = open(os.path.join(fx.work, "app.stderr")).read()
     counted = re.search(r"entries: (\d+) found, (\d+) added", said)
     if not counted:
-        fail(f"ra-jit said nothing of the entries of the crate of the registry:\n{said[-2000:]}")
+        fail(f"blaze said nothing of the entries of the crate of the registry:\n{said[-2000:]}")
     return int(counted[1]), int(counted[2])
 
 
@@ -236,7 +236,7 @@ def another_cargo_home(work):
 def main():
     if os.name != "posix":
         raise SystemExit("storeguards.py: the modes of files are checked on Unix only")
-    work = scratch("ra-jit-storeguards-")
+    work = scratch("blaze-storeguards-")
     checkout = Checkout(work)
     store = os.path.join(work, "store")
     filled(checkout, store, "fill")

@@ -1,5 +1,5 @@
 //! blaze's `cargo fmt` as a binary taking the arguments after `fmt`, for the parity harness to
-//! run before `cargo blaze fmt` dispatches to it.
+//! run before `blaze fmt` dispatches to it.
 
 fn main() {
     std::process::exit(blaze_fmt::cargo_fmt::main(

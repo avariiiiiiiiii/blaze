@@ -14,7 +14,7 @@ fn same<A: Any, B: Any>(_: &A, b: &B) -> bool {
     TypeId::of::<A>() == b.type_id()
 }
 
-/// The hash itself: rustc's code and ra-jit's have to agree on it.
+/// The hash itself: rustc's code and blaze's have to agree on it.
 fn id<A: Any>(_: &A) -> TypeId {
     TypeId::of::<A>()
 }

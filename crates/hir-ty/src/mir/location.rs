@@ -87,7 +87,7 @@ type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> +
 static SOURCE_PATHS: std::sync::RwLock<Option<std::sync::Arc<SourcePaths>>> =
     std::sync::RwLock::new(None);
 
-/// Tells the evaluator of constants what the build calls each file: `Symbols::source_path` in ra-jit.
+/// Tells the evaluator of constants what the build calls each file: `Symbols::source_path` in blaze.
 pub fn name_sources(
     paths: impl Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync + 'static,
 ) {

@@ -434,19 +434,19 @@ put in a category). One row per project; each run of a build script counts once.
 
 ## other: not built for wasm32-wasip1 (13 runs, 13 crates)
 
-- `aws-lc-sys v0.32.1` (axum): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 2 functions ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:
-- `bat v0.26.0` (bat): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `biome_aria_metadata v0.7.0` (biome): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `encoding_rs v0.8.42` (biome): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `helix-term v25.7.1` (helix): ra-jit did not build it (exit status: 1): Error: `env!("BUILD_TARGET")` in helix_loader names a variable that is not set
-- `livekit_api v0.1.0` (zed): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:
-- `octocrab v0.49.7` (zed): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `oem_cp v2.1.0` (nushell): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `pbjson-types v0.9.0` (zed): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `proto v0.1.0` (zed): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:
-- `wasm-bindgen v0.2.117` (biome): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `wasmtime v48.0.1` (zed): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
-- `wasmtime-internal-fiber v48.0.1` (zed): ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `aws-lc-sys v0.32.1` (axum): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 2 functions blaze could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:
+- `bat v0.26.0` (bat): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `biome_aria_metadata v0.7.0` (biome): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `encoding_rs v0.8.42` (biome): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `helix-term v25.7.1` (helix): blaze did not build it (exit status: 1): Error: `env!("BUILD_TARGET")` in helix_loader names a variable that is not set
+- `livekit_api v0.1.0` (zed): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions blaze could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:
+- `octocrab v0.49.7` (zed): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `oem_cp v2.1.0` (nushell): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `pbjson-types v0.9.0` (zed): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `proto v0.1.0` (zed): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 19 functions blaze could not compile, and a build with nothing of rustc's has nothing else to compile them, so it is not built:
+- `wasm-bindgen v0.2.117` (biome): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `wasmtime v48.0.1` (zed): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
+- `wasmtime-internal-fiber v48.0.1` (zed): blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:
 
 ## other: reads outside its package and OUT_DIR (4 runs, 4 crates)
 

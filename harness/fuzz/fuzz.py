@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fuzz.py: generated programs, what ra-jit's build of each prints against what rustc's prints.
+"""fuzz.py: generated programs, what blaze's build of each prints against what rustc's prints.
 
 usage: fuzz.py smoke                                   a short run on fixed seeds, for CI
        fuzz.py run --seed S --rounds N [--jobs J]      the long mode: N programs from seed S
@@ -7,13 +7,13 @@ usage: fuzz.py smoke                                   a short run on fixed seed
        fuzz.py check FILE.rs ...                       reductions under found/, each on its own
        fuzz.py report DIR                              adds up the logs a run left in DIR
 
-A round is one program (`gen.py`) of `--cases` cases, built once by cargo and once by ra-jit under
+A round is one program (`gen.py`) of `--cases` cases, built once by cargo and once by blaze under
 each backend in `--backends`, and run. A finding is a case whose output differs, a function left
-to rustc, or a build ra-jit did not finish. Each finding is reduced (the cases, then the lines of
+to rustc, or a build blaze did not finish. Each finding is reduced (the cases, then the lines of
 the one case left) and written to `found/` with the seed that makes it again; a cause already
 found in the run is counted and not reduced a second time.
 
-BLAZE_BIN names the ra-jit under test. The exit status is 1 when there is a finding.
+BLAZE_BIN names the blaze under test. The exit status is 1 when there is a finding.
 """
 import argparse, collections, contextlib, json, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -79,7 +79,7 @@ class Project:
         open(self.main, "w", encoding="utf-8").write(gen.render(modules))
         if self.fx is None:
             self.fx = Fixture(self.dir, ["fz"], ["-p", "fz"], touch=self.main)
-            self.fx.ra_jit_timeout = 600
+            self.fx.blaze_timeout = 600
 
     def reference(self, modules, edition):
         """Builds with cargo and runs. Returns what rustc said when it turned the program down."""
@@ -91,14 +91,14 @@ class Project:
         self.expected = run(self.fx.reference)
         return None
 
-    def ra_jit(self, backend):
-        """Builds with ra-jit under a backend and compares. Returns the findings and the functions compiled."""
+    def blaze(self, backend):
+        """Builds with blaze under a backend and compares. Returns the findings and the functions compiled."""
         os.environ.update(BACKENDS[backend])
-        # ra-jit appends the layouts of every build to this, and nothing here reads it.
+        # blaze appends the layouts of every build to this, and nothing here reads it.
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.fx.layout_log)
         try:
-            self.fx.ra_jit_build()
+            self.fx.blaze_build()
         except SystemExit as error:
             text = str(error)
             return [Finding("crash", None, crash_key(text), text[-3000:])], 0
@@ -141,13 +141,13 @@ def differences(expected, got):
     for name, text in want.items():
         if name not in have:
             # The program died in the first case it did not finish.
-            detail = f"ra-jit's program ended with status {got[0]} in this case\n{rest[-600:]}\n{got[2][-600:]}"
+            detail = f"blaze's program ended with status {got[0]} in this case\n{rest[-600:]}\n{got[2][-600:]}"
             findings.append(Finding("differs", name, "died", detail))
             break
         if have[name] != text:
-            findings.append(Finding("differs", name, difference_key(text, have[name]), f"rustc:\n{text}\nra-jit:\n{have[name]}"))
+            findings.append(Finding("differs", name, difference_key(text, have[name]), f"rustc:\n{text}\nblaze:\n{have[name]}"))
     if not findings:
-        findings.append(Finding("differs", None, "status", f"rustc: status {expected[0]} {expected[2][-300:]}\nra-jit: status {got[0]} {got[2][-300:]}"))
+        findings.append(Finding("differs", None, "status", f"rustc: status {expected[0]} {expected[2][-300:]}\nblaze: status {got[0]} {got[2][-300:]}"))
     return findings
 
 
@@ -202,7 +202,7 @@ class Reducer:
             return False
         if self.project.expected[0] != 0:
             return False
-        findings, _ = self.project.ra_jit(self.backend)
+        findings, _ = self.project.blaze(self.backend)
         same = [f for f in findings if f.kind == self.finding.kind and f.key == self.finding.key]
         # What the smaller program shows is what gets filed with it.
         self.shown = same[0] if same else self.shown
@@ -308,7 +308,7 @@ def round_of(project, seed, cases, backends, seen, budget, only=()):
     if project.expected[0] != 0:
         record["reference_failed"] = str(project.expected[0])
         return record
-    results = {backend: project.ra_jit(backend) for backend in backends}
+    results = {backend: project.blaze(backend) for backend in backends}
     for backend, (findings, compiled) in results.items():
         entry = record["backends"][backend] = {"compiled": compiled, "findings": [f.record() for f in findings]}
         for finding in findings:
@@ -357,7 +357,7 @@ def report(directory, coverage_table=False):
         kinds = collections.Counter((f["kind"], f["key"]) for e in entries for f in e["findings"])
         total += sum(kinds.values())
         by_kind = collections.Counter(f["kind"] for e in entries for f in e["findings"])
-        print(f"{backend}: {len(entries)} programs, {sum(e['compiled'] for e in entries)} functions compiled by ra-jit, "
+        print(f"{backend}: {len(entries)} programs, {sum(e['compiled'] for e in entries)} functions compiled by blaze, "
               f"{by_kind['differs']} differences, {by_kind['crash']} crashes, {by_kind['left']} left to rustc")
         for (kind, key), count in kinds.most_common():
             print(f"    {count:6} {kind}: {key}")
@@ -386,7 +386,7 @@ def main():
     ap.add_argument("--coverage", action="store_true", help="print how often each construct was generated")
     args = ap.parse_args()
     args.backends = args.backends.split(",")
-    args.work = args.work or tempfile.mkdtemp(prefix="ra-jit-fuzz-")
+    args.work = args.work or tempfile.mkdtemp(prefix="blaze-fuzz-")
     if args.mode == "report":
         sys.exit(1 if report(args.targets[0], args.coverage) else 0)
     if args.mode == "check":
@@ -398,7 +398,7 @@ def main():
         sys.exit(1 if any(e["findings"] for e in record["backends"].values()) or not record["backends"] else 0)
     if args.mode == "smoke":
         args.seed, args.rounds, args.cases, args.first = SMOKE["seed"], SMOKE["rounds"], SMOKE["cases"], 0
-    args.out = args.out or tempfile.mkdtemp(prefix="ra-jit-fuzz-out-")
+    args.out = args.out or tempfile.mkdtemp(prefix="blaze-fuzz-out-")
     os.makedirs(args.out, exist_ok=True)
     args.jobs = max(1, min(args.jobs, args.rounds))
     children = [subprocess.Popen([sys.executable, os.path.abspath(__file__), "worker", str(index), json.dumps(vars(args))])
@@ -412,7 +412,7 @@ def main():
 
 
 def check(args):
-    """Each reduction given, or all of found/: whether ra-jit's build still differs from rustc's."""
+    """Each reduction given, or all of found/: whether blaze's build still differs from rustc's."""
     paths = args.targets or sorted(os.path.join(FOUND, name) for name in os.listdir(FOUND) if name.endswith(".rs"))
     project = Project(os.path.join(args.work, "check"))
     wrong = 0
@@ -425,7 +425,7 @@ def check(args):
             wrong += 1
             continue
         for backend in args.backends:
-            findings, _ = project.ra_jit(backend)
+            findings, _ = project.blaze(backend)
             wrong += bool(findings)
             said = "; ".join(f"{f.kind}: {f.key}" for f in findings)
             print(f"{'DIFFERENT' if findings else 'same     '} {os.path.basename(path)} ({backend}) {said}", flush=True)

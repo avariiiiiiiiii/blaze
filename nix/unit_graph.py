@@ -3,7 +3,7 @@
 
   nix/unit_graph.py   # cargo --unit-graph per target triple + cargo metadata -> nix/units/<project>.json
 
-Two projects: the daemon (the workspace at the repo root, `-p ra-jit`) and the Game of Life demo
+Two projects: the daemon (the workspace at the repo root, `-p blaze-engine`) and the Game of Life demo
 (demo/life, its own workspace and lock). Each `nix/units/<project>.json` is read by nix/units.nix,
 which picks `systems.<nix system>` and makes one derivation per unit, calling rustc directly
 (nix/unit_build.py). Platform-specific dependencies (num_threads -> libc
@@ -40,7 +40,7 @@ TARGETS = {
 }
 # project -> (directory with its Cargo.toml/Cargo.lock, extra cargo flags).
 PROJECTS = {
-    "daemon": (".", ["-p", "ra-jit"]),
+    "daemon": (".", ["-p", "blaze-engine"]),
     "life": ("demo/life", []),
 }
 UNITS_DIR = ROOT / "nix" / "units"

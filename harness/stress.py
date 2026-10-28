@@ -4,7 +4,7 @@
 usage: stress.py [--only TEXT] [--from N] [--keep]
 
 Copies harness/stress (three crates) to a scratch directory, starts the daemon on all of them, and
-applies STEPS in order. The edits stay: each step builds on the ones before. After each, `ra-jit
+applies STEPS in order. The edits stay: each step builds on the ones before. After each, `blaze
 sync` is asked for a build, the program is run, and `cargo build` of the same source is run and its
 program's output compared. A step marked broken is one cargo rejects: the daemon has to say
 so and survive it, and the first step after it that cargo builds has to be a patch: the text
@@ -17,7 +17,7 @@ import socket as unix
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, TARGET_ARGS, built, toolchain
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built, toolchain
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -217,12 +217,12 @@ STEPS = [
 
 def main():
     only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None
-    ws = tempfile.mkdtemp(prefix="ra-jit-stress-")
+    ws = tempfile.mkdtemp(prefix="blaze-stress-")
     shutil.copytree(os.path.join(HERE, "stress"), ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
     crates = ["sapp", "sbase", "smid"]
-    work = tempfile.mkdtemp(prefix="ra-jit-stress-out-")
-    obj, patch, binary = (os.path.join(work, n) for n in ("ra-jit.o", "ra-jit.patch.o", "bin-ra-jit"))
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = tempfile.mkdtemp(prefix="blaze-stress-out-")
+    obj, patch, binary = (os.path.join(work, n) for n in ("blaze.o", "blaze.patch.o", "bin-blaze"))
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     # Cargo's reference build has its own directory: the daemon links against the rlibs of the
     # build it started from.
     reference = os.path.join(work, "reference")
@@ -234,7 +234,7 @@ def main():
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
-        link = linkline.with_output(linkline.ahead(link, [patch, obj], RA_JIT), binary)
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
         for path in (socket, binary):
             if os.path.exists(path):
                 os.remove(path)
@@ -242,7 +242,7 @@ def main():
         # Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full.
         splice = ["--binary", binary]
         daemon = subprocess.Popen(
-            [RA_JIT, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
+            [BLAZE, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
              "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols], stderr=out, stdout=out)
         while "watching" not in open(log_path).read()[seen:]:
             if daemon.poll() is not None:
@@ -290,7 +290,7 @@ def main():
         if ops and isinstance(ops[0], str):
             ops = ops[0]
         if ops == "meanwhile":
-            # A build for one client (`cargo ra-jit build`, after a program was told to restart)
+            # A build for one client (`blaze build`, after a program was told to restart)
             # and an editor's edits come together: the edit waits for the build, and is not told
             # that no program is built (issue #32).
             path = os.path.join(ws, BASE)
@@ -301,7 +301,7 @@ def main():
             text = text.replace("wrapping_mul(7)", "wrapping_mul(9)", 1)
             if hasattr(unix, "AF_UNIX"):
                 seen = len(open(log_path).read())
-                other = subprocess.Popen([RA_JIT, "sync", socket], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                other = subprocess.Popen([BLAZE, "sync", socket], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 began = time.time()
                 while not re.search(r"^request: sync[^\n]*\n(?:.*\n)*?change: ", open(log_path).read()[seen:], re.M):
                     assert time.time() - began < 60, f"{name}: the daemon did not take the build"
@@ -340,10 +340,10 @@ def main():
                     os.remove(path)
         if os.environ.get("BLAZE_PATCH_FIRST"):
             # The edit is first built for a request that does not link.
-            subprocess.run([RA_JIT, "patch", socket], capture_output=True, text=True, timeout=120)
+            subprocess.run([BLAZE, "patch", socket], capture_output=True, text=True, timeout=120)
         asked = time.time()
         try:
-            asked_for = subprocess.run([RA_JIT, "sync", socket], capture_output=True, text=True, timeout=120)
+            asked_for = subprocess.run([BLAZE, "sync", socket], capture_output=True, text=True, timeout=120)
             reply = asked_for.stdout.strip() or asked_for.stderr.strip().removeprefix("Error: daemon: ")
         except subprocess.TimeoutExpired:
             reply = "no reply in 120 s"

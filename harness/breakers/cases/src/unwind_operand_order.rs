@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-s2-23-c24.rs`): the order of drops when
 //! an operand of an array, a tuple or a call panics. The operands already made belong to the
 //! expression they are operands of, and a `&temporary` made on the way lives to the end of
-//! the statement, so rustc drops the operands first. ra-jit dropped the first operand last,
+//! the statement, so rustc drops the operands first. blaze dropped the first operand last,
 //! after the temporaries that were made later than it.
 //!
 //! Found later (`fuzz/found/differs-checksum-L8-231-c11.rs`): where the expression ends its

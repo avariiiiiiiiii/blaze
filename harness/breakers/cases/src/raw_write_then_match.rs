@@ -1,6 +1,6 @@
 //! tests/ui/drop/issue-90752-raw-ptr-shenanigans.rs: a local known to be `None` is written
 //! through a raw pointer and then partly moved out of in a `match`. rustc's drop elaboration
-//! does not see the write, so the part that is not moved is leaked; ra-jit dropped it.
+//! does not see the write, so the part that is not moved is leaked; blaze dropped it.
 
 use std::cell::RefCell;
 

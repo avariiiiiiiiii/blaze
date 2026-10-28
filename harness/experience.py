@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""experience.py: what a new user sees, step by step, on real projects: `cargo blaze build`,
+"""experience.py: what a new user sees, step by step, on real projects: `blaze build`,
 the same again, `run`, `test`, `check`, an edit and its build and run, `status` and `stop`,
 each beside plain `cargo` on a copy of the same project, with what each step printed.
 
@@ -11,18 +11,18 @@ each beside plain `cargo` on a copy of the same project, with what each step pri
     python3 experience.py --update ...             # write what each step printed as experience/<project>.txt
     python3 experience.py --list
 
-It is a user's view: it runs `cargo blaze` from `PATH`, sets no `BLAZE_*`
+It is a user's view: it runs `blaze` from `PATH`, sets no `BLAZE_*`
 variable, and reads nothing but what the commands print and leave behind. A step fails the
 run when it is a rough edge a user would trip on:
 
   - a command that exits other than as cargo's does (cargo exits 0 where blaze does not);
-  - `ra-jit` in anything printed (the program is blaze);
+  - `blaze` in anything printed (the program is blaze);
   - a line that is not cargo's, the program's or the compiler's own, unless the project's
     transcript in `experience/` has it (a new message is looked at before it is accepted);
   - a build slower than cargo's of the same step, by more than `SLACK` (cold, no-op, edit);
   - a second no-op build that prints other than the first;
   - an edit whose run does not print the edited output;
-  - a blaze process left after `cargo blaze stop`.
+  - a blaze process left after `blaze stop`.
 
 What each step printed, with times, paths and hashes taken out and cargo's own progress lines
 (`Compiling`, `Downloaded`, ...) left out, has to be the project's `experience/<project>.txt`
@@ -281,7 +281,7 @@ class Step:
 
 
 def plain_cargo(env):
-    """The cargo blaze is compared with, and its environment: the user's, else, on a machine
+    """The blaze is compared with, and its environment: the user's, else, on a machine
     with no Rust, the one blaze downloaded, with its toolchain first on PATH so that it finds
     its rustc."""
     users = shutil.which("cargo", path=env["PATH"])
@@ -335,7 +335,7 @@ def blaze_processes():
     for line in out.splitlines():
         pid, _, command = line.strip().partition(" ")
         program = os.path.basename(command.split(" ", 1)[0]) if command else ""
-        if re.fullmatch(r"(cargo-)?(blaze|ra-jit)(-[\w-]+)?", program):
+        if re.fullmatch(r"(cargo-)?(blaze|blaze)(-[\w-]+)?", program):
             left.append(f"{pid} {command[:160]}")
     return left
 
@@ -349,9 +349,7 @@ def flow(name, spec, work, env):
         shutil.rmtree(d, ignore_errors=True)
         fetch(spec, d, env)
     steps, rough = [], []
-    # Where cargo is installed `cargo blaze` is the command; on a machine with no Rust, `blaze`.
-    users_cargo = shutil.which("cargo", path=env["PATH"])
-    front = ["cargo", "blaze"] if users_cargo else ["blaze"]
+    front = ["blaze"]
 
     def blaze(step, *args, **kw):
         s = Step(step, [*front, *args], blaze_dir, env, **kw)
@@ -405,7 +403,7 @@ def flow(name, spec, work, env):
     time.sleep(1)
     left = blaze_processes()
     if left:
-        rough.append(("stop", "blaze processes left after `cargo blaze stop`: " + "; ".join(left), "P1"))
+        rough.append(("stop", "blaze processes left after `blaze stop`: " + "; ".join(left), "P1"))
 
     where = [(blaze_dir, "$PROJECT"), (os.path.realpath(blaze_dir), "$PROJECT"), (env["HOME"], "$HOME")]
     if pairs and pairs[0][1].code != 0:
@@ -423,8 +421,8 @@ def flow(name, spec, work, env):
             rough.append((s.name, f"exit {s.code}", "P0"))
         for line in (s.out + s.err).splitlines():
             # Directories keep the old name (#270); a word of what it says does not.
-            if re.search(r"(?<![/\w.-])ra-jit(?![/\w-])", line):
-                rough.append((s.name, f"says ra-jit: {line.strip()}", "P2"))
+            if re.search(r"(?<![/\w.-])blaze(?![/\w-])", line):
+                rough.append((s.name, f"says blaze: {line.strip()}", "P2"))
     for ours, theirs in pairs:
         compiled = lambda step: sorted(l.split()[1] for l in step.err.splitlines() if l.strip().startswith("Compiling "))
         if compiled(ours) and not compiled(theirs) and ours.code == 0:

@@ -24,8 +24,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/ahash-0.8.11",
       "error": null,
       "ms": 20,
-      "program": "/root/bsw/work/target/nushell/debug/build/ahash/f2535d15da14ca71/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/ahash/f2535d15da14ca71/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/ahash/f2535d15da14ca71/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/ahash/f2535d15da14ca71/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -160,8 +160,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.94",
       "error": null,
       "ms": 3243,
-      "program": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -172,8 +172,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.94",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/anyhow/b98b6cc6ce97fe73/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -233,8 +233,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.3.3",
       "error": null,
       "ms": 10,
-      "program": "/root/bsw/work/target/nushell/debug/build/aws-types/2bfafc4d1525b762/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/aws-types/2bfafc4d1525b762/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/aws-types/2bfafc4d1525b762/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/aws-types/2bfafc4d1525b762/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -272,13 +272,13 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/bigdecimal-0.4.8",
       "error": null,
       "ms": 19,
-      "program": "/root/bsw/work/target/nushell/debug/build/bigdecimal/4218b245e9a0438f/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/bigdecimal/4218b245e9a0438f/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/bigdecimal/4218b245e9a0438f/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/bigdecimal/4218b245e9a0438f/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x3456bf - build_script_build.wasm!abort\n    1: 0x327a5e - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2f539b - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x2b7684 - build_script_build.wasm!__rust_abort\n    4: 0x2b764e - build_script_build.wasm!__rust_start_panic\n    5: 0x2fa52d - build_script_build.wasm!rust_panic\n    6: 0x2f98f4 - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x127fac - build_script_build.wasm!ra-jit::{closure}::6245\n    8:  0xc69b0 - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x285c0c - build_script_build.wasm!panic_impl\n   10: 0x221732 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x2a989e - build_script_build.wasm!ra-jit.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x6a31 - build_script_build.wasm!ra-jit::unwrap_failed::43\n   13:   0x227d - build_script_build.wasm!ra-jit::unwrap::6\n   14:  0x58501 - build_script_build.wasm!ra-jit.e4f48cd97c08dfcb.autocfg[e4f48cd97c08dfcb]::new\n   15:  0x57fed - build_script_build.wasm!ra-jit.d1b5625a42d7e250.build_script_build[d1b5625a42d7e250]::main\n   16:  0x1c638 - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n187\n   17:  0x1c50a - build_script_build.wasm!ra_jit::{closure}::n186\n   18: 0x1f45c6 - build_script_build.wasm!ra-jit::do_call::12179\n   19: 0x1dbbba - build_script_build.wasm!ra-jit::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x3456bf - build_script_build.wasm!abort\n    1: 0x327a5e - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2f539b - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x2b7684 - build_script_build.wasm!__rust_abort\n    4: 0x2b764e - build_script_build.wasm!__rust_start_panic\n    5: 0x2fa52d - build_script_build.wasm!rust_panic\n    6: 0x2f98f4 - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x127fac - build_script_build.wasm!blaze::{closure}::6245\n    8:  0xc69b0 - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x285c0c - build_script_build.wasm!panic_impl\n   10: 0x221732 - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x2a989e - build_script_build.wasm!blaze.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x6a31 - build_script_build.wasm!blaze::unwrap_failed::43\n   13:   0x227d - build_script_build.wasm!blaze::unwrap::6\n   14:  0x58501 - build_script_build.wasm!blaze.e4f48cd97c08dfcb.autocfg[e4f48cd97c08dfcb]::new\n   15:  0x57fed - build_script_build.wasm!blaze.d1b5625a42d7e250.build_script_build[d1b5625a42d7e250]::main\n   16:  0x1c638 - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n187\n   17:  0x1c50a - build_script_build.wasm!blaze::{closure}::n186\n   18: 0x1f45c6 - build_script_build.wasm!blaze::do_call::12179\n   19: 0x1dbbba - build_script_build.wasm!blaze::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "rustc": 1
     }
@@ -705,8 +705,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7",
       "error": null,
       "ms": 25,
-      "program": "/root/bsw/work/target/nushell/debug/build/generic-array/aec7c3e0ffa874a0/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/generic-array/aec7c3e0ffa874a0/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/generic-array/aec7c3e0ffa874a0/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/generic-array/aec7c3e0ffa874a0/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -782,7 +782,7 @@
    "result": {
     "status": 1,
     "tools": [],
-    "trap": "error while executing at wasm backtrace:\n    0: 0xa293b1 - build_script_build.wasm!abort\n    1: 0xa0aaf6 - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x9e7444 - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x9a972d - build_script_build.wasm!__rust_abort\n    4: 0x9a96f7 - build_script_build.wasm!__rust_start_panic\n    5: 0x9ec5d6 - build_script_build.wasm!rust_panic\n    6: 0x9eb99d - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x8839cd - build_script_build.wasm!ra-jit::{closure}::6245\n    8: 0x82cbe9 - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x976873 - build_script_build.wasm!panic_impl\n   10: 0x91044a - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x99adf8 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:  0x145a2 - build_script_build.wasm!ra_jit::unwrap_failed::n173\n   13:   0x56a5 - build_script_build.wasm!ra-jit::unwrap::8\n   14: 0x49206e - build_script_build.wasm!ra-jit.82f31143b289bfe4.build_script_build[82f31143b289bfe4]::main\n   15:  0x143c5 - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n171\n   16:  0x14297 - build_script_build.wasm!ra_jit::{closure}::n170\n   17: 0x9012dd - build_script_build.wasm!ra-jit::do_call::12179\n   18: 0x8f90c2 - build_script_build.wasm!ra-jit::catch_unwind::11616\n   19: 0x8ed37e - build_script_build.wasm!ra-jit::catch_unwind::10908\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0xa293b1 - build_script_build.wasm!abort\n    1: 0xa0aaf6 - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x9e7444 - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x9a972d - build_script_build.wasm!__rust_abort\n    4: 0x9a96f7 - build_script_build.wasm!__rust_start_panic\n    5: 0x9ec5d6 - build_script_build.wasm!rust_panic\n    6: 0x9eb99d - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x8839cd - build_script_build.wasm!blaze::{closure}::6245\n    8: 0x82cbe9 - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x976873 - build_script_build.wasm!panic_impl\n   10: 0x91044a - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x99adf8 - build_script_build.wasm!blaze.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:  0x145a2 - build_script_build.wasm!blaze::unwrap_failed::n173\n   13:   0x56a5 - build_script_build.wasm!blaze::unwrap::8\n   14: 0x49206e - build_script_build.wasm!blaze.82f31143b289bfe4.build_script_build[82f31143b289bfe4]::main\n   15:  0x143c5 - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n171\n   16:  0x14297 - build_script_build.wasm!blaze::{closure}::n170\n   17: 0x9012dd - build_script_build.wasm!blaze::do_call::12179\n   18: 0x8f90c2 - build_script_build.wasm!blaze::catch_unwind::11616\n   19: 0x8ed37e - build_script_build.wasm!blaze::catch_unwind::10908\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {}
    },
    "wasi_stderr": "\nthread 'main' (1) panicked at /root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/html5ever-0.27.0/build.rs:36:10:\ncalled `Result::unwrap()` on an `Err` value: Os { code: 58, kind: Unsupported, message: \"Not supported\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
@@ -817,8 +817,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/httparse-1.9.5",
       "error": null,
       "ms": 8,
-      "program": "/root/bsw/work/target/nushell/debug/build/httparse/fb6507c0848d1d5b/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/httparse/fb6507c0848d1d5b/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/httparse/fb6507c0848d1d5b/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/httparse/fb6507c0848d1d5b/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -855,8 +855,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.174",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/libc/5f9dbcbd8cd9709f/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/libc/5f9dbcbd8cd9709f/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/libc/5f9dbcbd8cd9709f/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/libc/5f9dbcbd8cd9709f/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -908,8 +908,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.174",
       "error": null,
       "ms": 23,
-      "program": "/root/bsw/work/target/nushell/debug/build/libc/dbd042cd85b5c7e8/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/libc/dbd042cd85b5c7e8/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/libc/dbd042cd85b5c7e8/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/libc/dbd042cd85b5c7e8/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -1221,7 +1221,7 @@
       "status": null
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x699404 - build_script_build.wasm!abort\n    1: 0x66272b - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x61cb19 - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x5dee02 - build_script_build.wasm!__rust_abort\n    4: 0x5dedcc - build_script_build.wasm!__rust_start_panic\n    5: 0x621cab - build_script_build.wasm!rust_panic\n    6: 0x621072 - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x3a90c3 - build_script_build.wasm!ra-jit::{closure}::6245\n    8: 0x3241d2 - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x5a4512 - build_script_build.wasm!panic_impl\n   10: 0x52ca4a - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x64d4ac - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::paths::unsupported::split_paths\n   12:   0x75f8 - build_script_build.wasm!ra_jit::split_paths::n32\n   13: 0x1f3b50 - build_script_build.wasm!ra-jit.93ad881bc69ad91d.build_script_build[93ad881bc69ad91d]::main\n   14: 0x19050a - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n3566\n   15: 0x1903dc - build_script_build.wasm!ra_jit::{closure}::n3565\n   16: 0x4e2e93 - build_script_build.wasm!ra-jit::do_call::12179\n   17: 0x4bb75b - build_script_build.wasm!ra-jit::catch_unwind::11616\n   18: 0x494480 - build_script_build.wasm!ra-jit::catch_unwind::10908\n   19: 0x465f81 - build_script_build.wasm!ra-jit::{closure}::9978\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x699404 - build_script_build.wasm!abort\n    1: 0x66272b - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x61cb19 - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x5dee02 - build_script_build.wasm!__rust_abort\n    4: 0x5dedcc - build_script_build.wasm!__rust_start_panic\n    5: 0x621cab - build_script_build.wasm!rust_panic\n    6: 0x621072 - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x3a90c3 - build_script_build.wasm!blaze::{closure}::6245\n    8: 0x3241d2 - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x5a4512 - build_script_build.wasm!panic_impl\n   10: 0x52ca4a - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x64d4ac - build_script_build.wasm!blaze.5502588822008fc7.std::sys::paths::unsupported::split_paths\n   12:   0x75f8 - build_script_build.wasm!blaze::split_paths::n32\n   13: 0x1f3b50 - build_script_build.wasm!blaze.93ad881bc69ad91d.build_script_build[93ad881bc69ad91d]::main\n   14: 0x19050a - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n3566\n   15: 0x1903dc - build_script_build.wasm!blaze::{closure}::n3565\n   16: 0x4e2e93 - build_script_build.wasm!blaze::do_call::12179\n   17: 0x4bb75b - build_script_build.wasm!blaze::catch_unwind::11616\n   18: 0x494480 - build_script_build.wasm!blaze::catch_unwind::10908\n   19: 0x465f81 - build_script_build.wasm!blaze::{closure}::9978\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "git": 1
     }
@@ -1387,13 +1387,13 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/lock_api-0.4.12",
       "error": null,
       "ms": 28,
-      "program": "/root/bsw/work/target/nushell/debug/build/lock_api/a7c085a04b20c8eb/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/lock_api/a7c085a04b20c8eb/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/lock_api/a7c085a04b20c8eb/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/lock_api/a7c085a04b20c8eb/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x30b458 - build_script_build.wasm!abort\n    1: 0x2ee08f - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2bf0bb - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x2813a4 - build_script_build.wasm!__rust_abort\n    4: 0x28136e - build_script_build.wasm!__rust_start_panic\n    5: 0x2c424d - build_script_build.wasm!rust_panic\n    6: 0x2c3614 - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10635e - build_script_build.wasm!ra-jit::{closure}::6245\n    8:  0xaa267 - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x25088c - build_script_build.wasm!panic_impl\n   10: 0x1f32ed - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x2735be - build_script_build.wasm!ra-jit.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x35d5 - build_script_build.wasm!ra-jit::unwrap_failed::10\n   13:   0x1c84 - build_script_build.wasm!ra-jit::unwrap::2\n   14:  0x47107 - build_script_build.wasm!ra-jit.e4f48cd97c08dfcb.autocfg[e4f48cd97c08dfcb]::new\n   15:  0x46f14 - build_script_build.wasm!ra-jit.b137b0e47c8d294.build_script_build[b137b0e47c8d294]::main\n   16:   0x55e7 - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n40\n   17:   0x54b9 - build_script_build.wasm!ra_jit::{closure}::n39\n   18: 0x1c66e2 - build_script_build.wasm!ra-jit::do_call::12179\n   19: 0x1ae781 - build_script_build.wasm!ra-jit::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x30b458 - build_script_build.wasm!abort\n    1: 0x2ee08f - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2bf0bb - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x2813a4 - build_script_build.wasm!__rust_abort\n    4: 0x28136e - build_script_build.wasm!__rust_start_panic\n    5: 0x2c424d - build_script_build.wasm!rust_panic\n    6: 0x2c3614 - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10635e - build_script_build.wasm!blaze::{closure}::6245\n    8:  0xaa267 - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x25088c - build_script_build.wasm!panic_impl\n   10: 0x1f32ed - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x2735be - build_script_build.wasm!blaze.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x35d5 - build_script_build.wasm!blaze::unwrap_failed::10\n   13:   0x1c84 - build_script_build.wasm!blaze::unwrap::2\n   14:  0x47107 - build_script_build.wasm!blaze.e4f48cd97c08dfcb.autocfg[e4f48cd97c08dfcb]::new\n   15:  0x46f14 - build_script_build.wasm!blaze.b137b0e47c8d294.build_script_build[b137b0e47c8d294]::main\n   16:   0x55e7 - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n40\n   17:   0x54b9 - build_script_build.wasm!blaze::{closure}::n39\n   18: 0x1c66e2 - build_script_build.wasm!blaze::do_call::12179\n   19: 0x1ae781 - build_script_build.wasm!blaze::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "rustc": 1
     }
@@ -1908,13 +1908,13 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/num-traits-0.2.19",
       "error": null,
       "ms": 30,
-      "program": "/root/bsw/work/target/nushell/debug/build/num-traits/7a5ea19f8e20d525/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/num-traits/7a5ea19f8e20d525/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/num-traits/7a5ea19f8e20d525/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/num-traits/7a5ea19f8e20d525/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x30b4fb - build_script_build.wasm!abort\n    1: 0x2ee132 - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2bf15e - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x281447 - build_script_build.wasm!__rust_abort\n    4: 0x281411 - build_script_build.wasm!__rust_start_panic\n    5: 0x2c42f0 - build_script_build.wasm!rust_panic\n    6: 0x2c36b7 - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10668e - build_script_build.wasm!ra-jit::{closure}::6245\n    8:  0xaa597 - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x2509ea - build_script_build.wasm!panic_impl\n   10: 0x1f3534 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x273661 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:  0x1ba81 - build_script_build.wasm!ra_jit::unwrap_failed::n287\n   13:   0x1c8d - build_script_build.wasm!ra_jit::unwrap::n2\n   14:  0x47332 - build_script_build.wasm!ra-jit.e4f48cd97c08dfcb.autocfg[e4f48cd97c08dfcb]::new\n   15:  0x4710f - build_script_build.wasm!ra-jit.e8d0093088c022b3.build_script_build[e8d0093088c022b3]::main\n   16:  0x1c344 - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n300\n   17:  0x1c216 - build_script_build.wasm!ra_jit::{closure}::n299\n   18: 0x1c6a12 - build_script_build.wasm!ra-jit::do_call::12179\n   19: 0x1aeab1 - build_script_build.wasm!ra-jit::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x30b4fb - build_script_build.wasm!abort\n    1: 0x2ee132 - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2bf15e - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x281447 - build_script_build.wasm!__rust_abort\n    4: 0x281411 - build_script_build.wasm!__rust_start_panic\n    5: 0x2c42f0 - build_script_build.wasm!rust_panic\n    6: 0x2c36b7 - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10668e - build_script_build.wasm!blaze::{closure}::6245\n    8:  0xaa597 - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x2509ea - build_script_build.wasm!panic_impl\n   10: 0x1f3534 - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x273661 - build_script_build.wasm!blaze.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:  0x1ba81 - build_script_build.wasm!blaze::unwrap_failed::n287\n   13:   0x1c8d - build_script_build.wasm!blaze::unwrap::n2\n   14:  0x47332 - build_script_build.wasm!blaze.e4f48cd97c08dfcb.autocfg[e4f48cd97c08dfcb]::new\n   15:  0x4710f - build_script_build.wasm!blaze.e8d0093088c022b3.build_script_build[e8d0093088c022b3]::main\n   16:  0x1c344 - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n300\n   17:  0x1c216 - build_script_build.wasm!blaze::{closure}::n299\n   18: 0x1c6a12 - build_script_build.wasm!blaze::do_call::12179\n   19: 0x1aeab1 - build_script_build.wasm!blaze::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "rustc": 1
     }
@@ -1944,7 +1944,7 @@
    "out_dir": "/root/bsw/work/target/nushell/debug/build/oem_cp/c9554c0490cff1c3/out",
    "real": "/root/bsw/work/target/nushell/debug/build/oem_cp/9aa33f2ba4cf510b/out/build_script_build.real",
    "result": {
-    "error": "ra-jit did not build the build script of `oem_cp` for wasm32-wasip1: ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::parse_code_tables: unsupported: callee `from_reader`: callee `from_trait`: unsupported: call to `<build_script_build[6778d072fa07d132]::parse_code_tables::JsonCodeTables as serde_core[da3e8cdd540d5cd8]::de::Deserialize>::deserialize::<&mut serde_json[1da225c67443a43c]::de::Deserializer<serde_json[1da225c67443a43c]::read::IoRead<alloc::io::buffered::bufreader::BufReader<std::fs::File>>>>`: no impl of the trait was selected for it",
+    "error": "blaze did not build the build script of `oem_cp` for wasm32-wasip1: blaze did not build it (exit status: 1): Error: `build_script_build` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::parse_code_tables: unsupported: callee `from_reader`: callee `from_trait`: unsupported: call to `<build_script_build[6778d072fa07d132]::parse_code_tables::JsonCodeTables as serde_core[da3e8cdd540d5cd8]::de::Deserialize>::deserialize::<&mut serde_json[1da225c67443a43c]::de::Deserializer<serde_json[1da225c67443a43c]::read::IoRead<alloc::io::buffered::bufreader::BufReader<std::fs::File>>>>`: no impl of the trait was selected for it",
     "tools": [],
     "tools_by_program": {}
    },
@@ -2110,8 +2110,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/paste-1.0.15",
       "error": null,
       "ms": 27,
-      "program": "/root/bsw/work/target/nushell/debug/build/paste/929065cc40e17db1/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/paste/929065cc40e17db1/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/paste/929065cc40e17db1/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/paste/929065cc40e17db1/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2149,8 +2149,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-0.51.0",
       "error": null,
       "ms": 57,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars/eac80a110bc751f5/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars/eac80a110bc751f5/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars/eac80a110bc751f5/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars/eac80a110bc751f5/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2188,8 +2188,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-arrow-0.51.0",
       "error": null,
       "ms": 33,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-arrow/578243b6e78e0d9c/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-arrow/578243b6e78e0d9c/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-arrow/578243b6e78e0d9c/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-arrow/578243b6e78e0d9c/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2227,8 +2227,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-compute-0.51.0",
       "error": null,
       "ms": 11,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-compute/63f84ffb0ba2db4e/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-compute/63f84ffb0ba2db4e/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-compute/63f84ffb0ba2db4e/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-compute/63f84ffb0ba2db4e/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2266,8 +2266,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.51.0",
       "error": null,
       "ms": 30,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-core/89117bc44e3978f7/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-core/89117bc44e3978f7/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-core/89117bc44e3978f7/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-core/89117bc44e3978f7/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2305,8 +2305,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-lazy-0.51.0",
       "error": null,
       "ms": 10,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-lazy/5349a4c80ed99891/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-lazy/5349a4c80ed99891/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-lazy/5349a4c80ed99891/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-lazy/5349a4c80ed99891/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2344,8 +2344,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-ops-0.51.0",
       "error": null,
       "ms": 63,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-ops/1a1fe77c2a7e13b2/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-ops/1a1fe77c2a7e13b2/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-ops/1a1fe77c2a7e13b2/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-ops/1a1fe77c2a7e13b2/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2383,8 +2383,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-plan-0.51.0",
       "error": null,
       "ms": 40,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-plan/50b168a1ff76b236/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-plan/50b168a1ff76b236/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-plan/50b168a1ff76b236/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-plan/50b168a1ff76b236/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2422,8 +2422,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-schema-0.51.0",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-schema/f8cc10be07762db5/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-schema/f8cc10be07762db5/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-schema/f8cc10be07762db5/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-schema/f8cc10be07762db5/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2461,8 +2461,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-stream-0.51.0",
       "error": null,
       "ms": 36,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-stream/4fe0ffc8a244d968/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-stream/4fe0ffc8a244d968/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-stream/4fe0ffc8a244d968/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-stream/4fe0ffc8a244d968/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2500,8 +2500,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/polars-utils-0.51.0",
       "error": null,
       "ms": 24,
-      "program": "/root/bsw/work/target/nushell/debug/build/polars-utils/1fbbae813c79b1d3/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/polars-utils/1fbbae813c79b1d3/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/polars-utils/1fbbae813c79b1d3/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/polars-utils/1fbbae813c79b1d3/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2538,8 +2538,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/portable-atomic-1.10.0",
       "error": null,
       "ms": 15,
-      "program": "/root/bsw/work/target/nushell/debug/build/portable-atomic/52d5e141aed8a0b0/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/portable-atomic/52d5e141aed8a0b0/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/portable-atomic/52d5e141aed8a0b0/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/portable-atomic/52d5e141aed8a0b0/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2576,8 +2576,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.92",
       "error": null,
       "ms": 18,
-      "program": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -2594,8 +2594,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.92",
       "error": null,
       "ms": 3476,
-      "program": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/proc-macro2/53397272230cd346/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2770,8 +2770,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.23",
       "error": null,
       "ms": 8,
-      "program": "/root/bsw/work/target/nushell/debug/build/ref-cast/3e078f290a2807c3/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/ref-cast/3e078f290a2807c3/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/ref-cast/3e078f290a2807c3/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/ref-cast/3e078f290a2807c3/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2918,8 +2918,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rstest_macros-0.23.0",
       "error": null,
       "ms": 85,
-      "program": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -2930,8 +2930,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rstest_macros-0.23.0",
       "error": null,
       "ms": 11,
-      "program": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/rstest_macros/f4170a87d87b1e90/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2997,8 +2997,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.0.7",
       "error": null,
       "ms": 3453,
-      "program": "/root/bsw/work/target/nushell/debug/build/rustix/4abde1409a8578ef/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/rustix/4abde1409a8578ef/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/rustix/4abde1409a8578ef/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/rustix/4abde1409a8578ef/blaze-rustc/rustc",
       "refused": null,
       "status": 1
      }
@@ -3041,8 +3041,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-0.38.42",
       "error": null,
       "ms": 3593,
-      "program": "/root/bsw/work/target/nushell/debug/build/rustix/fdd93f8ad7832549/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/rustix/fdd93f8ad7832549/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/rustix/fdd93f8ad7832549/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/rustix/fdd93f8ad7832549/blaze-rustc/rustc",
       "refused": null,
       "status": 1
      }
@@ -3125,8 +3125,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustversion-1.0.18",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/rustversion/48245f0e39a261d2/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/rustversion/48245f0e39a261d2/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/rustversion/48245f0e39a261d2/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/rustversion/48245f0e39a261d2/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3188,8 +3188,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/semver-1.0.23",
       "error": null,
       "ms": 67,
-      "program": "/root/bsw/work/target/nushell/debug/build/semver/9eece83253b0ad9a/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/semver/9eece83253b0ad9a/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/semver/9eece83253b0ad9a/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/semver/9eece83253b0ad9a/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3226,8 +3226,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.225",
       "error": null,
       "ms": 33,
-      "program": "/root/bsw/work/target/nushell/debug/build/serde/3158b3c72d7e2ce0/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/serde/3158b3c72d7e2ce0/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/serde/3158b3c72d7e2ce0/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/serde/3158b3c72d7e2ce0/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3264,8 +3264,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.225",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/serde/45ba3827fb602b86/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/serde/45ba3827fb602b86/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/serde/45ba3827fb602b86/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/serde/45ba3827fb602b86/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3302,8 +3302,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.225",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/serde_core/088ba3416faa6131/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/serde_core/088ba3416faa6131/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/serde_core/088ba3416faa6131/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/serde_core/088ba3416faa6131/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3340,8 +3340,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.225",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/serde_core/1bd4b77c44cc66ab/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/serde_core/1bd4b77c44cc66ab/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/serde_core/1bd4b77c44cc66ab/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/serde_core/1bd4b77c44cc66ab/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3448,8 +3448,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/slab-0.4.9",
       "error": null,
       "ms": 10,
-      "program": "/root/bsw/work/target/nushell/debug/build/slab/3b3cb352809e8c6c/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/slab/3b3cb352809e8c6c/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/slab/3b3cb352809e8c6c/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/slab/3b3cb352809e8c6c/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3491,8 +3491,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/slotmap-1.0.7",
       "error": null,
       "ms": 27,
-      "program": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -3504,8 +3504,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/slotmap-1.0.7",
       "error": null,
       "ms": 21,
-      "program": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -3517,8 +3517,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/slotmap-1.0.7",
       "error": null,
       "ms": 18,
-      "program": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/slotmap/11ee3e0f37f52bbb/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3601,8 +3601,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/syn-1.0.109",
       "error": null,
       "ms": 24,
-      "program": "/root/bsw/work/target/nushell/debug/build/syn/da0e600a3e6bc52c/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/syn/da0e600a3e6bc52c/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/syn/da0e600a3e6bc52c/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/syn/da0e600a3e6bc52c/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3668,8 +3668,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-1.0.69",
       "error": null,
       "ms": 3201,
-      "program": "/root/bsw/work/target/nushell/debug/build/thiserror/7f80e853096c2a04/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/thiserror/7f80e853096c2a04/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/thiserror/7f80e853096c2a04/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/thiserror/7f80e853096c2a04/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3712,8 +3712,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.12",
       "error": null,
       "ms": 3528,
-      "program": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -3724,8 +3724,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.12",
       "error": null,
       "ms": 10,
-      "program": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/thiserror/ba59ae928a4a47d2/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3785,8 +3785,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/typeid-1.0.2",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/nushell/debug/build/typeid/08cc686b8677fab8/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/typeid/08cc686b8677fab8/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/typeid/08cc686b8677fab8/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/typeid/08cc686b8677fab8/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -3924,8 +3924,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zerocopy-0.8.23",
       "error": null,
       "ms": 50,
-      "program": "/root/bsw/work/target/nushell/debug/build/zerocopy/ce8db76673675356/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/nushell/debug/build/zerocopy/ce8db76673675356/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/nushell/debug/build/zerocopy/ce8db76673675356/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/nushell/debug/build/zerocopy/ce8db76673675356/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }

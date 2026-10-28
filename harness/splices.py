@@ -18,7 +18,7 @@ import os, re, shlex, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, BINUTILS, toolchain, WINDOWS, TARGET, TARGET_ARGS, built, WASM, host
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, BINUTILS, toolchain, WINDOWS, TARGET, TARGET_ARGS, built, WASM, host
 
 # How many of the steps are spliced, by target: the rest link in full for the reasons printed,
 # or not at all where nothing was edited, and one more of them is a splice that got worse. A
@@ -462,25 +462,25 @@ def ported(text):
 
 
 def main():
-    ws = tempfile.mkdtemp(prefix="ra-jit-splices-")
+    ws = tempfile.mkdtemp(prefix="blaze-splices-")
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", TOML), (MAIN, ported(MAIN_TEXT) + (INLINE if WASM else ""))):
         open(os.path.join(ws, path), "w").write(text)
-    work = tempfile.mkdtemp(prefix="ra-jit-splices-out-")
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = tempfile.mkdtemp(prefix="blaze-splices-out-")
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     reference = os.path.join(work, "reference")
     fx = Fixture(ws, ["sedge"], ["-p", "sedge"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sedge.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
-    link = linkline.with_output(linkline.ahead(link, [patch, obj], RA_JIT), binary)
+    link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
     if os.environ.get("SPLICES_NO_PIE"):
         link = [a for a in link if a != "-pie"] + ["-no-pie"]
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     splice = ["--binary", binary]
     ask = ["--crate", "sedge", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols]
     out = open(log_path, "a")
-    daemon = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
+    daemon = subprocess.Popen([BLAZE, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -495,7 +495,7 @@ def main():
 
     def sync():
         seen = len(open(log_path).read())
-        reply = subprocess.run([RA_JIT, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
+        reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
         links = re.findall(r"^link: \S+ \((.*)\)$", open(log_path).read()[seen:], re.M)
         how = "no link" if not links else "spliced" if links[-1].startswith("spliced") else \
             "full: " + (re.search(r"not spliced: (.*)", links[-1]) or [None, "not asked to splice"])[1]

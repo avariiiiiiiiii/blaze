@@ -5,11 +5,11 @@ A daemon fills a store and ends. Then, many times over, one file of the store is
 bit flipped, the file cut short, bytes added to it, part of it zeroed or the whole file
 replaced) while no daemon runs or under a daemon that has already read it. Each time:
 
-  - `ra-jit cache verify` has to say so when a sealed pack was damaged;
+  - `blaze-engine cache verify` has to say so when a sealed pack was damaged;
   - a daemon on the store has to build a program that prints what cargo's does, for a state
     of the workspace whose code was in the damaged store;
   - the daemon has to say it removed the pack;
-  - `ra-jit cache verify` has to find nothing wrong afterwards.
+  - `blaze-engine cache verify` has to find nothing wrong afterwards.
 
 Then the same for a store that says it is of an older format, of none, and of a newer one.
 
@@ -173,13 +173,13 @@ def open_pack(checkout, store, round):
 
 
 def formats(checkout, store):
-    """A store that says it is of another format than this ra-jit writes."""
+    """A store that says it is of another format than this blaze writes."""
     version = os.path.join(store, "version")
     fill(checkout, store)
     current = open(version).read()
 
-    for text, name in [("ra-jit store 1\n", "an older format"), ("", "an empty version"),
-                       ("ra-jit store two\n", "a version that is no number"), (None, "no version at all")]:
+    for text, name in [("blaze store 1\n", "an older format"), ("", "an empty version"),
+                       ("blaze store two\n", "a version that is no number"), (None, "no version at all")]:
         fill(checkout, store)
         os.remove(version) if text is None else open(version, "w").write(text)
         before = set(files(store, ".pack"))
@@ -198,7 +198,7 @@ def formats(checkout, store):
         clean(store, name)
 
     packs = fill(checkout, store)
-    open(version, "w").write("ra-jit store 999\n")
+    open(version, "w").write("blaze store 999\n")
     before = sorted(os.listdir(store))
     daemon = Daemon(checkout, store, env=SEALS)
     checkout.set(RNG.randrange(100, 10**6))
@@ -219,7 +219,7 @@ def formats(checkout, store):
 
 def main():
     start = time.time()
-    work = scratch("ra-jit-storecorrupts-")
+    work = scratch("blaze-storecorrupts-")
     store = os.path.join(work, "store")
     checkout = Checkout(work)
     counts = {"with no daemon": 0, "under a daemon": 0, "an open pack": 0}

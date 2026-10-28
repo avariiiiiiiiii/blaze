@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-from difftest import Fixture, RA_JIT, sysroot_rlibs
+from difftest import Fixture, BLAZE, sysroot_rlibs
 
 
 def load(path):
@@ -64,7 +64,7 @@ def main():
     log = os.path.join(fx.work, "shapes.tsv")
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     args = [x for name in crates for x in ("--crate", name)]
-    subprocess.run([RA_JIT, fx.ws, *args, "--out", os.path.join(fx.work, "ra-jit.o"), *symbols],
+    subprocess.run([BLAZE, fx.ws, *args, "--out", os.path.join(fx.work, "blaze.o"), *symbols],
                    env={**os.environ, "BLAZE_SHAPES": log}, check=True, capture_output=True)
     origins, codes = load(log)
     total = len(codes)

@@ -1,6 +1,6 @@
 //! tests/ui/abi/variadic-ffi.rs: a `VaList` handed to a C function goes by its address, as
 //! C's `va_list` does where it is an array, though Rust has it by value. `core` marks the
-//! struct `#[rustc_pass_indirectly_in_non_rustic_abis]` for that, which ra-jit did not read: it
+//! struct `#[rustc_pass_indirectly_in_non_rustic_abis]` for that, which blaze did not read: it
 //! copied the list onto the stack, and the C function read its second register as the address.
 
 use std::ffi::{c_char, c_int, CStr, VaList};

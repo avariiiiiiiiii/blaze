@@ -1,4 +1,4 @@
-# Caching proc-macro expansions: rustc's derive cache and what ra-jit keeps
+# Caching proc-macro expansions: rustc's derive cache and what blaze keeps
 
 2026-10-21. For issue #38 (Glancer item 3, [docs/glancer.md](../glancer.md)). Sources under
 [docs/upstream/proc-macro-cache/](../upstream/proc-macro-cache/).
@@ -27,7 +27,7 @@
   macros are pure, and cargo has the same question for caching their dependents (Exa
   excerpt).
 
-## ra-jit
+## blaze
 
 - **read** rust-analyzer expands through its proc-macro server, which is the toolchain's
   `rust-analyzer-proc-macro-srv` here. A request carries the input token trees with spans as
@@ -39,10 +39,10 @@
   ranges inside that string, the call site's anchor and its context. A first version that
   refused outputs with spans not in the input's table kept none of 61 expansions.
 - **read** (measured, same test) The toolchain's server answers no question of a macro
-  during an expansion: `Span::source_text` returns `None` under ra-jit where rustc returns
+  during an expansion: `Span::source_text` returns `None` under blaze where rustc returns
   the text, and the callback counter saw no request. A macro that relies on it expands
   otherwise than under rustc; that is not the cache's doing.
-- **unverified** ra-jit's key covers what a macro can read without asking: every span's
+- **unverified** blaze's key covers what a macro can read without asking: every span's
   byte range within the item it is anchored to, and which of the call's anchors and contexts
   it has, numbered as they first appear. A macro that reads files or the environment by
   itself is outside what any key can see, as in rustc; the skip list and

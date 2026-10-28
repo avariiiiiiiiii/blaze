@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runs the scenarios of one project under `cargo ra-jit` (or plain cargo after `ra-jit
+"""Runs the scenarios of one project under `blaze` (or plain cargo after `blaze
 enable`) with a toolchain whose rustc, rustdoc and cargo log every run (wrap.sh), and writes
 where each step began and ended, how it ended, and what it printed, for classify.py.
 
@@ -72,14 +72,14 @@ def main():
                BLAZE_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
     if base == "bun":
         env["BLAZE_OTHER_TOOLCHAIN"] = "1"
-    # A release ships the standard library its builds start from (crates/ra-jit/src/shipped.rs):
-    # made here by the ra-jit under test as the release workflow makes it, from the toolchain
+    # A release ships the standard library its builds start from (crates/blaze-engine/src/shipped.rs):
+    # made here by the blaze under test as the release workflow makes it, from the toolchain
     # the builds use, and fetched by the first build. NR_STD=build has the builds make it.
     if os.environ.get("NR_STD") != "build":
         toolchain = f"{L}/tc-pin"
         shipped = f"{L}/std-remote"
         # What the toolchain runs for it is the release's, not the build's: counted apart.
-        subprocess.run(["ra-jit", "std", shipped, toolchain], env=dict(env, NR_LOG=f"{L}/logs/std.log"), check=True)
+        subprocess.run(["blaze-engine", "std", shipped, toolchain], env=dict(env, NR_LOG=f"{L}/logs/std.log"), check=True)
         env["BLAZE_STD_FROM"] = shipped
     extra = json.loads(os.environ.get("NR_ENV", "{}"))
     env.update(extra)
@@ -101,7 +101,7 @@ def main():
     def ready(limit=1800):
         began = time.time()
         while time.time() - began < limit:
-            out = subprocess.run(["ra-jit", "cargo", "status"], cwd=ws, env=env, capture_output=True, text=True).stdout
+            out = subprocess.run(["blaze-engine", "cargo", "status"], cwd=ws, env=env, capture_output=True, text=True).stdout
             if ": ready" in out:
                 return out
             time.sleep(2)
@@ -136,7 +136,7 @@ def main():
 
     if plain:
         cargo = ["cargo"]
-        subprocess.run(["ra-jit", "enable"], cwd=ws, env=env, check=True)
+        subprocess.run(["blaze-engine", "enable"], cwd=ws, env=env, check=True)
         step("cold", cargo + ["build", *build])
         step("noop", cargo + ["build", *build])
         time.sleep(30)  # the daemon loads the build that rustc did once cargo exits
@@ -148,16 +148,16 @@ def main():
         step("test-edit", cargo + ["test", "--no-run", *(test or [])], edits=[(opening_file, opening, opening + "\n    let _nr_t = 3u32;")])
         step("doctest", cargo + ["test", "--doc", *(test or [])])
         step("check", cargo + ["check"])
-        subprocess.run(["ra-jit", "disable"], cwd=ws, env=env)
+        subprocess.run(["blaze-engine", "disable"], cwd=ws, env=env)
     elif base == "bun":
         crate = ["-p", "bun_collections"]
-        step("cold", ["cargo", "ra-jit", "test", "--no-run", *crate], wait_ready=True)
-        step("noop", ["cargo", "ra-jit", "test", "--no-run", *crate])
-        step("generic", ["cargo", "ra-jit", "test", "--no-run", *crate], edits=edits["generic"])
-        step("generic2", ["cargo", "ra-jit", "test", "--no-run", *crate],
+        step("cold", ["blaze", "test", "--no-run", *crate], wait_ready=True)
+        step("noop", ["blaze", "test", "--no-run", *crate])
+        step("generic", ["blaze", "test", "--no-run", *crate], edits=edits["generic"])
+        step("generic2", ["blaze", "test", "--no-run", *crate],
              edits=[(edits["generic"][0][0], edits["generic"][0][1], edits["generic"][0][1] + "\n        let _nr_again = 2u32;")])
     else:
-        cr = ["cargo", "ra-jit"]
+        cr = ["blaze"]
         step("cold", cr + ["build", *build], wait_ready=True)
         step("noop", cr + ["build", *build])
         step("body", cr + ["build", *build], edits=edits["body"])
@@ -177,7 +177,7 @@ def main():
             step("doctest", cr + ["test", "--doc", *test])
             step("doctest2", cr + ["test", "--doc", *test])
         step("check", cr + ["check", *build])
-    subprocess.run(["ra-jit", "cargo", "stop"], cwd=ws, env=env)
+    subprocess.run(["blaze-engine", "cargo", "stop"], cwd=ws, env=env)
     print("DONE", name, flush=True)
 
 

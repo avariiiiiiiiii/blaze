@@ -7,7 +7,7 @@ inference or an estimate). What was fetched and measured is in
 [upstream/roadmap/](upstream/roadmap/SOURCE.md). The umbrella issue is
 [#279](https://github.com/indexable-inc/blaze/issues/279).
 
-blaze is ra-jit's new name; code paths below are still `ra-jit` where the rename has not reached
+blaze is blaze's new name; code paths below are still `blaze` where the rename has not reached
 them.
 
 ## Short version
@@ -53,7 +53,7 @@ results, and lints run in the same pipeline, per function.
   committer for each new revision, since a front-end memo is about 8 ns of work and a message
   costs more than that ([below](#the-concurrency-model)).
 - **No MCP.** The agent API is one versioned schema in deterministic CBOR over a Unix domain
-  socket and HTTP; `cargo blaze` is a client of it and den wraps it as hub tools. One value has
+  socket and HTTP; `blaze` is a client of it and den wraps it as hub tools. One value has
   one encoding, so requests and results can be hashed and stored like everything else.
 - **Delivery.** One integration branch, `blaze-next`, with one draft pull request, workstreams
   merged into it and main merged in often; it lands when the full gate and every differential
@@ -222,10 +222,10 @@ mapped (**unverified** until built).
   from `FileId` (an interned path) to bytes with a change log that salsa drains; no versions, no
   roots, no hashes; IO and watching are a separate `loader::Handle`. It stays as the front end's
   file table, fed from the Merkle VFS, until the front end reads nodes directly.
-- **ra-jit's own** (**read**, `tree.rs`, `main.rs`): every watched file's mtime is stat-ed in a
+- **blaze's own** (**read**, `tree.rs`, `main.rs`): every watched file's mtime is stat-ed in a
   loop with 20 ms sleeps until a pass finds nothing new; `tree.rs` lists directories whose mtime
   moved; an `edit\t` request carries one file's whole text (`Request::Edit`); `content.rs` names
-  crates by content so checkouts share crates. The heap profile's "ra-jit's own (vfs, symbol
+  crates by content so checkouts share crates. The heap profile's "blaze's own (vfs, symbol
   table, splice)" is 988 MB on nushell (**read**, lean-frontend.md); how much of it is file text
   was not measured (**unverified**: the source is 15 MB, so most of it is the symbol table and
   the splice's image).
@@ -442,7 +442,7 @@ full for a reason of size ([architecture.md](architecture.md)); a body edit stil
 refuse and link, 14 ms of it the link (**read**).
 
 - **On the edit path, nothing is linked.** The patch's code is placed and its references resolved
-  by the patch planner (sans-IO), written into the running program by ra-jit-live where one runs,
+  by the patch planner (sans-IO), written into the running program by blaze-live where one runs,
   and appended to the executable behind the reply, so the reply does not wait for the file.
 - **A patchable table**, as Relax keeps one: each function that has been patched is reached through
   a slot; the entry jump the splice writes today is one such slot. Generations of patches are kept,
@@ -513,7 +513,7 @@ like a Unix socket or HTTP."
   fixes as `ops` an agent can pass to `apply`; tests with outcome, duration, the reason a test was
   skipped (unchanged reach, #227) and output only for failures; run results with exit status and a
   bounded tail; timings per stage.
-- **Clients.** `cargo blaze` becomes a thin client of the same socket. den wraps the API as hub
+- **Clients.** `blaze` becomes a thin client of the same socket. den wraps the API as hub
   tools on its side (`blaze_apply`, `blaze_check`, `blaze_test`, `blaze_what_if`), the way its
   `lsp_*` tools wrap language servers. No MCP server anywhere.
 - **The number that counts** is edit tool call to structured result, measured end to end by a
@@ -526,7 +526,7 @@ like a Unix socket or HTTP."
 [#278](https://github.com/indexable-inc/blaze/issues/278), P3. Andrew: "something LIKE clippy in
 this too."
 
-- **clippy can't be run**: it is a rustc driver, and blaze never runs rustc. `cargo ra-jit clippy`
+- **clippy can't be run**: it is a rustc driver, and blaze never runs rustc. `blaze clippy`
   passes through to cargo today ([no-rustc.md](no-rustc.md)), which is one more such path.
 - **Lints run in blaze's pipeline**, on its HIR, types and MIR, as part of the check, per function:
   an edit re-lints only the items the push reached, and the result is memoized like any other.
@@ -537,7 +537,7 @@ this too."
   syntax tree, and 20 lint files use MIR (**read**): almost all of it maps onto rust-analyzer's
   HIR and types, which already carry 80 diagnostic handlers in `ide-diagnostics` (**read**).
 - **Parity**: a differential harness runs clippy and blaze on real crates (the bench set, then
-  crates.io's top crates) and compares each lint's spans and messages, as `cargo ra-jit check` was
+  crates.io's top crates) and compares each lint's spans and messages, as `blaze check` was
   compared field by field with rustc (#222). Lint config is honored as clippy's: `clippy.toml`,
   `#[allow]`/`#[warn]`/`#[deny]`/`#[expect]` of `clippy::...` and its groups, `-A/-W/-D` on the
   command line, `[lints.clippy]` in `Cargo.toml`.
@@ -563,7 +563,7 @@ this too."
 - **The image is the memory.** What a restart needs is mapped, so resident memory is what the
   current roots touch.
 - **Budgets, nushell** (worker after the base build: 5.8 GB sampled heap, 7.5 GB resident,
-  **read**): salsa's records 1.3 GB to under 0.3 GB through the item-level graph; "ra-jit's own"
+  **read**): salsa's records 1.3 GB to under 0.3 GB through the item-level graph; "blaze's own"
   988 MB measured apart and halved (**unverified** what it holds); a second agent's head under
   10% of the first's. Targets, **unverified**, each checked by `heap.py` as the workstream lands.
 
@@ -585,7 +585,7 @@ The order inside the branch, by what the floor needs and what depends on what:
 | 2 | the daemon takes transactions (socket and CLI), disk watching becomes one input producing them, builds pin roots | 1 | every edit harness passes with the watcher as the only input; notice to apply under 1 ms on the socket path |
 | 3 | invalidation driven by root diffs: changed items from the diff, the push layer in front of salsa | 2 | a body edit's revalidation share from 38% to under 5%; a signature edit's instances asked from 106k to its callers |
 | 3b | the compute plane: revisions as immutable snapshots, a work-stealing scheduler over per-item tasks with one committer, per-worker interning, the deterministic scheduler | 3 | beats rayon on the same tasks; the deterministic run's hashes equal the parallel run's; lock and queue time on an edit under 5% |
-| 4 | the agent API: check, build, test, run and what-if on a root, structured results; `cargo blaze` a client | 2 | edit-to-result end to end on nushell; best-of-4 candidates in under twice one |
+| 4 | the agent API: check, build, test, run and what-if on a root, structured results; `blaze` a client | 2 | edit-to-result end to end on nushell; best-of-4 candidates in under twice one |
 | 5 | diagnostics off the critical path with rollback; the patch path without a link on the reply | 3 | build-rest from 35-76 ms to 0; refuse-and-link from 28 ms to under 3 |
 | 6 | the image: graph, VFS arena, code index, marks by stable name | 3 | nushell warm restart under 1 s; no rebuild before the first edit |
 | 7 | the io_uring backend | 1 | faster than threads on a cold fork's start on the same host, or not the default |

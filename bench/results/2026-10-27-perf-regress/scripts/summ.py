@@ -8,7 +8,7 @@ for path in sys.argv[1:]:
         p = r["phases"]
         g = lambda k: p.get(k, {}).get("wall_s")
         cold = p.get("cold", {})
-        mem = cold.get("memory", {}).get("ra-jit", {}).get("peak_mb")
+        mem = cold.get("memory", {}).get("blaze", {}).get("peak_mb")
         roots = p.get("body", {}).get("steps_ms", {}).get("roots")
         print(f"{d.get('commit','?')[:10]} {name}: noop={g('no-op')} body={g('body')} sig={g('signature')} "
               f"leaf={g('leaf')} generic={g('generic')} cold={g('cold')} std_made={cold.get('std_made_s')} "

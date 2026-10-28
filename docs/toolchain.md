@@ -28,7 +28,7 @@ the standard library is part of a compiler.
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, `rust-std` (the host's, and `wasm32-wasip1`'s,
   which proc macros are built for) and `rust-src`, unchanged, from
   static.rust-lang.org, each checked against the sha256 compiled into blaze
-  (`crates/ra-jit/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
+  (`crates/blaze-engine/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
   when rustup already has it with `rust-src` (the same bytes). The installer downloads it once;
@@ -60,7 +60,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    what a bump needs beyond the gate: the corpus difftest with `--layouts` and every other
    harness on four platforms, rustc's borrow-check UI tests in both modes against the new
    nightly's own verdicts (at its commit, `--min-pass` as the floor) and
-   `cargo ra-jit` on real projects.
+   `blaze` on real projects.
 4. When the train finishes, `harness/stdcount.py` compiles the standard library with the bump's
    build and with `toolchain/base`'s (the same main commit, the old pin), each against its own
    nightly's `rust-src`, and counts the functions each refuses. Against main's newest build
@@ -72,7 +72,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
      acts on auto-merge only when a check finishes after it is set, so the gate's `ci` job runs
      again (seconds). A merge made for GITHUB_TOKEN starts no workflow, so once it merges the
      verdict dispatches on main every workflow a push to main starts (`train.yaml`,
-     `ra-jit.yaml`, ...). A job red on main too is listed and not
+     `blaze.yaml`, ...). A job red on main too is listed and not
      counted against the bump; the train's own issue covers it.
    - **red on the first attempt**: the train's failed jobs run again (`gh run rerun --failed`),
      and the verdict of that attempt decides, so a harness that fails one run in ten does not

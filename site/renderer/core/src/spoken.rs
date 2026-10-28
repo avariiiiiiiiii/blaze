@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(say_code("Rc<T>"), "Rc of T");
         assert_eq!(say_code("!Forget"), "not Forget");
         assert_eq!(say_code("/ Fs"), "slash Fs");
-        assert_eq!(say_code("#[ra_jit::cache]"), "ra jit cache");
+        assert_eq!(say_code("#[blaze::cache]"), "blaze cache");
         assert_eq!(say_code("build|run"), "build or run");
         assert_eq!(say_code("thread::scope(|s| ...)"), "thread scope");
         assert_eq!(sayable("the the cache"), "the cache.");

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""borrowck_apps.py: `ra-jit borrowck --project` over the applications of apps/apps.json.
+"""borrowck_apps.py: `blaze-engine borrowck --project` over the applications of apps/apps.json.
 
-usage: borrowck_apps.py [NAME...] [--bin ra-jit] [--apps-dir dir] [--jobs N] [--json out.json]
+usage: borrowck_apps.py [NAME...] [--bin blaze-engine] [--apps-dir dir] [--jobs N] [--json out.json]
 
 Every application there is code rustc accepts, so each borrow-check error the checker reports
 in one is a false one, and a file it panics on has none of its errors reported. Each app is
 cloned at its `rev` (or taken from `apps/<source>`), given what `cargo metadata` needs that the
 clone lacks (its `prepare` module's `sources`), checked, and its errors and panics printed by
-app; `ra-jit borrowck --project` refuses a workspace `cargo metadata` fails on. Exits 1 when any app has one, or could not be checked.
+app; `blaze-engine borrowck --project` refuses a workspace `cargo metadata` fails on. Exits 1 when any app has one, or could not be checked.
 """
 import argparse, asyncio, collections, importlib, json, os, sys, time
 from typing import Any
@@ -83,7 +83,7 @@ async def check(name, spec, args, gate) -> dict[str, Any]:
                   "summary": lines[-1] if lines and "files" in lines[-1] else None,
                   "secs": round(time.monotonic() - began)}
         if result["summary"] is None:
-            result["failed"] = f"`ra-jit borrowck --project` exited {code} with no summary: {err[-800:]}"
+            result["failed"] = f"`blaze-engine borrowck --project` exited {code} with no summary: {err[-800:]}"
         print(f"{name}: {len(result['errors'])} errors, {len(result['panics'])} panics"
               f"{', FAILED' if 'failed' in result else ''} ({result['secs']}s)", file=sys.stderr, flush=True)
         return result
@@ -92,7 +92,7 @@ async def check(name, spec, args, gate) -> dict[str, Any]:
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
-    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "blaze-engine"))
     ap.add_argument("--apps-dir", default=os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps"))
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=3600)

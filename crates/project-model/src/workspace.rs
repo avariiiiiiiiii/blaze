@@ -1991,7 +1991,7 @@ fn sysroot_to_crate_graph(
 /// The cfgs the build scripts of the standard library's `compiler_builtins` and `libc` set for
 /// the target of `rustc_cfg`, as their `build.rs` (and `libm/configure.rs`) compute them with
 /// nothing in the environment, for the library rustc ships: optimized, not on libc's CI.
-/// Targets no backend of ra-jit's has (32-bit ARM, Thumb) are left as on any other.
+/// Targets no backend of blaze's has (32-bit ARM, Thumb) are left as on any other.
 fn build_script_cfgs(rustc_cfg: &[CfgAtom]) -> Vec<(&'static str, Vec<CfgAtom>)> {
     let value = |key: &str| {
         rustc_cfg.iter().find_map(|atom| match atom {

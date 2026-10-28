@@ -4,7 +4,7 @@
 usage: cratetest.py <crate-dir> [--crate <name>] [--features a,b] [--skip <test>]... [--bisect]
                     [--json out.json]
 
-Each `tests/*.rs` target is built by cargo, then relinked with ra-jit's objects for the crate in
+Each `tests/*.rs` target is built by cargo, then relinked with blaze's objects for the crate in
 front of rustc's rlib. Both binaries must report the same result for every test.
 A crate whose tests print something else in every run of rustc's own binary is UNSTABLE, not a
 mismatch.
@@ -22,14 +22,14 @@ class TestFixture(Fixture):
             # The crate itself, built with `cfg(test)`: its `#[cfg(test)]` modules are the tests.
             super().__init__(crate_dir, [crate], ["--lib", "--profile", "test"],
                              touch=path)
-            self.ra_jit_args = ["--cfg-test"]
+            self.blaze_args = ["--cfg-test"]
         else:
             # By its file: an example may have the name of the test.
             super().__init__(crate_dir, [crate, os.path.abspath(path)], ["--test", test], touch=path)
-            self.ra_jit_args = ["--dev-deps"]
+            self.blaze_args = ["--dev-deps"]
         if features:
             self.target_args += ["--features", features]
-            self.ra_jit_args += ["--features", features]
+            self.blaze_args += ["--features", features]
         # A test left out by name: `--exact` keeps a name from leaving out the ones it starts.
         self.skips = ["--exact", *(x for name in skip for x in ("--skip", name))] if skip else []
         self.run_args = ["--test-threads=1", *self.skips]
@@ -38,7 +38,7 @@ class TestFixture(Fixture):
     def rustc_build(self):
         super().rustc_build()
         # A test that names nothing of the crate is linked without it: there is nothing of the
-        # crate in the binary for ra-jit to stand in front of.
+        # crate in the binary for blaze to stand in front of.
         # The standard library's own copy of a crate of the same name (hashbrown) is not it.
         linked = any(os.path.basename(r).startswith(f"lib{self.crates[0]}-") and "/rustlib/" not in r
                      for r in self.rlibs)
@@ -49,19 +49,19 @@ class TestFixture(Fixture):
     def binary_path(self):
         # Beside cargo's: a test may look for the crate's other artifacts from where it runs
         # (autocfg probes the rlibs in the directory of `current_exe`).
-        return self.reference + "-ra-jit"
+        return self.reference + "-blaze"
 
-    def ra_jit_build(self, deny=()):
+    def blaze_build(self, deny=()):
         # The crate's objects are the same whichever test binary they are linked into.
-        # ra-jit links to what the rlibs already hold, so that only goes for the same rlibs.
+        # blaze links to what the rlibs already hold, so that only goes for the same rlibs.
         key = tuple(self.rlibs)
         if deny or key not in self.shared:
-            super().ra_jit_build(deny)
+            super().blaze_build(deny)
             if self.leaves_to_rustc():
                 # rustc lays a future out its own way, so what the test leaves to rustc decides
-                # what of the crate can be ra-jit's: one run has to see both.
+                # what of the crate can be blaze's: one run has to see both.
                 self.crates = [",".join(self.crates)]
-                super().ra_jit_build(deny)
+                super().blaze_build(deny)
             if not deny:
                 self.shared[key] = (self.objects, self.reports)
         else:
@@ -74,7 +74,7 @@ class TestFixture(Fixture):
         return any(r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function" for r in rows)
 
     def normalize(self, stdout):
-        # A test that prints the path it runs from prints the name ra-jit's binary has.
+        # A test that prints the path it runs from prints the name blaze's binary has.
         stdout = stdout.replace(os.fsencode(self.binary_path()), os.fsencode(self.reference))
         stdout = re.sub(rb"' \(\d+\) panicked", b"' panicked", stdout)
         return re.sub(rb"finished in [0-9.]+s", b"finished", stdout)
@@ -93,7 +93,7 @@ def differing_tests(fx):
         if want[:2] != got[:2]:
             tail = got[2].decode(errors="replace").strip().splitlines()[-3:]
             differing.append(name)
-            print(f"  DIFFERS {name}: rustc status {want[0]}, ra-jit status {got[0]}: {' | '.join(tail)[:300]}")
+            print(f"  DIFFERS {name}: rustc status {want[0]}, blaze status {got[0]}: {' | '.join(tail)[:300]}")
     fx.run_args = ["--test-threads=1", *fx.skips]
     return differing
 
@@ -132,7 +132,7 @@ def main():
             result = compare(fx, test, a.bisect)
         except SystemExit as e:
             # One test target that does not build or link must not hide the others.
-            # ra-jit sees the crate with its default features, so only those are tested.
+            # blaze sees the crate with its default features, so only those are tested.
             if "requires the features" in str(e):
                 print("left out: needs features that are off by default")
                 left_out.append({"test": test, "why": "needs features"})
@@ -149,7 +149,7 @@ def main():
             continue
         if not result["match"]:
             # Tests that print a port, a random number or what a timeout made of the run
-            # differ between two runs of rustc's binary too, which says nothing of ra-jit.
+            # differ between two runs of rustc's binary too, which says nothing of blaze.
             runs = [fx.behaviour(fx.reference) for _ in range(3)]
             if any(run != runs[0] for run in runs):
                 result["unstable"] = True
@@ -164,7 +164,7 @@ def main():
               "crates": results[0]["crates"] if results else {},
               "binaries": results, "left_out": left_out,
               "culprits": [c for r in results for c in r.get("culprits", [])]}
-    # A crate ra_jit compiled nothing of matches rustc by construction, which is no result.
+    # A crate blaze compiled nothing of matches rustc by construction, which is no result.
     untested = ok and not sum(c["compiled"] for r in results for c in r["crates"].values())
     unstable = not ok and all(r["match"] or r.get("unstable") for r in results)
     if unstable:
@@ -172,7 +172,7 @@ def main():
         print(f"UNSTABLE: {len(results)} test binaries, {total} tests, rustc's differ from run to run")
     elif untested:
         merged["untested"] = True
-        print(f"UNTESTED: {len(results)} test binaries, {total} tests, no function from ra-jit")
+        print(f"UNTESTED: {len(results)} test binaries, {total} tests, no function from blaze")
     else:
         print(f"{'MATCH' if ok else 'MISMATCH'}: {len(results)} test binaries, {total} tests")
     if a.json:

@@ -1,7 +1,7 @@
 // Found by fuzz.py: seed A1-17, case c23, edition 2021, backend llvm.
 // differs: died
 // Reduced in 45 builds. Again: fuzz.py check differs-died-A1-17-c23.rs
-// ra-jit's program ended with status -11 in this case
+// blaze's program ended with status -11 in this case
 // panic: panicked at src/main.rs:488:13:
 // held 268566528
 // qemu: uncaught target signal 11 (Segmentation fault) - core dumped

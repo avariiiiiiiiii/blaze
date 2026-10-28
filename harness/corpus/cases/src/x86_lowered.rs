@@ -1,4 +1,4 @@
-//! What `core::arch`'s F16C and AVX512-BF16 functions do, done here so that ra-jit compiles it:
+//! What `core::arch`'s F16C and AVX512-BF16 functions do, done here so that blaze compiles it:
 //! the `simd_cast` of lanes of f16 `_mm_cvtph_ps` and `_mm256_cvtph_ps` make, and the LLVM
 //! intrinsics `avx512bf16.rs` declares, with its types.
 

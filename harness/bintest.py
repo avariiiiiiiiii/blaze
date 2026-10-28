@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Differential test of a program: the same command lines given to cargo's binary and ra-jit's.
+"""Differential test of a program: the same command lines given to cargo's binary and blaze's.
 
 usage: bintest.py <name> [--json out.json]
 
 <name> is an entry of breakers/bins.json: the checkout (BINS_DIR/<name>, cloned from `repo` when
-missing), the package whose binary is linked, the workspace crates ra-jit compiles, the command
+missing), the package whose binary is linked, the workspace crates blaze compiles, the command
 lines and the patterns of output that differs from run to run (`scrub`). Each command line runs in the checkout; stdout, stderr and exit status must match.
 """
 import argparse, json, os, re, subprocess, sys, time
@@ -60,7 +60,7 @@ def main():
         want, got = fx.behaviour(fx.reference), fx.behaviour(fx.binary)
         if want != got:
             differing.append(" ".join(run))
-            status = f"rustc status {want[0]}, ra-jit status {got[0]}"
+            status = f"rustc status {want[0]}, blaze status {got[0]}"
             tail = got[2].decode(errors="replace").strip().splitlines()[-2:]
             print(f"  DIFFERS `{' '.join(run)}`: {status}: {symptom(want, got)} {' | '.join(tail)[:300]}")
     result.update(match=not differing, differing_tests=differing, tests_run=len(runs))

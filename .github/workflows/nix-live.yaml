@@ -1,5 +1,5 @@
 # What is new since the fork: the flake (per-unit nix builds of the daemon and the demo), the
-# unit graphs behind them, the Game of Life demo, and live edits (ra-jit-live). A cold build of
+# unit graphs behind them, the Game of Life demo, and live edits (blaze-live). A cold build of
 # the flake takes up to two hours, so they run on every push to main in a workflow of their own,
 # not in the release train: the train's run would stay open until they ended, and main's next
 # train waits for it. A pull request that changes the flake, nix/ or the dependencies (which the
@@ -12,7 +12,7 @@
 #   nix           `nix build` of the daemon, the demo and the per-unit builds, and the flake's apps
 #   nix (darwin)  the flake evaluates and builds its cheapest outputs on aarch64-darwin
 #   demo          demo/life builds and its window opens (xvfb) and stays up
-#   live edits    macOS arm64: edit a running program's function, ra-jit-live applies the patch
+#   live edits    macOS arm64: edit a running program's function, blaze-live applies the patch
 #
 # The nix store is cached in the GitHub Actions cache. FlakeHub Cache needs an organization
 # `indexable-inc` on FlakeHub, which does not exist, and `id-token: write` on the jobs.
@@ -81,12 +81,11 @@ jobs:
         run: |
           nix run .#blaze -- --help
           nix run .#blaze -- --version || true
-          nix run .#ra-jit -- --version || true
       - name: the binaries run each other from next to themselves
         run: |
           for attr in daemon daemon-units; do
             out=$(nix build --no-link --print-out-paths .#$attr)
-            for bin in cargo-blaze ra-jit cargo-ra-jit ra-jit-rustc ra-jit-rustc-first; do test -x "$out/bin/$bin"; done
+            for bin in blaze blaze-engine blaze-rustc; do test -x "$out/bin/$bin"; done
           done
 
   nix-darwin:
@@ -110,7 +109,7 @@ jobs:
         run: nix build --print-build-logs --no-link .#daemon-units .#run
 
   demo:
-    name: demo/life and ra-jit-live (linux)
+    name: demo/life and blaze-live (linux)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -122,8 +121,8 @@ jobs:
           workspaces: |
             . -> target
             demo/life -> target
-      # ra-jit-live is a stub where live edits are not supported, and says so.
-      - run: cargo test --release -p ra-jit-live
+      # blaze-live is a stub where live edits are not supported, and says so.
+      - run: cargo test --release -p blaze-live
       - run: cargo build --locked
         working-directory: demo/life
       - name: window opens and stays up
@@ -151,15 +150,15 @@ jobs:
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
       - uses: Swatinem/rust-cache@v2
       # Where it is real code: the whole of macos.rs and the patch format.
-      - run: cargo test --release -p ra-jit-live
-      - run: cargo build --release -p ra-jit
+      - run: cargo test --release -p blaze-live
+      - run: cargo build --release -p blaze-engine
       - name: edit a running program
-        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_e2e.py
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_e2e.py
       - name: crash reports
         if: failure()
         run: |
           for report in "$HOME"/Library/Logs/DiagnosticReports/*; do
-            case "$report" in *ra-jit*|*liveprobe*) echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::";; esac
+            case "$report" in *blaze*|*liveprobe*) echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::";; esac
           done
       - name: the demo builds on macOS
         run: cargo build --locked

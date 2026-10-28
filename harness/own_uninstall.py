@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""own_uninstall.py: `cargo blaze uninstall` against `cargo uninstall`. cargo is the oracle; blaze
+"""own_uninstall.py: `blaze uninstall` against `cargo uninstall`. cargo is the oracle; blaze
 never runs it outside this harness.
 
 usage: own_uninstall.py [--blaze BIN] [--out FILE]
 
 Three made-up packages (one with two programs, one with one, one with an example only) are
 installed by `cargo install --path` into an install root, once. Each case copies that root
-twice, runs `cargo uninstall ARGS` in one and `BIN cargo uninstall ARGS` (BIN: `ra-jit`,
-default `target/release/ra-jit`) in the other, and compares the exit status, standard output
+twice, runs `cargo uninstall ARGS` in one and `BIN cargo uninstall ARGS` (BIN: `blaze`,
+default `target/release/blaze-engine`) in the other, and compares the exit status, standard output
 and error (with the roots named alike), the files left and the bytes of `.crates.toml` and
 `.crates2.json`. A case may first change the root, as an older cargo or a lost file would.
 """
@@ -77,7 +77,7 @@ def state(root):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     opts = ap.parse_args()
     work = tempfile.mkdtemp(prefix="own-uninstall-")
@@ -99,7 +99,7 @@ def main():
     for name, args, where, first, by_env in CASES:
         roots = {}
         outs = {}
-        for who in ("cargo", "blaze"):
+        for who in ("blaze"):
             root = os.path.join(work, f"{who}-root")
             shutil.rmtree(root, ignore_errors=True)
             shutil.copytree(base, root, symlinks=True)

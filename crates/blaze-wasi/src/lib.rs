@@ -1,8 +1,8 @@
 //! Build scripts compiled for wasm32-wasip1 and run under Wasmtime, an experiment beside the
 //! native sandbox (docs/cargo.md, "Build scripts under WASI").
 //!
-//! - [`STD_PROCESS`] is blaze's `std::process` for such a script: the standard library ra-jit
-//!   compiles for it (`ra-jit --run-tool`) has it in place of
+//! - [`STD_PROCESS`] is blaze's `std::process` for such a script: the standard library blaze
+//!   compiles for it (`blaze --run-tool`) has it in place of
 //!   `library/std/src/sys/process/unsupported.rs`, and its commands go to the host through the
 //!   import `blaze.run_tool`.
 //! - [`Request`] and [`Response`] are what that import is given and answers, as

@@ -3924,7 +3924,7 @@
        "round": 0,
        "key": 10,
        "asked after": true,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=116"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=116"
       },
       {
        "round": 0,
@@ -3936,7 +3936,7 @@
        "round": 0,
        "key": 54,
        "asked after": true,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=94"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=94"
       },
       {
        "round": 0,
@@ -3948,7 +3948,7 @@
        "round": 0,
        "key": 59,
        "asked after": true,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=88"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=88"
       },
       {
        "round": 0,
@@ -3966,19 +3966,19 @@
        "round": 0,
        "key": 2,
        "ms": 150.912,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=149"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=149"
       },
       {
        "round": 0,
        "key": 5,
        "ms": 8.564,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=7"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=7"
       },
       {
        "round": 0,
        "key": 6,
        "ms": 13.269,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=12"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=12"
       },
       {
        "round": 0,
@@ -3996,7 +3996,7 @@
        "round": 0,
        "key": 9,
        "ms": 123.25,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=122"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=122"
       },
       {
        "round": 0,
@@ -4014,13 +4014,13 @@
        "round": 0,
        "key": 13,
        "ms": 104.047,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=103"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=103"
       },
       {
        "round": 0,
        "key": 14,
        "ms": 12.919,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=6"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=6"
       },
       {
        "round": 0,
@@ -4038,13 +4038,13 @@
        "round": 0,
        "key": 17,
        "ms": 106.251,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=105"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=105"
       },
       {
        "round": 0,
        "key": 18,
        "ms": 8.017,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 0,
@@ -4062,13 +4062,13 @@
        "round": 0,
        "key": 21,
        "ms": 123.794,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=122"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=122"
       },
       {
        "round": 0,
        "key": 22,
        "ms": 10.842,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=5"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=5"
       },
       {
        "round": 0,
@@ -4200,13 +4200,13 @@
        "round": 0,
        "key": 44,
        "ms": 82.556,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=81"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=81"
       },
       {
        "round": 0,
        "key": 45,
        "ms": 19.851,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=13"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=13"
       },
       {
        "round": 0,
@@ -4242,7 +4242,7 @@
        "round": 0,
        "key": 51,
        "ms": 174.533,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=173"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=173"
       },
       {
        "round": 0,
@@ -4260,7 +4260,7 @@
        "round": 0,
        "key": 55,
        "ms": 111.562,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=110"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=110"
       },
       {
        "round": 0,
@@ -4278,7 +4278,7 @@
        "round": 0,
        "key": 58,
        "ms": 123.643,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=122"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=122"
       },
       {
        "round": 0,
@@ -4296,13 +4296,13 @@
        "round": 0,
        "key": 62,
        "ms": 126.776,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=125"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=125"
       },
       {
        "round": 0,
        "key": 63,
        "ms": 7.313,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 0,
@@ -4314,13 +4314,13 @@
        "round": 0,
        "key": 65,
        "ms": 106.931,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=105"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=105"
       },
       {
        "round": 0,
        "key": 66,
        "ms": 9.16,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 0,
@@ -4338,7 +4338,7 @@
        "round": 0,
        "key": 69,
        "ms": 111.185,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=110"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=110"
       },
       {
        "round": 0,
@@ -4374,19 +4374,19 @@
        "round": 0,
        "key": 75,
        "ms": 124.609,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=123"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=123"
       },
       {
        "round": 0,
        "key": 76,
        "ms": 35.9,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=30"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=30"
       },
       {
        "round": 0,
        "key": 77,
        "ms": 9.479,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=7"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=7"
       },
       {
        "round": 0,
@@ -4404,13 +4404,13 @@
        "round": 0,
        "key": 80,
        "ms": 103.383,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=102"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=102"
       },
       {
        "round": 0,
        "key": 81,
        "ms": 9.224,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 1,
@@ -4422,13 +4422,13 @@
        "round": 1,
        "key": 55,
        "asked after": true,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=114"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=114"
       },
       {
        "round": 1,
        "key": 59,
        "asked after": true,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=23"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=23"
       },
       {
        "round": 1,
@@ -4446,13 +4446,13 @@
        "round": 1,
        "key": 2,
        "ms": 85.399,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=84"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=84"
       },
       {
        "round": 1,
        "key": 3,
        "ms": 4.847,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
       },
       {
        "round": 1,
@@ -4464,13 +4464,13 @@
        "round": 1,
        "key": 5,
        "ms": 84.05,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=82"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=82"
       },
       {
        "round": 1,
        "key": 6,
        "ms": 5.427,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
       },
       {
        "round": 1,
@@ -4488,13 +4488,13 @@
        "round": 1,
        "key": 9,
        "ms": 83.886,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=82"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=82"
       },
       {
        "round": 1,
        "key": 10,
        "ms": 5.605,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
       },
       {
        "round": 1,
@@ -4512,13 +4512,13 @@
        "round": 1,
        "key": 13,
        "ms": 114.723,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=113"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=113"
       },
       {
        "round": 1,
        "key": 14,
        "ms": 7.673,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 1,
@@ -4536,13 +4536,13 @@
        "round": 1,
        "key": 17,
        "ms": 85.844,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=84"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=84"
       },
       {
        "round": 1,
        "key": 18,
        "ms": 6.27,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
       },
       {
        "round": 1,
@@ -4560,13 +4560,13 @@
        "round": 1,
        "key": 21,
        "ms": 82.241,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=81"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=81"
       },
       {
        "round": 1,
        "key": 22,
        "ms": 6.626,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=3"
       },
       {
        "round": 1,
@@ -4698,13 +4698,13 @@
        "round": 1,
        "key": 44,
        "ms": 81.366,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=80"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=80"
       },
       {
        "round": 1,
        "key": 45,
        "ms": 8.252,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=3"
       },
       {
        "round": 1,
@@ -4740,7 +4740,7 @@
        "round": 1,
        "key": 51,
        "ms": 119.875,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=118"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=118"
       },
       {
        "round": 1,
@@ -4758,7 +4758,7 @@
        "round": 1,
        "key": 54,
        "ms": 145.371,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=144"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=144"
       },
       {
        "round": 1,
@@ -4776,7 +4776,7 @@
        "round": 1,
        "key": 58,
        "ms": 122.541,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=120"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=120"
       },
       {
        "round": 1,
@@ -4794,7 +4794,7 @@
        "round": 1,
        "key": 62,
        "ms": 135.277,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=133"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=133"
       },
       {
        "round": 1,
@@ -4806,13 +4806,13 @@
        "round": 1,
        "key": 65,
        "ms": 179.326,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=166"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=166"
       },
       {
        "round": 1,
        "key": 66,
        "ms": 12.532,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=5"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=5"
       },
       {
        "round": 1,
@@ -4830,7 +4830,7 @@
        "round": 1,
        "key": 69,
        "ms": 88.774,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=87"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=87"
       },
       {
        "round": 1,
@@ -4866,19 +4866,19 @@
        "round": 1,
        "key": 75,
        "ms": 93.659,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=92"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=92"
       },
       {
        "round": 1,
        "key": 76,
        "ms": 7.115,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 1,
        "key": 77,
        "ms": 16.457,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=11"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=11"
       },
       {
        "round": 1,
@@ -4896,25 +4896,25 @@
        "round": 1,
        "key": 80,
        "ms": 127.239,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=126"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=126"
       },
       {
        "round": 1,
        "key": 81,
        "ms": 9.187,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
        "key": 3,
        "asked after": true,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=4"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=4"
       },
       {
        "round": 2,
        "key": 10,
        "asked after": true,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=5"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=5"
       },
       {
        "round": 2,
@@ -4944,7 +4944,7 @@
        "round": 2,
        "key": 2,
        "ms": 128.945,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=127"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=127"
       },
       {
        "round": 2,
@@ -4962,7 +4962,7 @@
        "round": 2,
        "key": 6,
        "ms": 113.254,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=112"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=112"
       },
       {
        "round": 2,
@@ -4980,7 +4980,7 @@
        "round": 2,
        "key": 9,
        "ms": 124.103,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=123"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=123"
       },
       {
        "round": 2,
@@ -4998,13 +4998,13 @@
        "round": 2,
        "key": 13,
        "ms": 110.349,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=109"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=109"
       },
       {
        "round": 2,
        "key": 14,
        "ms": 9.072,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 2,
@@ -5022,13 +5022,13 @@
        "round": 2,
        "key": 17,
        "ms": 206.044,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=191"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=191"
       },
       {
        "round": 2,
        "key": 18,
        "ms": 65.986,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=40"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=40"
       },
       {
        "round": 2,
@@ -5046,13 +5046,13 @@
        "round": 2,
        "key": 21,
        "ms": 112.969,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=111"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=111"
       },
       {
        "round": 2,
        "key": 22,
        "ms": 11.397,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=5"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=5"
       },
       {
        "round": 2,
@@ -5172,13 +5172,13 @@
        "round": 2,
        "key": 42,
        "ms": 76.639,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=75"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=75"
       },
       {
        "round": 2,
        "key": 43,
        "ms": 11.029,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=6"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=6"
       },
       {
        "round": 2,
@@ -5214,7 +5214,7 @@
        "round": 2,
        "key": 49,
        "ms": 117.116,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=115"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=115"
       },
       {
        "round": 2,
@@ -5232,13 +5232,13 @@
        "round": 2,
        "key": 52,
        "ms": 96.592,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=95"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=95"
       },
       {
        "round": 2,
        "key": 53,
        "ms": 7.854,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
@@ -5256,13 +5256,13 @@
        "round": 2,
        "key": 56,
        "ms": 115.986,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=114"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=114"
       },
       {
        "round": 2,
        "key": 57,
        "ms": 9.524,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 2,
@@ -5280,13 +5280,13 @@
        "round": 2,
        "key": 60,
        "ms": 104.692,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=103"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=103"
       },
       {
        "round": 2,
        "key": 61,
        "ms": 7.449,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
@@ -5298,13 +5298,13 @@
        "round": 2,
        "key": 63,
        "ms": 99.978,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=98"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=98"
       },
       {
        "round": 2,
        "key": 64,
        "ms": 4.811,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
@@ -5322,7 +5322,7 @@
        "round": 2,
        "key": 67,
        "ms": 120.168,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=118"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=118"
       },
       {
        "round": 2,
@@ -5358,19 +5358,19 @@
        "round": 2,
        "key": 73,
        "ms": 140.645,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=137"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=137"
       },
       {
        "round": 2,
        "key": 74,
        "ms": 13.95,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 2,
        "key": 75,
        "ms": 8.491,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=7"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=7"
       },
       {
        "round": 2,
@@ -5388,13 +5388,13 @@
        "round": 2,
        "key": 78,
        "ms": 113.549,
-       "answer": "ok object=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/ra-jit.o functions=2 files=1 ms=112"
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=112"
       },
       {
        "round": 2,
        "key": 79,
        "ms": 8.768,
-       "answer": "ok patch=ra-jit/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
       }
      ]
     },
@@ -5790,7 +5790,7 @@
        "round": 0,
        "key": 3,
        "ms": 121.56,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=120"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=120"
       },
       {
        "round": 0,
@@ -5802,7 +5802,7 @@
        "round": 0,
        "key": 6,
        "ms": 5.179,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 0,
@@ -5820,13 +5820,13 @@
        "round": 0,
        "key": 9,
        "ms": 92.654,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=91"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=91"
       },
       {
        "round": 0,
        "key": 10,
        "ms": 7.594,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 0,
@@ -5844,13 +5844,13 @@
        "round": 0,
        "key": 13,
        "ms": 134.965,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=133"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=133"
       },
       {
        "round": 0,
        "key": 14,
        "ms": 7.555,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 0,
@@ -5868,13 +5868,13 @@
        "round": 0,
        "key": 17,
        "ms": 104.557,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=103"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=103"
       },
       {
        "round": 0,
        "key": 18,
        "ms": 7.154,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=2"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=2"
       },
       {
        "round": 0,
@@ -5892,13 +5892,13 @@
        "round": 0,
        "key": 21,
        "ms": 87.601,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=86"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=86"
       },
       {
        "round": 0,
        "key": 22,
        "ms": 6.478,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
       },
       {
        "round": 0,
@@ -6030,13 +6030,13 @@
        "round": 0,
        "key": 44,
        "ms": 56.861,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=55"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=55"
       },
       {
        "round": 0,
        "key": 45,
        "ms": 6.164,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=2"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=2"
       },
       {
        "round": 0,
@@ -6072,7 +6072,7 @@
        "round": 0,
        "key": 51,
        "ms": 85.21,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=84"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=84"
       },
       {
        "round": 0,
@@ -6090,13 +6090,13 @@
        "round": 0,
        "key": 54,
        "ms": 79.345,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=78"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=78"
       },
       {
        "round": 0,
        "key": 55,
        "ms": 5.733,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=2"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=2"
       },
       {
        "round": 0,
@@ -6114,13 +6114,13 @@
        "round": 0,
        "key": 58,
        "ms": 87.771,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=86"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=86"
       },
       {
        "round": 0,
        "key": 59,
        "ms": 7.458,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 0,
@@ -6138,13 +6138,13 @@
        "round": 0,
        "key": 62,
        "ms": 103.529,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=102"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=102"
       },
       {
        "round": 0,
        "key": 63,
        "ms": 7.752,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 0,
@@ -6156,13 +6156,13 @@
        "round": 0,
        "key": 65,
        "ms": 105.837,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=104"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=104"
       },
       {
        "round": 0,
        "key": 66,
        "ms": 8.551,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
       },
       {
        "round": 0,
@@ -6180,7 +6180,7 @@
        "round": 0,
        "key": 69,
        "ms": 113.173,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=112"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=112"
       },
       {
        "round": 0,
@@ -6216,19 +6216,19 @@
        "round": 0,
        "key": 75,
        "ms": 131.75,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=130"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=130"
       },
       {
        "round": 0,
        "key": 76,
        "ms": 7.765,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 0,
        "key": 77,
        "ms": 11.197,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=10"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=10"
       },
       {
        "round": 0,
@@ -6246,13 +6246,13 @@
        "round": 0,
        "key": 80,
        "ms": 158.399,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=157"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=157"
       },
       {
        "round": 0,
        "key": 81,
        "ms": 10.771,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 1,
@@ -6264,7 +6264,7 @@
        "round": 1,
        "key": 54,
        "asked after": true,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=135"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=135"
       },
       {
        "round": 1,
@@ -6282,13 +6282,13 @@
        "round": 1,
        "key": 2,
        "ms": 114.603,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=113"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=113"
       },
       {
        "round": 1,
        "key": 3,
        "ms": 7.769,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 1,
@@ -6300,7 +6300,7 @@
        "round": 1,
        "key": 5,
        "ms": 130.348,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=129"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=129"
       },
       {
        "round": 1,
@@ -6324,13 +6324,13 @@
        "round": 1,
        "key": 9,
        "ms": 118.503,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=117"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=117"
       },
       {
        "round": 1,
        "key": 10,
        "ms": 10.804,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
       },
       {
        "round": 1,
@@ -6348,13 +6348,13 @@
        "round": 1,
        "key": 13,
        "ms": 127.33,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=126"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=126"
       },
       {
        "round": 1,
        "key": 14,
        "ms": 12.3,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=6"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=6"
       },
       {
        "round": 1,
@@ -6372,13 +6372,13 @@
        "round": 1,
        "key": 17,
        "ms": 132.917,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=131"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=131"
       },
       {
        "round": 1,
        "key": 18,
        "ms": 9.633,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 1,
@@ -6396,13 +6396,13 @@
        "round": 1,
        "key": 21,
        "ms": 114.421,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=113"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=113"
       },
       {
        "round": 1,
        "key": 22,
        "ms": 8.971,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
       },
       {
        "round": 1,
@@ -6534,13 +6534,13 @@
        "round": 1,
        "key": 44,
        "ms": 82.884,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=81"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=81"
       },
       {
        "round": 1,
        "key": 45,
        "ms": 10.183,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=5"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=5"
       },
       {
        "round": 1,
@@ -6576,7 +6576,7 @@
        "round": 1,
        "key": 51,
        "ms": 140.467,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=139"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=139"
       },
       {
        "round": 1,
@@ -6594,7 +6594,7 @@
        "round": 1,
        "key": 55,
        "ms": 103.426,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=102"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=102"
       },
       {
        "round": 1,
@@ -6612,13 +6612,13 @@
        "round": 1,
        "key": 58,
        "ms": 108.51,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=107"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=107"
       },
       {
        "round": 1,
        "key": 59,
        "ms": 9.879,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 1,
@@ -6636,13 +6636,13 @@
        "round": 1,
        "key": 62,
        "ms": 111.459,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=110"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=110"
       },
       {
        "round": 1,
        "key": 63,
        "ms": 9.127,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 1,
@@ -6654,13 +6654,13 @@
        "round": 1,
        "key": 65,
        "ms": 127.191,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=125"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=125"
       },
       {
        "round": 1,
        "key": 66,
        "ms": 12.656,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=8"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=8"
       },
       {
        "round": 1,
@@ -6678,7 +6678,7 @@
        "round": 1,
        "key": 69,
        "ms": 109.291,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=108"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=108"
       },
       {
        "round": 1,
@@ -6714,19 +6714,19 @@
        "round": 1,
        "key": 75,
        "ms": 133.302,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=132"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=132"
       },
       {
        "round": 1,
        "key": 76,
        "ms": 12.223,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
       },
       {
        "round": 1,
        "key": 77,
        "ms": 7.911,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=6"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=6"
       },
       {
        "round": 1,
@@ -6744,25 +6744,25 @@
        "round": 1,
        "key": 80,
        "ms": 150.755,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=148"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=148"
       },
       {
        "round": 1,
        "key": 81,
        "ms": 8.078,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
        "key": 3,
        "asked after": true,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=1 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=1 files=1 ms=3"
       },
       {
        "round": 2,
        "key": 9,
        "asked after": true,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=1 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=1 files=1 ms=3"
       },
       {
        "round": 2,
@@ -6774,7 +6774,7 @@
        "round": 2,
        "key": 13,
        "asked after": true,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=80"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=80"
       },
       {
        "round": 2,
@@ -6810,7 +6810,7 @@
        "round": 2,
        "key": 2,
        "ms": 139.351,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=138"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=138"
       },
       {
        "round": 2,
@@ -6828,7 +6828,7 @@
        "round": 2,
        "key": 6,
        "ms": 128.994,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=127"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=127"
       },
       {
        "round": 2,
@@ -6846,7 +6846,7 @@
        "round": 2,
        "key": 10,
        "ms": 127.669,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=126"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=126"
       },
       {
        "round": 2,
@@ -6864,7 +6864,7 @@
        "round": 2,
        "key": 14,
        "ms": 113.33,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=112"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=112"
       },
       {
        "round": 2,
@@ -6876,13 +6876,13 @@
        "round": 2,
        "key": 17,
        "ms": 119.959,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=119"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=119"
       },
       {
        "round": 2,
        "key": 18,
        "ms": 9.234,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
@@ -6900,13 +6900,13 @@
        "round": 2,
        "key": 21,
        "ms": 133.652,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=132"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=132"
       },
       {
        "round": 2,
        "key": 22,
        "ms": 8.164,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
       },
       {
        "round": 2,
@@ -7026,13 +7026,13 @@
        "round": 2,
        "key": 42,
        "ms": 77.449,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=76"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=76"
       },
       {
        "round": 2,
        "key": 43,
        "ms": 9.517,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=4"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=4"
       },
       {
        "round": 2,
@@ -7068,7 +7068,7 @@
        "round": 2,
        "key": 49,
        "ms": 112.569,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=111"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=111"
       },
       {
        "round": 2,
@@ -7086,13 +7086,13 @@
        "round": 2,
        "key": 52,
        "ms": 114.46,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=113"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=113"
       },
       {
        "round": 2,
        "key": 53,
        "ms": 12.037,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
       },
       {
        "round": 2,
@@ -7110,13 +7110,13 @@
        "round": 2,
        "key": 56,
        "ms": 141.757,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=139"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=139"
       },
       {
        "round": 2,
        "key": 57,
        "ms": 7.919,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
@@ -7134,13 +7134,13 @@
        "round": 2,
        "key": 60,
        "ms": 108.111,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=107"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=107"
       },
       {
        "round": 2,
        "key": 61,
        "ms": 15.003,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=7"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=7"
       },
       {
        "round": 2,
@@ -7152,13 +7152,13 @@
        "round": 2,
        "key": 63,
        "ms": 108.301,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=107"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=107"
       },
       {
        "round": 2,
        "key": 64,
        "ms": 8.309,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
@@ -7176,7 +7176,7 @@
        "round": 2,
        "key": 67,
        "ms": 152.905,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=151"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=151"
       },
       {
        "round": 2,
@@ -7212,19 +7212,19 @@
        "round": 2,
        "key": 73,
        "ms": 160.604,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=159"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=159"
       },
       {
        "round": 2,
        "key": 74,
        "ms": 8.434,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       },
       {
        "round": 2,
        "key": 75,
        "ms": 7.611,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=6"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=6"
       },
       {
        "round": 2,
@@ -7242,13 +7242,13 @@
        "round": 2,
        "key": 78,
        "ms": 149.175,
-       "answer": "ok object=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/ra-jit.o functions=2 files=1 ms=148"
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=148"
       },
       {
        "round": 2,
        "key": 79,
        "ms": 7.92,
-       "answer": "ok patch=ra-jit/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
       }
      ]
     },

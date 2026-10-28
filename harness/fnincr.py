@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ.update(BLAZE_STATS="1", RUSTD_TRACE="1", BLAZE_TRACE="1")
 sys.path.insert(0, HERE)
-from difftest import Fixture, RA_JIT, sysroot_rlibs
+from difftest import Fixture, BLAZE, sysroot_rlibs
 import genbig
 
 # Short names for the queries that tell how much was redone, by the name salsa gives them.
@@ -88,7 +88,7 @@ def main():
         chosen_edits = {name: (None, old, new) for name, old, new in a.edit}
         file_of = lambda _: os.path.join(ws, a.file)
     else:
-        ws, package, crate = tempfile.mkdtemp(prefix="ra-jit-fnincr-"), "big", "big"
+        ws, package, crate = tempfile.mkdtemp(prefix="blaze-fnincr-"), "big", "big"
         sys.argv = ["genbig.py", ws, str(a.fns), str(a.files)]
         genbig.main()
         chosen_edits = edits(a.fns)
@@ -101,8 +101,8 @@ def main():
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     log_path = os.path.join(fx.work, "daemon.log")
     log_out, log = open(log_path, "a"), open(log_path)
-    obj = os.path.join(fx.work, "ra-jit.o")
-    daemon = subprocess.Popen([RA_JIT, ws, "--crate", crate, "--out", obj, "--watch", *symbols],
+    obj = os.path.join(fx.work, "blaze.o")
+    daemon = subprocess.Popen([BLAZE, ws, "--crate", crate, "--out", obj, "--watch", *symbols],
                               stderr=log_out, stdout=log_out)
     done = 0
 

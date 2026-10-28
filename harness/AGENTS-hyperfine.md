@@ -13,7 +13,7 @@
 | 6 | unit 4 added (closure) | patch | 214 | same |
 | 7 | unit 4 (closure) to version 1 | patch | 177 | same |
 | 8 | unit 5 added (async) | patch | 187 | same |
-| 9 | BROKEN: syntax error in src/ra_jit_u4.rs | error | 477 | said so |
+| 9 | BROKEN: syntax error in src/blaze_u4.rs | error | 477 | said so |
 | 10 | mended | full | 324 | same |
 | 11 | unit 6 added (static) | patch | 189 | same |
 | 12 | unit 7 added (plain) | patch | 173 | same |
@@ -49,7 +49,7 @@
 | 42 | unit 18 (async) to version 1 | patch | 207 | same |
 | 43 | unit 28 added (generic) | patch | 226 | same |
 | 44 | blank in src/main.rs | patch | 188 | same |
-| 45 | BROKEN: unresolved name in src/ra_jit_u0.rs | error | 50 | said so |
+| 45 | BROKEN: unresolved name in src/blaze_u0.rs | error | 50 | said so |
 | 46 | mended | patch | 192 | same |
 | 47 | unit 30 added (struct) | patch | 230 | same |
 | 48 | unit 31 added (async) | patch | 236 | same |
@@ -64,7 +64,7 @@
 | 57 | unit 12 (generic) to version 3 | patch | 223 | same |
 | 58 | unit 36 (macro) to version 1 | patch | 217 | same |
 | 59 | blank in src/main.rs | patch | 194 | same |
-| 60 | BROKEN: unresolved name in src/ra_jit_u32.rs | error | 50 | said so |
+| 60 | BROKEN: unresolved name in src/blaze_u32.rs | error | 50 | said so |
 | 61 | mended | patch | 243 | same |
 | 62 | blank in src/main.rs | patch | 191 | same |
 | 63 | burst: blank in src/main.rs; unit 6 (static) to version 1 | patch | 236 | same |

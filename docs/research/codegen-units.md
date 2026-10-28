@@ -100,18 +100,18 @@ build:
 
 - rustc's LLVM takes about 25 s for ripgrep summed over the cores: cargo's build takes 45.6 s
   of user time, of which rustc's main threads (`-Ztime-passes`, `RUSTC_BOOTSTRAP=1`) are 20.2 s
-  (read), and the rest is its LLVM threads (unverified). ra-jit's takes 100 s for code of the
+  (read), and the rest is its LLVM threads (unverified). blaze's takes 100 s for code of the
   same size: ripgrep's `.text` is 2.87 MB in 8,718
   functions against rustc's 2.75 MB in 9,299 (read, `size -A`, `nm`).
-- The difference is what ra-jit gives LLVM: 33,270 exports, each built and put through
+- The difference is what blaze gives LLVM: 33,270 exports, each built and put through
   ThinLTO's pre-link passes at `-O3` (27 s), 139 k bodies imported into the units (1.2 M
   instructions), each simplified again where it is imported (read). rustc copies only
   `#[inline]` and small functions into each codegen unit and ThinLTO imports within a crate.
   Importing less runs slower: bun built in 93.6 s and ran 1.311x with half the room of today's
   118.0 s and 1.244x (read, `imports.rs`, 2026-10-23).
 - So the programs need the inlining, and what makes them need more of it than rustc's is the
-  IR ra-jit gives LLVM (unverified: [mir-gap.md](mir-gap.md) has the passes rustc runs on MIR
-  that ra-jit does not, and the lowering to LLVM loses what Cranelift's IR does not say, such
+  IR blaze gives LLVM (unverified: [mir-gap.md](mir-gap.md) has the passes rustc runs on MIR
+  that blaze does not, and the lowering to LLVM loses what Cranelift's IR does not say, such
   as `noalias` and value ranges). Grouping functions into modules does not change how much
   there is to optimize.
 

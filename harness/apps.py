@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""apps.py: whole applications built by ra-jit, dependencies included, against cargo's build.
+"""apps.py: whole applications built by blaze, dependencies included, against cargo's build.
 
 usage: apps.py <name> [--stage build,workload,perf,tests,edits] [--json out.json]
        apps.py --table <dir of json>
@@ -10,14 +10,14 @@ replacement it prints in `.cargo/config.toml`), at the locked versions. An entry
 has that module of the harness make what cargo needs before it (for bun, bunprep.py: its own
 build of its C and C++, and the member rustc links). The stages:
 
-build     cargo builds the program for the link line; ra-jit compiles every crate linked into
-          it and links its objects ahead of rustc's. Then the same with ra-jit as cargo's
+build     cargo builds the program for the link line; blaze compiles every crate linked into
+          it and links its objects ahead of rustc's. Then the same with blaze as cargo's
           `RUSTC_WRAPPER`, where rustc builds only what runs during the build: that one is
           timed from nothing and is the program the other stages use when it links.
-workload  each command line of `runs`, cargo's program against ra-jit's: status, stdout, stderr.
-perf      `bench` timed with cargo's debug and release programs and ra-jit's; sizes.
-tests     the test binaries of `tests`: those of a library are linked again with ra-jit's
-          objects, those that start the program are run with ra-jit's program in its place.
+workload  each command line of `runs`, cargo's program against blaze's: status, stdout, stderr.
+perf      `bench` timed with cargo's debug and release programs and blaze's; sizes.
+tests     the test binaries of `tests`: those of a library are linked again with blaze's
+          objects, those that start the program are run with blaze's program in its place.
 edits     the daemon holds the program; each edit of `edits` is timed to a linked program and
           to cargo's, and `check` has to print the same from both.
 
@@ -29,7 +29,7 @@ import argparse, importlib, json, os, re, shlex, shutil, socket, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import difftest, linkline, memory
-from difftest import Fixture, RA_JIT, bucket, host, sysroot_rlibs
+from difftest import Fixture, BLAZE, bucket, host, sysroot_rlibs
 
 APPS_DIR = os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps")
 SPECS = os.path.join(HERE, "apps", "apps.json")
@@ -40,7 +40,7 @@ FLAGS = "-C link-dead-code --cap-lints allow"
 def own_flags(spec):
     """The flags the program's own build gives rustc (bun's `-Cforce-frame-pointers=yes`),
     which the harness's RUSTFLAGS would otherwise take the place of. Each build has them, and
-    ra-jit reads them from RUSTFLAGS as cargo does."""
+    blaze reads them from RUSTFLAGS as cargo does."""
     return spec.get("rustflags", "")
 STAGES = ["build", "workload", "perf", "tests", "edits"]
 
@@ -79,7 +79,7 @@ def prepare(ws, spec):
 
 def localize(ws):
     """Puts the source of every dependency in a directory beside the workspace and has cargo
-    take it from there, so the versions built are the locked ones and ra-jit reads the files
+    take it from there, so the versions built are the locked ones and blaze reads the files
     cargo compiles."""
     config = os.path.join(ws, ".cargo", "config.toml")
     marker = "# apps.py: dependencies in a directory\n"
@@ -93,7 +93,7 @@ def localize(ws):
 
 
 def package_directory(ws, package):
-    """Where the package's manifest is. ra-jit is asked for the package and not the workspace:
+    """Where the package's manifest is. blaze is asked for the package and not the workspace:
     a build of one member has the features that member asks for, not every member's."""
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=ws))
@@ -118,11 +118,11 @@ class App(Fixture):
         self.project = package_directory(ws, spec["package"])
 
     def rustc_build(self):
-        """Cargo's build, with ra-jit in rustc's place for every crate when the program is
-        ra-jit's alone: a dependency is not of the workspace to cargo. Without `lto`, which
+        """Cargo's build, with blaze in rustc's place for every crate when the program is
+        blaze's alone: a dependency is not of the workspace to cargo. Without `lto`, which
         links one object of what the stand-ins use in place of the libraries, the standard
-        library's among them, that ra-jit's object calls into."""
-        own = {"RUSTC_WRAPPER": RA_JIT, "CARGO_PROFILE_RELEASE_LTO": "off", "CARGO_PROFILE_DEV_LTO": "off"}
+        library's among them, that blaze's object calls into."""
+        own = {"RUSTC_WRAPPER": BLAZE, "CARGO_PROFILE_RELEASE_LTO": "off", "CARGO_PROFILE_DEV_LTO": "off"}
         if self.alone:
             os.environ.update(own)
         try:
@@ -137,13 +137,13 @@ class App(Fixture):
         program = os.path.basename(self.reference).rsplit("-", 1)[0].replace("-", "_")
         self.crates = [",".join([program, *sorted(linked - {program})])]
 
-    def ra_jit_build(self, deny=()):
+    def blaze_build(self, deny=()):
         """As the fixture's, keeping what the process took: seconds and peak resident memory."""
         crate = self.crates[0]
         obj, report, log = (os.path.join(self.work, f"all.{ext}") for ext in ("o", "tsv", "stderr"))
         symbols = [x for rlib in self.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        argv = [RA_JIT, self.project, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj,
-                "--report", report, *self.ra_jit_args, *symbols]
+        argv = [BLAZE, self.project, *(x for c in crate.split(",") for x in ("--crate", c)), "--out", obj,
+                "--report", report, *self.blaze_args, *symbols]
         with open(os.path.join(self.work, "all.argv"), "w") as out:
             out.write(shlex.join(argv))
         began = time.monotonic()
@@ -151,9 +151,9 @@ class App(Fixture):
             child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err,
                                      env={**os.environ, "RUST_BACKTRACE": "1"})
             _, status, usage = os.wait4(child.pid, 0)
-        self.ra_jit_secs, self.ra_jit_mb = time.monotonic() - began, memory.maxrss_mb(usage)
+        self.blaze_secs, self.blaze_mb = time.monotonic() - began, memory.maxrss_mb(usage)
         if status != 0:
-            raise SystemExit(f"ra-jit crashed:\n{open(log).read()[-3000:]}")
+            raise SystemExit(f"blaze crashed:\n{open(log).read()[-3000:]}")
         self.reports = {crate: [l.rstrip("\n").split("\t") for l in open(report)]}
         self.objects = [obj]
         began = time.monotonic()
@@ -201,12 +201,12 @@ def cause(reason):
 
 
 def build(ws, spec, result, alone):
-    """One build of the program by ra-jit; returns the fixture, or None with the failure noted."""
+    """One build of the program by blaze; returns the fixture, or None with the failure noted."""
     key = "alone" if alone else "ahead"
     fx = App(ws, spec, alone)
     try:
         fx.rustc_build()
-        fx.ra_jit_build()
+        fx.blaze_build()
     except SystemExit as failed:
         result[key] = {"error": str(failed)[-1500:], "work": fx.work, **(fx.summary() if fx.reports else {})}
         missing = sorted(set(re.findall(r"undefined symbol: (.*)", str(failed))))
@@ -215,12 +215,12 @@ def build(ws, spec, result, alone):
             print(f"  undefined {symbol[:200]}")
         reasons(result[key])
         return None
-    result[key] = {**fx.summary(), "cargo_s": round(fx.cargo_secs, 1), "ra_jit_s": round(fx.ra_jit_secs, 1),
-                   "link_s": round(fx.link_secs, 1), "peak_mb": fx.ra_jit_mb,
+    result[key] = {**fx.summary(), "cargo_s": round(fx.cargo_secs, 1), "blaze_s": round(fx.blaze_secs, 1),
+                   "link_s": round(fx.link_secs, 1), "peak_mb": fx.blaze_mb,
                    "size": os.path.getsize(fx.binary), "work": fx.work}
     row = result[key]
-    print(f"{key}: {row['compiled']} functions from ra-jit over {row['crates']} crates, {row['left']} left; "
-          f"ra-jit {row['ra_jit_s']} s, link {row['link_s']} s, peak {row['peak_mb']} MB")
+    print(f"{key}: {row['compiled']} functions from blaze over {row['crates']} crates, {row['left']} left; "
+          f"blaze {row['blaze_s']} s, link {row['link_s']} s, peak {row['peak_mb']} MB")
     reasons(row)
     return fx
 
@@ -329,7 +329,7 @@ def name_of(run):
 
 
 def workload(fx, spec, debug, result):
-    """Every command line with cargo's program, then with ra-jit's, in the same order: a
+    """Every command line with cargo's program, then with blaze's, in the same order: a
     server keeps what the earlier ones did to it."""
     seen = []
     for binary in (debug, fx.binary):
@@ -340,7 +340,7 @@ def workload(fx, spec, debug, result):
         if want != got:
             differing.append(name_of(run))
             tail = got[2].decode(errors="replace").strip().splitlines()[-2:]
-            print(f"  DIFFERS `{name_of(run)}`: rustc status {want[0]}, ra-jit status {got[0]}: "
+            print(f"  DIFFERS `{name_of(run)}`: rustc status {want[0]}, blaze status {got[0]}: "
                   f"{difftest.symptom(want, got)} {' | '.join(tail)[:300]}")
     result["workload"] = {"runs": len(spec["runs"]), "differing": differing}
     print(f"workload: {len(spec['runs']) - len(differing)} of {len(spec['runs'])} command lines the same")
@@ -349,7 +349,7 @@ def workload(fx, spec, debug, result):
 def perf(fx, spec, debug, release, result):
     """`bench` timed, or `load` put on the server, with each of the three programs."""
     row = {"debug_size": os.path.getsize(debug), "release_size": os.path.getsize(release)}
-    for key, binary in (("ra_jit", fx.binary), ("debug", debug), ("release", release)):
+    for key, binary in (("blaze", fx.binary), ("debug", debug), ("release", release)):
         with Served(fx, binary) as served:
             if "load" in spec:
                 row.update({f"{key}_{k}": v for k, v in served.load(spec["load"]).items()})
@@ -358,11 +358,11 @@ def perf(fx, spec, debug, release, result):
     result["perf"] = row
     if "load" in spec:
         row["bench"] = shlex.join(spec["load"])
-        print(f"load `{row['bench']}`: ra-jit {row['ra_jit_rps']} requests/s ({row['ra_jit_failed']} failed), "
+        print(f"load `{row['bench']}`: blaze {row['blaze_rps']} requests/s ({row['blaze_failed']} failed), "
               f"rustc debug {row['debug_rps']} ({row['debug_failed']}), release {row['release_rps']} ({row['release_failed']})")
     else:
         row["bench"] = shlex.join(spec["bench"])
-        print(f"perf `{row['bench']}`: ra-jit {row['ra_jit_s']} s, rustc debug {row['debug_s']} s, release {row['release_s']} s")
+        print(f"perf `{row['bench']}`: blaze {row['blaze_s']} s, rustc debug {row['debug_s']} s, release {row['release_s']} s")
 
 
 def main():

@@ -3,7 +3,7 @@
 //! generic (one instance per marker or team they are added for), as bevy code tends to be. bevy's
 //! schedule runner steps it about once a millisecond.
 //!
-//! It takes edits while it runs: ra-jit-live applies each patch the moment it lands, and the
+//! It takes edits while it runs: blaze-live applies each patch the moment it lands, and the
 //! next frame runs the new systems. `answer()` is what live_latency.py's socket and burst modes
 //! edit; the frame prints it when it changes (`answer N at_us=`), and each patch's outcome.
 
@@ -555,7 +555,7 @@ fn add_team<T: Team>(app: &mut App) {
 }
 
 fn main() {
-    let live = match ra_jit_live::Live::start() {
+    let live = match blaze_live::Live::start() {
         Ok(live) => live,
         Err(why) => {
             println!("no live edits: {why}");

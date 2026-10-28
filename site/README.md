@@ -71,7 +71,7 @@ bun run deploy   # build + wrangler deploy
 
 ## Hosting (ix.dev/blaze)
 
-The site is the Cloudflare Worker `ra-jit` (account Indexable). `.github/workflows/site.yaml` deploys it on a push
+The site is the Cloudflare Worker `blaze` (account Indexable). `.github/workflows/site.yaml` deploys it on a push
 to main once the repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are set (the token needs Workers
 Scripts, Workers Routes and D1 edit on the account and the ix.dev zone); until then it only builds, and the site is
 deployed by hand from an up-to-date main, logged in with `wrangler login`:
@@ -90,7 +90,7 @@ It is reached three ways, all declared in `wrangler.jsonc` `routes`, so `wrangle
   the other routes) is terraform in indexable-inc/ix (`nix/terraform/cloudflare`); Cloudflare picks the most specific
   route, so this one wins over `ix.dev/*` without touching that config. It ends in `*` because a pattern without one
   does not match a URL with a query.
-- `ra-jit.ix.dev` (the old home) and `blaze.ix.dev`: Workers custom domains (Cloudflare makes their DNS records and
+- `blaze.ix.dev` (the old home) and `blaze.ix.dev`: Workers custom domains (Cloudflare makes their DNS records and
   certificates). The worker answers every request on them with a 301 (308 for a non-GET, which keeps a form post) to
   the same path and query under https://ix.dev/blaze.
 
@@ -150,7 +150,7 @@ themselves):
 
 ```
 bun gen/build.ts
-bunx wrangler d1 migrations apply ra-jit-updates --local
+bunx wrangler d1 migrations apply blaze-updates --local
 bunx wrangler dev --var GITHUB_CLIENT_ID:<dev app id>     # secrets for dev go in .dev.vars (gitignored)
 bunx tsc --noEmit -p tsconfig.json                         # type-checks worker/ only
 ```
@@ -220,12 +220,12 @@ Setup: create a GitHub OAuth App with the callback `https://ix.dev/blaze/auth/gi
 `GITHUB_CLIENT_ID` (`wrangler.jsonc` `vars`; empty turns sign-in off) and its secret with
 `wrangler secret put GITHUB_CLIENT_SECRET`. `COMMENT_ADMINS` is a comma-separated list of numeric GitHub user ids
 (`curl https://api.github.com/users/<login>` shows `id`), compared with the signed-in user's id; logins are not used,
-since a renamed login can be registered by someone else. Apply `0002_comments.sql` and `0003_doc_versions.sql` with `wrangler d1 migrations apply ra-jit-updates --remote`.
+since a renamed login can be registered by someone else. Apply `0002_comments.sql` and `0003_doc_versions.sql` with `wrangler d1 migrations apply blaze-updates --remote`.
 
 Reading comments:
 
 ```
-npx wrangler d1 execute ra-jit-updates --remote --command \
+npx wrangler d1 execute blaze-updates --remote --command \
   "select c.id, c.doc, c.block, u.login, c.body, c.created_at from comments c join users u on u.id = c.user_id where c.deleted_at is null order by c.id desc"
 ```
 
@@ -249,20 +249,20 @@ secret, verification is skipped; with no site key, the widget is not shown (dev)
 ### One-time setup
 
 ```
-npx wrangler d1 create ra-jit-updates      # paste the printed database_id into wrangler.jsonc (TODO there)
-npx wrangler d1 migrations apply ra-jit-updates --remote
+npx wrangler d1 create blaze-updates      # paste the printed database_id into wrangler.jsonc (TODO there)
+npx wrangler d1 migrations apply blaze-updates --remote
 npx wrangler secret put TURNSTILE_SECRET_KEY
 bun gen/build.ts && npx wrangler deploy
 ```
 
-Local dev: `npx wrangler d1 migrations apply ra-jit-updates --local`.
+Local dev: `npx wrangler d1 migrations apply blaze-updates --local`.
 
 ### Reading signups
 
 ```
-npx wrangler d1 execute ra-jit-updates --remote --command \
+npx wrangler d1 execute blaze-updates --remote --command \
   "select email, company, why, src, country, city, as_organization, created_at from signups order by created_at desc"
-npx wrangler d1 execute ra-jit-updates --remote --command "select count(*) from signups"
+npx wrangler d1 execute blaze-updates --remote --command "select count(*) from signups"
 ```
 
 Add `--json` for machine-readable output.

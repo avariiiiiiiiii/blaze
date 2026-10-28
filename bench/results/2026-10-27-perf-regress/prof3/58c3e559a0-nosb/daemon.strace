@@ -15,10 +15,10 @@
 90049 23:37:23.661700 +++ exited with 0 +++
 90050 23:37:23.661793 +++ exited with 0 +++
 90051 23:37:23.661906 +++ exited with 0 +++
-90056 23:37:23.684142 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562ee0ef00 /* 91 vars */) = 0
-90057 23:37:23.684632 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f270000 /* 91 vars */ <unfinished ...>
-90058 23:37:23.684663 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f677f00 /* 90 vars */ <unfinished ...>
-90059 23:37:23.684767 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4563985b200 /* 89 vars */ <unfinished ...>
+90056 23:37:23.684142 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562ee0ef00 /* 91 vars */) = 0
+90057 23:37:23.684632 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f270000 /* 91 vars */ <unfinished ...>
+90058 23:37:23.684663 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f677f00 /* 90 vars */ <unfinished ...>
+90059 23:37:23.684767 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4563985b200 /* 89 vars */ <unfinished ...>
 90057 23:37:23.684798 <... execve resumed>) = 0
 90058 23:37:23.684807 <... execve resumed>) = 0
 90059 23:37:23.684886 <... execve resumed>) = 0
@@ -57,13 +57,13 @@
 90085 23:37:23.707716 +++ exited with 0 +++
 90056 23:37:23.707954 <... execve resumed>) = 0
 90059 23:37:23.708254 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/ripgrep-2c1ff6b9e398918c/build-script-build", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/ripgrep-2c1ff6b9e398918c/build-script-build"], 0xe5b0ba81e000 /* 89 vars */ <unfinished ...>
-90088 23:37:23.709192 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/ra-jit-rustc/rustc", "--version"], 0xffffc330be58 /* 91 vars */) = 0
+90088 23:37:23.709192 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/blaze-rustc/rustc", "--version"], 0xffffc330be58 /* 91 vars */) = 0
 90058 23:37:23.709307 exit_group(0)     = ?
 90058 23:37:23.709470 +++ exited with 0 +++
 87696 23:37:23.709488 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90058, si_uid=0, si_status=0, si_utime=0, si_stime=1 /* 0.01 s */} ---
 90059 23:37:23.710211 <... execve resumed>) = 0
-90089 23:37:23.711029 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", "--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata", "--out-dir", "/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/out/probe", "src/nightly.rs", "--target", "aarch64-unknown-linux-gnu"], 0xb84d06eb2490 /* 91 vars */) = 0
-90090 23:37:23.711341 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f677000 /* 91 vars */) = 0
+90089 23:37:23.711029 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", "--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata", "--out-dir", "/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/out/probe", "src/nightly.rs", "--target", "aarch64-unknown-linux-gnu"], 0xb84d06eb2490 /* 91 vars */) = 0
+90090 23:37:23.711341 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f677000 /* 91 vars */) = 0
 90091 23:37:23.713154 execve("/root/.cargo/bin/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xffffd97cb188 /* 89 vars */) = -1 ENOENT (No such file or directory)
 90091 23:37:23.713326 execve("/root/perf/bin/58c3e559a0/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xffffd97cb188 /* 89 vars */) = -1 ENOENT (No such file or directory)
 90091 23:37:23.713360 execve("/nix/var/nix/profiles/default/bin/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xffffd97cb188 /* 89 vars */) = -1 ENOENT (No such file or directory)
@@ -98,8 +98,8 @@
 90057 23:37:23.719098 exit_group(0)     = ?
 90057 23:37:23.719342 +++ exited with 0 +++
 90054 23:37:23.719366 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90057, si_uid=0, si_status=0, si_utime=0, si_stime=1 /* 0.01 s */} ---
-90094 23:37:23.720351 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4563985af00 /* 91 vars */) = 0
-90099 23:37:23.722582 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f270300 /* 91 vars */) = 0
+90094 23:37:23.720351 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4563985af00 /* 91 vars */) = 0
+90099 23:37:23.722582 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f270300 /* 91 vars */) = 0
 90096 23:37:23.725515 +++ exited with 0 +++
 90098 23:37:23.725584 +++ exited with 0 +++
 90097 23:37:23.725621 +++ exited with 0 +++
@@ -112,7 +112,7 @@
 90090 23:37:23.729417 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-0b0dbd727d5aee2f/build-script-build", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-0b0dbd727d5aee2f/build-script-build"], 0xe1156681e000 /* 91 vars */) = 0
 90107 23:37:23.735674 +++ exited with 0 +++
 90106 23:37:23.736079 +++ exited with 0 +++
-90114 23:37:23.736299 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/ra-jit-rustc/rustc", "--version"], 0xffffc72fba58 /* 91 vars */ <unfinished ...>
+90114 23:37:23.736299 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/blaze-rustc/rustc", "--version"], 0xffffc72fba58 /* 91 vars */ <unfinished ...>
 90109 23:37:23.736457 +++ exited with 0 +++
 90114 23:37:23.736588 <... execve resumed>) = 0
 90108 23:37:23.736598 +++ exited with 0 +++
@@ -134,7 +134,7 @@
 90114 23:37:23.744333 exit_group(0)     = ?
 90094 23:37:23.744431 +++ exited with 0 +++
 90052 23:37:23.744437 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90094, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
-90121 23:37:23.744556 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/ra-jit-rustc/rustc", "--version"], 0xffffd1d8bb08 /* 91 vars */) = 0
+90121 23:37:23.744556 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/blaze-rustc/rustc", "--version"], 0xffffd1d8bb08 /* 91 vars */) = 0
 90114 23:37:23.745158 +++ exited with 0 +++
 90090 23:37:23.745171 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90114, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
 90090 23:37:23.745721 exit_group(0)     = ?
@@ -161,7 +161,7 @@
 90122 23:37:27.484254 +++ exited with 0 +++
 90089 23:37:27.484257 +++ exited with 0 +++
 90056 23:37:27.484301 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90089, si_uid=0, si_status=0, si_utime=301 /* 3.01 s */, si_stime=21 /* 0.21 s */} ---
-90132 23:37:27.485248 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", "--version"], 0xffffde893c58 /* 91 vars */) = 0
+90132 23:37:27.485248 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", "--version"], 0xffffde893c58 /* 91 vars */) = 0
 90132 23:37:27.492250 exit_group(0)     = ?
 90132 23:37:27.493028 +++ exited with 0 +++
 90056 23:37:27.493039 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90132, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
@@ -208,10 +208,10 @@
 90196 23:37:27.685149 +++ exited with 0 +++
 90197 23:37:27.685229 +++ exited with 0 +++
 90198 23:37:27.685346 +++ exited with 0 +++
-90203 23:37:27.706939 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562ee0e600 /* 91 vars */) = 0
-90204 23:37:27.707364 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f677f00 /* 89 vars */ <unfinished ...>
-90205 23:37:27.707384 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4563985b800 /* 90 vars */ <unfinished ...>
-90206 23:37:27.707454 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f270000 /* 91 vars */ <unfinished ...>
+90203 23:37:27.706939 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562ee0e600 /* 91 vars */) = 0
+90204 23:37:27.707364 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f677f00 /* 89 vars */ <unfinished ...>
+90205 23:37:27.707384 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4563985b800 /* 90 vars */ <unfinished ...>
+90206 23:37:27.707454 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f270000 /* 91 vars */ <unfinished ...>
 90205 23:37:27.707500 <... execve resumed>) = 0
 90204 23:37:27.707523 <... execve resumed>) = 0
 90206 23:37:27.707599 <... execve resumed>) = 0
@@ -253,8 +253,8 @@
 90205 23:37:27.731465 +++ exited with 0 +++
 87696 23:37:27.731492 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90205, si_uid=0, si_status=0, si_utime=0, si_stime=1 /* 0.01 s */} ---
 90206 23:37:27.731690 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-ee8a27ee5366fc5e/build-script-build", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-ee8a27ee5366fc5e/build-script-build"], 0xecc83761e000 /* 91 vars */ <unfinished ...>
-90235 23:37:27.733213 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", "--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata", "--out-dir", "/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/out/probe", "src/nightly.rs", "--target", "aarch64-unknown-linux-gnu"], 0xba771eaf2490 /* 91 vars */ <unfinished ...>
-90236 23:37:27.733297 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4563985b500 /* 91 vars */ <unfinished ...>
+90235 23:37:27.733213 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", "--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata", "--out-dir", "/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/out/probe", "src/nightly.rs", "--target", "aarch64-unknown-linux-gnu"], 0xba771eaf2490 /* 91 vars */ <unfinished ...>
+90236 23:37:27.733297 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4563985b500 /* 91 vars */ <unfinished ...>
 90237 23:37:27.733311 execve("/root/.cargo/bin/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xfffffe6e3e28 /* 89 vars */) = -1 ENOENT (No such file or directory)
 90235 23:37:27.733342 <... execve resumed>) = 0
 90237 23:37:27.733348 execve("/root/perf/bin/58c3e559a0/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xfffffe6e3e28 /* 89 vars */) = -1 ENOENT (No such file or directory)
@@ -263,14 +263,14 @@
 90236 23:37:27.733433 <... execve resumed>) = 0
 90206 23:37:27.733492 <... execve resumed>) = 0
 90237 23:37:27.733521 <... execve resumed>) = 0
-90238 23:37:27.736158 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/ra-jit-rustc/rustc", "--version"], 0xffffe9719e78 /* 91 vars */) = 0
+90238 23:37:27.736158 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/blaze-rustc/rustc", "--version"], 0xffffe9719e78 /* 91 vars */) = 0
 90237 23:37:27.737721 exit_group(128)   = ?
 90237 23:37:27.737908 +++ exited with 128 +++
 90204 23:37:27.737931 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90237, si_uid=0, si_status=128, si_utime=0, si_stime=0} ---
 90204 23:37:27.738182 exit_group(0)     = ?
 90204 23:37:27.738354 +++ exited with 0 +++
 87696 23:37:27.738375 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90204, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
-90239 23:37:27.739969 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f677f00 /* 91 vars */) = 0
+90239 23:37:27.739969 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f677f00 /* 91 vars */) = 0
 90238 23:37:27.742762 exit_group(0)     = ?
 90238 23:37:27.743476 +++ exited with 0 +++
 90206 23:37:27.743485 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90238, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
@@ -298,7 +298,7 @@
 90243 23:37:27.748263 +++ exited with 0 +++
 90246 23:37:27.748370 +++ exited with 0 +++
 90241 23:37:27.748967 +++ exited with 0 +++
-90251 23:37:27.749744 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f270900 /* 91 vars */) = 0
+90251 23:37:27.749744 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f270900 /* 91 vars */) = 0
 90252 23:37:27.750557 +++ exited with 0 +++
 90250 23:37:27.750596 +++ exited with 0 +++
 90249 23:37:27.750631 +++ exited with 0 +++
@@ -307,12 +307,12 @@
 90256 23:37:27.756949 +++ exited with 0 +++
 90253 23:37:27.756951 +++ exited with 0 +++
 90254 23:37:27.757167 +++ exited with 0 +++
-90257 23:37:27.757319 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/ra-jit-rustc/rustc", "--version"], 0xffffc5f69df8 /* 91 vars */) = 0
+90257 23:37:27.757319 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/blaze-rustc/rustc", "--version"], 0xffffc5f69df8 /* 91 vars */) = 0
 90260 23:37:27.759096 +++ exited with 0 +++
 90258 23:37:27.759108 +++ exited with 0 +++
 90259 23:37:27.759190 +++ exited with 0 +++
 90239 23:37:27.759835 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-155d486563f7b801/build-script-build", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-155d486563f7b801/build-script-build"], 0xe55ea161e000 /* 91 vars */) = 0
-90265 23:37:27.765754 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/ra-jit-rustc/rustc", "--version"], 0xfffff0f703b8 /* 91 vars */ <unfinished ...>
+90265 23:37:27.765754 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/blaze-rustc/rustc", "--version"], 0xfffff0f703b8 /* 91 vars */ <unfinished ...>
 90261 23:37:27.765817 +++ exited with 0 +++
 90265 23:37:27.765888 <... execve resumed>) = 0
 90264 23:37:27.765915 +++ exited with 0 +++
@@ -352,7 +352,7 @@
 90240 23:37:31.289289 +++ exited with 0 +++
 90235 23:37:31.289292 +++ exited with 0 +++
 90203 23:37:31.289334 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90235, si_uid=0, si_status=0, si_utime=280 /* 2.80 s */, si_stime=22 /* 0.22 s */} ---
-90281 23:37:31.290239 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", "--version"], 0xffffc53477e8 /* 91 vars */) = 0
+90281 23:37:31.290239 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", "--version"], 0xffffc53477e8 /* 91 vars */) = 0
 90281 23:37:31.297327 exit_group(0)     = ?
 90281 23:37:31.298103 +++ exited with 0 +++
 90203 23:37:31.298114 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90281, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
@@ -395,13 +395,13 @@
 90340 23:37:31.498285 +++ exited with 0 +++
 90341 23:37:31.498340 +++ exited with 0 +++
 90342 23:37:31.498488 +++ exited with 0 +++
-90348 23:37:31.520575 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f677000 /* 91 vars */ <unfinished ...>
-90349 23:37:31.520596 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4563985c100 /* 90 vars */ <unfinished ...>
-90347 23:37:31.520622 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f270300 /* 89 vars */ <unfinished ...>
+90348 23:37:31.520575 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f677000 /* 91 vars */ <unfinished ...>
+90349 23:37:31.520596 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4563985c100 /* 90 vars */ <unfinished ...>
+90347 23:37:31.520622 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f270300 /* 89 vars */ <unfinished ...>
 90348 23:37:31.520738 <... execve resumed>) = 0
 90349 23:37:31.520752 <... execve resumed>) = 0
 90347 23:37:31.520774 <... execve resumed>) = 0
-90350 23:37:31.521845 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562ee0e600 /* 91 vars */) = 0
+90350 23:37:31.521845 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562ee0e600 /* 91 vars */) = 0
 90353 23:37:31.534505 +++ exited with 0 +++
 90360 23:37:31.534699 +++ exited with 0 +++
 90358 23:37:31.534912 +++ exited with 0 +++
@@ -437,18 +437,18 @@
 90377 23:37:31.543780 +++ exited with 0 +++
 90350 23:37:31.543892 <... execve resumed>) = 0
 90349 23:37:31.544357 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/crossbeam-utils-f350ee410842bce6/build-script-build", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/crossbeam-utils-f350ee410842bce6/build-script-build"], 0xfd630581e000 /* 90 vars */ <unfinished ...>
-90379 23:37:31.545782 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/ra-jit-rustc/rustc", "--version"], 0xffffcc8a9aa8 /* 91 vars */) = 0
+90379 23:37:31.545782 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/libc-e0fe9e2562c9e4c5/blaze-rustc/rustc", "--version"], 0xffffcc8a9aa8 /* 91 vars */) = 0
 90380 23:37:31.546338 execve("/root/.cargo/bin/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xfffffa4fdbe8 /* 89 vars */) = -1 ENOENT (No such file or directory)
 90380 23:37:31.546369 execve("/root/perf/bin/58c3e559a0/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xfffffa4fdbe8 /* 89 vars */ <unfinished ...>
 90349 23:37:31.546376 <... execve resumed>) = 0
 90380 23:37:31.546386 <... execve resumed>) = -1 ENOENT (No such file or directory)
 90380 23:37:31.546396 execve("/nix/var/nix/profiles/default/bin/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xfffffa4fdbe8 /* 89 vars */) = -1 ENOENT (No such file or directory)
 90380 23:37:31.546430 execve("/run/current-system/sw/bin/git", ["git", "rev-parse", "--short=10", "HEAD"], 0xfffffa4fdbe8 /* 89 vars */) = 0
-90381 23:37:31.546601 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", "--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata", "--out-dir", "/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/out/probe", "src/nightly.rs", "--target", "aarch64-unknown-linux-gnu"], 0xaedaddf88490 /* 91 vars */) = 0
+90381 23:37:31.546601 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", "--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata", "--out-dir", "/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/out/probe", "src/nightly.rs", "--target", "aarch64-unknown-linux-gnu"], 0xaedaddf88490 /* 91 vars */) = 0
 90349 23:37:31.548539 exit_group(0)     = ?
 90349 23:37:31.548709 +++ exited with 0 +++
 90343 23:37:31.548738 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90349, si_uid=0, si_status=0, si_utime=0, si_stime=1 /* 0.01 s */} ---
-90382 23:37:31.550396 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4563985bb00 /* 91 vars */) = 0
+90382 23:37:31.550396 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4563985bb00 /* 91 vars */) = 0
 90380 23:37:31.550897 exit_group(128)   = ?
 90380 23:37:31.551134 +++ exited with 128 +++
 90347 23:37:31.551155 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90380, si_uid=0, si_status=128, si_utime=0, si_stime=0} ---
@@ -456,7 +456,7 @@
 90347 23:37:31.551605 +++ exited with 0 +++
 90345 23:37:31.551615 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90347, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
 90379 23:37:31.552770 exit_group(0)     = ?
-90383 23:37:31.553333 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f270300 /* 91 vars */) = 0
+90383 23:37:31.553333 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f270300 /* 91 vars */) = 0
 90379 23:37:31.553469 +++ exited with 0 +++
 90348 23:37:31.553502 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90379, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
 90385 23:37:31.554486 execve("/root/.cargo/bin/emcc", ["emcc", "-dumpversion"], 0xffffcc8a9aa8 /* 91 vars */) = -1 ENOENT (No such file or directory)
@@ -477,7 +477,7 @@
 90348 23:37:31.555794 exit_group(0)     = ?
 90348 23:37:31.556050 +++ exited with 0 +++
 90344 23:37:31.556059 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90348, si_uid=0, si_status=0, si_utime=0, si_stime=1 /* 0.01 s */} ---
-90386 23:37:31.557650 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xf4562f678200 /* 91 vars */) = 0
+90386 23:37:31.557650 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xf4562f678200 /* 91 vars */) = 0
 90388 23:37:31.559947 +++ exited with 0 +++
 90387 23:37:31.559978 +++ exited with 0 +++
 90392 23:37:31.565057 +++ exited with 0 +++
@@ -497,12 +497,12 @@
 90402 23:37:31.572045 +++ exited with 0 +++
 90401 23:37:31.572054 +++ exited with 0 +++
 90383 23:37:31.572653 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-155d486563f7b801/build-script-build", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-155d486563f7b801/build-script-build"], 0xec53fc01e000 /* 91 vars */) = 0
-90408 23:37:31.575011 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/ra-jit-rustc/rustc", "--version"], 0xfffffb22adf8 /* 91 vars */) = 0
+90408 23:37:31.575011 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde-1ec173b9fe44b2b2/blaze-rustc/rustc", "--version"], 0xfffffb22adf8 /* 91 vars */) = 0
 90405 23:37:31.577897 +++ exited with 0 +++
 90407 23:37:31.578302 +++ exited with 0 +++
 90404 23:37:31.578380 +++ exited with 0 +++
 90406 23:37:31.578747 +++ exited with 0 +++
-90409 23:37:31.579201 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/ra-jit-rustc/rustc", "--version"], 0xffffc75465c8 /* 91 vars */) = 0
+90409 23:37:31.579201 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/serde_core-d2a26aa75e6140fa/blaze-rustc/rustc", "--version"], 0xffffc75465c8 /* 91 vars */) = 0
 90411 23:37:31.580647 +++ exited with 0 +++
 90410 23:37:31.580683 +++ exited with 0 +++
 90412 23:37:31.580787 +++ exited with 0 +++
@@ -538,7 +538,7 @@
 90413 23:37:35.290991 +++ exited with 0 +++
 90381 23:37:35.290994 +++ exited with 0 +++
 90350 23:37:35.291038 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90381, si_uid=0, si_status=0, si_utime=298 /* 2.98 s */, si_stime=20 /* 0.20 s */} ---
-90423 23:37:35.291975 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/ra-jit-rustc/rustc", "--version"], 0xffffdae78dd8 /* 91 vars */) = 0
+90423 23:37:35.291975 execve("/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", ["/root/perf/prof3-ws/58c3e559a0/rg/target/rust-analyzer/compile-time/build/anyhow-034178ede30e81d5/blaze-rustc/rustc", "--version"], 0xffffdae78dd8 /* 91 vars */) = 0
 90423 23:37:35.299005 exit_group(0)     = ?
 90423 23:37:35.299805 +++ exited with 0 +++
 90350 23:37:35.299818 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=90423, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---

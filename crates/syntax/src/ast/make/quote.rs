@@ -1,6 +1,6 @@
 //! A `quote!`-like API for crafting AST nodes.
 
-pub(crate) use rowan::{GreenNode, GreenToken, NodeOrToken, SyntaxKind as RSyntaxKind};
+pub(crate) use syntax_tree::{GreenNode, GreenToken, NodeOrToken, SyntaxKind as RSyntaxKind};
 
 macro_rules! quote_impl_ {
     ( @append $children:ident ) => {}; // Base case.

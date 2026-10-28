@@ -1,14 +1,14 @@
-# Cargo's build model in ra-jit
+# Cargo's build model in blaze
 
-Branch `ra-jit-build-model`. The head has `ra-jit-collate-next` 1b022ff6f2 merged in (before
-it `ra-jit-collate` 3d47ed59bf and 14ee89181b; the third round from 1547078a30, the second
+Branch `blaze-build-model`. The head has `blaze-collate-next` 1b022ff6f2 merged in (before
+it `blaze-collate` 3d47ed59bf and 14ee89181b; the third round from 1547078a30, the second
 from 0151c01218). Work stopped here; "Where this stands" below says what is done, what is
 half done and what would come next. Linux x86-64, Rust 1.99.0,
 LLVM 20.
 
-This is a survey of which parts of cargo's build model ra-jit follows, with a small project
+This is a survey of which parts of cargo's build model blaze follows, with a small project
 for each part under `harness/buildmodel/` and a script, `harness/buildmodel.py`, that builds
-every one with cargo and rustc alone and again with ra-jit's code linked in, runs both and
+every one with cargo and rustc alone and again with blaze's code linked in, runs both and
 compares what they print and return. Where a case has steps, one input is changed at a time
 under the same daemon and each step is compared with cargo again.
 
@@ -16,7 +16,7 @@ under the same daemon and each step is compared with cargo again.
 
 Measured with
 
-    LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm
+    LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p blaze-engine --release --features llvm
     cd harness
     BLAZE_BIN=... python3 buildmodel.py --backend cranelift --jobs 6 --table table-cranelift.md
     BLAZE_BIN=... BLAZE_OPT=2 BLAZE_EMIT=fast python3 buildmodel.py --backend llvm --jobs 6 --table table-llvm.md
@@ -39,7 +39,7 @@ which 2 were refused. The first ended at 90 cases, 82 supported and 8 refused, w
 of which 7 were refused.
 
 A row is one of three things. "supported": the two programs print and return the same, and
-every function of the crates the case names was compiled by ra-jit. "refused": ra-jit said why
+every function of the crates the case names was compiled by blaze. "refused": blaze said why
 it does not build this and nothing ran differently; that includes a function it left to
 rustc with a reason. "WRONG": a different output, a crash, or a refusal without a reason. The
 script fails on a WRONG row and on any row that is not what its `case.json` expects, so a
@@ -49,8 +49,8 @@ feature that stops working, or a refusal that starts to pass, is seen.
 
 ### The merge
 
-`ra-jit-collate` is merged in four steps, as it moved: 2da3d6a792 (890d2ee757, conflicts in
-`Cargo.lock` and `crates/ra-jit/src/main.rs`), then ce52276cf5 with the platform ABI
+`blaze-collate` is merged in four steps, as it moved: 2da3d6a792 (890d2ee757, conflicts in
+`Cargo.lock` and `crates/blaze-engine/src/main.rs`), then ce52276cf5 with the platform ABI
 unification and the third S3 round (a6b6b5ede8, one conflict in
 `crates/hir-ty/src/mir/codegen.rs`, where each side had added a field to `ObjectCodegen`;
 both are kept), then 8f21942505 with the fuzzer (9cf4286511, no conflict), then f191c6e42a, which only adds
@@ -58,13 +58,13 @@ the two files under `publish/` (34d3333c9d, no conflict), then 14ee89181b with t
 round, the second round of the cargo drop-in, the docs and the publish tooling (1b4047e6f4,
 conflicts in ten files, see below). In `main.rs` the
 third round's widening is kept over the second round's refusal as it had been resolved in
-`ra-jit-collate`; `Cargo.lock` is `ra-jit-collate`'s, which has the dependencies of the remote
+`blaze-collate`; `Cargo.lock` is `blaze-collate`'s, which has the dependencies of the remote
 store. A unit test of `cargo/cli.rs` that still expected `--release`, a custom profile and
 feature flags to be left to cargo was brought up to the one plan.
 
 ### Doctests of 30 crates
 
-`harness/doctests.py` now runs `cargo test --doc` and `cargo ra-jit test --doc` on 30 crates
+`harness/doctests.py` now runs `cargo test --doc` and `blaze test --doc` on 30 crates
 from crates.io and compares the exit status and everything printed (test lines, failure
 blocks with the compiler's errors, the result line), with only the order of tests, the
 times and thread numbers taken out:
@@ -74,11 +74,11 @@ times and thread numbers taken out:
     BLAZE_BIN=... BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast python3 doctests.py
 
 Result on the head of the branch: 30 of 30 the same under Cranelift and 30 of 30 under LLVM,
-none left to rustdoc, 0 WRONG. Together they have 3095 doctests, and ra-jit compiled 1739 of
+none left to rustdoc, 0 WRONG. Together they have 3095 doctests, and blaze compiled 1739 of
 the 14292 functions of the libraries; the rest are generic or inlined and are rustc's code
 in the example, as said in the third round.
 
-| crate | doctests | functions of the library from ra-jit |
+| crate | doctests | functions of the library from blaze |
 |---|---|---|
 | semver 1.0.28 | 4 | 43 of 107 |
 | either 1.19.0 | 61 | 2 of 172 |
@@ -115,17 +115,17 @@ The numbers are the same under both backends.
 
 `serde` itself has no doctests since its code moved to `serde_core`, so that is what is
 run. In `serde_core`, `chrono` and `strum` some doctests fail under cargo too when the
-crate is tested alone out of its workspace (18, 3 and 4 of them); ra-jit's run fails the
+crate is tested alone out of its workspace (18, 3 and 4 of them); blaze's run fails the
 same ones with the same compiler errors.
 
 The first run of the list had many of them different. What was wrong, all of it in how the
-examples are found and named and none of it in the code ra-jit compiled:
+examples are found and named and none of it in the code blaze compiled:
 
-- rustdoc's own lint flags (`--allow`, `--warn`, ..) made ra-jit leave the crate to rustdoc.
+- rustdoc's own lint flags (`--allow`, `--warn`, ..) made blaze leave the crate to rustdoc.
   They say nothing of how an example is built and are now passed over.
-- An example that does not name the library is not linked with it. ra-jit put its object of
+- An example that does not name the library is not linked with it. blaze put its object of
   the library on that link all the same, and its undefined references failed the link
-  (`anyhow`, `memchr`). ra-jit's object now goes only on a link that has the library.
+  (`anyhow`, `memchr`). blaze's object now goes only on a link that has the library.
 - The line of an example is counted from the first comment or attribute of the
   documentation, also for `/*! */`, for a `doc` in a `cfg_attr`, and for what a macro
   wrote, where rustdoc has the line of the macro's use.
@@ -139,7 +139,7 @@ examples are found and named and none of it in the code ra-jit compiled:
   be in that file, by its lines (`src/../README.md - ReadmeDoctests (line 52)`); before 2024 they
   are in the file of the attribute. With a comment beside the `include_str!` it is the
   comment's line that is counted from. All of that was taken from rustdoc on a small crate
-  and is what ra-jit does now.
+  and is what blaze does now.
 - In edition 2024 rustdoc names a `should_panic` example ` - should panic`.
 
 The harness had a fault of its own: the last failure block was compared together with the
@@ -149,24 +149,24 @@ list of failures after it, so two runs with the same failures in another order d
 
 A daemon that is given a link command for a program with `lto` in its profile now looks in
 it for `core` as a library (`libcore-*.rlib`, or std's shared library). rustc's LTO link has
-neither, also for a program of one crate, and ra-jit refuses with the sentence. The rows
-`lto_single` and `lto_single_linked` hand ra-jit the link line (`"handed"` in `case.json`):
+neither, also for a program of one crate, and blaze refuses with the sentence. The rows
+`lto_single` and `lto_single_linked` hand blaze the link line (`"handed"` in `case.json`):
 with the line of a build with `lto = "off"` the program is the same as cargo's, with rustc's
-LTO line ra-jit refuses. What is left is the client that links by itself (`--out` only, as
-`buildmodel.py` does for its other rows): ra-jit never sees that link and cannot say anything
+LTO line blaze refuses. What is left is the client that links by itself (`--out` only, as
+`buildmodel.py` does for its other rows): blaze never sees that link and cannot say anything
 of it, and the linker's undefined symbols are what that client gets.
 
 ### Doctests of a workspace and of another target
 
 `doctest_members` runs `cargo test --doc -p app -p util` where `app` uses `util` (8
-examples, 3 of the 4 library functions from ra-jit; the fourth is generic). `doctest_cross`
+examples, 3 of the 4 library functions from blaze; the fourth is generic). `doctest_cross`
 runs the doctests with `--target aarch64-unknown-linux-gnu` under qemu, with examples
 marked `ignore-aarch64` and `ignore-x86_64` (4 examples, 2 of 2 functions). Both are the
 same as cargo's under both backends.
 
 ### Overflow checks and what rustc built before an edit
 
-In a program whose crates differ in `overflow-checks`, ra-jit reads from rustc's objects
+In a program whose crates differ in `overflow-checks`, blaze reads from rustc's objects
 which crate holds each copy of a function. That is only true of the source rustc built. The
 case `overflow_checks_stale` has a function of a package that checks, called from one that
 does not; an edit makes it small enough for rustc to compile it in its caller, where it
@@ -200,23 +200,23 @@ profiles, feature flags and `RUSTFLAGS` away from cargo, each in its own way. Wh
   dropped for it, and `Invocation::selection` now carries the packages named with `-p` and
   `--workspace`, which the drop-in had started to hand to the daemon.
 - `cargo/plan.rs` keeps this branch's rule that a crate built with LTO is cargo's when
-  `cargo ra-jit` runs cargo itself; the drop-in's new rule for test harnesses is kept as it
+  `blaze` runs cargo itself; the drop-in's new rule for test harnesses is kept as it
   came.
 - The key of a store entry has both additions: each field written with its length (the
   security round) and the program an entry is of when crates differ in `overflow-checks`
   (this branch). The identity of such a program is made from the crates' content ids, which
-  the security round made 32 bytes; the tag of the key moved to `ra-jit entry 8`.
+  the security round made 32 bytes; the tag of the key moved to `blaze entry 8`.
 - The drop-in now gives every cargo it runs the wrapper's variables, so that the cargo of
-  `cargo ra-jit test --doc` does not build the workspace a second time. ra-jit in rustdoc's
+  `blaze test --doc` does not build the workspace a second time. blaze in rustdoc's
   place saw those variables and took itself for the rustc wrapper; every doc test run ended
   in "No such file or directory". `main` now tells the two apart by what cargo gives each:
-  rustc's path first to the wrapper, flags alone to rustdoc. `cargo_ra_jit.py` caught it (5
+  rustc's path first to the wrapper, flags alone to rustdoc. `blaze_cli.py` caught it (5
   flag cases under each of cold, warm and edit).
-- `cargo_ra_jit.py` has both sides' cases. The program of its workspace prints three lines
+- `blaze_cli.py` has both sides' cases. The program of its workspace prints three lines
   for this branch's cases, so the checks of the daemon's life that compared its whole output
   with one line now compare the first line.
 
-`selects.py` failed once in CI on `ra-jit-collate` (run 39086041463, LLVM leg) with two
+`selects.py` failed once in CI on `blaze-collate` (run 39086041463, LLVM leg) with two
 markers on one line: "build script of devdepbuild script of dep". The scripts wrote their
 line with `writeln!` to a file opened for appending, which is two writes, the text and then
 the newline (seen with `strace`), and cargo runs build scripts at the same time. The line
@@ -224,7 +224,7 @@ is now written in one write. The selection itself was right.
 
 ## Third round
 
-Starts from `ra-jit-collate` at 1547078a30 merged in (c41ee3294c).
+Starts from `blaze-collate` at 1547078a30 merged in (c41ee3294c).
 
 ### 1. Overflow checks where rustc picks the copy
 
@@ -247,27 +247,27 @@ each instance:
   uses it, and so is a small plain leaf function, which rustc decides by itself to make
   inlinable across crates.
 
-What ra-jit does now. ra-jit keeps one copy per instance and setting, rustc one per crate, so
-ra-jit has to know which crate's copy a call would have reached. The v0 symbol of a copy ends
-with the crate that instantiated it, and ra-jit reads that from rustc's objects
+What blaze does now. blaze keeps one copy per instance and setting, rustc one per crate, so
+blaze has to know which crate's copy a call would have reached. The v0 symbol of a copy ends
+with the crate that instantiated it, and blaze reads that from rustc's objects
 (`symbols.rs`, `codegen/settled.rs`):
 
-- When the instance has a name ra-jit can spell and rustc's objects hold a copy of it, the
+- When the instance has a name blaze can spell and rustc's objects hold a copy of it, the
   call takes the setting of the crate whose object holds the copy the asking crate links to.
 - A plain function with no symbol exported from the crate it is written in was compiled into
   its users, so it takes the asking crate's setting. That is the release case.
-- When ra-jit cannot tell, the function that makes the call is refused and left to rustc,
-  with the reason in the report. That happens when the instance has no name ra-jit can spell
+- When blaze cannot tell, the function that makes the call is refused and left to rustc,
+  with the reason in the report. That happens when the instance has no name blaze can spell
   and a crate with a different setting made a copy of a function of that name (for a
   closure, of the function it is written in), or when two crates with the same setting
   would reach copies that check differently.
 
 I chose "observe, else refuse" over "refuse every program with mixed settings" because the
 first is right for everything it builds and still builds most of it: in the `keys.py`
-fixture 8 functions over the mixed cases are refused and the rest are ra-jit's.
+fixture 8 functions over the mixed cases are refused and the rest are blaze's.
 
 A program whose crates differ in overflow checks has its settings in every store key
-(`Entry::key`, namespace "ra-jit entry 7"), since what a call resolves to is no longer a
+(`Entry::key`, namespace "blaze entry 7"), since what a call resolves to is no longer a
 function of the caller's name alone.
 
 Not closed: the evidence is rustc's last build. An edit that adds a new instantiation, or
@@ -299,9 +299,9 @@ new member. All steps match cargo.
 
 ### 4. Doctests
 
-Implemented (`crates/ra-jit/src/doctest.rs`, `doctest/extract.rs`, `doctest/program.rs`).
-ra-jit stands in for rustdoc: cargo runs `$RUSTDOC --test`, and `cargo ra-jit test` and
-`cargo ra-jit test --doc` set that to ra-jit. Anything that is not `--test` goes to the real
+Implemented (`crates/blaze-engine/src/doctest.rs`, `doctest/extract.rs`, `doctest/program.rs`).
+blaze stands in for rustdoc: cargo runs `$RUSTDOC --test`, and `blaze test` and
+`blaze test --doc` set that to blaze. Anything that is not `--test` goes to the real
 rustdoc.
 
 - Extraction walks the crate in hir and reads each item's docs through rust-analyzer's
@@ -310,9 +310,9 @@ rustdoc.
   `should_panic`, `compile_fail` with error codes, `edition20xx`, hidden `#` lines, `##`,
   the `fn main` put around an example, the `Result` form that ends in `(())`, the injected
   `extern crate`, and crate-level attributes written in the example.
-- Each example is a program of its own. rustc compiles the example's text; ra-jit builds the
+- Each example is a program of its own. rustc compiles the example's text; blaze builds the
   library once and its object is linked ahead of rustc's library in every example. So the
-  example's own `main` is rustc's code and the library under it is ra-jit's.
+  example's own `main` is rustc's code and the library under it is blaze's.
 - The output is libtest's: the same test names, suffixes, failure block and exit status.
 
 Measured against `cargo test --doc`:
@@ -320,24 +320,24 @@ Measured against `cargo test --doc`:
 - the `doctest` case (21 examples, including one that fails): same under both backends;
 - `harness/doctests.py` on three crates from crates.io, comparing every test line and the
   exit status: semver 1.0.28 (4 doctests), either 1.19.0 (61), smallvec 1.16.3 (14), same
-  under both backends. Of the library's functions ra-jit compiled 43 of 107 in semver, 2 of
+  under both backends. Of the library's functions blaze compiled 43 of 107 in semver, 2 of
   172 in either and 2 of 170 in smallvec. In either the other 170 are reported as "no rustc
   symbol for function": they are generic, and their copies are made by rustc in the
   example's crate, which is rustc's code. So for either and smallvec this shows the extraction and the
-  programs are right, and says little about ra-jit's code.
+  programs are right, and says little about blaze's code.
 
 `either` found a crash in rust-analyzer's docs source map on an item whose docs have no
 written line (`hir-def/src/attrs/docs.rs`, an unchecked `- 1`); fixed.
 
 Not compared: the text of compiler errors of a `compile_fail` example, and timing lines.
-When ra-jit cannot build the library it says `ra-jit: the doctests are left to rustdoc:` with
+When blaze cannot build the library it says `blaze: the doctests are left to rustdoc:` with
 the reason and runs rustdoc.
 
 ### 5. `lto`
 
 What it would mean: with `lto = "thin"` or `"fat"` rustc keeps bitcode in every library and
 compiles the program again from that bitcode as it links, so it can inline and specialise
-across crates. ra-jit compiles each function alone and has no step at which it sees the whole
+across crates. blaze compiles each function alone and has no step at which it sees the whole
 program, so there is nothing for it to do with the setting.
 
 Is taking it and doing nothing observably different from rustc, other than in speed and
@@ -345,36 +345,36 @@ size? For a program without undefined behaviour, no: LTO is an optimisation and 
 the program does. Two things do differ and neither is the program's behaviour:
 
 - The link. rustc's LTO link line has no libraries on it, only the object it made from
-  bitcode, so ra-jit's functions have nothing to be linked against by name. ra-jit therefore
+  bitcode, so blaze's functions have nothing to be linked against by name. blaze therefore
   needs a link line from a build with `lto = "off"`. Given one, it accepts the profile and
   prints `lto: accepted, no cross-function optimization`. Given rustc's LTO link line it
   refuses and says so.
 - `-C lto` in `RUSTFLAGS` rather than in a profile is still refused: cargo does not know
   about it and builds libraries that cannot be linked the ordinary way.
 
-So the rows are: `lto_fat` and `lto_thin` supported (the reference is cargo with LTO, ra-jit
+So the rows are: `lto_fat` and `lto_thin` supported (the reference is cargo with LTO, blaze
 links against the same project built with `--config profile.release.lto="off"`, the outputs
 are the same and the sentence is checked), and `lto_fat_linked` and `lto_thin_linked`
-refused. `cargo ra-jit` runs cargo itself, so with `lto` in the profile there is no ordinary
+refused. `blaze` runs cargo itself, so with `lto` in the profile there is no ordinary
 link line and the program is left to cargo with "`x` is built with LTO".
 
 Open: when the program is a single crate there is no library of the workspace whose absence
-shows the link was an LTO one, and a client that hands ra-jit an LTO link line gets the
-linker's undefined-symbol error instead of ra-jit's sentence. The harness has no row for it.
+shows the link was an LTO one, and a client that hands blaze an LTO link line gets the
+linker's undefined-symbol error instead of blaze's sentence. The harness has no row for it.
 
 ### 6. One plan
 
-There is one reader of cargo's unit graph, `crates/ra-jit/src/plan.rs`, and one description
+There is one reader of cargo's unit graph, `crates/blaze-engine/src/plan.rs`, and one description
 of which build is meant, `plan::Selection` (profile, features, `--no-default-features`,
 `--all-features`, packages, `--workspace`, target, dev dependencies). The daemon's arguments
-hold a `Selection`, `cargo ra-jit` makes one from its command line and hands it to its worker
+hold a `Selection`, `blaze` makes one from its command line and hands it to its worker
 (`WorkerConfig.selection`), and `Selection::flags` is the only place that turns it into
 cargo arguments. Rustflags come from one place too (`Flags::of`), read from the client's
 environment and configuration.
 
-Because `cargo ra-jit` now uses the daemon's plan, it no longer sends these to cargo: other
+Because `blaze` now uses the daemon's plan, it no longer sends these to cargo: other
 profiles than dev, `--all-features`, `--no-default-features`, `RUSTFLAGS`, `opt-level`,
-`panic = "abort"`, `-C target-cpu` and `-C target-feature`. `cargo_ra_jit.py`'s workspace
+`panic = "abort"`, `-C target-cpu` and `-C target-feature`. `blaze_cli.py`'s workspace
 was changed so these can be told apart in the output (it prints `cfg!(debug_assertions)`, a
 cfg from `RUSTFLAGS`, a target feature and the result of an overflow; release is
 `panic = "abort"`) and has six new commands.
@@ -386,12 +386,12 @@ leave a program to cargo (LTO, coverage, PGO, `-Z`).
 
 ### 7. Clippy and style
 
-`cargo clippy -p ra-jit -p hir-ty -p hir-def --all-targets -- --cap-lints warn` gave 305
+`cargo clippy -p blaze-engine -p hir-ty -p hir-def --all-targets -- --cap-lints warn` gave 305
 warnings. A warning is "new" when a line it points at was written on this branch (by `git
 blame` against the commits of the three rounds, or not committed yet): 12 new, 293 old. The
 12 are fixed: one unused `mut`; four `Command::new` (now one function, `doctest::as_asked`,
 that says why `toolchain::command` is wrong there: it adds a variable to the environment an
-example can read); seven `eprintln!`, by allowing `clippy::print_stderr` for the `ra-jit`
+example can read); seven `eprintln!`, by allowing `clippy::print_stderr` for the `blaze`
 binary, whose output that is. That also silences 60 or so old ones of the same kind; 234
 remain, all old.
 
@@ -467,8 +467,8 @@ given, because the client has just sent a link line from a fresh cargo build.
 
 ### 2. Debug info from the unit graph
 
-`crates/ra-jit/src/profile.rs`, which read `Cargo.toml` itself, is deleted, and the `toml`
-dependency of `ra-jit` with it. `Plan::debug()` in `plan.rs` says whether the packages the
+`crates/blaze-engine/src/profile.rs`, which read `Cargo.toml` itself, is deleted, and the `toml`
+dependency of `blaze` with it. `Plan::debug()` in `plan.rs` says whether the packages the
 build was asked for have debug info, from the profile of their units in cargo's unit graph,
 with `-g` and `-C debuginfo=` of the rustflags over it. That sees `.cargo/config.toml`
 profiles and per-package overrides because cargo has already applied them. It is kept per
@@ -499,10 +499,10 @@ Known differences at the end of this round (the first two are closed in the thir
 
 - With `-Z share-generics`, which is on by default at `opt-level` 0, rustc may reuse an
   instantiation that an upstream crate already made, with the upstream crate's setting.
-  ra-jit always uses the setting of the crate that asks. The fixtures do not show a
+  blaze always uses the setting of the crate that asks. The fixtures do not show a
   difference; a program built so that it depends on which copy rustc reuses could.
 - In release rustc can decide by itself that a small non-generic function is inlinable
-  across crates and compile it in the caller, with the caller's setting. ra-jit goes by
+  across crates and compile it in the caller, with the caller's setting. blaze goes by
   `#[inline]` only. The fixture's function for "defined in the dependency" is
   `#[inline(never)]` for that reason.
 - The `ub_checks` intrinsic is a constant false, as before.
@@ -527,7 +527,7 @@ The first run of the suite, before any fix, had 19 WRONG rows of 87 under Cranel
 
 Fixed at the root:
 
-- Profiles. ra-jit had no notion of one and compiled everything as dev. It now takes
+- Profiles. blaze had no notion of one and compiled everything as dev. It now takes
   `--release` and `--profile`, asks cargo for the unit graph of the build (`plan.rs`), and
   gives each package the `debug_assertions`, overflow checks and panic strategy cargo builds
   it with. Those are part of the crate's cfg, so of its hash in `content.rs`, and the
@@ -543,7 +543,7 @@ Fixed at the root:
 - `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and `[build] rustflags` / `[target.<triple>]
   rustflags` of `.cargo/config.toml`. `-C debug-assertions`, `-C overflow-checks`,
   `-C panic` and `-C opt-level` come after the profile's flags on rustc's command line and
-  win; ra-jit ignored them. They are now read the way cargo orders them and applied over the
+  win; blaze ignored them. They are now read the way cargo orders them and applied over the
   profile of every package.
 - `--features`, `--no-default-features`, `--all-features`, `-p` and `--workspace`. The
   features of a package are now those of the unit cargo builds, not those of `cargo
@@ -555,7 +555,7 @@ Fixed at the root:
 - `--target aarch64-unknown-linux-gnu`: `std::env::consts::ARCH` printed
   `UNRESOLVED_ENV_VAR`, because the build script of `std`, which sets `STD_ENV_ARCH`, is
   never run. The variable is now set on the sysroot's `std` from the target's cfg.
-- `#![no_main]`: ra-jit wrote a `main` that calls `lang_start` for any crate with a function
+- `#![no_main]`: blaze wrote a `main` that calls `lang_start` for any crate with a function
   named `main` at its root, which is wrong for a crate that exports its own. A crate with
   `#![no_main]` gets none.
 - `#![no_std]` binary that defines `rust_eh_personality` itself (the usual way on stable):
@@ -570,7 +570,7 @@ dealt with (per-package overflow checks, `[target.'cfg(..)'] rustflags`, changes
 needed a restart, doctests).
 
 Two rows are refusals by cargo itself (`env!` of an unset variable, a `rust-version` newer
-than the toolchain); the case checks that ra-jit turns the project down too.
+than the toolchain); the case checks that blaze turns the project down too.
 
 ## What is measured and what is inferred
 
@@ -579,10 +579,10 @@ Measured: the table below; the regression gate; `keys.py`.
 Inferred, not measured:
 
 - "supported" for `opt-level`, `codegen-units` and `strip` means the program behaves the
-  same. ra-jit's own optimisation level is its own (`BLAZE_OPT`), not the profile's, and the
+  same. blaze's own optimisation level is its own (`BLAZE_OPT`), not the profile's, and the
   suite does not compare speed or size.
 - `-C target-cpu` and `-C target-feature` are supported in that `cfg(target_feature)` and
-  the program's output agree with rustc. Whether ra-jit's backends emit the wider
+  the program's output agree with rustc. Whether blaze's backends emit the wider
   instructions was not looked at.
 - The cross rows run under qemu (aarch64) and natively (musl). Other targets were not run.
 - The points marked as inferred under "A checkout is loaded again in place" and the known
@@ -595,9 +595,9 @@ Inferred, not measured:
   move a copy) would let most edits through. Generic code that std ships a copy of was not
   examined.
 - `lto`: a client that links by itself with rustc's LTO link line gets the linker's error;
-  ra-jit only sees a link command it is given. `-C lto` in `RUSTFLAGS` is refused.
+  blaze only sees a link command it is given. `-C lto` in `RUSTFLAGS` is refused.
 - Doctests: rustdoc prints nothing of the errors of a `compile_fail` example that fails to
-  compile as it should, so those are not compared; where ra-jit cannot build the library the
+  compile as it should, so those are not compared; where blaze cannot build the library the
   examples are left to rustdoc with the reason printed (none of the 30 crates).
 - `cargo/units.rs` still keeps its own records of what rustc was run with (it does not read
   the unit graph), and `cargo/plan.rs` plans the link from them.
@@ -609,11 +609,11 @@ Inferred, not measured:
 Done and measured under both backends: everything in this report up to and including the
 merge of 14ee89181b, with the whole gate in the table below.
 
-Half done: the merges after that. `ra-jit-collate` 3d47ed59bf is merged (094c139694, one
-conflict in the flag cases of `harness/cargo_ra_jit.py`; both sides' cases are kept, and the
+Half done: the merges after that. `blaze-collate` 3d47ed59bf is merged (094c139694, one
+conflict in the flag cases of `harness/blaze_cli.py`; both sides' cases are kept, and the
 case with `-C target-cpu=x86-64-v3` only runs on an x86-64 host). The whole Cranelift leg
 passed on that merge; its LLVM leg was stopped after `buildmodel.py` (105 of 105) to merge
-the next head. `ra-jit-collate-next` 1b022ff6f2 is merged on top (03e4d294df, conflicts in
+the next head. `blaze-collate-next` 1b022ff6f2 is merged on top (03e4d294df, conflicts in
 `codegen.rs`, `codegen/cached.rs`, `cargo/plan.rs`, `main.rs`, `outline.rs`, `symbols.rs`).
 What was kept: both sides' additions to `SymbolResolver`; the timed store read with this
 branch's program identity in the key; `LinkLine::command` with this branch's signature (the
@@ -628,7 +628,7 @@ stopped; the MSVC link path of `LinkLine::command` is only covered by its unit t
 What would come next, in order: the LLVM leg of the gate on the head; then the open items
 above (generic copies of the standard library in programs that differ in
 `overflow-checks`; `cargo/units.rs` reading the planner's unit graph; `Flags::of` without
-the unstable `cargo config get`; `cargo ra-jit` with `lto` in the profile; diagnostic text
+the unstable `cargo config get`; `blaze` with `lto` in the profile; diagnostic text
 of `compile_fail` doctests).
 
 The fix of the build-script markers of `selects.py` (one write for a line) is in, since
@@ -662,7 +662,7 @@ it by the unit test alone). Every harness of the gate passed:
 | `python3 selects.py` | 3 of 3 right |
 | `python3 remote.py` | 117 of 117 right |
 | `python3 fuzz/fuzz.py smoke --backends cranelift` | exit 0 |
-| `python3 cargo_ra_jit.py --only-checks` | PASS |
+| `python3 blaze_cli.py --only-checks` | PASS |
 | `python3 doctests.py` | 30 same, 0 refused, 0 WRONG |
 
 ## Regression gate
@@ -671,20 +671,20 @@ The table of this section is of the merge of 14ee89181b, the last head both legs
 
 
 Run from `harness/` with `BLAZE_BIN` set to the release binary built with `--features llvm`
-from the head of the branch (the merge of `ra-jit-collate` 14ee89181b and the fix of ra-jit in
+from the head of the branch (the merge of `blaze-collate` 14ee89181b and the fix of blaze in
 rustdoc's place after it), once with `BLAZE_BACKEND=cranelift` and once with
 `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`, one after the other. The numbers were the
 same under both.
 
-The Cranelift leg ran on the binary of the merge itself, where `cargo_ra_jit.py` and
-`doctests.py` failed on ra-jit taking itself for the rustc wrapper. Those two were run again
+The Cranelift leg ran on the binary of the merge itself, where `blaze_cli.py` and
+`doctests.py` failed on blaze taking itself for the rustc wrapper. Those two were run again
 under Cranelift on the fixed binary and pass; the other Cranelift rows are of the binary
-before the fix, which changes only which part of ra-jit answers when cargo runs it as
+before the fix, which changes only which part of blaze answers when cargo runs it as
 rustdoc. The whole LLVM leg ran on the fixed binary.
 
 | command | result |
 |---|---|
-| `python3 difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822/822 functions from ra-jit, 0 of 893 layouts differ |
+| `python3 difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822/822 functions from blaze, 0 of 893 layouts differ |
 | `python3 backends.py corpus runner cases --bin runner --levels 2f` (LLVM leg) | the program prints the same as cargo's; LLVM produced 11801 of 11801 functions (100%) |
 | `python3 programs.py` | 22 of 22 right |
 | `python3 stress.py` | 99 of 99 right, 0 restarts |
@@ -705,13 +705,13 @@ rustdoc. The whole LLVM leg ran on the fixed binary.
 | `python3 storeguards.py` | all right |
 | `python3 selects.py` | 3 of 3 right |
 | `python3 remote.py` (MinIO in `~/s3tools/minio`) | 117 of 117 right |
-| `python3 fuzz/fuzz.py smoke --backends <backend>` | 2 programs, 505 functions compiled by ra-jit, 0 differences, 0 crashes |
-| `python3 cargo_ra_jit.py --only-checks` | PASS |
+| `python3 fuzz/fuzz.py smoke --backends <backend>` | 2 programs, 505 functions compiled by blaze, 0 differences, 0 crashes |
+| `python3 blaze_cli.py --only-checks` | PASS |
 | `cargo fmt --all -- --check` | clean |
-| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p ra-jit` | 1021 passed, 0 failed |
+| `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p blaze-engine` | 1021 passed, 0 failed |
 
-The open cases of `breakers.py` came with `ra-jit-collate` and are not of this work.
-`cargo_ra_jit.py` was run without its timings of real projects. Clippy on `ra-jit` has no
+The open cases of `breakers.py` came with `blaze-collate` and are not of this work.
+`blaze_cli.py` was run without its timings of real projects. Clippy on `blaze` has no
 warning in the lines this round touched.
 
 ## The table
@@ -733,7 +733,7 @@ One row per case. "invalidation" is what each step of the case came to under one
 | crate type `cdylib` | `crate_cdylib` | both | supported |  |  |
 | crate type `dylib` | `crate_dylib` | both | supported |  |  |
 | crate types `dylib` and `rlib` together | `crate_dylib_rlib` | both | supported |  |  |
-| crate type `proc-macro` (rustc's build of it is loaded; its expansion is compiled by ra-jit) | `crate_proc_macro` | both | supported |  |  |
+| crate type `proc-macro` (rustc's build of it is loaded; its expansion is compiled by blaze) | `crate_proc_macro` | both | supported |  |  |
 | crate type `rlib` | `crate_rlib` | both | supported |  |  |
 | crate type `staticlib` | `crate_staticlib` | both | supported |  |  |
 | `--target aarch64-unknown-linux-gnu` | `cross_aarch64` | both | supported |  |  |
@@ -768,12 +768,12 @@ One row per case. "invalidation" is what each step of the case came to under one
 | integration tests | `integration_test` | both | supported |  |  |
 | `links` and `DEP_<name>_<key>` metadata | `links` | both | supported |  |  |
 | `lto = true` | `lto_fat` | both | supported |  |  |
-| `lto = true`, and what ra-jit links against built with it | `lto_fat_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: ra-jit links against a build with `lto = "off"` |  |
+| `lto = true`, and what blaze links against built with it | `lto_fat_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: blaze links against a build with `lto = "off"` |  |
 | `lto = "off"` | `lto_off` | both | supported |  |  |
-| `lto = true` in a program of one crate, ra-jit given the link line | `lto_single` | both | supported |  |  |
-| `lto = true` in a program of one crate, ra-jit given the link line built with it | `lto_single_linked` | both | refused | the link command has no library of `core`, as rustc's has not with `lto`: ra-jit links against a build with `lto = "off"` |  |
+| `lto = true` in a program of one crate, blaze given the link line | `lto_single` | both | supported |  |  |
+| `lto = true` in a program of one crate, blaze given the link line built with it | `lto_single_linked` | both | refused | the link command has no library of `core`, as rustc's has not with `lto`: blaze links against a build with `lto = "off"` |  |
 | `lto = "thin"` | `lto_thin` | both | supported |  |  |
-| `lto = "thin"`, and what ra-jit links against built with it | `lto_thin_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: ra-jit links against a build with `lto = "off"` |  |
+| `lto = "thin"`, and what blaze links against built with it | `lto_thin_linked` | both | refused | rustc linked the program without a library of `dep`, as it does with `lto`: blaze links against a build with `lto = "off"` |  |
 | proc macro: attribute | `macro_attribute` | both | supported |  |  |
 | proc macro: derive, with a dependency of its own | `macro_derive` | both | supported |  |  |
 | proc macro: function-like | `macro_function` | both | supported |  |  |

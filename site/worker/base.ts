@@ -6,7 +6,7 @@
  * and as dist/ is laid out; `index.ts` strips the base on the way in. Anything going back to the browser as a path
  * (a Location, a cookie's Path, an OAuth redirect_uri) goes through `outer`.
  *
- * Any other host the worker is reached on (the custom domains ra-jit.ix.dev and blaze.ix.dev, the site's old homes)
+ * Any other host the worker is reached on (the custom domains blaze.ix.dev and blaze.ix.dev, the site's old homes)
  * is answered with a redirect to the same path and query under ORIGIN + BASE. localhost (`wrangler dev`) is served.
  */
 import siteJson from '../.gen/site.json';

@@ -1,7 +1,7 @@
 # The fuzzer
 
 Every other harness runs programs somebody wrote. The fuzzer makes programs up, builds each
-with cargo and with ra-jit, and compares what they print. It found twenty-one bugs the other
+with cargo and with blaze, and compares what they print. It found twenty-one bugs the other
 harnesses had not, most of them miscompiles, so it is worth knowing how to run it and what
 it does not cover. The full account, with every finding, is in
 [reports/FUZZ.md](reports/FUZZ.md).
@@ -9,12 +9,12 @@ it does not cover. The full account, with every finding, is in
 ## Running it
 
     cd harness
-    export BLAZE_BIN=$PWD/../target/release/ra-jit
+    export BLAZE_BIN=$PWD/../target/release/blaze-engine
     python3 fuzz/fuzz.py smoke                                  # 2 programs, fixed seed; in CI
     python3 fuzz/store.py                                       # asm changes, cold and warm store; in CI
     python3 fuzz/fuzz.py run --seed S --rounds N --jobs 8 --out DIR
     python3 fuzz/fuzz.py repro S-ROUND [CASE ...]               # one program again, or some of its cases
-    python3 fuzz/fuzz.py check fuzz/found/*.rs                  # every stored reduction against this ra-jit
+    python3 fuzz/fuzz.py check fuzz/found/*.rs                  # every stored reduction against this blaze
     python3 fuzz/fuzz.py report DIR [--coverage]                # add up the logs of a run
 
 By default each program is built under both backends, so `BLAZE_BIN` should be a build with
@@ -33,7 +33,7 @@ On failure the script prints and keeps its work directory, including each smoke 
 first round), `--reduce` (seconds a reduction may take, 0 to only count) and `--work`
 (where the programs are built).
 
-A round is one program of about 290 functions. It costs one cargo build and one ra-jit build
+A round is one program of about 290 functions. It costs one cargo build and one blaze build
 per backend. The smoke run took 31 s under Cranelift and 53 s under LLVM on the machine
 these documents were checked on. A full-size run of 360 programs is long; use `--jobs`.
 
@@ -72,8 +72,8 @@ only `std`.
 
 - A case whose line differs from cargo's: the checksum, the panic location, the panic
   message, whether it panics, or the program dying.
-- A function ra-jit's report lists as left to rustc.
-- A ra-jit build that did not finish.
+- A function blaze's report lists as left to rustc.
+- A blaze build that did not finish.
 
 Each finding is reduced in two steps, first over the cases of the program and then over the
 lines of the one case left, keeping a candidate only while rustc still accepts it and the
@@ -101,10 +101,10 @@ only on AArch64. Most were miscompiles: the program ran and did the wrong thing.
 of those were the order in which temporaries and partly moved values are dropped, in
 `if let`, `let ... else`, `match` guards, `for` loops in tail position and when an operand
 panics. One was an index that was not bounds-checked when its value was unused. The rest
-were wrong panic text and functions ra-jit refused.
+were wrong panic text and functions blaze refused.
 
-Eighteen are fixed. Two are worked around and look like LLVM bugs rather than ra-jit's: an
-array of `i128` rows left partly unwritten, which ra-jit avoids by turning a vectoriser pass
+Eighteen are fixed. Two are worked around and look like LLVM bugs rather than blaze's: an
+array of `i128` rows left partly unwritten, which blaze avoids by turning a vectoriser pass
 off, and a crash while unwinding on AArch64 at `-O2`. One is open and listed in
 [support.md](support.md): the text of a long `assert!` condition.
 

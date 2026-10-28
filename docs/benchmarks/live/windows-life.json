@@ -1632,7 +1632,7 @@
    "keys run by a patch": 50,
    "keys run by a restart": 27,
    "keys that compile": 77,
-   "keys that compile and ra-jit refused": 2,
+   "keys that compile and blaze refused": 2,
    "keys that do not compile": 214,
    "patch for no program (the executable was linked again)": 9,
    "patch that asked for a restart": 28,
@@ -1724,13 +1724,13 @@
      "round": 0,
      "key": 45,
      "asked after": true,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 46,
      "asked after": true,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
@@ -1754,7 +1754,7 @@
      "round": 0,
      "key": 0,
      "ms": 26.656,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=1 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=1 files=1 ms=23"
     },
     {
      "round": 0,
@@ -1808,37 +1808,37 @@
      "round": 0,
      "key": 9,
      "ms": 30.286,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=2 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=2 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 10,
      "ms": 30.66,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 11,
      "ms": 28.475,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 12,
      "ms": 25.239,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
     },
     {
      "round": 0,
      "key": 13,
      "ms": 26.27,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
     },
     {
      "round": 0,
      "key": 14,
      "ms": 29.452,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
     },
     {
      "round": 0,
@@ -1850,43 +1850,43 @@
      "round": 0,
      "key": 16,
      "ms": 26.173,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 17,
      "ms": 25.344,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
     },
     {
      "round": 0,
      "key": 18,
      "ms": 28.589,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 19,
      "ms": 29.449,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=25"
     },
     {
      "round": 0,
      "key": 20,
      "ms": 29.614,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 21,
      "ms": 24.774,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=3 files=1 ms=22"
     },
     {
      "round": 0,
      "key": 22,
      "ms": 28.41,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
@@ -1898,235 +1898,235 @@
      "round": 0,
      "key": 24,
      "ms": 28.797,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 25,
      "ms": 30.824,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 26,
      "ms": 27.453,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 27,
      "ms": 50.329,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 28,
      "ms": 34.278,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=27"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=27"
     },
     {
      "round": 0,
      "key": 29,
      "ms": 26.339,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 30,
      "ms": 42.021,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 31,
      "ms": 28.955,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
     },
     {
      "round": 0,
      "key": 32,
      "ms": 26.45,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 33,
      "ms": 26.053,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 34,
      "ms": 25.684,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 35,
      "ms": 27.96,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 36,
      "ms": 27.573,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 37,
      "ms": 25.99,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 38,
      "ms": 48.137,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=22"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=22"
     },
     {
      "round": 0,
      "key": 39,
      "ms": 26.815,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 40,
      "ms": 27.6,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 41,
      "ms": 26.117,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 42,
      "ms": 33.17,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=26"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=26"
     },
     {
      "round": 0,
      "key": 43,
      "ms": 27.158,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 44,
      "ms": 195.207,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 47,
      "ms": 28.416,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
     },
     {
      "round": 0,
      "key": 48,
      "ms": 43.337,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 49,
      "ms": 27.232,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 50,
      "ms": 27.023,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 51,
      "ms": 25.812,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 52,
      "ms": 60.983,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=22"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=22"
     },
     {
      "round": 0,
      "key": 53,
      "ms": 30.077,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 54,
      "ms": 25.848,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 55,
      "ms": 27.937,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
     },
     {
      "round": 0,
      "key": 56,
      "ms": 42.891,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=29"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=29"
     },
     {
      "round": 0,
      "key": 57,
      "ms": 27.14,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 58,
      "ms": 51.723,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=36"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=36"
     },
     {
      "round": 0,
      "key": 59,
      "ms": 29.853,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 60,
      "ms": 26.698,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 61,
      "ms": 47.868,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 62,
      "ms": 30.072,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 63,
      "ms": 26.444,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 64,
      "ms": 194.318,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
     },
     {
      "round": 0,
@@ -2234,13 +2234,13 @@
      "round": 0,
      "key": 82,
      "ms": 29.807,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
     },
     {
      "round": 0,
      "key": 83,
      "ms": 27.279,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=23"
     },
     {
      "round": 0,
@@ -2906,13 +2906,13 @@
      "round": 0,
      "key": 194,
      "ms": 61.052,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=54"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=54"
     },
     {
      "round": 0,
      "key": 195,
      "ms": 29.163,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=10 files=1 ms=25"
     },
     {
      "round": 0,
@@ -3068,7 +3068,7 @@
      "round": 0,
      "key": 221,
      "ms": 34.562,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=26 files=1 ms=31"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=26 files=1 ms=31"
     },
     {
      "round": 0,
@@ -3122,43 +3122,43 @@
      "round": 0,
      "key": 230,
      "ms": 33.877,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=27"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=27"
     },
     {
      "round": 0,
      "key": 231,
      "ms": 25.585,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 232,
      "ms": 32.043,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=26"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=26"
     },
     {
      "round": 0,
      "key": 233,
      "ms": 33.505,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=25"
     },
     {
      "round": 0,
      "key": 234,
      "ms": 33.386,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=27"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=27"
     },
     {
      "round": 0,
      "key": 235,
      "ms": 25.105,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 236,
      "ms": 27.831,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=24"
     },
     {
      "round": 0,
@@ -3170,37 +3170,37 @@
      "round": 0,
      "key": 238,
      "ms": 33.035,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=26"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=26"
     },
     {
      "round": 0,
      "key": 239,
      "ms": 25.111,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 240,
      "ms": 27.3,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 241,
      "ms": 25.846,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=23"
     },
     {
      "round": 0,
      "key": 242,
      "ms": 28.579,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=25 files=1 ms=24"
     },
     {
      "round": 0,
      "key": 243,
      "ms": 24.978,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=24 files=1 ms=24"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=24 files=1 ms=24"
     },
     {
      "round": 0,
@@ -3296,7 +3296,7 @@
      "round": 0,
      "key": 259,
      "ms": 243.236,
-     "answer": "cargo: `step` is not compiled by ra-jit and rustc's copy is from before the edit: unsupported: expected scalar, got Iter<'{region error}, u32> (no-rustc E, #85)"
+     "answer": "cargo: `step` is not compiled by blaze and rustc's copy is from before the edit: unsupported: expected scalar, got Iter<'{region error}, u32> (no-rustc E, #85)"
     },
     {
      "round": 0,
@@ -3416,7 +3416,7 @@
      "round": 0,
      "key": 281,
      "ms": 178.931,
-     "answer": "cargo: `step` is not compiled by ra-jit and rustc's copy is from before the edit: unsupported: expected scalar, got Filter<Iter<'{region error}, u32>, Closure(InternedClosureId(InternedClosureId { key"
+     "answer": "cargo: `step` is not compiled by blaze and rustc's copy is from before the edit: unsupported: expected scalar, got Filter<Iter<'{region error}, u32>, Closure(InternedClosureId(InternedClosureId { key"
     },
     {
      "round": 0,
@@ -3458,13 +3458,13 @@
      "round": 0,
      "key": 289,
      "ms": 28.275,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=8 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=8 files=1 ms=25"
     },
     {
      "round": 0,
      "key": 290,
      "ms": 27.98,
-     "answer": "ok patch=ra-jit\\0d868935ef68b949\\programs\\life\\patch.o functions=1 files=1 ms=25"
+     "answer": "ok patch=blaze\\0d868935ef68b949\\programs\\life\\patch.o functions=1 files=1 ms=25"
     }
    ]
   },

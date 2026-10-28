@@ -957,7 +957,7 @@ pub fn block_place(
     Some(out)
 }
 
-/// Where any function is written, block or not: for a function whose path ra-jit cannot write
+/// Where any function is written, block or not: for a function whose path blaze cannot write
 /// (an `impl` for a type it has no name for, such as `!`, `dyn Trait` or a type taking a
 /// constant), the place names it instead.
 pub fn function_place(

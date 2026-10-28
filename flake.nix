@@ -17,7 +17,7 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
-        # The one toolchain ra-jit is pinned to: the dated nightly in harness/toolchain
+        # The one toolchain blaze is pinned to: the dated nightly in harness/toolchain
         # (`nightly-YYYY-MM-DD`, moved by harness/toolchain_bump.py, which also moves the
         # rust-overlay input to one that has it). rust-src is the sysroot source rust-analyzer
         # reads `core` from.
@@ -59,7 +59,7 @@
         # scripts use. Nothing here wraps rustc (no sccache) or replaces the default linker:
         # mold and wild are on PATH for the setups that ask for them with `-fuse-ld`. Every
         # library directory here costs every link a `realpath` in Nix's linker wrapper, which
-        # cargo pays and ra-jit does not: what only one project needs goes in a shell of its own.
+        # cargo pays and blaze does not: what only one project needs goes in a shell of its own.
         bench = llvmEnv // {
           packages = [
             rust
@@ -96,7 +96,7 @@
         src = self;
         # The one version, from the workspace's Cargo.toml.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-        # The one build of ra-jit, the release workflow's recipe (.github/scripts/build_release.py):
+        # The one build of blaze, the release workflow's recipe (.github/scripts/build_release.py):
         # the `dist` profile optimized with the profile pgo/profiles.json pins for this system,
         # fetched by its sha256. The binaries run each other from next to themselves, unwrapped.
         # `--nix`: they load nixpkgs' glibc, so the release's floor of RHEL 9's glibc is not theirs
@@ -111,9 +111,9 @@
           let pin = pgo.targets.${triple} or (throw "pgo/profiles.json has no profile for ${triple}: run the pgo workflow");
           in pkgs.fetchurl { url = "${pgo.release}/${pin.name}"; inherit (pin) sha256; };
         dist = rustPlatform.buildRustPackage (llvmEnv // {
-          pname = "ra-jit-dist";
+          pname = "blaze-dist";
           inherit version src;
-          # `ra-jit --version` names the commit (a dirty tree has none of its own).
+          # `blaze-engine --version` names the commit (a dirty tree has none of its own).
           BLAZE_GIT_SHA = self.shortRev or self.dirtyShortRev or "";
           cargoLock.lockFile = ./Cargo.lock;
           # otool: build_release.py checks that no binary loads libLLVM.
@@ -137,17 +137,17 @@
         # What `nix profile install` puts on PATH: the same binaries, with the toolchain.
         daemon = pkgs.runCommand "blaze-${version}" {
           nativeBuildInputs = [ pkgs.makeWrapper ];
-          meta.mainProgram = "cargo-blaze";
+          meta.mainProgram = "blaze";
         } ''
           mkdir -p $out/bin
           for bin in ${dist}/bin/*; do
             makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin
           done
         '';
-        # `nix run github:indexable-inc/blaze#blaze -- build` is `cargo blaze build`.
+        # `blaze` with the toolchain and the other programs first on PATH.
         run = pkgs.writeShellScriptBin "blaze" ''
           export PATH=${daemon}/bin:${rust}/bin:$PATH
-          exec ${daemon}/bin/cargo-blaze blaze "$@"
+          exec ${daemon}/bin/blaze "$@"
         '';
 
         # eframe/winit dlopen these at run time.
@@ -164,8 +164,8 @@
         libPath = pkgs.lib.makeLibraryPath guiLibs;
 
         # One derivation per cargo unit (nix/units.nix, nix/units/*.json from nix/unit_graph.py):
-        # editing ra-jit's own source rebuilds only ra-jit, never the crates it depends on. The
-        # demo's window is built this way; `daemon-units` is ra-jit built this way, `release`
+        # editing blaze's own source rebuilds only blaze, never the crates it depends on. The
+        # demo's window is built this way; `daemon-units` is blaze built this way, `release`
         # without PGO, for working on the flake: what ships is `dist`.
         units = json: import ./nix/units.nix {
           inherit pkgs rust guiLibs json;
@@ -174,14 +174,14 @@
         };
         daemonUnits = units ./nix/units/daemon.json;
         lifeUnits = units ./nix/units/life.json;
-        # ra-jit's binaries run each other from next to themselves, found by
+        # blaze's binaries run each other from next to themselves, found by
         # their own path: the binaries are copied together, not wrapped or linked. The toolchain
         # has to be on PATH (the launcher puts it there).
-        daemon-units = pkgs.runCommand "ra-jit-units" { } ''
+        daemon-units = pkgs.runCommand "blaze-units" { } ''
           mkdir -p $out/bin
           cp -L ${daemonUnits.bins}/bin/* $out/bin/
         '';
-        life-bin = pkgs.runCommand "ra-jit-life-bin" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+        life-bin = pkgs.runCommand "blaze-life-bin" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
           mkdir -p $out/bin
           makeWrapper ${builtins.head lifeUnits.roots}/bin/life $out/bin/life \
             --prefix LD_LIBRARY_PATH : ${libPath}
@@ -191,12 +191,12 @@
         # time; its crates.io dependencies are vendored from Cargo.lock so that needs no network.
         lifeSource = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.unions [ ./demo/life ./crates/ra-jit-live ];
+          fileset = pkgs.lib.fileset.unions [ ./demo/life ./crates/blaze-live ];
         };
         lifeVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./demo/life/Cargo.lock; };
         # `nix run github:indexable-inc/blaze#life`: the Game of Life window. On macOS on AArch64 the
         # daemon builds the copy and edits to it show up live; elsewhere the prebuilt window runs.
-        life = pkgs.writeShellScriptBin "ra-jit-life" ''
+        life = pkgs.writeShellScriptBin "blaze-life" ''
           export BLAZE_LIFE_SOURCE=${lifeSource} BLAZE_LIFE_VENDOR=${lifeVendor}
           export BLAZE_LIFE_DAEMON_BINS=${dist}/bin BLAZE_LIFE_PREBUILT=${life-bin}/bin/life
           export BLAZE_LIFE_PATH=${rust}/bin${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":${pkgs.stdenv.cc}/bin"}
@@ -205,12 +205,10 @@
         '';
       in {
         packages = {
-          # `nix profile install github:indexable-inc/blaze`: cargo-blaze and the programs it runs, so
-          # `cargo blaze` and `cargo blaze enable` work. `#blaze` names it too, and `ra-jit` is its
-          # name from before.
+          # `nix profile install github:indexable-inc/blaze`: blaze and the programs it runs, so
+          # `blaze build` and `blaze enable` work. `#blaze` names it too.
           default = daemon;
           blaze = daemon;
-          ra-jit = daemon;
           inherit dist daemon run life daemon-units life-bin;
           # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
           # read debug info, and the prefix a build of the `llvm` feature links.
@@ -223,13 +221,9 @@
         };
         apps.life = {
           type = "app";
-          program = "${life}/bin/ra-jit-life";
+          program = "${life}/bin/blaze-life";
         };
         apps.blaze = {
-          type = "app";
-          program = "${run}/bin/blaze";
-        };
-        apps.ra-jit = {
           type = "app";
           program = "${run}/bin/blaze";
         };
@@ -259,10 +253,10 @@
         });
         devShells.bench = pkgs.mkShell bench;
         # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
-        # bun's own pinned nightly in place of ra-jit's (rust-src, which ra-jit reads `core` from), and
+        # bun's own pinned nightly in place of blaze's (rust-src, which blaze reads `core` from), and
         # what bun's own build of its C and C++ needs, as its flake.nix has it: LLVM 23 as the
         # C and C++ compiler, cmake, ninja, nasm (x86), go, a bun to run its build scripts, and on Linux lld.
-        # ra-jit itself is built in the bench shell.
+        # blaze itself is built in the bench shell.
         devShells.bench-bun = (pkgs.mkShell.override { stdenv = pkgs.llvmPackages_23.stdenv; }) {
           packages = [
             (pkgs.rust-bin.nightly."2026-09-15".default.override { extensions = [ "rust-src" ]; })

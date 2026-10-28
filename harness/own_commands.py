@@ -5,8 +5,8 @@ cargo's, over workspaces. cargo is the oracle; blaze never runs it outside this 
 usage: own_commands.py [--blaze BIN] [--out FILE] DIR...
 
 Each DIR is a workspace with its Cargo.lock, whose packages are fetched already. In each, every
-case of CASES is run as `cargo ARGS` and as `BIN cargo ARGS` (BIN: `ra-jit`, default
-`target/release/ra-jit`), and standard output (as JSON for the commands that print JSON),
+case of CASES is run as `cargo ARGS` and as `BIN cargo ARGS` (BIN: `blaze`, default
+`target/release/blaze-engine`), and standard output (as JSON for the commands that print JSON),
 standard error and the exit status compared. The `clean` cases run in two copies of a made-up
 target directory, one for each, and compare what each says it removed and what is left.
 `cargo tree` has harness/own_tree.py.
@@ -117,7 +117,7 @@ def left(dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     opts = ap.parse_args()
     cases = []

@@ -1,6 +1,6 @@
 //! library/alloctests str.rs, `const_str_ptr`: a pointer a constant holds to another
 //! constant's value and a pointer the function makes to that value are equal under rustc,
-//! which keeps one copy of equal read-only bytes. ra-jit did not know the alignment the
+//! which keeps one copy of equal read-only bytes. blaze did not know the alignment the
 //! constant's memory was made with, gave it the most a value could need, and so did not take
 //! it for the same bytes at the alignment of their type.
 

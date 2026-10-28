@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""own_report.py: `cargo blaze report` against `cargo report`. cargo is the oracle; blaze never
+"""own_report.py: `blaze report` against `cargo report`. cargo is the oracle; blaze never
 runs it outside this harness.
 
 usage: own_report.py [--blaze BIN] [--out FILE]
 
 A made-up package is given the file builds leave their future-incompatibility reports in,
 written here as cargo writes it (two reports, colored, one with a terminal link), and each
-case runs `cargo report ARGS` and `BIN cargo report ARGS` (BIN: `ra-jit`, default
-`target/release/ra-jit`) in it, comparing the exit status, standard output and standard
+case runs `cargo report ARGS` and `BIN cargo report ARGS` (BIN: `blaze`, default
+`target/release/blaze-engine`) in it, comparing the exit status, standard output and standard
 error. A case may first change the package: no reports, a file of a later cargo, one that is
 not JSON, or a `build.build-dir` the reports are in.
 """
@@ -89,13 +89,13 @@ CASES = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     opts = ap.parse_args()
     cases = []
     for args, first in CASES:
         outs = {}
-        for who in ("cargo", "blaze"):
+        for who in ("blaze"):
             work = tempfile.mkdtemp(prefix="own-report-")
             pkg = os.path.join(work, "pkg")
             write(os.path.join(pkg, "Cargo.toml"), "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")

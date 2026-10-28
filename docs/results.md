@@ -8,12 +8,12 @@ How to read the commit column. The work was done on separate branches that were 
 into one, so the commits differ from section to section. Where a report names the commit
 it measured, that commit is given. Where it only says "the head of this branch", the commit
 given is the one that last changed the report, marked "report at". Commits are of the
-development branch (`ra-jit-collate` and the branches merged into it), not of the published
+development branch (`blaze-collate` and the branches merged into it), not of the published
 tree; `vendor/source.rev` says which development commit a published tree was made from.
 
 Reports are named by file. Those under [reports/](reports/) are published with this
 tree. BREAKERS.md and the other `harness/*.md` files are in `harness/`. WINDOWS.md,
-MACOS.md, MACOS-ABI2.md, AARCH64.md and RA_JIT.md are earlier reports that
+MACOS.md, MACOS-ABI2.md, AARCH64.md and BLAZE.md are earlier reports that
 [platforms.md](platforms.md) and these documents replace; they are on the development
 branch only.
 
@@ -26,7 +26,7 @@ commit. Do not append a second row for the same measurement.
 ## 1. Checked for these documents
 
 Run on Linux x86-64 (8 CPUs, 31 GB) with Rust 1.99.0 at f191c6e42a, the commit these
-documents were written against. ra-jit was built with `cargo build -p ra-jit --release`, and
+documents were written against. blaze was built with `cargo build -p blaze-engine --release`, and
 for the LLVM column with `--features llvm` against LLVM 20.1.8.
 Source trees and scratch directories were on tmpfs.
 
@@ -36,7 +36,7 @@ The gate, from `harness/` with `BLAZE_BIN` set and `TMPDIR` on tmpfs:
 
 | Harness | Cranelift | LLVM (`BLAZE_OPT=2 BLAZE_EMIT=fast`) |
 |---|---|---|
-| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822 of 822 functions from ra-jit, 0 of 893 layouts differ | MATCH, 822 of 822, 0 of 893 layouts differ |
+| `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822 of 822 functions from blaze, 0 of 893 layouts differ | MATCH, 822 of 822, 0 of 893 layouts differ |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
 | `breakers.py` | 58 of 58, 7 open, 0 functions skipped | 58 of 58, 7 open, 0 functions skipped |
@@ -52,30 +52,30 @@ The gate, from `harness/` with `BLAZE_BIN` set and `TMPDIR` on tmpfs:
 
 The seven "open" breakers are the five known differences and the two known refusals
 listed in [support.md](support.md). Not run here: `buildmodel.py`, `farsplices.py`, the
-four store harnesses, `remote.py` and `cargo_ra_jit.py`.
+four store harnesses, `remote.py` and `blaze_cli.py`.
 
-By hand, with `cargo ra-jit` from that build:
+By hand, with `blaze` from that build:
 
 | What | Result |
 |---|---|
-| New `cargo new` project: `cargo ra-jit build`, `run`, edit, `run` | first build cargo's; edit served by the daemon; `Finished` in 0.01 s |
-| ripgrep 15.1.0: `cargo ra-jit build` | cargo's, 5.6 s; daemon ready within 10 s |
-| ripgrep: one-line edit to `crates/core/main.rs`, `cargo ra-jit build` | by the daemon, 0.26 s wall; the binary prints the edit |
-| ripgrep: `cargo ra-jit test` | by the daemon; 114 and 329 tests pass, the same as cargo's |
+| New `cargo new` project: `blaze build`, `run`, edit, `run` | first build cargo's; edit served by the daemon; `Finished` in 0.01 s |
+| ripgrep 15.1.0: `blaze build` | cargo's, 5.6 s; daemon ready within 10 s |
+| ripgrep: one-line edit to `crates/core/main.rs`, `blaze build` | by the daemon, 0.26 s wall; the binary prints the edit |
+| ripgrep: `blaze test` | by the daemon; 114 and 329 tests pass, the same as cargo's |
 | ripgrep: second git worktree | first build cargo's, 16 s; joined the same worker; edit by the daemon, 0.44 s wall |
-| `BLAZE_CACHE` set when the daemon starts | store filled: 1 pack, 26,377 records, 57,153,509 bytes; `ra-jit cache verify` exit 0 |
-| `ra-jit cache push` and `pull` to a directory remote | 1 pack, 7,744,971 bytes compressed, sent and fetched |
-| Published layout: recursive clone, `cargo build -p ra-jit --release --locked` | builds |
+| `BLAZE_CACHE` set when the daemon starts | store filled: 1 pack, 26,377 records, 57,153,509 bytes; `blaze-engine cache verify` exit 0 |
+| `blaze-engine cache push` and `pull` to a directory remote | 1 pack, 7,744,971 bytes compressed, sent and fetched |
+| Published layout: recursive clone, `cargo build -p blaze-engine --release --locked` | builds |
 
 ## 2. Corpus and layouts, per platform
 
 `difftest.py corpus --bin runner --crate cases --layouts`. "Functions" is how many
-functions of the corpus rustc emitted a symbol for and ra-jit compiled; the rest would be
-left to rustc. "Layouts" is how many types ra-jit laid out differently from rustc's
+functions of the corpus rustc emitted a symbol for and blaze compiled; the rest would be
+left to rustc. "Layouts" is how many types blaze laid out differently from rustc's
 `-Zprint-type-sizes`. The LLVM columns are from
 `backends.py corpus runner cases --bin runner --levels 2f` and count instances.
 
-| Platform | Functions from ra-jit, both backends | Layouts that differ | LLVM compiled | Left to Cranelift | Commit | Source |
+| Platform | Functions from blaze, both backends | Layouts that differ | LLVM compiled | Left to Cranelift | Commit | Source |
 |---|---|---|---|---|---|---|
 | Linux x86-64 | 822 of 822 | 0 of 893 | 11,787 of 11,787 | 0 | 888e87df74, CI run 39057174862 | PLAT-ABI2.md |
 | Linux AArch64, native | 825 of 825 | 0 of 903 | 11,813 of 11,813 | 0 | same | PLAT-ABI2.md |
@@ -92,10 +92,10 @@ each harness per leg, only that the legs passed.
 The wasm row was measured by hand on 2026-10-27 with wasmtime 49.0.2, along with stress 100 of
 100, splices 71 of 71 and breakers 176 of 177 (`procmacro`'s `spelled`, which fails the same way
 on the aarch64 host without blaze's proc-macro server). The train runs the corpus, stress and
-`allrajit_wasm.py` for wasm32 on every push to main (`harness/wasm32.py`, Linux x86-64). Of
+`allblaze_wasm.py` for wasm32 on every push to main (`harness/wasm32.py`, Linux x86-64). Of
 the two functions left to rustc there, `undecided_alias_drop`'s `release_state` (a layout with
 a type error) is left on the aarch64 host as well, and `fma_nans::vectors` calls `simd_fma`,
-which ra-jit refuses on wasm. Builds with nothing of rustc's (wasm-host guests, Cloudflare
+which blaze refuses on wasm. Builds with nothing of rustc's (wasm-host guests, Cloudflare
 Workers, blaze-manifest and blaze-resolve) are in [platforms.md](platforms.md), wasm32.
 
 ## 3. The gate on Linux x86-64
@@ -125,10 +125,10 @@ run (the same CI run).
 ## 4. rustc's own test suites
 
 Linux x86-64, Rust 1.99.0, the rust-lang/rust checkout at the `1.99.0` tag. Single runs.
-Report at b46bc7b8ec, branch `ra-jit-rustc-suites` off 6d12f21c86. Source: RUSTCSUITES.md.
+Report at b46bc7b8ec, branch `blaze-rustc-suites` off 6d12f21c86. Source: RUSTCSUITES.md.
 Harnesses: `uitest.py` and `libsuite.py`.
 
-| Suite | Backend | Tests run | Matching | Differing | Left out | Functions from ra-jit | Left to rustc |
+| Suite | Backend | Tests run | Matching | Differing | Left out | Functions from blaze | Left to rustc |
 |---|---|---|---|---|---|---|---|
 | `tests/ui` run-pass | Cranelift | 2690 | 2686 | 4 | 1114 | 5558 of 5615 | 57 |
 | `tests/ui` run-pass | LLVM | 2689 | 2685 | 4 | 1115 | 5554 of 5611 | 57 |
@@ -148,14 +148,14 @@ std's. The unit tests inside `core`, `alloc` and `std` are not run at all. Only 
 x86-64 was run.
 
 The four differing tests are three causes, all listed as open in
-[support.md](support.md): the size of a future (two tests), a value rustc leaks and ra-jit
+[support.md](support.md): the size of a future (two tests), a value rustc leaks and blaze
 drops, and a macro fragment read by a different edition.
 
 ## 5. The crate sweep (partial)
 
 This is a sweep of 93 crates chosen by hand, not of crates.io. Seven of the 93 gave no
 result (tests that do not build from the published crate, a missing system library, a
-timeout). Each crate's own integration tests are built by cargo and again with ra-jit's
+timeout). Each crate's own integration tests are built by cargo and again with blaze's
 objects linked in front, and every test must report the same.
 
 Harness: `cratesweep.sh` and `sweepreport.py`. Source: harness/BREAKERS.md, "On stable
@@ -166,7 +166,7 @@ Harness: `cratesweep.sh` and `sweepreport.py`. Source: harness/BREAKERS.md, "On 
 | Crates with a result | 86 of 93 |
 | Crates whose tests behave as rustc's | 86 of 86 |
 | Tests run and compared | 10,745 |
-| Functions compiled by ra-jit, as the sweep ran | 41,958 of 41,987 (29 left to rustc) |
+| Functions compiled by blaze, as the sweep ran | 41,958 of 41,987 (29 left to rustc) |
 | After the fixes, rerun on the four crates they touch | 15 left, all in generic-array |
 | tokio with `--features full` (`cratetest.py`) | 155 test binaries, 1018 tests, all matching, 296,088 of 296,088 functions |
 
@@ -176,11 +176,11 @@ The sweep has not been run under LLVM, or on any platform but Linux x86-64.
 
 ### Command lines compared (`bintest.py`)
 
-Each program is built by cargo and with ra-jit's code for its workspace crates, and a list
+Each program is built by cargo and with blaze's code for its workspace crates, and a list
 of command lines is run with both. Source: harness/BREAKERS.md. Linux x86-64, Cranelift,
 `nightly-2026-05-10`, at 1c293327c1. Not rerun on 1.99.0.
 
-| Program | Command lines the same | Functions from ra-jit |
+| Program | Command lines the same | Functions from blaze |
 |---|---|---|
 | fd | 10 of 10 | 148 of 148 |
 | just | 12 of 12 | 822 of 822 |
@@ -190,11 +190,11 @@ of command lines is run with both. Source: harness/BREAKERS.md. Linux x86-64, Cr
 | bat | 10 of 10 | 321 of 321 |
 | tokei | 8 of 8 | 141 of 141 |
 
-### `cargo ra-jit` against cargo (`cargo_ra_jit.py`)
+### `blaze` against cargo (`blaze_cli.py`)
 
 Linux x86-64, 8 CPUs, 31 GB, Rust 1.99.0, Cranelift. Report at 13054e50d6 (the head of
-the cargo branch with `ra-jit-collate` b43304222b merged). Source: harness/CARGO-RA_JIT.md.
-Seconds, `cargo ra-jit` / plain cargo, one run each. `(c)` marks a step cargo built in the
+the cargo branch with `blaze-collate` b43304222b merged). Source: harness/BLAZE-CLI.md.
+Seconds, `blaze` / plain cargo, one run each. `(c)` marks a step cargo built in the
 daemon's place. "Differences" counts steps whose output, exit status or test results were
 not cargo's.
 
@@ -246,7 +246,7 @@ Twenty-one distinct problems were found, most of them miscompiles. Eighteen are 
 (believed to be LLVM bugs) are worked around, and one is open. The table stops at L10; the
 later runs, which found findings 17 to 21, are in FUZZ.md.
 
-| Run | ra-jit at | Programs | Functions generated | Compiled by ra-jit, each backend | Differences | Left to rustc |
+| Run | blaze at | Programs | Functions generated | Compiled by blaze, each backend | Differences | Left to rustc |
 |---|---|---:|---:|---:|---|---|
 | L1 | early fixes | 136 | 39,720 | 41,089 Cranelift, 38,984 LLVM | Cranelift 4, LLVM 7 | Cranelift 12 |
 | L3 | fixes 1 to 8 | 360 | 105,869 | 102,426 | 5 per backend | 0 |
@@ -258,7 +258,7 @@ later runs, which found findings 17 to 21, are in FUZZ.md.
 | L9 | 27a94f2770 | 360 | 106,116 | 101,848 | 0 | 0 |
 | L10 | 27920a4f69 (after the merge) | 60 | 17,297 | 16,734 | 0 | 0 |
 
-L2 is left out because L3 repeats its seed. No run crashed ra-jit. Up to L8, about one
+L2 is left out because L3 repeats its seed. No run crashed blaze. Up to L8, about one
 program in a few hundred still found something; L9 is the first full-size run that found
 nothing. The fuzzer builds whole programs only and has not been run on another platform.
 
@@ -290,25 +290,25 @@ Linux x86-64, 8 cores, Cranelift, MinIO over loopback behind a counting proxy. E
 host. One run each. Real AWS was not run. Source: REMOTE.md, report at 90017bf2d5.
 Harness: `remote.py --measure`.
 
-ripgrep 14.1.1, 9 crates by ra-jit, 22,340 functions compiled cold:
+ripgrep 14.1.1, 9 crates by blaze, 22,340 functions compiled cold:
 
-| Fresh machine | To a running program | cargo | ra-jit | Functions compiled | Requests | Bytes down |
+| Fresh machine | To a running program | cargo | blaze | Functions compiled | Requests | Bytes down |
 |---|---:|---:|---:|---:|---:|---:|
 | no remote | 16.8 s | 4.6 s | 12.2 s | 22,340 | 0 | 0 |
-| ra-jit's packs | 14.3 s | 4.8 s | 9.5 s | 0 | 3 | 7,355,315 |
+| blaze's packs | 14.3 s | 4.8 s | 9.5 s | 0 | 3 | 7,355,315 |
 | packs and cargo's units | 9.6 s | 2.0 s | 7.3 s | 0 | 45 | 59,161,263 |
 | the same, lazy | 10.0 s | 2.1 s | 7.6 s | 0 | 46 | 59,946,863 |
 
-cargo 0.92.0, 7 crates by ra-jit, 226,180 functions compiled cold:
+cargo 0.92.0, 7 crates by blaze, 226,180 functions compiled cold:
 
-| Fresh machine | To a running program | cargo | ra-jit | Functions compiled | Requests | Bytes down |
+| Fresh machine | To a running program | cargo | blaze | Functions compiled | Requests | Bytes down |
 |---|---:|---:|---:|---:|---:|---:|
 | no remote | 152.4 s | 42.0 s | 110.3 s | 226,180 | 0 | 0 |
-| ra-jit's packs | 117.1 s | 43.4 s | 73.6 s | 0 | 18 | 95,048,041 |
+| blaze's packs | 117.1 s | 43.4 s | 73.6 s | 0 | 18 | 95,048,041 |
 | packs and cargo's units | 94.4 s | 25.2 s | 67.4 s | 0 | 406 | 525,028,848 |
 | the same, lazy | 100.2 s | 25.5 s | 73.1 s | 0 | 422 | 532,207,920 |
 
-With every function served from the remote, ra-jit still takes 7.3 s on ripgrep and 67 s on
+With every function served from the remote, blaze still takes 7.3 s on ripgrep and 67 s on
 cargo. That is loading the workspace and walking every instance to find its key.
 
 The robustness part of `remote.py` (broken transfers, spoiled objects, forged manifests,
@@ -316,7 +316,7 @@ collection) passes on MinIO and on SeaweedFS; collection is 12 of 12 on both.
 
 ## 10. Edit and warm-up timings
 
-The warm-up and edit times of `cargo ra-jit` are in section 6. The numbers below are of the
+The warm-up and edit times of `blaze` are in section 6. The numbers below are of the
 daemon driven directly, which leaves out the client.
 
 ### Full link against splice
@@ -327,7 +327,7 @@ daemon driven directly, which leaves out the client.
 | Windows x86-64 | regex-automata | 548 ms | 18 ms | same | WINDOWS.md |
 | macOS arm64 | small program | 50 ms | 23 ms | whole request, median of 100 | MACOS.md |
 | macOS arm64 | ripgrep 14.1.1 | 104.8 ms | 58.5 ms | daemon's edit to binary, median of 50 | MACOS.md |
-| Linux x86-64, AArch64 target | stress app | 131.3 ms | 6.1 ms | `ra-jit sync`, median of 10 | AARCH64.md |
+| Linux x86-64, AArch64 target | stress app | 131.3 ms | 6.1 ms | `blaze sync`, median of 10 | AARCH64.md |
 | Linux x86-64, AArch64 target | ripgrep 14.1.1 | 2018.5 ms | 18.9 ms | same; the full link is GNU ld | AARCH64.md |
 | Linux x86-64, wasm32-wasip1 | small std program | 57 ms | 11 ms | edit to a program that can be run | WASM32.md |
 | Linux x86-64, wasm32-unknown-unknown | Dioxus hello | 193 ms | 35 ms | same, before 0.27 to 0.36 s of wasm-bindgen | WASM32.md |
@@ -359,21 +359,21 @@ edit, the test suites, the fastest cargo setups (mold, wild, `-Zthreads=8`, cg_c
 check`) and subsecond's hot-patching, every sample kept, and the history the site charts at
 /bench. What follows is the first run, with `harness/realbench.py`.
 
-`cargo ra-jit build` against `cargo build` on three real projects, each at a pinned tag
-(issue #7). Harness: `harness/realbench.py`. ra-jit at 6a7d245e47 (main), Cranelift backend,
+`blaze build` against `cargo build` on three real projects, each at a pinned tag
+(issue #7). Harness: `harness/realbench.py`. blaze at 6a7d245e47 (main), Cranelift backend,
 release build. Measured on 2026-10-20. Seconds, wall clock of the command; median of 5
 (min-max).
 
 Machine: dev-aws-6, AWS c6i.16xlarge, Intel Xeon Platinum 8375C at 2.90 GHz, 64 vCPU,
 123 GB, NixOS, Linux 6.18.53, claimed for this run alone. The one-minute load was 7.24 at the
-start (ra-jit's own release build had just finished) and 3.19 at the end; per project,
+start (blaze's own release build had just finished) and 3.19 at the end; per project,
 ripgrep 7.24 to 6.56, just 6.56 to 3.87, nushell 3.87 to 3.19.
 
 Toolchain: rustc 1.99.0 (b940084d7 2026-09-28), dev profile, incremental on, no
 `RUSTFLAGS`. Linker on both sides: Rust's default for x86_64-unknown-linux-gnu, `cc` with
 rust-lld; `readelf -p .comment` names LLD 23.1.1 in both binaries.
 
-| Project | Step | cargo | ra-jit | cargo / ra-jit | ra-jit built by |
+| Project | Step | cargo | blaze | cargo / blaze | blaze built by |
 |---|---|---:|---:|---:|---|
 | ripgrep 15.1.0 | cold, empty store: command returns | 6.16 (6.13-6.21) | 6.96 (6.90-7.07) | 0.9x | cargo (wrapper) |
 | | cold, empty store: daemon ready | | 12.96 (12.92-13.23) | 0.5x | |
@@ -400,20 +400,20 @@ rust-lld; `readelf -p .comment` names LLD 23.1.1 in both binaries.
 | | edit: body in a library | 6.19 (6.10-7.46) | 0.24 (0.23-0.38) | 26.2x | daemon; output same 5/5 |
 | | edit: new function | 1.55 (1.53-1.59) | 0.42 (0.42-0.44) | 3.7x | daemon; output same 5/5 |
 
-All three projects built under ra-jit; nothing was refused or fell back to cargo after the
+All three projects built under blaze; nothing was refused or fell back to cargo after the
 first build.
 
 What each row is:
 
 - **Cold.** `rm -rf` of the target directory, then the build. The cargo side is
-  `CARGO_TARGET_DIR=t-cargo cargo build`. The ra-jit side is
-  `CARGO_TARGET_DIR=t-ra-jit BLAZE_HOME=<new> BLAZE_CACHE=<store> cargo ra-jit build`
-  with a new daemon home each run. A first `cargo ra-jit build` is cargo's own build with
-  ra-jit as the workspace wrapper, so "command returns" is that build. The daemon then loads
+  `CARGO_TARGET_DIR=t-cargo cargo build`. The blaze side is
+  `CARGO_TARGET_DIR=t-blaze BLAZE_HOME=<new> BLAZE_CACHE=<store> blaze build`
+  with a new daemon home each run. A first `blaze build` is cargo's own build with
+  blaze as the workspace wrapper, so "command returns" is that build. The daemon then loads
   the workspace and compiles every program once; "daemon ready" is when
-  `cargo ra-jit status` says the checkout is ready and the background `cargo check` has
+  `blaze status` says the checkout is ready and the background `cargo check` has
   finished. Edits are fast only after that. "Empty store" is a new, empty `BLAZE_CACHE`
-  each run. "Warm store" is one store filled beforehand by `cargo ra-jit build` of the same
+  each run. "Warm store" is one store filled beforehand by `blaze build` of the same
   commit in a second checkout. The three cold kinds were interleaved run by run.
 - **No-op.** The build again with nothing changed.
 - **Edits.** Each run writes different text, so no run repeats an earlier one, and the
@@ -452,10 +452,10 @@ daemon and worker and waiting for the background check.
 
 Commands, on the host:
 
-    RUSTUP_TOOLCHAIN=1.99.0 cargo build -p ra-jit --release
-    BLAZE_PROJECTS=~/rajit-realproj/projects python3 -u harness/realbench.py \
-        ripgrep just nushell --runs 5 --work ~/rajit-realproj/work
-    python3 harness/realbench.py --table ~/rajit-realproj/work/realbench.json
+    RUSTUP_TOOLCHAIN=1.99.0 cargo build -p blaze-engine --release
+    BLAZE_PROJECTS=~/blaze-realproj/projects python3 -u harness/realbench.py \
+        ripgrep just nushell --runs 5 --work ~/blaze-realproj/work
+    python3 harness/realbench.py --table ~/blaze-realproj/work/realbench.json
 
 Dependencies were fetched with `cargo fetch` first and every timed build ran with
 `CARGO_NET_OFFLINE=true`.
@@ -463,7 +463,7 @@ Dependencies were fetched with `cargo fetch` first and every timed build ran wit
 ### Warm edits, before and after (2026-10-20)
 
 The cold rows above are still from 6a7d245e47. The warm rows were measured again on the same
-host, dev-aws-6, to compare two ra-jit builds. Before is 46aff2550e. After is the same code
+host, dev-aws-6, to compare two blaze builds. Before is 46aff2550e. After is the same code
 plus the two commits "where the time of a build goes" and "warm edits". The commits between
 46aff2550e and their base on main change only docs and the bench harness.
 
@@ -490,7 +490,7 @@ both sides.
 Where the time goes, after, from `realbench.py --table` (the median run). The steps sum to
 the client's total, and "outside the client" is cargo and rustup starting up.
 
-| Project | Step | ra-jit | Where the time went (ms) |
+| Project | Step | blaze | Where the time went (ms) |
 |---|---|---:|---|
 | ripgrep | edit: main | 0.107 | worker wait 38.4, check 17.8, apply 7.1, client checks 2.4, object 2.2, link 1.9, refuse 1.1, 20 more 8.9, outside the client 27.1 |
 | | edit: lib | 0.066 | check 13.8, apply 6.8, reach 2.6, client checks 2.5, compile-rest 1.7, link 1.6, refuse 1.4, 20 more 8.1, outside the client 27.0 |
@@ -547,15 +547,15 @@ What is left:
 
 Commands, on the host. A loop waited for a quiet host and ran this for each project and side:
 
-    BLAZE_BIN=<before or after>/ra-jit BLAZE_PROJECTS=~/rajit-warm/projects \
+    BLAZE_BIN=<before or after>/blaze BLAZE_PROJECTS=~/blaze-warm/projects \
         python3 -u harness/realbench.py <project> --runs 5 --parts noop,edits \
-        --work ~/rajit-warm/work-<side>
-    python3 harness/realbench.py --table ~/rajit-warm/work-<side>/realbench.json
+        --work ~/blaze-warm/work-<side>
+    python3 harness/realbench.py --table ~/blaze-warm/work-<side>/realbench.json
 
 ### Edits on macOS, where the time goes (2026-10-20)
 
 Measured on an M5 Max (18 cores, macOS 27), shared with other builds, so single runs spread
-widely; the tables are medians of runs 2 to 6 of `cargo ra-jit build` after realbench's
+widely; the tables are medians of runs 2 to 6 of `blaze build` after realbench's
 edits, each step from the client's `BLAZE_TRACE` breakdown. Before is 1dbad5b048, from
 before the merges of `fn-incremental` and `tiers-speed`. After is the header pad (d611d65b66,
 since merged with the fix of #13, which keeps the size beside the executable and adds a quarter
@@ -606,7 +606,7 @@ main 107 ms):
    macOS. Cranelift is 6.4 times slower on the Linux host where inference is about 2.4 times:
    worth a profile there.
 4. Outside the client, 27 ms: rustup's proxy (15 to 20 ms here) and cargo starting. Not
-   ra-jit's code; running the toolchain's cargo directly saves the proxy.
+   blaze's code; running the toolchain's cargo directly saves the proxy.
 5. The outline in apply, 5 to 13 ms: the functions of a crate by file are listed again on
    every edit, which an edit to bodies alone cannot change (2.5 to 3 ms).
 6. refuse, 4 to 9 ms: the list of tests is read again from every function's attributes after
@@ -620,7 +620,7 @@ On dev-aws-11, the machine of the README's run (AWS c8a.metal-24xl, AMD EPYC 9R4
 pinned to cores 0-15), with `harness/bench.py` in `nix develop .#bench`, Cranelift, 5 runs.
 Before is main cc22006337, after is c8f58ac7d9 (the two commits on build scripts); both are
 built as released, without the `llvm` feature. Median ms; the multiplier is cargo's time of the
-same run over ra-jit's.
+same run over blaze's.
 
 | Project | Edit | cargo | before | after |
 |---|---|---:|---:|---:|
@@ -649,7 +649,7 @@ Where the time of one edit went before, from `BLAZE_TRACE` (the median of 5 to 7
 
 | | ripgrep, a function (70 ms) | nushell, a function (252 ms) |
 |---|---:|---:|
-| cargo starting and handing over to `cargo-ra-jit` and `ra-jit` | 14 | 20 |
+| cargo starting and handing over to `blaze` and the engine | 14 | 20 |
 | the worker waiting for `cargo check --compile-time-deps` | 26 | 1 |
 | type-checking, MIR, translating and Cranelift of the edited function | 18 | 149 |
 | rust-analyzer taking the change | 4 | 20 |
@@ -659,7 +659,7 @@ Where the time of one edit went before, from `BLAZE_TRACE` (the median of 5 to 7
 
 - Cargo's part is the same on both sides: Nix's `cargo` is a bash wrapper (1.3 ms), and cargo
   takes about 8 ms before it runs an external subcommand (`cargo --version` takes 1.5 ms), part
-  of it reading the 470 KB certificate bundle. `cargo-ra-jit` takes 0.4 ms and `ra-jit` 0.9 ms to
+  of it reading the 470 KB certificate bundle. `blaze` takes 0.4 ms and `blaze` 0.9 ms to
   start.
 - The splice keeps the executable of the last link and appends the edit, so linking is not
   on the way: 0.3 to 2 ms, also for nushell's 1.1 GB executable. A full link happens on the
@@ -667,7 +667,7 @@ Where the time of one edit went before, from `BLAZE_TRACE` (the median of 5 to 7
   keeps it out of the medians.
 - The kernel has 8.6% of the processor time of nushell's edit, spread over page faults and
   `stat`; nothing on Linux's side of it is worth more than a millisecond.
-- A binary built with `--features llvm` loads libLLVM (198 MB) each time it starts: `ra-jit
+- A binary built with `--features llvm` loads libLLVM (198 MB) each time it starts: `blaze
   --version` takes 7.8 ms against 1.4 ms, mostly the dynamic loader binding and relocating it.
   The README's run until now used that binary for the Cranelift column; it now uses the build
   as released (nothing changed in ripgrep: 28 ms with the feature, 19 ms without).
@@ -675,11 +675,11 @@ Where the time of one edit went before, from `BLAZE_TRACE` (the median of 5 to 7
 What changed: ripgrep's, fd's and hyperfine's build scripts name no `rerun-if-changed`, so the
 worker ran every build script of the workspace through cargo before each edit of their
 package. It now runs the one script as cargo ran it and compares it with what it loaded, and
-not at all when `cargo ra-jit` just did; cargo runs them when the script is older than its
+not at all when `blaze` just did; cargo runs them when the script is older than its
 source, read a variable while compiled that cargo does not set, or printed or wrote something
 else (CHANGELOG, commits 20708cd2da and c8f58ac7d9).
 
-Commands: for each side, `BLAZE_BIN=<side>/ra-jit taskset -c 0-15 python3 harness/bench.py
+Commands: for each side, `BLAZE_BIN=<side>/blaze taskset -c 0-15 python3 harness/bench.py
 <projects> --backend cranelift --runs 5`; the after run measured both tiers (with
 `BLAZE_LLVM_BIN` a build with the feature) and is the README's.
 
@@ -703,5 +703,5 @@ Where reports disagree, this file follows the later one.
 | `sym` in `naked_asm!` on Mach-O and COFF | "not read back" (AARCH64.md, WINDOWS.md) | compiled on all four platforms (PLAT-ABI2.md) |
 | Aggregates aligned to 16 bytes on the x86-64 stack | open bug (MACOS-ABI2.md) | fixed (PLAT-ABI2.md) |
 | Toolchain | `nightly-2026-05-10` (BREAKERS.md first passes, WINDOWS.md, MACOS.md, AARCH64.md first rounds, WASM.md, WASM32.md) | stable 1.99.0 everywhere else |
-| Goals | "Hot patching" and optimised code are "not goals"; "What to build next" lists the panic fixtures, the layout check, random programs and CI (RA_JIT.md) | all four exist; the splice exists; RA_JIT.md is the original plan and is out of date |
-| `cargo ra-jit -q` | listed among the flags handed to cargo (CARGO.md) | not in the list in `cargo/cli.rs`. Checked by hand: the first `-q` build is cargo's because `-q` makes it a different command line, and later ones are the daemon's |
+| Goals | "Hot patching" and optimised code are "not goals"; "What to build next" lists the panic fixtures, the layout check, random programs and CI (BLAZE.md) | all four exist; the splice exists; BLAZE.md is the original plan and is out of date |
+| `blaze -q` | listed among the flags handed to cargo (CARGO.md) | not in the list in `cargo/cli.rs`. Checked by hand: the first `-q` build is cargo's because `-q` makes it a different command line, and later ones are the daemon's |

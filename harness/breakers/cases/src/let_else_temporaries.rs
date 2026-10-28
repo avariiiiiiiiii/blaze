@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L2-372-c9.rs`, `-L2-354-c5.rs`,
 //! `-L2-431-c24.rs`): a `let` with an `else` whose pattern does not match. The temporaries of
 //! the initializer, the value that was matched among them, are dropped before the `else`
-//! runs, and an array none of whose elements were moved out is dropped front to back. ra-jit
+//! runs, and an array none of whose elements were moved out is dropped front to back. blaze
 //! dropped them after the `else`, and the array from the back.
 
 use std::cell::RefCell;

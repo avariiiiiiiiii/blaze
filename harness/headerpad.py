@@ -2,14 +2,14 @@
 """headerpad.py: a program whose unwind table is larger than the room its header was given
 is spliced all the same (macOS on AArch64, issue #13).
 
-usage: headerpad.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: headerpad.py    (BLAZE_BIN names the blaze built; blaze and blaze-rustc
                         are found next to it)
 
 A splice moves the program's `__unwind_info` into the room Apple's linker leaves after the
 load commands, which is as much as `-headerpad` says. A program of a few hundred crates has
 more table than the 1 MiB the daemon starts with; here a small one is made short of room the
 cheap way, by a `-headerpad` of its own in `.cargo/config.toml` that asks for 256 bytes.
-The program is built with `cargo ra-jit build` until the daemon serves the build, then
+The program is built with `blaze build` until the daemon serves the build, then
 edited a few times. The first link is told the room the unwind information of what it links
 wants, so it is linked once (#173: a large program was linked a second time, 260 s more), and
 every edit after the first one (which writes the whole object again) has to be spliced, and
@@ -52,7 +52,7 @@ EDITS = 4
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["cargo", "ra-jit", "build"], cwd=ws, env=env, capture_output=True, text=True,
+    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
                          timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
@@ -74,9 +74,9 @@ def main():
         print("headerpad.py: only Apple's linker leaves no more room than it is told; nothing to do")
         return
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
-    if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
-    root = tempfile.mkdtemp(prefix="ra-jit-headerpad-", dir="/tmp")
+    if not os.path.exists(os.path.join(bin_dir, "blaze")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
+    root = tempfile.mkdtemp(prefix="blaze-headerpad-", dir="/tmp")
     ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
@@ -118,7 +118,7 @@ def main():
             wrong += verdict != "ok"
             print(f"{f'edit {n}':30} {verdict:12} {how[:110]}", flush=True)
         # A daemon started anew links with the room the last one found, and no more than once.
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         # The next daemon's workers write their logs where these were.
         for log in glob.glob(os.path.join(home, "*", "*", "log")):
             os.rename(log, log + ".old")
@@ -135,7 +135,7 @@ def main():
         print(f"{'a new daemon':30} {verdict:12} {made[0][:110] if made else ''}")
         wrong += verdict != "ok"
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     print(f"{EDITS + 2 - wrong} of {EDITS + 2} right; under {root}")
     if wrong:
         sys.exit(1)

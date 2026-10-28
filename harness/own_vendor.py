@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""own_vendor.py: `cargo blaze vendor` against `cargo vendor`. cargo is the oracle; blaze never
+"""own_vendor.py: `blaze vendor` against `cargo vendor`. cargo is the oracle; blaze never
 runs it outside this harness.
 
 usage: own_vendor.py --fd DIR --ripgrep DIR [--blaze BIN] [--out FILE]
 
 fd and ripgrep (checkouts with their `Cargo.lock`, whose packages are fetched) and a made-up
 workspace of path packages are copied afresh for every case and every side, side by side,
-and each case runs `cargo vendor ARGS` and `BIN cargo vendor ARGS` (BIN: `ra-jit`, default
-`target/release/ra-jit`) offline in one of them, comparing the exit status, standard output
+and each case runs `cargo vendor ARGS` and `BIN cargo vendor ARGS` (BIN: `blaze`, default
+`target/release/blaze-engine`) offline in one of them, comparing the exit status, standard output
 and standard error, and then every file under the copies: its path and sha256, the vendored
 packages, their `.cargo-checksum.json` and the lock files. A case may first change the copy:
 a vendor directory with a stale package and a dot file in it, or one vendored already.
@@ -73,7 +73,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fd", required=True)
     ap.add_argument("--ripgrep", required=True)
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     opts = ap.parse_args()
     env = {k: v for k, v in os.environ.items() if not k.startswith("CARGO_") or k == "CARGO_HOME"}
@@ -91,7 +91,7 @@ def main():
     cases = []
     for fixture, args, first in CASES:
         outs = {}
-        for who in ("cargo", "blaze"):
+        for who in ("blaze"):
             work = tempfile.mkdtemp(prefix="own-vendor-case-")
             for name in ("fd", "ripgrep", "made"):
                 shutil.copytree(os.path.join(templates, name), os.path.join(work, name))

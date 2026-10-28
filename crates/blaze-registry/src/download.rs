@@ -32,13 +32,13 @@ pub trait Blobs: Send + Sync {
     fn put(&self, sha256: &[u8; 32], bytes: &[u8]);
 }
 
-impl Blobs for ra_jit_store::Store {
+impl Blobs for blaze_store::Store {
     fn get(&self, sha256: &[u8; 32]) -> Option<Vec<u8>> {
-        ra_jit_store::Store::get(self, sha256)
+        blaze_store::Store::get(self, sha256)
     }
 
     fn has(&self, sha256: &[u8; 32]) -> bool {
-        ra_jit_store::Store::has(self, sha256)
+        blaze_store::Store::has(self, sha256)
     }
 
     fn put(&self, sha256: &[u8; 32], bytes: &[u8]) {

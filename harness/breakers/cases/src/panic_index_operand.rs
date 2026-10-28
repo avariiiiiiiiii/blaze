@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-panic-location-s2-3-c10.rs`): an index out of
 //! bounds that is an operand of something else, an argument of a macro or of a call. rustc
-//! reports the index expression; ra-jit reported the statement the index was read in, and
-//! `<ra-jit>:0:0` when that statement was written by a macro.
+//! reports the index expression; blaze reported the statement the index was read in, and
+//! `<blaze>:0:0` when that statement was written by a macro.
 
 use std::hint::black_box;
 use std::panic::{AssertUnwindSafe, catch_unwind};

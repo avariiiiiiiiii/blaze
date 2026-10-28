@@ -8,7 +8,7 @@
   "cargo": [
     "--workspace"
   ],
-  "ra-jit": [
+  "blaze": [
     "--workspace"
   ]
 }

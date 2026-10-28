@@ -7,17 +7,17 @@ shows with `<picture>` by the reader's colour scheme. Hand-written SVG, standard
 nothing to pin, and a change of numbers is a readable diff. The two files of a chart differ only
 in their `<style>`, and the same numbers always give the same bytes.
 
-Every chart is the same chart (`compare`): ra-jit against cargo, as how many times better
-ra-jit is, on a log axis around a line at 1×, the same as cargo. Right of the line ra-jit is
+Every chart is the same chart (`compare`): blaze against cargo, as how many times better
+blaze is, on a log axis around a line at 1×, the same as cargo. Right of the line blaze is
 better, left of it worse, in every chart, and the axis says so under it.
 
   edits     how many times faster than incremental `cargo build` an edit builds, per project and
             platform: the median over the kinds of edit, the line from the slowest kind to the fastest
-  memory    the most memory the work of an edit held at once, ra-jit's (the daemon, its workers,
+  memory    the most memory the work of an edit held at once, blaze's (the daemon, its workers,
             the command) against cargo's (cargo, rustc, the linker)
   disk      what each side keeps on disk once the edits are done: cargo's target directory against
-            ra-jit's target directory, store and home
-  runtime   how long the program ra-jit's LLVM built takes against `cargo build --release`'s
+            blaze's target directory, store and home
+  runtime   how long the program blaze's LLVM built takes against `cargo build --release`'s
 
 Each row has a bar per platform (benchplatforms.PLATFORMS, in that order), and a platform with
 no numbers for the row says so in place of its bar. The first row is each platform's geometric
@@ -104,7 +104,7 @@ def style(c):
 
 
 def cell(better, low=None, high=None, detail="", rough=False):
-    """One platform's bar of a row: how many times better ra-jit is (over 1, better; under 1,
+    """One platform's bar of a row: how many times better blaze is (over 1, better; under 1,
     worse), the range of it from `low` to `high` when there is one, what to add after the factor,
     and whether the runs varied too much to read it closely (≈)."""
     return better, low, high, detail, rough
@@ -237,14 +237,14 @@ THE_LINE = "Right of the 1× line blaze is better, left of it worse; the scale i
 
 
 def edits(rows, where):
-    """`rows`: (project, {platform: [cargo seconds / ra-jit seconds of each kind of edit]}).
+    """`rows`: (project, {platform: [cargo seconds / blaze seconds of each kind of edit]}).
     `where` names each platform's machine. The chart's alt text is its own summary."""
     rows = [(p, {k: sorted(v) for k, v in by.items() if v}) for p, by in rows]
     rows = [(p, {k: cell(median(r), r[0], r[-1]) for k, r in by.items()}) for p, by in rows if by]
     if not rows:
         return None
     return compare("edits", "How much faster an edit builds than with cargo",
-                   "A small edit to a real project, then an incremental build: cargo build's time ÷ cargo blaze build's, "
+                   "A small edit to a real project, then an incremental build: cargo build's time ÷ blaze build's, "
                    "both warm. The bar is the median over the kinds of edit, the thin line runs from the slowest kind to "
                    f"the fastest. {THE_LINE}",
                    rows, "All projects", ("faster", "slower"), "as fast as cargo", ("blaze slower", "blaze faster"),
@@ -252,13 +252,13 @@ def edits(rows, where):
 
 
 def against(rows):
-    """(project, {platform: (cargo's MB, ra-jit's MB)}) as cells: how many times less ra-jit uses."""
+    """(project, {platform: (cargo's MB, blaze's MB)}) as cells: how many times less blaze uses."""
     rows = [(p, {k: cell(a / b, detail=f"{gigabytes(b)} vs cargo's {gigabytes(a)}") for k, (a, b) in by.items() if a and b}) for p, by in rows]
     return [(p, by) for p, by in rows if by]
 
 
 def memory(rows, where):
-    """`rows`: (project, {platform: (cargo's peak MB, ra-jit's peak MB)}) during an edit."""
+    """`rows`: (project, {platform: (cargo's peak MB, blaze's peak MB)}) during an edit."""
     rows = against(rows)
     if not rows:
         return None
@@ -271,7 +271,7 @@ def memory(rows, where):
 
 
 def disk(rows, where):
-    """`rows`: (project, {platform: (cargo's MB on disk, ra-jit's MB on disk)}) once the edits are done."""
+    """`rows`: (project, {platform: (cargo's MB on disk, blaze's MB on disk)}) once the edits are done."""
     rows = against(rows)
     if not rows:
         return None
@@ -283,7 +283,7 @@ def disk(rows, where):
 
 
 def runtime(rows, where, rough=(), rough_note=""):
-    """`rows`: (benchmark, {platform: ra-jit's time / release's}); `rough`: the (benchmark, platform)
+    """`rows`: (benchmark, {platform: blaze's time / release's}); `rough`: the (benchmark, platform)
     whose runs varied too much to read closely, labelled ≈."""
     rows = [(b, {k: cell(1 / v, rough=(b, k) in rough) for k, v in by.items() if v}) for b, by in rows]
     rows = [(b, by) for b, by in rows if by]

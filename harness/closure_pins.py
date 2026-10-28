@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """closure_pins.py: the nixpkgs store paths build scripts run with
-(crates/ra-jit/src/cargo/closure/pins.txt): a C toolchain, a small shell userland and the system
+(crates/blaze-engine/src/cargo/closure/pins.txt): a C toolchain, a small shell userland and the system
 libraries of the per-crate table, per Linux host, from one pinned nixpkgs revision.
 
     closure_pins.py                    say whether pins.txt is what its revision evaluates to
@@ -12,7 +12,7 @@ libraries of the per-crate table, per Linux host, from one pinned nixpkgs revisi
 A tool for people moving the pin, not a part of blaze: it runs `nix eval` on the pinned revision
 to name each root's store path, so it runs where nix is, an ix VM. No blaze code path runs nix,
 and users need none: blaze reads the paths from pins.txt, CI fetches them from cache.nixos.org
-(`ra-jit closure fetch`) into blaze's store, and users take them from blaze's remote cache.
+(`blaze-engine closure fetch`) into blaze's store, and users take them from blaze's remote cache.
 
 The roots are named by attribute, `openssl.dev`, so that the per-crate table can name them. Each
 root's NarHash and NarSize, and the size of its whole closure, are read from cache.nixos.org's
@@ -23,7 +23,7 @@ import concurrent.futures, json, os, subprocess, sys, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-PINS = os.path.join(ROOT, "crates/ra-jit/src/cargo/closure/pins.txt")
+PINS = os.path.join(ROOT, "crates/blaze-engine/src/cargo/closure/pins.txt")
 CACHE = "https://cache.nixos.org"
 CHANNEL = "https://channels.nixos.org/nixos-unstable/git-revision"
 HOSTS = ["x86_64-linux", "aarch64-linux"]

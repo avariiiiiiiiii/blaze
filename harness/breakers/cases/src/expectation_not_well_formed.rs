@@ -1,7 +1,7 @@
 //! library/coretests pin_macro.rs, `unsize_coercion`: `pin!([x; 2])` where a `Pin<&mut [T]>`
 //! is wanted. The helper `pin!` calls returns `Pin<&mut T>` for a `&mut Helper<T>`, and the
 //! wanted type would make that `Helper<[T]>`, which is no type: rustc drops what it expected
-//! of the argument and unsizes the result instead. ra-jit took nothing to be needed for a type
+//! of the argument and unsizes the result instead. blaze took nothing to be needed for a type
 //! to be well formed, called the helper with `[T]`, and left the caller to rustc for having
 //! no layout.
 

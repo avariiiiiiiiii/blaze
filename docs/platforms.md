@@ -1,6 +1,6 @@
 # Platforms
 
-This is the current state of each platform ra-jit has been run on, in one place. The
+This is the current state of each platform blaze has been run on, in one place. The
 numbers are from GitHub Actions run 39057174862 on commit 888e87df74, the last recorded run
 that covered all four native platforms under both backends, unless a line says otherwise.
 The report behind it is [reports/PLAT-ABI2.md](reports/PLAT-ABI2.md). The table of what is
@@ -43,17 +43,17 @@ macOS; on Linux at 3a844b09d5, before the rule covered more than macOS, it was 1
 Windows only the link line is tested, by a unit test in `cargo/plan.rs`. rustc's own link,
 which the first edits after a cold build are spliced into, still takes the code out, and
 those edits are linked in full until step G of [no-rustc.md](no-rustc.md) links nothing
-rustc built ([#52](https://github.com/indexable-inc/ra-jit/issues/52)). What that link keeps
+rustc built ([#52](https://github.com/indexable-inc/blaze/issues/52)). What that link keeps
 includes the standard library's optimized code, where a function an object keeps to itself
 can take its arguments otherwise than its signature says: LLVM passes the `&u16` of
 `<u16 as Debug>::fmt` as a `u16`. A patch calls a local of rustc's executable only if it
-was a hidden global or is of a crate that calls by symbol; ra-jit builds the rest into it.
+was a hidden global or is of a crate that calls by symbol; blaze builds the rest into it.
 
 On every platform the gate in CI is the corpus with layouts, programs, stress, breakers,
 unwinds, splices, asmedits, includes, worktrees, keys, storekills, storecorrupts and
 storeshared, under Cranelift and under LLVM at `-O2` with fast instruction selection.
 
-| Platform | Corpus functions from ra-jit, both backends | Layouts that differ | LLVM compiled itself |
+| Platform | Corpus functions from blaze, both backends | Layouts that differ | LLVM compiled itself |
 |---|---|---|---|
 | Linux x86-64 | 822 of 822 | 0 of 893 | 11,787 of 11,787 |
 | Linux AArch64, native | 825 of 825 | 0 of 903 | 11,813 of 11,813 |
@@ -67,10 +67,10 @@ system.
 
 The platform the work was done on, and the only one where everything has been run: the
 whole gate, `debuginfo.py`, `buildmodel.py`, `storefull.py`, `remote.py` against MinIO, the
-fuzzer, rustc's own test suites, the crate sweep and `cargo blaze`. The gate was rerun for
+fuzzer, rustc's own test suites, the crate sweep and `blaze`. The gate was rerun for
 these documents at f191c6e42a under both backends; see [results.md](results.md).
 
-Objects are ELF. A full link runs rustc's link line with ra-jit's object first and
+Objects are ELF. A full link runs rustc's link line with blaze's object first and
 `--allow-multiple-definition`, so the first definition wins. The splice appends segments to
 the executable and rewrites the debug sections so that a debugger sees the new code. About
 60 of the 71 steps of `splices.py` are spliced; the others link in full by design. An edit
@@ -84,7 +84,7 @@ Runs natively on `ubuntu-24.04-arm` in CI under both backends, including `debugi
 and `farsplices.py`.
 
 A `b` or `bl` reaches 128 MB. When a function and its replacement are further apart than
-that, the splice uses a longer jump of 12 bytes, and ra-jit makes no function shorter than
+that, the splice uses a longer jump of 12 bytes, and blaze makes no function shorter than
 that. `farsplices.py` tests this with 160 MB between the code and the splice, and
 `bigbinary.py` with 220 MB of code.
 
@@ -95,13 +95,13 @@ AArch64 can also be a cross target from Linux x86-64, with the programs run unde
 `qemu-aarch64`. The counts are the same as native except `debuginfo.py`, which does not
 pass under qemu because the harness runs gdb and backtraces without the emulator.
 
-The fuzzer has not been run on AArch64, and nobody has recorded running `cargo blaze`
+The fuzzer has not been run on AArch64, and nobody has recorded running `blaze`
 there.
 
 ## Windows x86-64 (MSVC)
 
 Runs on `windows-latest` in CI under both backends. Objects are COFF and link with MSVC
-`link.exe` using rustc's line, with `/FORCE:MULTIPLE` so that ra-jit's definitions win.
+`link.exe` using rustc's line, with `/FORCE:MULTIPLE` so that blaze's definitions win.
 
 What is specific to the port:
 
@@ -110,7 +110,7 @@ What is specific to the port:
   calling convention, so a call with a pad is a plain call followed by a look at a slot of
   the frame, and each object carries a personality function of its own (`unwind/seh.rs`).
   This costs a load and a branch after every such call. Exceptions that are not C++
-  exceptions (structured exceptions, foreign unwinds) pass through ra-jit's frames without
+  exceptions (structured exceptions, foreign unwinds) pass through blaze's frames without
   running cleanup; that is inferred from the code and not tested. A Rust panic is a C++
   exception on MSVC and is handled.
 - The splice (`splice/pe.rs`) adds sections behind the linker's last. `splices.py` is 71 of
@@ -124,11 +124,11 @@ What is specific to the port:
   checks in the code; the harness links none of these).
 - A running `.exe` cannot be written, even by the linker. The daemon renames it aside and
   links a new file, or splices a copy and puts it in its place.
-- Live edits (`ra-jit-live`): the program is named by the GUID of its PDB, reserves room
+- Live edits (`blaze-live`): the program is named by the GUID of its PDB, reserves room
   within 2 GB behind its image with `VirtualAlloc`, and registers each patch's `.pdata` with
   `RtlAddFunctionTable`, so a panic unwinds through patched code. The daemon wakes it through a
   named event where Unix has a datagram socket. A static with another value asks for a restart
-  (the splice writes it in place). `ra_jit_live::edit`, which the demo's editor sends each
+  (the splice writes it in place). `blaze_live::edit`, which the demo's editor sends each
   keystroke with, talks to the daemon's AF_UNIX socket through Winsock. `harness/live_e2e.py`
   passes, by hand, not in CI; life's latency is in [live.md](live.md#latency-under-typing).
 - The daemon's socket is an AF_UNIX socket. The check that only the user can reach it is
@@ -136,9 +136,9 @@ What is specific to the port:
 
 Debug info is CodeView procedures and line tables: backtraces and breakpoints by line work,
 a debugger shows no types, parameters or locals. The PDB is stale after a splice until the
-next full link. `cargo blaze` builds through the daemon (`[ra-jit]`) and links with `rust-lld`
+next full link. `blaze` builds through the daemon (`[blaze]`) and links with `rust-lld`
 as the repository's cargo configuration names it. That was run by hand on one machine, on a toy
-crate and `demo/life`, not in CI; `harness/cargo_ra_jit.py` and the fuzzer are not run there.
+crate and `demo/life`, not in CI; `harness/blaze_cli.py` and the fuzzer are not run there.
 The GNU and ARM64 Windows targets have nothing implemented.
 
 ## macOS arm64
@@ -148,8 +148,8 @@ modes. Objects are Mach-O.
 
 What is specific to the port:
 
-- Linking. Apple's linker has no flag to keep the first of two definitions. `ra-jit weaken`
-  makes copies of rustc's objects and archives whose definitions are weak, and ra-jit's
+- Linking. Apple's linker has no flag to keep the first of two definitions. `blaze-engine weaken`
+  makes copies of rustc's objects and archives whose definitions are weak, and blaze's
   object is linked ahead of them.
 - The splice (`splice/macho.rs`). The loader wants `__LINKEDIT` last with the signature at
   its end. The patch goes where `__LINKEDIT` was, in two new segments, `__LINKEDIT` is
@@ -160,7 +160,7 @@ What is specific to the port:
   program's. When the patch's frames are larger than the program's unwind table, both tables
   move into that room, the program's frames where the table has them and the patch's behind;
   only a patch whose frames don't fit there either is linked in full. The room for two more load commands and the table comes from `-Wl,-headerpad`,
-  which `cargo blaze` gives the link in a file of its own beside the executable
+  which `blaze` gives the link in a file of its own beside the executable
   (`bin.headerpad`), last on the line: 1 MiB, or what the line asks for. The table grows
   with the program (3 MB for a GUI app of 570 crates). Before a link the daemon makes the
   room in that file what the executable there wants, and at least what the unwind
@@ -181,27 +181,27 @@ What is specific to the port:
   arguments always go on the stack.
 
 Not there: debug info is not checked on macOS (the harness reads DWARF out of ELF).
-`cargo blaze` and plain cargo after `ra-jit enable` serve dev and test builds;
-`harness/cargo_ra_jit.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
+`blaze` and plain cargo after `blaze enable` serve dev and test builds;
+`harness/blaze_cli.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
 the larger projects of that harness have not been run ([cargo.md](cargo.md#macos-arm64)).
 `buildmodel.py`,
 `storefull.py`, `remote.py`, `farsplices.py` and the fuzzer are not run. The first port
 noted that under LLVM the unwind rules are not exact inside prologues and epilogues;
 nothing later says that changed.
 
-`x86_64-apple-darwin` is refused. With the triple forced through, ra-jit compiled the corpus
+`x86_64-apple-darwin` is refused. With the triple forced through, blaze compiled the corpus
 and the link failed on a relocation in the unwind table; the splice and the LLVM object
 reader are arm64 only as well.
 
 ## wasm32
 
-ra-jit runs natively and emits wasm32 with its own lowering from Cranelift IR, written as a
+blaze runs natively and emits wasm32 with its own lowering from Cranelift IR, written as a
 relocatable wasm object: `v128` with the simd128 and relaxed-simd operations, 128-bit
 integers, the wasm C ABI (vectors as `v128`, an aggregate of one scalar as that scalar,
 C-variadic calls and definitions through a buffer), `#[link_section]` statics as custom
 sections and a `target_features` section, as LLVM writes them. In the harnesses `rust-lld`
 links these objects ahead of rustc's rlibs. With nothing of rustc's (the whole build of
-[no-rustc.md](no-rustc.md), `BLAZE_STD_FROM=off`), ra-jit compiles the target's standard
+[no-rustc.md](no-rustc.md), `BLAZE_STD_FROM=off`), blaze compiles the target's standard
 library as a unit of its own and links with `rust-lld -flavor wasm` (`link.rs`), with the
 toolchain's wasi-libc for `wasm32-wasip1`. A `#![no_std]` program's unit is `core`,
 `compiler_builtins` and what it names with `extern crate`, as rustc puts them in, so a
@@ -213,35 +213,35 @@ wasmtime 49.0.2, at main fdc1c53f15 (#622 for the `no_std` rows):
 
 | What | Result |
 |---|---|
-| `wasm32-wasip1` corpus | MATCH, 957 of 959 functions from ra-jit |
+| `wasm32-wasip1` corpus | MATCH, 957 of 959 functions from blaze |
 | the same with `+simd128,+relaxed-simd` | MATCH, 964 of 966 |
 | stress, splices | 100 of 100, 71 of 71 |
 | breakers | 176 of 177: `procmacro`'s `spelled` fails the same way on the aarch64 host without blaze's proc-macro server |
-| `allrajit_wasm.py`, nothing of rustc's | 3 wasip1 programs, a wasm32-unknown-unknown cdylib and a `#![no_std]` simd128 guest, each as cargo's build answers |
+| `allblaze_wasm.py`, nothing of rustc's | 3 wasip1 programs, a wasm32-unknown-unknown cdylib and a `#![no_std]` simd128 guest, each as cargo's build answers |
 | blaze-manifest + blaze-resolve over blaze's workspace and lock file (issue #458), nothing of rustc's | 45,837 functions, built and linked in 9.1 s (3.2 GB), output byte-identical to rustc's native build; 36.6 MB vs 3.9 MB, 0.30 vs 0.03 s a run |
-| the same with `cargo blaze build --release --target wasm32-wasip1`, a store that starts empty | 64.5 s (9.6 GB at `CARGO_BUILD_JOBS=2`), its build scripts, 157 macro expansions (blaze's proc-macro server) and std unit blaze's; output byte-identical; 0.06 s again with nothing changed |
+| the same with `blaze build --release --target wasm32-wasip1`, a store that starts empty | 64.5 s (9.6 GB at `CARGO_BUILD_JOBS=2`), its build scripts, 157 macro expansions (blaze's proc-macro server) and std unit blaze's; output byte-identical; 0.06 s again with nothing changed |
 | indexable-inc/wasm-host guests (`no_std`, `+simd128,+relaxed-simd,+wide-arithmetic,+tail-call`), nothing of rustc's | request transcripts byte-identical to rustc's; bench_raw 534,750 B vs 10,757 B, 833 to 836 vs 240 to 242 ns a request; bench_worker 984,365 B vs 49,930 B, 4,324 to 4,367 vs 318 to 319 ns |
-| Cloudflare Workers through workers-rs 0.8.7 and wasm-bindgen 0.2.129 (`worker-build --release` with ra-jit as its cargo build), nothing of rustc's | under `wrangler dev` 4.148.0 the hello and a SHA-256/HMAC worker (sha2, hmac) answer as rustc's builds; 1,218,107 vs 145,034 B and 1,304,087 vs 159,091 B; p50 1.44 to 1.47 vs 1.36 to 1.37 ms, and 3.04 to 3.14 vs 1.60 to 1.64 ms hashing 10 KiB |
-| the same workers with `cargo blaze build` as worker-build's cargo build, and the `no_std` simd128 guest of `allrajit_wasm.py` with `cargo blaze build --release --target wasm32-unknown-unknown`, at main 2acba39f76 | std unit blaze's (18 crates for the workers, 3 for the guest); the workers answer as rustc's builds, 983,740 and 1,060,993 B, 88.8 and 81.3 s from a store that starts empty, p50 1.49 to 1.54 vs 1.41 to 1.44 ms and 3.07 to 3.16 vs 1.63 to 1.72 ms; the guest answers 7 of 7 calls as rustc's, 378,591 B vs 4,904 B, 4.4 s |
+| Cloudflare Workers through workers-rs 0.8.7 and wasm-bindgen 0.2.129 (`worker-build --release` with blaze as its cargo build), nothing of rustc's | under `wrangler dev` 4.148.0 the hello and a SHA-256/HMAC worker (sha2, hmac) answer as rustc's builds; 1,218,107 vs 145,034 B and 1,304,087 vs 159,091 B; p50 1.44 to 1.47 vs 1.36 to 1.37 ms, and 3.04 to 3.14 vs 1.60 to 1.64 ms hashing 10 KiB |
+| the same workers with `blaze build` as worker-build's cargo build, and the `no_std` simd128 guest of `allblaze_wasm.py` with `blaze build --release --target wasm32-unknown-unknown`, at main 2acba39f76 | std unit blaze's (18 crates for the workers, 3 for the guest); the workers answer as rustc's builds, 983,740 and 1,060,993 B, 88.8 and 81.3 s from a store that starts empty, p50 1.49 to 1.54 vs 1.41 to 1.44 ms and 3.07 to 3.16 vs 1.63 to 1.72 ms; the guest answers 7 of 7 calls as rustc's, 378,591 B vs 4,904 B, 4.4 s |
 
-The train runs the corpus, stress and `allrajit_wasm.py` on every push to main
+The train runs the corpus, stress and `allblaze_wasm.py` on every push to main
 (`harness/wasm32.py`, [harness.md](harness.md)).
 
 Limits: no unwinding is emitted (the wasm targets are `panic=abort`), threads are not
 supported, `simd_fma` is refused (wasm has no fused multiply-add; LLVM calls libm's for
 each lane), and the std unit refuses 84 functions, all `f16` or `f128`, which no program
 here reaches. The modules are 8 to 50 times the size of rustc's and run 1.1 to 14 times as
-long: ra-jit has no LTO or inlining across crates and keeps SIMD values in memory. In
+long: blaze has no LTO or inlining across crates and keeps SIMD values in memory. In
 workers-rs, five js_sys functions (`MaybeIterator`, `Global`) are refused for type errors,
-and no module reaches them. `cargo blaze build --target wasm32-*` of a package with proc
-macros needs blaze's proc-macro server beside ra-jit (`blaze-proc-macro-srv`, which releases
+and no module reaches them. `blaze build --target wasm32-*` of a package with proc
+macros needs blaze's proc-macro server beside blaze (`blaze-proc-macro-srv`, which releases
 ship). With a store
-that starts empty, the workspace load compiles every build script at once, a ra-jit process
+that starts empty, the workspace load compiles every build script at once, a blaze process
 each of up to a few GB: on a 16 GB machine `CARGO_BUILD_JOBS=2` kept it at 9.6 GB, where the
 default was killed at 14 GB. wasm-bindgen runs again after every edit, 0.27 to 0.36 s on a hello world
 ([reports/WASM32.md](reports/WASM32.md)). There is no LLVM backend for wasm.
 
-Running the compiler itself in a browser is a separate experiment in `crates/ra-jit-wasm`.
+Running the compiler itself in a browser is a separate experiment in `crates/blaze-wasm`.
 
 ## Still refused on every platform
 

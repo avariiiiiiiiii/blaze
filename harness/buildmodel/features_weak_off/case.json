@@ -9,7 +9,7 @@
     "--features",
     "weak"
   ],
-  "ra-jit": [
+  "blaze": [
     "--features",
     "weak"
   ]

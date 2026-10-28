@@ -752,10 +752,12 @@
      "blaze-manifest",
      "blaze-metadata",
      "blaze-new",
+     "blaze-protocol",
      "blaze-registry",
      "blaze-resolve",
      "blaze-store",
      "blaze-tree",
+     "blaze-ui",
      "blaze-units",
      "blaze-wasi",
      "cargo-platform",
@@ -19036,6 +19038,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -19050,6 +19056,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -19409,6 +19419,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -19423,6 +19437,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -19782,6 +19800,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -19796,6 +19818,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -20200,6 +20226,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -20214,6 +20244,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -21008,6 +21042,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.1 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.1 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -21320,6 +21379,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.1 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.1 lib blaze_units build": {
      "crate_type": "lib",
@@ -40101,6 +40185,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -40115,6 +40203,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -40474,6 +40566,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -40488,6 +40584,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -40847,6 +40947,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -40861,6 +40965,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -41265,6 +41373,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -41279,6 +41391,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -42073,6 +42189,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.1 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.1 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -42385,6 +42526,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.1 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.1 lib blaze_units build": {
      "crate_type": "lib",
@@ -61039,6 +61205,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -61053,6 +61223,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -61412,6 +61586,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -61426,6 +61604,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -61785,6 +61967,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -61799,6 +61985,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -62203,6 +62393,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -62217,6 +62411,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -63011,6 +63209,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.1 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.1 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -63323,6 +63546,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.1 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.1 lib blaze_units build": {
      "crate_type": "lib",
@@ -82131,6 +82379,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -82145,6 +82397,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -82504,6 +82760,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -82518,6 +82778,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -82877,6 +83141,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -82891,6 +83159,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -83295,6 +83567,10 @@
        "unit": "blaze-new@0.20261028.1 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
       },
@@ -83309,6 +83585,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.1 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -84103,6 +84383,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.1 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.1 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -84415,6 +84720,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.1 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.1 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.1 lib blaze_units build": {
      "crate_type": "lib",

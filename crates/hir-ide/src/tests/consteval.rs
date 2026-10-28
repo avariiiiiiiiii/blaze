@@ -2501,6 +2501,43 @@ fn static_read_through_another() {
 }
 
 #[test]
+fn static_written_by_a_static() {
+    let modifying = |e: ConstEvalError<'_>| {
+        if let ConstEvalError::MirEvalError(MirEvalError::ConstEvalError(_, inner)) = e
+            && let ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(it)) =
+                simplify(*inner)
+        {
+            it.starts_with("modifying the initial value of static")
+        } else {
+            false
+        }
+    };
+    check_fail(
+        r#"
+    static mut A: u32 = 0;
+    static B: u32 = unsafe { A = 1; 2 };
+    const GOAL: u32 = B;
+    "#,
+        modifying,
+    );
+    check_fail(
+        r#"
+    static mut C: u32 = unsafe { C = 1; 0 };
+    const GOAL: u32 = unsafe { C };
+    "#,
+        modifying,
+    );
+    check_number(
+        r#"
+    static mut D: u32 = 4;
+    static E: u32 = { let mut x = unsafe { D }; x += 1; x };
+    const GOAL: u32 = E;
+    "#,
+        5,
+    );
+}
+
+#[test]
 fn extern_weak_statics() {
     check_number(
         r#"

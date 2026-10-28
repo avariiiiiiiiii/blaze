@@ -205,6 +205,9 @@ pub struct Evaluator<'db> {
     unevaluated_statics: Vec<(usize, usize, StaticId)>,
     /// The unevaluated static whose memory was read, which fails the evaluation.
     missing_static: Cell<Option<StaticId>>,
+    /// Running a static's initializer, where the memory of every static is read-only, as in
+    /// rustc.
+    in_static: bool,
     /// We don't really have function pointers, i.e. pointers to some assembly instructions that we can run. Instead, we
     /// store the type as an interned id in place of function and vtable pointers, and we recover back the type at the
     /// time of use.
@@ -522,6 +525,7 @@ impl<'db> Evaluator<'db> {
             read_statics: None,
             unevaluated_statics: Vec::new(),
             missing_static: Cell::new(None),
+            in_static: matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_))),
             db,
             random_state: oorandom::Rand64::new(0),
             param_env: trait_env.unwrap_or_else(|| ParamEnvAndCrate {
@@ -2344,9 +2348,29 @@ impl<'db> Evaluator<'db> {
         not_supported!("reading a static that was left unevaluated")
     }
 
+    /// Fails a write to the memory of a static from a static's initializer.
+    fn check_static_write(&self, pos: usize, size: usize) -> Result<'db, ()> {
+        if !self.in_static {
+            return Ok(());
+        }
+        let written = self
+            .static_memory
+            .iter()
+            .chain(&self.unevaluated_statics)
+            .find(|&&(start, len, _)| pos < start + len && start < pos + size);
+        let Some(&(.., id)) = written else { return Ok(()) };
+        Err(MirEvalError::UndefinedBehavior(format!(
+            "modifying the initial value of static `{}` from a static's initializer",
+            StaticSignature::of(self.db, id).name.as_str()
+        )))
+    }
+
     fn write_memory_using_ref(&mut self, addr: Address, size: usize) -> Result<'db, &mut [u8]> {
         if size == 0 {
             return Ok(&mut []);
+        }
+        if let Heap(pos) = addr {
+            self.check_static_write(pos, size)?;
         }
         let (mem, pos) = match addr {
             Stack(it) => (&mut self.stack, it),
@@ -2389,6 +2413,9 @@ impl<'db> Evaluator<'db> {
 
         if let Heap(src) = r.addr {
             self.check_static_is_evaluated(src, r.size)?;
+        }
+        if let Heap(dst) = addr {
+            self.check_static_write(dst, r.size)?;
         }
         match (addr, r.addr) {
             (Stack(dst), Stack(src)) => {
@@ -3562,8 +3589,9 @@ impl<'db> Evaluator<'db> {
                 self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
             let result = Interval::new(self.heap_allocate(size, align)?, size);
             // Known before its value is written: what it points to may point back at it.
-            let location = self.locate_static(st, result)?;
+            let location = self.locate_static(st, result.addr)?;
             self.write_allocation(locals, allocation, result.addr, size)?;
+            self.static_memory.push((result.addr.to_usize(), size, st));
             return Ok(location);
         } else {
             let ty = InferenceResult::of(self.db, DefWithBodyId::from(st))
@@ -3574,14 +3602,14 @@ impl<'db> Evaluator<'db> {
             let addr = self.heap_allocate(size, align)?;
             Interval::new(addr, size)
         };
-        self.locate_static(st, result)
+        self.static_memory.push((result.addr.to_usize(), result.size, st));
+        self.locate_static(st, result.addr)
     }
 
     /// Records where the memory of a static is, and gives the address of a pointer to it.
-    fn locate_static(&mut self, st: StaticId, memory: Interval) -> Result<'db, Address> {
-        self.static_memory.push((memory.addr.to_usize(), memory.size, st));
+    fn locate_static(&mut self, st: StaticId, memory: Address) -> Result<'db, Address> {
         let addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
-        self.write_memory(addr, &memory.addr.to_bytes())?;
+        self.write_memory(addr, &memory.to_bytes())?;
         self.static_locations.insert(st, addr);
         Ok(addr)
     }

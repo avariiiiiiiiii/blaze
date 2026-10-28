@@ -31,89 +31,37 @@ you send them, including fixes you find here and want to upstream.
     docs/                     these documents
     docs/reports/             working reports, one per piece of work, as written at the time
     SECURITY.md               what to know before sharing a store, and how to report a problem
-    vendor/rust-analyzer/     rust-analyzer with ra-jit's changes, a git subtree
+    vendor/rust-analyzer/     the front end: crates derived from rust-analyzer, members of the root workspace
     vendor/rust-analyzer/crates/hir-ty-borrowck/
                               the borrow checker, a crate next to hir-ty (borrowck.md)
     vendor/rust-analyzer/lib/rowan/
                               rowan 0.17.0 with a flat kind of tree behind its cursor (flat-syntax.md)
-    vendor/rustc_abi/         rustc's layout crate at the pinned nightly's commit, a git subtree
+    vendor/rustc_abi/         rustc's layout crate at the pinned nightly's commit
     vendor/proc-macro-srv/    the pinned nightly's proc-macro server, built by ra-jit to load
                               the proc-macro libraries ra-jit links (no-rustc.md, step J1)
-    vendor/subtree.py         moves vendor/ changes to the forks, and the forks and upstream into vendor/
     vendor/source.rev         the commit of the old development branch this tree last took from
 
 `crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
 it uses of `hir-ty` is public there. Its root is `mod.rs`, the file it was compiled from when
-it was a module of `hir-ty`. Nothing in `vendor/` depends on anything in `crates/`, so the
-fork builds alone ([architecture-split.md](architecture-split.md)).
+it was a module of `hir-ty`. Nothing in `vendor/` depends on anything in `crates/`
+([architecture-split.md](architecture-split.md)).
 
 ## rust-analyzer
 
-`vendor/rust-analyzer` is a squashed git subtree of the `ra-jit` branch of
-[indexable-inc/rust-analyzer](https://github.com/indexable-inc/rust-analyzer). That branch is DioxusLabs' `rust-analyzer` branch of rustd (upstream at
-`dd5ed69d4b` with rustd's changes on top), merged with upstream rust-analyzer master, with
-the MIR passes that make rust-analyzer's MIR like rustc's on top
-([`docs/mir-passes.md`](https://github.com/indexable-inc/rust-analyzer/blob/ra-jit/docs/mir-passes.md)
-there). The fork stays the public home of those changes and the place upstream is merged
-in; ra-jit carries the files themselves, so a plain clone builds:
+`vendor/rust-analyzer` started as a fork of rust-analyzer (DioxusLabs' rustd branch merged
+with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's on
+top: [mir-passes.md](../vendor/rust-analyzer/docs/mir-passes.md)). It is no longer synced with
+upstream or with a fork repository: its crates (`hir-ty`, `hir-def`, `syntax`, `parser` and the
+rest) are members of the root workspace, with the root `Cargo.toml`'s dependencies, lints and
+profiles and the one `Cargo.lock`. Edit them, build and test from the root, and commit like any
+other file. A plain clone builds:
 
     git clone https://github.com/indexable-inc/blaze && cd blaze
     cargo +"$(cat harness/toolchain)" build -p ra-jit --release   # cargo +nightly-2026-10-25
 
-`vendor/rustc_abi` is a subtree of [indexable-inc/rustc_abi](https://github.com/indexable-inc/rustc_abi)
-(`main`) the same way.
-
-### Changing a rust-analyzer file
-
-Edit the file in `vendor/rust-analyzer`, build and test from the root as usual, and commit
-in ra-jit like any other file: one commit can change MIR lowering and the code generator
-together. A branch that changes vendor/ merges into main like any other branch; there is
-nothing to port and no pointer to bump.
-
-The fork follows main by itself: every ten minutes, a `sync from blaze` workflow in each
-fork (on its `fork-sync` branch, the default only so the schedule runs) checks out main and
-runs, with that fork's own token, so no secret for it exists in blaze
-
-    vendor/subtree.py push rust-analyzer
-    vendor/subtree.py push rustc_abi
-
-which makes one fork commit for each commit on main's first-parent line that changed the
-directory (its tree under `vendor/<name>`, its author, dates and message, and a line naming
-it) and pushes them to the fork's branch (`ra-jit` for rust-analyzer, `main` for
-rustc_abi). The same commit always makes the same fork commit, so running it by hand
-(`--dry-run` makes the commits and pushes nothing) and in CI agree. It only fast-forwards:
-it never force-pushes, and if the fork holds a change main does not have, it stops, pushes
-nothing and says so. That happens only if someone committed to the fork directly; bring it
-in with `pull` below, merge that into main, and the next push goes through. A fork pushed
-from a branch before its merge, or a main whose history was rewritten since the last push,
-is caught up with one commit that says what it brings, once it is checked that the fork has
-nothing main lacks. The `ra-jit` branch only moves forward; do not rebase or force-push it.
-
-`git subtree split` is not used: it cannot follow `vendor/rustc_abi` past the time it was a
-submodule, and it makes different commits from a branch than from main, so the fork stopped
-being a fast-forward of what main makes.
-
-### Taking a newer fork commit
-
-    vendor/subtree.py pull rust-analyzer
-    # git subtree pull --prefix vendor/rust-analyzer https://github.com/indexable-inc/rust-analyzer ra-jit --squash
-
-That is the whole bump: there is no second pin, and the flake builds from the same files.
-
-### Merging upstream rust-analyzer
-
-    vendor/subtree.py upstream rust-analyzer              # its newest weekly release tag
-    vendor/subtree.py upstream rust-analyzer 2026-10-26   # a tag, a branch (master) or a commit
-
-merges upstream's commit into `vendor/rust-analyzer` on the current branch, with a clean
-tree. The base is the newest upstream commit the fork's history already has (the fork's
-branch and every squashed merge on this branch), so the merge brings exactly upstream's
-changes since then, as merging upstream in the fork would. A clean merge is committed;
-otherwise the conflicts are left in `vendor/rust-analyzer` with the usual markers and
-`git status`, and `git add` and `git commit` finish it (or `git merge --abort`). The merge's
-second parent is a squashed commit of upstream's tree with `git subtree`'s
-`git-subtree-split` line; when main gets the merge, `push` makes upstream's commit a parent
-of the fork's commit, so the fork's history records the upstream merge too.
+`vendor/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
+crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
+(indexable-inc/rust-analyzer, indexable-inc/rustc_abi) are archived.
 
 ### Where new code goes
 
@@ -125,11 +73,8 @@ with the database it reads. Where rust-analyzer's MIR differs from rustc's, the 
 the fork's lowering or in a pass of its runtime MIR queries, and the code generator relies on
 it: codegen does not compensate.
 
-Inside `vendor/rust-analyzer`, prefer a new crate under `crates/` (or, where the code needs
-private items of `hir-ty`, a new module file declared with one line) over edits spread through
-upstream's files. Every changed line of an upstream file is a line an upstream merge can
-conflict on; a new file conflicts with nothing. Fixes that are simply rust-analyzer bugs are
-the exception, and should be sent upstream, under their rules.
+Inside `vendor/rust-analyzer`, a crate of its own under `crates/` is better than growing
+`hir-ty` or `hir-def`, which are already the longest builds in the workspace.
 
 ra-jit's machinery stays in `crates/`: the code generator's backends, object and debug-info
 writing, the splice, the daemon and its socket, the cargo drop-in, the store and the remote,
@@ -142,21 +87,6 @@ read `RUSTC` or `RUSTDOC`, does not add a reason for a build to go to cargo or a
 to leave to rustc, and does not use rustc's rlibs, objects, symbols or link line for anything
 new. Where a feature needs what rustc does, the change builds that piece in ra-jit, or waits for
 it. The paths that remain may be fixed where they are wrong, and are otherwise only removed.
-
-### Moving to a newer rust-analyzer
-
-1. On a branch, `vendor/subtree.py upstream rust-analyzer` and resolve the conflicts.
-2. Update `Cargo.toml` and `Cargo.lock` at the root for dependencies rust-analyzer changed.
-3. Build, and run the whole gate under both backends ([harness.md](harness.md)). A newer
-   rust-analyzer changes inference, MIR lowering and layout queries, any of which can
-   change generated code. The corpus with `--layouts`, `breakers.py` and
-   `fuzz/fuzz.py smoke` are the ones that notice first.
-4. Land it on `main` through a pull request ([Landing a change](#landing-a-change)). The
-   forks' `sync from blaze` workflow sends the merge to the fork within ten minutes.
-
-This was done once, on 2026-10-20, for upstream `0b21bd6596`. The merge was clean; the one
-API change ra-jit had to follow was `CrateData::is_proc_macro` becoming `target_kind` (a
-`base_db::TargetKind`). Step 3 has not been run on that merge yet.
 
 ### Where the history is
 
@@ -240,7 +170,7 @@ match by the whole version line.
    a fix. Find what the case is an instance of.
 
 Style follows rust-analyzer's guide
-(`vendor/rust-analyzer/docs/book/src/contributing/style.md`): `cargo fmt`, no new
+([style.md](https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md)): `cargo fmt`, no new
 dependencies without a reason, small focused changes. Comments say what the code is for and
 why, not what was changed. Messages printed to the user say what happened and what ra-jit
 did about it in one line.
@@ -261,11 +191,9 @@ did about it in one line.
   `nix develop -c cargo build -p ra-jit --release --features llvm`
   ([LLVM for `--features llvm`](#llvm-for---features-llvm)).
 - `cargo fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
-  pull request's diff should be its change), `cargo test --release -p ra-jit` and
-  `cargo test --release -p hir-ty -p hir-def -p parser -p syntax` in `vendor/rust-analyzer`
-  (or `python3 harness/unittests.py`, which runs both as CI does). The fork's crates are tested
-  in `vendor/rust-analyzer`'s own workspace: the root excludes it so that `cargo install --git`
-  can build ra-jit (#293), and cargo only tests a member of the workspace it runs in.
+  pull request's diff should be its change), and
+  `cargo test --release -p ra-jit -p hir-ty -p hir-def -p parser -p syntax` from the root (or
+  `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).
 - For anything that changes numbers in [results.md](results.md): the command, the commit
   and the machine, so the entry can be replaced and not just appended to.
 

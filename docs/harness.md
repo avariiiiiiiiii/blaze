@@ -66,13 +66,10 @@ A part runs all of its harnesses even when one fails, then names the ones that f
 long each took. Alongside the harnesses, CI runs `python3 harness/imports.py`, which imports
 every script of the harness, and
 `python3 harness/unittests.py`, which runs the Rust unit tests and holds them to its `OPEN`
-list (below). It runs cargo twice: the root workspace's crates, then the rust-analyzer fork's
-(`hir-ty`, `hir-def`, `hir-ide` and the rest) in `vendor/rust-analyzer` (there, not with `--manifest-path`: cargo reads
-`.cargo/config.toml` from where it runs, and the fork's sets `CARGO_WORKSPACE_DIR`, where
-expect-test finds the parser's `.rast` files),
-since the root excludes `vendor/rust-analyzer` so that `cargo install --git` builds ra-jit
-(#293) and cargo only tests a member of the workspace it runs in. That workspace patches salsa
-to `vendor/salsa*` as the root does, so the fork's tests run against the same salsa.
+list (below). It is one `cargo test` from the root over blaze's crates and the front end's
+(`hir-ty`, `hir-def`, `hir-ide`, `ide-diagnostics` and the rest, in `vendor/rust-analyzer`), all
+members of the one workspace; the root `.cargo/config.toml` sets `CARGO_WORKSPACE_DIR`, where
+expect-test finds the parser's `.rast` files.
 
 ### Under Cranelift
 
@@ -418,9 +415,6 @@ with the `llvm` feature, hands the binary to its other jobs, and runs:
   ripgrep, fd, bat, hyperfine, just, axum and nushell with each project's tests (Linux AArch64;
   axum and nushell not blocking, [#26](https://github.com/indexable-inc/blaze/issues/26) and
   [#734](https://github.com/indexable-inc/blaze/issues/734));
-- `fork alone`: `vendor/rust-analyzer` built and tested outside this repository (the tests of
-  `hir-ty`, `hir-ty-borrowck`, `hir-ty-wfcheck` and `ide-diagnostics`, whose diagnostics are the
-  daemon's errors);
 - the ripgrep bench (not blocking).
 
 `nix-live.yaml` (the unit graphs, the flake's builds, the demo and live edits on macOS) runs on
@@ -501,8 +495,7 @@ schedules of their own: each takes hours or a dedicated machine, and the train w
 them. On a pull request that changes the flake, `nix/` or the dependencies, `nix-live.yaml`
 checks only the unit graphs. The flake's `dist` passes `--nix` to `build_release.py`, which
 then checks that every binary loads through a `/nix/store` loader instead of the glibc 2.34
-floor of a shipped release. `live-*.yaml` run on their own branches (the forks of `vendor/` sync themselves from main,
-by a workflow of their own). None of them is part of `ci`. `site.yaml` deploys the
+floor of a shipped release. `live-*.yaml` run on their own branches. None of them is part of `ci`. `site.yaml` deploys the
 site, and `release.yaml` builds releases from tags, each target through
 `.github/scripts/build_release.py` (the `dist` profile with PGO,
 [reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), the recipe the flake's `dist` runs too.

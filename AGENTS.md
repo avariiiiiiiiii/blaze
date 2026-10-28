@@ -124,3 +124,17 @@ AGENTS.md).
     accurate to the article: a change to a page changes its script in the same commit.
     Pronunciations go in `site/audio/lexicon.toml`, which never touches text inside `[ ]`. See
     [site/audio/README.md](site/audio/README.md).
+16. **scripts-take-typed-input**: A script (Python in `.github/scripts/`, `harness/`, `bench/`,
+    `scripts/`, `nix/`) takes one typed input, not a set of flags: a single JSON value, given as a
+    path to a file, `-` for standard input, or inline as the one argument. It parses that into a
+    typed structure (a frozen `dataclass` with `Literal` and exact types, every field named, unknown
+    fields refused) and fails naming the field that is wrong. At most a positional subcommand may
+    come before it. No `argparse` flag sets, no environment variables as hidden parameters (an
+    environment variable is only for what the environment is, like a token). A workflow writes the
+    JSON inline (`python3 x.py '{"target": "...", "pgo": false}'`). An existing script moves to this
+    when it is next changed.
+    Why: Andrew, 2026-10-28: "for parser things it should be typed like json instead of cli args, json
+    through a file or stdin or a single value". Flags drift (build_release.py grew --strict,
+    --no-pgo, --server, --server-beside, ...), are untyped, and an agent or a workflow has to guess
+    their combinations; one JSON value is checkable, diffable and the same from a workflow, a person
+    or another script.

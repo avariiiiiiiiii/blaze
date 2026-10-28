@@ -9147,7 +9147,7 @@ fn run_holding(
     write_harnesses(&mut db, texts);
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
     frozen::store(&db, &served)?;
-    if let Some(said) = ra_jit_expand::report() {
+    for said in [ra_jit_expand::report(), ra_jit_macro_wasm::report()].into_iter().flatten() {
         eprintln!("{said}");
     }
     memory::checkpoint("resolve");
@@ -9333,7 +9333,8 @@ fn run_holding(
                 eprint!("cold: ");
                 report(&cold);
             }
-            if let Some(said) = ra_jit_expand::report() {
+            for said in [ra_jit_expand::report(), ra_jit_macro_wasm::report()].into_iter().flatten()
+            {
                 eprintln!("{said}");
             }
             if let Some(why) = cold.refused_reached(&args) {
@@ -11439,6 +11440,10 @@ impl Program {
                 warm.looked.statics,
                 warm.looked.left,
             );
+            let macros = [ra_jit_expand::report(), ra_jit_macro_wasm::report()];
+            for said in macros.into_iter().flatten() {
+                eprintln!("{said}");
+            }
         }
         eprintln!("edit-to-binary: {total:.1?}");
         write_reach(db, table, known, listed, args, failed.is_none());

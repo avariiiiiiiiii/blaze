@@ -27,7 +27,10 @@ use std::{
     fmt,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -637,13 +640,13 @@ impl Wasm {
         let kept = was_kept.into();
         let wasm = Wasm { path: path.to_owned(), digest, identity, pre, compiled_in, kept };
         wasm.keep_code(store);
+        LOADED.add(start.elapsed());
         Ok(wasm)
     }
 
     /// Keeps its machine code in `store`, if it has not: a module compiled before the daemon
     /// told the store the toolchain is kept once it has.
     fn keep_code(&self, store: Option<&ra_jit_store::Store>) {
-        use std::sync::atomic::Ordering;
         let Some(store) = store else { return };
         if self.kept.swap(true, Ordering::Relaxed) {
             return;
@@ -757,6 +760,7 @@ impl Wasm {
             && let Some(kept) = keyed::find(store, &first, &now)
             && let Some(trees) = shapes.read(&kept)
         {
+            FOUND.add(start.elapsed());
             return Ran { output: Ok(restore(trees)), found: true, took: start.elapsed() };
         }
         let ran = self.run(index, root.as_deref(), env, spans, db, &input, attr.as_deref());
@@ -764,16 +768,20 @@ impl Wasm {
             let trees = Reader::new(&output, &state.spans)
                 .stream()
                 .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
+            if state.asked {
+                ASKED.add(Duration::ZERO);
+            }
             if let Some(store) = store
                 && !state.asked
                 && let Some(value) = shapes.written(&state.spans, &output)
             {
                 let reads: Vec<(String, String)> = state.files.reads.into_iter().collect();
                 keyed::keep(store, &first, &reads, &value);
-                KEPT.store(true, std::sync::atomic::Ordering::Relaxed);
+                KEPT.store(true, Ordering::Relaxed);
             }
             Ok(restore(trees))
         });
+        RAN.add(start.elapsed());
         Ran { output, found: false, took: start.elapsed() }
     }
 
@@ -1232,10 +1240,59 @@ impl fmt::Debug for Expander {
 /// Whether an expansion was kept since [`flush`].
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How many, and the time they took on the threads that did them.
+struct Count {
+    calls: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl Count {
+    const fn new() -> Count {
+        Count { calls: AtomicU64::new(0), nanos: AtomicU64::new(0) }
+    }
+
+    fn add(&self, took: Duration) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> (u64, f64) {
+        (self.calls.load(Ordering::Relaxed), self.nanos.load(Ordering::Relaxed) as f64 / 1e9)
+    }
+}
+
+/// Expansions run in a module, with the time each took from its call.
+static RAN: Count = Count::new();
+/// Expansions the store had, with the time each took from its call.
+static FOUND: Count = Count::new();
+/// Expansions run that were not kept, as they asked the database.
+static ASKED: Count = Count::new();
+/// Modules made ready to run in this process (machine code loaded or compiled, linked).
+static LOADED: Count = Count::new();
+
+/// The expansions so far, for the daemon's log: `None` before the first.
+pub fn report() -> Option<String> {
+    let (ran, running) = RAN.get();
+    let (found, finding) = FOUND.get();
+    if ran + found == 0 {
+        return None;
+    }
+    let (loaded, loading) = LOADED.get();
+    let mut said = format!(
+        "wasm proc macros: {ran} ran in {running:.3}s, {found} from the store in \
+         {finding:.3}s, {loaded} modules loaded in {loading:.3}s"
+    );
+    let (asked, _) = ASKED.get();
+    if asked != 0 {
+        said += &format!("; {asked} not kept, as they asked the database");
+    }
+    Some(said)
+}
+
 /// Writes out the expansions kept since the last call, for the next process to find: the
 /// store holds what is added in memory until it is flushed.
 pub fn flush() {
-    if KEPT.swap(false, std::sync::atomic::Ordering::Relaxed)
+    if KEPT.swap(false, Ordering::Relaxed)
         && let Some(store) = store()
     {
         store.flush();

@@ -5,9 +5,12 @@
  * that sends.
  *
  * Anyone can read; signed-in readers talk (Enter sends, Shift+Enter is a new line) and take back their own messages,
- * admins anyone's. While the panel is shut the top line's Chat button counts what came in. Whether it is open is kept
- * per browser (localStorage), wrapped like every storage access here because storage can refuse.
+ * admins anyone's. While the panel is shut the top line's Chat button counts what came in. It starts open where the
+ * page makes room for it (a wide screen) until the reader closes it; that choice is kept per browser (localStorage),
+ * wrapped like every storage access here because storage can refuse.
  */
+
+import { CHAT, handle } from './resize';
 
 type Who = { key: string; login: string | null; avatar: string | null };
 type You = Who & { signIn: boolean; admin?: boolean };
@@ -21,6 +24,7 @@ let send: (m: object) => void = () => {};
 let you: You | null = null;
 let base = '/';
 let face: (w: Who) => HTMLElement = () => document.createElement('span');
+let speak: (key: string, login: string, text: string) => void = () => {};
 let messages: Msg[] = [];
 let unread = 0;
 
@@ -49,7 +53,7 @@ const jump = el('button', 'chat-jump', 'New messages');
 jump.type = 'button';
 jump.hidden = true;
 const foot = el('div', 'chat-foot');
-panel.append(head, list, jump, foot);
+panel.append(handle(CHAT), head, list, jump, foot);
 
 /** The top line's Chat button (client/lib/presence.ts places it). */
 export const button = el('button', 'tl-btn tl-chat');
@@ -60,12 +64,15 @@ const badge = el('span', 'tl-badge');
 badge.hidden = true;
 button.append(el('span', 'tl-chat-icon'), el('span', 'tl-label', 'Chat'), badge);
 
+/** Open on load: as the reader last left it, else open where the page makes room (styles/shell.css, 1280px). */
 function stored(): boolean {
+	let v: string | null = null;
 	try {
-		return localStorage.getItem(OPEN_KEY) === '1';
+		v = localStorage.getItem(OPEN_KEY);
 	} catch {
-		return false;
+		// Storage refused: the default below.
 	}
+	return v === null ? matchMedia('(min-width: 1280px)').matches : v === '1';
 }
 
 function setOpen(open: boolean): void {
@@ -166,16 +173,21 @@ function drawFoot(): void {
 		const ta = el('textarea');
 		ta.rows = 1;
 		ta.maxLength = MAX;
-		ta.placeholder = `Message as ${you.login}`;
+		ta.placeholder = 'Message everyone here…';
 		ta.setAttribute('aria-label', 'Message');
 		const err = el('p', 'chat-err');
 		err.hidden = true;
 		err.id = 'chat-err';
-		const go = el('button', 'chat-send', 'Send');
+		const go = el('button', 'chat-send');
 		go.type = 'submit';
+		go.setAttribute('aria-label', 'Send');
+		go.title = 'Send (Enter)';
+		go.disabled = true;
+		go.append(arrow());
 		const grow = () => {
 			ta.style.height = 'auto';
 			ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
+			go.disabled = !ta.value.trim();
 		};
 		ta.addEventListener('input', grow);
 		ta.addEventListener('keydown', (e) => {
@@ -204,9 +216,26 @@ function drawFoot(): void {
 	}
 }
 
+function arrow(): SVGSVGElement {
+	const ns = 'http://www.w3.org/2000/svg';
+	const svg = document.createElementNS(ns, 'svg');
+	svg.setAttribute('viewBox', '0 0 16 16');
+	svg.setAttribute('aria-hidden', 'true');
+	const p = document.createElementNS(ns, 'path');
+	p.setAttribute('d', 'M8 13V3M3.5 7.5 8 3l4.5 4.5');
+	svg.append(p);
+	return svg;
+}
+
 /** Wires the chat to the presence socket and the page. Called once. */
-export function setup(opts: { send: (m: object) => void; base: string; face: (w: Who) => HTMLElement }): void {
+export function setup(opts: {
+	send: (m: object) => void;
+	base: string;
+	face: (w: Who) => HTMLElement;
+	speak: (key: string, login: string, text: string) => void;
+}): void {
 	send = opts.send;
+	speak = opts.speak;
 	base = opts.base;
 	face = opts.face;
 	document.body.append(panel);
@@ -243,6 +272,7 @@ export function message(m: { t?: unknown }): boolean {
 	} else if (m.t === 'msg') {
 		const msg = (m as { m: Msg }).m;
 		const stick = nearBottom();
+		if (msg.key !== you?.key) speak(msg.key, msg.login, msg.text);
 		messages.push(msg);
 		if (messages.length > 200) messages.shift();
 		list.querySelector('.chat-empty')?.remove();

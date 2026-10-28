@@ -130,10 +130,11 @@ all of it:
   rustc to build the rest. To cargo, ra-jit is then rustc: it answers the questions, and for
   each unit cargo asks for it writes the files cargo expects to find (the names
   `--print file-names` gave, and the dep-info), compiled through the daemon.
-- **What goes to cargo today** (`Invocation::only_cargo` in `cargo/cli.rs`: `--message-format`,
-  `-Z`, `--exclude`, several targets, an unknown triple, of a build; of a check only
-  `--build-plan` and `--unit-graph`) becomes supported, or refused with the reason. None of it
-  goes to cargo.
+- **What went to cargo** (`--message-format`, `-Z`, several targets, an unknown triple, of a
+  build; of a check only `--build-plan` and `--unit-graph`) is refused with the reason since
+  [#571](https://github.com/indexable-inc/blaze/pull/571) (`refused` in `cargo/whole.rs`, `check`
+  in `cargo/mod.rs`), until it is supported. None of it goes to cargo. `Invocation::only_cargo`
+  in `cargo/cli.rs` is left only to the wrapper under plain cargo.
 
 Every other subcommand is blaze's own, Andrew, 2026-10-26: those that are no builds "should go
 to us and not cargo". `cargo blaze fmt`, `clippy`, `doc` and the rest start no cargo, rustc,
@@ -148,8 +149,8 @@ The same goal seen from the machine blaze is installed on
 ([self-contained.md](self-contained.md), [#298](https://github.com/indexable-inc/blaze/issues/298)):
 installing is one `curl`, with no rustup, no toolchain pin and no cargo, and blaze resolves a
 project exactly as cargo does. Until K, J and M land, blaze keeps a toolchain of its own,
-private to it: the pinned nightly's `rustc`, `cargo`, `rust-std` and `rust-src` as the Rust project
-publishes them (96 to 133 MB), each piece removed as the step that ends its use lands. A
+private to it: the pinned nightly's `rustc`, `cargo`, `rust-std` (the host's and `wasm32-wasip1`'s) and
+`rust-src` as the Rust project publishes them (123 to 160 MB), each piece removed as the step that ends its use lands. A
 project's own pin does not change which Rust blaze builds with
 ([#269](https://github.com/indexable-inc/blaze/issues/269)). blaze's manifest reader, registry,
 resolver and unit graph (`crates/blaze-manifest`, `blaze-registry`, `blaze-resolve`,
@@ -198,6 +199,15 @@ reference builds) and with `RA_JIT_PROC_MACRO_SERVER=off`.
 These are the places ra-jit still runs rustc or relies on what it wrote, as of main at
 41e7906192 (2026-10-22). [How often](#how-often) has the counts on real projects;
 [the plan](#the-plan) has the order they go in.
+
+Since 2026-10-27 `cargo blaze build`, `run` and `test` are whole builds with no cargo build,
+rustc or rustdoc ([#408](https://github.com/indexable-inc/blaze/pull/408)), and `cargo blaze`
+has no path that hands a build to cargo
+([#571](https://github.com/indexable-inc/blaze/pull/571)): what blaze cannot build or plan fails
+the build with the reason (`cargo/whole.rs`). For `cargo blaze`, the first build, the fallback
+and `plain_cargo` below are history. What still runs rustc is plain cargo after `blaze enable`
+and its wrapper (`cargo/wrapper.rs`, `ra-jit-rustc`, and `settle`'s `Built::by_cargo`), until
+step M ([#93](https://github.com/indexable-inc/blaze/issues/93)).
 
 - The first build of every workspace is cargo's and rustc's, with ra-jit as the workspace
   wrapper recording what rustc built (`cargo/wrapper.rs`, `ra-jit-rustc`,
@@ -1453,9 +1463,11 @@ paid once, by the release, instead of on a user's machine (`crates/ra-jit/src/sh
   attaches the remote's files to the release with `.` for `/` (`manifests.std-…`, `packs.….pack.zst`,
   `keys.…`). A remote can be a plain `https://` address now (`remote/https.rs`): read-only,
   flat, redirects followed, which is what a release's download URL is.
-- A build with nothing of rustc's, before it first reads the store, fetches that project once
-  per store: from `RA_JIT_STD_FROM` when set (`off` for nowhere), otherwise from its own
-  release when it is one (`RA_JIT_RELEASE`, set by the workflow on a tag). Builds that start
+- A build with nothing of rustc's fetches that project once per store, beside the build and
+  never waited for (the store reads it when it is in, [cache.md](cache.md#the-standard-library)):
+  from `RA_JIT_STD_FROM` when set (`off` for nowhere), otherwise from its own release when it
+  is one (`RA_JIT_RELEASE`, set by the workflow on a tag) and the root manifest does not say
+  `fetch-public = false` under `[workspace.metadata.blaze]`. Builds that start
   together take a lock and fetch once; `fetched-<project>` in the store dir records that it is
   done, and a failure is retried an hour later. A pack is used only once its bytes hash to the
   name the manifest lists, as with any remote.

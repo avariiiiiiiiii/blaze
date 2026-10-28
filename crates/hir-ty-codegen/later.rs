@@ -420,11 +420,19 @@ impl<'db> Keeper<'_, 'db> {
         use cached::{CachedData, CachedFunc, CachedTarget};
         let (compiled, ids, db) = (later.compiled, &later.ids, self.db);
         let mut funcs = Vec::with_capacity(ids.funcs.len());
+        // An item of an `extern` block is the symbol it links to, whoever declares it: the
+        // allocator's shim is defined in the object of a program with nothing of rustc's.
+        let foreign = |callee: &Instance| match callee.def {
+            InstanceDef::Fn(func) => link_name(db, func).is_some(),
+            _ => false,
+        };
         let requests = compiled.requests.funcs.iter().zip(&ids.funcs).zip(&later.imported.0);
         for (at, ((request, &id), &imported)) in requests.enumerate() {
             let target = if let Some(&hash) = self.type_ids.get(&id) {
                 CachedTarget::TypeId(hash)
-            } else if imported {
+            } else if imported
+                || matches!(&request.target, FuncTarget::Instance(callee, _) if foreign(callee))
+            {
                 let decl = self.declarations.get_function_decl(id);
                 // rustc's copy of a function of the checkout is of the checkout as rustc
                 // built it, and uses rustc's copies of the statics.
@@ -432,11 +440,6 @@ impl<'db> Keeper<'_, 'db> {
                 // Checked too when it is one of an object ra-jit built before, the standard
                 // library's unit: a build that compiles std's crates itself has no such symbol.
                 let checked = self.symbols.provides(&symbol);
-                // An item of an `extern` block is the symbol it links to, whoever declares it.
-                let foreign = |callee: &Instance| match callee.def {
-                    InstanceDef::Fn(func) => link_name(db, func).is_some(),
-                    _ => false,
-                };
                 let mut copied = None;
                 let callee = match &request.target {
                     FuncTarget::Instance(callee, _) if !foreign(callee) => {

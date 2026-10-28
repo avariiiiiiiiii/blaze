@@ -9,9 +9,11 @@ There are also Rust unit tests in `crates/ra-jit` and in the code generator; the
 are what carries the weight.
 
 `checktargets.py` compares plain and explicit-test checks with cargo, using workspace and
-registry dev-dependencies (#634). Errors in unselected tests, examples and benches must not
-fail a plain check; errors in libraries and binaries must, and an all-targets check must
-report the dev targets' errors.
+registry dev-dependencies (#634, #632). Errors in unselected tests, examples and benches must
+not fail a plain check; errors in libraries and binaries must, and an all-targets check must
+report the dev targets' errors. Each target flag must pick what cargo's does: `--tests` no
+example or bench, `--test NAME` the one test, `--lib` no unit tests, and a member only
+depended on its library alone.
 
 ## Running them
 
@@ -162,16 +164,18 @@ writes them again.
 | `rustsrc.py` | A toolchain without `rust-src` is turned down, saying how to install it |
 | `splices.py` | Edits that are hard on the splice: thread-locals, statics, vtables, function pointers, closures, panics, foreign calls. Counts how each step was linked |
 | `loadretry.py` | A refused load reports changed flags and recovers after configuration files are removed or rewritten, without restarting the daemon (#597). Both configuration filenames, inherited configuration, and cached source diagnostics are checked |
+| `scriptenv.py` | A build script that says it reads `SDK_DIR` and fails without it (cef-dll-sys's shape) is given the command's value, with a fresh daemon and with one started without it, and another value or none reruns it; a path dependency that is a workspace of its own is given what the build's root manifest names in `build-script-env` ([#720](https://github.com/indexable-inc/blaze/issues/720)) |
 | `farsplices.py` | Splices into a binary whose code is further from its end than an AArch64 branch reaches |
 | `farfile.py` | Edits of a program whose file is 2.3 GB of a section nothing loads, as a debug build of bevy's is mostly debug info: bodies, a caller, a new function and taking it back each have to be spliced, which a patch placed as far from the code as it is behind the file is not ([#79](https://github.com/indexable-inc/ra-jit/issues/79)). Linux |
 | `bigbinary.py` | Edits of a program larger than any place of the splice is sized for: 220 MB of code, over 16 MB of frames the unwinder reads from `__eh_frame` or `.eh_frame`, and on Linux 4.2 GB of `.debug_abbrev`. A function shorter than the long jump, one that panics through its replacement, 3,000 functions added and a new function each have to be spliced ([architecture.md](architecture.md#no-size-is-a-reason-to-link-in-full)). Nightly, Linux and macOS |
 | `unreached.py` | Edits under `cargo ra-jit` that call instances of another crate's generic function the executable did not reach when it was linked: each is spliced, not linked in full. The daemon's own links, with `RA_JIT_RUSTC_BASE=0`. Linux and macOS; not run on Windows, where `cargo ra-jit` has been run by hand only |
 | `anonstatics.py` | Edits under `cargo ra-jit` that reach, through code rustc inlined at opt-level 1, a `static mut` inside a `const _: () = { .. }` of a crate rustc built (the shape of objc2's `declare_class!` ivar offsets, which winit's frame function reads): the daemon serves each build and refers to rustc's static, found under its `_` segment. Linux and macOS; not run on Windows, where `cargo ra-jit` has been run by hand only |
+| `artifactedits.py [case ...] [--release]` | An edit of a dependency reaches the file `cargo blaze build` says it built ([#730](https://github.com/indexable-inc/blaze/issues/730)): a workspace of a library and a `bin`, `cdylib`, `dylib` or `staticlib` over it, built cold, unchanged, after a body edit that changes no behaviour (`std::hint::black_box`), one that does, and the edits taken back. A build that exits 0 has written the artifact, with bytes other than the build's before after each edit, and it computes what the source says (run, loaded with ctypes, or linked into a C program); one that cannot write it fails naming the kind (`dylib` and `staticlib` today, #262). `flags` is a program built with #731's rustflags (`-Z threads=8` with `RUSTC_BOOTSTRAP=1`, `--cfg tokio_unstable`, `-C target-cpu`, `-C force-frame-pointers=yes`, lld on AArch64 Linux), built and spliced by blaze. Linux and macOS |
 | `loadedits.py` | A file written while a worker loads, after the worker read it and before it took its timestamp (held there with `RA_JIT_LOAD_PAUSE_MS`), is built as written: the next build, and the one after an edit of another crate, print the new text ([#53](https://github.com/indexable-inc/ra-jit/issues/53)). Linux and macOS |
 | `agents.py` | Random edits of the kind coding agents make, on a real workspace |
 | `invalidation.py` | How much the database redoes after different kinds of edit |
-| `testselect.py` | `cargo ra-jit test` with `RA_JIT_TESTS=affected` on a library's unit tests and an integration test of it, edited a step at a time: the tests that run are those whose code or what it calls changed, also through a library of the workspace both link (built without `cfg(test)`, which the daemon takes over from rustc), one added, one given `#[ignore]`, one that reads a file (only when the file changed, which `-v` names, from what the sandbox recorded), one that downcasts a `dyn Any` (only when what it calls changed), one in a private module named as a public function beside it (the harness names it through the module) and one that failed (until it passes); `RA_JIT_TESTS=all` runs every test. Every test runs sandboxed: one that writes into the package leaves it as it was, and the harness fails where the sandbox can't be made (`RA_JIT_SANDBOX=off` checks the unsandboxed path). Linux and macOS |
-| `sandboxbench.py` | What the sandbox every test runs in costs: a trivial program bare and in `ra-jit sandbox` (with and without a record), and a generated 600-test library under `cargo ra-jit test` with `RA_JIT_SANDBOX=off`, sandboxed under `all` and `affected`, and as a process per test, bare and sandboxed; medians of alternated rounds, pinned to `--cpus`. Linux and macOS |
+| `testselect.py` | `cargo ra-jit test` with `RA_JIT_TESTS=affected` on a library's unit tests and an integration test of it, edited a step at a time: the tests that run are those whose code or what it calls changed, also through a library of the workspace both link (built without `cfg(test)`, which the daemon takes over from rustc), one added, one given `#[ignore]`, one that reads a file (only when the file changed, which `-v` names, from what the sandbox recorded), one that downcasts a `dyn Any` (only when what it calls changed), one in a private module named as a public function beside it (the harness names it through the module) and one that failed (until it passes); `RA_JIT_TESTS=all` runs every test. Its workspace opts into sandboxed tests, so every test runs sandboxed: one that writes into the package leaves it as it was, and the harness fails where the sandbox can't be made (`RA_JIT_SANDBOX=off` checks the unsandboxed path); a package that has not opted in runs every test under `affected` and is told what to add. Linux and macOS |
+| `sandboxbench.py` | What the sandbox of a test costs: a trivial program bare and in `ra-jit sandbox` (with and without a record), and a generated 600-test library, opted into sandboxed tests, under `cargo ra-jit test` with `RA_JIT_SANDBOX=off`, sandboxed under `all` and `affected`, and as a process per test, bare and sandboxed; medians of alternated rounds, pinned to `--cpus`. Linux and macOS |
 | `doctestonce.py` | `cargo ra-jit test --doc` on a workspace of three libraries against `cargo test --doc`: the workspace is loaded once for all of them, each library's results, `Doc-tests` line and cargo's lines of what failed are cargo's (every example passing, two failing with and without `--no-fail-fast`, one failing with it), and each example reads the directory, variables and dev-dependencies it has under rustdoc. Linux and macOS |
 | `movedlines.py` | A panic reports its new line after lines are added above its function (seven ways to panic, each against cargo), and moving a function compiles nothing |
 | `buildmodel.py` | One small cargo project per feature of cargo's build model, under both backends, with steps that change one input at a time |
@@ -185,7 +189,7 @@ writes them again.
 | `rustcbase.py` | The first edits after a cold `cargo ra-jit build`, spliced into the executable rustc linked ([#11](https://github.com/indexable-inc/ra-jit/issues/11)), against plain cargo: bodies, closures, a dependency crate, function-local statics, two edits in a row, a new function of the program's crate, also in a package with a library it uses, a body of a program whose library has its name, and a `#[ra_jit::cache]` function and what it reaches have to be patches, also a function that hands `iter.map(Ok)` to a library asking its `TypeId` through `dyn Any`, as axum's `Body::from_stream` does (`typeid-ctor`, [#369](https://github.com/indexable-inc/blaze/issues/369)), and an edit of a `#[global_allocator]`'s `alloc` at opt-level 1, which rustc's allocator entries have inlined (`global-alloc`, [#386](https://github.com/indexable-inc/blaze/issues/386)); generic, `#[inline]` and default trait functions, statics, a new function of a crate another depends on or of a name the crate already writes, other new items, `async`, `impl Trait` and `include_str!` edits have to be built in full and say why; and the daemon's own base, built while nothing waits, takes the edits after it; an edit that comes as it builds is a patch of rustc's executable, or of the base when it had begun to link ([#79](https://github.com/indexable-inc/ra-jit/issues/79)), also when a crate it loads includes a file no build script wrote (`unbuilt-member`), and is given up once it holds more memory than `RA_JIT_OWN_BASE_MEMORY` (`own-base-budget`), after which an edit built in full is spliced into rustc's executable and the patches after it chain onto that (`own-base-budget-full`, [#159](https://github.com/indexable-inc/ra-jit/issues/159)). On Linux each build in full of the scenarios is spliced whole into what rustc linked, not linked. Every edit's output and exit status against cargo's, macOS and Linux |
 | `stalecopies.py` | Plain `cargo build` through `ra-jit enable` with an opt-level 1 profile, where rustc's copies keep code of before an edit: each edit of a `#[global_allocator]`'s `alloc` (which rustc's allocator entries have inlined) is the daemon's and runs (`allocator`), and an edit made while the daemon is stopped, to a `main` left to rustc, is never linked from rustc's copy of before once the daemon starts again (`restart`) ([#386](https://github.com/indexable-inc/blaze/issues/386)). Every edit's program has to print what its source says. Linux and macOS |
 | `nocompact.py` | A program linked with `-no_compact_unwind`, as bun is, which has `__eh_frame` and no `__unwind_info`: its edits are spliced, and the unwinder finds the frame of the edited function where its symbol now is, behind the program's frames and, once a thousand new functions outgrow that room, with all of them moved into the header's ([#33](https://github.com/indexable-inc/ra-jit/issues/33)). macOS on AArch64 |
-| `headerpad.py` | A program whose unwind table does not fit the room its link leaves after the load commands: the first link is done again with room, the edits after it are spliced, and a restarted daemon starts from the room kept beside the executable ([#13](https://github.com/indexable-inc/ra-jit/issues/13)). It is built for macOS 14, as nix's shell builds, which Apple's linker gives chained fixups unless told not to ([#30](https://github.com/indexable-inc/ra-jit/issues/30)). The daemon's own links, with `RA_JIT_RUSTC_BASE=0`. macOS on AArch64 |
+| `headerpad.py` | A program whose unwind table does not fit the room its link leaves after the load commands: the first link is told the room the unwind information of its objects wants and is linked once ([#173](https://github.com/indexable-inc/blaze/issues/173)), the edits after it are spliced, and a restarted daemon starts from the room kept beside the executable ([#13](https://github.com/indexable-inc/ra-jit/issues/13)). It is built for macOS 14, as nix's shell builds, which Apple's linker gives chained fixups unless told not to ([#30](https://github.com/indexable-inc/ra-jit/issues/30)). The daemon's own links, with `RA_JIT_RUSTC_BASE=0`. macOS on AArch64 |
 | `tiers.py` | Tiers ([tiers.md](tiers.md)): `demo/lifebench` running under the daemon reaches levels 2 and 3 with output identical to cargo's, an edit of a tiered function demotes it and is applied at once, and `RA_JIT_TIER=off` changes nothing. macOS on AArch64 with `--features llvm`; it exits 0 elsewhere |
 | `tierbench.py` | The benchmark table of [tiers.md](tiers.md): `demo/lifebench` at level 1, 2 and 3 under a daemon and as cargo builds it (release, and `-O3` with the dev profile's checks), in interleaved rounds, the steady rate of each; `--together` runs a round's builds at once, for a loaded machine. Measures; checks nothing; not in CI |
 
@@ -204,6 +208,7 @@ writes them again.
 | `remote.py`, `s3fake.py` | A store shared by two machines through an S3 service, with the transfer broken, objects spoiled and manifests forged |
 | `packs.py` | Not a check: the sealed pack's layout ([cache.md](cache.md)) read and written, for `remote.py`, `storeguards.py` and `bench.py` |
 | `deps.py` | cargo's builds of registry crates pushed and pulled. Builds offline from cargo's registry cache, so it does not run on a clean CI machine |
+| `netdown.py` | No build waits on the network ([cache.md](cache.md), "The standard library"): hello world built whole with the standard library's remote served fine, slowly, hung and at an address nothing answers. A warm store builds as fast as with the remote fine and prints no error; a cold one compiles the library from the start, as fast as with `RA_JIT_STD_FROM=off`, and says the fetch failed in one line at most |
 
 ### Timing
 
@@ -384,8 +389,11 @@ starts rustc, rustdoc or cargo ([no-rustc.md](no-rustc.md)).
 
 ### The release train
 
-`train.yaml` runs on every push to main and by hand (`gh workflow run train.yaml --ref
-<branch>` runs it on a branch, without the release or the issue). One train runs at a time: a
+`train.yaml` runs by hand only for now (`gh workflow run train.yaml` on main; `--ref <branch>`
+runs it on a branch, without the release or the issue). On every push to main it never
+finished and was red for reasons the merge gate (`ci`) does not share, so releases are cut by
+hand until it runs on pushes again: `gh workflow run release-cut.yaml` runs the train's release
+job alone on main (the release commit, then pgo.yaml tags it and release.yaml builds it). One train runs at a time: a
 push while it runs waits, and a newer push replaces the one waiting, so the train always runs
 on the newest commit of main once the one before it is done. It does not cancel the running
 train: with a merge every few minutes, a train of 45 would never end.
@@ -407,7 +415,9 @@ with the `llvm` feature, hands the binary to its other jobs, and runs:
 - `harness/wasm32.py` (Linux x86-64, in the flake's `wasm` shell): the corpus and `stress.py`
   built for `wasm32-wasip1` and run under wasmtime against cargo's build;
 - `cargo_ra_jit.py`: its checks, ripgrep and hyperfine, and fd (Linux x86-64 and macOS), and
-  ripgrep, fd, bat, hyperfine, just, axum and nushell with each project's tests (Linux AArch64);
+  ripgrep, fd, bat, hyperfine, just, axum and nushell with each project's tests (Linux AArch64;
+  axum and nushell not blocking, [#26](https://github.com/indexable-inc/blaze/issues/26) and
+  [#734](https://github.com/indexable-inc/blaze/issues/734));
 - `fork alone`: `vendor/rust-analyzer` built and tested outside this repository (the tests of
   `hir-ty`, `hir-ty-borrowck`, `hir-ty-wfcheck` and `ide-diagnostics`, whose diagnostics are the
   daemon's errors);
@@ -491,8 +501,8 @@ schedules of their own: each takes hours or a dedicated machine, and the train w
 them. On a pull request that changes the flake, `nix/` or the dependencies, `nix-live.yaml`
 checks only the unit graphs. The flake's `dist` passes `--nix` to `build_release.py`, which
 then checks that every binary loads through a `/nix/store` loader instead of the glibc 2.34
-floor of a shipped release. `fork-sync.yaml` runs on pushes to main that touch `vendor/`, and
-`live-*.yaml` on their own branches. None of them is part of `ci`. `site.yaml` deploys the
+floor of a shipped release. `live-*.yaml` run on their own branches (the forks of `vendor/` sync themselves from main,
+by a workflow of their own). None of them is part of `ci`. `site.yaml` deploys the
 site, and `release.yaml` builds releases from tags, each target through
 `.github/scripts/build_release.py` (the `dist` profile with PGO,
 [reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), the recipe the flake's `dist` runs too.

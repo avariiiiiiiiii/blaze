@@ -101,7 +101,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if asked.subcommand == Subcommand::Run {
         programs.retain(|it| !it.kind.linked_library());
     }
-    if let Some(it) = programs.iter().find(|it| it.kind == Kind::Staticlib) {
+    if let Some(it) = programs.iter().find(|it| matches!(it.kind, Kind::Staticlib | Kind::Dylib)) {
         let kind = format!("{:?}", it.kind).to_lowercase();
         say::error(&format!(
             "blaze does not link the `{kind}` of `{}` (target `{}`) yet, so it would write no `{}` (#262)",
@@ -118,11 +118,15 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if programs.is_empty() {
         return super::check(asked);
     }
-    compiling(asked, &programs);
+    let mut said = Vec::new();
+    compiling(asked, programs.iter().filter(|it| !it.executable.exists()), &mut said);
     let checkout = checkout(asked, &cwd, &metadata, &programs, false, BTreeMap::new());
-    if let Err(why) = whole(&cwd, &checkout, &programs) {
-        why.say();
-        return Ok(FAILED);
+    match whole(&cwd, &checkout, &programs) {
+        Ok(rebuilt) => compiling(asked, rebuilt.into_iter().map(|at| &programs[at]), &mut said),
+        Err(why) => {
+            why.say();
+            return Ok(FAILED);
+        }
     }
     finished(asked, asked.profile(), started);
     if let Some(failed) = super::remote_failed_it() {
@@ -166,7 +170,8 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
         say::error(&format!("blaze does not build the unit tests of `{}` {why}", it.name));
         return Ok(FAILED);
     }
-    compiling(asked, &programs);
+    let mut said = Vec::new();
+    compiling(asked, programs.iter().filter(|it| !it.executable.exists()), &mut said);
     // What an integration test's `env!` reads to run a binary of its package, and the scratch
     // directory cargo makes for the integration tests and benchmarks, `target/tmp`. The whole
     // build gives one environment to all its crates, so a program sees it too, where cargo's
@@ -257,9 +262,12 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
                 false => _ = std::fs::remove_file(&tests),
             }
         }
-        if let Err(why) = whole(&cwd, checkout, programs) {
-            why.say();
-            return Ok(FAILED);
+        match whole(&cwd, checkout, programs) {
+            Ok(rebuilt) => compiling(asked, rebuilt.into_iter().map(|at| &programs[at]), &mut said),
+            Err(why) => {
+                why.say();
+                return Ok(FAILED);
+            }
         }
     }
     finished(asked, profile, started);
@@ -356,19 +364,24 @@ fn state_kind(kind: Kind) -> super::state::Kind {
         Kind::Bin => super::state::Kind::Bin,
         Kind::Example => super::state::Kind::Example,
         Kind::Test => super::state::Kind::Test,
-        Kind::Cdylib | Kind::Staticlib => super::state::Kind::Lib,
+        Kind::Cdylib | Kind::Staticlib | Kind::Dylib => super::state::Kind::Lib,
     }
 }
 
-/// Says that each package of `programs` is compiled, once.
-fn compiling(asked: &Invocation, programs: &[Program]) {
-    let mut said = Vec::new();
+/// Says that each package of `programs` is compiled, once in a command: as cargo, of what is
+/// built and not of what was up to date. A program not built before is said before the build,
+/// which may be long; one the daemon rebuilt, after it answers.
+fn compiling<'a>(
+    asked: &Invocation,
+    programs: impl Iterator<Item = &'a Program>,
+    said: &mut Vec<cargo_metadata::PackageId>,
+) {
     for program in programs {
         let package = &program.package;
-        if said.contains(&&package.id) {
+        if said.contains(&package.id) {
             continue;
         }
-        said.push(&package.id);
+        said.push(package.id.clone());
         let at = super::state::package_dir(package);
         say::status(
             asked.flags.quiet,
@@ -412,20 +425,21 @@ impl Unbuilt {
 fn turned_down(program: &Program, said: &crate::errors::Said) -> String {
     let name = &program.name;
     let target = match (program.kind, program.test) {
-        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, false) => "lib".to_owned(),
-        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, true) => "lib test".to_owned(),
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib | Kind::Dylib, false) => "lib".to_owned(),
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib | Kind::Dylib, true) => "lib test".to_owned(),
         (Kind::Bin, false) => format!("bin \"{name}\""),
         (Kind::Bin, true) => format!("bin \"{name}\" test"),
         (Kind::Example, _) => format!("example \"{name}\""),
         (Kind::Test, _) => format!("test \"{name}\""),
     };
-    super::state::turned_down(said, &program.package.name.to_string(), &target)
+    super::state::turned_down(said, &program.package.name, &target)
 }
 
 /// Has the daemon build the `programs` of `checkout` whole, and puts each where cargo would.
 /// A worker of the daemon loads the workspace and links each program before it answers, and
-/// builds them again on what it has loaded when asked next. `Err` says why not.
-fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), Unbuilt> {
+/// builds them again on what it has loaded when asked next. `Ok` names the programs, by
+/// index, the daemon built rather than found up to date; `Err` says why not.
+fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<Vec<usize>, Unbuilt> {
     let reply = client::ask(Request::Build(super::asking(checkout)), Start::IfMissing)
         .map_err(|it| format!("{it:#}"))?;
     let built = match reply {
@@ -434,9 +448,12 @@ fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), Un
         None => return Err(client::why_none().into()),
         Some(other) => return Err(format!("the daemon answered {other:?}").into()),
     };
-    for ((program, plan), built) in std::iter::zip(programs, &checkout.programs).zip(built) {
+    let mut rebuilt = Vec::new();
+    let pairs = std::iter::zip(programs, &checkout.programs).zip(built).enumerate();
+    for (at, ((program, plan), built)) in pairs {
         match built {
-            Ok(_) => {}
+            Ok(said) if said == "ok unchanged" => {}
+            Ok(_) => rebuilt.push(at),
             Err(NotBuilt::Error(said)) => return Err(Unbuilt::Said(turned_down(program, &said))),
             Err(why) => {
                 return Err(format!("could not build `{}`: {}", program.name, why.why()).into());
@@ -469,7 +486,7 @@ fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<(), Un
         place(&plan.binary, &program.executable)
             .map_err(|it| format!("installing {}: {it}", program.executable.display()))?;
     }
-    Ok(())
+    Ok(rebuilt)
 }
 
 /// The daemon's checkout of a whole build of `programs`, each linked in its `dir`, by a
@@ -496,6 +513,7 @@ fn checkout(
         cfg_test: unit_tests,
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
+        command_env: BTreeMap::new(),
         whole: true,
     };
     // A worker links its programs where it was started to and builds again only what was
@@ -612,9 +630,9 @@ fn not_loaded(cwd: &Path, checkout: &Checkout, reason: &str) -> String {
             refused.join("\n  ")
         );
     }
-    let last = said.lines().rev().find(|it| it.starts_with("Error"));
-    let last = last.map_or(reason, |it| it.strip_prefix("Error: ").unwrap_or(it));
-    format!("could not build {named}: {last} (what blaze said is in {shown})")
+    let last = super::daemon::last_error(&said);
+    let last = last.as_deref().unwrap_or(reason).replace('\n', "\n  ");
+    format!("could not build {named}: {last}\n(what blaze said is in {shown})")
 }
 
 /// The log of the daemon's worker for the package in `project`.
@@ -748,15 +766,17 @@ fn planned(
         out.push(triple);
     }
     out.push(profile);
-    // Cargo's tests are in its build directory (`build.build-dir`), in the layout of it that
-    // cargo has: a test that finds a program from where it is itself finds what it finds there.
+    // A test is in the `deps` of cargo's build directory (`build.build-dir`), where stable
+    // cargo puts it, also where nightly's second layout would put it in its unit's directory:
+    // a test that finds its package's programs from its own path (`current_exe()`'s
+    // grandparent, the `executable-path` crate, assert_cmd's `cargo_bin`) finds them only
+    // from `deps`.
     let build_dir = metadata.build_directory.as_ref().map_or(target, |it| it.as_std_path());
     let mut built = build_dir.to_owned();
     if let Some(triple) = &selection.target {
         built.push(triple);
     }
     built.push(profile);
-    let second = second_layout(&asked.flags.config);
     let mut programs = Vec::new();
     for program in planned {
         let Some(package) = metadata.packages.iter().find(|it| it.id.repr == program.package)
@@ -775,7 +795,9 @@ fn planned(
         };
         let executable = match (program.kind, program.test) {
             (Kind::Example, _) => out.join("examples").join(exe(&program.name)),
-            (Kind::Cdylib, _) => out.join(library(named.dll_prefix, named.dll_suffix)),
+            (Kind::Cdylib | Kind::Dylib, _) => {
+                out.join(library(named.dll_prefix, named.dll_suffix))
+            }
             (Kind::Staticlib, _) => out.join(match cfg!(windows) {
                 true => library("", ".lib"),
                 false => library("lib", ".a"),
@@ -785,14 +807,7 @@ fn planned(
             // what tells its tests apart.
             (_, true) => {
                 let hash = test_hash(&package.id.repr, &kind, &program.name, &built);
-                let name = exe(&format!("{}-{hash}", program.name));
-                match second {
-                    true => {
-                        let unit = built.join("build").join(package.name.as_str()).join(&hash);
-                        unit.join("out").join(name)
-                    }
-                    false => built.join("deps").join(name),
-                }
+                built.join("deps").join(exe(&format!("{}-{hash}", program.name)))
             }
         };
         // A test's directory has the file that says it starts in the harness, and a build of
@@ -817,16 +832,6 @@ fn planned(
         });
     }
     Ok(programs)
-}
-
-/// Whether cargo lays its build directory out in its second layout ([`super::layout`]): the
-/// nightly blaze pins does, unless `unstable.build-dir-new-layout` (or
-/// `CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT`) is false. `config` is cargo's `--config` arguments.
-fn second_layout(config: &[String]) -> bool {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let config = blaze_manifest::Config::load(&cwd, std::env::vars(), config);
-    let set = config.and_then(|it| it.get::<Option<bool>>("unstable.build-dir-new-layout"));
-    set.map_or(true, |it| it != Some(false))
 }
 
 /// Sixteen hexadecimal digits, as cargo names a unit by, of the test `name` of `kind` in

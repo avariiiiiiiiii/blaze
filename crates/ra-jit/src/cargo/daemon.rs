@@ -56,7 +56,7 @@ fn memory_max() -> Result<Option<u64>, String> {
         Ok(text) if text == "off" => Ok(None),
         Ok(text) => ra_jit_store::parse_size(&text)
             .map(Some)
-            .ok_or_else(|| format!("RA_JIT_MEMORY_MAX=`{text}` is neither a size nor `off`")),
+            .ok_or_else(|| format!("BLAZE_MEMORY_MAX=`{text}` is neither a size nor `off`")),
     }
 }
 
@@ -82,7 +82,7 @@ fn spares() -> Result<Spares, String> {
         Err(_) => Ok(Spares::Asked),
         Ok(text) if text == "0" => Ok(Spares::Never),
         Ok(text) if text == "ready" => Ok(Spares::Ready),
-        Ok(text) => Err(format!("RA_JIT_SPARE=`{text}` is neither `0` nor `ready`")),
+        Ok(text) => Err(format!("BLAZE_SPARE=`{text}` is neither `0` nor `ready`")),
     }
 }
 
@@ -145,25 +145,11 @@ pub(crate) struct Envelope {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Request {
-    /// Bring the programs of a checkout up to date with its source, if the daemon is warm
-    /// for it.
-    Sync(Checkout),
     /// Load a checkout that cargo has just built, for the builds to come.
     Warm(Checkout),
     /// Load a checkout cargo has just built what stands in for the crates of, and answer
     /// when its programs are built.
     Build(Checkout),
-    /// A workspace cargo is about to build what stands in for the crates of: a worker
-    /// loads it meanwhile, for the [`Request::Build`] that follows.
-    Ahead(Ahead),
-    /// A line cargo printed of a build script it ran or a proc macro it built, for the
-    /// worker of the [`Request::Ahead`] of this [`WorkerConfig::id`].
-    Said {
-        id: String,
-        line: String,
-    },
-    /// No build follows the [`Request::Ahead`] of this [`WorkerConfig::id`].
-    Forget(String),
     /// `cargo ra-jit check` of a build the daemon has no programs of: what a checker that
     /// loaded the workspace as it would finds in its crates, with no rustc.
     Check(Ahead),
@@ -172,6 +158,20 @@ pub(crate) enum Request {
     Lint(Ahead, String),
     Status,
     Stop,
+}
+
+impl Request {
+    /// The request, with the variables of this command its build's scripts are given
+    /// ([`WorkerConfig::command_env`]): set as it is sent, so that no state on disk keeps them.
+    pub(crate) fn of_this_command(mut self) -> Request {
+        if let Request::Warm(it) | Request::Build(it) = &mut self {
+            it.config.command_env = super::cli::command_env();
+        }
+        if let Request::Check(it) | Request::Lint(it, _) = &mut self {
+            it.config.command_env = super::cli::command_env();
+        }
+        self
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -272,6 +272,11 @@ pub(crate) struct WorkerConfig {
     pub(crate) selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
     pub(crate) env: BTreeMap<String, String>,
+    /// The rest of the variables of the command ([`super::cli::command_env`]), which its build
+    /// scripts are given of as cargo's are. Not what picks the worker ([`Self::id`]): one
+    /// loads the workspace again when a variable a script reads is another.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) command_env: BTreeMap<String, String>,
     /// Whether its programs are built whole, with nothing of rustc's ([`Plan::whole`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) whole: bool,
@@ -281,8 +286,16 @@ impl WorkerConfig {
     /// 16 hex digits: it names the worker's directory, and the path of the socket in it has
     /// to fit the 104 bytes macOS has for one, with the daemon's directory before it.
     pub(crate) fn id(&self) -> String {
-        let text = serde_json::to_vec(self).unwrap_or_default();
+        let picks = WorkerConfig { command_env: BTreeMap::new(), ..self.clone() };
+        let text = serde_json::to_vec(&picks).unwrap_or_default();
         Sha256::digest(text).iter().take(8).map(|it| format!("{it:02x}")).collect()
+    }
+
+    /// Every variable of the build: [`Self::env`] over [`Self::command_env`].
+    pub(crate) fn builds_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.command_env.clone();
+        env.extend(self.env.clone());
+        env
     }
 }
 
@@ -322,6 +335,11 @@ pub(crate) struct Ahead {
     pub(crate) root: PathBuf,
     /// Where the source of each crate the daemon compiles starts.
     pub(crate) crates: Vec<PathBuf>,
+    /// The flags of a check that pick targets (`--tests`, `--bin NAME`, ...), each with its
+    /// value. What is loaded does not turn on them, so they are not the checker's
+    /// [`WorkerConfig`]: they are told it with each request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) targets: Vec<String>,
 }
 
 /// A checkout as cargo last built it, and the programs of it the daemon is asked for.
@@ -434,9 +452,6 @@ struct Worker {
     project: PathBuf,
     socket: PathBuf,
     log: PathBuf,
-    /// The variables the process runs with. A request says them with the ones of its
-    /// checkout over them.
-    env: ide_db::base_db::Env,
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
     asked: Mutex<Instant>,
@@ -523,16 +538,6 @@ impl Worker {
             args.push("--scripts-from".into());
             args.push(scripts.into());
         }
-        // Sent with each request, so the daemon's flags would reload the workspace with them.
-        let not_ours = super::cli::not_the_builds(&config.env);
-        let mut env: ide_db::base_db::Env = Vec::from(crate::process::own())
-            .into_iter()
-            .filter(|(name, _)| !not_ours.contains(name))
-            .collect();
-        for (name, value) in &config.env {
-            env.set(name, value);
-        }
-        env.set(ENDS_WITH_INPUT, "1");
         // What `env!` reads of the places cargo set, as each request has them: the load
         // compiles the crates before the first request is read, and an integration test
         // that names a program (`CARGO_BIN_EXE_<name>`) would not compile without them.
@@ -542,8 +547,8 @@ impl Worker {
             .filter(|(name, _)| super::wrapper::names_a_place(name))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
-        started.extend(config.env.clone());
-        let told = spare.and_then(|it| it.told(&args, &started, &checkout.root, false));
+        started.extend(config.builds_env());
+        let told = spare.and_then(|it| it.told(&args, &started, &checkout.root));
         let child = match told {
             Some(spare) => {
                 log = spare.log;
@@ -559,7 +564,7 @@ impl Worker {
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
                 command.envs(&started).env(ENDS_WITH_INPUT, "1");
-                exact_env(&mut command, &config.env);
+                exact_env(&mut command, &started);
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 own_group(&mut command);
@@ -575,7 +580,6 @@ impl Worker {
             project: checkout.project(),
             socket,
             log,
-            env,
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
             asked: Mutex::new(Instant::now()),
@@ -741,7 +745,7 @@ impl Worker {
             }
         };
         let mut stream = self.connected()?;
-        let mut env = self.env.clone();
+        let mut env = requests_env(&checkout.config);
         for (name, value) in &checkout.env {
             env.set(name, value);
         }
@@ -841,6 +845,23 @@ fn exact_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
+/// The variables a request of the build `config` says, under its checkout's: those a worker
+/// of it runs with. The worker loads the workspace again when the flags or a variable a
+/// build script reads are another than it loaded it with, and its `env!` reads them.
+fn requests_env(config: &WorkerConfig) -> ide_db::base_db::Env {
+    let builds = config.builds_env();
+    let not_ours = super::cli::not_the_builds(&builds);
+    let mut env: ide_db::base_db::Env = Vec::from(crate::process::own())
+        .into_iter()
+        .filter(|(name, _)| !not_ours.contains(name))
+        .collect();
+    for (name, value) in &builds {
+        env.set(name, value);
+    }
+    env.set(ENDS_WITH_INPUT, "1");
+    env
+}
+
 impl Spare {
     /// Starts one with its files in `dir`.
     fn start(dir: &Path) -> anyhow::Result<Spare> {
@@ -862,19 +883,17 @@ impl Spare {
 
     /// Tells it to be the worker `args` start, with the variables `env`. `None` when it
     /// can't be told: it has ended, or a path of the build is not text.
-    /// One told a build `ahead` has what cargo has not built yet left out of `args`, and
-    /// is told them whole afterwards.
     fn told(
         mut self,
         args: &[OsString],
         env: &BTreeMap<String, String>,
         cwd: &Path,
-        ahead: bool,
     ) -> Option<Spare> {
         let told = || {
             let args: Option<Vec<String>> =
                 args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
-            let told = crate::Told { args: args?, env: env.clone(), cwd: cwd.to_owned(), ahead };
+            let told =
+                crate::Told { args: args?, env: env.clone(), cwd: cwd.to_owned(), ahead: false };
             let mut line = serde_json::to_string(&told).ok()?;
             line.push('\n');
             Some(line)
@@ -890,16 +909,6 @@ impl Spare {
             return None;
         }
         Some(self)
-    }
-
-    /// Passes on what cargo said of a script or a proc macro. One that has ended is found
-    /// out when it is told its build.
-    fn said(&mut self, line: String) {
-        let Ok(mut line) = serde_json::to_string(&crate::Line::Said { said: line }) else { return };
-        line.push('\n');
-        if let Some(input) = self.child.stdin.as_mut() {
-            let _ = input.write_all(line.as_bytes());
-        }
     }
 
     fn stop(&mut self) {
@@ -935,8 +944,9 @@ impl Checker {
         };
         let output =
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
-        command.envs(&ahead.config.env).env(ENDS_WITH_INPUT, "1");
-        exact_env(&mut command, &ahead.config.env);
+        let env = ahead.config.builds_env();
+        command.envs(&env).env(ENDS_WITH_INPUT, "1");
+        exact_env(&mut command, &env);
         command.current_dir(&ahead.root);
         command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
         own_group(&mut command);
@@ -1032,8 +1042,6 @@ struct Daemon {
     /// The worker the next workspace is loaded by, when there is one.
     spare: Mutex<Option<Spare>>,
     spare_when: Spares,
-    /// The workers told a build ahead of cargo's, by [`WorkerConfig::id`].
-    ahead: Mutex<FxHashMap<String, Spare>>,
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
     /// The checkers of the last [`Request::Check`]s, each of another build and loaded for
@@ -1051,7 +1059,7 @@ pub(crate) fn home() -> anyhow::Result<PathBuf> {
         return Ok(Path::new(&runtime).join("ra-jit"));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    Ok(Path::new(&home.context("no RA_JIT_HOME, XDG_RUNTIME_DIR or HOME")?).join(".cache/ra-jit"))
+    Ok(Path::new(&home.context("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME")?).join(".cache/ra-jit"))
 }
 
 /// The disk store of the user's builds: the directory `RA_JIT_CACHE` names, none when it
@@ -1127,7 +1135,6 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         workers: Mutex::default(),
         spare: Mutex::default(),
         spare_when,
-        ahead: Mutex::default(),
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
@@ -1226,27 +1233,10 @@ impl Daemon {
     fn handle(&self, request: Request) -> Reply {
         *lock(&self.asked) = Instant::now();
         match request {
-            Request::Sync(checkout) => self.sync(&checkout),
             Request::Warm(checkout) => match self.warm(checkout) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
-            Request::Ahead(ahead) => {
-                self.ahead(ahead);
-                Reply::Warming
-            }
-            Request::Said { id, line } => {
-                if let Some(spare) = lock(&self.ahead).get_mut(&id) {
-                    spare.said(line);
-                }
-                Reply::Warming
-            }
-            Request::Forget(id) => {
-                if let Some(mut spare) = lock(&self.ahead).remove(&id) {
-                    spare.stop();
-                }
-                Reply::Warming
-            }
             Request::Build(checkout) => match self.warm(checkout.clone()) {
                 Ok(()) => self.built(&checkout),
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
@@ -1371,12 +1361,11 @@ impl Daemon {
         if let Some(old) = workers.remove(&id) {
             old.stop();
         }
-        let ahead = lock(&self.ahead).remove(&id);
         // A spare loads its library before it is told the build, which a whole build that
         // asks at once would wait for.
         let spare = match checkout.config.whole {
-            true => ahead,
-            false => ahead.or_else(|| lock(&self.spare).take()),
+            true => None,
+            false => lock(&self.spare).take(),
         };
         let worker =
             Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare)?);
@@ -1403,7 +1392,7 @@ impl Daemon {
             // The next spare starts when the worker that was one has loaded its workspace.
             if self.spare_when == Spares::Ready {
                 let loading = lock(&self.workers).values().any(|it| it.loading());
-                if !loading && lock(&self.ahead).is_empty() {
+                if !loading {
                     self.spare();
                 }
             }
@@ -1463,7 +1452,7 @@ impl Daemon {
             let Some(worker) = workers.remove(&id) else { continue };
             eprintln!(
                 "worker {id} of {} stopped: the workers hold {} MB, over the {} MB of \
-                 RA_JIT_MEMORY_MAX, and it was asked longest ago",
+                 BLAZE_MEMORY_MAX, and it was asked longest ago",
                 worker.project.display(),
                 all >> 20,
                 most >> 20
@@ -1505,7 +1494,7 @@ impl Daemon {
             };
             let checker = &mut held[at];
             checker.asked = Instant::now();
-            match checker.ask(request) {
+            match checker.ask(&crate::check::request(&ahead.targets, request)) {
                 Ok(reply) if reply == "ok" => return Reply::Checked { errors: None },
                 Ok(reply) if reply.starts_with(crate::check::LINT) => {
                     return Reply::Linted { answer: reply[crate::check::LINT.len()..].to_owned() };
@@ -1523,23 +1512,6 @@ impl Daemon {
         }
         Reply::Cold {
             reason: "the checker loaded the workspace twice and still had to again".to_owned(),
-        }
-    }
-
-    /// Has the spare worker load the workspace of a build cargo has only started.
-    fn ahead(&self, ahead: Ahead) {
-        let id = ahead.config.id();
-        if lock(&self.workers).contains_key(&id) {
-            return;
-        }
-        let waiting = lock(&self.spare).take();
-        let Some(spare) = waiting.or_else(|| self.new_spare()) else { return };
-        let mut args = ahead.config.args(&ahead.root, &ahead.crates);
-        args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config.env, &ahead.root, true)
-            && let Some(mut other) = lock(&self.ahead).insert(id, spare)
-        {
-            other.stop();
         }
     }
 
@@ -1574,16 +1546,12 @@ impl Daemon {
         // these are stopped: one started then would write in the home and outlive the daemon.
         // In the order a worker that loads a workspace takes them.
         let workers = lock(&self.workers);
-        let mut ahead = lock(&self.ahead);
         let mut spare = lock(&self.spare);
         if let Some(spare) = spare.as_mut() {
             spare.stop();
         }
         for checker in lock(&self.checkers).iter_mut() {
             checker.stop();
-        }
-        for spare in ahead.values_mut() {
-            spare.stop();
         }
         for worker in workers.values() {
             worker.let_go();
@@ -1617,8 +1585,33 @@ fn last_words(log: &Path) -> String {
         let message = lines.get(at + 1).copied().unwrap_or_default();
         return format!("panicked at {place} {message}");
     }
-    let last = lines.iter().rev().find(|it| it.starts_with("Error"));
-    last.or(lines.last()).copied().unwrap_or("no output").to_owned()
+    match last_error(&log) {
+        Some(error) => format!("Error: {}", error.replace('\n', "; ")),
+        None => lines.last().copied().unwrap_or("no output").to_owned(),
+    }
+}
+
+/// The last error a worker's log has, with what caused it, each cause on a line of its own:
+/// the outermost error says what blaze was doing, and the innermost why it could not, which
+/// is what the user acts on.
+pub(crate) fn last_error(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let at = lines.iter().rposition(|it| it.starts_with("Error"))?;
+    let mut said = lines[at].strip_prefix("Error: ").unwrap_or(lines[at]).to_owned();
+    let mut rest = lines[at + 1..].iter().skip_while(|it| it.trim().is_empty());
+    if rest.next().is_some_and(|it| it.trim() == "Caused by:") {
+        for line in rest.take_while(|it| it.starts_with("    ")) {
+            let line = line.trim();
+            // `0: what`, or a line more of the cause before it.
+            let numbered = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            match line.split_once(": ").filter(|(n, _)| numbered(n)) {
+                Some((_, cause)) => said.push_str(&format!("\n{cause}")),
+                None if said.contains('\n') => said.push_str(&format!("\n  {line}")),
+                None => said.push_str(&format!("\n{line}")),
+            }
+        }
+    }
+    Some(said)
 }
 
 /// The end of a worker's log, for the daemon's: where it panicked and with what, then its
@@ -1680,5 +1673,26 @@ mod tests {
         assert_eq!(over(&holding, 8), ["oldest", "old"]);
         // The busy one and the one asked last stay, whatever they hold.
         assert_eq!(over(&holding, 0), ["oldest", "old"]);
+    }
+
+    #[test]
+    fn a_workers_last_error_is_said_with_what_caused_it() {
+        let log = "symbols: 0 in 138.9µs\n\
+            Error: Failed to build the build scripts of /w\n\
+            \n\
+            Caused by:\n    \
+            0: blaze could not link the proc macro of `clap_derive v4.6.7` for the load\n    \
+            1: the proc macro `clap_derive` cannot run as WebAssembly: no wasm32-wasip1 target\n         \
+            name its package in `native-proc-macros` to expand it natively\n";
+        assert_eq!(
+            last_error(log).unwrap(),
+            "Failed to build the build scripts of /w\n\
+             blaze could not link the proc macro of `clap_derive v4.6.7` for the load\n\
+             the proc macro `clap_derive` cannot run as WebAssembly: no wasm32-wasip1 target\n  \
+             name its package in `native-proc-macros` to expand it natively"
+        );
+        assert_eq!(last_error("Error: one\n\nCaused by:\n    two\n").unwrap(), "one\ntwo");
+        assert_eq!(last_error("Error: alone\n").unwrap(), "alone");
+        assert_eq!(last_error("nothing wrong\n"), None);
     }
 }

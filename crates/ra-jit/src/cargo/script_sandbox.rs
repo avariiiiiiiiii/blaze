@@ -53,8 +53,18 @@ use std::{
 
 use anyhow::Context as _;
 
+#[cfg(unix)]
+use super::hermetic;
+#[cfg(unix)]
+pub(crate) use super::hermetic::InView;
 use super::sandboxed;
 use crate::sandbox::{self, Line, Reached, Spec};
+
+/// A run in its closure alone, which Windows has none of: `hermetic` is the closure's, and
+/// the closure is Linux's.
+#[cfg(not(unix))]
+#[derive(Clone, Debug)]
+pub(crate) enum InView {}
 
 /// The file beside a script's `OUT_DIR` with what its last run of cargo's read, when that is
 /// what decides whether it runs again ([`reads_unchanged`]): a first line [`READS_HEAD`], then
@@ -108,6 +118,9 @@ pub(crate) enum Plan {
         /// The system directories its `rustc-link-search` may name besides those it always may
         /// (`directives.rs`): `build-script-link-dirs` of the root manifest.
         link_dirs: Vec<PathBuf>,
+        /// The closure it sees alone, when it does (`RA_JIT_SCRIPT_VIEW`): then its run is kept
+        /// by what it is made of, and not by what it was seen reading.
+        in_view: Option<InView>,
     },
 }
 
@@ -123,6 +136,11 @@ impl Plan {
 
 /// The directory of a run's `scratch` that has ra-jit linked as `rustc`.
 const OWN_RUSTC: &str = "ra-jit-rustc";
+
+/// What cargo set that ra-jit's own rustc stands for ([`with_own_rustc`]): a script is not
+/// given them, and is not missing them.
+const OWN_RUSTC_FOR: [&str; 4] =
+    ["RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", crate::as_rustc::TOOLCHAIN];
 
 /// `env`, cargo's for a script, with `RUSTC` naming ra-jit as rustc ([`crate::as_rustc`]),
 /// linked in `scratch`, and the toolchain's rustc in [`crate::as_rustc::TOOLCHAIN`]: what
@@ -140,7 +158,7 @@ fn with_own_rustc(
     let dir = scratch.join(OWN_RUSTC);
     std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
     let link = dir.join(format!("{}{}", crate::as_rustc::NAME, std::env::consts::EXE_SUFFIX));
-    let exe = std::env::current_exe().context("finding ra-jit itself")?;
+    let exe = std::env::current_exe().context("finding blaze itself")?;
     if std::fs::read_link(&link).ok().as_deref() != Some(&*exe) {
         _ = std::fs::remove_file(&link);
         #[cfg(unix)]
@@ -150,9 +168,8 @@ fn with_own_rustc(
         std::fs::hard_link(&exe, &link).with_context(|| format!("linking {}", link.display()))?;
     }
     let link = link.to_str().context("a directory whose name is not text")?.to_owned();
-    let dropped = ["RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", crate::as_rustc::TOOLCHAIN];
     let mut env: Vec<(String, String)> =
-        env.iter().filter(|it| !dropped.contains(&it.0.as_str())).cloned().collect();
+        env.iter().filter(|it| !OWN_RUSTC_FOR.contains(&it.0.as_str())).cloned().collect();
     env.push(("RUSTC".to_owned(), link));
     env.push((crate::as_rustc::TOOLCHAIN.to_owned(), rustc));
     Ok(env)
@@ -165,12 +182,20 @@ fn on_in(env: &[(String, String)]) -> bool {
     sandbox::on_with(|name| env.iter().find(|it| it.0 == name).map(|it| it.1.clone()))
 }
 
-/// The workspace a script's run is part of: the one around its package, for a package not
-/// below cargo's home; else the one around the target directory its `OUT_DIR` is in; else the
-/// one the shell that ran cargo was in. `PWD` comes last: it is wherever the command was
-/// started, which for a command run by another program (a harness, an editor) is not the
-/// workspace built.
+/// The variable that names to a run the root of the workspace being built, set by the
+/// daemon's load (`compile_time.rs`): a path dependency that is a workspace of its own is
+/// still the build's, whose root manifest says how its script runs. The script is not given it.
+pub(crate) const ROOT: &str = "RA_JIT_BUILD_ROOT";
+
+/// The workspace a script's run is part of: the one [`ROOT`] names; else the one around its
+/// package, for a package not below cargo's home; else the one around the target directory
+/// its `OUT_DIR` is in; else the one the shell that ran cargo was in. `PWD` comes last: it is
+/// wherever the command was started, which for a command run by another program (a harness,
+/// an editor) is not the workspace built.
 fn workspace_of(script: &Script<'_>) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(root) = script.var(ROOT).filter(|it| !it.is_empty()) {
+        return Ok(Some(PathBuf::from(root)));
+    }
     let home = script.var("CARGO_HOME").map(Path::new);
     if !home.is_some_and(|it| script.cwd.starts_with(it))
         && let Some(root) = sandboxed::workspace_root(script.cwd)?
@@ -198,9 +223,10 @@ pub(crate) fn target_of(out_dir: &Path) -> Option<&Path> {
 /// sandbox's spec. `Err` is a manifest that says it wrongly.
 pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let package = script.package();
-    let env = with_own_rustc(script.env, script.scratch)?;
+    let mut env = with_own_rustc(script.env, script.scratch)?;
+    env.retain(|it| it.0 != ROOT);
     if !on_in(script.env) {
-        return Ok(Plan::Outside(format!("{}=off", sandboxed::VAR), env));
+        return Ok(Plan::Outside(format!("{}=off", crate::sandbox::VAR_BLAZE), env));
     }
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         // No running it outside instead: a build that can't keep its promise stops.
@@ -208,7 +234,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
             "the build script of `{package}` runs in a sandbox, and there is none on {} yet \
              (#257); `{}=off` runs build scripts and tests outside a sandbox, as cargo does",
             std::env::consts::OS,
-            sandboxed::VAR
+            crate::sandbox::VAR_BLAZE
         );
     }
     let root = workspace_of(script)?;
@@ -238,6 +264,11 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     writable.extend(user_cache());
     let mut readable = vec![script.cwd.to_owned()];
     readable.extend(root.clone());
+    // A path dependency's own workspace, which is not below the build's.
+    let home = script.var("CARGO_HOME").map(Path::new);
+    if script.var(ROOT).is_some() && !home.is_some_and(|it| script.cwd.starts_with(it)) {
+        readable.extend(sandboxed::workspace_root(script.cwd)?);
+    }
     readable.extend(target_of(script.out_dir).map(Path::to_owned));
     // The programs cargo names, and the directories of `PATH`, where a sandbox has empty
     // directories: `RUSTC` is ra-jit's own, which may be built below `/dev/shm`.
@@ -245,7 +276,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let programs = ["RUSTC", "RUSTDOC", "CARGO"];
     let programs = programs.into_iter().filter_map(var).filter(|it| !it.is_empty());
     let programs = programs.filter_map(|it| Path::new(it).parent().map(Path::to_owned));
-    let exe = std::env::current_exe().context("finding ra-jit itself")?;
+    let exe = std::env::current_exe().context("finding blaze itself")?;
     let programs = programs.chain(exe.parent().map(Path::to_owned));
     let path = script.var("PATH").unwrap_or_default().split(':').map(PathBuf::from);
     // One reached through a link (NixOS's `/run/current-system/sw/bin`) is seen where the link
@@ -255,7 +286,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     }));
     // What it would download, handed to it locked, as `cargo/fetches.rs` says.
     let handed = super::fetches::hand(&env, script.out_dir, root.as_deref(), &also)?;
-    readable.extend(handed.readable);
+    readable.extend(handed.readable.iter().cloned());
     readable.sort();
     readable.dedup();
     // The innermost is enough: a directory is seen with what is below it.
@@ -263,6 +294,56 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     readable.retain(|it| !all.iter().any(|other| other != it && it.starts_with(other)));
     let mut not_inputs = vec![script.real.to_owned()];
     not_inputs.extend(std::fs::canonicalize(script.real).ok());
+    let root_manifest = root.as_ref().map(|it| it.join("Cargo.toml"));
+    #[cfg(unix)]
+    if hermetic::wanted(script.env) && cfg!(target_os = "linux") {
+        let overrides = match &root_manifest {
+            Some(manifest) => hermetic::system_deps(manifest)?,
+            None => Default::default(),
+        };
+        let version = script.var("CARGO_PKG_VERSION").unwrap_or("0.0.0");
+        let closure = hermetic::closure_for(package, version, &overrides)?;
+        // Cargo names the toolchain's rustc as it found it, often by name on `PATH`, which the
+        // run's `PATH` is not: it is named where it is.
+        let mut env = env;
+        let var = |name: &str| env.iter().find(|it| it.0 == name).map(|it| OsString::from(&it.1));
+        let rustc = var(crate::as_rustc::TOOLCHAIN)
+            .and_then(|it| crate::answers::toolchain_rustc(&it, &var))
+            .and_then(|it| it.into_os_string().into_string().ok());
+        if let Some(rustc) = rustc {
+            env.retain(|it| it.0 != crate::as_rustc::TOOLCHAIN);
+            env.push((crate::as_rustc::TOOLCHAIN.to_owned(), rustc));
+        }
+        let mut also = also;
+        also.extend(script.declared.iter().cloned());
+        let mut env = hermetic::env_in(&env, &also, &closure);
+        env.extend(handed.env);
+        let deps = hermetic::dep_out_dirs(&env);
+        let mut read = deps.clone();
+        read.extend(handed.readable);
+        read.extend(script.real.parent().map(Path::to_owned));
+        read.push(script.scratch.join(OWN_RUSTC));
+        read.extend(std::fs::canonicalize(&exe).ok().and_then(|it| Some(it.parent()?.to_owned())));
+        let toolchain = env.iter().find(|it| it.0 == crate::as_rustc::TOOLCHAIN);
+        let toolchain =
+            toolchain.and_then(|it| Some(Path::new(&it.1).parent()?.parent()?.to_owned()));
+        read.extend(toolchain.and_then(|it| std::fs::canonicalize(it).ok()));
+        let (view, hidden) =
+            hermetic::view(script.cwd, script.out_dir, &read, &closure, script.scratch)?;
+        let spec = Spec {
+            cwd: script.cwd.to_owned(),
+            env,
+            overlays: Vec::new(),
+            writable: Vec::new(),
+            readable: Vec::new(),
+            record: Some(script.scratch.join("ra-jit-record")),
+            record_reads: false,
+            not_inputs,
+            view: Some(view),
+        };
+        let in_view = Some(hermetic::InView { closure, hidden, deps });
+        return Ok(Plan::Sandboxed { spec, root_manifest, link_dirs, in_view });
+    }
     let declared = |name: &String| script.declared.contains(name);
     let mut env: Vec<(String, String)> = env
         .into_iter()
@@ -280,7 +361,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         not_inputs,
         view: None,
     };
-    Ok(Plan::Sandboxed { spec, root_manifest: root.map(|it| it.join("Cargo.toml")), link_dirs })
+    Ok(Plan::Sandboxed { spec, root_manifest, link_dirs, in_view: None })
 }
 
 /// `plan`, a script's, for a program the script runs under WASI (`wasi_script.rs`): the same
@@ -294,7 +375,7 @@ pub(crate) fn for_tool(
 ) -> Plan {
     match plan {
         Plan::Outside(why, _) => Plan::Outside(why.clone(), env),
-        Plan::Sandboxed { spec, root_manifest, link_dirs } => Plan::Sandboxed {
+        Plan::Sandboxed { spec, root_manifest, link_dirs, .. } => Plan::Sandboxed {
             spec: Spec {
                 cwd: cwd.to_owned(),
                 env,
@@ -303,6 +384,7 @@ pub(crate) fn for_tool(
             },
             root_manifest: root_manifest.clone(),
             link_dirs: link_dirs.clone(),
+            in_view: None,
         },
     }
 }
@@ -398,9 +480,12 @@ pub(crate) fn given(name: &str) -> bool {
 
 /// The variables a run that printed `stdout` said it reads (`rerun-if-env-changed`) which
 /// cargo had in `env` but the run in the sandbox was not given (`plan`): it saw them unset,
-/// and a run given them ([`Script::declared`]) is the one that stands for cargo's.
+/// and a run given them ([`Script::declared`]) is the one that stands for cargo's; what ra-jit's
+/// own rustc stands for ([`OWN_RUSTC_FOR`]) it is not missing. A run in
+/// its closure is given the closure's C toolchain and pkg-config in place of the machine's,
+/// so those of [`given`] it was not given are not missing.
 pub(crate) fn not_given(stdout: &[u8], env: &[(String, String)], plan: &Plan) -> Vec<String> {
-    let Plan::Sandboxed { spec, .. } = plan else { return Vec::new() };
+    let Plan::Sandboxed { spec, in_view, .. } = plan else { return Vec::new() };
     let had = |name: &str, env: &[(String, String)]| env.iter().any(|it| it.0 == name);
     let mut names: Vec<String> = String::from_utf8_lossy(stdout)
         .lines()
@@ -410,6 +495,8 @@ pub(crate) fn not_given(stdout: &[u8], env: &[(String, String)], plan: &Plan) ->
             line.strip_prefix("rerun-if-env-changed=").map(str::to_owned)
         })
         .filter(|name| had(name, env) && !had(name, &spec.env))
+        .filter(|name| !OWN_RUSTC_FOR.contains(&name.as_str()))
+        .filter(|name| in_view.is_none() || !given(name))
         .collect();
     names.sort();
     names.dedup();
@@ -453,7 +540,7 @@ fn user_cache() -> Option<PathBuf> {
 /// has a note after what it printed to stderr, naming the package, what the sandbox refused
 /// it and how to take it out; a sandbox that could not be made, why and how to fix it.
 pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Result<Ran> {
-    let (spec, root_manifest) = match plan {
+    let (spec, root_manifest, in_view) = match plan {
         Plan::Outside(why, env) => {
             if std::env::var_os("RA_JIT_STATS").is_some() {
                 eprintln!("blaze: the build script of `{}` runs outside: {why}", script.package());
@@ -464,7 +551,7 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
             let output = command.output().with_context(|| running(script))?;
             return Ok(Ran { output, reads: None });
         }
-        Plan::Sandboxed { spec, root_manifest, .. } => (spec, root_manifest),
+        Plan::Sandboxed { spec, root_manifest, in_view, .. } => (spec, root_manifest, in_view),
     };
     std::fs::create_dir_all(script.scratch)
         .with_context(|| format!("making {}", script.scratch.display()))?;
@@ -473,11 +560,17 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
         .with_context(|| format!("writing {}", spec_file.display()))?;
     let record = spec.record.clone().context("a sandbox with no record")?;
     _ = std::fs::remove_file(&record);
-    let mut command = Command::new(std::env::current_exe().context("finding ra-jit itself")?);
+    let mut command = Command::new(std::env::current_exe().context("finding blaze itself")?);
     command.arg(sandbox::COMMAND).arg(&spec_file).arg("--").arg(script.real).args(script.args);
     command.current_dir(script.cwd).stdin(stdin);
     let mut output = command.output().with_context(|| running(script))?;
-    let lines = sandbox::read_record(&record);
+    let mut lines = sandbox::read_record(&record);
+    // glibc asks nscd for any user or host it looks up; in a closure, that is all it is.
+    if in_view.is_some()
+        && let Some(lines) = &mut lines
+    {
+        lines.retain(|it| !(it.reached == Reached::Net && it.what.contains("/nscd/socket")));
+    }
     let package = script.package();
     if output.status.code() == Some(sandbox::COULD_NOT)
         && lines.is_none()
@@ -488,7 +581,7 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
                 "error: the build script of `{package}` runs in a sandbox, which can't be made \
                  here: {why}\n`{}=off` runs build scripts and tests outside a sandbox, as cargo \
                  does\n",
-                sandboxed::VAR
+                crate::sandbox::VAR_BLAZE
             )
             .into_bytes(),
         );
@@ -502,10 +595,30 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
         if let Some(note) = fetches {
             output.stderr.extend(format!("note: {note}\n").into_bytes());
         }
+    } else if !output.status.success()
+        && let Some(in_view) = in_view
+    {
+        let note = failed_note(package, in_view, &output.stderr, root_manifest.as_deref());
+        output.stderr.extend(format!("note: {note}\n").into_bytes());
+    }
+    if in_view.is_some() {
+        return Ok(Ran { output, reads: None });
     }
     let reads = lines.filter(|it| it.iter().all(|it| it.reached != Reached::Incomplete));
     let reads = reads.map(|lines| inputs(&lines, script, spec));
     Ok(Ran { output, reads })
+}
+
+/// What a run of `package` in its closure that failed with `stderr` is told
+/// ([`hermetic::failed_note`]).
+#[cfg(unix)]
+fn failed_note(package: &str, in_view: &InView, stderr: &[u8], root: Option<&Path>) -> String {
+    hermetic::failed_note(package, &in_view.closure, stderr, root)
+}
+
+#[cfg(not(unix))]
+fn failed_note(_: &str, in_view: &InView, _: &[u8], _: Option<&Path>) -> String {
+    match *in_view {}
 }
 
 fn running(script: &Script<'_>) -> String {
@@ -711,7 +824,8 @@ mod tests {
     fn a_script_that_says_it_reads_what_it_was_not_given_is_named() {
         let pair = |name: &str| (name.to_owned(), "x".to_owned());
         let spec = Spec { env: vec![pair("CC")], ..Spec::default() };
-        let plan = Plan::Sandboxed { spec, root_manifest: None, link_dirs: Vec::new() };
+        let plan =
+            Plan::Sandboxed { spec, root_manifest: None, link_dirs: Vec::new(), in_view: None };
         let outside = [pair("CC"), pair("OPENSSL_DIR")];
         let stdout = b"cargo:rerun-if-env-changed=CC\ncargo::rerun-if-env-changed=OPENSSL_DIR\n\
             cargo:rerun-if-env-changed=OPENSSL_DIR\ncargo:rerun-if-env-changed=UNSET\n";
@@ -744,6 +858,77 @@ mod tests {
         let unset = plan(&Script { declared: &[], ..script }).unwrap();
         assert_eq!(names(&unset), ["CARGO_PKG_NAME"]);
         assert_eq!(not_given(stdout, &env, &unset), ["BM_LEVEL"]);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_path_dependency_in_a_workspace_of_its_own_reads_the_builds_root_manifest() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-build-root-{}", std::process::id()));
+        let (root, dep) = (dir.join("app"), dir.join("vendor/vendor"));
+        let out_dir = root.join("target/debug/build/vendor-1/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n[workspace.metadata.blaze.sandbox]\nbuild-script-env = [\"VENDOR_DIR\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("vendor/Cargo.toml"), "[workspace]\nmembers = [\"vendor\"]\n")
+            .unwrap();
+        std::fs::write(
+            dep.join("Cargo.toml"),
+            "[package]\nname = \"vendor\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+        let told = [
+            pair("CARGO_PKG_NAME", "vendor"),
+            pair("VENDOR_DIR", "/opt/vendor"),
+            pair(ROOT, root.to_str().unwrap()),
+        ];
+        let script = Script {
+            real: Path::new("/nonexistent/build_script_build"),
+            args: &[],
+            cwd: &dep,
+            env: &told,
+            out_dir: &out_dir,
+            scratch: out_dir.parent().unwrap(),
+            declared: &[],
+        };
+        let names = |plan: &Plan| plan.env().iter().map(|it| it.0.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&plan(&script).unwrap()), ["CARGO_PKG_NAME", "VENDOR_DIR"]);
+        let Plan::Sandboxed { spec, .. } = plan(&script).unwrap() else { panic!("outside") };
+        assert!(spec.readable.contains(&dir.join("vendor")), "{:?}", spec.readable);
+        let untold = plan(&Script { env: &told[..2], ..script }).unwrap();
+        assert_eq!(names(&untold), ["CARGO_PKG_NAME"]);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_ra_jit_s_rustc_stands_for_is_not_missing() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-own-rustc-{}", std::process::id()));
+        let out_dir = dir.join("target/debug/build/pkg-1/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+        let env = [
+            pair("CARGO_PKG_NAME", "pkg"),
+            pair("RUSTC", "rustc"),
+            pair("RUSTC_WRAPPER", "/w/ra-jit-rustc"),
+        ];
+        let script = Script {
+            real: Path::new("/nonexistent/build_script_build"),
+            args: &[],
+            cwd: &dir,
+            env: &env,
+            out_dir: &out_dir,
+            scratch: out_dir.parent().unwrap(),
+            declared: &[],
+        };
+        let plan = plan(&script).unwrap();
+        assert!(!plan.env().iter().any(|it| it.0 == "RUSTC_WRAPPER"));
+        let stdout =
+            b"cargo::rerun-if-env-changed=RUSTC_WRAPPER\ncargo::rerun-if-env-changed=RUSTC\n";
+        assert!(not_given(stdout, &env, &plan).is_empty());
         _ = std::fs::remove_dir_all(&dir);
     }
 

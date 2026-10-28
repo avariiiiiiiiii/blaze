@@ -41,7 +41,7 @@ SKIPPED = {
     "docs/rename.md",
     # What blaze says of the old names, which it has to name.
     "crates/ra-jit/src/renamed.rs",
-    "crates/blaze-engine/src/renamed.rs",
+    "crates/blaze-cargo/src/renamed.rs",
 }
 # A line that names an old name on purpose, as install.sh's clean-up of a blaze from before the
 # rename does, says so with this in a comment, and is left as it is.

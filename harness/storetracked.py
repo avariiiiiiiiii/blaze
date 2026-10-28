@@ -290,7 +290,7 @@ def main():
 
     def env_of(home):
         env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
-                   BLAZE_CACHE=store, BLAZE_RUSTC_BASE="0", BLAZE_STATS="1")
+                   BLAZE_CACHE=store, BLAZE_STATS="1")
         for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
             env.pop(name, None)
         return env

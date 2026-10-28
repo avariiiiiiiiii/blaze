@@ -27,6 +27,13 @@ moves is two pointers:
 Canary is the newest release of either kind: every stable release was a canary first, so when
 the newest canary is promoted the two channels name the same release.
 
+Each channel also has a pointer, for what reads a channel without GitHub's API (a workspace
+pinned to `"stable"` or `"canary"`): the assets `stable` and `canary` of the release `channels`,
+each the channel's version and a newline,
+`https://github.com/indexable-inc/blaze/releases/download/channels/stable`. release.yaml moves
+`canary` when it has published a release, and promote.yaml moves `stable` when it makes a
+release stable and *Latest* (`.github/scripts/promote.py pointer`).
+
 A release older than this scheme (`v0.20261027.0`, the `nightly` build of 2026-10-20) was
 published as a full release and counts as stable.
 
@@ -40,20 +47,30 @@ with `--no-pgo`.
 
 ## Promotion to stable
 
-`promote.yaml` runs when a prerelease is published, and by hand for a given tag (to run again
-after a flake, or after fixing the gate itself). Against the published archives, installed with
-`install.sh --version <v>` as a user installs them, on macOS (Apple silicon) and Linux (x86-64
-and ARM64):
+`release.yaml` starts `promote.yaml` once it has published the prerelease (by dispatch: a release
+the workflow's own token publishes starts no `release:` workflow). It runs, against the
+published archives, installed with `install.sh --version <v>` as a user installs them, on macOS
+(Apple silicon) and Linux (x86-64 and ARM64):
 
-- the install checks of install.yaml (the programs are there and run, `blaze new` + `blaze run`);
+- the install checks: `blaze --version` is the release's, `blaze new` + `blaze run` prints
+  `Hello, world!`;
 - the whole smoke corpus (below), dev and `--release`, `blaze run` and `blaze test`;
-- the train's tiers that run against a release build.
+- the train (`train.yaml`, every tier on every platform), dispatched on the tag: built from the
+  commit the archives were built from. A train on a tag releases nothing and opens no issue.
 
-When every job passes it marks the release stable and *Latest*, and appends to its notes the
-line `Promoted to stable on <date> after <run URL>`. When one fails the release stays a canary
-for good, and an issue is opened (or commented on, for the same failing case) with the release,
-the case, the platform, the command to reproduce it and the run's link. A later canary that
-passes is promoted over it; stable never moves backwards.
+When every job passes, `.github/scripts/promote.py` marks the release stable and *Latest* and
+appends to its notes the line `Promoted to stable on <date> after <run URL>`. When one fails the
+release stays a canary, and an issue `Canary v... is not promoted to stable` is opened (or
+commented on, for a run again) with each failed job, each failed smoke case with its platform
+and the commands that repeat it after installing that release, and the run's link. A later
+canary that passes is promoted over it. Stable never moves backwards: a canary that passes after
+a newer one was promoted becomes stable but not *Latest*.
+
+By hand: `gh workflow run promote.yaml -f tag=v0.YYYYMMDD.N` tests that release again (after a
+flake, or a fix to the gate itself); `-f train-run=<id>` counts a green train run on the tag
+instead of starting another; `-f promote=false` tests without promoting or opening an issue. A pull request that
+changes the gate (`promote.yaml`, `promote.py`, the smoke corpus) runs it against the newest
+release, without the train, the promotion or an issue.
 
 ## The smoke corpus
 

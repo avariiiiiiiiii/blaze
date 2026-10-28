@@ -1,6 +1,8 @@
 //! What a crate of a checkout is, by what is written in it: two checkouts with the same
 //! sources have the same crate, and what was compiled for one is the code of the other.
 
+pub(crate) use blaze_cargo::content::hex;
+
 use std::{
     path::Path,
     sync::{Mutex, OnceLock},
@@ -328,11 +330,6 @@ pub(crate) fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Ha
     } else {
         Sha256::digest(std::fs::read(path).unwrap_or_default()).into()
     }
-}
-
-/// `bytes` in lower-case hex, two digits each: how a hash is written in a name or a key.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|it| format!("{it:02x}")).collect()
 }
 
 /// The directory cargo keeps what it fetched in, by a file it fetched: sources of a registry

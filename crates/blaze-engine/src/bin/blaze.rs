@@ -1,8 +1,7 @@
 //! `blaze build|run|test|check|stop ...`, which becomes `blaze-engine cargo ...`, the `blaze` being
-//! the one installed next to it. Cargo runs it the same way as `cargo fmt` and `cargo clippy`
-//! once `blaze enable` has linked them to it (`cargo-fmt fmt ...` is `blaze fmt ...`). In a
-//! workspace that pins another release of blaze (`[workspace.metadata.blaze] version`), it runs
-//! that release instead, fetched once when it is not there (`pin.rs`).
+//! the one installed next to it. In a workspace that pins another release of blaze
+//! (`[workspace.metadata.blaze] version`), it runs that release instead, fetched once when it
+//! is not there (`pin.rs`).
 
 use std::{
     ffi::OsString,
@@ -54,10 +53,23 @@ fn pinned_elsewhere(engine: &Path, args: &[OsString]) -> Option<ExitCode> {
         Ok(None) => return None,
         Err(why) => return Some(failed(&why)),
     };
+    let shown = manifest.display();
+    let wanted = if pin::is_channel(&wanted) {
+        match channel_version(engine, &wanted) {
+            Ok(version) => version,
+            Err(why) => {
+                return Some(failed(&format!(
+                    "{shown} pins blaze's {wanted} channel, and {why}; no other blaze builds in \
+                     its place"
+                )));
+            }
+        }
+    } else {
+        wanted
+    };
     if wanted == pin::OURS {
         return None;
     }
-    let shown = manifest.display();
     if std::env::var_os(pin::PINNED_BY).is_some() {
         let this = std::env::current_exe().unwrap_or_default();
         return Some(failed(&format!(
@@ -91,6 +103,41 @@ fn pinned_elsewhere(engine: &Path, args: &[OsString]) -> Option<ExitCode> {
     let mut command = Command::new(&pinned);
     command.args(args).env(pin::PINNED_BY, &manifest);
     Some(ended(&mut command, &pinned))
+}
+
+/// The version `channel` names: the one read for it within [`pin::CHANNEL_FRESH`], else read
+/// again with `engine` (`version-resolve`, which keeps it). When it can't be read again, the one
+/// read last, with a line saying so.
+fn channel_version(engine: &Path, channel: &str) -> Result<String, String> {
+    let file = pin::channel_file(channel).ok_or_else(|| {
+        "blaze keeps what a channel names in .blaze in your home directory, and there is none \
+         (`BLAZE_HOME` names where)"
+            .to_owned()
+    })?;
+    let known = pin::channel_known(&file);
+    if let Some((version, true)) = &known {
+        return Ok(version.clone());
+    }
+    let asked = Command::new(engine).arg("version-resolve").arg(channel).output();
+    let answer = asked.as_ref().ok().filter(|it| it.status.success());
+    let answer = answer.map(|it| String::from_utf8_lossy(&it.stdout).trim().to_owned());
+    if let Some(version) = answer.filter(|it| pin::is_version(it)) {
+        return Ok(version);
+    }
+    let why = match &asked {
+        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        Err(error) => format!("{} did not run: {error}", engine.display()),
+    };
+    match known {
+        Some((version, _)) => {
+            eprintln!(
+                "blaze: what the {channel} channel names could not be read ({why}); blaze \
+                 {version}, which it named when last read, runs"
+            );
+            Ok(version)
+        }
+        None => Err(format!("what it names could not be read: {why}")),
+    }
 }
 
 fn failed(why: &str) -> ExitCode {

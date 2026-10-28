@@ -7,7 +7,7 @@ several machines push to and pull from, off until you configure it.
 
 The reports behind this file are [reports/DISKCACHE.md](reports/DISKCACHE.md) and
 [reports/REMOTE.md](reports/REMOTE.md). The variables and commands below were checked
-against `crates/blaze-store/src/lib.rs` and `crates/blaze-engine/src/remote.rs`.
+against `crates/blaze-store/src/lib.rs` and `crates/blaze-cargo/src/remote.rs`.
 
 ## What is stored and under what key
 

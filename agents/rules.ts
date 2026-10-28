@@ -95,6 +95,11 @@ export const rules = [
 		link: "docs/contributing.md#landing-a-change",
 	},
 	{
+		id: "own-prs-to-merge",
+		info: "Get pull requests in; don't hand them back. Any agent may take any open pull request (a lane's, a contributor's, a draft) to merged: merge main, resolve conflicts (an append-only file like CHANGELOG.md keeps both sides), fix its gate, finish a draft, mark it ready, turn on auto-merge. Close one only when it is wrong or unwanted, saying why; skip one whose author asked to be left alone. Tell the owning lane what you changed. Issues too: fix one rather than route it to an owner.",
+		reason: "Andrew, 2026-10-28: \"u can work on drafts and get them completed, dont care about draft state; u can control and fix issues instead of sending back to owner, u should resolve ideally\", and \"be agentic wrt prs\". Tonight's crate splits left every open pull request conflicting; routing each back to its lane left them all waiting.",
+	},
+	{
 		id: "clean-up-lane",
 		info: "Delete what a lane made when it is done: its worktree, target directory and ix VM, and its merged branch.",
 	},

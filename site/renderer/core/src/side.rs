@@ -181,7 +181,14 @@ pub fn hover_picture(world: &World, site: Id, served: &Served) -> String {
 }
 
 /// The logo from `Brand`'s two file fields `keys` (dark, light).
-fn picture_of(world: &World, site: Id, served: &Served, keys: (&str, &str), class: &str, alt: &str) -> String {
+fn picture_of(
+    world: &World,
+    site: Id,
+    served: &Served,
+    keys: (&str, &str),
+    class: &str,
+    alt: &str,
+) -> String {
     let e = world.get(site);
     let (dark, light) = (field(e, "Brand", keys.0), field(e, "Brand", keys.1));
     if dark.is_empty() {

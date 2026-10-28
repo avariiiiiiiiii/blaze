@@ -33,21 +33,25 @@ site {
       Say: {"[thoughtful] So, what is blaze for? Four things. [pause] One: proc macros you can cache. blaze runs each one as sandboxed WebAssembly, so it sees only its own package and gives the same answer every time, and then its output can be kept. [short pause] Two: hermetic builds. Same inputs, same output, whatever else is on the machine. Build scripts and proc macros already run in a sandbox. [short pause] Three: fast rebuilds and tests. An edit recompiles only the functions it changed, and reruns only the tests it touched. [short pause] And four: remote execution. Long builds and test suites sent to other machines, over the protocol Bazel's build farms speak. The shared cache comes first; running the work remotely comes after. [calm] Each one opens up on the page if you want the detail."}
 
       Goal proc_macros(title: "Cacheable proc macros", line: "Proc macros run as sandboxed WebAssembly, so their output can be kept.") {
+        Art art(piece: "cache", label: "A pattern goes into a sealed square and comes out changed, and a copy of the result is kept on a shelf above it. The same pattern arrives again, and the kept copy comes out without the square doing any work.")
         P why("A normal proc macro is native code that can read anything and answer differently each run, so nothing can safely keep what it produced.")
         P how("blaze builds each one to WebAssembly and runs it seeing only its own package and cargo's variables, with a fixed clock and fixed randomness. An expansion becomes a pure function, and blaze's store keeps it. For now the cache is per checkout. [More](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#proc-macros-run-as-webassembly)")
       }
 
       Goal hermetic(title: "Hermetic builds", line: "Same inputs, same output, whatever else is on the machine.") {
+        Art art(piece: "hermetic", label: "A sealed box. Inside, the same three inputs make the same output on every loop; specks drift around outside and bounce off its wall, never getting in.")
         P why("A build should depend only on your source, your locked dependencies and blaze's pinned toolchain. That is what makes it safe to cache and share.")
         P how("Build scripts and proc macros run in a sandbox and write only their own output. Tests, Windows and the standard library are the parts still to close. [More](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)")
       }
 
       Goal incremental(title: "Fast rebuilds and tests", line: "An edit recompiles only the functions it changed, and reruns only the tests it touched.") {
+        Art art(piece: "incremental", label: "A lattice of dots. One dot changes, and only it and the few dots that depend on it light up and settle; the rest never move.")
         P why("The wait between an edit and a result is where the time goes, for people and for agents building in a loop.")
         P how("blaze patches the changed functions into the program already built instead of linking it again ([numbers](#speed)). Rerunning only the affected tests is opt-in for now, with `BLAZE_TESTS=affected`. [More](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#running-only-the-tests-that-have-not-passed)")
       }
 
       Goal remote(title: "Remote execution", line: "Long builds and test suites run on other machines, over Bazel's remote execution protocol.") {
+        Art art(piece: "remote", label: "One block sends work along lines to a column of blocks, each works for a while and sends its result back, and the results stack up beside the first block.")
         P why("A cold build of a big workspace should not be bound by one laptop, and work some machine already did should not be done twice.")
         P how("The shared cache comes first, and blaze can already push to it and pull from it. Running the work remotely, over REAPI, comes after. [Design](https://github.com/indexable-inc/blaze/blob/main/docs/remote-cache.md)")
       }
@@ -76,7 +80,7 @@ site {
 
     Section credits(title: "Credits") {
       Say: {"[warm, grateful] And credit where it's due. blaze includes code from rust-analyzer, Cranelift, LLVM and inkwell, salsa, object, Rust, and DioxusLabs' rustd. Thank you to the people who built them; none of them endorses blaze. It's made at ix, for den's native app. [small laugh] And this site? It's Flecs scripts, rendered by a little Rust renderer compiled to wasm."}
-      Dim thanks("blaze stands on the shoulders of giants. Thank you to the people who built [rust-analyzer](https://github.com/rust-lang/rust-analyzer), [Cranelift](https://cranelift.dev), [LLVM](https://llvm.org) and [inkwell](https://github.com/TheDan64/inkwell), [salsa](https://github.com/salsa-rs/salsa), [object](https://github.com/gimli-rs/object), [Rust](https://github.com/rust-lang/rust), and [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes. None of these projects endorses blaze. blaze was called ra-jit until 2026-10-24, and `cargo ra-jit` still works. Made at [ix](https://ix.dev) for den's native app. MIT or Apache-2.0. This site is [Flecs](https://github.com/SanderMertens/flecs) scripts, rendered by a Rust renderer compiled to wasm.")
+      Dim thanks("blaze stands on the shoulders of giants. Thank you to the people who built [rust-analyzer](https://github.com/rust-lang/rust-analyzer), [Cranelift](https://cranelift.dev), [LLVM](https://llvm.org) and [inkwell](https://github.com/TheDan64/inkwell), [salsa](https://github.com/salsa-rs/salsa), [object](https://github.com/gimli-rs/object), [Rust](https://github.com/rust-lang/rust), and [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes. None of these projects endorses blaze. Made at [ix](https://ix.dev) for den's native app. MIT or Apache-2.0. This site is [Flecs](https://github.com/SanderMertens/flecs) scripts, rendered by a Rust renderer compiled to wasm.")
     }
   }
 

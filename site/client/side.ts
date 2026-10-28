@@ -3,6 +3,9 @@
  * sections still fold (`<details>`), the phone drawer still opens (`#menu` and `:target`) and the outline is links.
  *
  * - Folds: a section the reader folded stays folded on the next page (localStorage), except the one holding the page.
+ *   A fold slides open and shut as the ix sidebar's (svelte/transition slide, 180 ms). The sidebar's scroll carries
+ *   over too (sessionStorage, written on pagehide); keep.ts puts both back before the next page's first paint.
+ * - Rows: ix's hover pill (lib/site/glide.ts) slides from row to row under the pointer.
  * - The drawer: Menu opens it, the scrim, the close button and Escape close it, without touching the URL.
  * - Search: the pill (and ⌘K, Ctrl K or /) opens a dialog over `search.json` (gen/build.ts writes it: one entry per
  *   page and per section, with its text); every word typed must appear, title and heading matches rank first.
@@ -31,11 +34,50 @@ function writeFolded(s: Set<string>) {
 	}
 }
 
+/** svelte/transition's slide as the ix sidebar runs it: 180 ms of cubicOut, nothing when motion is reduced. */
+const SLIDE: KeyframeAnimationOptions = { duration: 180, easing: 'cubic-bezier(0.33, 1, 0.68, 1)' };
+const still = matchMedia('(prefers-reduced-motion: reduce)');
+
+/**
+ * A `<details>` body slides between nothing and its height (and vertical margins), as slide does. Native `<details>`
+ * doesn't animate in every browser (::details-content with interpolate-size is Chromium only), so the summary's
+ * click is taken over here. While it slides shut the details stays open, marked `.closing` so the caret turns now.
+ */
+function slide(d: HTMLDetailsElement) {
+	const head = d.querySelector<HTMLElement>(':scope > summary');
+	const body = d.querySelector<HTMLElement>(':scope > div');
+	if (!head || !body) return;
+	const shut: Keyframe = { height: '0px', marginTop: '0px', marginBottom: '0px' };
+	const size = (): Keyframe => {
+		const s = getComputedStyle(body);
+		return { height: s.height, marginTop: s.marginTop, marginBottom: s.marginBottom };
+	};
+	let run: Animation | null = null;
+	head.addEventListener('click', (e) => {
+		if (still.matches || typeof body.animate !== 'function') return;
+		e.preventDefault();
+		const closing = d.open && !d.classList.contains('closing');
+		// A click mid-slide turns it around from where it is.
+		const from = d.open ? size() : shut;
+		run?.cancel();
+		d.open = true;
+		d.classList.toggle('closing', closing);
+		const to = closing ? shut : size();
+		body.style.overflow = 'hidden';
+		run = body.animate([from, to], SLIDE);
+		run.onfinish = () => {
+			run = null;
+			body.style.overflow = '';
+			d.classList.remove('closing');
+			if (closing) d.open = false;
+		};
+	});
+}
+
 function folds() {
-	const folded = readFolded();
+	for (const d of document.querySelectorAll<HTMLDetailsElement>('details.sec, details.fold')) slide(d);
 	for (const sec of document.querySelectorAll<HTMLDetailsElement>('details.sec[data-sec]')) {
 		const key = sec.dataset.sec!;
-		if (folded.has(key) && !('here' in sec.dataset)) sec.open = false;
 		sec.addEventListener('toggle', () => {
 			const now = readFolded();
 			if (sec.open) now.delete(key);
@@ -43,10 +85,62 @@ function folds() {
 			writeFolded(now);
 		});
 	}
-	// The open page's row in view inside the sidebar's own scroller.
+	// keep.ts already closed the folded sections and put the scroll back, before the first paint. The scroll is saved
+	// as the page goes; the open page's row is centred only when nothing was kept or the kept scroll hides it.
 	const row = document.querySelector<HTMLElement>('.navlist [aria-current="page"]');
-	const box = document.querySelector<HTMLElement>('.scrollbox');
-	if (row && box) box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - box.clientHeight / 2 + row.offsetHeight / 2;
+	const box = document.querySelector<HTMLElement>('.side .scrollbox');
+	if (!box) return;
+	addEventListener('pagehide', () => {
+		try {
+			sessionStorage.setItem('blaze.side.scroll', String(box.scrollTop));
+		} catch {
+			// Storage off: the next page centres its row instead.
+		}
+	});
+	const shown = (r: HTMLElement) => {
+		const a = r.getBoundingClientRect();
+		const b = box.getBoundingClientRect();
+		return a.top >= b.top && a.bottom <= b.bottom;
+	};
+	if (row && !('kept' in box.dataset && shown(row))) box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - box.clientHeight / 2 + row.offsetHeight / 2;
+}
+
+/**
+ * ix's hover pill (lib/site/glide.ts): one tint under the rows, placed at once on the first row the pointer touches,
+ * then sliding from row to row (shell.css times it); it fades when the pointer leaves the list. `data-glide` drops
+ * the rows' own :hover tint, the stand-in without JS. The open row keeps its own tint: ix's resting pill looks for
+ * `aria-selected`, which its rows never set, and a page load here would only ever place it, not move it.
+ */
+function glide() {
+	const list = document.querySelector<HTMLElement>('.navlist');
+	if (!list) return;
+	const pill = document.createElement('span');
+	pill.className = 'glide-hov';
+	pill.setAttribute('aria-hidden', 'true');
+	pill.style.opacity = '0';
+	list.append(pill);
+	list.dataset.glide = '';
+	const put = (row: HTMLElement) => {
+		const instant = pill.style.opacity === '0';
+		const box = list.getBoundingClientRect();
+		const r = row.getBoundingClientRect();
+		if (instant) pill.style.transition = 'none';
+		pill.style.transform = `translate(${r.left - box.left}px, ${r.top - box.top}px)`;
+		pill.style.width = `${r.width}px`;
+		pill.style.height = `${r.height}px`;
+		pill.style.borderRadius = getComputedStyle(row).borderRadius;
+		pill.style.opacity = '1';
+		if (instant) {
+			// Commit the jump before the transition comes back, so only later moves slide.
+			void pill.offsetWidth;
+			pill.style.transition = '';
+		}
+	};
+	list.addEventListener('pointerover', (e) => {
+		const row = e.target instanceof Element ? e.target.closest<HTMLElement>('.row') : null;
+		if (row && list.contains(row)) put(row);
+	});
+	list.addEventListener('pointerleave', () => (pill.style.opacity = '0'));
 }
 
 function drawer() {
@@ -231,6 +325,7 @@ function spy() {
 }
 
 folds();
+glide();
 drawer();
 search();
 spy();

@@ -40,6 +40,7 @@ struct Th(text: string)
 struct Td(text: string)
 struct Code(lang: string, text: string) // a code block; lang is rust, toml, bash or empty
 struct Command(text: string)            // one shell command with a copy button
+struct Art(piece: string, label: string) // an animated drawing (client/art.ts draws `piece`); label is its alt text, never read out
 struct Img(src: string, alt: string, width: i32, height: i32)
 
 // Containers: their children are their content, in order.

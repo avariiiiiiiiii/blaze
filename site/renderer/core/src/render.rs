@@ -407,6 +407,14 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
             a.thread
         ));
     }
+    if let Some(v) = e.value("Art") {
+        // An empty canvas that client/art.ts draws the named piece into; the label is what it shows.
+        let (piece, label) = (esc(&field(Some(v), "piece")), esc(&field(Some(v), "label")));
+        ctx.script("art");
+        return Ok(format!(
+            "<div class=\"art\" data-piece=\"{piece}\" role=\"img\" aria-label=\"{label}\"><canvas></canvas></div>"
+        ));
+    }
     if let Some(v) = e.value("Section") {
         let title = field(Some(v), "title");
         let id = esc(&ctx.block_id(n));
@@ -443,7 +451,9 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         return Ok(format!(
             "<details class=\"goal\" id=\"{id}\"><summary><span class=\"goal-head\"><h3{}>{t}</h3><span class=\"goal-line\">{l}</span></span>{}</summary>{}{}<div class=\"goal-body\">\n{kids}\n</div></details>",
             a.attr,
-            crate::icons::svg("caret").unwrap_or_default().replace("class=\"icon\"", "class=\"icon chev\""),
+            crate::icons::svg("caret")
+                .unwrap_or_default()
+                .replace("class=\"icon\"", "class=\"icon chev\""),
             a.button,
             a.thread
         ));
@@ -669,8 +679,13 @@ pub fn render(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // No widget has extra <head> markup, so that line of the TS template is always empty.
-    let extra_head = "";
+    // Hovering a link to another page of the site prerenders it (Chromium's Speculation Rules; others ignore the
+    // script), so the click shows a page that is already loaded, as the ix docs' client-side routing feels. Not the
+    // worker's /api and /auth routes, which act.
+    let base = &s.served.base;
+    let extra_head = format!(
+        "<script type=\"speculationrules\">{{\"prerender\":[{{\"where\":{{\"and\":[{{\"href_matches\":\"{base}/*\"}},{{\"not\":{{\"href_matches\":\"{base}/api/*\"}}}},{{\"not\":{{\"href_matches\":\"{base}/auth/*\"}}}}]}},\"eagerness\":\"moderate\"}}]}}</script>"
+    );
     let doc_attr =
         if discussable { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
     let say_intro = if audio.is_some() {
@@ -730,6 +745,7 @@ pub fn render(
 <body>
 <div class=\"frame\">
 {}
+<script src=\"{keep}\"></script>
 <div class=\"pane\">
 {}
 <div class=\"grid{width}\">
@@ -750,6 +766,8 @@ pub fn render(
         crate::side::mobile_bar(s.served, s.world, s.site),
         crate::side::pager(s.nav, page, s.served),
         css = esc(&s.served.href("/site.css")),
+        // Classic and synchronous on purpose: it runs as soon as the sidebar is parsed, before the first paint.
+        keep = esc(&s.served.href("/js/keep.js")),
     );
     Ok((html, out_blocks))
 }

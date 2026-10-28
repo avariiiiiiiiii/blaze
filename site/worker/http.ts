@@ -153,7 +153,9 @@ const TURNSTILE = 'https://challenges.cloudflare.com';
 export function csp({ turnstile = false } = {}): string {
 	return [
 		"default-src 'self'",
-		turnstile ? `script-src 'self' ${TURNSTILE}` : "script-src 'self'",
+		// 'inline-speculation-rules' lets in only the page's <script type="speculationrules"> (hover prerendering),
+		// never inline code.
+		turnstile ? `script-src 'self' 'inline-speculation-rules' ${TURNSTILE}` : "script-src 'self' 'inline-speculation-rules'",
 		"style-src 'self'",
 		"img-src 'self' https://avatars.githubusercontent.com https://github.com",
 		"connect-src 'self'",

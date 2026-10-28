@@ -39,7 +39,12 @@
 .sechead:hover { color: var(--ink-1); }
 .sechead span { flex: 1; }
 .sechead .chev { width: 12px; height: 12px; transition: transform 0.18s; }
-.sec:not([open]) > .sechead .chev { transform: rotate(-90deg); }
+/* `.closing`: client/side.ts is still sliding the section shut, so the caret turns at the click, as in ix. */
+.sec:not([open]) > .sechead .chev, .sec.closing > .sechead .chev { transform: rotate(-90deg); }
+
+/* ix's glide.ts hover pill (client/side.ts places it): it appears on the first row the pointer touches, slides
+   between rows with a small overshoot and fades when the pointer leaves the list. */
+.navlist .glide-hov { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; background: color-mix(in srgb, var(--ink-1) 3.5%, transparent); transition: transform 0.14s cubic-bezier(0.34, 1.3, 0.5, 1), width 0.14s cubic-bezier(0.34, 1.3, 0.5, 1), height 0.1s, opacity 0.1s; }
 
 .rowwrap { position: relative; }
 .row { position: relative; z-index: 1; display: flex; align-items: center; gap: 9px; height: 32px; padding: 0 30px 0 10px; border-radius: 8px; color: var(--ink-2); font-size: 14px; text-decoration: none; transition: color 0.12s, background-color 0.12s; }
@@ -47,7 +52,9 @@
 .row .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .num { flex: none; font-family: var(--font-mono); font-size: 12px; color: var(--ink-4); }
 .row .outmark { width: 12px; height: 12px; margin-left: auto; color: var(--ink-4); }
-.row:hover { color: var(--ink-1); background: color-mix(in srgb, var(--ink-1) 3.5%, transparent); }
+.row:hover { color: var(--ink-1); }
+/* Without JS (or before it runs) the row paints the pill's tint itself. */
+.navlist:not([data-glide]) .row:hover { background: color-mix(in srgb, var(--ink-1) 3.5%, transparent); }
 .row:hover .icon, .row[aria-current='page'] .icon { color: var(--ink-1); }
 .row[aria-current='page'] { color: var(--ink-1); font-weight: 500; background: var(--s-tint); }
 .row[aria-current='page'] .num { color: var(--ink-3); }
@@ -56,7 +63,7 @@
 .fold > .caret { position: absolute; z-index: 2; right: 3px; top: 3px; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 6px; color: var(--ink-3); cursor: pointer; list-style: none; }
 .fold > .caret:hover { background: var(--line); color: var(--ink-1); }
 .fold > .caret .icon { width: 12px; height: 12px; transition: transform 0.18s; }
-.fold:not([open]) > .caret .icon { transform: rotate(-90deg); }
+.fold:not([open]) > .caret .icon, .fold.closing > .caret .icon { transform: rotate(-90deg); }
 .kids { margin: 2px 0 4px 17px; border-left: 1px solid var(--line-2); }
 .kids .row { padding-left: 10px; }
 .kids .row .icon { display: none; }
@@ -168,5 +175,19 @@ main.wide { max-width: none; }
 	.doc .pager a { max-width: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-	.side, .sechead .chev, .fold > .caret .icon { transition: none; }
+	.side, .sechead .chev, .fold > .caret .icon, .navlist .glide-hov { transition: none; }
+}
+
+/* Moving between pages: a real load, made to feel like the ix docs' client-side routing. Same-origin navigations are
+   a view transition (Chrome and Edge 126+, Safari 18.2+; elsewhere a plain load): the sidebar and the phone bar are
+   their own layers and swap in place, so only the page column cross-fades, quickly. */
+@view-transition { navigation: auto; }
+.side { view-transition-name: side; }
+.mbar { view-transition-name: mbar; }
+::view-transition-group(side), ::view-transition-group(mbar),
+::view-transition-new(side), ::view-transition-new(mbar) { animation: none; }
+::view-transition-old(side), ::view-transition-old(mbar) { display: none; }
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: 150ms; }
+@media (prefers-reduced-motion: reduce) {
+	@view-transition { navigation: none; }
 }

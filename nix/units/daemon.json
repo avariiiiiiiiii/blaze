@@ -911,6 +911,7 @@
      "proc-macro-api",
      "ra-ap-rustc_lexer",
      "rustc-hash 2.1.2",
+     "salsa",
      "sha2 0.10.9",
      "span",
      "tt",
@@ -20331,6 +20332,10 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
       },
       {
        "name": "sha2",
@@ -41004,6 +41009,10 @@
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
       },
       {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
+      },
+      {
        "name": "sha2",
        "unit": "sha2@0.10.9 lib sha2 build"
       },
@@ -61546,6 +61555,10 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
       },
       {
        "name": "sha2",
@@ -82244,6 +82257,10 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
       },
       {
        "name": "sha2",

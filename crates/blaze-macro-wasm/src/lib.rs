@@ -909,10 +909,7 @@ pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), St
 /// As [`prepare`], but a module that carries its list of macros ([`exports::LIST_SECTION`]) is
 /// compiled on a thread of its own: its list is written now, and the first of its macros to
 /// expand in this process waits for the compile.
-pub fn prepare_soon(
-    path: &Path,
-    store: Option<&'static blaze_store::Store>,
-) -> Result<(), String> {
+pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> Result<(), String> {
     if let Some((known, _)) = listing(path)
         && code_file(path, &code_key(&known.digest)).is_file()
     {

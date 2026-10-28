@@ -82,7 +82,7 @@ def strace(arm):
     d = f"{out}/strace-{arm}"
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
-    pids = subprocess.run(["pgrep", "-f", f"bh-{setup}-{arm}|ra-jit"], capture_output=True, text=True).stdout.split()
+    pids = subprocess.run(["pgrep", "-f", f"bh-{setup}-{arm}|blaze-engine"], capture_output=True, text=True).stdout.split()
     tracers = [
         subprocess.Popen(["strace", "-f", "-e", "trace=execve", "-o", f"{d}/daemon.{pid}", "-p", pid], stderr=subprocess.DEVNULL)
         for pid in pids

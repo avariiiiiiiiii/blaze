@@ -8,6 +8,14 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Added
+
+- A build or check that waits for the daemon says what it waits for: on a terminal one status
+  line, written over as the worker loads the workspace, resolves names, compiles, checks and
+  links (`Loading workspace (38 s)`), and cleared when it is done; off a terminal one line per
+  step. Before, a first build of a large workspace printed nothing for a minute. `-q` shows
+  none.
+
 ### Removed
 
 - `blaze enable` and `blaze disable`, and plain cargo building through blaze (#93, no-rustc.md's

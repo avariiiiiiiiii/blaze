@@ -8103,7 +8103,6 @@ pub(crate) fn erase_regions<'db>(
     erased
 }
 
-
 /// The integer an address is on the target.
 fn ptr() -> Type {
     Target::current().pointer()

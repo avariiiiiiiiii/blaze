@@ -15,7 +15,11 @@ use rustc_hash::FxHashMap;
 use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use unicode_width::UnicodeWidthChar;
 
-use crate::{InferenceResult, db::HirDatabase, mir::{MirSpan, is_builtin_index}};
+use crate::{
+    InferenceResult,
+    db::HirDatabase,
+    mir::{MirSpan, is_builtin_index},
+};
 
 /// The range of an item or a macro call without the attributes and comments on top of it,
 /// which rustc's span of it leaves out.

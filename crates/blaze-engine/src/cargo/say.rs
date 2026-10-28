@@ -158,7 +158,7 @@ const SHOWN_AFTER: Duration = Duration::from_millis(500);
 /// What a command that waits for the daemon shows of the build's records
 /// ([`blaze_protocol::events`]). On a terminal: a region below the lines that stay, drawn again as
 /// records come and time passes, and at the end the build's last line in its place
-/// ([`blaze_ui::live`]). Elsewhere: cargo's lines, for a log ([`blaze_ui::plain`]). Nothing
+/// ([`blaze_ui::Live`]). Elsewhere: cargo's lines, for a log ([`blaze_ui::Plain`]). Nothing
 /// when the command is quiet.
 pub(crate) struct Shown {
     asked: Instant,
@@ -170,8 +170,8 @@ pub(crate) struct Shown {
 }
 
 enum Rendering {
-    Live(blaze_ui::live::Live),
-    Plain(blaze_ui::plain::Plain),
+    Live(blaze_ui::Live),
+    Plain(blaze_ui::Plain),
 }
 
 impl Shown {
@@ -181,9 +181,9 @@ impl Shown {
             () if QUIET.load(Ordering::Relaxed) => None,
             () if terminal => {
                 let width = terminal_width().unwrap_or(80);
-                Some(Rendering::Live(blaze_ui::live::Live::new(width, colored())))
+                Some(Rendering::Live(blaze_ui::Live::new(width, colored())))
             }
-            () => Some(Rendering::Plain(blaze_ui::plain::Plain::new(colored()))),
+            () => Some(Rendering::Plain(blaze_ui::Plain::new(colored()))),
         };
         let held = terminal.then(String::new);
         Shown { asked: Instant::now(), to, held, records: Vec::new() }

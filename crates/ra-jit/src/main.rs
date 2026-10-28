@@ -8943,6 +8943,13 @@ fn run(args: Args, doc: Option<&doctest::Libraries>) -> anyhow::Result<()> {
     run_holding(args, doc, None, false)
 }
 
+/// The remote `RA_JIT_REMOTE` names once the pull a load starts beside itself is over.
+fn pulled(
+    pulling: std::thread::JoinHandle<anyhow::Result<Option<remote::Shared>>>,
+) -> anyhow::Result<Option<remote::Shared>> {
+    pulling.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?
+}
+
 /// [`run`], with what a process started before its build was known has loaded already.
 fn run_holding(
     mut args: Args,
@@ -9005,11 +9012,19 @@ fn run_holding(
         ra_jit_store::compiles_against(&toolchain);
     }
 
-    // What other machines compiled is fetched next to the workspace too.
+    // What other machines compiled is fetched beside the build, which never waits for it: the
+    // store reads what arrived once it is in, and the build finds it from then on.
     let shared = std::thread::spawn(|| {
         let shared = remote::Shared::from_env()?;
         if let Some(shared) = &shared {
             shared.pull()?;
+            // Opened before the toolchain is known, the store of this process is none for good;
+            // opened after, it reads what the pull brought anyway.
+            if ra_jit_store::toolchain().is_some()
+                && let Some(store) = ra_jit_store::Store::global()
+            {
+                store.refresh();
+            }
         }
         anyhow::Ok(shared)
     });
@@ -9122,9 +9137,12 @@ fn run_holding(
     if checkouts.lto(&args.project)? {
         linked_from_libraries(&db, &args)?;
     }
-    // The store reads its packs when first opened, which serving does: what the remote's pull
-    // brings after that is not in it for this build.
-    let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))??;
+    // Only a remote the build requires (RA_JIT_REMOTE_REQUIRED) is waited for: its failure is
+    // the build's.
+    let (mut pulling, mut shared) = (Some(shared), None);
+    if remote::required() {
+        shared = pulled(pulling.take().expect("not joined yet"))?;
+    }
     let built = built_crates(&db, &args)?;
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
@@ -9458,14 +9476,26 @@ fn run_holding(
         }
     };
     // What this build added goes to the other machines while the daemon waits for edits; a
-    // build that is not a daemon's has nothing to wait for but this.
-    match shared {
-        Some(shared) if args.socket.is_none() && !args.watch => {
+    // build that is not a daemon's has nothing to wait for but this. A daemon's keeps them in
+    // step once the pull is over, which its builds do not wait for.
+    let once = args.socket.is_none() && !args.watch;
+    if once && let Some(pulling) = pulling.take() {
+        shared = pulled(pulling)?;
+    }
+    match (shared, pulling) {
+        (Some(shared), _) if once => {
             ra_jit_store::settled();
             shared.push()?
         }
-        Some(shared) => shared.keep(),
-        None => {}
+        (Some(shared), _) => shared.keep(),
+        (None, Some(pulling)) => {
+            std::thread::spawn(move || match pulled(pulling) {
+                Ok(Some(shared)) => shared.keep(),
+                Ok(None) => {}
+                Err(e) => eprintln!("remote: {e:#}"),
+            });
+        }
+        (None, None) => {}
     }
     let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
     if let Some((edited, sources)) = &rewritten {

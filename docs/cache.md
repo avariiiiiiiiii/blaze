@@ -223,10 +223,18 @@ whether it went through or not, for a CI job's summary:
 
 ### From the daemon
 
-With `BLAZE_REMOTE` set, the daemon pulls before its first build, pulls again when a build
-misses a key and the manifest has changed, and pushes what it compiled after the first
-build, then every five minutes, and once more when it is told to stop. No build waits for a
-push. A daemon killed with SIGKILL pushes nothing on its way out; the next push sends it.
+With `BLAZE_REMOTE` set, the daemon pulls as it starts, pulls again when a build misses a
+key and the manifest has changed, and pushes what it compiled after the first build, then
+every five minutes, and once more when it is told to stop. No build waits for the network:
+the first build compiles from the start while the pull runs beside it, and once the pull is
+in, the store reads it and what the build asks for after that is found rather than compiled.
+With `BLAZE_REMOTE_LAZY`, the first key a build lacks of a pack starts fetching that pack,
+and the thread that asked waits for it a quarter of a second at most. Once a pack takes
+longer, no thread of the daemon waits on the remote again: what it lacks is compiled here
+while the packs come. Only `BLAZE_REMOTE_REQUIRED` has the first build wait for the pull,
+since its failure is then the build's. A connection that is not made within 2 seconds fails,
+as a network that is down does. A daemon killed with SIGKILL pushes nothing on its way out;
+the next push sends it.
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -274,7 +282,7 @@ within 2 seconds fails the fetch, which says so in one line and is tried again a
 What is public is fetched by default. A workspace turns that off in its root manifest:
 
     [workspace.metadata.blaze]
-    fetch-public = false   # no standard library from the release; RA_JIT_STD_FROM still names one
+    fetch-public = false   # no standard library from the release; BLAZE_STD_FROM still names one
 
 A build of another binary (crates.io, nix, your own) finds nothing for its `<build>` and
 compiles the library itself, once per store.

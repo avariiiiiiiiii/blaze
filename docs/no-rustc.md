@@ -1465,7 +1465,7 @@ paid once, by the release, instead of on a user's machine (`crates/ra-jit/src/sh
   flat, redirects followed, which is what a release's download URL is.
 - A build with nothing of rustc's fetches that project once per store, beside the build and
   never waited for (the store reads it when it is in, [cache.md](cache.md#the-standard-library)):
-  from `RA_JIT_STD_FROM` when set (`off` for nowhere), otherwise from its own release when it
+  from `BLAZE_STD_FROM` when set (`off` for nowhere), otherwise from its own release when it
   is one (`RA_JIT_RELEASE`, set by the workflow on a tag) and the root manifest does not say
   `fetch-public = false` under `[workspace.metadata.blaze]`. Builds that start
   together take a lock and fetch once; `fetched-<project>` in the store dir records that it is

@@ -18,10 +18,9 @@
  * step seen, whether it is finished, and each question's tries. Storage can be missing or refuse writes (private
  * windows, blocked site data), so every access is wrapped and the course works for the visit from memory instead.
  * Diagrams are client/lib/diagrams.ts, and the sounds (a chime when right, a soft low tone when not, a tick to move on;
- * the speaker in the top bar mutes them; /learn/sounds picks the palette, client/lib/audition.ts) client/lib/sound.ts.
+ * the speaker in the top bar mutes them) client/lib/sound.ts.
  */
 
-import { soundBoard } from './lib/audition';
 import { mount, type Diagram } from './lib/diagrams';
 import { onPage } from './lib/page';
 import { KEY, firstTime, load, progress, stateOf, stateWords, store } from './lib/progress';
@@ -579,8 +578,6 @@ function courseMap(list: HTMLOListElement, signal: AbortSignal): () => void {
 onPage((signal) => {
 	const main = document.querySelector<HTMLElement>('main.lesson[data-lesson]');
 	if (main && !main.hasAttribute('data-on')) return player(main, signal);
-	const board = document.querySelector<HTMLElement>('.soundboard');
-	if (board) return soundBoard(board, signal);
 	const list = document.querySelector<HTMLOListElement>('ol.course');
 	if (list) return courseMap(list, signal);
 	// A figure outside a lesson (none yet), drawn all the same.

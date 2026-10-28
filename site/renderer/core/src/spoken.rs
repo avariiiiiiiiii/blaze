@@ -190,7 +190,7 @@ fn derive(n: Id, ctx: &mut Ctx) -> Result<Option<String>, String> {
         }
         return Ok(Some(items.join(" ")));
     }
-    if ["References", "SignupForm", "BenchHistory", "SoundBoard"].iter().any(|t| e.has_tag(t)) {
+    if ["References", "SignupForm", "BenchHistory"].iter().any(|t| e.has_tag(t)) {
         return Ok(None);
     }
     for comp in ["Lede", "P", "Dim", "Li"] {

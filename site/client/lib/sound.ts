@@ -3,8 +3,8 @@
  *
  * - Instruments, not bare oscillators: a mallet (additive partials at inharmonic ratios, a fast strike with a breath of
  *   noise, exponential decay), an FM bell (modulator at 3.5 times the carrier, its index falling over the note), a warm
- *   pluck (two detuned saws through a low-pass whose cutoff falls fast), glass (a free bar's partials, slow to fade,
- *   with a slight shimmer), and a woody tick (filtered noise and a falling blip, never twice the same).
+ *   pluck (two detuned saws through a low-pass whose cutoff falls fast), and a woody tick (filtered noise and a falling
+ *   blip, never twice the same).
  * - One key, D major pentatonic, so every sound belongs with the others. A right answer is a quick rising figure that
  *   starts a step higher on each right answer in a row (back to the bottom on a miss); not quite is a soft falling
  *   minor third on the pluck, low-passed; Continue and a pick are the tick; a finished lesson is a rising arpeggio that
@@ -12,10 +12,9 @@
  *   on a full chord instead.
  * - A room: two ConvolverNodes with impulses made here (decaying stereo noise, darker as it fades: 1.2 s for the
  *   room, 2.6 s for the finish), mixed low. Notes are spread a little left and right. Everything goes through a light
- *   compressor and an output gain set so the loudest sound peaks near -14 dBFS (the audition page measures each one
- *   offline).
- * - Palettes: which instrument plays what. /learn/sounds (client/lib/audition.ts) plays every sound in each, and the
- *   reader's pick is kept in localStorage (`blaze.sound.palette`).
+ *   compressor and an output gain set so the loudest sound peaks near -14 dBFS.
+ * - One palette, the same for every reader: the mallet for right answers and the finish, a bell on top, the soft
+ *   pluck for not quite, the wood tick.
  * - One AudioContext, made on the reader's first tap or key and resumed inside that handler (iOS Safari starts it
  *   only from a gesture). Every sound is played from a click or key handler, so nothing sounds before the reader has
  *   done something.
@@ -26,7 +25,6 @@
  */
 
 const KEY = 'blaze.sound';
-const PALETTE_KEY = 'blaze.sound.palette';
 
 function read(key: string): string | null {
 	try {
@@ -93,7 +91,7 @@ function impulse(ctx: BaseAudioContext, seconds: number, gap: number): AudioBuff
 	return buf;
 }
 
-/** Peak target: the output gain is set so the loudest sound lands near -14 dBFS (audition.ts measures). */
+/** Peak target: the output gain is set so the loudest sound lands near -14 dBFS (measured with an OfflineAudioContext). */
 const OUTPUT = 0.265;
 
 function output(ctx: BaseAudioContext): Out {
@@ -222,87 +220,50 @@ const bell: Instrument = (o, t, f, v, p = {}) => {
 	}
 };
 
-/** A warm pluck: two saws a few cents apart through a resonant low-pass that closes fast. `bright` sets the opening. */
-function pluckOf(bright: number): Instrument {
-	return (o, t, f, v, p = {}) => {
-		const out = voice(o, p.pan ?? 0, p.room ?? 0.16, p.hall);
-		const dur = 0.55;
-		const lp = o.ctx.createBiquadFilter();
-		lp.type = 'lowpass';
-		lp.Q.value = 1.6;
-		lp.frequency.setValueAtTime(Math.min(f * bright, 8000), t);
-		lp.frequency.exponentialRampToValueAtTime(f * 1.1, t + 0.2);
-		const g = o.ctx.createGain();
-		env(g.gain, t, v, 0.004, t + dur);
-		lp.connect(g).connect(out);
-		for (const cents of [-6, 6]) {
-			const osc = o.ctx.createOscillator();
-			osc.type = 'sawtooth';
-			osc.frequency.value = f;
-			osc.detune.value = cents;
-			osc.connect(lp);
-			osc.start(t);
-			osc.stop(t + dur + 0.05);
-		}
-	};
-}
-const pluck = pluckOf(7);
-/** The pluck for "not quite": darker, so it is kind rather than a buzzer. */
-const softPluck = pluckOf(3.2);
-
-/** Glass: a free bar's partials (1, 2.76, 5.4), a softer start, a long fade and a slow shimmer. */
-const glass: Instrument = (o, t, f, v, p = {}) => {
-	const out = voice(o, p.pan ?? 0, p.room ?? 0.38, p.hall);
-	const dur = Math.min(2.6, 2.0 * (660 / f) ** 0.3);
-	const lfo = o.ctx.createOscillator();
-	lfo.frequency.value = 5.2;
-	const lfoGain = o.ctx.createGain();
-	lfoGain.gain.value = f * 0.003;
-	lfo.connect(lfoGain);
-	for (const [ratio, amp, life] of [
-		[1, 1, 1],
-		[2.76, 0.22, 0.45],
-		[5.4, 0.06, 0.2],
-	] as const) {
-		if (f * ratio > 15000) continue;
+/** The pluck for "not quite": two saws a few cents apart through a resonant low-pass that opens only to 3.2 times the
+ * note and closes fast, so it is warm and kind rather than a buzzer. */
+const softPluck: Instrument = (o, t, f, v, p = {}) => {
+	const out = voice(o, p.pan ?? 0, p.room ?? 0.16, p.hall);
+	const dur = 0.55;
+	const lp = o.ctx.createBiquadFilter();
+	lp.type = 'lowpass';
+	lp.Q.value = 1.6;
+	lp.frequency.setValueAtTime(Math.min(f * 3.2, 8000), t);
+	lp.frequency.exponentialRampToValueAtTime(f * 1.1, t + 0.2);
+	const g = o.ctx.createGain();
+	env(g.gain, t, v, 0.004, t + dur);
+	lp.connect(g).connect(out);
+	for (const cents of [-6, 6]) {
 		const osc = o.ctx.createOscillator();
-		osc.frequency.value = f * ratio;
-		if (ratio === 1) lfoGain.connect(osc.frequency);
-		const g = o.ctx.createGain();
-		env(g.gain, t, v * amp, 0.008, t + dur * life);
-		osc.connect(g).connect(out);
+		osc.type = 'sawtooth';
+		osc.frequency.value = f;
+		osc.detune.value = cents;
+		osc.connect(lp);
 		osc.start(t);
-		osc.stop(t + dur * life + 0.05);
+		osc.stop(t + dur + 0.05);
 	}
-	lfo.start(t);
-	lfo.stop(t + dur + 0.05);
 };
 
-/** The tick: a knock of band-passed noise and a tiny falling blip, pitched a little differently every time. */
-function tickOf(centre: number, blip: number): (o: Out, t: number, v: number) => void {
-	return (o, t, v) => {
-		const vary = 1 + (Math.random() - 0.5) * 0.14;
-		const out = voice(o, (Math.random() - 0.5) * 0.2, 0.08);
-		strike(o, out, t, centre * vary, v, 0.022);
-		const osc = o.ctx.createOscillator();
-		osc.frequency.setValueAtTime(blip * vary, t);
-		osc.frequency.exponentialRampToValueAtTime(blip * vary * 0.62, t + 0.03);
-		const g = o.ctx.createGain();
-		env(g.gain, t, v * 0.7, 0.001, t + 0.035);
-		osc.connect(g).connect(out);
-		osc.start(t);
-		osc.stop(t + 0.06);
-	};
-}
-const wood = tickOf(1900, 820);
-const glassTick = tickOf(4200, 1760);
+/** The tick: a woody knock of band-passed noise and a tiny falling blip, pitched a little differently every time. */
+const wood = (o: Out, t: number, v: number) => {
+	const centre = 1900;
+	const blip = 820;
+	const vary = 1 + (Math.random() - 0.5) * 0.14;
+	const out = voice(o, (Math.random() - 0.5) * 0.2, 0.08);
+	strike(o, out, t, centre * vary, v, 0.022);
+	const osc = o.ctx.createOscillator();
+	osc.frequency.setValueAtTime(blip * vary, t);
+	osc.frequency.exponentialRampToValueAtTime(blip * vary * 0.62, t + 0.03);
+	const g = o.ctx.createGain();
+	env(g.gain, t, v * 0.7, 0.001, t + 0.035);
+	osc.connect(g).connect(out);
+	osc.start(t);
+	osc.stop(t + 0.06);
+};
 
-// ---------- Palettes ----------
+// ---------- The palette ----------
 
-export type Palette = {
-	id: string;
-	name: string;
-	about: string;
+type Palette = {
 	right: Instrument;
 	wrong: Instrument;
 	done: Instrument;
@@ -310,29 +271,16 @@ export type Palette = {
 	tick: (o: Out, t: number, v: number) => void;
 };
 
-export const palettes: Palette[] = [
-	{ id: 'mallet', name: 'Mallet', about: 'A soft wooden mallet, a bell on top when you finish.', right: mallet, wrong: softPluck, done: mallet, top: bell, tick: wood },
-	{ id: 'bell', name: 'Bell', about: 'Small FM bells, brighter and longer.', right: bell, wrong: softPluck, done: bell, top: bell, tick: wood },
-	{ id: 'glass', name: 'Glass', about: 'Struck glass in a bigger room, with a glassy tick.', right: glass, wrong: softPluck, done: glass, top: bell, tick: glassTick },
-	{ id: 'pluck', name: 'Pluck', about: 'A warm plucked string, closest to a guitar.', right: pluck, wrong: softPluck, done: pluck, top: mallet, tick: wood },
-];
-
-export function palette(): Palette {
-	const id = read(PALETTE_KEY);
-	return palettes.find((p) => p.id === id) ?? palettes[0]!;
-}
-export function setPalette(id: string) {
-	write(PALETTE_KEY, id);
-}
+const pal: Palette = { right: mallet, wrong: softPluck, done: mallet, top: bell, tick: wood };
 
 // ---------- The sounds ----------
 
 /** Right answers in a row: each one starts a step higher, up to an octave. */
 let streak = 0;
 
-type Sound = (o: Out, t: number, pal: Palette, level?: number) => void;
+type Sound = (o: Out, t: number, level?: number) => void;
 
-const figure = (o: Out, t: number, pal: Palette, from: number) => {
+const figure = (o: Out, t: number, from: number) => {
 	// Three notes up the scale, the last one quieter and higher: it sparkles rather than shouts.
 	pal.right(o, t, note(from), 0.55, { pan: -0.18 });
 	pal.right(o, t + 0.075, note(from + 2), 0.5, { pan: 0.05 });
@@ -340,24 +288,24 @@ const figure = (o: Out, t: number, pal: Palette, from: number) => {
 };
 
 const sounds: Record<string, Sound> = {
-	tick: (o, t, pal) => pal.tick(o, t, 0.1),
-	pick: (o, t, pal) => pal.tick(o, t, 0.13),
+	tick: (o, t) => pal.tick(o, t, 0.1),
+	pick: (o, t) => pal.tick(o, t, 0.13),
 	// D5 F#5 B5 to start; each right answer in a row starts a step higher, up to D6 F#6 B6.
-	right: (o, t, pal, level = 0) => figure(o, t, pal, D5 + Math.min(level, 5)),
-	wrong: (o, t, pal) => {
+	right: (o, t, level = 0) => figure(o, t, D5 + Math.min(level, 5)),
+	wrong: (o, t) => {
 		// A falling minor third, A3 to F#3, soft and low-passed.
 		pal.wrong(o, t, note(3), 0.33, { pan: -0.08 });
 		pal.wrong(o, t + 0.14, note(2), 0.28, { pan: 0.08 });
 	},
-	done: (o, t, pal) => {
+	done: (o, t) => {
 		// D4 F#4 A4 B4 D5: up the scale, landing on the tonic, a bell an octave above it.
 		const run = [D4, D4 + 2, D4 + 3, D4 + 4, D5];
 		run.forEach((d, i) => pal.done(o, t + i * 0.085, note(d), i === run.length - 1 ? 0.5 : 0.4, { pan: -0.3 + i * 0.15, hall: 0.18 }));
 		const land = t + (run.length - 1) * 0.085;
 		pal.top(o, land + 0.02, note(D5 + 5), 0.3, { pan: 0.12, hall: 0.35 });
 	},
-	milestone: (o, t, pal) => {
-		sounds.done!(o, t, pal);
+	milestone: (o, t) => {
+		sounds.done!(o, t);
 		// Then the whole chord, D A E F# D, rolled upward, with the bell on top and the long room.
 		const at = t + 0.62;
 		[D4 - 5, D4 - 2, D4 + 1, D4 + 2, D5].forEach((d, i) => pal.done(o, at + i * 0.028, note(d), 0.3, { pan: -0.35 + i * 0.17, hall: 0.3 }));
@@ -375,8 +323,8 @@ let live: Out | null = null;
 type AudioCtor = typeof AudioContext;
 
 /** Makes or resumes the context. Call it from inside a gesture's handler. */
-function unlock(force = false): Out | null {
-	if (!on && !force) return null;
+function unlock(): Out | null {
+	if (!on) return null;
 	try {
 		if (!live) {
 			const AC: AudioCtor | undefined = window.AudioContext ?? (window as unknown as { webkitAudioContext?: AudioCtor }).webkitAudioContext;
@@ -391,11 +339,11 @@ function unlock(force = false): Out | null {
 	}
 }
 
-function play(name: SoundName, pal = palette(), level?: number, force = false) {
-	const o = unlock(force);
+function play(name: SoundName, level?: number) {
+	const o = unlock();
 	if (!o) return;
 	try {
-		sounds[name]!(o, o.ctx.currentTime + 0.012, pal, level);
+		sounds[name]!(o, o.ctx.currentTime + 0.012, level);
 	} catch {
 		// A browser without some node: silence, never an error in the lesson.
 	}
@@ -405,7 +353,7 @@ export const sound = {
 	tick: () => play('tick'),
 	pick: () => play('pick'),
 	right: () => {
-		play('right', palette(), streak);
+		play('right', streak);
 		streak++;
 	},
 	wrong: () => {
@@ -415,29 +363,3 @@ export const sound = {
 	done: () => play('done'),
 	milestone: () => play('milestone'),
 };
-
-/** For the audition page: play one sound in one palette, even when the lessons are muted (the reader asked). */
-export function audition(name: SoundName, pal: Palette, level = 0) {
-	play(name, pal, level, true);
-}
-
-/** Five right answers in a row, climbing, as a reader on a streak hears them. */
-export function auditionStreak(pal: Palette) {
-	const o = unlock(true);
-	if (!o) return;
-	for (let i = 0; i < 5; i++) sounds.right!(o, o.ctx.currentTime + 0.02 + i * 0.55, pal, i);
-}
-
-/** A sound's peak, in dBFS, rendered offline through the same chain (no gesture needed, nothing heard). */
-export async function peak(name: SoundName, pal: Palette, level = 0): Promise<number> {
-	const rate = 44100;
-	const ctx = new OfflineAudioContext(2, rate * 4, rate);
-	sounds[name]!(output(ctx), 0.05, pal, level);
-	const buf = await ctx.startRendering();
-	let max = 0;
-	for (let ch = 0; ch < buf.numberOfChannels; ch++) {
-		const d = buf.getChannelData(ch);
-		for (let i = 0; i < d.length; i++) max = Math.max(max, Math.abs(d[i]!));
-	}
-	return max > 0 ? 20 * Math.log10(max) : -Infinity;
-}

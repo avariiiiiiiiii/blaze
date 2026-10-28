@@ -354,26 +354,3 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 	main.lesson[data-on] > section.step.in-fwd, main.lesson[data-on] > section.step.in-back, .pick[data-mark='wrong'] { animation: none; }
 	.lp-bar i, .pick, .dg-part, .dg-wires rect, .m-group i { transition: none; }
 }
-
-/* ---------- /learn/sounds: the palettes, to pick by ear (client/lib/audition.ts) ---------- */
-
-.soundboard { display: grid; gap: 14px; margin: 24px 0 8px; }
-.sb-nojs { color: var(--ink-3); }
-.sb-muted { margin: 0 !important; padding: 10px 14px; border-radius: 12px; background: var(--bg-2); color: var(--ink-2); font-size: 14.5px !important; }
-.sb-muted[hidden] { display: none; }
-.sb-muted button { margin-left: 6px; padding: 0; border: 0; background: none; color: var(--ink-1); font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
-.sb-card { padding: 16px 16px 14px; border-radius: 16px; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line); transition: box-shadow 0.2s; }
-.sb-card[data-active] { box-shadow: inset 0 0 0 2px var(--ink-1); }
-.sb-card header { margin-bottom: 12px; }
-.doc .sb-card h3 { margin: 0; font-size: 17px; }
-.doc .sb-card header p { margin: 2px 0 0; color: var(--ink-3); font-size: 14px; line-height: 1.4; }
-.sb-sounds { display: flex; flex-wrap: wrap; gap: 8px; }
-.sb-play { display: inline-flex; align-items: baseline; gap: 8px; min-height: 40px; padding: 8px 14px; border: 0; border-radius: 999px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-1); font: inherit; font-size: 14px; cursor: pointer; }
-.sb-play:hover { box-shadow: inset 0 0 0 1px var(--ink-3); }
-.sb-play:focus-visible, .sb-use:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 2px; }
-.sb-play.hit { animation: sb-hit 0.35s ease-out; }
-@keyframes sb-hit { from { background: var(--ink-1); color: var(--bg); } }
-.sb-db { color: var(--ink-4); font-family: var(--font-mono); font-size: 11.5px; }
-.sb-use { margin-top: 14px; padding: 9px 16px; border: 0; border-radius: 999px; background: var(--ink-1); color: var(--bg); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
-.sb-card[data-active] .sb-use { background: none; box-shadow: inset 0 0 0 1.5px var(--ink-3); color: var(--ink-2); }
-@media (prefers-reduced-motion: reduce) { .sb-play.hit { animation: none; } .sb-card { transition: none; } }

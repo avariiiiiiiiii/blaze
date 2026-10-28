@@ -629,7 +629,7 @@ def chunks_of(units):
 def identity():
     """What a kept result is a result of: this ra-jit and this backend."""
     stat = os.stat(difftest.RA_JIT)
-    backend = [os.environ.get(k, "") for k in ("RA_JIT_BACKEND", "RA_JIT_OPT", "RA_JIT_EMIT")]
+    backend = [os.environ.get(k, "") for k in ("BLAZE_BACKEND", "BLAZE_OPT", "BLAZE_EMIT")]
     return f"{os.path.abspath(difftest.RA_JIT)} {stat.st_size} {stat.st_mtime_ns} {backend}"
 
 

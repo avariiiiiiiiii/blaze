@@ -5,7 +5,7 @@ daemon holds meanwhile, for each way of running it (issue #56).
     spare.py [PROJECT...] --variant LABEL:BIN[:VAR=VALUE...]... [--rounds N] [--out FILE] [--work DIR]
 
 A variant is a ra-jit and the variables it runs with, for example
-`--variant asked:target/release/ra-jit --variant ready:target/release/ra-jit:RA_JIT_SPARE=ready`.
+`--variant asked:target/release/ra-jit --variant ready:target/release/ra-jit:BLAZE_SPARE=ready`.
 Each round runs every variant once, in turn, for each PROJECT (bench.py's, default ripgrep fd
 nushell), each with a home and a store of its own:
   first   a small package of no dependencies is built with `cargo ra-jit build`, which starts the
@@ -85,11 +85,11 @@ def sequence(name, spec, source, variant, work):
     open(os.path.join(first_ws, "Cargo.toml"), "w").write(FIRST_TOML)
     open(os.path.join(first_ws, "src/main.rs"), "w").write(FIRST_MAIN)
     shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", ".git"))
-    env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), RA_JIT_CACHE=store, **variables)
+    env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), BLAZE_CACHE=store, **variables)
     env["PATH"] = os.path.dirname(os.path.abspath(binary)) + os.pathsep + env["PATH"]
     env.pop("RUSTC_WRAPPER", None)
-    if "RA_JIT_SPARE" not in variables:
-        env.pop("RA_JIT_SPARE", None)
+    if "BLAZE_SPARE" not in variables:
+        env.pop("BLAZE_SPARE", None)
     first, project = Side(os.path.realpath(first_ws), env, True), Side(ws, env, True)
     first.cargo("stop")
     row = {}
@@ -126,7 +126,7 @@ def main():
     out = options(argv, "--out", os.path.join(cargo_ra_jit.HERE, "spare.json"))[0]
     work = (options(argv, "--work") or [None])[0] or tempfile.mkdtemp(prefix="ra-jit-spare-")
     names = argv or ["ripgrep", "fd", "nushell"]
-    result = dict(machine=os.environ.get("RA_JIT_BENCH_MACHINE", ""), rounds=rounds,
+    result = dict(machine=os.environ.get("BLAZE_BENCH_MACHINE", ""), rounds=rounds,
                   variants=[dict(label=l, bin=b, env=v) for l, b, v in variants], projects={})
     for name in names:
         spec = PROJECTS[name]

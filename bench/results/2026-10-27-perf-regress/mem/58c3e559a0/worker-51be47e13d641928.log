@@ -24,7 +24,7 @@ store: 17728 functions found, 13585 compiled and added
 entries: 0 found, 31232 added, 0 as stored, 0 not as stored, 0 instances and 0 requests without a stable name
 not found: [("no entry", 26569)]
 watching 135 files
-tier: off (RA_JIT_TIER=off, blaze built without `--features llvm`, or not macOS on AArch64)
+tier: off (BLAZE_TIER=off, blaze built without `--features llvm`, or not macOS on AArch64)
 request: sync at_us=1793146760681052
 request: sync at_us=1793146760830564
 request: sync at_us=1793146763942302

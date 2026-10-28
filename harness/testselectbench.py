@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""testselectbench.py: what `RA_JIT_TESTS=affected` saves on real projects. Measures, and fails
+"""testselectbench.py: what `BLAZE_TESTS=affected` saves on real projects. Measures, and fails
 when a build after the daemon first served one went to cargo, which ra-jit is never to do (#84):
 an edit's tests are the daemon's to build.
 
 usage: testselectbench.py [--json FILE] [--keep DIR] [--args ARG,ARG...] [project ...]
-       (RA_JIT_BIN names the ra-jit built; the projects are bench.py's, ripgrep, helix and
+       (BLAZE_BIN names the ra-jit built; the projects are bench.py's, ripgrep, helix and
        nushell by default, at their pinned revisions and on harness/toolchain, tested with
        bench.py's `test` arguments)
 
 Each project is copied to a scratch directory, opted into sandboxed tests, and tested with `cargo ra-jit test` until the
-daemon serves the build. Then, each a row: every test (`RA_JIT_TESTS=all`); the affected
+daemon serves the build. Then, each a row: every test (`BLAZE_TESTS=all`); the affected
 ones twice, the first recording what passed; the affected ones after bench.py's `leaf` edit
 (the first build after it may be cargo's), after a second edit of the same function, and every
 test after it. A row has the wall time, whether the daemon built it, how many tests ran and how
@@ -63,14 +63,14 @@ def reach(dirs):
 
 
 def row(ws, env, args, mode, what):
-    took, ran = timed(["cargo", "ra-jit", "test", *args], ws, dict(env, RA_JIT_TESTS=mode), TIMEOUT)
+    took, ran = timed(["cargo", "ra-jit", "test", *args], ws, dict(env, BLAZE_TESTS=mode), TIMEOUT)
     said = ran.stdout + ran.stderr
     if KEEP:
         os.makedirs(KEEP, exist_ok=True)
         name = re.sub(r"\W+", "-", f"{os.path.basename(ws)} {what}")
         open(os.path.join(KEEP, f"{name}.log"), "w").write(said)
     skipped = sum(int(n) for n in SKIPPED.findall(said))
-    listed, sandboxed, always, by = reach([os.path.join(ws, "target"), env["RA_JIT_HOME"]])
+    listed, sandboxed, always, by = reach([os.path.join(ws, "target"), env["BLAZE_HOME"]])
     # Why a build was cargo's, as `cargo ra-jit` says it; not the doc tests rustc builds.
     fell = [it for it in dict.fromkeys(FELL.findall(ran.stderr)) if "is rustc's" not in it and "rustdoc" not in it]
     return dict(step=what, mode=mode, exit=ran.returncode, seconds=round(took, 1), served="[blaze]" in said, fell=fell[:3],
@@ -120,9 +120,9 @@ def project(name, args):
     with open(os.path.join(ws, "Cargo.toml"), "a") as manifest:
         manifest.write('\n[workspace.metadata.blaze]\nexperimental = ["sandboxed-tests"]\n')
     bin_dir = os.path.dirname(os.path.abspath(RA_JIT))
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
                RUST_BACKTRACE="0", RUSTUP_TOOLCHAIN=TOOLCHAIN, **spec.get("env", {}))
-    for var in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RA_JIT_TESTS"):
+    for var in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "BLAZE_TESTS"):
         env.pop(var, None)
     args = args if args is not None else spec.get("test", [])
     rows = Rows(name)

@@ -2,7 +2,7 @@
 
 2026-10-24, for [#41](https://github.com/indexable-inc/ra-jit/issues/41) (the workspace's own
 state on disk). Measured on dev-aws-7 (c7i.16xlarge, 64 cores, 124 GiB, Linux x86-64),
-Cranelift, `RA_JIT_RUSTC_BASE=0`, with `harness/warmstart.py` on bench.py's helix, ripgrep and
+Cranelift, `BLAZE_RUSTC_BASE=0`, with `harness/warmstart.py` on bench.py's helix, ripgrep and
 nushell. Before is main at `b6e58ceab9`; after is the warm-manifest branch on it. Each claim is
 **read** (measured, or read in a source), **reported** (someone says so) or **unverified** (our
 inference).
@@ -34,7 +34,7 @@ inference).
 ## How it was measured
 
 - `harness/warmstart.py PROJECT` gives every build its own home and one store, with
-  `RA_JIT_CACHE`, `RA_JIT_RUSTC_BASE=0` and `RA_JIT_STATS=1`. Its steps are `first` (an empty
+  `BLAZE_CACHE`, `BLAZE_RUSTC_BASE=0` and `BLAZE_STATS=1`. Its steps are `first` (an empty
   store), `warm` (a second checkout of the same commit on that store), `restart` (the second
   checkout's daemon stopped and started) and `again` (once more). After each it makes a body
   edit and undoes it, and checks the program's output against cargo's (**read**).
@@ -383,5 +383,5 @@ and the branch 21.44 and 21.61 s, its compile of the roots 9.7 s where main's to
   fixture's closures, whose two zero-sized parameters `f` and `g` have a slot each in the
   full build and none in the later compile, the machine code byte for byte the same. Every
   edit after a restart found such code changed and compiled it again; the mark now leaves
-  the slots out with the variables (**read**, storetracked.py under `RA_JIT_CHECK_ALL`). Why
+  the slots out with the variables (**read**, storetracked.py under `BLAZE_CHECK_ALL`). Why
   the two compiles give them slots differently is not known (**unverified**).

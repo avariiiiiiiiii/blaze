@@ -15,7 +15,7 @@ crate's codegen units, bring them to cargo's time with no slower a program?
 
 ## What was built
 
-`RA_JIT_UNITS=1` ([`units.rs`](../../crates/hir-ty-codegen/units.rs)) compiles a whole-program
+`BLAZE_UNITS=1` ([`units.rs`](../../crates/hir-ty-codegen/units.rs)) compiles a whole-program
 build in units; without it nothing changes.
 
 - A function's IR is built without LLVM's part (`Detach::Unit`), and its imports are chosen
@@ -37,7 +37,7 @@ build in units; without it nothing changes.
 
 Linking the imports in one at a time took time of the square of their number, since LLVM's
 linker goes over the whole module it links into: lowering ripgrep's units took 23.7 s summed
-over the cores, where its functions compiled alone took 12.3 s (read, `RA_JIT_STATS`). The
+over the cores, where its functions compiled alone took 12.3 s (read, `BLAZE_STATS`). The
 imports are now linked to each other two at a time and into the module once, which took it to
 8.1 s (read). Compiles of one function link theirs the same way.
 
@@ -46,7 +46,7 @@ imports are now linked to each other two at a time and into the module once, whi
 `harness/runbench.py` through `base.sh` (three runs of each program, the median; one build
 each), 2026-10-24 (read). "main" is the binary of `main` before this lane, measured the same
 morning on the same hosts; "one function" and "units" are this lane's binary without and with
-`RA_JIT_UNITS=1`. Build time in seconds, then the program's run time against cargo's release
+`BLAZE_UNITS=1`. Build time in seconds, then the program's run time against cargo's release
 build:
 
 | x86-64 (c8a.24xlarge) | cargo release | main | one function | units |
@@ -66,11 +66,11 @@ build:
 - Neither reaches cargo's release build but bun, which did before (read).
 - "main" to "one function" is mostly the hosts, not the change: LLVM's time summed over the
   cores is the same within 1% (helix 790 against 783 s, nushell 2,415 against 2,394 s, read
-  `RA_JIT_STATS`), of which linking the imports two at a time takes 7 to 10% off lowering.
+  `BLAZE_STATS`), of which linking the imports two at a time takes 7 to 10% off lowering.
 - Units against one function: within 3% either way on build time, but for nushell on AArch64
   (6% faster), and the programs run as fast or slower (helix on x86-64 1.28x against 1.21x).
 
-`RA_JIT_STATS=1` on helix, x86-64, the same binary with and without units (read):
+`BLAZE_STATS=1` on helix, x86-64, the same binary with and without units (read):
 
 | helix | one function | units |
 |---|---|---|

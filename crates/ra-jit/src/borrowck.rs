@@ -118,7 +118,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         let mut change = ChangeWithProcMacros::default();
         change.change_file(file, Some(load_cargo::source_text(text)));
         db.apply_change(change);
-        if let Ok(name) = std::env::var("RA_JIT_BORROWCK_MIR") {
+        if let Ok(name) = std::env::var("BLAZE_BORROWCK_MIR") {
             dump_mir(&db, file, &name);
         }
         let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -225,7 +225,7 @@ fn check_project(project: &str) -> anyhow::Result<()> {
     let mut unused_mut = 0;
     let mut panics = 0;
     for &file in &files {
-        if let Ok(name) = std::env::var("RA_JIT_BORROWCK_MIR") {
+        if let Ok(name) = std::env::var("BLAZE_BORROWCK_MIR") {
             dump_mir(&db, file, &name);
         }
         let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -386,8 +386,8 @@ fn time_project(project: &str, out: &str) -> anyhow::Result<()> {
                 }
             }
         }
-        // RA_JIT_BORROWCK_ONLY=part times only the bodies whose name contains it, to profile one.
-        let only = std::env::var("RA_JIT_BORROWCK_ONLY").ok();
+        // BLAZE_BORROWCK_ONLY=part times only the bodies whose name contains it, to profile one.
+        let only = std::env::var("BLAZE_BORROWCK_ONLY").ok();
         for (def, name) in found {
             if only.as_deref().is_some_and(|it| !name.contains(it)) {
                 continue;
@@ -525,7 +525,7 @@ fn mode_name(mode: hir_ty_borrowck::Mode) -> &'static str {
 }
 
 /// Prints the MIR of each function named `name` at the top of `file`, and of its closures, to
-/// stderr: `RA_JIT_BORROWCK_MIR`, for working on the checker.
+/// stderr: `BLAZE_BORROWCK_MIR`, for working on the checker.
 fn dump_mir(db: &RootDatabase, file: vfs::FileId, name: &str) {
     use hir_ty::db::HirDatabase as _;
     hir::attach_db(db, || {

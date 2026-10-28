@@ -37,10 +37,10 @@ fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata
 
 /// How the daemon's loads read a workspace for the build `selection` names: blaze's own
 /// reading and resolution, the graph that of the build, its features unified over the other
-/// members only as `resolver.feature-unification` says. `RA_JIT_OWN_RESOLVE=0` leaves both to
+/// members only as `resolver.feature-unification` says. `BLAZE_OWN_RESOLVE=0` leaves both to
 /// cargo.
 pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::OwnMetadata> {
-    if std::env::var_os("RA_JIT_OWN_RESOLVE").is_some_and(|it| it == "0") {
+    if std::env::var_os("BLAZE_OWN_RESOLVE").is_some_and(|it| it == "0") {
         return None;
     }
     let selection = selection.clone();

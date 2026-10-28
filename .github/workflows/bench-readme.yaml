@@ -103,8 +103,8 @@ jobs:
       - name: Bench
         id: bench
         run: |
-          export RA_JIT_BIN="$BENCH_HOME/target/release/ra-jit" RA_JIT_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit"
-          export RA_JIT_PROJECTS="$BENCH_HOME/projects"
+          export BLAZE_BIN="$BENCH_HOME/target/release/ra-jit" BLAZE_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit"
+          export BLAZE_PROJECTS="$BENCH_HOME/projects"
           work=${BENCH_WORK:-$BENCH_HOME/work}
           rm -rf "$work" "$BENCH_HOME/reference"
           mkdir -p "$RUNNER_TEMP/results"
@@ -119,7 +119,7 @@ jobs:
       - name: Runtime bench
         continue-on-error: true
         run: |
-          export RA_JIT_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
+          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
           nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime \
             --runs 5 --out "$RUNNER_TEMP/results/runtime.json"
       - uses: actions/upload-artifact@v7

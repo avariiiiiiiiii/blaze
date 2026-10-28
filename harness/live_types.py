@@ -3,9 +3,9 @@
 components change while it runs: a component is never changed in place, a new type takes its
 place ([live.md](../docs/live.md#types)).
 
-usage: live_types.py        (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: live_types.py        (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
-The daemon builds its own base (RA_JIT_RUSTC_BASE=0): over rustc's executable an edit that is more
+The daemon builds its own base (BLAZE_RUSTC_BASE=0): over rustc's executable an edit that is more
 than function bodies takes a build in full.
 
 harness/live-types keeps values of `V1` in a world that erases their type, each type with an id
@@ -113,7 +113,7 @@ async def edit(step: str, program: Running, source: Path, stage: int, project: P
 
 async def main() -> None:
     own_home()
-    bin_dir = Path(os.environ["RA_JIT_BIN"]).resolve().parent
+    bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
     work = Path(tempfile.mkdtemp(prefix="ra-jit-live-types-"))
     started: list[Running] = []
     try:
@@ -135,7 +135,7 @@ async def main() -> None:
             CARGO_TARGET_DIR=str(work / "target"),
             RUST_BACKTRACE="full",
             # Over rustc's executable an edit that adds a type takes a build in full.
-            RA_JIT_RUSTC_BASE="0",
+            BLAZE_RUSTC_BASE="0",
         )
         env.pop("CARGO_INCREMENTAL", None)
         # The first edit after the daemon starts writes the whole object again: it is made

@@ -46,4 +46,4 @@
   byte range within the item it is anchored to, and which of the call's anchors and contexts
   it has, numbered as they first appear. A macro that reads files or the environment by
   itself is outside what any key can see, as in rustc; the skip list and
-  `RA_JIT_PROC_MACRO_CACHE=check` are for those.
+  `BLAZE_PROC_MACRO_CACHE=check` are for those.

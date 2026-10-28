@@ -1,6 +1,6 @@
 //! Where the daemon's memory is.
 //!
-//! With `RA_JIT_MEMORY` naming a directory, the daemon reports what the process holds after
+//! With `BLAZE_MEMORY` naming a directory, the daemon reports what the process holds after
 //! each step of warming up, and once warm and after each request it answers writes there what
 //! every ingredient of the database holds, and how much of the heap is live. A build with the
 //! `heap-profile` feature run with `_RJEM_MALLOC_CONF=prof:true` also writes a profile of the
@@ -13,9 +13,9 @@ use std::{
 
 use ide_db::{RootDatabase, base_db::salsa};
 
-/// The directory `RA_JIT_MEMORY` names, when it is set.
+/// The directory `BLAZE_MEMORY` names, when it is set.
 pub(crate) fn report_dir() -> Option<PathBuf> {
-    std::env::var_os("RA_JIT_MEMORY").map(PathBuf::from)
+    std::env::var_os("BLAZE_MEMORY").map(PathBuf::from)
 }
 
 /// Megabytes of memory the process holds, as [`held_by`] counts it.
@@ -152,7 +152,7 @@ pub(crate) fn checkpoint(step: &str) {
     eprintln!("memory after {step}: {} MB resident{live}", resident().unwrap_or(0));
 }
 
-/// Writes what the daemon holds now that `step` is done to the directory `RA_JIT_MEMORY` names.
+/// Writes what the daemon holds now that `step` is done to the directory `BLAZE_MEMORY` names.
 pub(crate) fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
     checkpoint(step);
     let Some(dir) = report_dir() else { return Ok(()) };

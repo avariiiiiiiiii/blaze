@@ -145,7 +145,7 @@ What it leaves to a person, and prints at the end:
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
 3. `python3 harness/toolchain_bump.py --checks` in an ix VM, under Cranelift and under LLVM
-   (in `nix develop`, with `RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`). It builds
+   (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
    ra-jit and runs, in parallel, what proves ra-jit and the nightly agree: `toolchain_pins.py`,
    `answers.py`, `macroserver.py`, the corpus with its `nightly` feature and `--layouts`, and
    the gate's quick parts.

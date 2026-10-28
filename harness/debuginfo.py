@@ -20,7 +20,7 @@ Then the cost: the time and the size of the corpus's object with and without deb
 whether ra-jit leaves it out when the profile says `debug = false`, and whether it works out
 the types of variables only when the profile asks for variables.
 
-RA_JIT_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail position into
+BLAZE_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail position into
                      jumps, so a frame the cargo build prints may be missing: those are counted.
 --only NAME          one of: corpus stress rung2 edits callers locals types scopes rich profile cost
 """
@@ -32,7 +32,7 @@ os.environ.setdefault("CARGO_PROFILE_DEV_DEBUG", "true")
 import linkline
 from difftest import Fixture, RA_JIT, WINDOWS, sysroot_rlibs, built
 
-LLVM = os.environ.get("RA_JIT_BACKEND") == "llvm"
+LLVM = os.environ.get("BLAZE_BACKEND") == "llvm"
 # The pinned LLVM's, on PATH in the flake's dev shell and in CI.
 DWARFDUMP = shutil.which("llvm-dwarfdump") or "llvm-dwarfdump"
 PDBUTIL = shutil.which("llvm-pdbutil") or os.path.join(os.environ.get("LLVM_SYS_231_PREFIX", r"C:\llvm"), "bin", "llvm-pdbutil.exe")
@@ -1055,7 +1055,7 @@ def edited(tally, part):
     ours = backtraces(binary, ws)
     if WINDOWS and how == "spliced":
         # The lines the PDB has are of code a jump now leads away from.
-        tally.say(f"{part}: the last binary: cdb", "not asked", "its PDB is of the code before the splices: RA_JIT_SPLICE=0 asks")
+        tally.say(f"{part}: the last binary: cdb", "not asked", "its PDB is of the code before the splices: BLAZE_SPLICE=0 asks")
     elif place := call_site(ours):
         debugger(tally, f"{part}: the last binary", binary, ws, place[2:])
     if not WINDOWS:
@@ -1067,7 +1067,7 @@ def edited(tally, part):
         kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("ra-jit ', unit)) for unit in units(binary))
         tally.say(f"{part}: units of the last binary kept apart", "some" if kept else "NONE", str(kept))
     daemon.kill()
-    if os.environ.get("RA_JIT_SPLICE") != "0":
+    if os.environ.get("BLAZE_SPLICE") != "0":
         tally.say(f"{part}: added to the linked binary", "spliced" if spliced else "NONE SPLICED", f"{spliced} of {len(EDITS)} steps")
     if sys.platform.startswith("linux") and first:
         copied = max(first)
@@ -1189,7 +1189,7 @@ def kept_by_rustc(ws, asked):
     if not asked:
         return []
     env = dict(os.environ, CARGO_PROFILE_RELEASE_DEBUG="true", CARGO_TARGET_DIR=os.path.join(ws, "target-optimized"),
-               CARGO_PROFILE_RELEASE_OPT_LEVEL=os.environ.get("RA_JIT_OPT", "2"))
+               CARGO_PROFILE_RELEASE_OPT_LEVEL=os.environ.get("BLAZE_OPT", "2"))
     out = subprocess.run(["cargo", "build", "--release", "-p", "sline"], cwd=ws, capture_output=True, text=True, env=env)
     if out.returncode != 0:
         raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
@@ -1435,14 +1435,14 @@ def cost(tally):
     fx.rustc_build()
     measured = {}
     for setting in ("0", "1"):
-        os.environ["RA_JIT_DEBUGINFO"] = setting
+        os.environ["BLAZE_DEBUGINFO"] = setting
         times = []
         for _ in range(3):
             began = time.time()
             fx.ra_jit_build()
             times.append(time.time() - began)
         measured[setting] = (min(times), *sections(fx.objects[0]), os.path.getsize(fx.binary))
-    del os.environ["RA_JIT_DEBUGINFO"]
+    del os.environ["BLAZE_DEBUGINFO"]
     (t0, s0, d0, b0), (t1, s1, d1, b1) = measured["0"], measured["1"]
     told = f"{d1} of sections a debugger reads, {s1 - s0 - d1} of their relocations"
     tally.say("cost: the corpus's object without debug info", "measured", f"{t0:.2f} s to compile and link, object {s0} bytes, binary {b0} bytes")
@@ -1450,11 +1450,11 @@ def cost(tally):
               f"{t1:.2f} s ({(t1 / t0 - 1) * 100:+.1f}%), object {s1} bytes ({(s1 / s0 - 1) * 100:+.1f}%, {told}), binary {b1} bytes")
     for setting, expected, typed in (("false", False, False), ("true", True, True), ("line-tables-only", True, False)):
         os.environ["CARGO_PROFILE_DEV_DEBUG"] = setting
-        os.environ["RA_JIT_MEMORY"] = memory = tempfile.mkdtemp(prefix="debuginfo-memory-")
+        os.environ["BLAZE_MEMORY"] = memory = tempfile.mkdtemp(prefix="debuginfo-memory-")
         try:
             fx.ra_jit_build()
         finally:
-            del os.environ["RA_JIT_MEMORY"]
+            del os.environ["BLAZE_MEMORY"]
         has = sections(fx.objects[0])[1] > 0
         tally.say(f"cost: the profile says debug = {setting}", ("described" if has else "left out") if has == expected else "NOT FOLLOWED")
         # The types of variables are worked out only for a build that writes the variables:
@@ -1474,9 +1474,9 @@ def cost(tally):
         def variables(settings, store):
             """Builds at each of `settings` from one store, and the variables of the object and
             what ra-jit's units of the binary tell of after each."""
-            before = os.environ.pop("RA_JIT_CACHE", None)
+            before = os.environ.pop("BLAZE_CACHE", None)
             if store:
-                os.environ["RA_JIT_CACHE"] = tempfile.mkdtemp(prefix="debuginfo-store-")
+                os.environ["BLAZE_CACHE"] = tempfile.mkdtemp(prefix="debuginfo-store-")
             told = []
             try:
                 for setting in settings:
@@ -1486,9 +1486,9 @@ def cost(tally):
                     told.append((dump.count("DW_TAG_variable"), described(fx.binary)))
             finally:
                 if store:
-                    shutil.rmtree(os.environ.pop("RA_JIT_CACHE"), ignore_errors=True)
+                    shutil.rmtree(os.environ.pop("BLAZE_CACHE"), ignore_errors=True)
                 if before is not None:
-                    os.environ["RA_JIT_CACHE"] = before
+                    os.environ["BLAZE_CACHE"] = before
             return told
         # Against a build at `true` from a store a build at `true` filled.
         (_, first), (same, again) = variables(["true", "true"], True)
@@ -1503,7 +1503,7 @@ def cost(tally):
 
 
 def told_types(memory):
-    """How many types of variables the build told of, from the report `RA_JIT_MEMORY` has it write."""
+    """How many types of variables the build told of, from the report `BLAZE_MEMORY` has it write."""
     reports = glob.glob(os.path.join(memory, "*.tsv"))
     if not reports:
         return None

@@ -202,7 +202,7 @@ additions so the backend can sit in its own crate.
 
 **LLVM.** An optional second producer of a function's machine code, built with
 `cargo build -p ra-jit --release --features llvm` (needs LLVM 20; set `LLVM_SYS_201_PREFIX` to
-its prefix) and chosen with `RA_JIT_BACKEND=llvm`. `RA_JIT_OPT=0..3` sets the level, 2 by
+its prefix) and chosen with `BLAZE_BACKEND=llvm`. `BLAZE_OPT=0..3` sets the level, 2 by
 default. It takes the Cranelift IR the front half builds, so layout and calling conventions
 are decided once for both, and gives back the same thing Cranelift does: bytes, relocations
 against the function's requests, and unwind rules (`codegen/backend.rs` says what a producer
@@ -219,7 +219,7 @@ format), and code that differs between platforms asks that and never `cfg!(targe
 The triple is in the key of the code cache. `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu` are accepted today; another triple is turned down by name. The
 splice does not take the target from the daemon: it reads the machine from the executable.
-The harnesses build for and run another target with `RA_JIT_TARGET=<triple>` (`difftest.py`
+The harnesses build for and run another target with `BLAZE_TARGET=<triple>` (`difftest.py`
 has the linker, the emulator and the binutils of each). `AARCH64.md` is the state of AArch64.
 
 **CAS.** Keys are (toolchain, crate source hash, flags, dependency keys) for rustc artifacts and

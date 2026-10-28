@@ -2,7 +2,7 @@
 //! compiles, of every function of a crate and of the closures in them, written as rustc's
 //! `-Zunpretty=mir` writes its own. `harness/mirparity.py` compares the two.
 //!
-//! `--level` is the MIR optimization level (`RA_JIT_MIR_OPT`): 0, the default, writes the
+//! `--level` is the MIR optimization level (`BLAZE_MIR_OPT`): 0, the default, writes the
 //! runtime body, 1 and 2 that body after rustc's passes at its `-Zmir-opt-level` 1 and 2.
 //! `--time` says on stderr how long the bodies took to build and to optimize.
 

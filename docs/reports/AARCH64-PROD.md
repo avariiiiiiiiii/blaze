@@ -80,7 +80,7 @@ harness job of that run stopped at `remote.py`, which is last, with the same cou
 | `breakers.py` | 62 of 62, 7 open |
 | `unwinds.py` | 8 of 8 |
 | `splices.py` | 71 of 71 |
-| `RA_JIT_SPLICE=1 farsplices.py` | 6 of 6 |
+| `BLAZE_SPLICE=1 farsplices.py` | 6 of 6 |
 | `asmedits.py` | 10 of 10 |
 | `includes.py` | 9 of 9 |
 | `worktrees.py` | 62 of 62 |

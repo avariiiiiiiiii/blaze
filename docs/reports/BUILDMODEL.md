@@ -18,8 +18,8 @@ Measured with
 
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm
     cd harness
-    RA_JIT_BIN=... python3 buildmodel.py --backend cranelift --jobs 6 --table table-cranelift.md
-    RA_JIT_BIN=... RA_JIT_OPT=2 RA_JIT_EMIT=fast python3 buildmodel.py --backend llvm --jobs 6 --table table-llvm.md
+    BLAZE_BIN=... python3 buildmodel.py --backend cranelift --jobs 6 --table table-cranelift.md
+    BLAZE_BIN=... BLAZE_OPT=2 BLAZE_EMIT=fast python3 buildmodel.py --backend llvm --jobs 6 --table table-llvm.md
 
 Result: 105 of 105 as expected under Cranelift and 105 of 105 under LLVM, 0 WRONG. The two
 tables are the same but for the backend column: 100 supported and 5 refused. Of the 5, 2 are
@@ -70,8 +70,8 @@ blocks with the compiler's errors, the result line), with only the order of test
 times and thread numbers taken out:
 
     cd harness
-    RA_JIT_BIN=... RA_JIT_BACKEND=cranelift python3 doctests.py
-    RA_JIT_BIN=... RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast python3 doctests.py
+    BLAZE_BIN=... BLAZE_BACKEND=cranelift python3 doctests.py
+    BLAZE_BIN=... BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast python3 doctests.py
 
 Result on the head of the branch: 30 of 30 the same under Cranelift and 30 of 30 under LLVM,
 none left to rustdoc, 0 WRONG. Together they have 3095 doctests, and ra-jit compiled 1739 of
@@ -277,7 +277,7 @@ a copy of was not examined, in programs with one setting either.
 
 ### 2. A request in the middle of a reload
 
-`RA_JIT_RELOAD_PAUSE_MS` makes the daemon stop inside `Checkouts::reload` at the point
+`BLAZE_RELOAD_PAUSE_MS` makes the daemon stop inside `Checkouts::reload` at the point
 where the checkouts already have their new workspaces and the crates are still the old
 ones, and log `reload: paused`. The case `reload_paused` changes the manifest, has one
 client ask (which sets the reload off), waits for that line, and sends 8 more clients while
@@ -472,7 +472,7 @@ dependency of `ra-jit` with it. `Plan::debug()` in `plan.rs` says whether the pa
 build was asked for have debug info, from the profile of their units in cargo's unit graph,
 with `-g` and `-C debuginfo=` of the rustflags over it. That sees `.cargo/config.toml`
 profiles and per-package overrides because cargo has already applied them. It is kept per
-checkout and read again on a reload. `RA_JIT_DEBUGINFO` still overrides it. `debuginfo.py`
+checkout and read again on a reload. `BLAZE_DEBUGINFO` still overrides it. `debuginfo.py`
 passes under both backends.
 
 ### 3. Overflow checks and debug assertions per package
@@ -579,7 +579,7 @@ Measured: the table below; the regression gate; `keys.py`.
 Inferred, not measured:
 
 - "supported" for `opt-level`, `codegen-units` and `strip` means the program behaves the
-  same. ra-jit's own optimisation level is its own (`RA_JIT_OPT`), not the profile's, and the
+  same. ra-jit's own optimisation level is its own (`BLAZE_OPT`), not the profile's, and the
   suite does not compare speed or size.
 - `-C target-cpu` and `-C target-feature` are supported in that `cfg(target_feature)` and
   the program's output agree with rustc. Whether ra-jit's backends emit the wider
@@ -636,7 +636,7 @@ The fix of the build-script markers of `selects.py` (one write for a line) is in
 
 ### The gate on the head
 
-Run with `RA_JIT_BACKEND=cranelift` only, on the binary of 03e4d294df (the head differs from
+Run with `BLAZE_BACKEND=cranelift` only, on the binary of 03e4d294df (the head differs from
 it by the unit test alone). Every harness of the gate passed:
 
 | command | result |
@@ -670,10 +670,10 @@ it by the unit test alone). Every harness of the gate passed:
 The table of this section is of the merge of 14ee89181b, the last head both legs ran on.
 
 
-Run from `harness/` with `RA_JIT_BIN` set to the release binary built with `--features llvm`
+Run from `harness/` with `BLAZE_BIN` set to the release binary built with `--features llvm`
 from the head of the branch (the merge of `ra-jit-collate` 14ee89181b and the fix of ra-jit in
-rustdoc's place after it), once with `RA_JIT_BACKEND=cranelift` and once with
-`RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`, one after the other. The numbers were the
+rustdoc's place after it), once with `BLAZE_BACKEND=cranelift` and once with
+`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`, one after the other. The numbers were the
 same under both.
 
 The Cranelift leg ran on the binary of the merge itself, where `cargo_ra_jit.py` and

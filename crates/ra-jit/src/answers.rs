@@ -83,11 +83,11 @@ const WRAPPER: &str = "RUSTC_WRAPPER";
 
 /// The variable that tells ra-jit as cargo's wrapper only to answer questions, and to leave
 /// what cargo compiles as it would be without ra-jit.
-pub(crate) const ONLY_ASKS: &str = "RA_JIT_ONLY_ASKS";
+pub(crate) const ONLY_ASKS: &str = "BLAZE_ONLY_ASKS";
 
 /// The variable that says which answers are given: `0` none, so rustc is asked every time;
 /// `own` only ra-jit's own, so a question it has no answer of fails.
-const OFF: &str = "RA_JIT_ANSWERS";
+const OFF: &str = "BLAZE_ANSWERS";
 
 /// Whether rustc run with `args` compiles nothing and says only what its release, the
 /// arguments and standard input decide.
@@ -256,13 +256,13 @@ pub(crate) fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>>
     }))
 }
 
-/// Where the answers are kept: in `RA_JIT_HOME` when it is set, else in the user's cache
+/// Where the answers are kept: in `BLAZE_HOME` when it is set, else in the user's cache
 /// directory, which outlives the session.
 fn dir() -> Option<PathBuf> {
     if std::env::var_os(OFF).is_some_and(|it| it == "0") {
         return None;
     }
-    if let Some(home) = std::env::var_os("RA_JIT_HOME").filter(|it| !it.is_empty()) {
+    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
         return Some(Path::new(&home).join("answers"));
     }
     let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);

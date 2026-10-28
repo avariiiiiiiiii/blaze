@@ -3,11 +3,11 @@
 
 usage: store.py [--backends cranelift,llvm]
 
-Issue #418: smoke-1/c16 differed only with RA_JIT_CACHE set. Two asm! wrappers can have
+Issue #418: smoke-1/c16 differed only with BLAZE_CACHE set. Two asm! wrappers can have
 identical Cranelift IR but different assembly, so LLVM must key its code by the assembly too
 (2a3a0a35). Compile one body, change only its assembly, then read each body back from the
 store. The smoke seeds also run twice, first filling a fresh store and then reading it.
-RA_JIT_BIN names the compiler under test. A failure keeps its work and logs.
+BLAZE_BIN names the compiler under test. A failure keeps its work and logs.
 """
 import argparse, os, shutil, subprocess, sys, tempfile
 
@@ -41,7 +41,7 @@ ASSEMBLY = {
 
 def asm_changes(work, backend):
     """One IR with two different asm! bodies, each compiled and restored in a new process."""
-    os.environ["RA_JIT_CACHE"] = os.path.join(work, "asm-store")
+    os.environ["BLAZE_CACHE"] = os.path.join(work, "asm-store")
     project = Project(os.path.join(work, "asm"))
     for step, body in enumerate(("add", "negate", "add", "negate")):
         x86, arm = ASSEMBLY[body]
@@ -71,9 +71,9 @@ def main():
     print(f"work: {work}", flush=True)
     for backend in backends:
         own = os.path.join(work, backend)
-        os.environ["RA_JIT_HOME"] = os.path.join(own, "home")
+        os.environ["BLAZE_HOME"] = os.path.join(own, "home")
         asm_changes(own, backend)
-        os.environ["RA_JIT_CACHE"] = os.path.join(own, "smoke-store")
+        os.environ["BLAZE_CACHE"] = os.path.join(own, "smoke-store")
         for phase in ("cold", "warm"):
             print(f"smoke {phase} ({backend})", flush=True)
             command = [sys.executable, os.path.join(HERE, "fuzz.py"), "smoke", "--backends", backend,

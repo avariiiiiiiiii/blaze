@@ -26,8 +26,8 @@ def option(name, default):
 
 
 DAEMONS, ROUNDS, SEED = option("--daemons", 3), option("--rounds", 30), option("--seed", int(time.time()))
-ROOMY = {"RA_JIT_CACHE_SEAL_AT": "1", "RA_JIT_CACHE_MAX": "off"}
-TIGHT = {"RA_JIT_CACHE_SEAL_AT": "1", "RA_JIT_CACHE_MAX": "1500K"}
+ROOMY = {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "off"}
+TIGHT = {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "1500K"}
 STATES = 6
 FAILURES = []
 

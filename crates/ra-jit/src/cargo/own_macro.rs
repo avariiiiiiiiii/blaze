@@ -30,14 +30,14 @@ use super::{
 /// The variable that names the proc-macro server that reads the list of macros of a library
 /// ra-jit linked: a path, `1` for the one a release ships beside ra-jit ([`SHIPPED`]), which
 /// is also what is used when it is not set and that server is there, or `0` for none.
-pub(crate) const SERVER: &str = "RA_JIT_PROC_MACRO_SERVER";
+pub(crate) const SERVER: &str = "BLAZE_PROC_MACRO_SERVER";
 
 /// The server's executable a release has beside ra-jit's (`.github/scripts/build_release.py`).
 pub(crate) const SHIPPED: &str = "blaze-proc-macro-srv";
 
 /// The variable that has proc macros expanded natively, `0` or `off`, rather than built as
 /// WebAssembly modules and run by ra-jit, which is what is done when it is unset.
-pub(crate) const WASM: &str = "RA_JIT_PROC_MACRO_WASM";
+pub(crate) const WASM: &str = "BLAZE_PROC_MACRO_WASM";
 
 /// The target a proc macro's module is built for.
 pub(crate) const WASM_TARGET: &str = "wasm32-wasip1";
@@ -126,7 +126,7 @@ pub(crate) fn runs_as_wasm(name: &str) -> anyhow::Result<bool> {
 }
 
 /// The variable ra-jit sets for the cargo of a load into its own target directory.
-pub(crate) const OWN_TARGET: &str = "RA_JIT_OWN_TARGET";
+pub(crate) const OWN_TARGET: &str = "BLAZE_OWN_TARGET";
 
 /// Whether [`SERVER`] turns ra-jit's proc macros off, `0` or `off`, as the harness's reference
 /// builds do: a load's cargo is then told so, and rustc builds what it asks for.
@@ -280,7 +280,7 @@ pub(crate) fn libraries_of(
                     command.arg(sysroot).arg(library);
                     let start = std::time::Instant::now();
                     let ran = command.stdin(std::process::Stdio::null()).output();
-                    if std::env::var_os("RA_JIT_STATS").is_some() {
+                    if std::env::var_os("BLAZE_STATS").is_some() {
                         eprintln!("blaze: the proc macro {name} made in {:.1?}", start.elapsed());
                     }
                     let found = match ran {

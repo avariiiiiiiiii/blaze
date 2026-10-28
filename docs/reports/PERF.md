@@ -27,7 +27,7 @@ has to print what cargo's prints. For each phase the JSON has the wall time of t
 (the median for edits, with each sample and the slowest), cargo's time, the most memory the
 daemon's workers held (`VmHWM` summed), who built it (the daemon, or cargo with the daemon's
 stated reason), whether the edit was spliced or linked in full and why, how many functions
-were compiled, and the daemon's own timings from `RA_JIT_STATS`. An edit the daemon turns down
+were compiled, and the daemon's own timings from `BLAZE_STATS`. An edit the daemon turns down
 is measured once and reported as built by cargo; it is not retried, since each refusal has the
 daemon load the workspace again.
 
@@ -67,7 +67,7 @@ three; "first" is the first of the three where it differed much from the others.
 | generic | 0.08 / 0.82, spliced | 35.7 / 7.8, full link | 1.27 / 10.3 (first 30.6, full link) |
 | peak RSS | 2.1 GB | 8.4 GB | 10.2 GB |
 
-| LLVM (`RA_JIT_OPT=2 RA_JIT_EMIT=fast`) | ripgrep | cargo | nushell |
+| LLVM (`BLAZE_OPT=2 BLAZE_EMIT=fast`) | ripgrep | cargo | nushell |
 |---|---|---|---|
 | cold | 20.1 / 5.3 | 225.6 / 52.8 | 311.4 / 66.6 |
 | no-op | 0.04 / 0.03 | 0.07 / 0.18 | 0.05 / 0.30 |
@@ -105,7 +105,7 @@ The sections below take these one at a time.
 
 ## What the daemon says about its own time
 
-With `RA_JIT_STATS=1` the daemon already printed, for every build, `timeline-us:` (the steps
+With `BLAZE_STATS=1` the daemon already printed, for every build, `timeline-us:` (the steps
 of an edit one after another: settle, read, apply, roots, check, reach, resolve, define,
 object, write, link, and what is left between them), `phases:`, `backend:` (the producer's
 time summed over threads; LLVM's split into lower, verify, optimize, emit, read), `store:`,
@@ -128,21 +128,21 @@ The client, the daemon and the worker also record spans of every build on one cl
 (`crates/ra-jit/src/trace.rs`): the worker sends its own with its answer, the daemon adds its
 own, and the client puts them together. With them:
 
-- `RA_JIT_STATS=1` makes `cargo ra-jit build` print `ra-jit time: 402.1 ms: check 285.5 (71%),
+- `BLAZE_STATS=1` makes `cargo ra-jit build` print `ra-jit time: 402.1 ms: check 285.5 (71%),
   …` and a table of where the client's wall time went, step by step (client, daemon, worker),
   with `unaccounted` for moments no step had: the rows add up to the total.
-- `RA_JIT_TRACE=<path>` writes the spans as a Chrome trace (ui.perfetto.dev and
+- `BLAZE_TRACE=<path>` writes the spans as a Chrome trace (ui.perfetto.dev and
   chrome://tracing open it): to `path` if it ends in `.json`, else to a new file in the
   directory `path` for every build. Besides the steps it has a span for each rust-analyzer
   query the worker ran (infer, MIR, impls) and each step of code generation (translate,
   cranelift) of 0.2 ms or longer. The worker's
   reach, resolve, define, object, statics, setup and compile-rest are sums over threads laid
   end to end, so read them as one stretch.
-- `harness/realbench.py` runs every warm build with `RA_JIT_TRACE` and keeps the breakdown of
+- `harness/realbench.py` runs every warm build with `BLAZE_TRACE` and keeps the breakdown of
   each row's median run; `realbench.py --table FILE` prints it under the results.
 
-The old `RA_JIT_TRACE` switch, which printed the rust-analyzer queries an edit ran, is now
-`RA_JIT_QUERIES`.
+The old `BLAZE_TRACE` switch, which printed the rust-analyzer queries an edit ran, is now
+`BLAZE_QUERIES`.
 
 `bench.py` puts these in the JSON as `steps_ms` (the timeline), `threads_s` (the `steps:` and
 `backend:` lines) and `started_over` (the reasons).
@@ -163,9 +163,9 @@ with cargo's own artifacts built beforehand. Seconds are ra-jit's alone.
 | | this head | before format 2 and debug info (27315323cb) |
 | --- | --- | --- |
 | store, debug info | 102.7 s (compiling 92.3 s) | 81.2 s (71.1 s), no debug info yet |
-| store, `RA_JIT_DEBUGINFO=0` | 88.2 s (77.7 s) | |
+| store, `BLAZE_DEBUGINFO=0` | 88.2 s (77.7 s) | |
 | no store, debug info | 74.6 s (64.7 s) | |
-| no store, `RA_JIT_DEBUGINFO=0` | 61.0 s (51.2 s) | 65.0 s (54.9 s) |
+| no store, `BLAZE_DEBUGINFO=0` | 61.0 s (51.2 s) | 65.0 s (54.9 s) |
 
 One run each after a run that is thrown away. The same four in the opposite order gave 109.9,
 97.2, 77.6 and 65.0 s, and the old binary gave 81.2 and 89.7 s for the same thing twice, so a

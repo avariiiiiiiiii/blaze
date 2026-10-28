@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             for call in missed.iter().take(20) {
                 eprintln!("  {}", call.chars().take(200).collect::<String>());
             }
-            if std::env::var_os("RA_JIT_EXPANDED").is_some() {
+            if std::env::var_os("BLAZE_EXPANDED").is_some() {
                 eprintln!("{}", compiler.expanded());
             }
             let start = std::time::Instant::now();

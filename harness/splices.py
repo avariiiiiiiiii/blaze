@@ -9,7 +9,7 @@ on macOS), read by readelf (there: its signature verified and its fixups read by
 `cargo build` of the same source prints. How each step got linked is counted, and where SPLICED
 has the target, the number of steps that were spliced has to be the one it says.
 
-RA_JIT_SPLICE=0   link each edit in full (the same test of the full link)
+BLAZE_SPLICE=0   link each edit in full (the same test of the full link)
 SPLICES_NO_PIE   link the daemon's binary with -no-pie
 SPLICES_SOAK=N   after the steps, N more edits of one constant, each checked by its output
 """

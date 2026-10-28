@@ -23,13 +23,13 @@ import json, os, platform, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 FIXTURE = os.path.join(HERE, "norustc", "fixture")
 BASELINE = os.path.join(HERE, "norustc", "baseline.json")
 SYSTEM = {"linux": "linux", "darwin": "macos"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
-PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('RA_JIT_BACKEND') or 'cranelift'}"
+PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('BLAZE_BACKEND') or 'cranelift'}"
 COUNTED = ("rustc", "rustdoc", "cargo")
 # How long the log has to be still, with no counted tool running, for a step to be over.
 STILL = 4
@@ -158,7 +158,7 @@ def apply(ws, edits):
 
 def main():
     record, keep = "--record" in sys.argv, "--keep" in sys.argv
-    # Under /tmp on macOS: the daemon's socket is in RA_JIT_HOME below, and under $TMPDIR
+    # Under /tmp on macOS: the daemon's socket is in BLAZE_HOME below, and under $TMPDIR
     # (/var/folders/...) its path passes the 104 bytes macOS has for one.
     work = tempfile.mkdtemp(prefix="ra-jit-norustc-", dir="/tmp" if sys.platform == "darwin" else None)
     log = os.path.join(work, "runs.log")
@@ -170,7 +170,7 @@ def main():
     shutil.copytree(FIXTURE, ws)
     home = os.path.join(work, "home")
     os.makedirs(home, mode=0o700)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("RA_JIT", "RUSTC", "RUSTDOC"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("BLAZE_", "RUSTC", "RUSTDOC"))}
     for unset in ("RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO"):
         env.pop(unset, None)
     # Flags the shell gives a target (nix's x86-64 Linux shell sets
@@ -178,11 +178,11 @@ def main():
     # under them: six more runs that only ask in the cold build.
     for key in [k for k in env if k.endswith("RUSTFLAGS")]:
         del env[key]
-    env.update(RUSTUP_TOOLCHAIN=name, RA_JIT_HOME=home, RA_JIT_CACHE=os.path.join(work, "store"),
+    env.update(RUSTUP_TOOLCHAIN=name, BLAZE_HOME=home, BLAZE_CACHE=os.path.join(work, "store"),
                PATH=os.path.dirname(os.path.abspath(RA_JIT)) + os.pathsep + env["PATH"],
                CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", CARGO_NET_OFFLINE="true")
-    if os.environ.get("RA_JIT_BACKEND"):
-        env["RA_JIT_BACKEND"] = os.environ["RA_JIT_BACKEND"]
+    if os.environ.get("BLAZE_BACKEND"):
+        env["BLAZE_BACKEND"] = os.environ["BLAZE_BACKEND"]
     found, failed = {}, []
     try:
         for scenario, steps in SCENARIOS:

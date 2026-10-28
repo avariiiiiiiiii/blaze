@@ -5,7 +5,7 @@ Branch `ra-jit-rustc-suites`, off `ra-jit-collate`; round two merges `ra-jit-col
 `rustc 1.99.0` and the rust-lang/rust checkout at the `1.99.0` tag. Each number is from a
 single run unless it says otherwise. "Cranelift" is `cargo build -p ra-jit --release`; "LLVM"
 is the same with `--features llvm` (`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20`), run with
-`RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`. Both binaries are built from the head of
+`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`. Both binaries are built from the head of
 this branch.
 
 The numbers in the Summary and in "Round two" are from the last run of round two. The
@@ -36,7 +36,7 @@ it had 2785, 2786, 2787 and 2785 tests. The differing tests were the same in eac
 The differing count went from 4 to 14 (15 on LLVM) because tests that were left out are now
 run, not because anything that matched stopped matching: 9 of the new ones are a family of
 tests marked `known-bug` upstream, one needs the optimiser, and the LLVM one comes from the
-gate's own `RA_JIT_OPT=2`. They are listed under "Round two: differing".
+gate's own `BLAZE_OPT=2`. They are listed under "Round two: differing".
 
 Where round one started, with `ra-jit-collate` as found: Cranelift 2650 tests run, 16
 differing, 1 link error; LLVM 2649 run, 17 differing, 1 link error; `coretests` hung.
@@ -125,7 +125,7 @@ since but for the tests that race):
 
 What "release mode" means here: rustc's side is optimised as the test asks. On ra-jit's side
 the checks and the panic strategy follow the flags; Cranelift does not optimise, and LLVM
-runs at `RA_JIT_OPT=2` whatever the test says. The 11 LTO tests are still left out: with LTO
+runs at `BLAZE_OPT=2` whatever the test says. The 11 LTO tests are still left out: with LTO
 rustc inlines the test into the program and nothing of ra-jit's would run.
 
 Two bugs came out of this and are fixed: a closure with
@@ -203,7 +203,7 @@ now run:
 |---|---|---|
 | `codegen/equal-pointers-unequal/{as-cast,exposed-provenance,strict-provenance}/{inline1,inline2,zero}.rs` (9) | both | Marked `known-bug` for rust-lang/rust#107975, built with `-O`. Each asserts that two pointers with equal addresses compare unequal, which is the LLVM miscompilation the issue is about. ra-jit's program compares them equal. No breaker: there is nothing to reduce to but the bug. |
 | `codegen/issue-28950.rs` | both | Built with `-O`. A thread with a 16 KB stack makes a large temporary that the test expects the optimiser to remove. rustc `-O` removes it; ra-jit's code keeps it and the thread overflows its stack (signal 11 on Cranelift, abort on LLVM). Open, no breaker: the corpus is not built with `-O`. |
-| `panics/panic-abort-backtrace-without-debuginfo.rs` | LLVM | The test asks for `opt-level=0` so that two functions stay in the backtrace. The gate's `RA_JIT_OPT=2` inlines them. With `RA_JIT_OPT=0` the test matches (measured once). |
+| `panics/panic-abort-backtrace-without-debuginfo.rs` | LLVM | The test asks for `opt-level=0` so that two functions stay in the backtrace. The gate's `BLAZE_OPT=2` inlines them. With `BLAZE_OPT=0` the test matches (measured once). |
 
 The harness prints the `known-bug` issue next to a differing test and counts them: 10 of the
 14 (the nine above and `metavar_cross_edition_recursive_macros.rs`).
@@ -251,7 +251,7 @@ Cranelift leg of the gate passed its first nine scripts (`difftest.py` through
 `cargo test` were not run on it.
 
 The harness list of `.github/workflows/ra-jit.yaml` as of `ra-jit-collate` `14ee89181b`, run
-from `harness/` with `RA_JIT_BIN` at each binary, plus `cargo_ra_jit.py --small`. Every script
+from `harness/` with `BLAZE_BIN` at each binary, plus `cargo_ra_jit.py --small`. Every script
 exited 0 on both backends. `buildmodel.py` runs on the Cranelift leg and `backends.py` on
 the LLVM leg, as in the workflow. `remote.py` was not run: there is no MinIO on this machine.
 
@@ -304,7 +304,7 @@ which needs the large temporary removed without an optimiser.
 
     git clone --filter=blob:none --sparse https://github.com/rust-lang/rust -b 1.99.0
     git sparse-checkout set tests/ui tests/codegen-units library
-    RA_JIT_BIN=<ra-jit> python3 harness/uitest.py <rust> --work <dir> --fresh --json ui.json
+    BLAZE_BIN=<ra-jit> python3 harness/uitest.py <rust> --work <dir> --fresh --json ui.json
 
 `harness/uitest.py` was there; it ran tests one at a time and left out anything with an
 auxiliary crate. It now accounts for every file marked `//@ run-pass` (3760 files, 3804 with
@@ -533,7 +533,7 @@ of a future.
 
 ## Regression gate
 
-Run from `harness/` with `RA_JIT_BIN` at each binary, once per backend. All passed.
+Run from `harness/` with `BLAZE_BIN` at each binary, once per backend. All passed.
 
 | command | Cranelift | LLVM |
 |---|---|---|

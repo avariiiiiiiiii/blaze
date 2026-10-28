@@ -220,7 +220,7 @@ nixpkgs' binutils 2.46 `objcopy` nor LLVM 20's `llvm-objcopy` writes zstd (**rea
   `packstat.py` on helix's 229,358 records). 128K at level 3 is what shipped: 5.0x on helix,
   5.1x on bevy.
 - Its bound is a tenth of what the disk has for it (free space plus the store), at least
-  256 MiB and at most 32 GiB, recomputed at each collection; `RA_JIT_CACHE_MAX` sets bytes or
+  256 MiB and at most 32 GiB, recomputed at each collection; `BLAZE_CACHE_MAX` sets bytes or
   `off`, `ra-jit cache gc` collects, `ra-jit status` says the size and the bound
   ([cache.md](../cache.md)) (**read**).
 - `bench.py` says of each project how much of its store no project before it in the run had

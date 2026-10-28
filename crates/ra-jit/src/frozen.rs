@@ -9,7 +9,7 @@
 //! and ra-jit's own build. `OUT_DIR` counts by its place below the target directory and by what
 //! the build script wrote there, so the same crate in another checkout has the same key.
 //!
-//! `RA_JIT_FROZEN` says what is done with what the store has: by default it is served;
+//! `BLAZE_FROZEN` says what is done with what the store has: by default it is served;
 //! `check` resolves and finds as well and fails the build on any difference, `verify` writes
 //! what was read and fails on any difference, `off` neither reads nor writes.
 
@@ -47,7 +47,7 @@ pub(crate) fn overlaid(krate: Crate, text: &'static str) {
 }
 
 fn mode() -> Option<Mode> {
-    match std::env::var("RA_JIT_FROZEN").as_deref() {
+    match std::env::var("BLAZE_FROZEN").as_deref() {
         Ok("off" | "0") => None,
         Ok("check") => Some(Mode::Check),
         Ok("verify") => Some(Mode::Verify),

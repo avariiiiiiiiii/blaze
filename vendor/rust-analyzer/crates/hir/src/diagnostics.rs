@@ -420,7 +420,7 @@ pub struct BorrowckError {
 }
 
 /// A body the borrow checker skipped, because MIR lowering does not support something in it.
-/// Reported only when `RA_JIT_BORROWCK_SKIPPED` is set, for the borrow checker's test harness.
+/// Reported only when `BLAZE_BORROWCK_SKIPPED` is set, for the borrow checker's test harness.
 #[derive(Debug)]
 pub struct BorrowckSkipped {
     pub node: InFile<SyntaxNodePtr>,
@@ -1478,7 +1478,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             );
         }
         if let Some(reason) = &result.skipped
-            && std::env::var_os("RA_JIT_BORROWCK_SKIPPED").is_some()
+            && std::env::var_os("BLAZE_BORROWCK_SKIPPED").is_some()
             && let Some(node) = node_of(MirSpan::Unknown)
         {
             self.acc.push(BorrowckSkipped { node, reason: reason.clone() }.into());

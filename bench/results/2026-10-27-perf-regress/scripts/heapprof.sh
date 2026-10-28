@@ -1,5 +1,5 @@
 # heapprof.sh BRANCH: release ra-jit of BRANCH (from fix.bundle) with the heap-profile feature into bin/heapprof,
-# then a cold ripgrep build with RA_JIT_MEMORY and jemalloc profiling; folds the worker's build.prof with jeprof.
+# then a cold ripgrep build with BLAZE_MEMORY and jemalloc profiling; folds the worker's build.prof with jeprof.
 # Out: /root/perf/heap/.
 export PATH=/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:$PATH
 b=$1
@@ -15,14 +15,14 @@ out=/root/perf/heap; rm -rf $out; mkdir -p $out/tables
 p=/root/perf/heap-ws; rm -rf $p; mkdir -p $p
 cp -r /root/ra-jit-projects/ripgrep $p/rg; rm -rf $p/rg/target $p/rg/.git
 (
-  export RA_JIT_HOME=$p/home RA_JIT_CACHE=$p/store RA_JIT_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
-  export RA_JIT_STD_FROM=/root/perf/work/stdkey-cranelift/std-cranelift CARGO_TERM_COLOR=never
-  export RA_JIT_MEMORY=$out/tables _RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19
+  export BLAZE_HOME=$p/home BLAZE_CACHE=$p/store BLAZE_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
+  export BLAZE_STD_FROM=/root/perf/work/stdkey-cranelift/std-cranelift CARGO_TERM_COLOR=never
+  export BLAZE_MEMORY=$out/tables _RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19
   export PATH=$bin:$PATH
   cd $p/rg
   taskset -c 0-3 cargo ra-jit build > $out/cold.out 2>&1; echo "cold exit $?"
   for i in $(seq 600); do cargo ra-jit status 2>&1 | grep -q "$p/rg: ready" && break; sleep 0.5; done
-  for w in $RA_JIT_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log; done
+  for w in $BLAZE_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log; done
   cargo ra-jit stop >/dev/null 2>&1
 )
 ls $out/tables

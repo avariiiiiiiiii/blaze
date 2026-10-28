@@ -75,7 +75,7 @@ a registry package it does not pin chosen from the registry's index as cargo cho
 (blaze-registry's `IndexRegistry`, #321). What it does not read yet goes to cargo's `cargo
 metadata` with the reason printed: `[replace]`, a registry with a git index, a git or vendored
 package the lock file does not pin.
-`RA_JIT_OWN_RESOLVE=0` sends every load to cargo.
+`BLAZE_OWN_RESOLVE=0` sends every load to cargo.
 
 The unit graph is blaze's own (`crates/blaze-units`, 2026-10-27): a port of cargo's unit
 generator (`ops/cargo_compile/unit_generator.rs`), `compiler/unit_dependencies.rs` and the

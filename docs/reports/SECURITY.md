@@ -34,7 +34,7 @@ directory: either cargo itself runs them, or the daemon repeats cargo's own run 
 record of it.
 
 **The signer of a remote.** A machine that pulls names the public keys it trusts
-(`RA_JIT_REMOTE_TRUST`). A holder of one of those keys can make every
+(`BLAZE_REMOTE_TRUST`). A holder of one of those keys can make every
 machine that trusts it run any code, by signing a list that names a pack of their making.
 That is what the trust means. A signer vouches that its packs were compiled by an honest
 ra-jit from the sources their keys name, on a machine whose store nobody else could write
@@ -64,7 +64,7 @@ root or, on Windows, the system and the administrators.
 decide the bytes of every object and every list. ra-jit guarantees:
 
 - Nothing is pulled from a remote whose lists nobody trusted signed, unless the user sets
-  `RA_JIT_REMOTE_UNSIGNED=1`, which is the user saying that everyone who can write there
+  `BLAZE_REMOTE_UNSIGNED=1`, which is the user saying that everyone who can write there
   is trusted as the signer would be.
 - With signed lists, a writer without a key can delete or withhold, which costs cache
   hits. It cannot add or change, because every pack is named by the SHA-256 of its bytes
@@ -142,8 +142,8 @@ only does anything as root; I ran it with `sudo` and it passed). End to end:
 `harness/storeguards.py`.
 
 **H3. Unsigned remotes were pulled from without asking. Fixed.** A machine that names no
-key in `RA_JIT_REMOTE_TRUST` takes no list from a remote, and so fetches nothing, unless
-`RA_JIT_REMOTE_UNSIGNED=1`. Only the exact value `1` counts, and it does not undo naming
+key in `BLAZE_REMOTE_TRUST` takes no list from a remote, and so fetches nothing, unless
+`BLAZE_REMOTE_UNSIGNED=1`. Only the exact value `1` counts, and it does not undo naming
 keys. The refusal is in `Trust::open` (`crates/ra-jit/src/remote/signed.rs`), which every
 list a pull reads goes through: `ra-jit cache pull`, `ra-jit deps pull`, the daemon's pull
 before a build and its lazy fetching. Pushing asks for nothing; it reads the list it adds
@@ -297,7 +297,7 @@ and the next build links it. This is by design the same as write access to `targ
 fix is H2: ra-jit refuses to be in that position.
 
 With write access to an unsigned remote, before this round: the same, for every machine
-that pulls. After: nothing, unless the user set `RA_JIT_REMOTE_UNSIGNED=1`.
+that pulls. After: nothing, unless the user set `BLAZE_REMOTE_UNSIGNED=1`.
 
 With write access to a signed remote but no trusted key: they can delete or withhold,
 which costs cache hits but never gives wrong code, since every pack is named by its hash
@@ -329,7 +329,7 @@ Default run (20,000 mutations each, part of `cargo test`):
 | manifest | 20,000 inputs | | 0 |
 | dependency key list | 20,000 inputs | | 0 |
 
-Long run, `RA_JIT_FUZZ_RUNS=2000000 cargo test --release -p hir-ty --features llvm --lib no_`:
+Long run, `BLAZE_FUZZ_RUNS=2000000 cargo test --release -p hir-ty --features llvm --lib no_`:
 entry 83,573 accepted and 1,916,430 refused; stored code 193,184 and 1,806,818; pack
 11,759 and 1,988,245; 0 panics, 0 allocations over the bound, 4.7 seconds. Every accepted
 entry is then walked the way the linker walks it (`follow`) to show that no offset or index
@@ -345,7 +345,7 @@ The remote-facing parsers have the same loops, in `crates/ra-jit`, with the same
 | A manifest | `remote::tests::no_bytes_break_the_reading_of_a_manifest` | 20,000 | no panic; every pack and key list it names is 64 hex digits; what is found to fit under a limit sums to no more than it |
 | A list of units | `deps::tests::no_bytes_break_the_reading_of_a_list_of_units` | 20,000 | no panic; every unit is a crate name and a hash with no separator, every archive 64 hex digits |
 | A signed list | `signed::tests::no_bytes_are_taken_for_a_list_that_was_signed` | 20,000 | no panic; whatever verifies is the body that was signed, at the turn it was signed at |
-| An archive of a unit | `deps::tests::no_bytes_of_an_archive_write_outside_of_its_unit_or_past_the_bound` | 3,000 (`RA_JIT_FUZZ_RUNS`), each zstd-packed and bare | nothing is written outside `deps/` and `build/` of the target directory, and no more than the 64 KiB bound |
+| An archive of a unit | `deps::tests::no_bytes_of_an_archive_write_outside_of_its_unit_or_past_the_bound` | 3,000 (`BLAZE_FUZZ_RUNS`), each zstd-packed and bare | nothing is written outside `deps/` and `build/` of the target directory, and no more than the 64 KiB bound |
 
 Packs pulled from a remote are read by the pack reader and `Entry::decode`, which are the
 first two rows of the first table.
@@ -362,12 +362,12 @@ how much. Now:
 | A manifest, or a list of units | 16 MiB | fixed (`LIST_MAX`); a line is under 200 bytes |
 | A pack as it is sent (zstd) | the compressed size its manifest lists | the manifest |
 | A pack as it unpacks | the size its manifest lists | the manifest |
-| All the packs one pull writes | the store's limit, 8 GiB | `RA_JIT_CACHE_MAX`; a pull fetches only what its listed sizes say fits |
-| The keys of one pack | the pack's listed size, and 512 MiB | `RA_JIT_REMOTE_MAX` |
-| All the keys a lazy daemon holds in memory | 512 MiB | `RA_JIT_REMOTE_MAX` |
-| A pack a lazy daemon fetches | its listed size, and the store's limit | `RA_JIT_CACHE_MAX` |
-| The archive of one unit | 512 MiB | `RA_JIT_REMOTE_MAX` |
-| All that one `ra-jit deps pull` unpacks | 64 GiB | `RA_JIT_DEPS_MAX` (`off` for none) |
+| All the packs one pull writes | the store's limit, 8 GiB | `BLAZE_CACHE_MAX`; a pull fetches only what its listed sizes say fits |
+| The keys of one pack | the pack's listed size, and 512 MiB | `BLAZE_REMOTE_MAX` |
+| All the keys a lazy daemon holds in memory | 512 MiB | `BLAZE_REMOTE_MAX` |
+| A pack a lazy daemon fetches | its listed size, and the store's limit | `BLAZE_CACHE_MAX` |
+| The archive of one unit | 512 MiB | `BLAZE_REMOTE_MAX` |
+| All that one `ra-jit deps pull` unpacks | 64 GiB | `BLAZE_DEPS_MAX` (`off` for none) |
 
 How each is held:
 
@@ -388,7 +388,7 @@ How each is held:
   store.
 - A pack's bound is the size in its manifest line, which with signed lists is a number
   the signer wrote. The existing `fitting` already left out packs whose listed sizes do
-  not fit under `RA_JIT_CACHE_MAX`; with each pack held to its listed size, that sum is
+  not fit under `BLAZE_CACHE_MAX`; with each pack held to its listed size, that sum is
   now a bound on what is written and not a hope.
 - The keys of a pack are 32 of every 40 or more bytes of it, so their list is never
   longer than the pack.
@@ -415,7 +415,7 @@ does, through `ra-jit cache pull`: a pack listed as 0, 1 and one byte short unpa
 as 0 and one byte short as sent; 2,115 bytes that `ra-jit cache push` made of a 64 MiB
 pack, listed as 1 MiB; and the manifest of 16 MiB and of one byte more.
 
-Not covered: with `RA_JIT_CACHE_MAX=off` the sum of what a pull writes has no bound, which
+Not covered: with `BLAZE_CACHE_MAX=off` the sum of what a pull writes has no bound, which
 is what the setting says. The lazy path's two bounds have no test of their own.
 
 ## What was applied on top of the S3 remote
@@ -440,7 +440,7 @@ to the old remote was done again on the new one, not merged:
   (`remote::tests::a_pack_longer_than_its_list_says_is_not_written` checks the mode of
   what arrives).
 - **A machine that signs takes only signed lists,** also when it names no keys to trust
-  and has `RA_JIT_REMOTE_UNSIGNED=1`: what it pulls it later pushes under its own
+  and has `BLAZE_REMOTE_UNSIGNED=1`: what it pulls it later pushes under its own
   signature, so an unsigned list would be laundered into a signed one.
 - **`Kind::of` in `store.rs`** takes `<pack>.fetch.tmp` for a temporary file of the
   store. The stricter names of M5 did not know the name S3 gives a pack on its way, so
@@ -451,12 +451,12 @@ to the old remote was done again on the new one, not merged:
   and it removes only objects that no list names, reading every list for that whoever
   signed it. What was wrong, and older than `gc`: a machine with no key and no keys to
   trust that wrote a list back (a push, or a collection with
-  `RA_JIT_REMOTE_UNSIGNED=1`) wrote it without a signature, over a signed one. Every
+  `BLAZE_REMOTE_UNSIGNED=1`) wrote it without a signature, over a signed one. Every
   machine that trusts the signer then takes nothing, and the signer's next push starts
   the list again from what it sends. That is a writer to the remote doing through
   ra-jit what it could do with the bucket's own tools, so no new power, but ra-jit should
   not do it by accident. Now `rewrite_list` refuses: "is signed, and this machine has no
-  key in RA_JIT_REMOTE_SIGN: it is left as it is". A collection counts such a manifest
+  key in BLAZE_REMOTE_SIGN: it is left as it is". A collection counts such a manifest
   with the ones it does not trust and goes on. A signer that collects signs what is
   left at a later turn, and does not shrink a list that was put back under it. The
   bounds hold in `gc` too: lists to 16 MiB, key lists to their pack's size. Tests:
@@ -464,10 +464,10 @@ to the old remote was done again on the new one, not merged:
   `remote.py`, `gc --remote --older-than 0s` by a keyless machine with and without the
   unsigned setting leaves the list and every object as they were, its push is refused,
   and the signer's collection is signed at a later turn and taken by the reader.
-  `gc --remote` without `RA_JIT_CACHE` remembers the signer's turn in the daemon's home.
+  `gc --remote` without `BLAZE_CACHE` remembers the signer's turn in the daemon's home.
 - **Temporary names.** `Kind::of` also takes `<pack>.zst.tmp` and `<pack>.send.tmp`,
   the two names the compressed transfer leaves, for the store's.
-- **`harness/remote.py`** runs its machines with `RA_JIT_REMOTE_UNSIGNED=1` where they
+- **`harness/remote.py`** runs its machines with `BLAZE_REMOTE_UNSIGNED=1` where they
   name no keys, and has a new section, "unsigned lists, old lists, long objects",
   25 checks. `harness/deps.py` expects the new remote's wording for a changed archive
   ("rejected units/...").
@@ -511,11 +511,11 @@ one second must still be ordered, and over a plain counter because of the reset 
 and a newline. It is written like every file of the store (temporary file, fsync,
 rename, directory fsync), in a directory made 0700. Where:
 
-- For `ra-jit cache` and the daemon, in the store (`RA_JIT_CACHE`). The store is what the
+- For `ra-jit cache` and the daemon, in the store (`BLAZE_CACHE`). The store is what the
   list fills, it is already private to the user and checked for that, and removing the
   store forgets the turns together with the packs they protected. The store's own code
   leaves a name it does not know alone, which `turns` is.
-- For `ra-jit deps`, in the store when `RA_JIT_CACHE` is set, and otherwise in `.ra-jit/`
+- For `ra-jit deps`, in the store when `BLAZE_CACHE` is set, and otherwise in `.ra-jit/`
   of the target directory the units are unpacked into. `cargo clean` forgets them with
   the units.
 
@@ -547,7 +547,7 @@ so it does not put its name under a list that was rolled back. Such a list gets 
 untrusted list already got: "it is written anew", with only what this push sent, at a
 turn above everything the signer remembers. After a write goes through, the signer
 remembers its own turn. A damaged memory stops a push as it stops a pull, and the list
-on the remote is not touched. A machine with `RA_JIT_REMOTE_UNSIGNED=1` and no keys has
+on the remote is not touched. A machine with `BLAZE_REMOTE_UNSIGNED=1` and no keys has
 no turns and no protection; that is the meaning of the setting. The lists of `ra-jit
 deps` go through the same code.
 
@@ -557,7 +557,7 @@ it. A remote can also freeze a machine at the newest list that machine has seen,
 never showing a newer one. Both are the same gap, freshness, and need an expiry to
 close. The turn makes one possible without another field: a turn is never below the
 signing time, so a list whose turn is older than a chosen age was certainly signed
-before it. An optional `RA_JIT_REMOTE_FRESH=<duration>`, refusing lists with
+before it. An optional `BLAZE_REMOTE_FRESH=<duration>`, refusing lists with
 `turn < now - duration`, would close it for machines that start from an empty store
 (CI), at the price of a signer having to re-sign at least that often and of the reader's
 clock mattering. It is not implemented, and I would not make it the default.
@@ -702,12 +702,12 @@ elevated) shell, then the first line again in an elevated one:
     cargo test --release -p hir-ty --lib -- store::tests
     cargo build -p ra-jit --release
     mkdir C:\ra-jit-store-check
-    set RA_JIT_CACHE=C:\ra-jit-store-check
+    set BLAZE_CACHE=C:\ra-jit-store-check
     target\release\ra-jit.exe cache stats
     icacls C:\ra-jit-store-check /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"
     target\release\ra-jit.exe cache stats
     mkdir %LOCALAPPDATA%\ra-jit-store-check
-    set RA_JIT_CACHE=%LOCALAPPDATA%\ra-jit-store-check
+    set BLAZE_CACHE=%LOCALAPPDATA%\ra-jit-store-check
     target\release\ra-jit.exe cache stats
 
 Expected: the tests pass, among them the three written for Windows
@@ -831,7 +831,7 @@ changed:
 
 - **Freshness.** A machine with an empty store can be given any list ever signed, and a
   remote can keep a machine at the newest list it has seen. See the end of the rollback
-  section; `RA_JIT_REMOTE_FRESH` is a sketch, not code.
+  section; `BLAZE_REMOTE_FRESH` is a sketch, not code.
 - **Windows was compiled, not run.** The store check needs the commands above run on a
   Windows machine. The socket there has no peer check, and the store is not made private
   on creation. The directory of turns is made 0700 on Unix and with what it inherits on
@@ -840,7 +840,7 @@ changed:
   depend on the service, but that is an argument.
 - **The two bounds of the lazy path** (keys held in memory, a pack over the store's
   limit) have no test of their own.
-- **With `RA_JIT_CACHE_MAX=off`** a pull writes as much as the lists name.
+- **With `BLAZE_CACHE_MAX=off`** a pull writes as much as the lists name.
 - **A writer to the remote can still delete a signed list with the bucket's own tools,**
   or anything else in it. Signing protects what is taken, not that there is something
   to take.
@@ -881,9 +881,9 @@ tests in `crates/ra-jit/src/main.rs` that came with the build model merge and ar
 `remote.rs`, `remote/` or `deps.rs` that `ra-jit-collate` does not have (the prints, an
 `Arc<Vec<u8>>` and two `chunks_exact`).
 
-The harnesses, from `harness/`, one backend after the other, with `RA_JIT_BIN` at the
-release binary and `RA_JIT_BACKEND=cranelift`, then `RA_JIT_BACKEND=llvm RA_JIT_OPT=2
-RA_JIT_EMIT=fast`:
+The harnesses, from `harness/`, one backend after the other, with `BLAZE_BIN` at the
+release binary and `BLAZE_BACKEND=cranelift`, then `BLAZE_BACKEND=llvm BLAZE_OPT=2
+BLAZE_EMIT=fast`:
 
 | Harness | Cranelift | LLVM |
 |---|---|---|

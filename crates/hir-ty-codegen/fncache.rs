@@ -864,7 +864,7 @@ impl<'db> Walk<'db> {
 
     fn hash_node(&mut self, at: u32, node: &Node) {
         let db = self.db;
-        if std::env::var_os("RA_JIT_FN_CACHE_TRACE").is_some() {
+        if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
             eprintln!("fn-cache: {at} {}", describe(db, node));
         }
         let mut hasher = rustc_stable_hash::StableSipHasher128::new();

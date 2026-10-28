@@ -28,7 +28,7 @@ def option(name, default):
 
 ROUNDS, SEED = option("--rounds", 40), option("--seed", int(time.time()))
 RNG = random.Random(SEED)
-SEALS = {"RA_JIT_CACHE_SEAL_AT": "1", "RA_JIT_CACHE_MAX": "off"}
+SEALS = {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "off"}
 # The states of the workspace the store is filled with.
 STATES = [0, 1, 2, 3]
 
@@ -154,7 +154,7 @@ def while_running(checkout, store, round):
 def open_pack(checkout, store, round):
     """Damages the pack a killed daemon left open."""
     checkout.set(RNG.randrange(100, 10**6))
-    daemon = Daemon(checkout, store, env={"RA_JIT_CACHE_MAX": "off"})
+    daemon = Daemon(checkout, store, env={"BLAZE_CACHE_MAX": "off"})
     checkout.check(daemon, f"round {round}: before the damage")
     daemon.kill()
     left = files(store, ".open")

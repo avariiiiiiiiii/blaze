@@ -845,8 +845,8 @@ def runtime_best(measured):
     if not scored:
         return None
     geomean, build = min(scored)
-    env = {"RA_JIT_OPT": "3", **((measured.get("variants") or {}).get(build) or {})}
-    named = ", ".join([f"-O{env.pop('RA_JIT_OPT')}", *(f"{k}={v}" for k, v in env.items())])
+    env = {"BLAZE_OPT": "3", **((measured.get("variants") or {}).get(build) or {})}
+    named = ", ".join([f"-O{env.pop('BLAZE_OPT')}", *(f"{k}={v}" for k, v in env.items())])
     return ratios(build), geomean, named
 
 

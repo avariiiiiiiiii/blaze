@@ -58,8 +58,8 @@ Each claim is **read** (measured, or read in a source), **reported** (someone sa
 - A build with counters in salsa 0.28.5 (not committed: a patched copy of salsa and a dump at
   each request) gave per revision the deep verifications by durability and query, edges walked
   and executions. The heap: a `heap-profile` build under `_RJEM_MALLOC_CONF=prof:true` and
-  `RA_JIT_MEMORY`, read with `heap.py` (**read**).
-- `RA_JIT_MEMORY` makes edits slower (to 1.5 s), so timings come from runs without it and
+  `BLAZE_MEMORY`, read with `heap.py` (**read**).
+- `BLAZE_MEMORY` makes edits slower (to 1.5 s), so timings come from runs without it and
   memory from runs with it (**read**).
 
 ## The cold start and the base build
@@ -226,7 +226,7 @@ work done again that rustc keeps in `.rmeta`; not doing it again is #40 (frozen 
 them all first with `of_all`, which skips crates already listed. What is listed is the same.
 
 nushell, main at `07217080d0` against the change on it, two interleaved runs each of
-`leanprof.py nushell --no-warm --env RA_JIT_STATS=1` on cores 16 to 31, medians of the
+`leanprof.py nushell --no-warm --env BLAZE_STATS=1` on cores 16 to 31, medians of the
 ten edits after the first of each kind (**read**):
 
 | | main | listed on every core |
@@ -250,7 +250,7 @@ nu-protocol: what is left of the stage is that and the exported functions (**rea
 ## Slices 2 to 4, and where a body edit's time goes
 
 2026-10-25. As for slice 1, but on cores 120 to 135 with builds on 136 to 191,
-`leanprof.py nushell --no-warm --env RA_JIT_STATS=1 --rounds 6`, two interleaved runs per build
+`leanprof.py nushell --no-warm --env BLAZE_STATS=1 --rounds 6`, two interleaved runs per build
 and medians of the 25 edits of each kind after the first. Each branch is measured against main at
 its own base: `81648d0a9c` (#239) for the patch marks, salsa and borrowck branches and the crates
 lookup, `08924cadc8` (#241, which brings #235) for the impls branch and for all of them together.

@@ -40,13 +40,13 @@ const FINGERPRINT: &str = "fingerprint";
 /// What an entry of an archive takes of it besides what the file holds.
 const HEADER: u64 = 512;
 
-/// The most the units one `ra-jit deps pull` fetches unpack to, unless `RA_JIT_DEPS_MAX`
+/// The most the units one `ra-jit deps pull` fetches unpack to, unless `BLAZE_DEPS_MAX`
 /// says: `off` for no limit.
 const UNPACKED_MAX: u64 = 64 << 30;
 
-/// The bound on what a pull unpacks, from `RA_JIT_DEPS_MAX`.
+/// The bound on what a pull unpacks, from `BLAZE_DEPS_MAX`.
 fn unpacked_max() -> anyhow::Result<Option<u64>> {
-    match std::env::var("RA_JIT_DEPS_MAX") {
+    match std::env::var("BLAZE_DEPS_MAX") {
         Err(_) => Ok(Some(UNPACKED_MAX)),
         Ok(text) if text == "off" => Ok(None),
         Ok(text) => Ok(Some(
@@ -366,7 +366,7 @@ async fn pull(
 /// Where the turns of the lists of units are remembered: with the store, when the machine
 /// has one, and with the units themselves when it does not.
 fn turns_kept_in(dir: &Path) -> PathBuf {
-    match std::env::var_os("RA_JIT_CACHE") {
+    match std::env::var_os("BLAZE_CACHE") {
         Some(store) => PathBuf::from(store),
         None => dir.join(".ra-jit"),
     }
@@ -589,7 +589,7 @@ mod tests {
         let seed = tar.into_inner().unwrap();
         let top = scratch("changed-archives");
         let dir = top.join("target/debug");
-        let runs: usize = std::env::var("RA_JIT_FUZZ_RUNS").map_or(3_000, |it| it.parse().unwrap());
+        let runs: usize = std::env::var("BLAZE_FUZZ_RUNS").map_or(3_000, |it| it.parse().unwrap());
         let (mut unpacked, most) = (0, 1 << 16);
         for bytes in changed(&seed, runs) {
             _ = std::fs::remove_dir_all(&top);

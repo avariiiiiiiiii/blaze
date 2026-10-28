@@ -295,7 +295,7 @@ impl<'db> Keeper<'_, 'db> {
     }
 
     /// What the store is given of a stitched instance, when everything it is and refers to
-    /// has a name that another run of the daemon can find it by. With `RA_JIT_CACHE_CHECK`
+    /// has a name that another run of the daemon can find it by. With `BLAZE_CACHE_CHECK`
     /// the entry is set against the one the store has here, and nothing is given.
     fn keep(
         &mut self,
@@ -311,7 +311,7 @@ impl<'db> Keeper<'_, 'db> {
         };
         let told = cached::Told::of(debug.is_some(), self.variables);
         let key = cached::Entry::key(&name, told, self.program.flatten().as_ref())?;
-        let check = std::env::var_os("RA_JIT_CACHE_CHECK");
+        let check = std::env::var_os("BLAZE_CACHE_CHECK");
         let sets = || debug.iter().flat_map(|it| &it.types).cloned().collect::<Vec<_>>();
         if check.is_none() && store.has(&key) {
             return Some(cached::Kept::Types(sets()));

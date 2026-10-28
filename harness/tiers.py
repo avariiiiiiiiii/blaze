@@ -3,7 +3,7 @@
 takes edits runs under the daemon, which samples it and compiles its hot functions again with
 LLVM, swapping them in as patches while it runs (docs/tiers.md).
 
-usage: tiers.py          (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: tiers.py          (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
                           are found next to it)
 
 A copy of demo/lifebench (the Game of Life on a large grid, run flat out) is built by cargo,
@@ -14,7 +14,7 @@ then by a daemon. Three checks:
    generation;
 2. an edit demotes: an edit of a promoted function that keeps what it does (`next_age`) is
    applied as a patch at once, the function is back at level 1, and the output stays cargo's;
-3. RA_JIT_TIER=off changes nothing: under a daemon started with it, nothing is sampled, no
+3. BLAZE_TIER=off changes nothing: under a daemon started with it, nothing is sampled, no
    function leaves level 1, and the output is cargo's.
 
 Python 3.13, stdlib only. Every step has a timeout; a failure names the step.
@@ -148,7 +148,7 @@ def live_dir(binary: Path) -> Path | None:
 
 
 async def main() -> None:
-    bin_dir = Path(os.environ["RA_JIT_BIN"]).resolve().parent
+    bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
     # Short: a worker's socket is in the daemon's home, and macOS takes 104 bytes of path.
     work = Path(tempfile.mkdtemp(prefix="rjt-", dir="/tmp" if Path("/tmp").is_dir() else None))
     try:
@@ -156,7 +156,7 @@ async def main() -> None:
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
         base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=PIN)
-        for name in ("CARGO_INCREMENTAL", "RA_JIT_TIER", "RA_JIT_BACKEND", "RA_JIT_OPT"):
+        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER", "BLAZE_BACKEND", "BLAZE_OPT"):
             base.pop(name, None)
 
         # What cargo's own build prints. The program never overflows, so its debug and
@@ -174,7 +174,7 @@ async def main() -> None:
             return out.decode().splitlines()
 
         # 1 and 2: a daemon that tiers.
-        env = dict(base, CARGO_TARGET_DIR=str(work / "tiered"), RA_JIT_HOME=str(work / "home-tiered"))
+        env = dict(base, CARGO_TARGET_DIR=str(work / "tiered"), BLAZE_HOME=str(work / "home-tiered"))
         await serve(project, env)
         binary = work / "tiered" / "debug" / "lifebench"
         program, tasks = await start(binary, project, env, RUN_SECONDS)
@@ -208,26 +208,26 @@ async def main() -> None:
         same_as_cargo("output of the tiered program", program.checksums, await cargo(len(program.checksums)))
         print(f"output: {len(program.checksums)} checksums, all cargo's")
 
-        # 3: RA_JIT_TIER=off.
+        # 3: BLAZE_TIER=off.
         source.write_text(text)
-        env = dict(base, CARGO_TARGET_DIR=str(work / "off"), RA_JIT_HOME=str(work / "home-off"), RA_JIT_TIER="off")
+        env = dict(base, CARGO_TARGET_DIR=str(work / "off"), BLAZE_HOME=str(work / "home-off"), BLAZE_TIER="off")
         await serve(project, env)
         binary = work / "off" / "debug" / "lifebench"
         program, tasks = await start(binary, project, env, min(RUN_SECONDS, 12))
         await finish(program, tasks)
         if any(v > 1 for v in program.levels.values()):
-            raise StepError(f"RA_JIT_TIER=off: functions left level 1: {program.levels}")
+            raise StepError(f"BLAZE_TIER=off: functions left level 1: {program.levels}")
         live = live_dir(binary)
         if live is not None and (live / "sample").exists():
-            raise StepError(f"RA_JIT_TIER=off: the daemon asked the program to sample ({live / 'sample'})")
+            raise StepError(f"BLAZE_TIER=off: the daemon asked the program to sample ({live / 'sample'})")
         logs = "".join(p.read_text(errors="replace") for p in (work / "home-off").rglob("log"))
         if "tier: off" not in logs:
-            raise StepError("RA_JIT_TIER=off: the worker did not say tiering is off")
-        same_as_cargo("output with RA_JIT_TIER=off", program.checksums, await cargo(len(program.checksums)))
-        print(f"RA_JIT_TIER=off: nothing sampled, nothing tiered, {len(program.checksums)} checksums, all cargo's")
+            raise StepError("BLAZE_TIER=off: the worker did not say tiering is off")
+        same_as_cargo("output with BLAZE_TIER=off", program.checksums, await cargo(len(program.checksums)))
+        print(f"BLAZE_TIER=off: nothing sampled, nothing tiered, {len(program.checksums)} checksums, all cargo's")
     finally:
         for home in ("home-tiered", "home-off"):
-            stop = dict(os.environ, RA_JIT_HOME=str(work / home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+            stop = dict(os.environ, BLAZE_HOME=str(work / home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
             try:
                 proc = await asyncio.create_subprocess_exec("cargo-ra-jit", "ra-jit", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 await asyncio.wait_for(proc.wait(), 30)

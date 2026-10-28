@@ -11,9 +11,9 @@ usage: bscache.py record [PROJECT...] --ra-jit BIN [--work DIR] [--out DIR] [--j
 `record` fetches each project of harness/bench.py at its pinned revision (all of them when none
 is named) and runs the step of a workspace load that builds and runs its build scripts and proc
 macros, `cargo check --compile-time-deps --workspace --all-targets`, through ra-jit's wrapper
-(RUSTC_WRAPPER=ra-jit-rustc beside BIN, RA_JIT_ONLY_ASKS), with an empty store (RA_JIT_CACHE of its own), so every
+(RUSTC_WRAPPER=ra-jit-rustc beside BIN, BLAZE_ONLY_ASKS), with an empty store (BLAZE_CACHE of its own), so every
 script runs, and runs in the sandbox (cargo/script_sandbox.rs) through `ra-jit build-script`.
-Proc macros are rustc's here (RA_JIT_PROC_MACRO_SERVER=0): what is measured is the scripts'
+Proc macros are rustc's here (BLAZE_PROC_MACRO_SERVER=0): what is measured is the scripts'
 runs. The sandbox leaves beside each script's OUT_DIR the record of what it reached
 (`ra-jit-record`: R read, W write refused, N network refused, X record not whole) and how cargo
 ran it (`ra-jit-ran.json`). Each project's are collected into `<out>/<project>.json`.
@@ -32,10 +32,10 @@ would-be denial by package, `<out>/denied.json`:
               closure; a dependency's OUT_DIR (what `links` gives a script by DEP_*) is listed
               apart, as a read a hermetic sandbox allows
 
-`closure` runs the same step with every build script in its closure alone (RA_JIT_SCRIPT_VIEW=on:
+`closure` runs the same step with every build script in its closure alone (BLAZE_SCRIPT_VIEW=on:
 the package, OUT_DIR and the pinned nixpkgs toolchain and libraries in a mount namespace,
 cargo/hermetic), `--keep-going`, against the store `--store` (which must hold the closure, or
-RA_JIT_REMOTE must bring it), and writes per project whether each script ran, came from the
+BLAZE_REMOTE must bring it), and writes per project whether each script ran, came from the
 store (its run's key is of what it is made of), or failed, with its note. Run it twice, the
 second time on another machine whose store pulled the first's, for the hit rate across hosts.
 `closure-report` writes `<out>/closure.md` of them.
@@ -75,13 +75,13 @@ def record(name, repo, rev, work, ra_jit, jobs):
         shutil.rmtree(dir, ignore_errors=True)
     env = dict(os.environ)
     for key in list(env):
-        if key.startswith(("CARGO_", "RA_JIT_", "RUSTC_")) and key != "CARGO_HOME":
+        if key.startswith(("CARGO_", "BLAZE_", "RUSTC_")) and key != "CARGO_HOME":
             del env[key]
     env.update(
         RUSTC_WRAPPER=os.path.join(os.path.dirname(ra_jit), "ra-jit-rustc"),
-        RA_JIT_ONLY_ASKS="1",
-        RA_JIT_PROC_MACRO_SERVER="0",
-        RA_JIT_CACHE=store,
+        BLAZE_ONLY_ASKS="1",
+        BLAZE_PROC_MACRO_SERVER="0",
+        BLAZE_CACHE=store,
         CARGO_TARGET_DIR=target,
         CARGO_BUILD_JOBS=str(jobs),
         CARGO_UNSTABLE_CHECKSUM_FRESHNESS="false",
@@ -471,7 +471,7 @@ def said_by_cargo(stderr, package):
 
 def in_closure(name, repo, rev, work, ra_jit, jobs, store):
     """Runs `name`'s compile-time step with every build script in its closure alone
-    (RA_JIT_SCRIPT_VIEW=on), keeping going past a failed script, with `store` as the store: what
+    (BLAZE_SCRIPT_VIEW=on), keeping going past a failed script, with `store` as the store: what
     each script did, from its run directory."""
     source = os.path.join(work, "src", name)
     fetch_git(repo, rev, source)
@@ -483,11 +483,11 @@ def in_closure(name, repo, rev, work, ra_jit, jobs, store):
             del env[key]
     env.update(
         RUSTC_WRAPPER=os.path.join(os.path.dirname(ra_jit), "ra-jit-rustc"),
-        RA_JIT_ONLY_ASKS="1",
-        RA_JIT_PROC_MACRO_SERVER="0",
-        RA_JIT_SCRIPT_VIEW="on",
-        RA_JIT_STATS="1",
-        RA_JIT_CACHE=store,
+        BLAZE_ONLY_ASKS="1",
+        BLAZE_PROC_MACRO_SERVER="0",
+        BLAZE_SCRIPT_VIEW="on",
+        BLAZE_STATS="1",
+        BLAZE_CACHE=store,
         CARGO_TARGET_DIR=target,
         CARGO_BUILD_JOBS=str(jobs),
         CARGO_UNSTABLE_CHECKSUM_FRESHNESS="false",

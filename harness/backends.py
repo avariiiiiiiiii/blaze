@@ -30,7 +30,7 @@ class Compiled:
         start = time.monotonic()
         child = subprocess.Popen([RA_JIT, project, *crates, "--out", obj, *symbols],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                                 env={**os.environ, "RA_JIT_STATS": "1", **env})
+                                 env={**os.environ, "BLAZE_STATS": "1", **env})
         self.stderr = child.stderr.read()
         if hasattr(os, "wait4"):
             _, status, usage = os.wait4(child.pid, 0)
@@ -105,11 +105,11 @@ def main():
     lines = [f"cargo build: {time.monotonic() - start:.1f} s (whatever was not built already), work in {fx.work}", ""]
     expected = run(fx.reference, run_args)
     project = os.path.join(workspace, opt("--project", ""))
-    producers = [("cranelift", {"RA_JIT_BACKEND": "cranelift"})]
+    producers = [("cranelift", {"BLAZE_BACKEND": "cranelift"})]
     # A level with an `f` after it is that level's passes with LLVM's fast code selection.
     for level in levels:
         fast = level.endswith("f")
-        env = {"RA_JIT_BACKEND": "llvm", "RA_JIT_OPT": level.rstrip("f"), "RA_JIT_EMIT": "fast" if fast else "optimized"}
+        env = {"BLAZE_BACKEND": "llvm", "BLAZE_OPT": level.rstrip("f"), "BLAZE_EMIT": "fast" if fast else "optimized"}
         producers.append((f"llvm -O{level.rstrip('f')}" + (" fast emit" if fast else ""), env))
     built = []
     for name, env in producers:

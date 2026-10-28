@@ -3,7 +3,7 @@
 program, and the running program must run the new code, applied by ra-jit-live from the
 daemon's patch.
 
-usage: live_e2e.py          (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: live_e2e.py          (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
                              are found next to it)
        LIVE_PROGRAM=live-alloc live_e2e.py
                             the same steps on harness/live-alloc, the program on the nightly's
@@ -147,7 +147,7 @@ async def start(executable: Path, cwd: Path, env: dict[str, str], step: str, ans
 
 async def main() -> None:
     own_home()
-    bin_dir = Path(os.environ["RA_JIT_BIN"]).resolve().parent
+    bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
     work = Path(tempfile.mkdtemp(prefix="ra-jit-live-e2e-"))
     started: list[Running] = []
     try:
@@ -233,19 +233,19 @@ async def main() -> None:
 
 
 def own_home() -> None:
-    """Gives this run a daemon of its own when RA_JIT_HOME names none: the default home
+    """Gives this run a daemon of its own when BLAZE_HOME names none: the default home
     (XDG_RUNTIME_DIR/ra-jit) is one daemon and socket for every harness and lane of the user,
     and a run that talks to another's daemon tests that daemon's binary and state, not its own."""
-    if os.environ.get("RA_JIT_HOME"):
+    if os.environ.get("BLAZE_HOME"):
         return
     # Short, under /tmp: the daemon's socket is in it, and macOS allows 104 bytes.
     home = tempfile.mkdtemp(prefix="rj-live-", dir=None if os.name == "nt" else "/tmp")
-    os.environ["RA_JIT_HOME"] = home
+    os.environ["BLAZE_HOME"] = home
 
     def stop() -> None:
         # The daemon of this home alone, which nothing else talks to; its logs stay for a failure.
-        cargo_ra_jit = Path(os.environ["RA_JIT_BIN"]).resolve().parent / "cargo-ra-jit"
-        subprocess.run([str(cargo_ra_jit), "ra-jit", "stop"], env=dict(os.environ, RA_JIT_HOME=home),
+        cargo_ra_jit = Path(os.environ["BLAZE_BIN"]).resolve().parent / "cargo-ra-jit"
+        subprocess.run([str(cargo_ra_jit), "ra-jit", "stop"], env=dict(os.environ, BLAZE_HOME=home),
                        capture_output=True, timeout=120)
 
     atexit.register(stop)
@@ -253,8 +253,8 @@ def own_home() -> None:
 
 def daemon_home() -> Path:
     """Where the daemon keeps its socket and log, as `cargo::daemon::home` finds it."""
-    if os.environ.get("RA_JIT_HOME"):
-        return Path(os.environ["RA_JIT_HOME"])
+    if os.environ.get("BLAZE_HOME"):
+        return Path(os.environ["BLAZE_HOME"])
     if os.environ.get("XDG_RUNTIME_DIR"):
         return Path(os.environ["XDG_RUNTIME_DIR"]) / "ra-jit"
     return Path.home() / ".cache" / "ra-jit"

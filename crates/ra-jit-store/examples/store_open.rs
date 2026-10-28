@@ -6,7 +6,7 @@
 //!
 //! `many` reads the values in one `get_many` on every core rather than one by one.
 //!
-//! Run `make` with `RA_JIT_CACHE_SEAL_AT` and `RA_JIT_CACHE_MAX=off` to choose how large
+//! Run `make` with `BLAZE_CACHE_SEAL_AT` and `BLAZE_CACHE_MAX=off` to choose how large
 //! a pack is and that none is evicted. Memory is read from `/proc/self/status`.
 
 use std::{path::Path, time::Instant};

@@ -31,7 +31,7 @@ use super::{plan::Plan, units::stamp_of};
 use crate::socket::{self, NotServed, Served, private_dir, private_file, read_request};
 
 /// How long the daemon and each worker live without being asked, unless
-/// `RA_JIT_IDLE_SECS` says otherwise.
+/// `BLAZE_IDLE_SECS` says otherwise.
 const IDLE: Duration = Duration::from_secs(1800);
 /// How long a worker that is stopped has to finish writing to the store.
 const SETTLE: Duration = Duration::from_secs(60);
@@ -43,15 +43,15 @@ const TICK: Duration = Duration::from_secs(1);
 /// targets, or checks of several workspaces in turn.
 const CHECKERS: usize = 4;
 
-/// The share of the machine's memory the workers may hold when `RA_JIT_MEMORY_MAX` does not
+/// The share of the machine's memory the workers may hold when `BLAZE_MEMORY_MAX` does not
 /// say: one part in this many.
 const MEMORY_SHARE: u64 = 2;
 
-/// The most the workers may hold together, from `RA_JIT_MEMORY_MAX`: a size, or `off` for no
+/// The most the workers may hold together, from `BLAZE_MEMORY_MAX`: a size, or `off` for no
 /// limit. Half of the machine's memory when it does not say, and no limit where the system
 /// does not tell how much that is.
 fn memory_max() -> Result<Option<u64>, String> {
-    match std::env::var("RA_JIT_MEMORY_MAX") {
+    match std::env::var("BLAZE_MEMORY_MAX") {
         Err(_) => Ok(crate::memory::of_the_machine().map(|it| it / MEMORY_SHARE)),
         Ok(text) if text == "off" => Ok(None),
         Ok(text) => ra_jit_store::parse_size(&text)
@@ -61,9 +61,9 @@ fn memory_max() -> Result<Option<u64>, String> {
 }
 
 /// The setting of when the daemon has a spare worker.
-pub(crate) const SPARE: &str = "RA_JIT_SPARE";
+pub(crate) const SPARE: &str = "BLAZE_SPARE";
 
-/// When the daemon has a spare worker, from `RA_JIT_SPARE`.
+/// When the daemon has a spare worker, from `BLAZE_SPARE`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Spares {
     /// `0`: none. A workspace is loaded once cargo has built it.
@@ -126,7 +126,7 @@ const LAST_LINES: usize = 12;
 
 /// The variable that has a worker end when its standard input does, which is when the
 /// daemon that started it is gone.
-pub(crate) const ENDS_WITH_INPUT: &str = "RA_JIT_ENDS_WITH_INPUT";
+pub(crate) const ENDS_WITH_INPUT: &str = "BLAZE_ENDS_WITH_INPUT";
 
 /// Where a worker that listens at `socket` leaves the errors it found in the source as it
 /// loaded the workspace, in JSON, before it ends.
@@ -558,8 +558,8 @@ impl Worker {
                 let mut command = Command::new(std::env::current_exe()?);
                 command.args(&args);
                 match store() {
-                    Some(store) => command.env("RA_JIT_CACHE", store),
-                    None => command.env_remove("RA_JIT_CACHE"),
+                    Some(store) => command.env("BLAZE_CACHE", store),
+                    None => command.env_remove("BLAZE_CACHE"),
                 };
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
@@ -870,8 +870,8 @@ impl Spare {
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("--spare").arg(dir.join("package"));
         match store() {
-            Some(store) => command.env("RA_JIT_CACHE", store),
-            None => command.env_remove("RA_JIT_CACHE"),
+            Some(store) => command.env("BLAZE_CACHE", store),
+            None => command.env_remove("BLAZE_CACHE"),
         };
         let output =
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
@@ -939,8 +939,8 @@ impl Checker {
         let mut command = Command::new(std::env::current_exe()?);
         command.args(&args);
         match store() {
-            Some(store) => command.env("RA_JIT_CACHE", store),
-            None => command.env_remove("RA_JIT_CACHE"),
+            Some(store) => command.env("BLAZE_CACHE", store),
+            None => command.env_remove("BLAZE_CACHE"),
         };
         let output =
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
@@ -1052,7 +1052,7 @@ struct Daemon {
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
 pub(crate) fn home() -> anyhow::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("RA_JIT_HOME").filter(|it| !it.is_empty()) {
+    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
         return Ok(PathBuf::from(home));
     }
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|it| !it.is_empty()) {
@@ -1062,11 +1062,11 @@ pub(crate) fn home() -> anyhow::Result<PathBuf> {
     Ok(Path::new(&home.context("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME")?).join(".cache/ra-jit"))
 }
 
-/// The disk store of the user's builds: the directory `RA_JIT_CACHE` names, none when it
+/// The disk store of the user's builds: the directory `BLAZE_CACHE` names, none when it
 /// says `off`, and without it `ra-jit/store` in the user's cache directory. Unlike `home`
 /// it is not in `XDG_RUNTIME_DIR`, which does not outlive the session.
 pub(crate) fn store() -> Option<PathBuf> {
-    if let Some(named) = std::env::var_os("RA_JIT_CACHE") {
+    if let Some(named) = std::env::var_os("BLAZE_CACHE") {
         return (!ra_jit_store::is_off(&named)).then(|| PathBuf::from(named));
     }
     let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
@@ -1122,7 +1122,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
             anyhow::bail!("listening on {}: {error}", socket.display());
         }
     };
-    let idle = match std::env::var("RA_JIT_IDLE_SECS").ok().and_then(|it| it.parse::<u64>().ok()) {
+    let idle = match std::env::var("BLAZE_IDLE_SECS").ok().and_then(|it| it.parse::<u64>().ok()) {
         Some(0) => None,
         Some(secs) => Some(Duration::from_secs(secs)),
         None => Some(IDLE),
@@ -1530,7 +1530,7 @@ impl Daemon {
         *spare = self.new_spare();
     }
 
-    /// A spare worker started now, unless `RA_JIT_SPARE=0` says there are none.
+    /// A spare worker started now, unless `BLAZE_SPARE=0` says there are none.
     fn new_spare(&self) -> Option<Spare> {
         if self.spare_when == Spares::Never {
             return None;

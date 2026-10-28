@@ -2,7 +2,7 @@
 """sandboxbench.py: what the sandbox a test runs in costs, on Linux and macOS.
 
 usage: sandboxbench.py [--cpus 0-15] [--rounds 5] [--runs 600] [--tests 600] [--io 50]
-       (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+       (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
 Two measurements, each in `--rounds` rounds whose setups alternate, as medians with the
 lowest and highest of the rounds:
@@ -12,8 +12,8 @@ lowest and highest of the rounds:
   record of what it wrote and reached);
 - a generated library, opted into sandboxed tests, with `--tests` unit tests, `--io` of which
   read a file of the package and write one in the package and one in `std::env::temp_dir()`, under `cargo ra-jit test`
-  once the daemon serves its build: with `RA_JIT_SANDBOX=off`, in the sandbox under
-  `RA_JIT_TESTS=all`, under `affected` with what passed forgotten before each run (so every
+  once the daemon serves its build: with `BLAZE_SANDBOX=off`, in the sandbox under
+  `BLAZE_TESTS=all`, under `affected` with what passed forgotten before each run (so every
   test runs and records what it reads), and as one process per test (`--exact name`, 16 at a
   time), in a sandbox each and bare. The command's wall time is given whole and less that of
   `cargo ra-jit test --no-run` (the build and the daemon's answer, which every setup has).
@@ -156,19 +156,19 @@ async def main():
     pinned = hasattr(os, "sched_setaffinity")
     if pinned:
         os.sched_setaffinity(0, cpus)
-    ra_jit = os.environ["RA_JIT_BIN"]
+    ra_jit = os.environ["BLAZE_BIN"]
     bin_dir = os.path.dirname(os.path.abspath(ra_jit))
     where = f"cpus {args.cpus}" if pinned else f"{os.cpu_count()} cpus, not pinned"
     print(f"{sys.platform}: {where}, {parallel} at a time; load {os.getloadavg()}", flush=True)
 
     root = tempfile.mkdtemp(prefix="ra-jit-sandboxbench-")
     home = tempfile.mkdtemp(prefix="rj-sb-", dir="/tmp")
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
                RUST_BACKTRACE="0")
     if not pinned:
         # Kept under `affected` too, which passes a test only a few variables.
-        env.update(RUST_TEST_THREADS=str(parallel), RA_JIT_TEST_ENV="RUST_TEST_THREADS")
-    for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "RA_JIT_TESTS", "RA_JIT_SANDBOX"):
+        env.update(RUST_TEST_THREADS=str(parallel), BLAZE_TEST_ENV="RUST_TEST_THREADS")
+    for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "BLAZE_TESTS", "BLAZE_SANDBOX"):
         env.pop(name, None)
     pkg = os.path.join(root, "sbxbench")
     try:
@@ -205,7 +205,7 @@ async def main():
             if time.monotonic() > deadline:
                 raise Failed(f"the daemon did not serve the build in 600 s:\n{said[-2000:]}")
             await asyncio.sleep(1)
-        await run(test, cwd=pkg, env=dict(env, RA_JIT_TESTS="affected"))
+        await run(test, cwd=pkg, env=dict(env, BLAZE_TESTS="affected"))
         exe = test_executable(pkg)
         _, listed = await run([exe, "--list", "--format", "terse"], cwd=pkg, env=env)
         names = [line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")]
@@ -248,9 +248,9 @@ async def main():
 
         modes = {
             "build only (--no-run)": no_run,
-            "RA_JIT_SANDBOX=off": lambda: command({"RA_JIT_SANDBOX": "off"}),
-            "sandbox, all": lambda: command({"RA_JIT_TESTS": "all"}),
-            "sandbox, affected, every test": lambda: command({"RA_JIT_TESTS": "affected"}, forget=True),
+            "BLAZE_SANDBOX=off": lambda: command({"BLAZE_SANDBOX": "off"}),
+            "sandbox, all": lambda: command({"BLAZE_TESTS": "all"}),
+            "sandbox, affected, every test": lambda: command({"BLAZE_TESTS": "affected"}, forget=True),
             f"a sandbox per test, {parallel} at a time": lambda: per_test(True),
             f"a process per test, bare, {parallel} at a time": lambda: per_test(False),
         }

@@ -16,18 +16,18 @@ rustc gives, so `cargo check` stays the final word.
 
 An edit with a borrow-check error fails its build, with the file, line and error, as an edit
 with a type error does; under `cargo ra-jit`, cargo then runs and rustc reports it.
-`RA_JIT_BORROWCK_REFUSE=0` in the daemon's environment turns this off.
+`BLAZE_BORROWCK_REFUSE=0` in the daemon's environment turns this off.
 
 This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
 fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
-borrow-check error ra-jit reports where rustc reports none is a bug; `RA_JIT_BORROWCK_REFUSE=0`
+borrow-check error ra-jit reports where rustc reports none is a bug; `BLAZE_BORROWCK_REFUSE=0`
 works around it until it is fixed. What it does not do: it misses about a sixth of the
 errors rustc gives (it accepts code rustc rejects, listed below), so code with such an error
 still builds and runs from memory.
 
 ## Modes
 
-`RA_JIT_BORROWCK` picks one:
+`BLAZE_BORROWCK` picks one:
 
 - `polonius`, the default: rustc's Polonius alpha, which is what nightly rustc does by
   default (`-Zpolonius=next`). It accepts more programs than NLL: a loan ends where nothing
@@ -455,7 +455,7 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   needs the `mut` of a captured variable when its body mutates it, and a name that starts
   with `_` is left alone, as rustc does. A body whose types have an error gets none, as
   rustc lints no body its type check failed. A source that denies it fails the build with it
-  ([no-rustc.md](no-rustc.md), step D), unless `RA_JIT_BORROWCK_REFUSE=0`.
+  ([no-rustc.md](no-rustc.md), step D), unless `BLAZE_BORROWCK_REFUSE=0`.
 
 ## How it is tested
 
@@ -676,7 +676,7 @@ crates on one thread. It infers and checks each body once cold, paying for the q
 is the first to need (`infer_us`, `first_us`), then infers it and checks it in each mode as an
 edit of it costs in the daemon: the rest of the workspace answered and the trait solver's cache
 empty, as it is in a new revision (`infer_warm_us`, each mode's phases and sizes).
-`RA_JIT_BORROWCK_ONLY=part` limits it to the bodies whose name contains `part`. Run it inside
+`BLAZE_BORROWCK_ONLY=part` limits it to the bodies whose name contains `part`. Run it inside
 `nix develop`: without the toolchain's sysroot most bodies have inference errors and are not
 checked. `harness/borrowck_speed.py` runs it over the bench apps and reports totals, p50/p99/max
 and the slowest bodies; `--rustc TOOLCHAIN` measures rustc's own `mir_borrowck` and `typeck`
@@ -801,8 +801,8 @@ is 0.3 ms now. Nothing else moves (bench/results/2026-10-27-borrowck-speed-place
 ## Debugging
 
 - `echo file.rs | ra-jit borrowck --edition 2021` prints a file's diagnostics as JSON.
-- `RA_JIT_BORROWCK_MIR=<function>` with that command, or with `--project`, prints the MIR
+- `BLAZE_BORROWCK_MIR=<function>` with that command, or with `--project`, prints the MIR
   of a top-level function and its closures.
-- `RA_JIT_BORROWCK_DEBUG=1` prints each body's locals, universal regions, constraints and
-  loans; `RA_JIT_BORROWCK_DEBUG=<function>` only those of that function and its closures,
+- `BLAZE_BORROWCK_DEBUG=1` prints each body's locals, universal regions, constraints and
+  loans; `BLAZE_BORROWCK_DEBUG=<function>` only those of that function and its closures,
   which a project needs.

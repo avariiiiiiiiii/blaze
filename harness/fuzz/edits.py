@@ -25,7 +25,7 @@ The edits:
   fn.add, fn.signature, fn.remove    a function of the edit's own, and the call of it
   undo              the source of an earlier step again
 
-RA_JIT_BIN names the ra-jit under test. The exit status is 1 when there is a finding.
+BLAZE_BIN names the ra-jit under test. The exit status is 1 when there is a finding.
 """
 import argparse, collections, concurrent.futures, copy, json, os, random, re, shutil, subprocess, sys, tempfile, time
 

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use vfs::{AbsPath, AbsPathBuf};
 
 /// The name of the static the list is in.
-const LIST: &[u8] = b"RA_JIT_PROC_MACROS";
+const LIST: &[u8] = b"BLAZE_PROC_MACROS";
 
 static SERVER: OnceLock<AbsPathBuf> = OnceLock::new();
 

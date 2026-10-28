@@ -69,8 +69,8 @@ as the last line of the log.
 
 ## Measured
 
-Local, native, on the head commit's code. LLVM is `RA_JIT_BACKEND=llvm RA_JIT_OPT=2
-RA_JIT_EMIT=fast`.
+Local, native, on the head commit's code. LLVM is `BLAZE_BACKEND=llvm BLAZE_OPT=2
+BLAZE_EMIT=fast`.
 
 | harness | Cranelift | LLVM |
 |---|---|---|
@@ -80,7 +80,7 @@ RA_JIT_EMIT=fast`.
 | `stress.py` | 99/99, 0 restarts | 99/99, 0 restarts |
 | `breakers.py` | 25/25, 0 open, 0 skipped | 25/25, 0 open, 0 skipped |
 | `unwinds.py` | 8/8 | 8/8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71/71 | 71/71 |
+| `BLAZE_SPLICE=1 splices.py` | 71/71 | 71/71 |
 | `asmedits.py` | 10/10 | 10/10 |
 | `deps.py` | 10/10 | 10/10 |
 | `includes.py` | 9/9 | 9/9 |

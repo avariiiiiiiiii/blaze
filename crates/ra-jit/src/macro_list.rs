@@ -16,7 +16,7 @@ pub(crate) const MODULE: &str = "__ra_jit_proc_macros";
 
 /// What the loader looks the list up by: a slice of the macros, as rustc's
 /// `#[rustc_proc_macro_decls]` static is.
-pub(crate) const SYMBOL: &str = "RA_JIT_PROC_MACROS";
+pub(crate) const SYMBOL: &str = "BLAZE_PROC_MACROS";
 
 /// What the module starts with, after the text of the root file.
 pub(crate) const MARK: &str =

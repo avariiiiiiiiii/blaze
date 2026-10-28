@@ -1,6 +1,6 @@
 # Build scripts of the bench corpus in their closure, and their runs on another machine
 
-Every build script ran with `RA_JIT_SCRIPT_VIEW=on` (`crates/ra-jit/src/cargo/hermetic`): a
+Every build script ran with `BLAZE_SCRIPT_VIEW=on` (`crates/ra-jit/src/cargo/hermetic`): a
 root of its own with its package read-only, its `OUT_DIR` writable, the dependencies' `OUT_DIR`s
 it is handed (`DEP_*`), the toolchain and ra-jit's own rustc, and the pinned nixpkgs closure at
 `/nix/store` (clang, lld, binutils, glibc, linux headers, pkg-config, bash, coreutils, make,
@@ -18,7 +18,7 @@ cache.nixos.org once by `ra-jit closure fetch` (no nix binary: 203 store paths, 
 and pushed to a directory remote as project `nix-closure` (0.67 s); each host lays it out from
 that remote (`ra-jit closure materialize`, 4.4 to 5.7 s). The seconds are the whole
 `cargo check --compile-time-deps` of the project, most of it compiling scripts and proc macros
-(cargo's rustc compiles here, `RA_JIT_ONLY_ASKS`), not the runs.
+(cargo's rustc compiles here, `BLAZE_ONLY_ASKS`), not the runs.
 
 ## Host A, empty store (closure-a/)
 
@@ -85,7 +85,7 @@ the same checkout path as host A, as CI runners have.
 371 of 371: every run that succeeds on host B is host A's.
 
 With another checkout path on host B (and so another `CARGO_HOME`), ripgrep had 2 of 10. The
-keys' fields (`RA_JIT_KEY_TRACE`) differ only in the script itself: a script cargo's rustc
+keys' fields (`BLAZE_KEY_TRACE`) differ only in the script itself: a script cargo's rustc
 compiled is keyed by its executable's bytes, which hold the paths of its sources and its
 dependencies' under `CARGO_HOME`. Its environment, the package, the closure's NarHashes and
 the toolchain were the same on both hosts. A script keyed by what it was built from, with the

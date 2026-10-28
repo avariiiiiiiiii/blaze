@@ -9,9 +9,9 @@
 //! or its archiver, or pkg-config ([`allowed`]), and refused, naming the program, when it is
 //! anything else. Each command is written down beside `OUT_DIR` ([`TOOLS`]).
 //!
-//! - `RA_JIT_BUILD_SCRIPTS=wasi` runs every script so; `wasi-build-scripts` in
+//! - `BLAZE_BUILD_SCRIPTS=wasi` runs every script so; `wasi-build-scripts` in
 //!   `[workspace.metadata.blaze.sandbox]` runs those of the packages it lists (`"*"`, all).
-//! - `RA_JIT_BUILD_SCRIPTS=wasi-compare` is for measuring: the module runs first and what it
+//! - `BLAZE_BUILD_SCRIPTS=wasi-compare` is for measuring: the module runs first and what it
 //!   printed and wrote is set aside ([`ASIDE`]), then the script runs as without, for cargo;
 //!   `harness/bswasi.py` compares the two.
 //!
@@ -28,7 +28,7 @@ use anyhow::Context as _;
 use super::{own_script, sandboxed, script_sandbox};
 
 /// The variable that runs build scripts under WASI: `wasi`, `wasi-compare` or `native`.
-pub(crate) const VAR: &str = "RA_JIT_BUILD_SCRIPTS";
+pub(crate) const VAR: &str = "BLAZE_BUILD_SCRIPTS";
 
 /// The key of [`sandboxed::WORKSPACE_TABLE`] that lists the packages whose scripts run under
 /// WASI.
@@ -321,7 +321,7 @@ mod running {
             && !checking
         {
             kept.restore(script.out_dir)?;
-            if std::env::var_os("RA_JIT_STATS").is_some() {
+            if std::env::var_os("BLAZE_STATS").is_some() {
                 eprintln!("ra-jit: a run under WASI the store kept");
             }
             std::io::stdout().write_all(&kept.stdout)?;
@@ -728,7 +728,7 @@ mod tests {
         {
             assert!(documented(it), "{it}");
         }
-        for it in ["PATH", "HOME", "CC", "NIX_CFLAGS_COMPILE", "PKG_CONFIG_PATH", "RA_JIT_CACHE"] {
+        for it in ["PATH", "HOME", "CC", "NIX_CFLAGS_COMPILE", "PKG_CONFIG_PATH", "BLAZE_CACHE"] {
             assert!(!documented(it), "{it}");
         }
     }

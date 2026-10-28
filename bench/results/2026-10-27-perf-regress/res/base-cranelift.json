@@ -27,7 +27,7 @@
  },
  "backends": {
   "cranelift": {
-   "RA_JIT_BACKEND": "cranelift"
+   "BLAZE_BACKEND": "cranelift"
   }
  },
  "setups": {},

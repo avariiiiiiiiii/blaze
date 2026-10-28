@@ -90,8 +90,8 @@ the helpers for either kind of link line and the others use them.
 | `stress.py` | 99 of 99, 0 restarts |
 | `breakers.py` | 15 of 15, 1 open (`future_size`, open on Linux too) |
 | `unwinds.py` | 8 of 8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 52 of 52 |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71 |
+| `BLAZE_SPLICE=1 worktrees.py` | 52 of 52 |
 | `asmedits.py` | 10 of 10 |
 | `deps.py` | 10 of 10 |
 | `includes.py` | 9 of 9 |
@@ -119,7 +119,7 @@ they are. The LLVM backend (`--features llvm`) was not built or tried on Windows
 Commit `a5aedad842` of this branch on Linux x86-64, same harness toolchain: corpus 679/680
 MATCH, programs 22/22, stress 99/99, breakers 15/15 (1 open), unwinds 8/8, splices 71/71,
 worktrees 52/52, asmedits 10/10, deps 10/10, includes 9/9, and `bench.py toy corpus` ran in
-both modes (10/10 spliced with `RA_JIT_SPLICE`). These are the numbers of `ra-jit-spike`. The
+both modes (10/10 spliced with `BLAZE_SPLICE`). These are the numbers of `ra-jit-spike`. The
 two commits after `a5aedad842` change a harness JSON path, a docstring and parentheses in the
 Windows-only `seh.rs`; they were not rerun on Linux.
 
@@ -211,7 +211,7 @@ This section is newer than the rest of the file and was measured on the same mac
 
 ### The LLVM backend
 
-`RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast` compiles every function Cranelift does on
+`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast` compiles every function Cranelift does on
 Windows; nothing is left to Cranelift in any harness. What it took:
 
 - `emitted.rs` reads COFF relocations back (REL32 and its `_1` to `_5` forms, SECREL,
@@ -279,11 +279,11 @@ to Cranelift.
 | `stress.py` | 99 of 99, 0 restarts | 5425 / 0 | 99 of 99, 0 restarts |
 | `breakers.py` | 25 of 25, 0 open | 3065 / 0 | 25 of 25, 0 open |
 | `unwinds.py` | 8 of 8 | 102 / 0 | 8 of 8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71 | 2337 / 0 | 71 of 71 |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71 | 2337 / 0 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 20 / 0 | 10 of 10 |
 | `deps.py` | 10 of 10 | 0 / 0 | 10 of 10 |
 | `includes.py` | 9 of 9 | 76 / 0 | 9 of 9 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 52 of 52 | 2369 / 0 | 52 of 52 |
+| `BLAZE_SPLICE=1 worktrees.py` | 52 of 52 | 2369 / 0 | 52 of 52 |
 | `worktrees.py --join --together` | 52 of 52 | 2385 / 0 | 52 of 52 |
 | `worktrees.py --overlay` | 61 of 61 | 1950 / 0 | 61 of 61 |
 
@@ -383,11 +383,11 @@ default backend.
 | `stress.py` | 99 of 99, 0 restarts | 5435 / 0 | 99 of 99, 0 restarts |
 | `breakers.py` | 25 of 25, 0 open | 3065 / 0 | 25 of 25, 0 open |
 | `unwinds.py` | 8 of 8 | 102 / 0 | 8 of 8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71, 61 spliced | 2340 / 0 | 71 of 71, 61 spliced |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71, 61 spliced | 2340 / 0 | 71 of 71, 61 spliced |
 | `asmedits.py` | 10 of 10 | 20 / 0 | 10 of 10 |
 | `deps.py` | 10 of 10 | 0 / 0 | 10 of 10 |
 | `includes.py` | 9 of 9 | 76 / 0 | 9 of 9 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 58 of 58 | 2396 / 0 | 58 of 58 |
+| `BLAZE_SPLICE=1 worktrees.py` | 58 of 58 | 2396 / 0 | 58 of 58 |
 | `worktrees.py --join --together` | 58 of 58 | 2439 / 0 | 58 of 58 |
 | `worktrees.py --overlay` | 67 of 67 | 1998 / 0 | 67 of 67 |
 | `keys.py` | 26 of 26, 4 open | 7973 / 0 | 26 of 26, 4 open |
@@ -527,11 +527,11 @@ default backend.
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
 | `breakers.py` | 25 of 25, 0 open | 25 of 25, 0 open |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
 | `deps.py` | 10 of 10 | 10 of 10 |
 | `includes.py` | 9 of 9 | 9 of 9 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 58 of 58 | 58 of 58 |
+| `BLAZE_SPLICE=1 worktrees.py` | 58 of 58 | 58 of 58 |
 | `worktrees.py --join --together` | 58 of 58 | 58 of 58 |
 | `worktrees.py --overlay` | 67 of 67 | 67 of 67 |
 | `keys.py` | 36 of 36, 0 open | 36 of 36, 0 open |
@@ -671,7 +671,7 @@ differences, 0 crashes, 0 left to rustc. The long fuzzing runs were not done her
 ### Harness results (measured)
 
 One binary; the Cranelift column is the default backend, the LLVM column is
-`RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`.
+`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`.
 
 | Harness | Cranelift | LLVM |
 |---|---|---|
@@ -681,11 +681,11 @@ One binary; the Cranelift column is the default backend, the LLVM column is
 | `stress.py` | 99/99, 0 restarts | 99/99, 0 restarts |
 | `breakers.py` | 63/63, 6 open | 63/63, 6 open |
 | `unwinds.py` | 8/8 | 8/8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71/71 (61 spliced, 10 full links) | 71/71 (61 spliced, 10 full links) |
+| `BLAZE_SPLICE=1 splices.py` | 71/71 (61 spliced, 10 full links) | 71/71 (61 spliced, 10 full links) |
 | `asmedits.py` | 10/10 | 10/10 |
 | `deps.py` | 10/10 | 10/10 |
 | `includes.py` | 9/9 | 9/9 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 62/62 | 62/62 |
+| `BLAZE_SPLICE=1 worktrees.py` | 62/62 | 62/62 |
 | `worktrees.py --join --together` | 62/62 | 62/62 |
 | `worktrees.py --overlay` | 71/71 | 71/71 |
 | `keys.py` | 46/46, 0 open | 46/46, 0 open |

@@ -22,7 +22,7 @@ What only rustc has is left out of the comparison and counted: a message worded 
 spans of an error) and `code.explanation`. A package without errors has to give
 `build-finished` with success true; rustc's `compiler-artifact` lines are not compared.
 
-RA_JIT_BIN (default target/release/ra-jit) is the ra-jit with `cargo-ra-jit` and `ra-jit-rustc`
+BLAZE_BIN (default target/release/ra-jit) is the ra-jit with `cargo-ra-jit` and `ra-jit-rustc`
 next to it. Exits 1 when anything compared differs.
 """
 import json, os, re, shutil, subprocess, sys, tempfile
@@ -30,7 +30,7 @@ import json, os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 EXE = ".exe" if os.name == "nt" else ""
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit" + EXE)
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit" + EXE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 ALLOW = "#![allow(unused, dead_code)]\n"
 
@@ -86,8 +86,8 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def env(home):
-    it = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_HOME=home, RUST_BACKTRACE="0")
-    it["RA_JIT_CACHE"] = os.path.join(home, "store")
+    it = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, RUST_BACKTRACE="0")
+    it["BLAZE_CACHE"] = os.path.join(home, "store")
     it["PATH"] = os.path.dirname(RA_JIT) + os.pathsep + it["PATH"]
     for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_TERM_COLOR"):
         it.pop(name, None)
@@ -240,7 +240,7 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     keep = "--keep" in sys.argv
     cases = {name: CASES[name] for name in (args or CASES)}
-    # Under /tmp on macOS: the checkers' sockets are in RA_JIT_HOME below, and under $TMPDIR
+    # Under /tmp on macOS: the checkers' sockets are in BLAZE_HOME below, and under $TMPDIR
     # (/var/folders/...) their paths pass the 104 bytes macOS has for one.
     work = tempfile.mkdtemp(prefix="check-json-", dir="/tmp" if sys.platform == "darwin" else None)
     home = os.path.join(work, "home")

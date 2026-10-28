@@ -21,13 +21,13 @@ construction and not by test.
 | `stress.py` | 99 of 99, 0 restarts | 99/99 |
 | `breakers.py` | 15 of 15, 1 open, 0 functions skipped | 15/15 |
 | `unwinds.py` | 8 of 8 | 8/8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71; 58 spliced, 13 full links | 71/71 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 52 of 52; 39 links spliced, 5 full | 52/52 |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71; 58 spliced, 13 full links | 71/71 |
+| `BLAZE_SPLICE=1 worktrees.py` | 52 of 52; 39 links spliced, 5 full | 52/52 |
 | `asmedits.py` | 10 of 10 | |
 | `deps.py` | 10 of 10 | |
 | `includes.py` | 9 of 9 | |
 
-Also run: `RA_JIT_SPLICE=1 programs.py` 22 of 22, and `splices.py` with `SPLICES_SOAK=100`,
+Also run: `BLAZE_SPLICE=1 programs.py` 22 of 22, and `splices.py` with `SPLICES_SOAK=100`,
 100 of 100 with all 100 spliced and the last binary the same as cargo's.
 
 Notes on those numbers:
@@ -60,7 +60,7 @@ Everything above ran on Cranelift, the default. The LLVM backend also builds and
 `brew install llvm@20`, then
 `LLVM_SYS_201_PREFIX=/opt/homebrew/opt/llvm@20 cargo build -p ra-jit --release --features llvm`
 (LLVM 20.1.8). Homebrew has since dropped `llvm@20`; the supported LLVM is now the flake's,
-the same 20.1.8 ([contributing.md](../contributing.md#llvm-for---features-llvm)). With `RA_JIT_BACKEND=llvm`, at the default `RA_JIT_OPT=2`:
+the same 20.1.8 ([contributing.md](../contributing.md#llvm-for---features-llvm)). With `BLAZE_BACKEND=llvm`, at the default `BLAZE_OPT=2`:
 
 | harness | result |
 |---|---|
@@ -69,8 +69,8 @@ the same 20.1.8 ([contributing.md](../contributing.md#llvm-for---features-llvm))
 | `stress.py` | 99 of 99, 0 restarts |
 | `breakers.py` | 15 of 15, 1 open |
 | `unwinds.py` | 8 of 8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71 (57 spliced, 14 full links) |
-| `RA_JIT_SPLICE=1 worktrees.py` | 52 of 52 |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71 (57 spliced, 14 full links) |
+| `BLAZE_SPLICE=1 worktrees.py` | 52 of 52 |
 | `asmedits.py` / `deps.py` / `includes.py` | 10 of 10 / 10 of 10 / 9 of 9 |
 
 The daemon logs of programs, stress, unwinds, asmedits, includes, splices and worktrees have
@@ -114,7 +114,7 @@ every call, which is where a panic unwinds, and wrong inside the prologue and ep
 which only matters to something that unwinds from an arbitrary instruction (a sampling
 profiler, a debugger).
 
-Not measured for LLVM: `RA_JIT_OPT` other than 0 and 2 (0 only through `backends.py`), edit
+Not measured for LLVM: `BLAZE_OPT` other than 0 and 2 (0 only through `backends.py`), edit
 latency against Cranelift, and the x86-64 side. The x86-64 path of the feature type-checks
 (`cargo check -p hir-ty --features llvm --target x86_64-apple-darwin`) and the ELF code in
 `emitted.rs` is the old code behind a format check, but it was not run.
@@ -175,7 +175,7 @@ and ra-jit's own objects are written the same way. Linux keeps the flag it had.
 
 The splice (`crates/ra-jit/src/splice/macho.rs`). The loader wants `__LINKEDIT` last and the
 signature at the end of it, so the patch goes where `__LINKEDIT` was, in two new segments
-(`__RA_JIT_TEXT` for code, constants, stubs and the unwind tables; `__RA_JIT_DATA` for writable
+(`__BLAZE_TEXT` for code, constants, stubs and the unwind tables; `__BLAZE_DATA` for writable
 data and address slots), and `__LINKEDIT` is written again behind them. That keeps W^X and
 16 KB pages. Calls out of `b`/`bl` range go through a stub. The rebase opcodes are encoded
 again to cover the new pointers. `__unwind_info` is rebuilt with the patch's functions and

@@ -981,7 +981,7 @@ pub(super) fn inline(
     clobber_abi: bool,
 ) -> Option<Inline> {
     static ASKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("RA_JIT_INLINE_ASM").is_none_or(|it| it != "0")
+        std::env::var_os("BLAZE_INLINE_ASM").is_none_or(|it| it != "0")
     });
     let jumps = operands.iter().any(|it| matches!(it, Operand::Label | Operand::Sym));
     if !*ASKED
@@ -1331,7 +1331,7 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, Strin
     Ok(code)
 }
 
-/// What turns the text of a block into an object file. `RA_JIT_ASSEMBLER=cc` picks the C
+/// What turns the text of a block into an object file. `BLAZE_ASSEMBLER=cc` picks the C
 /// compiler in a build with LLVM.
 #[derive(Clone, Copy)]
 enum Assembler {
@@ -1344,7 +1344,7 @@ enum Assembler {
 
 impl Assembler {
     fn selected() -> Assembler {
-        if std::env::var("RA_JIT_ASSEMBLER").as_deref() == Ok("cc") {
+        if std::env::var("BLAZE_ASSEMBLER").as_deref() == Ok("cc") {
             return Assembler::Cc;
         }
         #[cfg(feature = "llvm")]

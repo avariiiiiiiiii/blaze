@@ -5,7 +5,7 @@ and the Worker in this directory. v0 serves today's remote layout (packs/, keys/
 manifests/, deps/) per tenant. Slice 3 adds `/has`, `/get`, `/put` beside it (API.md).
 
 Base address of a tenant: `https://<gateway>/t/<tenant>/v3`. The client is given that base
-(`RA_JIT_REMOTE=blaze+https://<gateway>/t/<tenant>/v3`, `blaze+http://` for local tests) and
+(`BLAZE_REMOTE=blaze+https://<gateway>/t/<tenant>/v3`, `blaze+http://` for local tests) and
 puts objects at `<base>/<name>`.
 
 ## Names

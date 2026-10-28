@@ -1,7 +1,7 @@
 //! rustc's MIR optimizations, run on a [`MirPhase::Runtime`] body as rustc's
 //! `run_optimization_passes` runs them on its runtime MIR (`rustc_mir_transform` at 1.99.0,
 //! `compiler/rustc_mir_transform/src/lib.rs`). They are optional: the IDE and the interpreter
-//! never ask for them, and the code generator asks only when told to (`RA_JIT_MIR_OPT`).
+//! never ask for them, and the code generator asks only when told to (`BLAZE_MIR_OPT`).
 //!
 //! The level is rustc's `-Zmir-opt-level`: [`MirOptLevel::Debug`] is what rustc runs at
 //! `opt-level=0` (its level 1) and [`MirOptLevel::Release`] what it runs otherwise (its

@@ -42,7 +42,7 @@ this one in versions and in order.
 
 ## The gate at the merge
 
-Every harness below was run under Cranelift and then under LLVM (`RA_JIT_OPT=2 RA_JIT_EMIT=fast`)
+Every harness below was run under Cranelift and then under LLVM (`BLAZE_OPT=2 BLAZE_EMIT=fast`)
 on the merge with `ra-jit-collate` at `3d47ed59bf` (`bf8c5edbee`), one backend at a time, with the binary of
 `LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm`.
 
@@ -53,10 +53,10 @@ on the merge with `ra-jit-collate` at `3d47ed59bf` (`bf8c5edbee`), one backend a
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
 | `breakers.py` | 129 of 129, 7 open or left to rustc, 0 skipped | 129 of 129, 7 open or left to rustc, 0 skipped |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
 | `includes.py` | 9 of 9 | 9 of 9 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 62 of 62 | 62 of 62 |
+| `BLAZE_SPLICE=1 worktrees.py` | 62 of 62 | 62 of 62 |
 | `keys.py` | 46 of 46 | 46 of 46 |
 | `fuzz/fuzz.py smoke` | 2 programs, 505 functions, 0 differences | 2 programs, 505 functions, 0 differences |
 | `backends.py corpus runner cases --bin runner --levels 2f` | (LLVM only) | prints the same as cargo's |
@@ -151,7 +151,7 @@ cargo either) and 42 have one in which no function of the crate is reached. toki
 ```
 LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm
 cd harness
-RA_JIT_BIN=$PWD/../target/release/ra-jit CLEAN=1 JOBS=3 BACKENDS="cranelift llvm" \
+BLAZE_BIN=$PWD/../target/release/ra-jit CLEAN=1 JOBS=3 BACKENDS="cranelift llvm" \
     ./cratesweep.sh ~/sweep/out $(cat sweep1000.txt)
 ./sweepreport.py ~/sweep/out/cranelift
 ```

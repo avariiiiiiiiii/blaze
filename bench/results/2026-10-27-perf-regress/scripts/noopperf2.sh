@@ -10,8 +10,8 @@ out=/root/perf/noopperf2/$name; rm -rf "$out"; mkdir -p "$out"
 p=/root/perf/noopperf2-ws/$name; rm -rf "$p"; mkdir -p "$p"
 cp -r /root/ra-jit-projects/ripgrep "$p/rg"; rm -rf "$p/rg/target" "$p/rg/.git"
 tc=$(cat /root/perf/wt-build/harness/toolchain)
-export RA_JIT_HOME=$p/home RA_JIT_CACHE=$p/store RA_JIT_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
-export RA_JIT_STD_FROM=/root/perf/work/stdkey-cranelift/std-cranelift RUST_BACKTRACE=0 CARGO_TERM_COLOR=never
+export BLAZE_HOME=$p/home BLAZE_CACHE=$p/store BLAZE_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
+export BLAZE_STD_FROM=/root/perf/work/stdkey-cranelift/std-cranelift RUST_BACKTRACE=0 CARGO_TERM_COLOR=never
 export PATH=$bin:$PATH
 cd $p/rg
 taskset -c 0-3 cargo ra-jit build > $out/cold.out 2>&1; echo "cold exit $?"

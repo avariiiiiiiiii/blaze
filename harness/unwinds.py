@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """unwinds.py: a daemon follows edits to functions that a panic unwinds through.
 
-Unless RA_JIT_SPLICE=0 the edited functions are code added to the linked binary, which the unwinder
+Unless BLAZE_SPLICE=0 the edited functions are code added to the linked binary, which the unwinder
 has to find the frames of. Each step is compared with what `cargo build` of the same source prints.
 """
 from includes import follow

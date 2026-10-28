@@ -63,11 +63,11 @@ jobs:
       # rust-src: blaze's proc-macro server and the standard library are compiled from it.
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component rust-src && rustup default "$tc"
       # `cargo blaze --version` names the commit, as the flake's build does.
-      - run: echo "RA_JIT_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - run: echo "BLAZE_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
       # A release's builds fetch the standard library from the release's assets (the step
       # `Standard library` below; crates/ra-jit/src/shipped.rs).
       - if: github.ref_type == 'tag'
-        run: echo "RA_JIT_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+        run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
       # No build cache: release binaries come from a clean build. With the `llvm` feature, so
       # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
       # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a

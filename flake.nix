@@ -84,7 +84,7 @@
             # dx, for harness/hotpatch.py's subsecond (Dioxus hot-patching).
             pkgs.dioxus-cli
           ];
-          RA_JIT_NIGHTLY = "${nightly}";
+          BLAZE_NIGHTLY = "${nightly}";
           # A C compiler as a distribution ships it: the wrapper's _FORTIFY_SOURCE warns at the
           # -O0 of a debug build, which fails configure probes (jemalloc's, in fd).
           hardeningDisable = [ "all" ];
@@ -114,7 +114,7 @@
           pname = "ra-jit-dist";
           inherit version src;
           # `ra-jit --version` names the commit (a dirty tree has none of its own).
-          RA_JIT_GIT_SHA = self.shortRev or self.dirtyShortRev or "";
+          BLAZE_GIT_SHA = self.shortRev or self.dirtyShortRev or "";
           cargoLock.lockFile = ./Cargo.lock;
           # otool: build_release.py checks that no binary loads libLLVM.
           nativeBuildInputs = [ pkgs.python3 ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.cctools ];
@@ -197,10 +197,10 @@
         # `nix run github:indexable-inc/blaze#life`: the Game of Life window. On macOS on AArch64 the
         # daemon builds the copy and edits to it show up live; elsewhere the prebuilt window runs.
         life = pkgs.writeShellScriptBin "ra-jit-life" ''
-          export RA_JIT_LIFE_SOURCE=${lifeSource} RA_JIT_LIFE_VENDOR=${lifeVendor}
-          export RA_JIT_LIFE_DAEMON_BINS=${dist}/bin RA_JIT_LIFE_PREBUILT=${life-bin}/bin/life
-          export RA_JIT_LIFE_PATH=${rust}/bin${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":${pkgs.stdenv.cc}/bin"}
-          export RA_JIT_LIFE_LIBS=${libPath}
+          export BLAZE_LIFE_SOURCE=${lifeSource} BLAZE_LIFE_VENDOR=${lifeVendor}
+          export BLAZE_LIFE_DAEMON_BINS=${dist}/bin BLAZE_LIFE_PREBUILT=${life-bin}/bin/life
+          export BLAZE_LIFE_PATH=${rust}/bin${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":${pkgs.stdenv.cc}/bin"}
+          export BLAZE_LIFE_LIBS=${libPath}
           exec ${pkgs.python3}/bin/python3 -I ${./nix/life_launch.py} "$@"
         '';
       in {

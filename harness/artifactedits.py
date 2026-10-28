@@ -5,7 +5,7 @@ for each kind of artifact a package can ask for: a program (`bin`), a `cdylib`, 
 success over the bytes of before.
 
 usage: artifactedits.py [case ...] [--release] [--keep]
-       (RA_JIT_BIN names the ra-jit built; cargo-blaze is found next to it)
+       (BLAZE_BIN names the ra-jit built; cargo-blaze is found next to it)
 
 Each case is a workspace of two packages: `dep`, a library, and `top`, of the case's kind,
 which calls it. It is built cold, again with nothing changed, after an edit of a body of `dep`
@@ -200,12 +200,12 @@ def main():
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--keep", action="store_true")
     opts = parser.parse_args()
-    bin_dir = os.path.dirname(os.path.abspath(os.environ.get("RA_JIT_BIN", os.path.join(HERE, "../target/release/ra-jit"))))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "../target/release/ra-jit"))))
     if not os.path.exists(os.path.join(bin_dir, "cargo-blaze")):
         raise SystemExit(f"no cargo-blaze in {bin_dir}")
     root = tempfile.mkdtemp(prefix="rj-artifactedits-")
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-               RA_JIT_HOME=os.environ.get("RA_JIT_HOME") or os.path.join(root, "home"))
+               BLAZE_HOME=os.environ.get("BLAZE_HOME") or os.path.join(root, "home"))
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     wrong = {}

@@ -1,6 +1,6 @@
 //! Passed tests kept in the store, like compiled functions: a test that passed is not run again
 //! while nothing it is a function of has changed, on this machine or on any other that pulls
-//! the store from a remote (`ra-jit cache pull`, `RA_JIT_REMOTE`). Only a pass is kept as a
+//! the store from a remote (`ra-jit cache pull`, `BLAZE_REMOTE`). Only a pass is kept as a
 //! result; a failure is kept only to tell a flaky test, and never skips one.
 //!
 //! What a test is a function of is found in two steps, as a build cache finds what a step read.
@@ -42,7 +42,7 @@ const RESULTS: &str = "test results 1";
 const SETS: u8 = 4;
 
 /// Names where results kept by this command come from, in place of what CI says of the run.
-pub(crate) const FROM: &str = "RA_JIT_TESTS_FROM";
+pub(crate) const FROM: &str = "BLAZE_TESTS_FROM";
 
 pub(crate) type Key = [u8; 32];
 
@@ -87,7 +87,7 @@ pub(crate) struct Results {
 
 impl Results {
     /// The results of the store this command uses, `None` when it uses none
-    /// (`RA_JIT_CACHE=off`).
+    /// (`BLAZE_CACHE=off`).
     pub(crate) fn open() -> Option<Results> {
         ra_jit_store::compiles_against(RESULTS);
         let store = ra_jit_store::Store::global_or(super::daemon::store().as_deref())?;

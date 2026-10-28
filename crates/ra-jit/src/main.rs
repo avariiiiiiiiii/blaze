@@ -26,6 +26,7 @@ mod outline;
 mod plan;
 mod process;
 mod remote;
+mod renamed;
 mod sandbox;
 mod shipped;
 mod socket;
@@ -2741,7 +2742,7 @@ impl Checkouts {
         let base = self.splits[at].as_ref().map(|it| it.base.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
         // An override for measuring one against the other.
-        let level = match std::env::var("RA_JIT_DEBUGINFO").ok().as_deref() {
+        let level = match std::env::var("BLAZE_DEBUGINFO").ok().as_deref() {
             Some("0") => plan::Level::Nothing,
             Some("lines") => plan::Level::Lines,
             Some(_) => plan::Level::Full,
@@ -2953,7 +2954,7 @@ impl Checkouts {
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
         // A checkout like a loaded one shares the packages they have alike, unless told not to.
-        let share = std::env::var_os("RA_JIT_SPLIT").is_none_or(|it| it != "0");
+        let share = std::env::var_os("BLAZE_SPLIT").is_none_or(|it| it != "0");
         for project in projects {
             if share && let Some((base, over)) = self.alike(project) {
                 let own = self.differing(base, &over);
@@ -3004,7 +3005,7 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let files = start.elapsed() - workspaces_at;
             eprintln!(
                 "load-us: workspaces={} files={}",
@@ -3130,21 +3131,21 @@ impl Checkouts {
     }
 }
 
-/// Waits for `RA_JIT_RELOAD_PAUSE_MS` where a reload has the new workspaces of its checkouts
+/// Waits for `BLAZE_RELOAD_PAUSE_MS` where a reload has the new workspaces of its checkouts
 /// and the crates are still the old ones, and says so: what `harness/buildmodel.py` holds a
 /// reload at while it sends the requests that must not see the two mixed.
 fn pause_mid_reload() {
-    let pause = std::env::var("RA_JIT_RELOAD_PAUSE_MS").ok().and_then(|it| it.parse().ok());
+    let pause = std::env::var("BLAZE_RELOAD_PAUSE_MS").ok().and_then(|it| it.parse().ok());
     if let Some(pause) = pause {
         eprintln!("reload: paused");
         std::thread::sleep(Duration::from_millis(pause));
     }
 }
 
-/// Waits for `RA_JIT_LOAD_PAUSE_MS` where the workspace's files are read and their timestamps
+/// Waits for `BLAZE_LOAD_PAUSE_MS` where the workspace's files are read and their timestamps
 /// not taken yet, and says so: what `harness/loadedits.py` writes a file at.
 fn pause_after_load() {
-    let pause = std::env::var("RA_JIT_LOAD_PAUSE_MS").ok().and_then(|it| it.parse().ok());
+    let pause = std::env::var("BLAZE_LOAD_PAUSE_MS").ok().and_then(|it| it.parse().ok());
     if let Some(pause) = pause {
         eprintln!("load: paused");
         std::thread::sleep(Duration::from_millis(pause));
@@ -3420,7 +3421,7 @@ fn workspace_at(
         }
         workspace.set_build_scripts(build_scripts);
     }
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         let us = |it: Duration| it.as_micros();
         let (metadata, plan) = (us(metadata_at), us(planned_at - metadata_at));
         eprintln!(
@@ -3621,7 +3622,7 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: us
                             // come next.
                             _ = declared_in(&db, krate.into());
                         }
-                        if std::env::var_os("RA_JIT_STATS").is_some() {
+                        if std::env::var_os("BLAZE_STATS").is_some() {
                             let name = krate.extra_data(&db).display_name.as_ref();
                             let name = name.map(|it| it.to_string()).unwrap_or_default();
                             // What the heap grew by is this crate's when one thread resolves.
@@ -3863,7 +3864,7 @@ fn write_reach(
     if std::fs::write(&writing, text).and_then(|()| std::fs::rename(&writing, &file)).is_err() {
         _ = std::fs::remove_file(&file);
     }
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!("tests-reach-us: {}", start.elapsed().as_micros());
     }
 }
@@ -4231,7 +4232,7 @@ fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
             }
         }
     }
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!(
             "listing: name resolution {resolved:.1?}, scopes {:.1?}, {count} bodies {:.1?}",
             scopes - resolved,
@@ -4252,9 +4253,9 @@ fn functions_of_modules(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
 /// What scopes declare that has code.
 /// What rustc linked of the program, when the daemon's first edits are patches of it rather
 /// than of a build of its own: a daemon's, whose edits are spliced, of the files rustc built
-/// it from (`unwritten`). `RA_JIT_RUSTC_BASE=0` has the first build be the daemon's.
+/// it from (`unwritten`). `BLAZE_RUSTC_BASE=0` has the first build be the daemon's.
 fn rustcs_to_patch(args: &Args, unwritten: bool) -> Option<PathBuf> {
-    let off = std::env::var_os("RA_JIT_RUSTC_BASE").is_some_and(|it| it == "0");
+    let off = std::env::var_os("BLAZE_RUSTC_BASE").is_some_and(|it| it == "0");
     let spliced = args.splice.is_some() && args.patch.is_some() && args.link_cmd.is_some();
     let daemon = args.socket.is_some() && args.isolate.is_none();
     let rustcs = args.rustc_binary.as_ref().filter(|it| it.is_file());
@@ -5289,7 +5290,7 @@ fn build(
         offered: &offered,
     };
     let setup = start.elapsed();
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!("entries: {:.1?}", setup - list);
     }
     // Not dropped from the roots: what they share with the others has to stay with rustc too.
@@ -5354,7 +5355,7 @@ fn build(
         })
     };
     let codegen = start.elapsed();
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!(
             "roots: {setup:.1?}, revalidate: {:.1?}, compile: {:.1?}",
             revalidate - setup,
@@ -5616,7 +5617,7 @@ fn report(build: &Build) {
         build.codegen,
         build.emit,
     );
-    if let Some(path) = std::env::var_os("RA_JIT_SKIPPED") {
+    if let Some(path) = std::env::var_os("BLAZE_SKIPPED") {
         let all: String =
             build.skipped.iter().map(|(name, error)| format!("{name}: {error}\n")).collect();
         if let Err(error) = std::fs::write(&path, all) {
@@ -5694,7 +5695,7 @@ fn rustc_symbols(binary: &Path) -> Option<Arc<symbols::Linked>> {
         LinkedNames::Reading(thread) => {
             let start = Instant::now();
             let read = thread.join();
-            if std::env::var_os("RA_JIT_STATS").is_some() {
+            if std::env::var_os("BLAZE_STATS").is_some() {
                 eprintln!("rustc-symbols-us: waited={}", start.elapsed().as_micros());
             }
             match read {
@@ -5712,7 +5713,7 @@ fn rustc_symbols(binary: &Path) -> Option<Arc<symbols::Linked>> {
 }
 
 static SPLICING: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("RA_JIT_SPLICE").is_none_or(|it| it != "0"));
+    std::sync::LazyLock::new(|| std::env::var_os("BLAZE_SPLICE").is_none_or(|it| it != "0"));
 
 /// Why a patch of what rustc linked, or an object that names what only that has
 /// ([`ONTO_RUSTCS`]), was not spliced into it: the program is built in full and linked
@@ -5753,7 +5754,7 @@ impl std::error::Error for PatchUnlinked {}
 /// Brings an executable up to date with its objects. An edit that left the whole object alone
 /// is spliced into the executable at `splice`, which `--binary` names, when that is known from
 /// its last link; anything else, and whatever the splice declines, runs the link command, whose
-/// result is then known. `RA_JIT_SPLICE=0` has every edit linked in full. A patch of what rustc
+/// result is then known. `BLAZE_SPLICE=0` has every edit linked in full. A patch of what rustc
 /// linked (`over_rustc`) is spliced or fails with [`RustcLinkedLost`], and so is an object
 /// that names what only that executable has (`onto`, [`ONTO_RUSTCS`]). With `packs` the object
 /// is kept packed after the link ([`whole`]). A patch the splice declines whose line is the
@@ -5889,7 +5890,7 @@ fn link(
             live::publish(baseline, patch);
         }
         let superseded = old.filter(|_| !rewritten).and_then(Baseline::uuid);
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!("link-us: read={}", start.elapsed().as_micros());
         }
         let spliced = match known {
@@ -5915,7 +5916,7 @@ fn link(
             Some(Err(why)) => Err(why),
             None => Err(anyhow::anyhow!("no executable to add to")),
         };
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!("link-us: spliced={}", start.elapsed().as_micros());
         }
         match spliced {
@@ -6618,7 +6619,7 @@ const SURE: &[&str] = &[
     "unresolved-macro-call",
 ];
 
-/// The borrow checker's errors, which fail a build unless `RA_JIT_BORROWCK_REFUSE=0`:
+/// The borrow checker's errors, which fail a build unless `BLAZE_BORROWCK_REFUSE=0`:
 /// `borrowck` is rustc's errors without a code, as "lifetime may not live long enough".
 const BORROWCK: &[&str] = &[
     "E0309", "E0310", "E0311", "E0373", "E0381", "E0382", "E0384", "E0499", "E0500", "E0501",
@@ -6655,7 +6656,7 @@ fn broken_in(
 ) -> Option<errors::Said> {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
-    let refuse_borrowck = std::env::var_os("RA_JIT_BORROWCK_REFUSE").is_none_or(|it| it != "0");
+    let refuse_borrowck = std::env::var_os("BLAZE_BORROWCK_REFUSE").is_none_or(|it| it != "0");
     let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
@@ -6794,7 +6795,7 @@ fn errors_of(
     })
     .map(|it| (it.range, it.code.as_str(), it.message))
     .collect();
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         let (n, of) = asked_of.get();
         eprintln!("check: {file:?}: the bodies of {n} of {of} functions asked");
     }
@@ -7520,14 +7521,14 @@ fn let_go(db: &mut RootDatabase, builds: &Builds, programs: &[Program]) {
 /// monomorphized copies), the code of each instance and the bodies to inline. A worker's own
 /// base computes all of them for the whole program; kept, they were about 4.5 GB of reth's
 /// 13 GB live (#261). One let go is computed again if an edit asks for it, which only the
-/// first edit after a build in full does much of. `RA_JIT_LRU` (`mir=N,runtime=N,compiled=N,
+/// first edit after a build in full does much of. `BLAZE_LRU` (`mir=N,runtime=N,compiled=N,
 /// inlinable=N`) sets any of them; 0 keeps every value.
 fn memo_capacities(db: &mut RootDatabase) -> anyhow::Result<()> {
     let (mut mir, mut runtime, mut compiled, mut inlinable) = (2048, 2048, 16384, 8192);
-    let said = match std::env::var("RA_JIT_LRU") {
+    let said = match std::env::var("BLAZE_LRU") {
         Ok(said) => said,
         Err(std::env::VarError::NotPresent) => String::new(),
-        Err(why) => bail!("RA_JIT_LRU: {why}"),
+        Err(why) => bail!("BLAZE_LRU: {why}"),
     };
     for it in said.split(',').filter(|it| !it.trim().is_empty()) {
         let parsed =
@@ -7538,7 +7539,7 @@ fn memo_capacities(db: &mut RootDatabase) -> anyhow::Result<()> {
             Some(("compiled", n)) => compiled = n,
             Some(("inlinable", n)) => inlinable = n,
             _ => bail!(
-                "RA_JIT_LRU: `{it}` is not one of mir, runtime, compiled or inlinable = a number"
+                "BLAZE_LRU: `{it}` is not one of mir, runtime, compiled or inlinable = a number"
             ),
         }
     }
@@ -7633,7 +7634,7 @@ fn end_link() {
 }
 
 /// Reading a loaded checkout from another place is long when the build takes more than this,
-/// or than `RA_JIT_SLOW_SWITCH_MS`.
+/// or than `BLAZE_SLOW_SWITCH_MS`.
 const SLOW_SWITCH: Duration = Duration::from_secs(2);
 
 /// A checkout that is long to turn to or from this many times running is loaded instead.
@@ -7658,11 +7659,11 @@ struct Running {
 const OWN_BASE_AFTER: Duration = Duration::from_secs(1);
 
 /// Bytes the daemon may hold while it builds a base of its own, which no edit waits for:
-/// what `RA_JIT_OWN_BASE_MEMORY` says (a size, or `off` for no bound), else a quarter of the
+/// what `BLAZE_OWN_BASE_MEMORY` says (a size, or `off` for no bound), else a quarter of the
 /// machine's memory. What the build computed stays, so the bound is on what the daemon keeps
 /// after it.
 fn own_base_budget() -> Option<u64> {
-    match std::env::var("RA_JIT_OWN_BASE_MEMORY") {
+    match std::env::var("BLAZE_OWN_BASE_MEMORY") {
         Ok(it) if it == "off" => None,
         it => it
             .ok()
@@ -8089,25 +8090,12 @@ pub(crate) fn end_with_reader() {
     }
 }
 
-/// Takes each `BLAZE_<NAME>` for the `RA_JIT_<NAME>` the code reads, over it when both are
-/// set: the settings are named for blaze from its rename on, and keep their old names too.
-/// The programs this one starts see both.
-fn take_blaze_names() {
-    for (name, value) in std::env::vars_os() {
-        let Some(rest) = name.to_str().and_then(|it| it.strip_prefix("BLAZE_")) else {
-            continue;
-        };
-        // SAFETY: before any thread is started.
-        unsafe { std::env::set_var(format!("RA_JIT_{rest}"), value) };
-    }
-}
-
 /// `blaze 0.20261026.0 (fb82b09)`: the crate's version (`0.YYYYMMDD.N`, the release train's,
-/// docs/harness.md "CI"), and the commit, which build.rs takes from `RA_JIT_GIT_SHA` (the
+/// docs/harness.md "CI"), and the commit, which build.rs takes from `BLAZE_GIT_SHA` (the
 /// release workflow and the flake set it) or the checkout's HEAD.
 pub(crate) fn version() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    match option_env!("RA_JIT_GIT_SHA") {
+    match option_env!("BLAZE_GIT_SHA") {
         Some(sha) if !sha.is_empty() => format!("blaze {version} ({sha})"),
         _ => format!("blaze {version}"),
     }
@@ -8119,18 +8107,18 @@ fn main() -> anyhow::Result<()> {
         sandbox::command(std::env::args_os().skip(2));
     }
     trace::began();
-    take_blaze_names();
-    if let Some(sources) = option_env!("RA_JIT_SOURCES") {
+    renamed::refuse_old_settings();
+    if let Some(sources) = option_env!("BLAZE_SOURCES") {
         ra_jit_store::built_from(sources);
     }
-    syntax::set_green_trees(std::env::var_os("RA_JIT_GREEN_TREES").is_some());
+    syntax::set_green_trees(std::env::var_os("BLAZE_GREEN_TREES").is_some());
     project_model::answer_toolchain_questions_with(answers::ask);
     // A build script runs ra-jit as its `RUSTC`, whose load asks what it asks
     // rustc of [`answers`].
     if as_rustc::is_me() {
         as_rustc::command();
     }
-    let stands_in_for_rustc = std::env::var_os("RA_JIT_WRAPS_RUSTC").is_some();
+    let stands_in_for_rustc = std::env::var_os("BLAZE_WRAPS_RUSTC").is_some();
     if let Some(replayed) = doctest::replay() {
         return replayed;
     }
@@ -8214,7 +8202,7 @@ fn main() -> anyhow::Result<()> {
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
         std::thread::spawn(end_with_input);
     }
-    if std::env::var_os("RA_JIT_WRAPS_RUSTC").is_some() {
+    if std::env::var_os("BLAZE_WRAPS_RUSTC").is_some() {
         return stub::command(std::env::args_os().skip(1));
     }
     if std::env::args().nth(1).as_deref() == Some("--check") {
@@ -8943,7 +8931,7 @@ fn run(args: Args, doc: Option<&doctest::Libraries>) -> anyhow::Result<()> {
     run_holding(args, doc, None, false)
 }
 
-/// The remote `RA_JIT_REMOTE` names once the pull a load starts beside itself is over.
+/// The remote `BLAZE_REMOTE` names once the pull a load starts beside itself is over.
 fn pulled(
     pulling: std::thread::JoinHandle<anyhow::Result<Option<remote::Shared>>>,
 ) -> anyhow::Result<Option<remote::Shared>> {
@@ -9090,7 +9078,7 @@ fn run_holding(
     }
     let following_at = start.elapsed();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         let (loaded, toolchain) = (loaded_at.as_micros(), (following_at - loaded_at).as_micros());
         let cargo = (start.elapsed() - following_at).as_micros();
         eprintln!("load-us: loaded={loaded} toolchain={toolchain} cargo={cargo}");
@@ -9137,7 +9125,7 @@ fn run_holding(
     if checkouts.lto(&args.project)? {
         linked_from_libraries(&db, &args)?;
     }
-    // Only a remote the build requires (RA_JIT_REMOTE_REQUIRED) is waited for: its failure is
+    // Only a remote the build requires (BLAZE_REMOTE_REQUIRED) is waited for: its failure is
     // the build's.
     let (mut pulling, mut shared) = (Some(shared), None);
     if remote::required() {
@@ -9583,7 +9571,7 @@ fn run_holding(
         tier::watch(move |ask| _ = sender.send(Event::Tier(ask)));
     } else if serving {
         eprintln!(
-            "tier: off (RA_JIT_TIER=off, blaze built without `--features llvm`, or not macOS \
+            "tier: off (BLAZE_TIER=off, blaze built without `--features llvm`, or not macOS \
              on AArch64)"
         );
     }
@@ -9605,7 +9593,7 @@ fn run_holding(
         moved: false,
         own_lines: FxHashMap::default(),
     }];
-    let overlay = match std::env::var("RA_JIT_OVERLAY").as_deref() {
+    let overlay = match std::env::var("BLAZE_OVERLAY").as_deref() {
         Ok("0") => Overlay::Never,
         Ok(_) => Overlay::Always,
         Err(_) => Overlay::Quick,
@@ -9636,7 +9624,7 @@ fn run_holding(
     // The ones whose link failed: what rustc built of one lacks what the object of the
     // checkout it was read as takes from what rustc built of that.
     let unlinked: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::default();
-    let slow_switch = std::env::var("RA_JIT_SLOW_SWITCH_MS")
+    let slow_switch = std::env::var("BLAZE_SLOW_SWITCH_MS")
         .ok()
         .and_then(|it| it.parse().ok())
         .map_or(SLOW_SWITCH, Duration::from_millis);
@@ -10470,14 +10458,14 @@ fn run_holding(
                     .for_each(|it| it.known.forget_rustc_for(why));
             }
             if bodies_only {
-                if std::env::var_os("RA_JIT_STATS").is_some() {
+                if std::env::var_os("BLAZE_STATS").is_some() {
                     eprintln!("bodies only: {file:?}");
                 }
                 programs.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
                 continue;
             }
             if let Some((crates, files)) = added {
-                if std::env::var_os("RA_JIT_STATS").is_some() {
+                if std::env::var_os("BLAZE_STATS").is_some() {
                     eprintln!("functions added: {file:?}");
                 }
                 programs.iter_mut().for_each(|it| it.known.touch_added(&db, &crates, &files));
@@ -10497,7 +10485,7 @@ fn run_holding(
             listed.touch(&db, Some(&moved));
         }
         let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!(
                 "apply-us: change={} outlines={} rest={}",
                 applied_change.as_micros(),
@@ -10574,7 +10562,7 @@ fn run_holding(
                             }
                             if let Some(held) = over() {
                                 eprintln!(
-                                    "not compiling the program for edits to patch any more: it holds {} MB, more than the {} MB it may (RA_JIT_OWN_BASE_MEMORY), and edits go on patching what rustc linked: {krate}",
+                                    "not compiling the program for edits to patch any more: it holds {} MB, more than the {} MB it may (BLAZE_OWN_BASE_MEMORY), and edits go on patching what rustc linked: {krate}",
                                     held >> 20,
                                     budget >> 20
                                 );
@@ -10662,7 +10650,7 @@ fn run_holding(
             }
             listed.touch(&db, Some(&late));
         };
-        if std::env::var_os("RA_JIT_QUERIES").is_some() {
+        if std::env::var_os("BLAZE_QUERIES").is_some() {
             let ran: Vec<String> = ide_db::executions::take(&db)
                 .iter()
                 .take(400)
@@ -11230,7 +11218,7 @@ impl Program {
                 scope.spawn(move || {
                     let start = Instant::now();
                     let broken = broken_in(&db, edited, paths, root, within, lints);
-                    if std::env::var_os("RA_JIT_STATS").is_some() {
+                    if std::env::var_os("BLAZE_STATS").is_some() {
                         eprintln!("check-us: {}", start.elapsed().as_micros());
                     }
                     broken
@@ -11309,7 +11297,7 @@ impl Program {
         failed = failed.or_else(|| stale_copies(db, table, args).map(Refused::Cargos));
         let copies = start.elapsed();
         let now = hir::attach_db(db, || Tests::of(db, listed, args, tests_now));
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let us = |it: Duration| it.as_micros();
             eprintln!(
                 "refuse-us: out_of_date={} refusal={} copies={} tests={}",
@@ -11451,7 +11439,7 @@ impl Program {
                 ("link", total - checked),
             ]
         };
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let steps: Vec<String> =
                 steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
             eprintln!("timeline-us: {}", steps.join(" "));

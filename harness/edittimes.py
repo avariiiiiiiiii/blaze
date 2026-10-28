@@ -10,7 +10,7 @@ every run: the time `ra-jit sync` took (compiling, and linking or splicing), wha
 link or the splice was by the daemon's log, and the time the program then took to run. Every
 run is printed, so that nothing is a median of unseen numbers.
 
-With RA_JIT_TARGET the program runs under an emulator: its run time is the emulator's, not
+With BLAZE_TARGET the program runs under an emulator: its run time is the emulator's, not
 that of the target's hardware. The daemon and the linker are the host's own programs.
 """
 import os, re, shlex, shutil, statistics, subprocess, sys, tempfile, time

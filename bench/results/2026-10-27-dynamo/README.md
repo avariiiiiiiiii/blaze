@@ -43,7 +43,7 @@ proc macro `macro_rules_attribute-proc_macro 0.2.2`, of which 3 functions do not
 frontend (`frontend: mir: UnresolvedMethod("vec")`, `("flat_map")`, `("vec")`). The crate
 defines `impl<T: IntoIterator> CollectVec for T {}` inside the body of the trait's own default
 method, and a method call outside that block does not find the impl. The 10-line repro is on
-#771. Expanding natively (`RA_JIT_PROC_MACRO_WASM=0`, with blaze-proc-macro-srv beside ra-jit)
+#771. Expanding natively (`BLAZE_PROC_MACRO_WASM=0`, with blaze-proc-macro-srv beside ra-jit)
 fails the same way, because ra-jit links the proc macro there too. The blaze dev cold time
 includes downloading blaze's toolchain (6.4 s) and a crates.io retry.
 

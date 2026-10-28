@@ -19,7 +19,7 @@ the merge gate and the release train, and the train's verdict queues it or says 
                             issue
     blocked FILE [--date D] open or update the issue with what FILE says failed
 
-git pushes with the checkout's token, RA_JIT_BOT_TOKEN, since a push with GITHUB_TOKEN starts no
+git pushes with the checkout's token, BLAZE_BOT_TOKEN, since a push with GITHUB_TOKEN starts no
 workflow; gh (GH_TOKEN) is GITHUB_TOKEN, which may open and comment on pull requests and issues
 where the bot's token may not. A pull request GITHUB_TOKEN opens starts no workflow either, so it
 is opened before the bot pushes the answers, whose push runs the gate on it. Python 3.11+,

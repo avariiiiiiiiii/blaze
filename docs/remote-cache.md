@@ -9,8 +9,8 @@ index-write check, the refresh inside head writes, the 80-day location expiry, a
 rules (API.md "Index", `bench/remote-cache/index-v1.tsv`). One deviation: the refresh rewrites each
 old object onto its own name through the R2 binding (a streamed get and put, R2 checking the MD5 or
 SHA-256), not S3 `CopyObject`, since no R2 S3 credential is readable to the Worker; measured live, a
-rewrite moves the upload date. The client speaks v0: `RA_JIT_REMOTE=blaze+https://<gateway>/t/<tenant>/v3`
-with `RA_JIT_REMOTE_TOKEN` pushes and pulls today's packs through the gateway
+rewrite moves the upload date. The client speaks v0: `BLAZE_REMOTE=blaze+https://<gateway>/t/<tenant>/v3`
+with `BLAZE_REMOTE_TOKEN` pushes and pulls today's packs through the gateway
 ([#525](https://github.com/indexable-inc/blaze/pull/525), `bench/remote-cache/e2e-client.tsv`), and
 `.github/actions/blaze-remote` is CI's step for it (pull on every run, push from main after the
 tests), which goes into the merge gate once the gate builds with blaze and a release contains the
@@ -35,7 +35,7 @@ shared remote CI fills, and rules out sccache. This file is the design of that s
 how CI on main fills it, how CI on every branch and any user reads it, and how nobody else can
 put code in it. It builds on [cache.md](cache.md) (the store and today's remote), on
 [ci-runner.md](ci-runner.md) (test results keyed by content) and on [cargo.md](cargo.md) (the
-sandbox and `RA_JIT_TESTS=affected`).
+sandbox and `BLAZE_TESTS=affected`).
 
 ## Short version
 
@@ -134,14 +134,14 @@ From [cache.md](cache.md) and `crates/ra-jit/src/remote.rs` (**read**):
   `packs/<sha256>.pack` (or `.pack.zst`), `keys/<sha256>` (the keys in one pack),
   `manifests/<project>` (one line per pack) and `units/`, `deps/` for cargo's dependency builds.
 - A pack is named by the SHA-256 of its bytes and checked after the fetch. The manifest is the one
-  mutable object; it is signed with Ed25519 when `RA_JIT_REMOTE_SIGN` is set, carries a turn
+  mutable object; it is signed with Ed25519 when `BLAZE_REMOTE_SIGN` is set, carries a turn
   number that only goes up, and a machine refuses a turn lower than one it took (`signed.rs`).
-- A daemon with `RA_JIT_REMOTE` pulls before its first build (all packs, or with
-  `RA_JIT_REMOTE_LAZY` only the key lists and then a pack when a key in it is first asked for),
+- A daemon with `BLAZE_REMOTE` pulls before its first build (all packs, or with
+  `BLAZE_REMOTE_LAZY` only the key lists and then a pack when a key in it is first asked for),
   and pushes every five minutes and when it ends (`keeper.rs`).
 - A fetch that fails its hash is thrown away, reported, and the functions are compiled again.
 - Real S3 was never run: everything was measured against MinIO and SeaweedFS over loopback.
-- No workflow in `.github/workflows` sets `RA_JIT_REMOTE` (**read**). CI fills no remote today.
+- No workflow in `.github/workflows` sets `BLAZE_REMOTE` (**read**). CI fills no remote today.
 
 The identity every store key is hashed with is `Identity(FORMAT, build, toolchain)`
 (`crates/ra-jit-store/src/lib.rs`, **read**). `build` is a hash of every source file of the
@@ -739,13 +739,13 @@ per head. `ed25519-dalek` does the checks (2.2 in the workspace today).
 
 ### Private tiers are tenants
 
-`RA_JIT_REMOTE` becomes a list of tenants, read in order; the shared one is the default last
+`BLAZE_REMOTE` becomes a list of tenants, read in order; the shared one is the default last
 entry:
 
-    RA_JIT_REMOTE="https://cache.<domain>/t/acme?token=env:ACME_CACHE_TOKEN&trust=acme-root-1:<pubkey>,shared"
+    BLAZE_REMOTE="https://cache.<domain>/t/acme?token=env:ACME_CACHE_TOKEN&trust=acme-root-1:<pubkey>,shared"
 
 Each entry has its own trust: `shared` is the `blaze` tenant with the root key compiled into blaze;
-a private tenant names its root key in the address (`trust=`) or in `RA_JIT_REMOTE_TRUST`, and its
+a private tenant names its root key in the address (`trust=`) or in `BLAZE_REMOTE_TRUST`, and its
 token by the environment variable that holds it, never inline. The client sends the token as
 `Authorization: Bearer`, never in a URL, so it stays out of logs and caches. The address can be
 another gateway (`blaze-gateway-server`, self-hosted) as well as ours. A machine writes only to a
@@ -759,7 +759,7 @@ entry off.
 ### What happens when the daemon starts
 
 1. **Before the workspace loads**: fetch the tenant's key list and the project head. The project
-   is the checkout's `RA_JIT_PROJECT`, else a name derived from its git remote; the head is that
+   is the checkout's `BLAZE_PROJECT`, else a name derived from its git remote; the head is that
    of the merge base of `HEAD` with main, else the newest of the first 50 first-parent ancestors,
    else `latest`: one `POST /t/<tenant>/heads` with all 52 names. Two requests, each a round trip
    to the nearest Cloudflare location (tens of milliseconds, **unverified**).
@@ -770,16 +770,16 @@ entry off.
 4. **Plan**: the union of blobs the segments name, minus what the local store has, in the
    segments' order (which is crate and walk order), cut into batches of about 4 to 20 MB of
    expected compressed size.
-5. **Fetch**: 16 `POST /get` in flight (`RA_JIT_REMOTE_JOBS`, default 16). Each response is
+5. **Fetch**: 16 `POST /get` in flight (`BLAZE_REMOTE_JOBS`, default 16). Each response is
    decompressed frame by frame as it streams, each blob hashed against its name, and written
    into the local store.
 6. **Meanwhile** rust-analyzer loads the workspace (52 s cold for nushell, **read**,
    [ci-runner.md](ci-runner.md)). Store lookups during the load and the first build
    find what has arrived; a key whose blob is still in flight waits on that part rather than
-   compiling it (the store's existing hook, `fetch_missing_with`, used by `RA_JIT_REMOTE_LAZY`
+   compiling it (the store's existing hook, `fetch_missing_with`, used by `BLAZE_REMOTE_LAZY`
    today).
 
-The lazy mode stays: with `RA_JIT_REMOTE_LAZY` step 5 fetches only what a build asks for. With a
+The lazy mode stays: with `BLAZE_REMOTE_LAZY` step 5 fetches only what a build asks for. With a
 project head the full prefetch is the default, since the head names what main's build actually
 used.
 
@@ -887,7 +887,7 @@ is a different matter: that is a bug or an attack, and must be seen and fixed.
 
 | failure | what blaze does |
 |---|---|
-| a tier cannot be reached (DNS, connect, timeout, a 5xx from the gateway after retries) | locally: the build goes on without that tier, and **every** build's `Finished` line says so (`[ra-jit, remote down: cache.<domain>: timed out]`), not one line in a log. With `RA_JIT_REMOTE_REQUIRED=1`, which blaze's own CI sets, it is an error and the job fails |
+| a tier cannot be reached (DNS, connect, timeout, a 5xx from the gateway after retries) | locally: the build goes on without that tier, and **every** build's `Finished` line says so (`[ra-jit, remote down: cache.<domain>: timed out]`), not one line in a log. With `BLAZE_REMOTE_REQUIRED=1`, which blaze's own CI sets, it is an error and the job fails |
 | a blob that does not hash to its name | error, naming the object, the tier and the head; after one retry that asks the gateway to bypass its edge cache. Today the build compiles those functions instead; that changes to an error |
 | a head or key list with a bad signature, an unknown, revoked or expired key | error, naming the head and the key |
 | a head with an older turn than this machine has seen | the edge cache may hold a head for 60 s at a location the write did not purge, so: fetch it again asking the gateway to bypass the edge cache. If that answer is still older, error (a rollback); if it is not, go on with it. A key list older than the release's minimum turn or the remembered one is an error at once |
@@ -899,7 +899,7 @@ is a different matter: that is a bug or an attack, and must be seen and fixed.
 | the local disk fills while fetching | as today: `store: nothing more is kept of this build`, and the build goes on |
 | the write job fails | main's train run fails, with the step and the request |
 
-Each error says how to go on: `RA_JIT_REMOTE=off` for this command, or the tier to drop from the
+Each error says how to go on: `BLAZE_REMOTE=off` for this command, or the tier to drop from the
 list.
 
 Why not stop on an unreachable tier by default too: a developer on a train with the shared tier
@@ -1136,11 +1136,11 @@ Ranked by what each gives. Each slice lands on its own and is measured.
 6. **Compression.** The upload level and the dictionaries, measured against level 3 in 128 KB
    blocks, on blaze's workspace and nushell.
 7. **Test passes.** Slice R2 of [ci-runner.md](ci-runner.md) writes its records into this index;
-   flake entries; `RA_JIT_TESTS=affected` reads them, so a branch skips what main passed.
+   flake entries; `BLAZE_TESTS=affected` reads them, so a branch skips what main passed.
 8. **Drivers.** The socket effects on `Uring`, and HTTP/3 over `quiche`, each kept only if it
    measures faster where it is meant to.
 9. **Private tenants.** Registration (tenant id, root key), tokens, per-tenant limits, the
-   tenant list in `RA_JIT_REMOTE`, and the threat model's examples as end-to-end tests: a second
+   tenant list in `BLAZE_REMOTE`, and the threat model's examples as end-to-end tests: a second
    tenant probing the first's planted secret, fixture and unit head gets only 404s, with timing
    that does not separate them.
 
@@ -1156,7 +1156,7 @@ first rule would expire what a head names.
   effect type so the network lives outside `blaze-core`?
 - **Is reading the shared tier on by default** for released blaze builds? On by default is what
   makes everyone benefit; it also tells Cloudflare and us which dependency units a machine builds
-  (the unit keys it asks for, and the address it asks from). Proposed: on, with `RA_JIT_REMOTE=off`,
+  (the unit keys it asks for, and the address it asks from). Proposed: on, with `BLAZE_REMOTE=off`,
   and said in the install docs.
 - **Should an unreachable tier stop a local build**, as it stops CI? Proposed: no, with the status
   on every `Finished` line; the no-fallback rule could be read either way.
@@ -1189,7 +1189,7 @@ first rule would expire what a head names.
   a hash of the codegen crates, so a developer's codegen experiment never lands in their own
   store under the released version's keys?
 - **Sampled rebuilds on clients**: should a client be able to recompile a fraction of what it
-  fetched and compare (`RA_JIT_REMOTE_VERIFY=sample`), for users who trust CI less than we do?
+  fetched and compare (`BLAZE_REMOTE_VERIFY=sample`), for users who trust CI less than we do?
   Needs per-function determinism, which the golden check gives.
 - **Windows and macOS**: CI on main runs Linux x64 and arm64 and macOS arm64 (`train.yaml`,
   **read**). Each target is its own set of heads; is macOS arm64 filled from the start?

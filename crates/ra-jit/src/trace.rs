@@ -1,7 +1,7 @@
 //! Where the time of a build goes: spans of the client, the daemon and the worker on one
 //! clock, always recorded. The worker sends its own with its answer, the daemon adds its
-//! own, and the client puts them together. `RA_JIT_STATS` prints a line and a table that
-//! adds up to the client's wall time; `RA_JIT_TRACE=<path>` writes them as a Chrome trace
+//! own, and the client puts them together. `BLAZE_STATS` prints a line and a table that
+//! adds up to the client's wall time; `BLAZE_TRACE=<path>` writes them as a Chrome trace
 //! (ui.perfetto.dev opens it).
 //!
 //! A span with a `level` is a step of the build: one level is inside the one above it
@@ -297,10 +297,10 @@ pub(crate) fn breakdown(spans: &[Span], start_us: u64, end_us: u64) -> Vec<(Stri
 }
 
 /// What the client says at the end of a build the daemon made, with all the spans of it:
-/// a line and a table with `RA_JIT_STATS`, a Chrome trace with `RA_JIT_TRACE`.
+/// a line and a table with `BLAZE_STATS`, a Chrome trace with `BLAZE_TRACE`.
 pub(crate) fn finish() {
-    let stats = std::env::var_os("RA_JIT_STATS").is_some();
-    let trace = std::env::var_os("RA_JIT_TRACE").filter(|it| !it.is_empty());
+    let stats = std::env::var_os("BLAZE_STATS").is_some();
+    let trace = std::env::var_os("BLAZE_TRACE").filter(|it| !it.is_empty());
     if !stats && trace.is_none() {
         return;
     }

@@ -4,7 +4,7 @@
 An unchanged refusal must still fail, and changing the refused flag must report the new
 flag. Removing or rewriting the configuration then has to build and run without stopping
 the daemon. Both cargo configuration filenames and a configuration above the workspace
-are covered. RA_JIT_BIN names the compiler, with cargo-ra-jit beside it.
+are covered. BLAZE_BIN names the compiler, with cargo-ra-jit beside it.
 """
 import os, re, shutil, subprocess, tempfile
 

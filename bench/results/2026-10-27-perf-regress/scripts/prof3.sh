@@ -14,8 +14,8 @@ git -C $wt checkout -q --force --detach "$rev"
 tc=$(cat $wt/harness/toolchain)
 rustup toolchain install "$tc" --profile minimal -c rust-src >/dev/null 2>&1
 std=$(ls -d /root/perf/work/*-cranelift/std-cranelift 2>/dev/null | head -1)
-export RA_JIT_HOME=$p/home RA_JIT_CACHE=$p/store RA_JIT_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
-export RA_JIT_STD_FROM=$std RA_JIT_STATS=1 RUST_BACKTRACE=0 CARGO_TERM_COLOR=never
+export BLAZE_HOME=$p/home BLAZE_CACHE=$p/store BLAZE_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
+export BLAZE_STD_FROM=$std BLAZE_STATS=1 RUST_BACKTRACE=0 CARGO_TERM_COLOR=never
 export PATH=$bin:$PATH
 cd $p/rg
 f=crates/core/main.rs; cp $f $f.orig
@@ -41,8 +41,8 @@ edit; echo "strace-daemon body $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null
 undo; echo "strace-daemon body back $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null)" | tee -a $out/times.txt
 echo "strace-daemon noop $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null)" | tee -a $out/times.txt
 sleep 0.5; kill -INT $sp; wait $sp
-for w in $RA_JIT_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log 2>/dev/null; done
-cp $RA_JIT_HOME/*.log $out/ 2>/dev/null
-ls -la $RA_JIT_HOME > $out/home-ls.txt
+for w in $BLAZE_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log 2>/dev/null; done
+cp $BLAZE_HOME/*.log $out/ 2>/dev/null
+ls -la $BLAZE_HOME > $out/home-ls.txt
 cargo ra-jit stop >/dev/null 2>&1
 echo done

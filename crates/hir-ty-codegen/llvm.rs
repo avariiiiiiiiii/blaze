@@ -331,9 +331,9 @@ fn compiled(
             }
             Ok::<_, Unhandled>((by_id, failed))
         })?;
-        // `RA_JIT_DUMP_LLVM=after` prints the IR as the passes left it, anything else as it
+        // `BLAZE_DUMP_LLVM=after` prints the IR as the passes left it, anything else as it
         // goes in.
-        let dump = std::env::var("RA_JIT_DUMP_LLVM").ok();
+        let dump = std::env::var("BLAZE_DUMP_LLVM").ok();
         if dump.as_deref().is_some_and(|it| it != "after") {
             eprintln!("{}", module.print_to_string().to_string_lossy());
         }
@@ -823,10 +823,10 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
 /// 2 to 5% more code and no more compile time; 1000 is no faster (1.079) for twice the code.
 const INLINE_THRESHOLD: u32 = 500;
 
-/// [`INLINE_THRESHOLD`], or `RA_JIT_LLVM_INLINE_THRESHOLD=N` to measure another. The store's
+/// [`INLINE_THRESHOLD`], or `BLAZE_LLVM_INLINE_THRESHOLD=N` to measure another. The store's
 /// key has it, as code inlined at another threshold is other code.
 pub(super) fn inline_threshold() -> u32 {
-    std::env::var("RA_JIT_LLVM_INLINE_THRESHOLD").map_or(INLINE_THRESHOLD, |it| {
+    std::env::var("BLAZE_LLVM_INLINE_THRESHOLD").map_or(INLINE_THRESHOLD, |it| {
         it.parse().unwrap_or_else(|_| panic!("BLAZE_LLVM_INLINE_THRESHOLD={it} is not a number"))
     })
 }

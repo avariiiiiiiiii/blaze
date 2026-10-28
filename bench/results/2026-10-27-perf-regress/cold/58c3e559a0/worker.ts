@@ -276,6 +276,6 @@
 1793144813.946868142 not found: [("no entry", 26569)]
 1793144813.947589790 manifest: kept, 2 files, 69733840 bytes (1.6s)
 1793144814.044783410 watching 135 files
-1793144814.045523008 tier: off (RA_JIT_TIER=off, blaze built without `--features llvm`, or not macOS on AArch64)
+1793144814.045523008 tier: off (BLAZE_TIER=off, blaze built without `--features llvm`, or not macOS on AArch64)
 1793144814.046254707 request: sync at_us=1793144814045225
 1793144814.201716721 request: sync at_us=1793144814200887

@@ -6,14 +6,14 @@ step J1).
 ra-jit builds the server of `vendor/proc-macro-srv` (`--exe`), and each proc-macro crate a
 package of serde, thiserror, tokio and clap depends on as a shared library with the list of
 its macros in it (`--exe` with `--shared`, step J2). It then builds the package with
-`RA_JIT_PROC_MACRO_COMPARE` naming that server (crates/ra-jit-expand/src/compare.rs): each
+`BLAZE_PROC_MACRO_COMPARE` naming that server (crates/ra-jit-expand/src/compare.rs): each
 call the toolchain's server expands with rustc's library, derives with helper attributes,
 attributes and function-like macros, is expanded again by ra-jit's server with ra-jit's
 library, and every output has to be the toolchain's, spans and all.
 
 Then the package is built whole by ra-jit into its own target directory (`--own-target`) and
 run, twice: once as before, where the load's `cargo check --compile-time-deps` has rustc build
-the proc macros, and once with `RA_JIT_PROC_MACRO_SERVER` naming the server, where ra-jit links
+the proc macros, and once with `BLAZE_PROC_MACRO_SERVER` naming the server, where ra-jit links
 each of them (crates/ra-jit/src/cargo/own_macro.rs) and that server expands with them. Each
 program has to print what cargo's does, and the proc-macro libraries in the target directory
 have to be all rustc's, then all ra-jit's. Every build shares one store: the package whole,
@@ -173,7 +173,7 @@ mod tests {
 # The proc-macro crates the package's build expands with, by package.
 MACRO_CRATES = {"serde_derive", "thiserror-impl", "tokio-macros", "clap_derive"}
 # The name of the static ra-jit lists a proc-macro library's macros in.
-LIST = b"RA_JIT_PROC_MACROS"
+LIST = b"BLAZE_PROC_MACROS"
 # The bench apps it measures: the crate ra-jit is asked for and the program it links.
 APPS = {"fd": ("fd", "fd"), "bat": ("bat", "bat"), "hyperfine": ("hyperfine", "hyperfine"),
         "just": ("just", "just"), "nushell": ("nu", "nu"), "helix": ("hx", "hx")}
@@ -322,7 +322,7 @@ def wired(work, root, meta, units, server):
     for named in (False, True):
         # A target directory of its own is seeded from cargo's, whose proc macros are rustc's.
         shutil.rmtree(os.path.join(root, "target"), ignore_errors=True)
-        env = {"RA_JIT_PROC_MACRO_SERVER": server if named else "0"}
+        env = {"BLAZE_PROC_MACRO_SERVER": server if named else "0"}
         ran, took = ra_jit(root, crates, os.path.join(work, "wired.o"), "--own-target",
                            "--exe", program, env=env)
         how = "with the server named" if named else "without it"
@@ -353,7 +353,7 @@ def app(name, work, server):
     into an empty target directory, where every library ra-jit linked is the store's; then
     from an empty store without the server, rustc's libraries expanded by the toolchain's
     server, and every call expanded again by ra-jit's server with the library ra-jit linked of
-    the same unit (`RA_JIT_PROC_MACRO_COMPARE`). The programs have to print the same. What
+    the same unit (`BLAZE_PROC_MACRO_COMPARE`). The programs have to print the same. What
     each build took and what the comparison found, and the comparison's counts."""
     import bench
     spec, (crate, program) = bench.PROJECTS[name], APPS[name]
@@ -370,12 +370,12 @@ def app(name, work, server):
         own = os.path.join(root, "target", "rust-analyzer" if named else "rust-analyzer-rustc")
         shutil.rmtree(os.path.join(root, "target"), ignore_errors=True)
         store = os.path.join(work, f"{name}-store-{'ours' if named else 'theirs'}")
-        env = {**spec.get("env", {}), "RA_JIT_CACHE": store}
+        env = {**spec.get("env", {}), "BLAZE_CACHE": store}
         if named:
-            env["RA_JIT_PROC_MACRO_SERVER"] = server
+            env["BLAZE_PROC_MACRO_SERVER"] = server
         else:
-            env.update(RA_JIT_PROC_MACRO_SERVER="0", RA_JIT_PROC_MACRO_COMPARE=server,
-                       RA_JIT_PROC_MACRO_LIBS=libs)
+            env.update(BLAZE_PROC_MACRO_SERVER="0", BLAZE_PROC_MACRO_COMPARE=server,
+                       BLAZE_PROC_MACRO_LIBS=libs)
         # The same file name in each, which a program's usage line prints.
         binary = os.path.join(work, f"{name}-{build}", program)
         os.makedirs(os.path.dirname(binary), exist_ok=True)
@@ -426,7 +426,7 @@ def app(name, work, server):
 
 
 def compared(stderr):
-    """What `RA_JIT_PROC_MACRO_COMPARE` found, from the build's report."""
+    """What `BLAZE_PROC_MACRO_COMPARE` found, from the build's report."""
     said = re.findall(r"compared with blaze's server: (\d+) calls \((\d+) derives, "
                       r"(\d+) attributes, (\d+) function-like\), (\d+) expanded otherwise, "
                       r"(\d+) failed by both, (\d+) not compared"
@@ -486,7 +486,7 @@ def main():
     # One store for the run: the server and the libraries are built over the standard
     # library's unit, and the package whole, which names its crates, must not take code from
     # the store that calls into the unit (#328). An app's builds have stores of their own.
-    os.environ["RA_JIT_CACHE"] = os.path.join(work, "store")
+    os.environ["BLAZE_CACHE"] = os.path.join(work, "store")
     passed = False
     try:
         server, said = built_server(work)
@@ -546,7 +546,7 @@ def main():
             raise SystemExit(f"FAIL: the package depends on {versions}, not each of "
                              f"{sorted(MACRO_CRATES)}")
 
-        env = {"RA_JIT_PROC_MACRO_COMPARE": server, "RA_JIT_PROC_MACRO_LIBS": libs}
+        env = {"BLAZE_PROC_MACRO_COMPARE": server, "BLAZE_PROC_MACRO_LIBS": libs}
         # With its tests, whose `#[tokio::test]` is another attribute.
         ran, took = ra_jit(root, ["macrouse"], os.path.join(work, "macrouse.o"), "--cfg-test",
                            env=env)

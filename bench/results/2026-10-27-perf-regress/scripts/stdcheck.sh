@@ -7,14 +7,14 @@ for name in "$@"; do
   p=/root/perf/stdcheck-ws/$name; rm -rf $p; mkdir -p $p
   cp -r /root/ra-jit-projects/ripgrep $p/rg; rm -rf $p/rg/target $p/rg/.git
   (
-    export RA_JIT_HOME=$p/home RA_JIT_CACHE=$p/store RA_JIT_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
-    export RA_JIT_STD_FROM=/root/perf/work/$name-cranelift/std-cranelift CARGO_TERM_COLOR=never
+    export BLAZE_HOME=$p/home BLAZE_CACHE=$p/store BLAZE_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
+    export BLAZE_STD_FROM=/root/perf/work/$name-cranelift/std-cranelift CARGO_TERM_COLOR=never
     export PATH=/root/perf/bin/$name:$PATH
     cd $p/rg
     s=$(date +%s%N)
     taskset -c 0-3 cargo ra-jit build > $out/cold.out 2>&1
     echo "$name cold exit $? in $(( ($(date +%s%N) - s) / 1000000 ))ms"
-    for w in $RA_JIT_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log; done
+    for w in $BLAZE_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log; done
     grep -h -E "standard library|^store|frozen|resolve:" $out/worker-*.log | cut -c1-200
     cargo ra-jit stop >/dev/null 2>&1
   )

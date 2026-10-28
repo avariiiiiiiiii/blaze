@@ -1,6 +1,6 @@
 # Cold builds from an empty store: the scripts' standard library made once (#203)
 
-A cold `cargo ra-jit build` with an empty store and `RA_JIT_STD_FROM=off`: what a build of
+A cold `cargo ra-jit build` with an empty store and `BLAZE_STD_FROM=off`: what a build of
 blaze that is not a release, or a toolchain the release shipped no standard library for, starts
 from. Each build-script and proc-macro build (`own_script.rs`) is a `ra-jit` process of its own;
 with nothing in the store, each made the standard library's unit and the frozen maps of its

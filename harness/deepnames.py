@@ -87,7 +87,7 @@ def main():
             began = time.monotonic()
             with open(log_path, "w") as out:
                 daemon = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--socket", socket, *ask],
-                                          stderr=out, stdout=out, env={**os.environ, "RA_JIT_CACHE": store})
+                                          stderr=out, stdout=out, env={**os.environ, "BLAZE_CACHE": store})
             try:
                 while "watching" not in open(log_path).read():
                     if daemon.poll() is not None:

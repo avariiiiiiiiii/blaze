@@ -36,8 +36,8 @@ KILLS, WORKERS, SEED = option("--kills", 300), option("--workers", 4), option("-
 MODES = ["cold", "start", "start", "edit", "edit", "settle", "write", "write"]
 # What a daemon is started with: packs sealed at every build or seldom, a store with room or one
 # that evicts all the time.
-SIZES = [{"RA_JIT_CACHE_SEAL_AT": "1"}, {"RA_JIT_CACHE_SEAL_AT": "1", "RA_JIT_CACHE_MAX": "2M"},
-         {"RA_JIT_CACHE_SEAL_AT": "64K", "RA_JIT_CACHE_MAX": "off"}, {}]
+SIZES = [{"BLAZE_CACHE_SEAL_AT": "1"}, {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "2M"},
+         {"BLAZE_CACHE_SEAL_AT": "64K", "BLAZE_CACHE_MAX": "off"}, {}]
 
 
 class Worker:

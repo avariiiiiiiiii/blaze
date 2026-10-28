@@ -128,7 +128,7 @@ let
     // lib.optionalAttrs (builtins.elem i checked.roots || u.pkg == (U (builtins.head checked.roots)).pkg) { CARGO_PRIMARY_PACKAGE = "1"; }
     // lib.optionalAttrs (p.links != null) { CARGO_MANIFEST_LINKS = p.links; }
     # `ra-jit --version` and the daemon's log name the commit, as the flake's `daemon` does.
-    // lib.optionalAttrs (p.name == "ra-jit" && gitSha != "") { RA_JIT_GIT_SHA = gitSha; };
+    // lib.optionalAttrs (p.name == "ra-jit" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
 
   mk = i:
     let

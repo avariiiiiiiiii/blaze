@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""testselect.py: `cargo ra-jit test` with `RA_JIT_TESTS=affected` runs the tests that have not
+"""testselect.py: `cargo ra-jit test` with `BLAZE_TESTS=affected` runs the tests that have not
 passed as they are now, and no others: a pass is kept in the store under what the test is a
 function of, and travels with it through a remote.
 
-usage: testselect.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: testselect.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
 A package has a library with unit tests and an integration test of it, and a library of the
 workspace beside it that both link, which says under `cfg(test)` what it does not otherwise
@@ -18,7 +18,7 @@ names: those whose code or what it calls changed, those added or given other att
 one that reads a file every time, the one that failed until it passes (and not the others that
 ran and passed beside it; once fixed back to code that passed, it is not run again), one added
 to a program with an `ignore` with a list, one added to a library with a bench (in a package of
-its own, built with RUSTC_BOOTSTRAP=1), and with `RA_JIT_TESTS=all` every test. A test that ran has to end as its source says.
+its own, built with RUSTC_BOOTSTRAP=1), and with `BLAZE_TESTS=all` every test. A test that ran has to end as its source says.
 A package's unit and integration tests find its program from their own path, as fd's do: they are
 in the profile's `deps` (of the debug and release profiles, and of a `--target`), the program is
 in the profile's directory, and that is `CARGO_BIN_EXE_<name>`. With `-v` the
@@ -26,12 +26,12 @@ output says why the one that reads a file runs, by the calls from it to the file
 how many tests run every time.
 
 The workspace opts into sandboxed tests (`experimental = ["sandboxed-tests"]`), so every test
-runs sandboxed (Linux and macOS, unless `RA_JIT_SANDBOX=off`): the one that reads a
+runs sandboxed (Linux and macOS, unless `BLAZE_SANDBOX=off`): the one that reads a
 file runs again only when the file changed, `-v` says which file, a test that writes into the
 package changes nothing of it outside its run, a test that writes outside fails and the command
 says what the sandbox denied it and how to take it out, a test its package takes out of the
 sandbox (`unsandboxed-tests`) runs outside and writes there, every time, with
-`RA_JIT_SANDBOX=off` every test runs every time, `RA_JIT_TESTS=verify` runs the tests kept as
+`BLAZE_SANDBOX=off` every test runs every time, `BLAZE_TESTS=verify` runs the tests kept as
 passed and says they passed again, a store pushed to a remote and pulled into an empty one
 skips every test that passed, and so does the store under a fresh target and daemon, as on a CI
 runner. A package that has not opted in runs every test under `affected`, and is told what to add
@@ -190,14 +190,14 @@ ALL = CALL_HELPER | CALL_BASE | {"tests::uses_other", "tests::reads_a_file", "te
                                  "shapes::twice::tests::doubles", "it_listed"}
 FILE = "tests::reads_a_file"
 WRITES = "tests::writes_a_file"
-SANDBOXED = sys.platform in ("linux", "darwin") and os.environ.get("RA_JIT_SANDBOX") not in ("off", "0")
+SANDBOXED = sys.platform in ("linux", "darwin") and os.environ.get("BLAZE_SANDBOX") not in ("off", "0")
 OUTSIDE_TEST = "tests::writes_outside"
 # A directory outside the package and the temporary ones, which the sandbox keeps read-only.
 OUTSIDE = os.path.join(os.path.expanduser("~"), ".cache", f"ra-jit-testselect-{os.getpid()}")
 # The test that reads a file, in a step that did not change the file: where it runs sandboxed,
 # it is skipped like any other unchanged test.
 F = set() if SANDBOXED else {FILE}
-# (what the step is, [(file, old, new)], RA_JIT_TESTS, the tests that run (`None`: cargo's build
+# (what the step is, [(file, old, new)], BLAZE_TESTS, the tests that run (`None`: cargo's build
 # of an edited manifest, which runs them all), whether they pass)
 STEPS = [
     ("nothing edited", [], "affected", F, True),
@@ -237,7 +237,7 @@ STEPS = [
 if SANDBOXED:
     STEPS += [
         # Outside the sandbox no test is hermetic, and every test runs every time.
-        ("outside the sandbox", [], "affected -v RA_JIT_SANDBOX=off", ALL | {"tests::added", "it_added"}, True),
+        ("outside the sandbox", [], "affected -v BLAZE_SANDBOX=off", ALL | {"tests::added", "it_added"}, True),
         ("the file a test reads edited", [("data.txt", "tsel", "tsel tsel")], "affected -v", {FILE}, True),
         ("nothing edited after the file", [], "affected", set(), True),
         ("a test that writes into the package", [
@@ -277,8 +277,8 @@ def kept_from():
     harness's earlier steps are a run of this same CI job when GitHub Actions says so."""
     var = lambda name: os.environ.get(name) or None
     sha, run = var("GITHUB_SHA"), var("GITHUB_RUN_ID")
-    if var("RA_JIT_TESTS_FROM"):
-        return var("RA_JIT_TESTS_FROM")
+    if var("BLAZE_TESTS_FROM"):
+        return var("BLAZE_TESTS_FROM")
     if sha:
         return f"commit {sha[:10]}" + (f" (run {run})" if run else "")
     return "an earlier run on this machine"
@@ -323,7 +323,7 @@ AFTER = {
         os.path.exists(os.path.join(OUTSIDE, "written.txt"))) or "IT DID NOT WRITE OUTSIDE",
 }
 # Steps that fail now and then for a reason not yet found, each with its issue. In the fast tier
-# (ci.py's RA_JIT_CI_TIER) a wrong one is printed as such and not counted, so it does not hold up
+# (ci.py's BLAZE_CI_TIER) a wrong one is printed as such and not counted, so it does not hold up
 # the merge queue; everywhere else, the release train's full tier included, it counts.
 FLAKY: dict[str, str] = {}
 RAN = re.compile(r"^test (\S+) \.\.\. (ok|ignored|FAILED)", re.M)
@@ -444,19 +444,19 @@ def beside(root, env):
 
 
 def test(ws, env, mode):
-    """`mode` is RA_JIT_TESTS's value, then `cargo ra-jit test`'s arguments and NAME=VALUE for the
+    """`mode` is BLAZE_TESTS's value, then `cargo ra-jit test`'s arguments and NAME=VALUE for the
     environment. `remote` pushes the store to a directory, pulls that into an empty store and
     runs `affected` with it."""
     if mode == "remote":
         remote, pulled = os.path.join(ws, "..", "remote"), os.path.join(ws, "..", "pulled-store")
-        for verb, store in (("push", env["RA_JIT_CACHE"]), ("pull", pulled)):
-            moved = subprocess.run([os.environ["RA_JIT_BIN"], "cache", verb, remote, "tsel"], cwd=ws,
-                                   env=dict(env, RA_JIT_CACHE=store, RA_JIT_REMOTE_UNSIGNED="1"),
+        for verb, store in (("push", env["BLAZE_CACHE"]), ("pull", pulled)):
+            moved = subprocess.run([os.environ["BLAZE_BIN"], "cache", verb, remote, "tsel"], cwd=ws,
+                                   env=dict(env, BLAZE_CACHE=store, BLAZE_REMOTE_UNSIGNED="1"),
                                    capture_output=True, text=True,
                                    timeout=TIMEOUT)
             if moved.returncode != 0:
                 return moved.returncode, f"cache {verb} failed:\n{moved.stdout}{moved.stderr}"
-        return test(ws, dict(env, RA_JIT_CACHE=pulled), "affected")
+        return test(ws, dict(env, BLAZE_CACHE=pulled), "affected")
     if mode == "fresh":
         subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=TIMEOUT)
         shutil.rmtree(os.path.join(ws, "target"))
@@ -464,19 +464,19 @@ def test(ws, env, mode):
     mode, *args = mode.split()
     more = dict(it.split("=", 1) for it in args if "=" in it)
     args = [it for it in args if "=" not in it]
-    ran = subprocess.run(["cargo", "ra-jit", "test", *args], cwd=ws, env=dict(env, RA_JIT_TESTS=mode, **more),
+    ran = subprocess.run(["cargo", "ra-jit", "test", *args], cwd=ws, env=dict(env, BLAZE_TESTS=mode, **more),
                          capture_output=True, text=True, timeout=TIMEOUT)
     return ran.returncode, ran.stdout + ran.stderr
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     if SANDBOXED:
-        probe = subprocess.run([os.environ["RA_JIT_BIN"], "sandbox", "--probe"], capture_output=True, text=True)
+        probe = subprocess.run([os.environ["BLAZE_BIN"], "sandbox", "--probe"], capture_output=True, text=True)
         if probe.returncode != 0:
-            raise SystemExit(f"there is no sandbox for the tests here (`RA_JIT_SANDBOX=off` tests without):\n"
+            raise SystemExit(f"there is no sandbox for the tests here (`BLAZE_SANDBOX=off` tests without):\n"
                              f"{probe.stderr.strip()}")
     root = tempfile.mkdtemp(prefix="ra-jit-testselect-")
     os.makedirs(OUTSIDE, exist_ok=True)
@@ -486,9 +486,9 @@ def main():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
     # A store of its own: the passes it keeps are what the steps are about.
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-               RUST_BACKTRACE="0", RA_JIT_CACHE=os.path.join(root, "store"))
-    for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RA_JIT_TESTS"):
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
+               RUST_BACKTRACE="0", BLAZE_CACHE=os.path.join(root, "store"))
+    for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "BLAZE_TESTS"):
         env.pop(name, None)
     wrong = 0
 
@@ -530,12 +530,12 @@ def main():
                 verdict = f"DID NOT SAY {' NOR '.join(unsaid)}"
             elif what in AFTER and (after := AFTER[what](ws)) is not True:
                 verdict = after
-            if verdict != "ok" and what in FLAKY and os.environ.get("RA_JIT_CI_TIER") == "fast":
+            if verdict != "ok" and what in FLAKY and os.environ.get("BLAZE_CI_TIER") == "fast":
                 verdict += f" (FLAKY, not counted in the fast tier: {FLAKY[what]})"
             else:
                 wrong += verdict != "ok"
             print(f"{what:34} {verdict}", flush=True)
-            if verdict != "ok" and (os.environ.get("TESTSELECT_VERBOSE") or os.environ.get("RA_JIT_CI_TIER")):
+            if verdict != "ok" and (os.environ.get("TESTSELECT_VERBOSE") or os.environ.get("BLAZE_CI_TIER")):
                 print(said[-4000:])
             if manifest:
                 served(f"after {what}")

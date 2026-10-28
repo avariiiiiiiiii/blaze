@@ -8,6 +8,13 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Changed
+
+- blaze's settings are `BLAZE_<NAME>` alone (#270). A setting under its old name,
+  `RA_JIT_<NAME>`, is no longer read; blaze stops when one is set, with a line for each:
+  `RA_JIT_CACHE was renamed BLAZE_CACHE`. The programs blaze builds read `BLAZE_FN_CACHE*`
+  and `BLAZE_TIER` alone too.
+
 ## [0.20261027.0] - 2026-10-27
 
 ### Added

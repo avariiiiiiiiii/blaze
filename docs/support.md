@@ -32,7 +32,7 @@ by the move.
 names ([cargo.md](cargo.md)). A rustc counts as the pinned one only when its whole
 `rustc -V` line matches, since every nightly of a release says `1.101.0`. A project that
 needs its own toolchain fails with rustc's error and a note naming both.
-`BLAZE_OTHER_TOOLCHAIN=1` (or its old name, `RA_JIT_OTHER_TOOLCHAIN=1`) builds with the project's toolchain
+`BLAZE_OTHER_TOOLCHAIN=1` builds with the project's toolchain
 instead, for a project pinned to a nightly near ours. Nothing checks that the other rustc
 lays out, mangles and passes values as the pinned nightly does.
 

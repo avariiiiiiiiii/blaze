@@ -11,8 +11,8 @@ for name in sys.argv[1:]:
     subprocess.run(["git", "checkout", "-q", "--", "."], cwd=ws)
     (path, old, new), = bench.PROJECTS[name]["edits"]["leaf"]
     text = open(os.path.join(ws, path)).read()
-    env = dict(os.environ, PATH=f"{BIN}:{os.environ['PATH']}", RA_JIT_HOME=f"/tmp/rjh3-{name}", RA_JIT_CACHE=f"{APPS}/store2",
-               RUST_BACKTRACE="0", HOME="/root", RA_JIT_MANIFEST="off")
+    env = dict(os.environ, PATH=f"{BIN}:{os.environ['PATH']}", BLAZE_HOME=f"/tmp/rjh3-{name}", BLAZE_CACHE=f"{APPS}/store2",
+               RUST_BACKTRACE="0", HOME="/root", BLAZE_MANIFEST="off")
     env.pop("CARGO_TARGET_DIR", None)
     args = cargo_ra_jit.PROJECTS[name].get("test", [])
     for round_ in range(2):
@@ -22,7 +22,7 @@ for name in sys.argv[1:]:
             open(os.path.join(ws, path), "w").write(text.replace(old, new.replace("let _bench_edit = 1u32;", mark), 1))
             subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
             shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
-            e = dict(env, RA_JIT_TESTS=mode)
+            e = dict(env, BLAZE_TESTS=mode)
             t0 = time.monotonic()
             b = subprocess.run(["cargo", "ra-jit", "test", *args, "--no-run"], cwd=ws, env=e, capture_output=True, text=True, timeout=3600)
             t1 = time.monotonic()

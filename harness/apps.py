@@ -21,8 +21,8 @@ tests     the test binaries of `tests`: those of a library are linked again with
 edits     the daemon holds the program; each edit of `edits` is timed to a linked program and
           to cargo's, and `check` has to print the same from both.
 
-The backend is the environment's, as for the other harnesses: `RA_JIT_BACKEND`, `RA_JIT_OPT`,
-`RA_JIT_EMIT`.
+The backend is the environment's, as for the other harnesses: `BLAZE_BACKEND`, `BLAZE_OPT`,
+`BLAZE_EMIT`.
 """
 import argparse, importlib, json, os, re, shlex, shutil, socket, subprocess, sys, time
 
@@ -384,7 +384,7 @@ def main():
     prepare(ws, spec)
     localize(ws)
     os.environ["RUSTFLAGS"] = f"{FLAGS} {own_flags(spec)}".strip()
-    backend = os.environ.get("RA_JIT_BACKEND", "cranelift")
+    backend = os.environ.get("BLAZE_BACKEND", "cranelift")
     result = {"app": a.name, "backend": backend, "rev": spec.get("rev")}
     debug, result["debug_cold_s"] = reference(ws, spec, "debug")
     setup(ws, spec)

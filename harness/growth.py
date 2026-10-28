@@ -26,8 +26,8 @@ import os, shutil, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ["RA_JIT_CACHE"] = "off"
-os.environ["RA_JIT_REGALLOC"] = "single_pass"
+os.environ["BLAZE_CACHE"] = "off"
+os.environ["BLAZE_REGALLOC"] = "single_pass"
 from difftest import Fixture
 
 CARGO_TOML = """[package]
@@ -184,11 +184,11 @@ def build(source, function, what):
     fx.ra_jit_timeout = 600
     fx.rustc_build()
     shapes = os.path.join(fx.work, "shapes.tsv")
-    os.environ["RA_JIT_SHAPES"] = shapes
+    os.environ["BLAZE_SHAPES"] = shapes
     try:
         fx.ra_jit_build()
     finally:
-        del os.environ["RA_JIT_SHAPES"]
+        del os.environ["BLAZE_SHAPES"]
     expected, got = fx.behaviour(fx.reference), fx.behaviour(fx.binary)
     if expected != got:
         raise SystemExit(f"{what}: ra-jit's program differs from cargo's:\n  rustc: {expected}\n  ra-jit: {got}")

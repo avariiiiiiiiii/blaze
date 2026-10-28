@@ -6,7 +6,7 @@ whether that went up against another build. A toolchain bump must not make more 
     stdcount.py --bin ra-jit --toolchain nightly-YYYY-MM-DD [--json out.json]
     stdcount.py --bin new/ra-jit --toolchain nightly-B --base old/ra-jit --base-toolchain nightly-A
 
-Each build compiles hello world's whole program with an empty store and RA_JIT_STD_FROM=off, so
+Each build compiles hello world's whole program with an empty store and BLAZE_STD_FROM=off, so
 the standard library of its toolchain's rust-src is compiled in the process, and reads the line
 `standard library: N crates, compiled C of T fns`: refused is T - C, and the reasons are the
 counted lines the build prints for them. With --base the second build is measured the same way,
@@ -36,10 +36,10 @@ def measure(binary, toolchain, keep=None):
             '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n')
         open(os.path.join(project, "src/main.rs"), "w").write(HELLO)
         env = {k: v for k, v in os.environ.items()
-               if k not in ("RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR") and not k.startswith("RA_JIT")}
+               if k not in ("RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR") and not k.startswith("BLAZE_")}
         env.update(PATH=os.path.join(root, "bin") + os.pathsep + env.get("PATH", ""),
-                   RA_JIT_CACHE=os.path.join(work, "store"), RA_JIT_HOME=os.path.join(work, "home"),
-                   RA_JIT_STD_FROM="off", RUST_BACKTRACE="0")
+                   BLAZE_CACHE=os.path.join(work, "store"), BLAZE_HOME=os.path.join(work, "home"),
+                   BLAZE_STD_FROM="off", RUST_BACKTRACE="0")
         done = subprocess.run(
             [binary, project, "--own-target", "--profile", "release", "--crate", "src/main.rs",
              "--out", os.path.join(project, "x.o"), "--exe", os.path.join(project, "hello")],

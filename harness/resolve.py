@@ -302,7 +302,7 @@ def ancestors(path, root):
 def toolchain_runs(root, spec, ra_jit, cargo_home, host, cargo):
     """Each question on the tree at root: (name, cargo's, ra-jit's), each {code, stdout}."""
     home = os.path.join(root, spec["home"]) if spec.get("home") else cargo_home
-    base = {k: v for k, v in clean_env(home).items() if k != "CARGO_ORACLE" and not k.startswith(("RA_JIT", "RUSTC"))}
+    base = {k: v for k, v in clean_env(home).items() if k != "CARGO_ORACLE" and not k.startswith(("BLAZE_", "RUSTC"))}
     base.update({k: v.replace("$ROOT", root) for k, v in spec.get("env", {}).items()})
     cwd = os.path.join(root, spec.get("cwd", ""))
     answers = tempfile.mkdtemp(prefix="blaze-toolchain-answers-")
@@ -317,7 +317,7 @@ def toolchain_runs(root, spec, ra_jit, cargo_home, host, cargo):
             out = out.replace(path, name)
         return dict(code=code, stdout=out if code == 0 else "")
 
-    mine_env = dict(base, RA_JIT_HOME=answers)
+    mine_env = dict(base, BLAZE_HOME=answers)
     try:
         for name, args, variables in toolchain_questions(host):
             env = dict(base, **variables)

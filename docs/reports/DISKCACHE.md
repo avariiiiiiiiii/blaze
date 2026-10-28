@@ -3,7 +3,7 @@
 Branch `ra-jit-disk-cache`, from `ra-jit-collate` at `b19fdfacd8`. Linux x86-64, 8 cores,
 Rust 1.99.0, LLVM 20.
 
-The store is the directory `RA_JIT_CACHE` names. It holds compiled functions (and the
+The store is the directory `BLAZE_CACHE` names. It holds compiled functions (and the
 entries that say which function a request resolves to) by a hash of what they were
 compiled from. The code is in `crates/hir-ty/src/mir/codegen/store.rs`; the `ra-jit cache`
 commands are in `crates/ra-jit/src/remote.rs`.
@@ -98,8 +98,8 @@ of a newer format.
 
 ## 4. Size limit and garbage collection
 
-`RA_JIT_CACHE_MAX` is the most the sealed packs may take: a number of bytes or one with
-`K`, `M` or `G`, `off` for no limit, 32G when unset. `RA_JIT_CACHE_SEAL_AT` (4M) is the
+`BLAZE_CACHE_MAX` is the most the sealed packs may take: a number of bytes or one with
+`K`, `M` or `G`, `off` for no limit, 32G when unset. `BLAZE_CACHE_SEAL_AT` (4M) is the
 size at which an open pack is sealed at the end of a build; it exists for the harnesses.
 
 A collection runs when a daemon opens the store and after it seals a pack, and on
@@ -115,7 +115,7 @@ unlinked pack stays readable to it until it exits. A daemon that starts later do
 see the pack and compiles what was in it.
 
     ra-jit cache stats      format, packs, bytes, open packs, temporaries, limit, oldest and newest use
-    ra-jit cache gc         collect now, to RA_JIT_CACHE_MAX or --max SIZE
+    ra-jit cache gc         collect now, to BLAZE_CACHE_MAX or --max SIZE
     ra-jit cache verify     read everything; exit 1 if any pack is not what was written
 
 Full disk: any error while adding to the store (ENOSPC among them) stops the writer for
@@ -160,8 +160,8 @@ loops beside them.
 
 Binaries: `cargo build -p ra-jit --release` and
 `LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm`.
-All commands from `harness/` with `RA_JIT_BIN` set; "Cranelift" is `RA_JIT_BACKEND=cranelift`,
-"LLVM" is `RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`.
+All commands from `harness/` with `BLAZE_BIN` set; "Cranelift" is `BLAZE_BACKEND=cranelift`,
+"LLVM" is `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`.
 
 Kills (`python3 storekills.py --kills N`, 4 workers):
 
@@ -223,7 +223,7 @@ Regression gate, both backends, all exit 0:
 | `worktrees.py` | 52 of 52 (58 of 58 after the merge) | 52 of 52 (58 of 58) |
 | `keys.py` (after the merge) | 26 of 26, 4 open | 26 of 26, 4 open |
 
-Remote, by hand: a daemon with `RA_JIT_REMOTE` set to a directory pushed 1 pack (1769
+Remote, by hand: a daemon with `BLAZE_REMOTE` set to a directory pushed 1 pack (1769
 records); a second daemon with an empty store pulled it and compiled 0 functions.
 
 The four store harnesses are added to `.github/workflows/ra-jit.yaml` (100 kills, 4

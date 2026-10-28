@@ -140,7 +140,7 @@ with its dependencies; 2026-10-26, dev-aws-8, blaze at 69cbce21f5):
 already run (the first load also runs them through cargo: fd's first run took 56.6 s, nearly
 all of it that). fd's 7.6 s, at an earlier commit, was 0.75 s of load, 6.3 s of model and
 0.06 s of writing. helix ran with `HELIX_DISABLE_AUTO_GRAMMAR_BUILD=1` on both sides (its
-build script otherwise fetches tree-sitter grammars), and biome with `RA_JIT_SANDBOX=off`
+build script otherwise fetches tree-sitter grammars), and biome with `BLAZE_SANDBOX=off`
 (its build scripts write outside the sandbox blaze runs them in).
 
 What blaze still misses or adds, and why:

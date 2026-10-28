@@ -20,7 +20,7 @@ Times are wall times from the run's start; "queue wait" is a job's creation to i
   (a few after a `Cargo.lock` change hit 0 to 8 percent); the `cargo build` step took 1.8 minutes
   at the median on Linux x86-64, 1.7 on AArch64 and 2.4 on macOS.
 - **macOS `quick-2`: `norustc.py` took 1489 of the part's 1730 seconds** (run 39851906782), where
-  it takes 66 to 70 seconds on Linux. The harness came with #97. On macOS its `RA_JIT_HOME` is
+  it takes 66 to 70 seconds on Linux. The harness came with #97. On macOS its `BLAZE_HOME` is
   under `$TMPDIR` (`/var/folders/...`), the daemon's socket path inside it passes the 104 bytes
   macOS allows, so the daemon never listened: the cold build ran cargo 623 times (28 on Linux)
   and each scenario ran until the log was still. It records nothing there either: the baseline
@@ -67,7 +67,7 @@ Times are wall times from the run's start; "queue wait" is a job's creation to i
   `.github/scripts/land.py`, which opens the pull request, queues it and waits for the result.
   The repository now deletes a merged branch, allows auto-merge (a pull request waits for its
   checks and then queues itself), and titles a merge commit with the pull request's title.
-- The workflows that commit to main check out with `RA_JIT_BOT_TOKEN` when the secret is set,
+- The workflows that commit to main check out with `BLAZE_BOT_TOKEN` when the secret is set,
   since the workflow's own token cannot pass the ruleset.
 
 ## What was not done, and why

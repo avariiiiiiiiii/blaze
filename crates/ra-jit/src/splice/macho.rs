@@ -5,9 +5,9 @@
 //! signature has no hash of. So the patch goes where `__LINKEDIT` was, in two segments of
 //! its own, and `__LINKEDIT` is written again behind them:
 //!
-//! 1. `__RA_JIT_TEXT`, read and run: the patch's constants and functions, and a stub for
+//! 1. `__BLAZE_TEXT`, read and run: the patch's constants and functions, and a stub for
 //!    each call that is out of a branch's reach.
-//! 2. `__RA_JIT_DATA`, read and written: the patch's writable sections and those that store
+//! 2. `__BLAZE_DATA`, read and written: the patch's writable sections and those that store
 //!    addresses, and an address slot for each symbol the code reaches through one.
 //! 3. `__LINKEDIT`: as the linker wrote it but for the addresses the loader moves with the
 //!    program, which are encoded again, and for the signature, which keeps the hashes of
@@ -1967,13 +1967,13 @@ impl Layout {
                 anyhow::Ok(command)
             };
         added.extend(segment(
-            b"__RA_JIT_TEXT",
+            b"__BLAZE_TEXT",
             self.text,
             macho::VM_PROT_READ | macho::VM_PROT_EXECUTE,
             (b"__text", macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS),
         )?);
         added.extend(segment(
-            b"__RA_JIT_DATA",
+            b"__BLAZE_DATA",
             self.data,
             macho::VM_PROT_READ | macho::VM_PROT_WRITE,
             (b"__data", macho::S_REGULAR),
@@ -2352,7 +2352,7 @@ pub(super) fn splice(
         step("rename", &mut from);
         Stamp::of(&file)
     })();
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         let shown: Vec<String> =
             steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
         eprintln!("splice-us: {} bytes={}", shown.join(" "), addition.appended.len());

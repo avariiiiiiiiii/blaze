@@ -13,10 +13,10 @@ times, the builds taking turns, and reported by its median wall time:
             to keep
   ra-jit    every crate linked into the program compiled by ra-jit (`apps.py`'s "alone"
             build) with the release profile's semantics (`--release`: no overflow checks, no
-            debug assertions), LLVM at -O3 (`RA_JIT_BACKEND=llvm RA_JIT_OPT=3`)
+            debug assertions), LLVM at -O3 (`BLAZE_BACKEND=llvm BLAZE_OPT=3`)
 
 `--variant NAME:VAR=VALUE,...` adds an ra-jit build with those variables set too (say
-`--variant ra-jit-mir2:RA_JIT_MIR_OPT=2`). Before timing, each benchmark is run once with
+`--variant ra-jit-mir2:BLAZE_MIR_OPT=2`). Before timing, each benchmark is run once with
 every build and its exit status, stdout and stderr (scrubbed as apps.json says) have to be
 release's; a build that differs is reported and not timed.
 
@@ -34,7 +34,7 @@ ra-jit, cargo's pass with ra-jit standing in for rustc (build scripts, proc macr
 libraries' metadata; `cargo_s`), ra-jit's compile (`ra_jit_s`) and the link (`link_s`).
 
 The ratio is ra-jit's time over release's (1.00 is as fast, 1.10 is 10% slower), with the
-geometric mean over the benchmarks. RA_JIT_BIN names the ra-jit used; it needs `--features
+geometric mean over the benchmarks. BLAZE_BIN names the ra-jit used; it needs `--features
 llvm`. Python 3.11+, stdlib only.
 """
 import argparse, json, math, os, shlex, shutil, statistics, subprocess, sys, time
@@ -45,11 +45,11 @@ import apps, memory  # noqa: E402
 
 KERNELS = ["sieve", "collatz", "fnv", "qsort", "matmul", "nbody", "mandelbrot", "words"]
 DEFAULT = ["kernels", "numeric", "jsonrt", "ripgrep", "fd", "tokei", "eza", "bat"]
-RA_JIT_ENV = {"RA_JIT_BACKEND": "llvm", "RA_JIT_OPT": "3"}
+BLAZE_ENV = {"BLAZE_BACKEND": "llvm", "BLAZE_OPT": "3"}
 # What a variant may not inherit from the shell: the build is said by its flags alone.
-OWN_VARS = ["RA_JIT_BACKEND", "RA_JIT_OPT", "RA_JIT_EMIT", "RA_JIT_MIR_OPT", "RA_JIT_INLINE",
-            "RA_JIT_BUILT_IN", "RA_JIT_LLVM_INLINE_THRESHOLD",
-            "RUSTFLAGS", "CARGO_INCREMENTAL", "RA_JIT_ALONE"]
+OWN_VARS = ["BLAZE_BACKEND", "BLAZE_OPT", "BLAZE_EMIT", "BLAZE_MIR_OPT", "BLAZE_INLINE",
+            "BLAZE_BUILT_IN", "BLAZE_LLVM_INLINE_THRESHOLD",
+            "RUSTFLAGS", "CARGO_INCREMENTAL", "BLAZE_ALONE"]
 
 
 def spec_of(name):
@@ -110,7 +110,7 @@ def ra_jit_release(ws, spec, label, extra):
         # `--gc-sections`, as the release build does not, and one object of every function then
         # has the calls of code no build keeps (bun's of Windows' API on macOS) to resolve.
         flags = f"--cap-lints allow {apps.own_flags(spec)}"
-        os.environ.update({**RA_JIT_ENV, **extra, "RUSTFLAGS": flags.strip()})
+        os.environ.update({**BLAZE_ENV, **extra, "RUSTFLAGS": flags.strip()})
         fx = apps.App(ws, {**spec, "cargo_args": [*spec.get("cargo_args", []), "--release"]}, alone=True)
         fx.ra_jit_args = ["--release"]
         # Cold: cargo's pass with ra-jit standing in for rustc (build scripts, proc macros,

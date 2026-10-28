@@ -20,10 +20,10 @@
 //! environment by itself does so without asking. Derives and
 //! attributes are kept, as rustc's `-Zcache-proc-macros` keeps derives; function-like macros,
 //! where such reading is (a query checked against a database, a directory put in the
-//! program), only with `RA_JIT_PROC_MACRO_CACHE=all`. A macro named in
-//! `RA_JIT_PROC_MACRO_CACHE_SKIP` is never kept, `RA_JIT_PROC_MACRO_CACHE=check` expands every
+//! program), only with `BLAZE_PROC_MACRO_CACHE=all`. A macro named in
+//! `BLAZE_PROC_MACRO_CACHE_SKIP` is never kept, `BLAZE_PROC_MACRO_CACHE=check` expands every
 //! call anyway and says which macro gave other output than it kept, and
-//! `RA_JIT_PROC_MACRO_CACHE=off` keeps nothing and still counts.
+//! `BLAZE_PROC_MACRO_CACHE=off` keeps nothing and still counts.
 //!
 //! The store's own key adds the build of ra-jit and the toolchain, whose proc-macro server
 //! expands.
@@ -77,15 +77,15 @@ struct Config {
 fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        let mode = match std::env::var("RA_JIT_PROC_MACRO_CACHE").as_deref() {
+        let mode = match std::env::var("BLAZE_PROC_MACRO_CACHE").as_deref() {
             Ok("off" | "0") => Mode::Off,
             Ok("all") => Mode::All,
             Ok("check") => Mode::Check,
             _ => Mode::On,
         };
-        let skip = std::env::var("RA_JIT_PROC_MACRO_CACHE_SKIP").unwrap_or_default();
+        let skip = std::env::var("BLAZE_PROC_MACRO_CACHE_SKIP").unwrap_or_default();
         let skip = skip.split(',').map(str::trim).filter(|it| !it.is_empty()).map(Into::into);
-        let compare = std::env::var_os("RA_JIT_PROC_MACRO_COMPARE").is_some();
+        let compare = std::env::var_os("BLAZE_PROC_MACRO_COMPARE").is_some();
         Config { mode, skip: skip.collect(), compare }
     })
 }

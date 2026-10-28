@@ -13,12 +13,12 @@ something I read off the code or concluded, it says so.
   fixture of the rows.
 - `harness/soakrows.py`: twenty-two file, toolchain and memory edge cases, one row each.
   `harness/SOAKROWS.md` is what it wrote last.
-- `RA_JIT_MEMORY_MAX`: a ceiling on what the daemon's workers hold, with eviction.
+- `BLAZE_MEMORY_MAX`: a ceiling on what the daemon's workers hold, with eviction.
 - Fixes for what the soak, the rows and the lock audit found (listed below with their tests).
 
 ## The soak
 
-    RA_JIT_MEMORY_MAX=6G RA_JIT_BIN=.../ra-jit python3 soak.py --seed 101 --hours 3 \
+    BLAZE_MEMORY_MAX=6G BLAZE_BIN=.../ra-jit python3 soak.py --seed 101 --hours 3 \
         --worktrees 2 --work /dev/shm/soak-cl --sample 0.25
 
 It copies ripgrep 15.1.0, fd v10.3.0, bat v0.26.0, axum axum-v0.8.6 (its `hello-world`
@@ -56,7 +56,7 @@ work directories are on a 16 GB tmpfs, which holds two worktrees per workspace a
 more; the soak deletes target directories when the disk runs low. And a soak ran beside
 the regression gates for part of the time, so latencies are not benchmark numbers.
 
-The runs, all with seed 101 under Cranelift, `RA_JIT_MEMORY_MAX=6G`, two worktrees per
+The runs, all with seed 101 under Cranelift, `BLAZE_MEMORY_MAX=6G`, two worktrees per
 workspace and a quarter of the steps compared with cargo
 (`python3 soak.py --seed 101 --hours 2 --worktrees 2 --work /dev/shm/soak-cl --sample 0.25 --quiet`;
 `python3 soak.py --report DIR` prints the tables these numbers come from):
@@ -118,7 +118,7 @@ Fixed, each with the test or row that holds it:
    outline and by `probe` in the patcher. It now goes on unwinding. Test
    `a_probe_that_is_interrupted_goes_on_unwinding_and_one_that_panics_finds_nothing`.
 6. Workers were never released before their idle time, and the worker of a deleted
-   worktree lived as long: 16.8 GB after eight steps. `RA_JIT_MEMORY_MAX` and the check for
+   worktree lived as long: 16.8 GB after eight steps. `BLAZE_MEMORY_MAX` and the check for
    a checkout that is gone. Rows `memory ceiling`, `no memory ceiling`,
    `worktree deleted and recreated`.
 7. A link that failed said only "the link failed (exit status: 1)": the linker's output
@@ -201,7 +201,7 @@ Not fixed:
 
 ## Edge cases
 
-    RA_JIT_BIN=.../ra-jit python3 soakrows.py
+    BLAZE_BIN=.../ra-jit python3 soakrows.py
 
 Each row builds or tests with `cargo ra-jit` and with cold cargo and compares, and most also
 require that the daemon (not the fallback to cargo) did the last build. The table is in `harness/SOAKROWS.md`: 22 of 22 right under Cranelift on 4eaebf61f2; under
@@ -283,7 +283,7 @@ Cancellation points and what catches the unwind:
 | corpus build per crate, `main.rs` | a panic of one crate's build in a batch | written to the report as `panicked:` |
 
 Left as it is, on purpose:
-- `Worker::ask` reads the worker's answer with no timeout. A build has no upper bound, so there is no right number; a worker that hangs holds one daemon thread and its client until the client is interrupted. `RA_JIT_MEMORY_MAX` and the idle time never stop a worker that is answering, so a hung worker is not reaped either. This is the one thing in the audit I would still change (a watchdog on a worker that makes no progress), and did not.
+- `Worker::ask` reads the worker's answer with no timeout. A build has no upper bound, so there is no right number; a worker that hangs holds one daemon thread and its client until the client is interrupted. `BLAZE_MEMORY_MAX` and the idle time never stop a worker that is answering, so a hung worker is not reaped either. This is the one thing in the audit I would still change (a watchdog on a worker that makes no progress), and did not.
 - A client that is killed does not cancel its build. The result is kept and the next client gets it, so the work is not lost, but nothing is saved either.
 - `Daemon::warm` holds the map of workers while it kills one worker and spawns another (not timed; a status request waits for it).
 
@@ -292,13 +292,13 @@ Left as it is, on purpose:
 Measured before the ceiling (commit 1d70c30788, Cranelift, seed 101, the five workspaces in
 two worktrees each): eight steps in, the daemon had ten workers that held 16.8 GB resident
 together, 118 descriptors and 120 threads. The daemon process itself was 19 MB. Nothing was
-released: a worker lived until `RA_JIT_IDLE_SECS` (1800 s) without a request, and the worker
+released: a worker lived until `BLAZE_IDLE_SECS` (1800 s) without a request, and the worker
 of a worktree that had been deleted lived as long. A worker is one process per workspace and
 build configuration (`dev` and `test` are two), and holds the whole analysis of the
 workspace and its dependencies: about 0.9 GB for the small build-script workspace and 1.3
 to 2.5 GB for the others, as `cargo ra-jit status` now prints per worker.
 
-What was added. `RA_JIT_MEMORY_MAX` (a size such as `6G`, or `off`; by default half of the
+What was added. `BLAZE_MEMORY_MAX` (a size such as `6G`, or `off`; by default half of the
 machine's memory) is the most the workers may have resident together. Once a second the
 daemon sums what they hold, and while it is over, stops the worker that was asked longest
 ago, never one that is answering a request and never the one asked last. It also stops a
@@ -396,9 +396,9 @@ To restart the soak (binaries from `cargo build -p ra-jit --release`, and with
 `--features llvm` for the second; `--resume` continues a work directory that was stopped):
 
     cd harness
-    RA_JIT_MEMORY_MAX=6G RA_JIT_BIN=.../ra-jit python3 soak.py --seed 101 --hours 2.5 \
+    BLAZE_MEMORY_MAX=6G BLAZE_BIN=.../ra-jit python3 soak.py --seed 101 --hours 2.5 \
         --worktrees 2 --work /dev/shm/soak-cl --sample 0.25 --quiet
-    RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast RA_JIT_MEMORY_MAX=6G RA_JIT_BIN=.../ra-jit \
+    BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast BLAZE_MEMORY_MAX=6G BLAZE_BIN=.../ra-jit \
         python3 soak.py --seed 202 --hours 2.5 --worktrees 2 --work /dev/shm/soak-ll \
         --sample 0.25 --quiet
 

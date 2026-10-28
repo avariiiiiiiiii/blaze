@@ -5,7 +5,7 @@ the executable rustc linked (issue #11), against plain cargo.
     rustcbase.py [--work DIR] [SCENARIO...]
 
 Writes a workspace of two crates (a program and a library it calls) into WORK/ws. Each scenario
-starts from an empty target directory, RA_JIT_HOME and store: `cargo ra-jit build`, then once
+starts from an empty target directory, BLAZE_HOME and store: `cargo ra-jit build`, then once
 the daemon is ready its edits one after the other, each built by `cargo ra-jit build` and by
 `cargo build` into a target directory of its own. Both programs run without arguments and with
 `panic`; stdout, stderr and the exit status must be the same. Each edit also has the way it was
@@ -246,7 +246,7 @@ SCENARIOS = {
     # rustc's `one` is shorter than a jump too, and told the padding is not there it hops: two
     # bytes of jump to the linker's traps near it, and a jump on from there.
     "hop": ([[edit(D, "pub fn one() -> u8 {\n    1\n", "pub fn one() -> u8 {\n    2\n")]],
-            ["patch"], 0, {"RA_JIT_SPLICE_HOPS": "1"}),
+            ["patch"], 0, {"BLAZE_SPLICE_HOPS": "1"}),
     "counted-body": ([[edit(M, "Ordering::Relaxed) + 1", "Ordering::Relaxed) + 2")]], ["patch"], 0, {}),
     "unused-std": ([[edit(M, "    x * 3\n", "    let _ = std::os::unix::process::parent_id();\n    x * 3\n")]],
                    [None], 0, {}),
@@ -281,7 +281,7 @@ SCENARIOS = {
     "interrupt": ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 1.3, {}),
     **{f"interrupt-{ms}": ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], ms / 1000, {})
        for ms in (1100, 1200, 1400, 1500, 1700)},
-    "off": ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 0, {"RA_JIT_RUSTC_BASE": "0"}),
+    "off": ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 0, {"BLAZE_RUSTC_BASE": "0"}),
 }
 # Of CACHED_FILES. The attribute hands the body to a macro: an edit of it is more than bodies.
 CACHED_SCENARIOS = {
@@ -471,7 +471,7 @@ ALLOC_SCENARIOS = {
 SCENARIOS.update(ALLOC_SCENARIOS)
 # The own base holds more than the memory it may, so it is given up once and not started again,
 # and the edit patches what rustc linked.
-SCENARIOS["own-base-budget"] = ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 8, {"RA_JIT_OWN_BASE_MEMORY": "1"})
+SCENARIOS["own-base-budget"] = ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 8, {"BLAZE_OWN_BASE_MEMORY": "1"})
 # Given up, and an edit that is more than bodies (#159): built in full, it is spliced into what
 # rustc linked rather than linked, and the edits after it are patches of that, an `#[inline]`
 # function's too: what it was spliced with has marks to compare with.
@@ -479,7 +479,7 @@ SCENARIOS["own-base-budget-full"] = ([[edit(M, "    x + 1\n}\n\nfn counted", "  
                                       [edit(M, "    x * 3\n", "    x * 4\n")],
                                       [edit(M, "    x + 2\n}\n\nfn counted", "    x + 3\n}\n\nfn counted")],
                                       [edit(M, "    x * 4\n", "    x * 5\n")]],
-                                     ["full", "patch", "patch", "patch"], 8, {"RA_JIT_OWN_BASE_MEMORY": "1"})
+                                     ["full", "patch", "patch", "patch"], 8, {"BLAZE_OWN_BASE_MEMORY": "1"})
 
 # A program whose package has a library too, as each example of bevy's package has bevy: the
 # library is a crate of the program's files too, and the program depends on it.
@@ -555,7 +555,7 @@ STATICS_FILES = {
 }
 STATICS_SCENARIOS = {
     "macro-statics": ([[edit(M, "    x + 1\n}\n\nfn counted", "    x + 2\n}\n\nfn counted")]], ["full"], 0,
-                      {"RA_JIT_STATS": "1"}),
+                      {"BLAZE_STATS": "1"}),
 }
 SCENARIOS.update(STATICS_SCENARIOS)
 # A program with a thread-local of its own, as nearly every real one has: a build in full has
@@ -571,7 +571,7 @@ TLS_FILES = {
 }
 TLS_SCENARIOS = {
     "thread-local-full": ([[edit(M, "    x + 1\n}\n\nfn counted", "    x + 2\n}\n\nfn counted")]], ["linked"], 0,
-                          {"RA_JIT_STATS": "1"}),
+                          {"BLAZE_STATS": "1"}),
 }
 SCENARIOS.update(TLS_SCENARIOS)
 # Scenarios whose builds in full are one round: a line of a round that started over fails them,
@@ -721,7 +721,7 @@ def run(argv, cwd, env, timeout=900):
 def outputs(exe, cwd):
     env = dict(os.environ, NO_COLOR="1")
     env.pop("RUST_BACKTRACE", None)
-    env.pop("RA_JIT_FN_CACHE_LOG", None)
+    env.pop("BLAZE_FN_CACHE_LOG", None)
     runs = (run([exe, *args], cwd, env, 60) for args in ([], ["panic"]))
     # A panic names the thread by its id, which is another in every run.
     return [(r.returncode, r.stdout, re.sub(r"thread '(.*?)' \(\d+\)", r"thread '\1'", r.stderr)) for r in runs]
@@ -762,14 +762,14 @@ def main():
     ws = os.path.join(work, "ws")
     reference = os.path.join(work, "t-cargo")
     base = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, CARGO_TERM_COLOR="never", CARGO_NET_OFFLINE="true",
-                RA_JIT_IDLE_SECS="0")
-    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "RUST_BACKTRACE", "RA_JIT_CACHE",
-                 "CARGO_INCREMENTAL", "RA_JIT_RUSTC_BASE",
-                 "RA_JIT_FN_CACHE_LOG"):
+                BLAZE_IDLE_SECS="0")
+    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "RUST_BACKTRACE", "BLAZE_CACHE",
+                 "CARGO_INCREMENTAL", "BLAZE_RUSTC_BASE",
+                 "BLAZE_FN_CACHE_LOG"):
         base.pop(name, None)
     # The programs run with os.environ.
     fn_cache = os.path.join(work, "fn-cache")
-    os.environ["RA_JIT_FN_CACHE_DIR"] = base["RA_JIT_FN_CACHE_DIR"] = fn_cache
+    os.environ["BLAZE_FN_CACHE_DIR"] = base["BLAZE_FN_CACHE_DIR"] = fn_cache
     cargo_env = dict(base, CARGO_TARGET_DIR=reference)
     failed = []
     for name in names:
@@ -798,7 +798,7 @@ def main():
         for path in (home, target, store, fn_cache):
             shutil.rmtree(path, ignore_errors=True)
         os.makedirs(home, mode=0o700)
-        env = dict(base, RA_JIT_HOME=home, CARGO_TARGET_DIR=target, RA_JIT_CACHE=store, **extra)
+        env = dict(base, BLAZE_HOME=home, CARGO_TARGET_DIR=target, BLAZE_CACHE=store, **extra)
         began = time.monotonic()
         r = run(["cargo", "ra-jit", "build"], ws, env)
         if r.returncode:

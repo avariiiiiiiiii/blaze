@@ -180,7 +180,7 @@ bounds check reading its length into a temporary where rustc uses the constant, 
 what a future keeps only where such a temporary lives across a yield, or a no-unwind call
 changes which unwind paths there are.
 
-ra-jit mixes futures by default now; `RA_JIT_SPLIT_FUTURES=1` keeps a future and everything
+ra-jit mixes futures by default now; `BLAZE_SPLIT_FUTURES=1` keeps a future and everything
 that makes, polls or drops it on one side, until mixing is verified (`harness/mixfutures`).
 
 ## What the consumers do with it
@@ -219,7 +219,7 @@ body: `optimized_mir_body(def, level)`, `optimized_mir_body_for_closure` and the
 `monomorphized_optimized_*` variants, again separate salsa queries so nothing else computes
 them. `MirOptLevel` is rustc's `-Zmir-opt-level`: `Off` is the runtime body unchanged,
 `Debug` is level 1 (what `-Copt-level=0` gets), `Release` level 2 (above `-Copt-level=0`).
-ra-jit picks the level from `RA_JIT_MIR_OPT` (0, the default, 1 or 2); the interpreter takes
+ra-jit picks the level from `BLAZE_MIR_OPT` (0, the default, 1 or 2); the interpreter takes
 it from `set_interpreter_mir_opt_level`.
 
 - Level 1: `CleanupPostBorrowck` (fake reads, false edges, `CopyForDeref`; also the storage

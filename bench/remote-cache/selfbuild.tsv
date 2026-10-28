@@ -11,7 +11,7 @@ time	machine	blaze	arm	shape	job	secs	rc	store_bytes	mem_peak	note
 2026-10-27T13:40:26Z	vm16b	fdc1c53f15	cargo	a	build	51.2	0		4310011904	no edit, main's warm target dir
 2026-10-27T13:41:24Z	vm16b	fdc1c53f15	cargo	a	test	56.9	0:54.7,101:2.2		3793670144	no edit
 2026-10-27T13:44:27Z	vm16b	fdc1c53f15	cold	a	build	181.6	101		7866482688	before the local commit: the build-script sandbox refused LLVM_SYS_231_PREFIX for llvm-sys and hir-ty-codegen
-2026-10-27T14:17:50Z	vm16b	fdc1c53f15	cold	a	build		oom			unit peak 14.8G, killed after about 356 s; RA_JIT_LRU=mir=256,runtime=256,compiled=2048,inlinable=1024 RA_JIT_SPARE=0: load 157.8 s (156.9 s build scripts), then codegen of 131167 roots took the worker from 4 to 15 GB in 90 s
+2026-10-27T14:17:50Z	vm16b	fdc1c53f15	cold	a	build		oom			unit peak 14.8G, killed after about 356 s; BLAZE_LRU=mir=256,runtime=256,compiled=2048,inlinable=1024 BLAZE_SPARE=0: load 157.8 s (156.9 s build scripts), then codegen of 131167 roots took the worker from 4 to 15 GB in 90 s
 2026-10-27T14:33:37Z	vm16b	fdc1c53f15	push	a	build	13.6	0	237824753		121 packs of a partial main store (925272165 bytes on disk) to blaze-gateway, tenant rcache-test
 2026-10-27T14:33:46Z	vm16b	fdc1c53f15	pull	a	build	8.55	0	237849771		into an empty store, 125 requests, 26.5 MiB/s
 2026-10-27T14:33:55Z	vm16b	fdc1c53f15	pull	a	build	8.55	0	237849771		again, page cache dropped, 26.5 MiB/s

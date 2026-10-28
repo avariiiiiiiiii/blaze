@@ -49,6 +49,11 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   (docs/cargo.md says what it does not hide). Sandboxed tests still need user namespaces.
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
 - Native proc macros receive real source positions, text and file paths through the bidirectional server protocol; a server that cannot enable source spans is refused (#823).
+- `unchecked_add`, `unchecked_sub`, `unchecked_mul`, `unchecked_shl`, `unchecked_shr`,
+  `unchecked_div`, `unchecked_rem` and `exact_div` in a constant fail to evaluate, as rustc's
+  do, where the operation is undefined: an overflow, a shift past the width, a division by
+  zero or of the least value by -1, and an `exact_div` with a remainder (#862). Some gave a
+  wrong value instead: `unchecked_div(-128i8, -1)`, and `exact_div` with a remainder.
 - Invalid built-in derives now fail `blaze check` and `blaze build`, including `Default` on an enum without a default variant and derives on unsupported item shapes (#751).
 - `Location::caller()` in a constant is evaluated, as rustc does: the place of the first call up
   the stack that does not track its caller, under the file name the build uses (#862). A function

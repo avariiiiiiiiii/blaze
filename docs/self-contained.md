@@ -57,7 +57,7 @@ it, and the step that ends the need for it ([no-rustc.md](no-rustc.md#the-plan))
 | `rust-analyzer-proc-macro-srv` (`libexec`) | in `rustc` | expanding proc macros with the libraries rustc built | J1 and J2 |
 | `rust-std-<host>` (the sysroot's rlibs) | 31.7 MB | linking what cargo and rustc built; `libstd`'s dynamic library for a proc macro's tests | F and G as the only build |
 | `rust-src` | 6.0 MB | the standard library's source, which blaze compiles (and which the shipped std unit is keyed by) | stays: it is source. Later shipped with blaze |
-| rustup | | finding the pinned nightly and its `rust-src` (`cargo/toolchain.rs`, #296), `multirust-channel-manifest.toml` for the release and commit (`answers/own.rs`, `main.rs`) | blaze's own toolchain ([below](#blazes-own-toolchain-the-stopgap)) |
+| rustup | | finding the pinned nightly and its `rust-src` (`cargo/toolchain.rs`, #296), `multirust-channel-manifest.toml` for the release and commit (`answers/own.rs`, `lib.rs`) | blaze's own toolchain ([below](#blazes-own-toolchain-the-stopgap)) |
 
 On macOS the same pieces are 51.6, 8.9, 30.9 and 6.0 MB (97.4 MB); on Linux AArch64 118.2 MB.
 Unpacked they are 710 MB on Linux x86-64 and 548 MB on macOS.

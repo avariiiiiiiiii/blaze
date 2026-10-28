@@ -41,7 +41,7 @@ The names are `blaze_live::format::LEVELS`, which the daemon's events and the wi
    Every function that has had 0.3% of the samples is one that may be built into what is
    compiled. Code that is not the daemon's (rustc's copies of the dependencies) is shown at
    level 0 and is not asked for again.
-4. **The worker compiles them beside its builds** (`compile_tiered` in `main.rs`) on a
+4. **The worker compiles them beside its builds** (`compile_tiered` in `lib.rs`) on a
    thread of its own: it builds the IR of each with a copy of the database
    (`hir_ty_codegen::tier::prepare`), lets go of the database, and only then runs LLVM
    (`Prepared::finish`), so a change to the source never waits for LLVM. It keeps the code

@@ -15,10 +15,16 @@ homepage.workspace = true
 keywords.workspace = true
 categories = ["development-tools::build-utils", "compilers"]
 
-# The program `blaze` and blaze-rustc run.
+# The engine is a library, so its parts can become crates of their own; its comments' code blocks
+# are not doctests.
+[lib]
+doctest = false
+
+# The program `blaze` and blaze-rustc run. Its tests are the library's.
 [[bin]]
 name = "blaze-engine"
 path = "src/main.rs"
+test = false
 
 # These make a sandbox with a view, whose seccomp listener the kernel refuses inside the test
 # sandbox's own (one listener to a process): `blaze test` runs them outside.

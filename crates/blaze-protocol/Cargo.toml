@@ -1,0 +1,24 @@
+[package]
+name = "blaze-protocol"
+description = "blaze's wire protocol between the daemon and its clients: length-prefixed frames of deterministic CBOR (RFC 8949 4.2.1)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+blaze-fuzz.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true

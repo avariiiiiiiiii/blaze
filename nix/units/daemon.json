@@ -929,6 +929,18 @@
    },
    {
     "dependencies": [
+     "blaze-protocol",
+     "crossbeam-channel",
+     "expect-test",
+     "rustc-hash 2.1.2",
+     "serde",
+     "serde_json"
+    ],
+    "name": "blaze-graph",
+    "version": "0.20261028.3"
+   },
+   {
+    "dependencies": [
      "libc"
     ],
     "name": "blaze-in-place",
@@ -8100,6 +8112,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-fuzz",
+    "kind": "path"
+   },
+   "version": "0.20261028.3"
+  },
+  "blaze-graph@0.20261028.3": {
+   "authors": "blaze contributors",
+   "description": "blaze's build driver as a graph that does no IO: a state machine of nodes, and the executor that does what it asks (docs/driver.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-graph",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-graph",
     "kind": "path"
    },
    "version": "0.20261028.3"

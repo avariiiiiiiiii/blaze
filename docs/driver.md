@@ -68,9 +68,10 @@ The machine does no fs, net, process, thread or clock call; a test checks its so
 them. Given the same inputs it gives the same outputs, in the same order: of the ready nodes,
 the one with the longest remaining path to the end of the build goes first, so the critical
 path is never behind work off it; ties go by node id. That makes it testable with recorded
-completions: a **trace** is the sequence of inputs of a real build, and the corpus of traces
-under `crates/blaze-graph/traces/` replays each one and checks the transitions it gives.
-A trace is the build events' file (below) of a real build, so any build can become a test.
+completions: a **trace** is the machine's configuration and the inputs of a real build, a line
+of JSON each, as the executor keeps them when asked (`blaze_graph::trace`). The corpus under
+`crates/blaze-graph/traces/` replays each one and checks the outputs against its `.out` file, so
+any build can become a test.
 
 ### The executor
 

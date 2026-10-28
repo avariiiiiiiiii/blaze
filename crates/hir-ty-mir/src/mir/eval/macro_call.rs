@@ -27,7 +27,7 @@ pub fn call_with_strs<'db>(
         slice.extend_from_slice(&word_bytes(arg.len()));
         slices.push(IntervalOrOwned::Owned(slice));
     }
-    let result = evaluator.interpret_mir(body, slices.into_iter())?;
+    let result = evaluator.interpret_mir(body, slices.into_iter(), None)?;
     read_string(&evaluator, result)
 }
 

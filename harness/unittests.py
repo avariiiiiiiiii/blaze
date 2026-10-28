@@ -40,6 +40,22 @@ OPEN = {
     "hir_ide::tests::traits::infer_from_return_pos_impl_trait",
     "hir_ide::tests::traits::nested_impl_traits",
 }
+# Known to fail when blaze builds and tests them, and not when rustc does: OPEN too on a blaze run.
+OPEN_BLAZE = {
+    # https://github.com/indexable-inc/blaze/issues/892
+    *(f"blaze_engine::socket::tests::{t}" for t in [
+        "a_client_that_never_reads_is_given_up_on", "a_directory_others_can_swap_is_refused",
+        "a_log_that_was_there_becomes_the_users_alone", "a_reply_has_a_time_limit_once_the_request_is_read",
+        "a_silent_or_endless_client_is_given_up_on", "a_socket_in_a_shared_directory_is_never_open_to_others",
+        "a_socket_let_go_of_is_free_while_processes_start", "one_connection_too_many_is_closed",
+        "one_process_serves_a_socket", "the_directory_and_the_socket_are_the_users_alone",
+    ]),
+    # https://github.com/indexable-inc/blaze/issues/893
+    "blaze_engine::remote::gateway::tests::what_is_over_a_put_goes_up_in_parts_checked_whole",
+}
+# Skipped on a blaze run: it overflows its stack, which aborts its whole test binary
+# (https://github.com/indexable-inc/blaze/issues/894).
+SKIP_BLAZE = ["handlers::borrowck::tests::a_5204_arm_else_if_chain_is_diagnosed_in_linear_time"]
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 # A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and
@@ -75,13 +91,16 @@ def main():
     plain = args[:1] == ["--cargo"]
     args = args[plain:]
     command = [*(["cargo"] if plain else ["blaze"]), "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *args]
+    open_ = OPEN if plain else OPEN | OPEN_BLAZE
+    if not plain:
+        command += [*([] if "--" in args else ["--"]), *(f"--skip={t}" for t in SKIP_BLAZE)]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
     seen, failed = set(), set()
     status, any_failed = run(command, ROOT, env, seen, failed)
     sys.stdout.flush()
-    new, fixed, gone = sorted(failed - OPEN), sorted(OPEN & seen - failed), sorted(OPEN - seen)
-    print(f"\n{len(seen)} tests, {len(failed)} failed, {len(OPEN & failed)} of them known (OPEN in harness/unittests.py)")
+    new, fixed, gone = sorted(failed - open_), sorted(open_ & seen - failed), sorted(open_ - seen)
+    print(f"\n{len(seen)} tests, {len(failed)} failed, {len(open_ & failed)} of them known (OPEN in harness/unittests.py)")
     for name in new:
         print(f"::error::{name} fails, and is not in OPEN in harness/unittests.py")
     for name in fixed:

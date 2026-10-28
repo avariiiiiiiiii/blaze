@@ -485,23 +485,23 @@ like a Unix socket or HTTP."
     and compiled functions, and two daemons agree on it byte for byte;
   - byte strings carry hashes and file contents as they are, without base64;
   - it is compact and fast to parse.
-- **The implementation.** minicbor, with structs encoded as maps keyed by small unsigned
-  integers declared in ascending order: its encoder always writes integers and lengths in the
-  shortest form (**read**, `minicbor` 2.3.0 `encoder.rs`), but it encodes a `HashMap` in
-  iteration order and a `BTreeMap` in Rust's order, which for text keys is not RFC 8949's
-  bytewise order of the encoded keys ("b" sorts before "aa" there), and writes every `f64` in
-  eight bytes (**read**, same source). So the schema has no maps keyed by strings or hash
-  iteration and no floats, and a small validator of blaze's own checks every message against
-  section 4.2 (shortest heads, definite lengths, strictly increasing map keys, no
-  non-shortest float). The daemon refuses a message that fails it, naming the first offence,
-  rather than canonicalizing it, so a client that encodes wrong finds out. Tests: every
-  message type round-trips decode to encode byte-identically, and the validator accepts
-  everything the encoder writes, on random values. ciborium (serde) was not chosen: serde's
-  maps and floats give no such control (**unverified** beyond the above); an encoder of our
-  own stays possible behind the same validator.
+- **The implementation** is `crates/blaze-protocol`: a serde serializer and deserializer of
+  blaze's own, so every message type is the `#[derive(Serialize, Deserialize)]` type it already
+  is. The serializer writes integers and lengths in their shortest head, definite lengths only,
+  each map's entries sorted by the bytes of their encoded keys whatever order the type gave
+  (a struct's fields, a `HashMap`; "b" sorts before "aa"), and a float in the shortest of half,
+  single and double precision that holds it exactly. minicbor was not chosen: it encodes a
+  `HashMap` in iteration order, a `BTreeMap` in Rust's order and every `f64` in eight bytes
+  (**read**, `minicbor` 2.3.0 `encoder.rs`); ciborium writes map entries in the order serde
+  gives them (**unverified**). Every read first runs a validator against section 4.2.1 (shortest heads, definite
+  lengths, strictly increasing map keys, shortest floats, one NaN, UTF-8 text, no tags) and
+  refuses a message that fails it, naming the first offence, rather than canonicalizing it, so
+  a client that encodes wrong finds out. Tests: RFC 8949 Appendix A's examples, a message pinned
+  byte for byte, random values round-tripping to the same bytes, and fuzzed bytes that never
+  panic the reader or make it allocate what a length claims.
 - **Framing on the socket.** Each message is a length (four bytes, big-endian, at most 16 MiB
   as `socket::LONGEST_REQUEST` today) and then one CBOR item, a map of a request id, the schema
-  version and the body. Request ids let a client pipeline several requests on one connection;
+  version and the body (`blaze_protocol::Message`). Request ids let a client pipeline several requests on one connection;
   replies and progress events (a test finished, a build stage done) carry the id they answer
   and may come in any order.
 - **Calls.** `apply(base, ops) -> root` (an atomic multi-file transaction), `head(workspace)`,

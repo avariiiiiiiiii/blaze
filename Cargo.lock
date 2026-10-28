@@ -971,6 +971,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-protocol"
+version = "0.20261028.0"
+dependencies = [
+ "blaze-fuzz",
+ "serde",
+]
+
+[[package]]
 name = "blaze-registry"
 version = "0.20261028.0"
 dependencies = [

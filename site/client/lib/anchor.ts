@@ -46,8 +46,8 @@ export const SHELL = ['main', ...REGIONS.map(([, sel]) => sel)].join(', ');
 /** A thing in a region that is neither a link nor a chat message is known by its kind and its place among the region's
  * things of that kind (`k<kind>.<n>`): the same for every reader, since the shell is. */
 const KINDS = ['button', 'summary', 'li', 'input, textarea', 'p', 'h2, h3'];
-/** What only this reader has on screen (a dialog, their pop-ups): a pointer there is on nothing the others have. */
-const PRIVATE = 'dialog, .chat-toasts';
+/** What only this reader has on screen (a dialog, the feed: client/lib/feed.ts): a pointer there is on nothing the others have. */
+const PRIVATE = 'dialog, .feed';
 /** What a key may hold. */
 const KEY = /^[\w/.#:?=&%~+@,-]{0,160}$/;
 /** A fraction's bounds: a little past the box, as for a pointer beside a block. */
@@ -153,12 +153,6 @@ function hitAt(px: number, py: number, skip: Element[]): { hit: Element; region:
 		if (box) return { hit, region, box };
 	}
 	return { hit, region: 'm', box: null };
-}
-
-/** Whether the window point is on a region (which stays put as the page scrolls) rather than the article. */
-export function fixedAt(px: number, py: number, skip: Element[]): boolean {
-	const at = hitAt(px, py, skip);
-	return !!at && at.region !== 'm';
 }
 
 /** What the window point is on, as sent; null when it is on nothing the others have. */

@@ -1183,7 +1183,9 @@ mod tests {
         let file = of(declared.clone(), true).unwrap().unwrap();
         assert_eq!(file, AbsPathBuf::assert(manifest.parent().unwrap().join("src/macros.rs")));
         let off = of(declared, false).unwrap().unwrap_err();
-        assert!(off.contains("`experimental = [\"const-macros\"]` under [workspace.metadata.blaze]"));
+        assert!(
+            off.contains("`experimental = [\"const-macros\"]` under [workspace.metadata.blaze]")
+        );
         let missing = of(json!({ "blaze": { "const-macros": "src/none.rs" } }), true);
         assert!(missing.unwrap().unwrap_err().contains("which does not exist"));
         let wrong = of(json!({ "blaze": { "const-macros": true } }), true);

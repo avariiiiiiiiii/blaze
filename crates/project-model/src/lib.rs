@@ -70,9 +70,9 @@ use base_db::TargetKind;
 pub use crate::{
     build_dependencies::{ProcMacroDylibPath, WorkspaceBuildScripts},
     cargo_workspace::{
-        CONST_MACROS, CargoConfig, CargoFeatures, CargoMetadataConfig, CargoWorkspace, OwnBuildAsked,
-        OwnBuildOutput, OwnBuildScripts, OwnMetadata, Package, PackageData, PackageDependency,
-        RustLibSource, Target, TargetData, TargetDirectoryConfig,
+        CONST_MACROS, CargoConfig, CargoFeatures, CargoMetadataConfig, CargoWorkspace,
+        OwnBuildAsked, OwnBuildOutput, OwnBuildScripts, OwnMetadata, Package, PackageData,
+        PackageDependency, RustLibSource, Target, TargetData, TargetDirectoryConfig,
     },
     manifest_path::ManifestPath,
     project_json::{ProjectJson, ProjectJsonData},

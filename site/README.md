@@ -149,8 +149,14 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   page's discussion with its comment count, the faces on this page (click for everyone and where), and the reader's
   GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
   The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the
-  object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour), taken back by their
-  author or a `COMMENT_ADMINS` id. Comment writes (`comments.ts`) tell it too, and open pages refresh their threads.
+  object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour, replies counted), taken
+  back by their author or a `COMMENT_ADMINS` id. Messages have Slack-style threads, one level deep (a `parent` column):
+  the list shows top-level messages with a line for their replies (faces, count, last reply), and a thread opens over
+  the list, or as a column beside it in full screen; taking back a message takes its thread, and pruning never leaves
+  a reply without its message. Replies make no bubbles, pop-ups or badge count unless they mention the reader. Both
+  composers complete `@login` from people online and recent authors; a message that mentions the reader is marked,
+  and while the chat is shut it pops up (even muted) and counts. Comment writes (`comments.ts`) tell the object too,
+  and open pages refresh their comment threads.
 - `updates.ts`: the `/updates` form.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.
 

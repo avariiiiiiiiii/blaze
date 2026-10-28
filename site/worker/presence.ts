@@ -13,19 +13,31 @@
  *   server -> client  {t: "you", key, login, avatar, signIn}       once, on connect
  *                     {t: "here", people: [{key, login, avatar, pages: [{path, away}]}]}   on every change
  *                     {t: "comments", doc}                      a comment on that doc was posted or deleted
- *                     {t: "chat", messages: [Msg]}              the chat's last CHAT_SHOWN messages, once, on connect
- *                     {t: "msg", m: Msg} / {t: "unsay", id}     a chat message said, or taken back
+ *                     {t: "chat", messages: [Msg]}              the chat's last CHAT_SHOWN top-level messages, each
+ *                                                                  with its thread's summary, once, on connect
+ *                     {t: "msg", m: Msg}                        a chat message said; a reply has `parent` set, and
+ *                                                                  clients bump that message's summary themselves
+ *                     {t: "unsay", id}                          a message taken back (a top-level one takes its
+ *                                                                  replies with it)
+ *                     {t: "unsay", id, parent, ...Summary}      a reply taken back, and its thread's new summary
+ *                     {t: "thread", id, root, messages: [Msg]}  the replies to message `id`, oldest first (the last
+ *                                                                  THREAD_SHOWN), and the message itself (null if gone)
  *                     {t: "typing", key, login, avatar}           someone signed in is writing (at most every TYPING_MS)
  *                     {t: "error", text}                        why the tab's last chat message was refused
  *   client -> server  {t: "at", path, away}                       the page the tab shows (a site path) and whether
  *                                                                  it is hidden; unknown paths count as no page
  *                     {t: "typing"}                            chat: the reader is writing a message
- *                     {t: "say", text} / {t: "unsay", id}       chat: signed-in readers only; taking back is for
- *                                                                  the author or a COMMENT_ADMINS id
+ *                     {t: "say", text, parent?}                 chat: signed-in readers only; `parent` makes it a
+ *                                                                  reply in that top-level message's thread
+ *                     {t: "unsay", id}                          chat: for the author or a COMMENT_ADMINS id
+ *                     {t: "thread", id}                         chat: asks for that message's thread
  *
- * Msg is {id, key, login, avatar, text, at}. The chat is everyone on the site, kept in the object's SQLite (the last
- * CHAT_KEPT messages); anyone can read it, only signed-in readers can talk, at most RATE_SHORT per 15 s and RATE_LONG
- * per hour each.
+ * Msg is {id, key, login, avatar, text, at, parent?}; a top-level one in `chat` and `thread` frames also carries its
+ * Summary, {replies, last, repliers}: how many replies, when the last came (ISO), and up to three of the latest
+ * distinct repliers ({key, login, avatar}). Threads are one level deep, like Slack's: a reply to a reply is refused.
+ * The chat is everyone on the site, kept in the object's SQLite (the last CHAT_KEPT messages, replies included; a
+ * message pruned takes its replies with it). Anyone can read it, only signed-in readers can talk, at most RATE_SHORT
+ * per 15 s and RATE_LONG per hour each, replies counted.
  *
  * A visitor with several tabs is one person with several pages. Broadcasts are coalesced (BROADCAST_MS). The
  * comment routes (worker/comments.ts) call `announce` after each write, so open pages refresh their threads live.
@@ -44,6 +56,7 @@ const MAX_FRAME = 4096;
 const CHAT_MAX = 500;
 const CHAT_SHOWN = 80;
 const CHAT_KEPT = 500;
+const THREAD_SHOWN = 200;
 const RATE_SHORT = 5;
 const RATE_LONG = 120;
 const MAX_PEOPLE = 300;
@@ -52,7 +65,8 @@ const TYPING_MS = 2000;
 const RETURN_MS = 120_000;
 
 type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean };
-type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string };
+type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string; parent?: number };
+type Summary = { replies: number; last: string | null; repliers: Who[] };
 /** Kept on each socket (`serializeAttachment`), so it survives hibernation. */
 type Tab = Who & { path: string | null; away: boolean; country: string | null; seen?: number; since?: number };
 /** `country` is Cloudflare's two-letter guess from the IP (`request.cf.country`), shown as a flag; null when unknown or Tor. */
@@ -104,6 +118,13 @@ export class Presence extends DurableObject<Env> {
 		ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS chat (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, login TEXT NOT NULL, avatar TEXT,
 			text TEXT NOT NULL, at TEXT NOT NULL)`);
+		// Threads came later: a database from before them gets the column here (and has it already the next time).
+		try {
+			ctx.storage.sql.exec('ALTER TABLE chat ADD COLUMN parent INTEGER');
+		} catch {
+			// The column is there.
+		}
+		ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS chat_parent ON chat (parent)');
 	}
 
 	override async fetch(request: Request): Promise<Response> {
@@ -135,7 +156,7 @@ export class Presence extends DurableObject<Env> {
 
 	override webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
 		if (typeof message !== 'string' || message.length > MAX_FRAME) return ws.close(1009, 'Too big.');
-		let m: { t?: unknown; path?: unknown; away?: unknown; text?: unknown; id?: unknown };
+		let m: { t?: unknown; path?: unknown; away?: unknown; text?: unknown; id?: unknown; parent?: unknown };
 		try {
 			m = JSON.parse(message) as typeof m;
 		} catch {
@@ -148,8 +169,9 @@ export class Presence extends DurableObject<Env> {
 			this.typed.set(tab.key, now);
 			return this.broadcast(JSON.stringify({ t: 'typing', key: tab.key, login: tab.login, avatar: tab.avatar }));
 		}
-		if (m.t === 'say') return this.say(ws, tab, m.text);
+		if (m.t === 'say') return this.say(ws, tab, m.text, m.parent);
 		if (m.t === 'unsay') return this.unsay(ws, tab, m.id);
+		if (m.t === 'thread') return this.thread(ws, m.id);
 		if (m.t !== 'at') return;
 		const path = typeof m.path === 'string' && PATHS.has(m.path) ? m.path : null;
 		const away = m.away === true;
@@ -171,11 +193,20 @@ export class Presence extends DurableObject<Env> {
 		this.schedule();
 	}
 
-	private say(ws: WebSocket, tab: Tab, raw: unknown): void {
+	private say(ws: WebSocket, tab: Tab, raw: unknown, rawParent: unknown): void {
 		const refuse = (text: string) => ws.send(JSON.stringify({ t: 'error', text }));
 		if (!tab.login) return refuse('Sign in with GitHub to chat.');
 		const text = typeof raw === 'string' ? raw.trim() : '';
 		if (text.length < 1 || text.length > CHAT_MAX) return refuse(`A message is 1 to ${CHAT_MAX} characters.`);
+		let parent: number | null = null;
+		if (rawParent !== undefined && rawParent !== null) {
+			if (typeof rawParent !== 'number' || !Number.isSafeInteger(rawParent)) return refuse('No such thread.');
+			const p = this.ctx.storage.sql.exec<{ parent: number | null }>('SELECT parent FROM chat WHERE id = ?', rawParent).toArray()[0];
+			if (!p) return refuse('That message is gone.');
+			// One level, like Slack: a reply goes in the thread of a top-level message, never under another reply.
+			if (p.parent !== null) return refuse('Reply in the thread, not to a reply.');
+			parent = rawParent;
+		}
 		const now = Date.now();
 		const times = (this.said.get(tab.key) ?? []).filter((t) => now - t < 3_600_000);
 		if (times.filter((t) => now - t < 15_000).length >= RATE_SHORT || times.length >= RATE_LONG) return refuse('Slow down a little.');
@@ -184,28 +215,83 @@ export class Presence extends DurableObject<Env> {
 		this.typed.delete(tab.key);
 		const at = new Date(now).toISOString();
 		const row = this.ctx.storage.sql
-			.exec<{ id: number }>('INSERT INTO chat (key, login, avatar, text, at) VALUES (?, ?, ?, ?, ?) RETURNING id', tab.key, tab.login, tab.avatar, text, at)
+			.exec<{ id: number }>(
+				'INSERT INTO chat (key, login, avatar, text, at, parent) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+				tab.key,
+				tab.login,
+				tab.avatar,
+				text,
+				at,
+				parent,
+			)
 			.one();
-		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id <= ?', row.id - CHAT_KEPT);
-		const m: Msg = { id: row.id, key: tab.key, login: tab.login, avatar: tab.avatar, text, at };
+		// Replies are always newer than their message, so a reply pruned by id never leaves its message behind; the
+		// second half takes the replies of messages pruned, wherever they are, so no reply is left without one.
+		const cutoff = row.id - CHAT_KEPT;
+		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id <= ? OR parent <= ?', cutoff, cutoff);
+		if (parent !== null && parent <= cutoff) return refuse('That thread is too old for replies.');
+		const m: Msg = { id: row.id, key: tab.key, login: tab.login, avatar: tab.avatar, text, at, ...(parent !== null && { parent }) };
 		this.broadcast(JSON.stringify({ t: 'msg', m }));
 	}
 
 	private unsay(ws: WebSocket, tab: Tab, id: unknown): void {
 		if (typeof id !== 'number' || !Number.isSafeInteger(id) || !tab.login) return;
-		const row = this.ctx.storage.sql.exec<{ key: string }>('SELECT key FROM chat WHERE id = ?', id).toArray()[0];
+		const row = this.ctx.storage.sql.exec<{ key: string; parent: number | null }>('SELECT key, parent FROM chat WHERE id = ?', id).toArray()[0];
 		if (!row) return;
 		if (row.key !== tab.key && !tab.admin) return ws.send(JSON.stringify({ t: 'error', text: 'Not your message.' }));
-		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id = ?', id);
-		this.broadcast(JSON.stringify({ t: 'unsay', id }));
+		// A top-level message takes its thread with it.
+		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id = ? OR parent = ?', id, id);
+		if (row.parent === null) return this.broadcast(JSON.stringify({ t: 'unsay', id }));
+		const s = this.summaries([row.parent]).get(row.parent) ?? { replies: 0, last: null, repliers: [] };
+		this.broadcast(JSON.stringify({ t: 'unsay', id, parent: row.parent, ...s }));
 	}
 
-	/** The last CHAT_SHOWN messages, oldest first. */
-	private history(): Msg[] {
-		return this.ctx.storage.sql
-			.exec<Msg>('SELECT id, key, login, avatar, text, at FROM chat ORDER BY id DESC LIMIT ?', CHAT_SHOWN)
+	/** Sends one tab the replies to `id`, oldest first, and the message itself. */
+	private thread(ws: WebSocket, id: unknown): void {
+		if (typeof id !== 'number' || !Number.isSafeInteger(id)) return;
+		const root = this.ctx.storage.sql
+			.exec<Msg>('SELECT id, key, login, avatar, text, at FROM chat WHERE id = ? AND parent IS NULL', id)
+			.toArray()[0];
+		const messages = root
+			? this.ctx.storage.sql
+					.exec<Msg>('SELECT id, key, login, avatar, text, at, parent FROM chat WHERE parent = ? ORDER BY id DESC LIMIT ?', id, THREAD_SHOWN)
+					.toArray()
+					.reverse()
+			: [];
+		const s = root ? this.summaries([id]).get(id) : undefined;
+		ws.send(JSON.stringify({ t: 'thread', id, root: root ? { ...root, ...s } : null, messages }));
+	}
+
+	/** The last CHAT_SHOWN top-level messages, oldest first, each with its thread's summary. */
+	private history(): (Msg & Summary)[] {
+		const top = this.ctx.storage.sql
+			.exec<Msg>('SELECT id, key, login, avatar, text, at FROM chat WHERE parent IS NULL ORDER BY id DESC LIMIT ?', CHAT_SHOWN)
 			.toArray()
 			.reverse();
+		const s = this.summaries(top.map((m) => m.id));
+		return top.map((m) => ({ ...m, ...(s.get(m.id) ?? { replies: 0, last: null, repliers: [] }) }));
+	}
+
+	/** The thread summaries of `ids` (top-level messages), only those with replies. The table is at most CHAT_KEPT rows. */
+	private summaries(ids: number[]): Map<number, Summary> {
+		const out = new Map<number, Summary>();
+		if (!ids.length) return out;
+		const want = new Set(ids);
+		const rows = this.ctx.storage.sql
+			.exec<{ parent: number; key: string; login: string; avatar: string | null; at: string }>(
+				'SELECT parent, key, login, avatar, at FROM chat WHERE parent >= ? ORDER BY id DESC',
+				Math.min(...ids),
+			)
+			.toArray();
+		for (const r of rows) {
+			if (!want.has(r.parent)) continue;
+			let s = out.get(r.parent);
+			// Newest first, so the first row a thread meets is its last reply.
+			if (!s) out.set(r.parent, (s = { replies: 0, last: r.at, repliers: [] }));
+			s.replies++;
+			if (s.repliers.length < 3 && !s.repliers.some((w) => w.key === r.key)) s.repliers.push({ key: r.key, login: r.login, avatar: r.avatar });
+		}
+		return out;
 	}
 
 	private broadcast(out: string): void {

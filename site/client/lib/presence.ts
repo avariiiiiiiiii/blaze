@@ -413,6 +413,7 @@ function connect(): void {
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
 			chat.setOnline(total);
+			chat.setPeople(people);
 		} else return;
 		draw();
 	});

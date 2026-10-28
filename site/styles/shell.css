@@ -397,6 +397,12 @@ body.chat-full .chat-back { order: 1; }
 @media (max-width: 800px) { .resizer { display: none; } }
 
 /* What someone just said in the chat, out of their face in the sidebar (client/lib/presence.ts), for a few seconds. */
+/* The site's tooltips (client/lib/tip.ts). */
+.tip { position: fixed; z-index: 60; max-width: 280px; padding: 4px 8px; border-radius: 7px; background: var(--ink-1); color: var(--bg); font-size: 12px; line-height: 1.35; pointer-events: none; animation: tip-in 0.1s ease-out; }
+.tip[hidden] { display: none; }
+@keyframes tip-in { from { opacity: 0; transform: translateY(2px); } }
+.tip.below { animation-name: tip-in-below; }
+@keyframes tip-in-below { from { opacity: 0; transform: translateY(-2px); } }
 .say-bubble { position: fixed; z-index: 45; max-width: 240px; padding: 7px 10px; border-radius: 12px 12px 12px 4px; background: var(--bg-4); box-shadow: inset 0 0 0 1px var(--line-2), 0 8px 24px rgb(0 0 0 / 0.25); color: var(--ink-1); font-size: 12.5px; line-height: 1.35; pointer-events: none; animation: say-in 0.18s ease-out; }
 .say-bubble b { display: block; margin-bottom: 1px; color: var(--ink-3); font-size: 11px; font-weight: 500; }
 .say-bubble span { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }

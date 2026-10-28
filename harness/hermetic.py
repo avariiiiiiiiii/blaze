@@ -81,25 +81,32 @@ mod dispatch {
     type Fn = *mut ();
     type RealFn = unsafe fn(u32) -> u32;
 
+    // As memchr writes it: in a macro, so the static is in a block in the body's block.
+    macro_rules! chosen {
+        ($x:ident) => {{
+            static FN: AtomicPtr<()> = AtomicPtr::new(detect as Fn);
+
+            unsafe fn fast(x: u32) -> u32 {
+                x + 1
+            }
+
+            unsafe fn slow(x: u32) -> u32 {
+                x + 1
+            }
+
+            unsafe fn detect(x: u32) -> u32 {
+                let fun = if std::hint::black_box(true) { fast as RealFn } else { slow as RealFn };
+                FN.store(fun as Fn, Ordering::Relaxed);
+                unsafe { fun(x) }
+            }
+
+            let fun = FN.load(Ordering::Relaxed);
+            unsafe { std::mem::transmute::<Fn, RealFn>(fun)($x) }
+        }};
+    }
+
     pub fn chosen(x: u32) -> u32 {
-        static FN: AtomicPtr<()> = AtomicPtr::new(detect as Fn);
-
-        unsafe fn fast(x: u32) -> u32 {
-            x + 1
-        }
-
-        unsafe fn slow(x: u32) -> u32 {
-            x + 1
-        }
-
-        unsafe fn detect(x: u32) -> u32 {
-            let fun = if std::hint::black_box(true) { fast as RealFn } else { slow as RealFn };
-            FN.store(fun as Fn, Ordering::Relaxed);
-            unsafe { fun(x) }
-        }
-
-        let fun = FN.load(Ordering::Relaxed);
-        unsafe { std::mem::transmute::<Fn, RealFn>(fun)(x) }
+        chosen!(x)
     }
 
     pub fn hooked(f: RealFn, x: u32) -> u32 {

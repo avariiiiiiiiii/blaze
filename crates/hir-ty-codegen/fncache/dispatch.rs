@@ -5,7 +5,7 @@
 //! has, as it has std's own choice of code by the CPU.
 //!
 //! A static is one when it is a `static` (not `mut`) of core's `AtomicPtr`, declared in a
-//! block of a body of a module (not of another block), whose value is a function's address
+//! block of a body of a module (a block in a block of it too), whose value is a function's address
 //! made into a pointer, and every body that can name it (the one its block is in, the
 //! closures of that body, and every item declared in a block of it, through their blocks)
 //! only `load`s it and `store`s a function's address made into a pointer in it. A body there
@@ -51,10 +51,11 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
     }
     let ItemContainerId::ModuleId(module) = id.lookup(db).container else { return Some("not declared in a block") };
     let Some(block) = module.block(db) else { return Some("not of a module's block") };
+    // A block in a block is in the same body: a body with a macro call has a block of its own.
     // SAFETY: the module is used in this call alone, as hir-def's own search for a block's body.
-    let outer = unsafe { block.module(db).to_static() };
-    if outer.block(db).is_some() {
-        return Some("not a module's block");
+    let mut outer = unsafe { block.module(db).to_static() };
+    while let Some(it) = outer.block(db) {
+        outer = unsafe { it.module(db).to_static() };
     }
     let Some(owner) = owners(db, outer)
         .into_iter()

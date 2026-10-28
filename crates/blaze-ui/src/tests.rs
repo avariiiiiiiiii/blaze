@@ -161,10 +161,7 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
         drawn = if live_finished(rest) { 0 } else { region_len(&lines) };
     }
     let last = &screens.last().unwrap().1;
-    assert!(
-        last.ends_with("    Compiled 5351 fns in 1 crate, 2 kept; 1m14s\n"),
-        "{last:?}"
-    );
+    assert!(last.ends_with("    Compiled 5351 fns in 1 crate, 2 kept; 1m14s\n"), "{last:?}");
     // In the middle of the compile: the step, the crate under way, its count.
     let middle = &screens.iter().find(|it| it.0 == 60 * S).unwrap().1;
     let region: Vec<&str> = middle.split("\x1b[J").last().unwrap().lines().collect();

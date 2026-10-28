@@ -44,7 +44,8 @@ pub(crate) fn forget_beside(socket: &Path) {
 /// of a process that started in the place of another that has not quite gone.
 pub(crate) fn written_in(dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
-    let written = entries.flatten().filter(|it| it.file_name().to_string_lossy().starts_with("events."));
+    let written =
+        entries.flatten().filter(|it| it.file_name().to_string_lossy().starts_with("events."));
     let written = written.filter_map(|it| Some((it.metadata().ok()?.modified().ok()?, it.path())));
     written.max().map(|(_, path)| path)
 }
@@ -246,7 +247,10 @@ mod tests {
         written.extend(&ended[3..]);
         std::fs::write(&path, &written).unwrap();
         let read = follow.read(&path, true);
-        assert!(matches!(read[..], [blaze_protocol::events::Record { event: Event::Ended { .. }, .. }]));
+        assert!(matches!(
+            read[..],
+            [blaze_protocol::events::Record { event: Event::Ended { .. }, .. }]
+        ));
         // A process in the place of the last writes another file, read from its start.
         let other = dir.join("events.2");
         std::fs::write(&other, &before).unwrap();

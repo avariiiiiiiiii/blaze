@@ -1210,7 +1210,8 @@ fn relaying(
         lock(&build).apply(&record);
         // A command that went away is handed nothing more; its answer goes nowhere too.
         if !gone.load(Relaxed)
-            && blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Record(record))).is_err()
+            && blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Record(record)))
+                .is_err()
         {
             gone.store(true, Relaxed);
         }
@@ -1294,7 +1295,8 @@ impl Daemon {
             Some(message) => (message.id, None),
             None => (0, None),
         };
-        let replaced = envelope.as_ref().is_some_and(|it| it.replaces && it.version != self.version);
+        let replaced =
+            envelope.as_ref().is_some_and(|it| it.replaces && it.version != self.version);
         let read = Instant::now();
         let mut reply = match envelope {
             Some(envelope) if envelope.version == self.version => {
@@ -1358,7 +1360,9 @@ impl Daemon {
             Request::Build(checkout) => {
                 Some((self.home.join("workers").join(checkout.config.id()), "build"))
             }
-            Request::Check(ahead) => Some((self.home.join("checkers").join(ahead.config.id()), "check")),
+            Request::Check(ahead) => {
+                Some((self.home.join("checkers").join(ahead.config.id()), "check"))
+            }
             Request::Lint(ahead, _) => {
                 Some((self.home.join("checkers").join(ahead.config.id()), "clippy"))
             }

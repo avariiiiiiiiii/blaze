@@ -66,7 +66,10 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
                 RELOAD.to_owned()
             }
             None => {
-                crate::events::at(crate::events::Step::Check, Some(&format!("{} crates", checker.crates)));
+                crate::events::at(
+                    crate::events::Step::Check,
+                    Some(&format!("{} crates", checker.crates)),
+                );
                 let answer = checker.answer(&db, &args, &request);
                 crate::events::idle();
                 answer

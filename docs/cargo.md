@@ -8,7 +8,7 @@ blaze had another name and another command before 2026-10-28; [rename.md](rename
 Every setting below is `BLAZE_<NAME>`, and blaze stops when one is set under its name from
 before, saying what it is called now.
 
-Everything in this file was checked against the code in `crates/blaze-engine/src/cargo/` and run on
+Everything in this file was checked against the code in `crates/blaze-cargo/src/cargo/` and run on
 Linux x86-64. On macOS arm64 `harness/blaze_cli.py --small` was run, and what is known of
 it is under [macOS arm64](#macos-arm64). The design notes it was written from are in
 [reports/CARGO.md](reports/CARGO.md).
@@ -57,7 +57,7 @@ stderr while it does: rustc, cargo, the standard library and its source from the
 own servers, 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
 and 710 MB on Linux x86-64 once unpacked). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
-`crates/blaze-engine/src/cargo/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
+`crates/blaze-cargo/src/cargo/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
 builds download it once; a download that stopped goes on from where it stopped the next time.
 Building with blaze's copy, blaze names its cargo, rustc and rustdoc in `CARGO`, `RUSTC` and
 `RUSTDOC` and puts its `bin` first on `PATH`, for the commands it runs and not for your shell.
@@ -378,7 +378,7 @@ resolve, keeps its bytes in blaze's store by their sha256 and writes them into
 checksum (commit it). A build writes the store's copy below the target directory and sets the
 crate's own variable for a local copy to it; a missing or stale entry fails the build, naming
 the command, and nothing is downloaded. The crates blaze knows and their variables are
-`OVERRIDES` in `crates/blaze-engine/src/cargo/fetches.rs`; a script refused the network that it does
+`OVERRIDES` in `crates/blaze-cargo/src/cargo/fetches.rs`; a script refused the network that it does
 not know is told which variable an entry there would set.
 
 The ways out, in the workspace's root manifest, which is the only one a dependency from a
@@ -1192,7 +1192,7 @@ A command blaze has not written yet fails, says so and does nothing, with status
 A command cargo does not have is refused the same way (`error: no such command`): cargo would
 run a plugin, `cargo-<name>`, from the path, and blaze runs none. `blaze --list` prints
 the table below; flags typed before the command (`blaze -v fmt`) are read after it, as
-cargo reads them. The table is `SUBCOMMANDS` in `crates/blaze-engine/src/cargo/own/mod.rs`.
+cargo reads them. The table is `SUBCOMMANDS` in `crates/blaze-cargo/src/cargo/own/mod.rs`.
 
 | Command | blaze's | What it is, and what it waits for |
 |---|---|---|

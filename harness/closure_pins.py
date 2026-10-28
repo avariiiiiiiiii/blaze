@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """closure_pins.py: the nixpkgs store paths build scripts run with
-(crates/blaze-engine/src/cargo/closure/pins.txt): a C toolchain, a small shell userland and the system
+(crates/blaze-cargo/src/cargo/closure/pins.txt): a C toolchain, a small shell userland and the system
 libraries of the per-crate table, per Linux host, from one pinned nixpkgs revision.
 
     closure_pins.py                    say whether pins.txt is what its revision evaluates to
@@ -23,7 +23,7 @@ import concurrent.futures, json, os, subprocess, sys, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-PINS = os.path.join(ROOT, "crates/blaze-engine/src/cargo/closure/pins.txt")
+PINS = os.path.join(ROOT, "crates/blaze-cargo/src/cargo/closure/pins.txt")
 CACHE = "https://cache.nixos.org"
 CHANNEL = "https://channels.nixos.org/nixos-unstable/git-revision"
 HOSTS = ["x86_64-linux", "aarch64-linux"]

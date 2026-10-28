@@ -46,7 +46,7 @@ said plainly when it happens:
 ## What blaze takes from a Rust toolchain today
 
 Measured on main at 012f0e91e3 (2026-10-25); the sizes are those of `nightly-2026-10-25`'s
-components, as `crates/blaze-engine/src/cargo/toolchain/pins.txt` lists them. Each piece, what uses
+components, as `crates/blaze-cargo/src/cargo/toolchain/pins.txt` lists them. Each piece, what uses
 it, and the step that ends the need for it ([no-rustc.md](no-rustc.md#the-plan)).
 
 | Piece | Size (xz, Linux x86-64) | What uses it | Removed by |
@@ -80,7 +80,7 @@ to it, that no project's pin or `PATH` changes:
   lays out a toolchain, with its channel manifest, so that blaze's sysroot rules read it
   unchanged.
 - **Checked:** the sha256 of each component is compiled into blaze, from the channel
-  manifest of the nightly (`crates/blaze-engine/src/cargo/toolchain/pins.txt`); a download whose
+  manifest of the nightly (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`); a download whose
   bytes differ is not used.
 - **When:** install.sh fetches it after installing blaze, and blaze fetches it itself on the
   first build that needs it and finds no other copy (a `cargo install` of blaze, a deleted

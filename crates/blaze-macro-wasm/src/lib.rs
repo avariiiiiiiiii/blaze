@@ -596,7 +596,7 @@ pub struct Wasm {
     path: PathBuf,
     digest: [u8; 32],
     /// What its expansions are kept under: what it was built of, when the file beside it says
-    /// (`crates/blaze-engine/src/cargo/own_script.rs`, `MADE_OF`), since two builds of the same
+    /// (`crates/blaze-cargo/src/cargo/own_script.rs`, `MADE_OF`), since two builds of the same
     /// source are not the same bytes; its digest otherwise.
     identity: [u8; 32],
     pre: InstancePre<State>,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """toolchain_pins.py: the checksums of the Rust nightly blaze downloads as its own toolchain
-(crates/blaze-engine/src/cargo/toolchain/pins.txt), read from the nightly's channel manifest on
+(crates/blaze-cargo/src/cargo/toolchain/pins.txt), read from the nightly's channel manifest on
 static.rust-lang.org. blaze refuses a download whose bytes hash to anything else. pins.txt also
 has what that rustc says its version is and the commit it was built from, which blaze and the
 harnesses compare a rustc with; harness/toolchain (`nightly-YYYY-MM-DD`) is the one pin.
@@ -19,13 +19,13 @@ RELEASE = open(os.path.join(HERE, "toolchain")).read().strip()
 # A dated nightly: its manifest and files are under the date, named for the channel.
 CHANNEL, _, DATE = RELEASE.partition("-")
 assert CHANNEL == "nightly" and len(DATE) == 10, f"harness/toolchain names {RELEASE}, not nightly-YYYY-MM-DD"
-PINS = os.path.join(ROOT, "crates/blaze-engine/src/cargo/toolchain/pins.txt")
+PINS = os.path.join(ROOT, "crates/blaze-cargo/src/cargo/toolchain/pins.txt")
 DIST = "https://static.rust-lang.org/dist"
 # The hosts blaze has a build for, and Windows for `cargo install`.
 HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
          "x86_64-pc-windows-msvc"]
 # rustup's `minimal` profile without rust-docs, the standard library of wasm32-wasip1, which
-# proc macros are built for (crates/blaze-engine/src/cargo/own_macro.rs), and the standard library's
+# proc macros are built for (crates/blaze-cargo/src/cargo/own_macro.rs), and the standard library's
 # source. `None` is the host.
 COMPONENTS = [("rustc", None), ("cargo", None), ("rust-std", None), ("rust-std", "wasm32-wasip1"),
               ("rust-src", "*")]

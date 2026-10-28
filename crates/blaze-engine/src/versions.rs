@@ -177,11 +177,14 @@ pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
     if !pin::is_channel(channel) {
         bail!("blaze has no channel {channel}: the channels are stable and canary");
     }
-    let bytes = read_at(POINTERS, channel)?
-        .with_context(|| format!("blaze's releases name no release for the {channel} channel yet"))?;
+    let bytes = read_at(POINTERS, channel)?.with_context(|| {
+        format!("blaze's releases name no release for the {channel} channel yet")
+    })?;
     let version = String::from_utf8_lossy(&bytes).trim().to_owned();
     if !pin::is_version(&version) {
-        bail!("the {channel} channel of blaze's releases names {version:?}, which is not a version");
+        bail!(
+            "the {channel} channel of blaze's releases names {version:?}, which is not a version"
+        );
     }
     if let Some(file) = pin::channel_file(channel) {
         let kept = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
@@ -190,7 +193,10 @@ pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
             std::fs::rename(&staged, &file)
         });
         if let Err(e) = kept {
-            eprintln!("blaze: could not keep the {channel} channel's version in {}: {e}", file.display());
+            eprintln!(
+                "blaze: could not keep the {channel} channel's version in {}: {e}",
+                file.display()
+            );
         }
     }
     Ok(version)

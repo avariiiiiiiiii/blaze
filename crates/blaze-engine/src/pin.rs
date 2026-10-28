@@ -166,7 +166,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("blaze-pin-channel-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let manifest = root.join("Cargo.toml");
-        for (pin, read) in [("stable", Ok(Some("stable"))), ("canary", Ok(Some("canary"))), ("nightly", Err(()))] {
+        for (pin, read) in
+            [("stable", Ok(Some("stable"))), ("canary", Ok(Some("canary"))), ("nightly", Err(()))]
+        {
             std::fs::write(&manifest, format!("[workspace.metadata.blaze]\nversion = \"{pin}\"\n"))
                 .unwrap();
             let got = pinned(&manifest);

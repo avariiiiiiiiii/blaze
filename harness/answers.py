@@ -8,7 +8,8 @@ arguments and variables cargo and rust-analyzer ask with (docs/no-rustc.md, step
     answers.py --write   write what rustc answers into blaze's data, after a toolchain bump
 
 blaze's answers are crates/blaze-cargo/src/answers/rustc.json, of the toolchain in harness/toolchain.
-Another toolchain is asked once per question and its answers are kept, as before. The target specs
+Any other rustc named is answered as that one (#837): a copy of the toolchain elsewhere is asked
+too, and blaze's answers to it must be the pinned toolchain's, its sysroot included. The target specs
 depend on the host rustc was built for (x86-64 Linux's links with its own lld): --write keeps
 those of the other hosts and writes this host's, so it is run on each host CI has (Linux
 x86-64 and AArch64, macOS arm64). On a host not written (Windows) blaze answers the spec all
@@ -44,6 +45,8 @@ LIBRARY = ["--crate-name", "word", "--edition=2021", "src/lib.rs", "--error-form
            "--check-cfg", "cfg(feature, values(\"default\"))", "-C", "metadata=d4ed28d9543870f2",
            "-C", "extra-filename=-c55bb0b8e8b3f5b4", "--out-dir", "target/debug/deps",
            "-L", "dependency=target/debug/deps", "-O", "--print", "cfg"]
+UI_FLAGS = ["--print", "link-args", "-C", "save-temps", "-C", "link-dead-code", "--cap-lints", "allow",
+            "-L", "native=/nowhere", "--cfg", "e2024"]
 
 
 def rustc():
@@ -175,14 +178,16 @@ def write():
 
 
 def questions(work):
-    """(rustc's executable, arguments, variables, standard input) for every question compared:
-    of the toolchain rustup installed, and of a copy laid out in `work` as norustc.py lays its out."""
+    """(the rustc blaze is asked as, the rustc whose answer is right, arguments, variables,
+    standard input) for every question compared: of the toolchain rustup installed, and of a
+    copy laid out in `work` as norustc.py lays its out, which blaze answers as the toolchain it
+    builds with, not as the copy, whose sysroot it does not build with."""
     rust = rustc()
     for args, variables, stdin in about_rustc():
-        yield rust, args, variables, stdin
+        yield rust, rust, args, variables, stdin
     copy = os.path.join(norustc.counted_toolchain(work, os.path.join(work, "runs.log")), "bin", "rustc")
     for args in (["--print", "sysroot"], ["--print=target-libdir"], ["-vV"], PROBE):
-        yield copy, args, {}, ""
+        yield copy, rust, args, {}, ""
 
 
 def about_rustc():
@@ -210,10 +215,15 @@ def about_rustc():
             yield ["--print", "cfg", "-O", "-C", "overflow-checks=on", *t], variables, ""
             yield ["--print", "cfg", "--cfg", 'feature="b"', "--cfg", "foo", "--cfg", 'feature="a"',
                    "--cfg", 'feature="b"', *t], variables, ""
-        # What RUSTFLAGS of no bearing on the answers add, as count.py's `-C link-dead-code`.
-        flags = ["-C", "link-dead-code", "-C", "force-frame-pointers=yes", "-Crpath", "-C", "force-unwind-tables=no"]
+        # What RUSTFLAGS of no bearing on the answers add, as count.py's `-C link-dead-code` and
+        # buildmodel.py's `--print link-args -C save-temps`, which print nothing beside another.
+        flags = ["-C", "link-dead-code", "-C", "force-frame-pointers=yes", "-Crpath", "-C", "force-unwind-tables=no",
+                 "--print", "link-args", "-C", "save-temps", "-L", "native=/nowhere"]
         yield [*flags, "-O", *t, "--print", "cfg"], {}, ""
         yield [*PROBE[:4], *flags, *t, *PROBE[4:]], {}, ""
+        # uitest.py's RUSTFLAGS, as cargo asks under them.
+        yield [*UI_FLAGS, *t, "--print", "cfg"], {}, ""
+        yield [*PROBE[:4], *UI_FLAGS, *t, *PROBE[4:]], {}, ""
         yield ["-", "--crate-name", "x", "--print=file-names", "--crate-type", "lib", "--crate-type", "bin",
                "--crate-type", "lib", "--print=crate-name", *t], {}, ""
     for args in features_asked(rustc()):
@@ -246,6 +256,15 @@ def features_asked(rust):
         yield ["--print", "cfg", *combined[target.split("-")[0]], *t]
 
 
+def must_answer(warned):
+    """Whether what rustc warns of is only a kind of crate the target does not have, which
+    cargo's probe of every target meets and blaze answers as rustc does."""
+    lines = [line for line in warned.splitlines() if line.strip()]
+    return all(line.startswith("warning: dropping unsupported crate type") or
+               (line.startswith("warning: ") and line.endswith((" warning emitted", " warnings emitted")))
+               for line in lines)
+
+
 def check():
     rust = rustc()
     if not os.path.exists(DATA):
@@ -257,9 +276,9 @@ def check():
     wrong, answered, unknown = [], 0, {}
 
     def compared(question):
-        rust, args, variables, stdin = question
-        want = ask([rust, *args], variables, stdin)
-        if want[0] != 0 or want[2].strip():
+        rust, truth, args, variables, stdin = question
+        want = ask([truth, *args], variables, stdin)
+        if want[0] != 0:
             return None
         if "target-spec-json" in args:
             target = args[args.index("--target") + 1] if "--target" in args else host
@@ -270,7 +289,10 @@ def check():
                 return "unknown", target, want[1]
         got = ask([BLAZE, "rustc-wrapper", rust, *args],
                   {**variables, "BLAZE_HOME": home}, stdin)
-        return "asked", (args, variables, want[1], got), got[:2] == want[:2]
+        if want[2].strip() and not must_answer(want[2]) and got[0] != 0:
+            # A warning blaze does not know it refuses rather than leaves out.
+            return None
+        return "asked", (args, variables, want[1:], got), got == want
 
     work = tempfile.mkdtemp(prefix="blaze-answers-", dir="/tmp" if sys.platform == "darwin" else None)
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
@@ -286,7 +308,8 @@ def check():
         if not result[2]:
             wrong.append(result[1])
     for args, variables, want, (code, out, err) in wrong:
-        print(f"DIFFERS: {' '.join(args)} {variables or ''}: exit {code}\n  rustc:  {want!r}\n  blaze: {out!r} {err.strip()}")
+        print(f"DIFFERS: {' '.join(args)} {variables or ''}: exit {code}\n  rustc:  {want[0]!r} {want[1]!r}\n"
+              f"  blaze: {out!r} {err!r}")
     print(f"{answered - len(wrong)} of {answered} questions answered by blaze as rustc {TOOLCHAIN} answers them")
     if unknown:
         print(f"blaze has not the target specs of rustc on {host}, which rustc is asked for; "

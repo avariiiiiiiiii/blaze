@@ -391,6 +391,9 @@ def measure(name, spec, arms, given, log):
                 r = runners[arm.name]
                 bench.write_edit(r.ws, changes, False)
                 took, ran = r.run("build", *build)
+                if round_ == 0:
+                    with open(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.txt"), "w") as f:
+                        f.write(f"took {took:.3f}s, exit {ran.returncode}\n--- stdout\n{ran.stdout[-20000:]}\n--- stderr\n{ran.stderr[-40000:]}")
                 if ran.returncode != 0:
                     rejected[arm.name] = (ran.stderr or ran.stdout)[-1500:]
                     print(f"    {arm.name}: {kind} edit rejected\n" + "".join(f"      {l}\n" for l in rejected[arm.name].strip().splitlines()[-8:]), flush=True)

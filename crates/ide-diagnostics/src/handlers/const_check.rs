@@ -132,7 +132,7 @@ const fn indirect() -> u32 {
 }
 const fn calls() -> &'static Counter {
     &CALLS
-  //^^^^^^ warn: const fn reads or writes mutable state: `CALLS` is `Counter`, which is not `Freeze`
+   //^^^^^ warn: const fn reads or writes mutable state: `CALLS` is `Counter`, which is not `Freeze`
 }
 const fn plain() -> u32 { PLAIN }
 fn runtime() -> u32 { unsafe { COUNT } }

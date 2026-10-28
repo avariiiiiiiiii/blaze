@@ -7,7 +7,7 @@ use std::{
     ops::Range,
 };
 
-use base_db::Crate;
+use base_db::{ConstEvalBudget, Crate};
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -59,7 +59,7 @@ use super::{
     Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
     TerminatorKind, UnOp, return_slot,
 };
-use super::{IsSigned, MirEvalError, VTableMap, pad16};
+use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 
 mod shim;
 
@@ -162,6 +162,8 @@ struct StackFrame<'db> {
     destination: Option<BasicBlockId>,
     prev_stack_ptr: usize,
     span: (MirSpan, InferBodyId<'db>),
+    /// The function called, when it is not a closure or what an evaluation starts from.
+    callee: Option<FunctionId>,
 }
 
 #[derive(Clone)]
@@ -188,6 +190,8 @@ pub struct Evaluator<'db> {
     /// doesn't say how much memory it can reach, its allocation does.
     allocations: [Vec<Allocated>; 2],
     code_stack: Vec<StackFrame<'db>>,
+    /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
+    running: Option<(Option<FunctionId>, (MirSpan, InferBodyId<'db>))>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
     static_locations: FxHashMap<StaticId, Address>,
@@ -227,12 +231,12 @@ pub struct Evaluator<'db> {
     type_ids: Vec<TypeIdOf<'db>>,
     // FIXME: This is a workaround, see the comment on `interpret_mir`
     assert_placeholder_ty_is_unused: bool,
-    /// A general limit on execution, to prevent non terminating programs from breaking r-a main process
-    execution_limit: usize,
+    /// What the evaluation may spend, of the workspace of the crate it is for.
+    budget: ConstEvalBudget,
+    /// The steps of [`Self::budget`] not spent yet.
+    steps_left: u64,
     /// An additional limit on stack depth, to prevent stack overflow
     stack_depth_limit: usize,
-    /// Maximum count of bytes that heap and stack can grow
-    memory_limit: usize,
     infcx: InferCtxt<'db>,
 }
 
@@ -449,15 +453,10 @@ pub fn interpret_mir<'db>(
     }
 }
 
-#[cfg(test)]
-const EXECUTION_LIMIT: usize = 100_000;
-#[cfg(not(test))]
-const EXECUTION_LIMIT: usize = 10_000_000;
-
 impl<'db> Evaluator<'db> {
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
-        let interval = self.interpret_mir(body, None.into_iter())?;
+        let interval = self.interpret_mir(body, None.into_iter(), None)?;
         let bytes = interval.get(self)?;
         let mut memory_map =
             self.create_memory_map(bytes, ty, &Locals { ptr: ArenaMap::new(), body })?;
@@ -508,12 +507,14 @@ impl<'db> Evaluator<'db> {
         let interner = DbInterner::new_with(db, trait_env.map_or(crate_id, |env| env.krate));
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         let lang_items = interner.lang_items();
+        let budget = crate_id.workspace_data(db).const_eval;
         Ok(Evaluator {
             target_data_layout,
             stack: vec![0],
             heap: vec![0],
             allocations: Default::default(),
             code_stack: vec![],
+            running: None,
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
             static_locations: Default::default(),
@@ -533,8 +534,8 @@ impl<'db> Evaluator<'db> {
             type_ids: Vec::new(),
             assert_placeholder_ty_is_unused,
             stack_depth_limit: 100,
-            execution_limit: EXECUTION_LIMIT,
-            memory_limit: 1_000_000_000, // 2GB, 1GB for stack and 1GB for heap
+            budget,
+            steps_left: budget.steps,
             layout_cache: RefCell::new(Default::default()),
             projected_ty_cache: RefCell::new(Default::default()),
             not_special_fn_cache: RefCell::new(Default::default()),
@@ -748,10 +749,12 @@ impl<'db> Evaluator<'db> {
         Ok(self.place_addr_and_ty_and_metadata(p, locals)?.1)
     }
 
-    /// Whether arithmetic of the body being evaluated panics when it overflows, which is
-    /// what the code compiled from the body does: a constant is what running it would give.
+    /// Whether arithmetic of the body being evaluated panics when it overflows. A function's
+    /// does what the code compiled from it does. The initializer of a constant, a static or a
+    /// discriminant always checks, as rustc builds it, whatever `-C overflow-checks` says.
     fn checks_overflow(&self, locals: &Locals<'db>) -> bool {
-        crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
+        !matches!(locals.body.owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
+            || crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
     }
 
     fn operand_ty(&self, o: &Operand, locals: &Locals<'db>) -> Result<'db, Ty<'db>> {
@@ -787,6 +790,7 @@ impl<'db> Evaluator<'db> {
         &mut self,
         body: &'db MirBody<'db>,
         args: impl Iterator<Item = IntervalOrOwned>,
+        called: Option<(FunctionId, MirSpan, InferBodyId<'db>)>,
     ) -> Result<'db, Interval> {
         if let Some(it) = self.stack_depth_limit.checked_sub(1) {
             self.stack_depth_limit = it;
@@ -797,21 +801,31 @@ impl<'db> Evaluator<'db> {
         let (mut locals, prev_stack_ptr) = self.create_locals_for_body(body, None)?;
         self.fill_locals_for_body(body, &mut locals, args)?;
         let prev_code_stack = mem::take(&mut self.code_stack);
-        let span = (MirSpan::Unknown, body.owner);
-        self.code_stack.push(StackFrame { locals, destination: None, prev_stack_ptr, span });
+        let prev_running = self.running;
+        let (callee, span) = match called {
+            Some((callee, span, caller)) => (Some(callee), (span, caller)),
+            None => (None, (MirSpan::Unknown, body.owner)),
+        };
+        let frame = StackFrame { locals, destination: None, prev_stack_ptr, span, callee };
+        self.code_stack.push(frame);
         'stack: loop {
             let Some(mut my_stack_frame) = self.code_stack.pop() else {
                 not_supported!("missing stack frame");
             };
+            let frame_body = my_stack_frame.locals.body;
+            self.running = Some((my_stack_frame.callee, my_stack_frame.span));
             let e = (|| {
                 let locals = &mut my_stack_frame.locals;
                 let body = locals.body.clone();
                 loop {
                     let current_block = &body.basic_blocks[current_block_idx];
-                    if let Some(it) = self.execution_limit.checked_sub(1) {
-                        self.execution_limit = it;
+                    if let Some(it) = self.steps_left.checked_sub(1) {
+                        self.steps_left = it;
                     } else {
-                        return Err(MirEvalError::ExecutionLimitExceeded);
+                        return Err(MirEvalError::OverBudget {
+                            spent: Budget::Steps(self.budget.steps),
+                            at: None,
+                        });
                     }
                     for statement in &current_block.statements {
                         match &statement.kind {
@@ -920,8 +934,14 @@ impl<'db> Evaluator<'db> {
             let my_stack_frame = match e {
                 Ok(None) => continue 'stack,
                 Ok(Some(x)) => x,
-                Err(e) => {
+                Err(mut e) => {
+                    if let MirEvalError::OverBudget { at: at @ None, .. } = &mut e {
+                        let block = &frame_body.basic_blocks[current_block_idx];
+                        let span = block.terminator.as_ref().map_or(MirSpan::Unknown, |it| it.span);
+                        *at = Some((frame_body.owner, span));
+                    }
                     let my_code_stack = mem::replace(&mut self.code_stack, prev_code_stack);
+                    self.running = prev_running;
                     let mut error_stack = vec![];
                     for frame in my_code_stack.into_iter().rev() {
                         if let Some(f) = frame.locals.body.owner.as_function() {
@@ -940,6 +960,7 @@ impl<'db> Evaluator<'db> {
             match my_stack_frame.destination {
                 None => {
                     self.code_stack = prev_code_stack;
+                    self.running = prev_running;
                     self.stack_depth_limit += 1;
                     return Ok(return_interval);
                 }
@@ -1030,11 +1051,7 @@ impl<'db> Evaluator<'db> {
             stack_ptr - self.stack.len()
         };
         let prev_stack_pointer = self.stack.len();
-        if stack_size > self.memory_limit {
-            return Err(MirEvalError::Panic(format!(
-                "Stack overflow. Tried to grow stack to {stack_size} bytes"
-            )));
-        }
+        self.check_memory(stack_size)?;
         self.stack.extend(std::iter::repeat_n(0, stack_size));
         Ok((locals, prev_stack_pointer))
     }
@@ -2223,7 +2240,7 @@ impl<'db> Evaluator<'db> {
             let name = GeneralConstId::AnonConstId(konst).name(self.db);
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
         })?;
-        let result = self.interpret_mir(body, iter::empty())?;
+        let result = self.interpret_mir(body, iter::empty(), None)?;
         let ty = body.locals[return_slot()].ty.as_ref();
         let align = self.size_align_of(ty, locals)?.map_or(1, |it| it.1);
         let addr = self.heap_allocate(result.size, align)?;
@@ -2510,6 +2527,18 @@ impl<'db> Evaluator<'db> {
         map.note_align(addr, align);
     }
 
+    /// Whether `more` bytes of stack or heap fit the evaluation's budget.
+    fn check_memory(&self, more: usize) -> Result<'db, ()> {
+        let used = self.stack.len() as u64 + self.heap.len() as u64;
+        if (more as u64).checked_add(used).is_none_or(|it| it > self.budget.memory) {
+            return Err(MirEvalError::OverBudget {
+                spent: Budget::Memory(self.budget.memory),
+                at: None,
+            });
+        }
+        Ok(())
+    }
+
     fn heap_allocate(&mut self, size: usize, align: usize) -> Result<'db, Address> {
         if !align.is_power_of_two() || align > 10000 {
             return Err(MirEvalError::UndefinedBehavior(format!("Alignment {align} is invalid")));
@@ -2517,9 +2546,7 @@ impl<'db> Evaluator<'db> {
         while !self.heap.len().is_multiple_of(align) {
             self.heap.push(0);
         }
-        if size.checked_add(self.heap.len()).is_none_or(|x| x > self.memory_limit) {
-            return Err(MirEvalError::Panic(format!("Memory allocation of {size} bytes failed")));
-        }
+        self.check_memory(size)?;
         let pos = self.heap.len();
         self.heap.extend(std::iter::repeat_n(0, size));
         if size != 0 {
@@ -3219,7 +3246,7 @@ impl<'db> Evaluator<'db> {
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
         let interval = self
-            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned))
+            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned), None)
             .map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
@@ -3413,13 +3440,20 @@ impl<'db> Evaluator<'db> {
         target_bb: Option<BasicBlockId>,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         if let Some(target_bb) = target_bb {
+            let span = (span, locals.body.owner);
             let (mut locals, prev_stack_ptr) =
                 self.create_locals_for_body(mir_body, Some(destination))?;
             self.fill_locals_for_body(mir_body, &mut locals, arg_bytes.into_iter())?;
-            let span = (span, locals.body.owner);
-            Ok(Some(StackFrame { locals, destination: Some(target_bb), prev_stack_ptr, span }))
+            Ok(Some(StackFrame {
+                locals,
+                destination: Some(target_bb),
+                prev_stack_ptr,
+                span,
+                callee: Some(def),
+            }))
         } else {
-            let result = self.interpret_mir(mir_body, arg_bytes).map_err(|e| {
+            let called = Some((def, span, locals.body.owner));
+            let result = self.interpret_mir(mir_body, arg_bytes, called).map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
                     vec![(Either::Left(def), span, locals.body.owner)],
@@ -3768,6 +3802,7 @@ pub fn render_const_using_debug_impl<'db>(
         db.runtime_mir_body(format_fn.into())
             .map_err(|e| MirEvalError::MirLowerError(format_fn, e))?,
         [IntervalOrOwned::Borrowed(Interval { addr: arguments, size: ptr_size * 2 })].into_iter(),
+        None,
     )?;
     let message_string = interval.get(&evaluator)?;
     let words = [

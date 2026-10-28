@@ -1890,7 +1890,12 @@ pub enum MirEvalError<'db> {
         Box<MirEvalError<'db>>,
         Vec<(Either<FunctionId, InternedClosureId<'db>>, MirSpan, InferBodyId<'db>)>,
     ),
-    ExecutionLimitExceeded,
+    /// The evaluation spent all of its budget ([`base_db::ConstEvalBudget`]), at `at`: the
+    /// body it was in and the place in it, when known.
+    OverBudget {
+        spent: Budget,
+        at: Option<(InferBodyId<'db>, MirSpan)>,
+    },
     StackOverflow,
     /// FIXME: Fold this into InternalError
     InvalidVTableId(usize),
@@ -1917,7 +1922,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
                 f.debug_tuple("TargetDataLayoutNotAvailable").field(arg0).finish()
             }
             Self::TypeIsUnsized(ty, it) => write!(f, "{ty:?} is unsized. {it} should be sized."),
-            Self::ExecutionLimitExceeded => write!(f, "execution limit exceeded"),
+            Self::OverBudget { spent, at: _ } => write!(f, "{spent}"),
             Self::StackOverflow => write!(f, "stack overflow"),
             Self::MirLowerError(arg0, arg1) => {
                 f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
@@ -1935,6 +1940,33 @@ impl std::fmt::Debug for MirEvalError<'_> {
             Self::InFunction(e, stack) => {
                 f.debug_struct("WithStack").field("error", e).field("stack", &stack).finish()
             }
+        }
+    }
+}
+
+/// What an evaluation ran out of: its budget of steps or of bytes, of this size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SalsaValue)]
+pub enum Budget {
+    Steps(u64),
+    Memory(u64),
+}
+
+impl std::fmt::Display for Budget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Budget::Steps(steps) => write!(f, "exceeded {steps} steps"),
+            Budget::Memory(bytes) => write!(f, "exceeded {bytes} bytes of memory"),
+        }
+    }
+}
+
+impl Budget {
+    /// The setting under `[workspace.metadata.blaze]` that raises this budget.
+    pub fn setting(&self) -> String {
+        let key = base_db::ConstEvalBudget::KEY;
+        match self {
+            Budget::Steps(_) => format!("`{key}.steps`"),
+            Budget::Memory(_) => format!("`{key}.memory`"),
         }
     }
 }

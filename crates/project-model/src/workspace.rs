@@ -7,7 +7,7 @@ use std::{collections::VecDeque, fmt, fs, iter, ops::Deref, sync, thread};
 
 use anyhow::Context;
 use base_db::{
-    CrateBuilderId, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin,
+    ConstEvalBudget, CrateBuilderId, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin,
     CrateWorkspaceData, DependencyBuilder, Env, LangCrateOrigin, ProcMacroLoadingError,
     ProcMacroPaths, target::TargetLoadResult,
 };
@@ -74,6 +74,8 @@ pub struct ProjectWorkspace {
     pub extra_includes: Vec<AbsPathBuf>,
     /// Set `cfg(test)` for local crates
     pub set_test: bool,
+    /// How far the evaluation of one constant may go.
+    pub const_eval: ConstEvalBudget,
 }
 
 #[derive(Clone)]
@@ -123,6 +125,7 @@ impl fmt::Debug for ProjectWorkspace {
             cfg_overrides,
             extra_includes,
             set_test,
+            const_eval: _,
         } = self;
         match kind {
             ProjectWorkspaceKind::Cargo { cargo, error: _, build_scripts, rustc } => f
@@ -489,6 +492,8 @@ impl ProjectWorkspace {
                 "Failed to read Cargo metadata from Cargo.toml file {cargo_toml}, {toolchain:?}",
             )
         })?;
+        let const_eval = crate::cargo_workspace::const_eval_budget(&meta.workspace_metadata)
+            .with_context(|| format!("[workspace.metadata.blaze] of {cargo_toml}"))?;
         let mut cargo = CargoWorkspace::new(meta, cargo_toml.clone(), cargo_env, false);
         cargo.set_executables(config.executables.clone());
         if let Ok(Some(loaded_sysroot)) = &loaded_sysroot {
@@ -518,6 +523,7 @@ impl ProjectWorkspace {
             target: data_layout.map_err(|it| format!("{it:#}").into()),
             extra_includes: extra_includes.clone(),
             set_test: *set_test,
+            const_eval,
         })
     }
 
@@ -594,6 +600,7 @@ impl ProjectWorkspace {
             cfg_overrides: config.cfg_overrides.clone(),
             extra_includes: config.extra_includes.clone(),
             set_test: config.set_test,
+            const_eval: ConstEvalBudget::default(),
         }
     }
 
@@ -673,6 +680,7 @@ impl ProjectWorkspace {
             cfg_overrides: config.cfg_overrides.clone(),
             extra_includes: config.extra_includes.clone(),
             set_test: config.set_test,
+            const_eval: ConstEvalBudget::default(),
         })
     }
 
@@ -1055,6 +1063,7 @@ impl ProjectWorkspace {
         let crate_ws_data = Arc::new(CrateWorkspaceData {
             toolchain: self.toolchain.clone(),
             target: self.target.clone(),
+            const_eval: self.const_eval,
         });
         let (crate_graph, proc_macros) = match kind {
             ProjectWorkspaceKind::Json(project) => project_json_to_crate_graph(

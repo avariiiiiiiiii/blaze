@@ -339,6 +339,9 @@ class Run:
     def blaze_fetch(self, name, dir, blaze_home, config=(), roots=False):
         start = time.monotonic()
         command = [self.fetch, os.path.join(dir, "Cargo.lock"), blaze_home]
+        home_config = os.path.join(blaze_home, "config.toml")
+        if os.path.isfile(home_config):
+            command += ["--config", home_config]
         for it in config:
             command += ["--config", it]
         ran = subprocess.run(command + (["--roots"] if roots else []), capture_output=True, text=True)
@@ -386,14 +389,23 @@ def main():
     parser.add_argument("--popular", type=int, default=300)
     parser.add_argument("--projects", help="names of bench.py's PROJECTS, all of them without")
     parser.add_argument("--vendor", default="ripgrep,zed", help="the projects vendored too")
+    parser.add_argument("--git-index-only", action="store_true", help="compare the local git-index fixture, with no external downloads")
+    parser.add_argument("--git-index", action="store_true", help="read crates.io through its git index for the full corpus")
     parser.add_argument("--blaze", help="blaze-registry's `fetch` example, built here without")
     args = parser.parse_args()
+    if args.git_index_only:
+        from gitindex import main as git_index
+        git_index(blaze_fetch(args.blaze))
+        return
     work = os.path.abspath(args.work)
     run = Run(blaze_fetch(args.blaze))
     cargo_home, blaze_home = os.path.join(work, "cargo-home"), os.path.join(work, "blaze-home")
     fresh(cargo_home, blaze_home)
     for home in cargo_home, blaze_home:
-        write(os.path.join(home, "config.toml"), AUTH_CONFIG)
+        config = AUTH_CONFIG
+        if args.git_index:
+            config += '\n[registries.crates-io]\nprotocol = "git"\n[net]\ngit-fetch-with-cli = true\n'
+        write(os.path.join(home, "config.toml"), config)
         write(os.path.join(home, "credentials.toml"), AUTH_CREDENTIALS)
     cargo = Cargo(cargo_home)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", MIRROR_PORT), Mirror)

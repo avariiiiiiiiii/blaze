@@ -9,9 +9,9 @@ use std::{any::TypeId, mem, str::FromStr, sync};
 
 use base_db::target::TargetData;
 use base_db::{
-    Crate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
-    DependencyBuilder, Env, FileChange, FileSet, FxIndexMap, LangCrateOrigin, SourceDatabase,
-    SourceRoot, TargetKind, Version, VfsPath, all_crates,
+    ConstEvalBudget, Crate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin,
+    CrateWorkspaceData, DependencyBuilder, Env, FileChange, FileSet, FxIndexMap, LangCrateOrigin,
+    SourceDatabase, SourceRoot, TargetKind, Version, VfsPath, all_crates,
 };
 use cfg::CfgOptions;
 use hir_expand::{
@@ -290,7 +290,11 @@ impl ChangeFixture {
 
         let mut file_position = None;
 
-        let crate_ws_data = Arc::new(CrateWorkspaceData { target, toolchain });
+        let crate_ws_data = Arc::new(CrateWorkspaceData {
+            target,
+            toolchain,
+            const_eval: ConstEvalBudget { steps: 10_000_000, ..ConstEvalBudget::default() },
+        });
 
         // FIXME: This is less than ideal
         let proc_macro_cwd = Arc::new(AbsPathBuf::assert_utf8(std::env::current_dir().unwrap()));

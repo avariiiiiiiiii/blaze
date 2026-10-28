@@ -237,8 +237,17 @@ impl<'a> Sig<'a> {
     pub(crate) fn bound(&self, out: &mut Code, bound: &TypeBound) {
         match bound {
             TypeBound::Path(path, modifier) => {
-                if *modifier == TraitBoundModifier::Maybe {
-                    out.text("?");
+                match modifier {
+                    TraitBoundModifier::None => {}
+                    TraitBoundModifier::Maybe => {
+                        out.text("?");
+                    }
+                    TraitBoundModifier::Const => {
+                        out.kw("const").text(" ");
+                    }
+                    TraitBoundModifier::MaybeConst => {
+                        out.text("[").kw("const").text("] ");
+                    }
                 }
                 self.path(out, &self.store[*path]);
             }

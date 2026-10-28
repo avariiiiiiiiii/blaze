@@ -18,10 +18,10 @@ CRATES = [
     "hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
     "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics",
 ]
+CRATES += ["proc-macro-api"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
-    "hir_ide::tests::consteval::bit_op",
     "hir_ide::tests::display_source_code::render_dyn_ty_independent_of_order",
     "hir_ide::tests::display_source_code::render_dyn_ty_under_enclosing_binder",
     "hir_ide::tests::incremental::add_struct_invalidates_trait_solve",

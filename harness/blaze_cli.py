@@ -28,7 +28,8 @@ Daemon. Started on demand, reused, shared by a git worktree, alive after its cli
 killed, replaced when the client is another build of blaze, gone when idle, and its workers
 gone with it. A project whose rust-toolchain file names an older stable or a nightly is built
 and edited by the daemon, under the toolchain blaze compiles; a `#![feature]` of the nightly
-builds, and an error in it fails with a note naming both toolchains. With no rustup and no Rust on
+builds, and an error in it fails, with nothing said of the project's toolchain but one line
+under `-v`. With no rustup and no Rust on
 the path, `blaze run` builds with blaze's own copy of its release and the edit is the daemon's.
 
 Upgraded. A project whose rust-toolchain file names another release: that is not said, and the
@@ -166,7 +167,9 @@ SMALL = ["ripgrep", "fd", "hyperfine"]
 MODES = {"blaze": "`blaze`"}
 
 # What cargo and `blaze` print about the build, which is not the program's output.
-STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:)")
+# cargo's status words, then blaze's own steps' (crates/blaze-ui), right-aligned to 12 columns.
+STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:)"
+                    r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing) ")
 
 
 def base_env(home):
@@ -838,7 +841,9 @@ def daemon(work):
     check("`blaze check` of an edit with an error fails with blaze's error, and no rustc", failed.returncode == 101 and not by_rustc(failed.stderr) and said, f"exit {failed.returncode}, {failed.stderr.strip()[-300:]}")
     open(main, "w").write(kept)
     # With no build of its flags loaded, the check is the daemon's checker's: no `cargo check`.
-    cargo_checked = lambda stderr: by_rustc(stderr) or bool(re.search(r"^\s*Checking |this is `cargo check`", stderr, re.M))
+    # cargo's line names a package and its version (`Checking app v0.1.0 (...)`); blaze's own
+    # step is `Checking 7 crates`.
+    cargo_checked = lambda stderr: by_rustc(stderr) or bool(re.search(r"^\s*Checking \S+ v\d|this is `cargo check`", stderr, re.M))
     here.cargo("stop")
     _, unloaded = here.cargo("check")
     check("`blaze check` with no build loaded is the daemon's, and no rustc", unloaded.returncode == 0 and not cargo_checked(unloaded.stderr) and "[blaze]" in unloaded.stderr, f"exit {unloaded.returncode}, {unloaded.stderr.strip()[-300:]}")
@@ -892,8 +897,8 @@ def fake_toolchain(dir, version):
 def pinned(work, check):
     """Projects whose rust-toolchain file names another toolchain than blaze's release (#269):
     an older stable and a nightly. `blaze` builds them with its own release, and their
-    edits are the daemon's; a nightly's `#![feature]` builds, an error in it fails with a note
-    naming both toolchains, and no build is cargo's."""
+    edits are the daemon's; a nightly's `#![feature]` builds, an error in it fails, the
+    project's toolchain is said only under `-v`, and no build is cargo's."""
     if WINDOWS or not shutil.which("rustup"):
         return
     env = base_env(os.path.join(work, "home-pinned"))
@@ -919,16 +924,18 @@ def pinned(work, check):
         _, edited = side.cargo("run")
         how = how_built(edited.stderr)
         check("and its edit is the daemon's", edited.returncode == 0 and how == "daemon" and "pinned 48" in edited.stdout, f"{how[:90]}; {edited.stderr.strip()[-300:]!r}")
-    # blaze's toolchain is a nightly (docs/toolchain.md): a nightly's `#![feature]` builds,
-    # and what fails says which toolchain built it in place of the project's.
+    # blaze's toolchain is a nightly (docs/toolchain.md): a nightly's `#![feature]` builds.
+    # The project's rust-toolchain file is not read, and said only under `-v` (#837).
     side = project("featured", "1.101.0-nightly", "#![feature(never_type)]\nfn main() {\n    let _: Option<!> = None;\n}\n")
+    named = lambda stderr: "0000000 2026-01-01" in stderr or "rust-toolchain" in stderr
     _, featured = side.cargo("build")
-    said = "not rustc 1.101.0-nightly (0000000 2026-01-01), which the project's rust-toolchain file names" in featured.stderr
-    check("a nightly's `#![feature]` builds, with a note naming both toolchains, and no cargo", featured.returncode == 0 and said and not by_rustc(featured.stderr), f"exit {featured.returncode}, {featured.stderr.strip()[-400:]!r}")
+    check("a nightly's `#![feature]` builds with blaze's own, nothing said of the project's toolchain, and no cargo", featured.returncode == 0 and blazes(featured.stderr) and not named(featured.stderr) and not by_rustc(featured.stderr), f"exit {featured.returncode}, {featured.stderr.strip()[-400:]!r}")
+    _, verbose = side.cargo("build", "-v")
+    ignored = verbose.stderr.count("rust-toolchain.toml is ignored: blaze builds with its own Rust")
+    check("and under `-v` one line says its rust-toolchain file is ignored", verbose.returncode == 0 and ignored == 1 and not by_rustc(verbose.stderr), f"exit {verbose.returncode}, {ignored} lines, {verbose.stderr.strip()[-400:]!r}")
     open(os.path.join(side.ws, "src/main.rs"), "a").write("\nfn broken() -> u32 { \"text\" }\n")
     _, failed = side.cargo("build")
-    said = "error[E0308]" in failed.stderr and "blaze built this with its own toolchain" in failed.stderr and "not 1.101.0-nightly (0000000 2026-01-01), which the project's rust-toolchain file names" in failed.stderr
-    check("and an error in it fails with the error and a note naming both toolchains, and no cargo", failed.returncode == 101 and said and not by_rustc(failed.stderr), f"exit {failed.returncode}, {failed.stderr.strip()[-400:]!r}")
+    check("and an error in it fails with the error, nothing said of the project's toolchain, and no cargo", failed.returncode == 101 and "error[E0308]" in failed.stderr and not named(failed.stderr) and not by_rustc(failed.stderr), f"exit {failed.returncode}, {failed.stderr.strip()[-400:]!r}")
     side.cargo("stop")
 
 
@@ -1494,8 +1501,9 @@ def upgraded(work):
     side = Side(ws, pinned_env, True)
     for round in ("first", "second"):
         _, ran = side.cargo("run", "--release")
-        notes = ran.stderr.count("note: blaze builds with its own toolchain")
-        check(f"a project pinned to rustc 1.98.1, {round} `blaze run --release`: blaze's release, no cargo, no warning", ran.returncode == 0 and "anim 42" in ran.stdout and not said(ran) and blazes(ran.stderr) and notes == (round == "first"), f"exit {ran.returncode}, {notes} notes, {said(ran) or ran.stderr.strip()[-200:]!r}")
+        # The pin is not read, and not said but under `-v` (#837).
+        notes = len(re.findall(r"^.*(own toolchain|rust-toolchain|0000000 2026-01-01).*$", ran.stderr, re.M))
+        check(f"a project pinned to rustc 1.98.1, {round} `blaze run --release`: blaze's release, no cargo, no warning", ran.returncode == 0 and "anim 42" in ran.stdout and not said(ran) and blazes(ran.stderr) and notes == 0, f"exit {ran.returncode}, {notes} notes, {said(ran) or ran.stderr.strip()[-200:]!r}")
     side.cargo("stop")
     return checks
 

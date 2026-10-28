@@ -157,7 +157,7 @@ def prepare(date):
         run("git", "checkout", "-q", "-B", BRANCH, "origin/main")
         base = "origin/main"
     was = pin()
-    argv = [sys.executable, "harness/toolchain_bump.py", *(["--date", date] if date else [])]
+    argv = [sys.executable, "harness/toolchain_bump.py", json.dumps({"date": date or ""})]
     bumped = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
     print(bumped.stdout, bumped.stderr, sep="\n")
     if bumped.returncode:

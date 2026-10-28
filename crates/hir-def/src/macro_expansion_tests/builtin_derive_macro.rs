@@ -311,7 +311,6 @@ impl <> $crate::cmp::PartialEq for Token< > where {
 
 #[test]
 fn test_partial_eq_expand_with_derive_const() {
-    // FIXME: actually expand with const
     check(
         r#"
 //- minicore: derive, eq
@@ -330,7 +329,7 @@ enum Command {
     Jump,
 }
 
-impl <> $crate::cmp::PartialEq for Command< > where {
+const impl <> $crate::cmp::PartialEq for Command< > where {
     fn eq(&self , other: &Self ) -> bool {
         let __self_discr = $crate::intrinsics::discriminant_value(self );
         let __arg1_discr = $crate::intrinsics::discriminant_value(other);
@@ -345,7 +344,7 @@ impl <> $crate::cmp::PartialEq for Command< > where {
         }
     }
 }
-impl <> $crate::cmp::Eq for Command< > where {}"#]],
+const impl <> $crate::cmp::Eq for Command< > where {}"#]],
     );
 }
 

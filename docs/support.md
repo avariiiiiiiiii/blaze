@@ -191,9 +191,7 @@ Known refusals:
 | the `win64` calling convention on Linux | no lowering |
 | pattern matching on a union | not lowered from MIR |
 | upcasting a `dyn` type with bound regions | not lowered |
-| `Location::caller()` in a constant | blaze does not know what file name rustc uses there |
 | `type_name` of a function item or of a `dyn` type with a binder | rustc's exact text is not reproduced |
-| `%` on floats in a constant; `type_id` of a type with lifetimes in a constant | const evaluation gaps |
 | a body in which rust-analyzer's type inference fails or finds errors rustc does not | no MIR, so no code; examples are range patterns over associated constants and an empty array whose element type comes from a single `PartialEq` impl |
 | 15 functions of the `generic-array` crate | a trait-solver gap on `GenericArray<T, N>` |
 
@@ -241,7 +239,7 @@ far:
 - `harness/live-alloc`, a program on `allocator_api` (`Vec<T, A>` and `Box<T, A>` in a bump
   arena) that takes live edits; `live_e2e.py` runs it with `LIVE_PROGRAM=live-alloc`, in the
   gate.
-- The corpus's `nightly` feature, which `toolchain_bump.py --checks` runs with `--layouts`.
+- The corpus's `nightly` feature, which `toolchain_bump.py checks '{}'` runs with `--layouts`.
 
 The nightly's own removals apply: `box` patterns are gone upstream in this nightly, replaced
 by `deref_patterns`, and blaze's support for deref patterns is being added. `-Z` flags in

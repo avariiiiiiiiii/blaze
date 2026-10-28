@@ -178,12 +178,14 @@ pub enum UseArgRef {
     Lifetime(LifetimeRefId),
 }
 
-/// A modifier on a bound, currently this is only used for `?Sized`, where the
-/// modifier is `Maybe`.
+/// A modifier on a bound: `?Sized` is `Maybe`; `const Tr` is `Const` and `[const] Tr` (or
+/// `~const Tr`) is `MaybeConst`, which are trait bounds like `None` that also carry the effect.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TraitBoundModifier {
     None,
     Maybe,
+    Const,
+    MaybeConst,
 }
 
 impl TypeRef {

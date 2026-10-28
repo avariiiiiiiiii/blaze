@@ -22,9 +22,10 @@ use crate::{
 
 use crate::{
     consteval::ConstEvalError,
-    mir::{MirEvalError, MirLowerError},
+    mir::{Budget, MirEvalError, MirLowerError},
 };
 
+mod const_traits;
 mod intrinsics;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
@@ -164,6 +165,21 @@ fn bit_op() {
         e == ConstEvalError::MirEvalError(MirEvalError::Panic("Overflow in Shl".to_owned()))
     });
     check_number(r#"const GOAL: i32 = 100000000i32 << 11"#, (100000000i32 << 11) as i128);
+}
+
+#[test]
+fn overflow_in_a_constant() {
+    // The test crate has no `-C overflow-checks`: a constant's own arithmetic is checked
+    // regardless, and a `const fn`'s wraps, as rustc evaluates both.
+    let overflow = |op: &str| {
+        let op = format!("Overflow in {op}");
+        move |e: ConstEvalError<'_>| e == ConstEvalError::MirEvalError(MirEvalError::Panic(op))
+    };
+    check_fail(r#"const GOAL: u8 = { let x = 255u8; x + 1 };"#, overflow("Add"));
+    check_fail(r#"const GOAL: i8 = { let x = -128i8; -x };"#, overflow("Neg"));
+    check_fail(r#"const GOAL: u32 = { let x = 1u32; x << 32 };"#, overflow("Shl"));
+    check_fail(r#"const GOAL: u8 = { let x = 0u8; x - 1 };"#, overflow("Sub"));
+    check_number(r#"const fn add(a: u8, b: u8) -> u8 { a + b } const GOAL: u8 = add(255, 1);"#, 0);
 }
 
 #[test]
@@ -3102,7 +3118,15 @@ fn exec_limits() {
         r#"
     const GOAL: usize = loop {};
     "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::ExecutionLimitExceeded),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Steps(10_000_000),
+                    at: Some(_),
+                })
+            )
+        },
     );
     check_fail(
         r#"
@@ -3111,7 +3135,15 @@ fn exec_limits() {
     }
     const GOAL: i32 = f(0);
     "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::ExecutionLimitExceeded),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Steps(10_000_000),
+                    at: Some(_),
+                })
+            )
+        },
     );
     // Reasonable code should still work
     check_number(
@@ -3149,9 +3181,13 @@ fn memory_limit() {
         };
         "#,
         |e| {
-            e == ConstEvalError::MirEvalError(MirEvalError::Panic(
-                "Memory allocation of 30000000000 bytes failed".to_owned(),
-            ))
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Memory(1_073_741_824),
+                    at: Some(_),
+                })
+            )
         },
     );
 }

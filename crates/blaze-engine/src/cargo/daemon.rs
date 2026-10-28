@@ -1216,11 +1216,14 @@ fn relaying(
             gone.store(true, Relaxed);
         }
     };
-    let follow = std::sync::Mutex::new(blaze_protocol::follow::Follow::default());
+    let follow = std::sync::Mutex::new(blaze_protocol::follow::Follow::from_now(dir));
     let relay = || {
         let Some(path) = blaze_protocol::follow::written_in(dir) else { return };
-        for record in lock(&follow).read(&path, true) {
-            send(record.event, record.at_ns);
+        for record in lock(&follow).read(&path) {
+            match record {
+                Ok(record) => send(record.event, record.at_ns),
+                Err(why) => eprintln!("{}: a record is not read: {why}", path.display()),
+            }
         }
     };
     let root = dir.to_owned();

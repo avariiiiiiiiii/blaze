@@ -54,15 +54,22 @@ pub struct Follow {
 }
 
 impl Follow {
-    /// The records written to `path` since the last read, from the end of what it had when
-    /// it was first named: a process says what it did before the command asked too. A file
-    /// other than the last is read from its start, as a process started in another's place.
-    pub fn read(&mut self, path: &Path, from_end: bool) -> Vec<Record> {
+    /// Follows what the process that listens in `dir` writes from now on: what it said before
+    /// was for the commands before.
+    pub fn from_now(dir: &Path) -> Follow {
+        let path = written_in(dir);
+        let at = path.as_deref().and_then(|it| std::fs::metadata(it).ok());
+        let at = at.map_or(0, |it| it.len());
+        Follow { path, at, partial: Vec::new() }
+    }
+
+    /// The records written to `path` since the last read, and why each frame that is not a
+    /// record is not. A file other than the last is read from its start, as a process started
+    /// in another's place.
+    pub fn read(&mut self, path: &Path) -> Vec<Result<Record, crate::cbor::Error>> {
         if self.path.as_deref() != Some(path) {
-            let len = std::fs::metadata(path).map_or(0, |it| it.len());
-            let first = self.path.is_none();
             self.path = Some(path.to_owned());
-            self.at = if first && from_end { len } else { 0 };
+            self.at = 0;
             self.partial.clear();
         }
         let Ok(mut file) = File::open(path) else { return Vec::new() };
@@ -77,10 +84,7 @@ impl Follow {
         while rest.len() >= 4 {
             let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
             let Some(item) = rest.get(4..4 + len) else { break };
-            match crate::cbor::from_slice::<Record>(item) {
-                Ok(record) => records.push(record),
-                Err(why) => eprintln!("{}: a record is not read: {why}", path.display()),
-            }
+            records.push(crate::cbor::from_slice::<Record>(item));
             rest = &rest[4 + len..];
         }
         self.partial = rest.to_vec();
@@ -106,24 +110,24 @@ mod tests {
         };
         let before = frame(Event::Said { level: Level::Note, text: "before".to_owned() });
         std::fs::write(&path, &before).unwrap();
-        let mut follow = super::Follow::default();
-        assert!(follow.read(&path, true).is_empty(), "what was said before is not read");
+        let mut follow = super::Follow::from_now(&dir);
+        assert!(follow.read(&path).is_empty(), "what was said before is not read");
         let started = frame(Event::Started { step: Step::Codegen, of: None });
         let ended = frame(Event::Ended { step: Step::Codegen, of: None });
         let mut written = before.clone();
         written.extend(&started);
         written.extend(&ended[..3]);
         std::fs::write(&path, &written).unwrap();
-        let read = follow.read(&path, true);
+        let read: Vec<_> = follow.read(&path).into_iter().map(Result::unwrap).collect();
         assert_eq!(read.len(), 1, "a frame half written waits for the rest");
         written.extend(&ended[3..]);
         std::fs::write(&path, &written).unwrap();
-        let read = follow.read(&path, true);
+        let read: Vec<_> = follow.read(&path).into_iter().map(Result::unwrap).collect();
         assert!(matches!(read[..], [crate::events::Record { event: Event::Ended { .. }, .. }]));
         // A process in the place of the last writes another file, read from its start.
         let other = dir.join("events.2");
         std::fs::write(&other, &before).unwrap();
-        assert_eq!(follow.read(&other, true).len(), 1);
+        assert_eq!(follow.read(&other).len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

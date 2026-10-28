@@ -414,6 +414,8 @@ def measure(name, spec, arms, given, log):
             if arm.name not in outcomes:
                 continue
             took, ran = outcomes[arm.name]
+            with open(os.path.join(given.out, "raw", f"{name}-{arm.name}-tests.txt"), "w") as f:
+                f.write(f"kept: {getattr(ran, 'kept', [])}\n--- stdout\n{ran.stdout}\n--- stderr\n{ran.stderr[-20000:]}")
             status, tests, totals = test_results(ran)
             entry = dict(wall_s=took, status=status, passed=totals[1], failed=totals[2], ignored=totals[3],
                          built=runners[arm.name].built(ran))

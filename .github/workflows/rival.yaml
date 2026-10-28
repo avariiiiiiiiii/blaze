@@ -137,7 +137,7 @@ jobs:
       - run: |
           mkdir -p rival/raw
           for part in parts/*/; do
-            cp "$part"raw/*.json rival/raw/ 2>/dev/null || true
+            cp "$part"raw/* rival/raw/ 2>/dev/null || true
             cat "$part"commands.txt >> rival/commands.txt 2>/dev/null || true
             [ -f rival/host.json ] || cp "$part"host.json rival/host.json
           done

@@ -110,7 +110,7 @@ jobs:
                     dict(name="astral", kind="astral", bin=f"{tmp}/bins/astral", commit=os.environ["ASTRAL"],
                          env=dict(RUSTUP_TOOLCHAIN=os.environ["ASTRAL_TOOLCHAIN"])),
                     dict(name="cargo", kind="cargo", bin="", commit=tc, env=dict(RUSTUP_TOOLCHAIN=tc))],
-              projects=[os.environ["PROJECT"]], work=f"{tmp}/work", out="rival-out", runs=5, tests=True,
+              projects=[os.environ["PROJECT"]], work=f"{tmp}/work", out="rival-out", runs=5, tests=True, interleave=False,
               machine="GitHub ubuntu-24.04 hosted runner (x86_64, 4 vCPU, 16 GB, shared)")))
           PY
           python3 -u harness/rival.py "$RUNNER_TEMP/input.json"

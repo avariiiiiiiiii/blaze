@@ -37,6 +37,9 @@ Input, one JSON object:
   out       where the results go: raw/<project>.json, host.json, commands.txt, README.md
   runs      timed builds per phase (default 5)
   tests     run each project's tests (default true)
+  interleave  the arms take turns within each phase (default true); false measures each blaze
+            arm on its own beside cargo, all its phases, and stops its daemon before the next,
+            for a machine that cannot hold two daemons with the project loaded (16 GB and ruff)
   machine   what the machine is, for host.json and the README (for example "ix arm64 16 vCPU")
 The report subcommand takes {"out": DIR}.
 
@@ -114,6 +117,7 @@ class Input:
     out: str
     runs: int = 5
     tests: bool = True
+    interleave: bool = True
     machine: str = ""
 
 
@@ -431,7 +435,7 @@ def host(given, arms):
     mem = open("/proc/meminfo").read().split("\n")[0] if os.path.exists("/proc/meminfo") else None
     return dict(machine=given.machine, platform=platform.platform(), cpus=os.cpu_count(), affinity=len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                 memory=mem, cargo=out(["cargo", "--version"]), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                arms=[dict(name=a.name, kind=a.kind, commit=a.commit) for a in arms], runs=given.runs)
+                arms=[dict(name=a.name, kind=a.kind, commit=a.commit) for a in arms], runs=given.runs, interleave=given.interleave)
 
 
 PHASES = ("cold", "no-op", "body", "signature", "tests")
@@ -446,7 +450,8 @@ def report(out):
     ours = next(a["name"] for a in info["arms"] if a["kind"] == "blaze")
     lines = [f"# Rival score: our blaze, Astral's fork and cargo ({info['date'][:10]})", "",
              f"Machine: {info['machine'] or info['platform']}, {info['affinity'] or info['cpus']} cores used. "
-             f"{info['runs']} timed builds per phase, arms in turn (harness/rival.py). Commits: "
+             f"{info['runs']} timed builds per phase, "
+             f"{'arms in turn' if info.get('interleave', True) else 'each blaze arm on its own beside cargo, one daemon at a time'} (harness/rival.py). Commits: "
              + ", ".join(f"{a['name']} ({a['kind']}) `{a['commit'][:10]}`" for a in info["arms"]) + ".", "",
              "Seconds, median. cold = first build + the wait until the daemon is ready. tests = the second `test` run. "
              f"gap = {ours} / fastest other arm: above 1.00x someone beats us. A cell with `!` was built by cargo "
@@ -496,9 +501,17 @@ def main():
     json.dump(host(given, arms), open(os.path.join(given.out, "host.json"), "w"), indent=1)
     log = Log(os.path.join(given.out, "commands.txt"))
     specs = spec_of_all()
+    cargo_arm = next(a for a in arms if a.kind == "cargo")
+    blocks = [arms] if given.interleave else [[cargo_arm, a] for a in arms if a.kind != "cargo"]
     for name in given.projects:
         try:
-            result = measure(name, specs[name], arms, given, log)
+            result = None
+            for block in blocks:
+                got = measure(name, specs[name], block, given, log)
+                if result is None:
+                    result = got
+                else:
+                    result["arms"].update((k, v) for k, v in got["arms"].items() if k != cargo_arm.name)
         except (RuntimeError, subprocess.CalledProcessError, OSError, AssertionError) as e:
             result = dict(project=name, repo=specs[name]["repo"], rev=specs[name]["rev"], arms={}, error=str(e)[-2000:])
             print(f"{name}: {e}", flush=True)

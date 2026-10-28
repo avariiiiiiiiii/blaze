@@ -3,10 +3,9 @@
 
 pub mod daemon;
 pub mod keyed;
-pub mod wrapper;
+pub mod load_wrapper;
 
 pub mod affected;
-pub mod ancestor;
 pub mod cli;
 pub mod client;
 #[cfg(unix)]
@@ -17,6 +16,7 @@ pub mod experimental;
 pub mod fetches;
 #[cfg(unix)]
 pub mod hermetic;
+pub mod home;
 pub mod layout;
 pub mod messages;
 pub mod metadata;
@@ -32,37 +32,35 @@ pub mod say;
 pub mod script;
 pub mod script_sandbox;
 pub mod state;
-pub mod switch;
 pub mod toolchain;
 pub mod units;
 pub mod wasi_script;
 pub mod whole;
 
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use anyhow::Context as _;
 
 use cli::{Asked, Invocation, Subcommand};
 use client::Start;
 use daemon::{Checkout, NotBuilt, Reply, Request};
-use state::{Built, Counts, Held, State};
+use state::{Held, State};
 pub use toolchain::{ours_commit, ours_says};
 pub use units::Record;
 
 /// `blaze-engine cargo ...`: runs the command and ends with the status cargo would end with.
 pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
-    if let [word, cargo, rest @ ..] = args.as_slice()
-        && word == SETTLE
-    {
-        return settle(cargo.parse().context("`settle` is told the cargo to wait for")?, rest);
-    }
     let asked = Asked::parse(own::subcommand_first(args));
     if !matches!(asked, Asked::Build(_)) {
         crate::end_with_reader();
     }
     if let Ok(home) = daemon::home() {
         crate::renamed::say_old_dirs(&home);
+    }
+    if let Err(why) = home::undo_enable() {
+        say::error(&format!("{why:#}"));
+        std::process::exit(FAILED);
     }
     if let Asked::Build(asked) = &asked {
         let cwd = std::env::current_dir()?;
@@ -89,8 +87,6 @@ pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Asked::Cache(args) => cache(args)?,
         Asked::Status => status()?,
         Asked::Stop => stop()?,
-        Asked::Enable => switch::enable()?,
-        Asked::Disable => switch::disable()?,
         Asked::Toolchain { path } => match toolchain::settle() {
             Ok(chosen) if path => {
                 println!("{}", chosen.dir().display());
@@ -130,9 +126,8 @@ usage: blaze <command> [cargo's flags]    (or blaze <command>)
                      tests, each example built by blaze; no rustc, rustdoc or cargo build
   check              what the daemon's build of the same flags says, when it has one loaded;
                      otherwise what the daemon finds loading the workspace as it, with no rustc
-  status             whether blaze is enabled, what the daemon has loaded, what fell back
+  status             what the daemon has loaded, the store, how the builds went
   stop               ends the daemon; the next build starts one
-  enable, disable    plain `cargo build|run|test|check` through blaze, and back
   toolchain          blaze's own toolchain, which it builds every project with, downloaded once
                      if it has none (`--path`: its directory)
   lock --fetches     records what build scripts download, by sha256, in Cargo.fetches.lock
@@ -146,34 +141,6 @@ usage: blaze <command> [cargo's flags]    (or blaze <command>)
 The daemon starts on the first build and stops after 30 minutes without one. Every other
 command of cargo's is blaze's own, or fails saying blaze has none yet: none is handed to cargo
 (`blaze --list`). The guide: https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md";
-
-/// What a wrapper runs blaze with once rustc has linked a program under plain cargo.
-pub const SETTLE: &str = "settle";
-
-/// Has the daemon load the build `typed` is the cargo command of, which the cargo `cargo`
-/// is running: once that cargo has exited, the build is asked of cargo again, which has
-/// nothing left to compile and says what it built. This process has that cargo's directory
-/// and environment. Nobody reads what it says but the log.
-fn settle(cargo: u32, typed: &[String]) -> anyhow::Result<()> {
-    // Cargo lets go of the target directory once it has built, before it runs the tests or
-    // the program, and a build links each program into place again by deleting it first:
-    // one of the tests that starts it then finds none.
-    while crate::live::alive(cargo) {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let settled = (|| {
-        let asked = cli::of_cargo(typed).context("`settle` is told a build command")?;
-        let cwd = std::env::current_dir()?;
-        let key = asked.key(&cwd);
-        eprintln!("settling {key}: cargo {} in {}", typed.join(" "), cwd.display());
-        if let Some(state) = loaded_by_cargo(&asked, &cwd, &key)? {
-            state.write()?;
-        }
-        anyhow::Ok(())
-    })();
-    wrapper::settled(cargo);
-    settled
-}
 
 /// `blaze cache`: what the `#[blaze::cache]` functions kept, which is under the target
 /// directory unless `BLAZE_FN_CACHE_DIR` says where; `cache clear` forgets it, and `cache clear
@@ -420,52 +387,14 @@ pub fn built(checkout: &Checkout) -> Result<Vec<Result<(), String>>, NotBuilt> {
 }
 
 /// `checkout` as a request names it: with the variables of this process, which `env!`
-/// reads where cargo set none. The ones that make blaze the wrapper are cargo's alone.
+/// reads where cargo set none, but those that say what blaze prints of the build: one that
+/// changed would be an edit of every `env!`.
 fn asking(checkout: &Checkout) -> Checkout {
-    // Nor are those that say what blaze prints of the build: one that changed would be an
-    // edit of every `env!`.
-    let wraps = |name: &str| {
-        name == wrapper::DRIVEN
-            || name == wrapper::EVERY_CRATE
-            || name == switch::VARIABLE
-            || name == switch::CHAINED
-            || name == "BLAZE_STATS"
-            || name == "BLAZE_TRACE"
-    };
+    let printing = |name: &str| name == "BLAZE_STATS" || name == "BLAZE_TRACE";
     let mut env: BTreeMap<String, String> =
-        std::env::vars().filter(|(name, _)| !wraps(name)).collect();
+        std::env::vars().filter(|(name, _)| !printing(name)).collect();
     env.extend(checkout.env.clone());
     Checkout { env, ..checkout.clone() }
-}
-
-/// Tells the daemon to load `checkout` as cargo just built it, starting one when there is
-/// none. `Err` is why it does not.
-fn warmed(checkout: &Checkout) -> Result<(), String> {
-    match client::ask(Request::Warm(asking(checkout)), Start::IfMissing) {
-        Ok(Some(Reply::Cold { reason })) => Err(reason),
-        Ok(_) => Ok(()),
-        Err(why) => Err(format!("{why:#}")),
-    }
-}
-
-/// Has cargo build what plain cargo just built, which leaves it nothing to compile and has it say
-/// what it built, and the daemon load that for the builds to come. `None` when cargo failed.
-fn loaded_by_cargo(asked: &Invocation, cwd: &Path, key: &str) -> anyhow::Result<Option<State>> {
-    State::give_back(key);
-    let Ok(built) = Built::by_cargo(asked)? else { return Ok(None) };
-    let mut state = State::after(asked, cwd, key, built, Counts::default())?;
-    if state.refusal.is_none() {
-        let asked = state.checkouts.iter().filter(|it| !it.programs.is_empty());
-        let cold: Vec<String> = asked.filter_map(|it| warmed(it).err()).collect();
-        for why in cold {
-            say::fallback(&why, "the daemon has no part in the next build");
-            state.count_cargo(&why);
-        }
-        for (program, why) in state.left_to_cargo() {
-            say::fallback(why, &format!("`{}` is cargo's to build", program.name));
-        }
-    }
-    Ok(Some(state))
 }
 
 /// What the store of compiled code holds and may hold, and where it is.
@@ -487,9 +416,6 @@ fn store_status() -> String {
 fn status() -> anyhow::Result<i32> {
     use std::fmt::Write as _;
     let mut said = String::new();
-    for line in switch::status(&std::env::current_dir()?).into_iter().chain(wrapper::tallied()) {
-        let _ = writeln!(said, "{line}");
-    }
     match client::ask(Request::Status, Start::Never)? {
         Some(Reply::Status(daemon)) => {
             let idle =

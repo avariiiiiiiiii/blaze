@@ -206,7 +206,7 @@
       in {
         packages = {
           # `nix profile install github:indexable-inc/blaze`: blaze and the programs it runs, so
-          # `blaze build` and `blaze enable` work. `#blaze` names it too.
+          # `blaze build` works. `#blaze` names it too.
           default = daemon;
           blaze = daemon;
           inherit dist daemon run life daemon-units life-bin;

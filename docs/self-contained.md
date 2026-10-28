@@ -235,8 +235,10 @@ store, measured and published beside cargo's.
 
 **M, the wrapper and the fallback** ([#93](https://github.com/indexable-inc/blaze/issues/93)).
 Once K and J are the default: `blaze-rustc`, `blaze-rustc-first`, the stand-ins, the dep-info
-runs, `settle`, `by_cargo`, `ToCargo` and `only_cargo` are deleted; plain cargo after `blaze
-enable` names blaze as `build.rustc`; the count of [no-rustc.md](no-rustc.md#how-often) is zero.
+runs, `settle`, `by_cargo`, `ToCargo` and `only_cargo` are deleted; the count of
+[no-rustc.md](no-rustc.md#how-often) is zero. Done of it (2026-10-27): `blaze enable` and the
+wrapper behind plain cargo, `blaze-rustc-first`, `by_cargo`, `ToCargo` and `only_cargo` are
+gone, plain cargo is cargo's alone, and `blaze-rustc` is left as a load's wrapper only.
 Then blaze's own toolchain loses `rustc` and `rust-std`. The link still needs an lld on ELF
 targets (rustc's `rust-lld` today, through `gcc-ld`): blaze ships one in its release, or links
 with the system's `cc` and an lld it finds, a choice for that step, measured on the bench apps.

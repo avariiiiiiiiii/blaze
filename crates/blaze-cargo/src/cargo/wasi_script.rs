@@ -12,8 +12,8 @@
 //! - `BLAZE_BUILD_SCRIPTS=wasi` runs every script so; `wasi-build-scripts` in
 //!   `[workspace.metadata.blaze.sandbox]` runs those of the packages it lists (`"*"`, all).
 //! - `BLAZE_BUILD_SCRIPTS=wasi-compare` is for measuring: the module runs first and what it
-//!   printed and wrote is set aside ([`ASIDE`]), then the script runs as without, for cargo;
-//!   `harness/bswasi.py` compares the two.
+//!   printed and wrote is set aside ([`ASIDE`]), then the script runs as without, for cargo
+//!   (docs/reports/BSWASI.md compared the two).
 //!
 //! A script blaze can't build for wasm32-wasip1 is an error, as is a run that fails: the
 //! native script does not run instead.

@@ -19,9 +19,6 @@ use serde_json::{Value, json};
 
 use super::{keyed, units::Record};
 
-/// The variable that has rustc compile the build scripts, as the harness's reference builds do.
-pub const BY_RUSTC: &str = "BLAZE_SCRIPTS_BY_RUSTC";
-
 /// The name of the script's crate in the description: the one blaze is asked to build.
 const SCRIPT: &str = "build_script_build";
 

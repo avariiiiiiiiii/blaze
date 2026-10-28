@@ -13,8 +13,8 @@ pub fn unwritten(path: &Path) -> std::io::Result<File> {
         {
             use std::os::unix::fs::MetadataExt as _;
             file.lock_shared()?;
-            // A copy the daemon is to write may have been put in its place meanwhile
-            // (`Linked::read_rustcs`), under the lock of its own.
+            // A copy the daemon is to write may have been put in its place meanwhile, under
+            // the lock of its own.
             let (locked, now) = (file.metadata()?, std::fs::metadata(path)?);
             if (locked.dev(), locked.ino()) != (now.dev(), now.ino()) {
                 continue;

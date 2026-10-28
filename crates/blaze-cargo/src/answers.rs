@@ -206,7 +206,7 @@ pub fn ready_cargo(command: &mut Command) {
         command.get_envs().any(|(it, value)| it == *name && value.is_some())
             || std::env::var_os(name).is_some_and(|it| !it.is_empty())
     });
-    let wrapper = crate::cargo::switch::wrapper_path().ok().filter(|it| it.is_file());
+    let wrapper = crate::cargo::load_wrapper::path().ok().filter(|it| it.is_file());
     if let Some(wrapper) = wrapper
         && !named
     {

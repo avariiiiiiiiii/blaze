@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Runs the scenarios of one project under `blaze` (or plain cargo after `blaze
-enable`) with a toolchain whose rustc, rustdoc and cargo log every run (wrap.sh), and writes
+"""Runs the scenarios of one project under `blaze` with a toolchain whose rustc, rustdoc and
+cargo log every run (wrap.sh), and writes
 where each step began and ended, how it ended, and what it printed, for classify.py.
 
-    count.py ripgrep|nushell|bevy|bun|ripgrep-plain
+    count.py ripgrep|nushell|bevy|bun
 
 setup.sh prepares `$NR_ROOT` (default ~/no-rustc) first. NR_PATH_PREFIX goes in front of
 PATH and NR_ENV (JSON) is added to the environment, for a project that needs native
@@ -55,7 +55,6 @@ def apply(ws, edits):
 def main():
     name = sys.argv[1]
     base, spec = project_spec(name)
-    plain = name.endswith("-plain")
     ws = checkout(base, spec)
     home, store, cargo_home = (f"{L}/{d}/{name}" for d in ("home", "store", "cargo-home"))
     for d in (home, store):
@@ -132,22 +131,7 @@ def main():
     build = spec.get("build", [])
     test = spec.get("test")
 
-    if plain:
-        cargo = ["cargo"]
-        subprocess.run(["blaze-engine", "enable"], cwd=ws, env=env, check=True)
-        step("cold", cargo + ["build", *build])
-        step("noop", cargo + ["build", *build])
-        time.sleep(30)  # the daemon loads the build that rustc did once cargo exits
-        quiet()
-        step("body", cargo + ["build", *build], edits=edits["body"])
-        step("body2", cargo + ["build", *build], edits=again)
-        step("leaf", cargo + ["build", *build], edits=edits["leaf"])
-        step("test-cold", cargo + ["test", "--no-run", *(test or [])])
-        step("test-edit", cargo + ["test", "--no-run", *(test or [])], edits=[(opening_file, opening, opening + "\n    let _nr_t = 3u32;")])
-        step("doctest", cargo + ["test", "--doc", *(test or [])])
-        step("check", cargo + ["check"])
-        subprocess.run(["blaze-engine", "disable"], cwd=ws, env=env)
-    elif base == "bun":
+    if base == "bun":
         crate = ["-p", "bun_collections"]
         step("cold", ["blaze", "test", "--no-run", *crate], wait_ready=True)
         step("noop", ["blaze", "test", "--no-run", *crate])

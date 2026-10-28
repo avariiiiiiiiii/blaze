@@ -94,6 +94,7 @@ blaze-units = { path = "crates/blaze-units" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-tree = { path = "crates/blaze-tree" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
+blaze-protocol = { path = "crates/blaze-protocol" }
 hir-ide = { path = "crates/hir-ide", version = "0.0.0" }
 ide-db = { path = "crates/ide-db", version = "0.0.0" }
 ide-diagnostics = { path = "crates/ide-diagnostics", version = "0.0.0" }

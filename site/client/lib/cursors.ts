@@ -172,8 +172,6 @@ function sendCursor(): void {
 }
 
 function queueCursor(): void {
-	// While the reader writes, their pointer stays where they pressed the key, for them and for the others.
-	if (saying) return;
 	if (peers.size && fine.matches) cTimer ??= setTimeout(sendCursor, MOVE_MS);
 }
 
@@ -432,7 +430,15 @@ function drawSay(r: Remote): void {
 		setTimeout(() => b.remove(), 300);
 		return;
 	}
-	if (!b) {
+	if (b?.classList.contains('pinned') && !r.say.done) {
+		// A new line after a sent one: the sent one stays its while, and the new one follows the pointer.
+		setTimeout(() => {
+			b.classList.add('out');
+			setTimeout(() => b.remove(), 300);
+		}, SAY_LINGER_MS);
+		r.sayEl = null;
+	}
+	if (!r.sayEl) {
 		r.sayEl = el('div', 'cursor-say');
 		r.sayEl.style.setProperty('--c', colour(r.who.key));
 	}
@@ -441,10 +447,23 @@ function drawSay(r: Remote): void {
 	placeSay(r);
 }
 
-/** By their pointer while it is on this reader's screen, else by their face on the rail, else nowhere for now. */
+/**
+ * By their pointer while it is on this reader's screen, else by their face on the rail, else nowhere for now. Once sent,
+ * a bubble by the pointer stays on the page where it was, and the pointer moves on.
+ */
 function placeSay(r: Remote): void {
 	const b = r.sayEl;
-	if (!b) return;
+	if (!b || b.classList.contains('pinned')) return;
+	if (r.say?.done && b.parentElement === r.el && r.el) {
+		const at = b.getBoundingClientRect();
+		const to = layer.getBoundingClientRect();
+		b.classList.remove('flip');
+		b.classList.add('pinned');
+		b.style.left = `${Math.round(at.left - to.left)}px`;
+		b.style.top = `${Math.round(at.top - to.top)}px`;
+		layer.append(b);
+		return;
+	}
 	const to = r.to;
 	if (r.el && to && !r.el.classList.contains('idle') && to.y > scrollY && to.y < scrollY + innerHeight - 40) {
 		b.classList.remove('on-rail');
@@ -478,7 +497,7 @@ let sentSay = '';
 let sayQueue: ReturnType<typeof setTimeout> | undefined;
 let sayKeep: ReturnType<typeof setInterval> | undefined;
 let sayFade: ReturnType<typeof setTimeout> | undefined;
-/** Where on the page (document px) the composer opened, or null at the foot of the window. */
+/** Where on the page (document px) the composer is: the pointer's place while it is written, kept once sent; null at the foot of the window. */
 let sayAt: { x: number; y: number } | null = null;
 
 const line = (v: string) => v.replace(/\s+/g, ' ').trim();
@@ -496,11 +515,12 @@ function queueSay(): void {
 }
 
 /**
- * Where the pointer was when the composer opened, scrolling with the page and kept inside the window; at the foot of
- * the window when it opened with the pointer off the page.
+ * Beside the pointer while the line is written, and where it was sent once it is (scrolling with the page), kept inside
+ * the window; at the foot of the window while the pointer is off the page.
  */
 function placeBox(): void {
 	if (sayBox.hidden) return;
+	if (saying) sayAt = pointer ? { x: pointer.x + scrollX, y: pointer.y + scrollY } : sayAt;
 	sayBox.classList.toggle('at-foot', !sayAt);
 	if (!sayAt) return void (sayBox.style.left = sayBox.style.top = '');
 	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x - scrollX + 14)))}px`;
@@ -521,10 +541,7 @@ function openSay(): void {
 	tipOn(sayKey, 'Enter sends, Esc cancels');
 	sayBox.querySelector(':scope > .face')?.remove();
 	if (w) sayBox.prepend(face(w));
-	sayAt = pointer ? { x: pointer.x + scrollX, y: pointer.y + scrollY } : null;
-	// The others' copy of the pointer parks here too, so the bubble they see stays put.
-	clearTimeout(cTimer);
-	if (peers.size) sendCursor();
+	sayAt = null;
 	sayBox.hidden = false;
 	placeBox();
 	sayField.focus({ preventScroll: true });
@@ -555,7 +572,6 @@ function closeSay(text: string | null): void {
 		sayBox.hidden = true;
 	}
 	sentSay = '';
-	queueCursor();
 }
 
 sayField.addEventListener('input', () => {
@@ -704,6 +720,7 @@ export function setup(opts: {
 			if (e.pointerType === 'touch') return;
 			pointer = { x: e.clientX, y: e.clientY };
 			queueCursor();
+			if (saying) placeBox();
 		},
 		{ passive: true },
 	);

@@ -532,6 +532,7 @@ body.chat-full .chat-back { order: 1; }
 .say-live.out { opacity: 0; }
 .say-live kbd, .tl-hint kbd { padding: 0 5px; border-radius: 5px; box-shadow: inset 0 0 0 1px var(--line-2); font-family: var(--font-mono); font-size: 11px; line-height: 17px; color: var(--ink-3); }
 .cursor-say { position: absolute; top: 38px; left: 12px; width: max-content; max-width: 260px; padding: 5px 10px; border-radius: 4px 12px 12px 12px; background: var(--pop-bg); box-shadow: var(--pop-ring), inset 0 0 0 1.5px var(--c), 0 8px 24px rgb(0 0 0 / 0.25); color: var(--ink-1); font-size: 12.5px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; pointer-events: none; animation: say-live-in 0.15s ease-out; transition: opacity 0.3s; }
+.cursor-say.pinned { animation: none; }
 .cursor-say.flip { left: 8px; transform: translateX(-100%); border-radius: 12px 4px 12px 12px; }
 .cursor-say.on-rail { top: -4px; left: auto; right: 30px; border-radius: 12px 4px 12px 12px; }
 .cursor-say.live::after { content: ""; display: inline-block; width: 1.5px; height: 1.05em; margin-left: 1px; vertical-align: -2px; background: var(--c); animation: say-caret 1s steps(1) infinite; }

@@ -108,6 +108,11 @@ export const rules = [
 		info: "The site's narration is a podcast script, not the article read aloud. Each page in `site/content/` has its own spoken version, written for the ear: an `Intro`, one `Say` per top-level Section or Issue (a `Say` on a container replaces its whole subtree; a long section splits into `Say`s on its sub-blocks, the rest `Silent`) and an `Outro`. Talk to the listener, say why before what, describe code by what it shows and never read symbols out, keep each `Say` under about 90 seconds, and steer the voice with Fish Audio Drama 3 directions (`[warm]`, `[curious]`, `[pause]`, `[laughs]`, `<emphasis>...</emphasis>`). It must stay accurate to the article: a change to a page changes its script in the same commit. Pronunciations go in `site/audio/lexicon.toml`, which never touches text inside `[ ]`.",
 		link: "site/audio/README.md",
 	},
+	{
+		id: "scripts-take-typed-input",
+		info: "A script (Python in `.github/scripts/`, `harness/`, `bench/`, `scripts/`, `nix/`) takes one typed input, not a set of flags: a single JSON value, given as a path to a file, `-` for standard input, or inline as the one argument. It parses that into a typed structure (a frozen `dataclass` with `Literal` and exact types, every field named, unknown fields refused) and fails naming the field that is wrong. At most a positional subcommand may come before it. No `argparse` flag sets, no environment variables as hidden parameters (an environment variable is only for what the environment is, like a token). A workflow writes the JSON inline (`python3 x.py '{\"target\": \"...\", \"pgo\": false}'`). An existing script moves to this when it is next changed.",
+		reason: "Andrew, 2026-10-28: \"for parser things it should be typed like json instead of cli args, json through a file or stdin or a single value\". Flags drift (build_release.py grew --strict, --no-pgo, --server, --server-beside, ...), are untyped, and an agent or a workflow has to guess their combinations; one JSON value is checkable, diffable and the same from a workflow, a person or another script.",
+	},
 ] as const satisfies readonly Rule[];
 
 /** What the SessionStart hook prints: header, then `N. id: info (see link)`, with `reason` only on request. */

@@ -23,9 +23,18 @@
 curl -fsSL https://ix.dev/blaze | sh
 ```
 
-For macOS on Apple silicon and Linux, with or without Rust installed: blaze downloads the Rust it
-builds with once (about 125 to 160 MB), or uses rustup's. Rather use crates.io or Nix?
+For macOS on Apple silicon and Linux, with or without Rust installed: blaze builds with its own
+Rust, whatever rustup or the project pins, and downloads it once (about 125 to 160 MB; none when
+rustup already has that same nightly). Rather use crates.io or Nix?
 [Other ways to install](docs/install.md).
+
+That installs **stable**: a release that passed the heavy tests (real projects on macOS and
+Linux). **Canary** is the newest release, out as soon as it is built and promoted to stable
+unchanged once it passes them ([release.md](docs/release.md)):
+
+```sh
+curl -fsSL https://ix.dev/blaze | sh -s -- --channel canary
+```
 
 ## Try it
 
@@ -40,7 +49,7 @@ blaze build   # like cargo build
 The first build loads your project and compiles every crate of it, with no cargo build and no
 rustc. Then change a function and build again: it's back in milliseconds, and the `Finished` line
 says `[blaze]`. The other cargo commands (`fmt`, `clippy`, `doc`, `tree` and the rest) are blaze's
-own too, and run no cargo. Where cargo is installed, `blaze run` is the same as `blaze run`.
+own too, and run no cargo.
 
 ## How fast
 

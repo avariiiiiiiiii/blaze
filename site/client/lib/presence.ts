@@ -13,6 +13,9 @@
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
  *   threads of that doc if it is the page shown.
  *
+ * The socket also says which build of the site is live (a `build` frame on every connect): client/lib/update.ts takes
+ * a new one in, a reload or a swap in place.
+ *
  * Without JS, or with the socket down, the page is as it was.
  *
  * Signed-in people are their GitHub avatar; anonymous ones a GitHub-style identicon of the key the worker gives them
@@ -21,6 +24,7 @@
 
 import { tipOn } from './tip';
 import * as chat from './chat';
+import * as update from './update';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
@@ -400,6 +404,7 @@ function connect(): void {
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
 		if (chat.message(msg)) return;
+		if (msg.t === 'build') return update.build(m as { build?: unknown; assets?: unknown });
 		if (msg.t === 'comments') {
 			const doc = (m as { doc?: unknown }).doc;
 			if (typeof doc === 'string') dispatchEvent(new CustomEvent(COMMENTS, { detail: doc }));

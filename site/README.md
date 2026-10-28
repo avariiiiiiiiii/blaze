@@ -157,6 +157,13 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   composers complete `@login` from people online and recent authors; a message that mentions the reader is marked,
   and while the chat is shut it pops up (even muted) and counts. Comment writes (`comments.ts`) tell the object too,
   and open pages refresh their comment threads.
+  On every connect the object also sends the live build (`.gen/build.json`); a deploy restarts it and drops every
+  socket, so each open tab hears of a new version within seconds (`client/lib/update.ts`). New scripts or styles
+  reload the tab; new content alone is fetched again and swapped in place by the router. Either waits until the
+  reader isn't typing, playing the narration or dragging (a hidden tab goes at once), with an "update ready" pop-up
+  and a button meanwhile, then says "Site updated". Drafts (chat and comments), the open thread, full screen, scroll
+  positions and the narration's place go through sessionStorage and come back; a reload that still gets the old
+  assets doesn't retry for a minute.
 - `updates.ts`: the `/updates` form.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.
 

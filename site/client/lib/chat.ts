@@ -18,6 +18,10 @@
  *
  * `@login` mentions: both composers complete GitHub logins (people online, recent authors), and a message that
  * mentions the reader is marked, and pops up and counts while the chat is shut, even when muted.
+ *
+ * The pop-up stack also carries the site's own word (`notice`, for client/lib/update.ts: a new version is in or ready),
+ * which shows whether the chat is open or muted. Before an update reloads the page, `save` hands over what the chat
+ * has that the reader would miss (drafts, the open thread, full screen, the list's scroll) and `restore` puts it back.
  */
 
 import { tipOn } from './tip';
@@ -71,6 +75,10 @@ let people: Who[] = [];
 let thread: { id: number; root: Msg | null; replies: Msg[]; loaded: boolean } | null = null;
 /** The error line of the composer that sent last, where a refusal shows. */
 let errAt: HTMLElement | null = null;
+/** What the chat keeps across a reload for a site update (client/lib/update.ts). */
+export type Kept = { main?: string; reply?: string; thread?: number; full?: boolean; list?: number; bottom?: boolean };
+/** Waiting to be put back, piece by piece as the socket brings the reader and the messages. */
+let restoring: Kept | null = null;
 /** Translations by message id: being made, made, or not to be made. */
 type Tr = { s: 'ask'; from: string } | { s: 'pending'; from: string } | { s: 'done'; from: string; text: string; original: boolean } | { s: 'none' };
 const translations = new Map<number, Tr>();
@@ -112,6 +120,7 @@ const SHRINK = 'M13.5 6.5h-4v-4M2.5 9.5h4v4M9.5 6.5 14 2M6.5 9.5 2 14';
 const BUBBLE = 'M2.5 3.5h11v7.5H8l-3 2.5V11H2.5Z';
 const BACK = 'M10 3 5 8l5 5';
 const CROSS = 'M4 4l8 8M12 4l-8 8';
+const REFRESH = 'M13 8a5 5 0 1 1-1.6-3.7M13.5 2v3h-3';
 const mute = el('button', 'chat-x chat-mute');
 mute.type = 'button';
 const full = el('button', 'chat-x chat-full');
@@ -174,7 +183,7 @@ function setMuted(m: boolean): void {
 		// Storage refused: the choice lasts this page.
 	}
 	drawMute();
-	if (m) for (const t of toasts.children) if (!t.classList.contains('mention')) t.remove();
+	if (m) for (const t of [...toasts.children]) if (!t.classList.contains('mention') && !t.classList.contains('chat-notice')) t.remove();
 }
 
 /** Full screen: the chat over the whole content pane, the sidebar still beside it. Esc or the button again leaves. */
@@ -207,11 +216,38 @@ function toast(m: Msg, mention: boolean): void {
 		t.remove();
 	});
 	toasts.prepend(t);
-	while (toasts.children.length > 3) toasts.lastElementChild?.remove();
+	// The oldest messages go; the site's notices stay until they are done.
+	const msgs = [...toasts.children].filter((x) => !x.classList.contains('chat-notice'));
+	for (const x of msgs.slice(3)) x.remove();
+	fade(t, TOAST_MS);
+}
+
+function fade(t: Element, ms: number): void {
 	setTimeout(() => {
 		t.classList.add('out');
 		setTimeout(() => t.remove(), 250);
-	}, TOAST_MS);
+	}, ms);
+}
+
+/**
+ * A word from the site itself (not a chat message) in the pop-up stack: shown whether the chat is open or muted, with
+ * an optional button. It fades after `ms`, or stays until the returned function is called.
+ */
+export function notice(title: string, text: string, opts: { ms?: number; action?: { label: string; run: () => void } } = {}): () => void {
+	const t = el('div', 'chat-toast chat-notice');
+	t.setAttribute('role', 'status');
+	const words = el('span', 'chat-toast-words');
+	words.append(el('b', '', title), el('span', '', text));
+	t.append(icon(REFRESH), words);
+	if (opts.action) {
+		const b = el('button', 'chat-notice-act', opts.action.label);
+		b.type = 'button';
+		b.addEventListener('click', opts.action.run);
+		t.append(b);
+	}
+	toasts.prepend(t);
+	if (opts.ms) fade(t, opts.ms);
+	return () => t.remove();
 }
 
 /** Open on load: as the reader last left it, else open where the page makes room (styles/shell.css, 1280px). */
@@ -236,7 +272,7 @@ function setOpen(open: boolean): void {
 	}
 	if (!open) setFull(false);
 	if (open) {
-		for (const t of toasts.children) t.remove();
+		for (const t of [...toasts.children]) if (!t.classList.contains('chat-notice')) t.remove();
 		unread = 0;
 		drawBadge();
 		toBottom();
@@ -539,7 +575,10 @@ function drawThread(stick = true): void {
 
 function drawThreadFoot(): void {
 	if (!thread) return;
-	threadFoot.replaceChildren(you?.login ? composer('Reply…', thread.id) : signIn());
+	// A reply being written before an update reloaded the page, in the thread it was for.
+	const draft = restoring?.thread === thread.id ? restoring.reply : undefined;
+	if (you?.login && restoring) delete restoring.reply;
+	threadFoot.replaceChildren(you?.login ? composer('Reply…', thread.id, draft) : signIn());
 }
 
 /** Logins to offer after `@`: in the open thread, then the list, latest first, then the rest online; not the reader. */
@@ -564,7 +603,7 @@ function candidates(q: string): Who[] {
 }
 
 /** A composer: Enter sends (a reply when `parent` is set), Shift+Enter is a new line, `@` offers logins to mention. */
-function composer(placeholder: string, parent: number | null): HTMLElement {
+function composer(placeholder: string, parent: number | null, draft = ''): HTMLElement {
 	const box = el('div', 'chat-compose');
 	const form = el('form', 'chat-form');
 	const ta = el('textarea');
@@ -689,6 +728,10 @@ function composer(placeholder: string, parent: number | null): HTMLElement {
 	});
 	form.append(ta, go);
 	box.append(err, pop, form);
+	if (draft) {
+		ta.value = draft;
+		grow();
+	}
 	return box;
 }
 
@@ -700,7 +743,9 @@ function signIn(): HTMLElement {
 }
 
 function drawFoot(): void {
-	foot.replaceChildren(you?.login ? composer('Message everyone here…', null) : signIn());
+	const draft = you?.login ? restoring?.main : undefined;
+	if (draft !== undefined) delete restoring!.main;
+	foot.replaceChildren(you?.login ? composer('Message everyone here…', null, draft) : signIn());
 }
 
 function arrow(): SVGSVGElement {
@@ -773,6 +818,7 @@ export function setup(opts: {
 	drawList();
 	drawFoot();
 	if (stored()) setOpen(true);
+	if (restoring?.full && !panel.hidden) setFull(true);
 }
 
 export function setYou(w: You): void {
@@ -781,6 +827,8 @@ export function setYou(w: You): void {
 	drawList();
 	drawThread(false);
 	drawThreadFoot();
+	// The thread the reader had open before an update reloaded the page (its composer takes the reply draft).
+	if (restoring?.thread !== undefined && !thread) openThread(restoring.thread);
 }
 
 export function setOnline(n: number): void {
@@ -817,6 +865,11 @@ export function message(m: { t?: unknown }): boolean {
 		const ms = (m as { messages?: unknown }).messages;
 		messages = Array.isArray(ms) ? (ms as Msg[]) : [];
 		drawList();
+		// The last of what the socket sends on connect: the list goes back where the reader left it, then nothing is left to restore.
+		if (restoring) {
+			if (restoring.list !== undefined && !restoring.bottom) list.scrollTop = restoring.list;
+			restoring = null;
+		}
 		for (const x of messages.slice(-TRANSLATE_HISTORY).reverse()) void translateOne(x);
 		// A reconnect: the open thread may have missed replies.
 		if (thread) {
@@ -886,4 +939,21 @@ export function message(m: { t?: unknown }): boolean {
 		}
 	} else return false;
 	return true;
+}
+
+export function save(): Kept {
+	const draft = (box: HTMLElement) => box.querySelector('textarea')?.value || undefined;
+	return {
+		main: draft(foot),
+		reply: thread ? draft(threadFoot) : undefined,
+		thread: thread?.id,
+		full: document.body.classList.contains('chat-full') || undefined,
+		list: list.scrollTop,
+		bottom: nearBottom(),
+	};
+}
+
+/** Called before setup: full screen goes back with the panel, drafts and the thread once the socket says who the reader is. */
+export function restore(k: Kept): void {
+	restoring = { ...k };
 }

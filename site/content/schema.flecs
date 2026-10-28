@@ -74,6 +74,7 @@ struct Figure(piece: string, label: string) // a diagram the reader can touch (c
 // A question answered by tapping parts of a diagram: `right` is the names of the parts to pick, comma separated (the
 // piece's node ids), `hint` what a wrong pick is told, `why` the explanation once it is right.
 struct Tap(prompt: string, piece: string, right: string, hint: string, why: string)
+SoundBoard {}                           // /learn/sounds: every lesson sound in each palette, to pick by ear (client/lib/audition.ts)
 Course {}                               // the course map: the Lesson pages under its (Lessons, page), or under this page, by order
 Step { (With, flecs.core.OrderedChildren) }
 Quiz { (With, flecs.core.OrderedChildren) }

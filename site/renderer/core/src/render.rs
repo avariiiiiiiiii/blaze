@@ -268,7 +268,8 @@ fn status(e: &Entity) -> String {
 const REFERENCES: &str = "<!--references-->";
 
 /// The tags that render through a widget (render/widgets.ts), in the order the TS object lists them.
-const WIDGETS: [&str; 5] = ["RfcIndex", "References", "SignupForm", "BenchHistory", "Course"];
+const WIDGETS: [&str; 6] =
+    ["RfcIndex", "References", "SignupForm", "BenchHistory", "Course", "SoundBoard"];
 
 const SIGNUP_FORM: &str = r#"<form method="POST" class="signup">
 <input type="hidden" name="ref" value="" />
@@ -325,6 +326,11 @@ fn widget(tag: &str, n: Id, ctx: &mut Ctx) -> Result<String, String> {
             }
         }
         "Course" => course(n, ctx),
+        // /learn/sounds: client/learn.ts (lib/audition.ts) fills it with a card per palette.
+        "SoundBoard" => {
+            ctx.script("learn");
+            Ok("<div class=\"soundboard\"><p class=\"sb-nojs\">The sounds are made in your browser, so this page needs JavaScript.</p></div>".to_string())
+        }
         _ => unreachable!("WIDGETS lists the tags"),
     }
 }

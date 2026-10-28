@@ -18,9 +18,10 @@
  * step seen, whether it is finished, and each question's tries. Storage can be missing or refuse writes (private
  * windows, blocked site data), so every access is wrapped and the course works for the visit from memory instead.
  * Diagrams are client/lib/diagrams.ts, and the sounds (a chime when right, a soft low tone when not, a tick to move on;
- * the speaker in the top bar mutes them) client/lib/sound.ts.
+ * the speaker in the top bar mutes them; /learn/sounds picks the palette, client/lib/audition.ts) client/lib/sound.ts.
  */
 
+import { soundBoard } from './lib/audition';
 import { mount, type Diagram } from './lib/diagrams';
 import { onPage } from './lib/page';
 import { KEY, firstTime, load, progress, stateOf, stateWords, store } from './lib/progress';
@@ -177,7 +178,8 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 	const course = main.dataset.course!;
 	const steps = [...main.querySelectorAll<HTMLElement>(':scope > section.step')];
 	if (!steps.length) return () => {};
-	const quizCount = (main.dataset.quizzes ?? '').split(' ').filter(Boolean).length;
+	const quizIds = (main.dataset.quizzes ?? '').split(' ').filter(Boolean);
+	const quizCount = quizIds.length;
 	const title = main.querySelector('.head h1')?.textContent ?? document.title;
 	let saved = load();
 	let me = progress(saved, lesson);
@@ -328,7 +330,8 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 			me.step = i;
 			me.seen = Math.max(me.seen, i);
 		}
-		if (dir > 0) (i === n + 1 ? sound.done : sound.tick)();
+		// The end: a rising phrase, or the full chord when every question was right the first time.
+		if (dir > 0) (i === n + 1 ? (quizIds.length && firstTime(me, quizIds) === quizIds.length ? sound.milestone : sound.done) : sound.tick)();
 		if (i === n + 1) {
 			me.done = true;
 			me.step = 0;
@@ -576,6 +579,8 @@ function courseMap(list: HTMLOListElement, signal: AbortSignal): () => void {
 onPage((signal) => {
 	const main = document.querySelector<HTMLElement>('main.lesson[data-lesson]');
 	if (main && !main.hasAttribute('data-on')) return player(main, signal);
+	const board = document.querySelector<HTMLElement>('.soundboard');
+	if (board) return soundBoard(board, signal);
 	const list = document.querySelector<HTMLOListElement>('ol.course');
 	if (list) return courseMap(list, signal);
 	// A figure outside a lesson (none yet), drawn all the same.

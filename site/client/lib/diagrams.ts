@@ -252,15 +252,16 @@ const sandbox: Piece = {
 // Lesson 4: what goes into a compiled function's key (a Tap question), laid out as the sandbox is, without wires.
 const inputs: Piece = {
 	cols: 28,
-	rows: 18,
+	rows: 23,
 	parts: [
 		{ id: 'key', label: 'key', x: 14, y: 1, fixed: true },
-		{ id: 'source', label: 'the source', x: 7, y: 6 },
-		{ id: 'opt', label: 'optimisation level', x: 21, y: 6 },
-		{ id: 'target', label: 'the target', x: 7, y: 11 },
+		{ id: 'name', label: 'its name', x: 7, y: 6 },
+		{ id: 'source', label: "its crate's source", x: 21, y: 6 },
+		{ id: 'opt', label: 'optimisation level', x: 7, y: 11 },
 		{ id: 'clock', label: 'the time of day', x: 21, y: 11 },
-		{ id: 'user', label: 'your user name', x: 7, y: 16 },
-		{ id: 'blaze', label: "blaze's version", x: 21, y: 16 },
+		{ id: 'target', label: 'the target', x: 7, y: 16 },
+		{ id: 'user', label: 'your user name', x: 21, y: 16 },
+		{ id: 'blaze', label: "blaze's build", x: 14, y: 21 },
 	],
 	wires: [],
 };

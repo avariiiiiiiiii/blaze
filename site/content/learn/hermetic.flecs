@@ -49,7 +49,7 @@ site {
 
       Step inputs("What goes in the key?") {
         Silent
-        Tap q(prompt: "Tap the things that go into the key of a compiled function.", piece: "inputs", right: "source,opt,target,blaze", hint: "For each one, ask: could it change the machine code that comes out?", why: "The source, the optimisation level, the target and blaze's own version can all change the machine code. The time of day and your user name can't, so they stay out.")
+        Tap q(prompt: "Tap the things that go into the key of a compiled function.", piece: "inputs", right: "name,source,opt,target,blaze", hint: "For each one, ask: could it change the machine code that comes out?", why: "The key holds the function's name and a hash of its whole crate's source, plus the optimisation level, the target and blaze's own build, so editing any line of the crate, or renaming the function, gives it a new key; the time of day and your user name stay out.")
       }
 
       Step close("Sealed where it matters") {

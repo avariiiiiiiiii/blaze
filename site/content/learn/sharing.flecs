@@ -24,9 +24,9 @@ site {
 
       Step branch("An old branch") {
         Silent
-        Quiz q(prompt: "You switch back to a branch you built yesterday, with the same blaze. What happens to a function nobody touched since?") {
+        Quiz q(prompt: "You switch back to a branch you built yesterday, with the same blaze, and nothing on it has changed since. What happens to its functions?") {
           Choice again("It's compiled again, to be safe.", "Same inputs give the same key and the same result, so compiling again would only make the same thing.")
-          Choice found("It's found in the store under the same key, and used as is.", "Same inputs, same key: yesterday's result is today's result.") {
+          Choice found("Each is found in the store under the same key, and used as is.", "Each crate's source hashes the same as yesterday, so every key matches again and yesterday's results are used.") {
             Right
           }
           Choice ask("blaze asks you which version to use.", "There's nothing to choose: the key says exactly which result fits.")

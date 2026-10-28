@@ -14,6 +14,30 @@ fn size_of() {
 }
 
 #[test]
+fn variant_count() {
+    let fixture = |goal: &str| {
+        format!(
+            r#"
+        #[rustc_intrinsic]
+        pub fn variant_count<T>() -> usize;
+
+        enum Three {{ A, B(u8), C {{ c: i32 }} }}
+        enum Never {{}}
+        struct One(u8);
+        union Both {{ a: u8, b: u16 }}
+
+        {goal}
+        "#
+        )
+    };
+    check_number(&fixture("const GOAL: usize = variant_count::<Three>();"), 3);
+    check_number(&fixture("const GOAL: usize = variant_count::<Never>();"), 0);
+    check_number(&fixture("const GOAL: usize = variant_count::<One>();"), 1);
+    check_number(&fixture("const GOAL: usize = variant_count::<Both>();"), 1);
+    check_number(&fixture("const GOAL: usize = variant_count::<u8>();"), 0);
+}
+
+#[test]
 fn size_of_val() {
     check_number(
         r#"

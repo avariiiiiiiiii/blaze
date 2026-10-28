@@ -21,6 +21,8 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   lines. `-q` shows none.
 - `blaze why [fn|crate]` says what the last build rebuilt and why.
 - `--events json|cbor` writes the build's events to stdout, one record a line or frame.
+- `variant_count` in a constant evaluates, as rustc's does: an enum's variants, 1 for a
+  struct or union, 0 for any other type (#862). A function using it was refused.
 
 ### Changed
 

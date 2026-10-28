@@ -42,6 +42,11 @@ pub(crate) fn ours_says() -> &'static str {
     own::rustc_version()
 }
 
+/// That rustc's release, as `rustc -vV` says it: `1.101.0-nightly`.
+pub(crate) fn ours_release() -> &'static str {
+    ours_says().split_once(' ').map_or(ours_says(), |(release, _)| release)
+}
+
 /// The commit that toolchain was built from.
 pub(crate) fn ours_commit() -> &'static str {
     own::commit()

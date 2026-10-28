@@ -220,8 +220,13 @@ impl<'a, R: Resolver> IndexRegistry<'a, R> {
         IndexRegistry { sources, others }
     }
 
+    /// What answers for the sources that are not registries.
+    pub fn others(&self) -> &R {
+        &self.others
+    }
+
     /// The source `id`'s packages come from, when it is a registry's index.
-    fn registry_of(&self, id: SourceId) -> Result<Option<SourceId>> {
+    pub fn registry_of(&self, id: SourceId) -> Result<Option<SourceId>> {
         if !id.is_registry() {
             return Ok(None);
         }

@@ -150,7 +150,7 @@ themselves):
 
 ```
 bun gen/build.ts
-bunx wrangler d1 migrations apply blaze-updates --local
+bunx wrangler d1 migrations apply ra-jit-updates --local
 bunx wrangler dev --var GITHUB_CLIENT_ID:<dev app id>     # secrets for dev go in .dev.vars (gitignored)
 bunx tsc --noEmit -p tsconfig.json                         # type-checks worker/ only
 ```
@@ -220,12 +220,12 @@ Setup: create a GitHub OAuth App with the callback `https://ix.dev/blaze/auth/gi
 `GITHUB_CLIENT_ID` (`wrangler.jsonc` `vars`; empty turns sign-in off) and its secret with
 `wrangler secret put GITHUB_CLIENT_SECRET`. `COMMENT_ADMINS` is a comma-separated list of numeric GitHub user ids
 (`curl https://api.github.com/users/<login>` shows `id`), compared with the signed-in user's id; logins are not used,
-since a renamed login can be registered by someone else. Apply `0002_comments.sql` and `0003_doc_versions.sql` with `wrangler d1 migrations apply blaze-updates --remote`.
+since a renamed login can be registered by someone else. Apply `0002_comments.sql` and `0003_doc_versions.sql` with `wrangler d1 migrations apply ra-jit-updates --remote`.
 
 Reading comments:
 
 ```
-npx wrangler d1 execute blaze-updates --remote --command \
+npx wrangler d1 execute ra-jit-updates --remote --command \
   "select c.id, c.doc, c.block, u.login, c.body, c.created_at from comments c join users u on u.id = c.user_id where c.deleted_at is null order by c.id desc"
 ```
 
@@ -249,20 +249,20 @@ secret, verification is skipped; with no site key, the widget is not shown (dev)
 ### One-time setup
 
 ```
-npx wrangler d1 create blaze-updates      # paste the printed database_id into wrangler.jsonc (TODO there)
-npx wrangler d1 migrations apply blaze-updates --remote
+npx wrangler d1 create ra-jit-updates      # paste the printed database_id into wrangler.jsonc (TODO there)
+npx wrangler d1 migrations apply ra-jit-updates --remote
 npx wrangler secret put TURNSTILE_SECRET_KEY
 bun gen/build.ts && npx wrangler deploy
 ```
 
-Local dev: `npx wrangler d1 migrations apply blaze-updates --local`.
+Local dev: `npx wrangler d1 migrations apply ra-jit-updates --local`.
 
 ### Reading signups
 
 ```
-npx wrangler d1 execute blaze-updates --remote --command \
+npx wrangler d1 execute ra-jit-updates --remote --command \
   "select email, company, why, src, country, city, as_organization, created_at from signups order by created_at desc"
-npx wrangler d1 execute blaze-updates --remote --command "select count(*) from signups"
+npx wrangler d1 execute ra-jit-updates --remote --command "select count(*) from signups"
 ```
 
 Add `--json` for machine-readable output.

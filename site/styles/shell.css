@@ -236,27 +236,32 @@ body.side-shut.chat-full .chat { left: clamp(8px, 1vw, 14px); }
 .tl-list { position: absolute; top: calc(100% + 2px); right: clamp(12px, 2vw, 20px); width: min(360px, calc(100vw - 24px)); max-height: min(60vh, 480px); overflow: auto; overscroll-behavior: contain; padding: 10px; border-radius: 12px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 16px 40px rgb(0 0 0 / 0.25); font-size: 13px; }
 .tl-list[hidden] { display: none; }
 .tl-list ul { margin: 0; padding: 0; list-style: none; }
-.tl-list li { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-top: 1px solid var(--line); }
-.tl-list .who { flex: none; color: var(--ink-1); text-decoration: none; }
-.tl-list .flag { font-size: 15px; line-height: 1; cursor: default; }
-.tl-list .tag { padding: 0 6px; border-radius: 6px; background: var(--s-tint); color: var(--ink-3); font-size: 11px; }
-/* One line a person: their pages sit to the right and end in an ellipsis when they do not fit. */
-.tl-list .where { flex: 1; min-width: 0; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
-.tl-list .where a + a { margin-left: 10px; }
-.tl-list .where a { color: var(--ink-3); text-decoration: none; }
-.tl-list .where a:hover { color: var(--ink-1); }
-.tl-list .where a.away { opacity: 0.55; }
+.tl-list li { display: flex; align-items: center; gap: 10px; padding: 7px 6px; border-radius: 8px; }
+.tl-list li:not(.tl-sub):hover { background: var(--s-tint); }
+.tl-list li.away { opacity: 0.6; }
+.tl-list li.tl-sub { margin-top: 6px; padding: 4px 6px 2px; color: var(--ink-4); font-size: 11px; letter-spacing: 0.02em; text-transform: uppercase; }
+.tl-body { display: grid; flex: 1; min-width: 0; line-height: 1.3; }
+.tl-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tl-list .who { overflow: hidden; color: var(--ink-1); font-weight: 500; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
+.tl-list a.who:hover { text-decoration: underline; }
+.tl-list .flag { font-size: 13px; line-height: 1; cursor: default; }
+.tl-list .tag { padding: 0 5px; border-radius: 5px; background: var(--s-tint); color: var(--ink-3); font-size: 10.5px; line-height: 16px; }
+.tl-meta { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--ink-4); font-size: 12px; white-space: nowrap; }
+.tl-meta > * + *::before { content: '·'; margin-right: 6px; color: var(--ink-4); }
+.tl-meta > .more::before { content: none; }
+.tl-meta .where { overflow: hidden; color: var(--ink-3); text-decoration: none; text-overflow: ellipsis; }
+.tl-meta .where:hover { color: var(--ink-1); }
 .tl-head { margin: 0 4px 6px; color: var(--ink-3); }
 .tl-list li.tl-head { border: 0; }
 .tl-list p.tl-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .tl-list .cursors-toggle { height: 24px; padding: 0 8px; font-size: 12px; }
 .tl-list .face, .tl-list .flag, .tl-list .tag { flex: none; }
 .tl-av { position: relative; flex: none; display: inline-grid; }
-.tl-av .face { width: 22px; height: 22px; }
+.tl-av .face { width: 28px; height: 28px; }
 .tl-av .dot { position: absolute; right: -2px; bottom: -2px; width: 9px; height: 9px; border-radius: 50%; background: var(--pop-bg); box-shadow: inset 0 0 0 1.5px var(--ink-4), 0 0 0 2px var(--pop-bg); }
 .tl-av .dot.on { background: var(--ok); box-shadow: 0 0 0 2px var(--pop-bg); }
-.tl-list .more { margin-left: 6px; color: var(--ink-4); cursor: default; }
-.tl-list .for { flex: none; min-width: 26px; color: var(--ink-4); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+.tl-list .more { margin-left: -2px; color: var(--ink-4); cursor: default; }
+.tl-list .for { flex: none; font-variant-numeric: tabular-nums; }
 .faces { display: inline-flex; align-items: center; }
 .faces .face + .face { margin-left: -6px; }
 .face { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: var(--bg-4); box-shadow: 0 0 0 2px var(--bg); transition: opacity 0.2s; }
@@ -339,8 +344,8 @@ body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typin
 .chat-toasts { position: fixed; z-index: 46; right: clamp(8px, 1vw, 14px); bottom: 14px; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 24px)); pointer-events: none; }
 .chat-toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 0; border-radius: 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 12px 32px rgb(0 0 0 / 0.3); color: var(--ink-2); font: inherit; font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; pointer-events: auto; animation: toast-in 0.2s ease-out; }
 a.chat-toast { text-decoration: none; }
-.tl-list .devices { display: inline-flex; gap: 2px; color: var(--ink-3); }
-.tl-list .device { display: inline-grid; width: 14px; height: 14px; }
+.tl-list .devices { display: inline-flex; gap: 2px; color: var(--ink-4); }
+.tl-list .device { display: inline-grid; width: 13px; height: 13px; }
 .tl-list .device svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
 .chat-toast:hover { background: var(--bg-3); }
 .chat-toast .face { width: 26px; height: 26px; }

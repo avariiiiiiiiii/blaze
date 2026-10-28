@@ -9,6 +9,7 @@ extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
 extern crate rustc_abi;
 extern crate rustc_type_ir;
 
+pub mod const_macro;
 pub mod diagnostics;
 pub mod display;
 mod impl_db_macro;

@@ -87,6 +87,8 @@ macro_rules! from_bytes {
 }
 use from_bytes;
 
+pub(super) mod macro_call;
+
 /// A float as an integer of `bits` bits, as `as` makes it and rustc's evaluation computes it
 /// with rustc_apfloat: rounded toward zero, saturating, and NaN as zero.
 fn apfloat_to_int<F: Float>(value: F, bits: usize, signed: bool) -> u128 {

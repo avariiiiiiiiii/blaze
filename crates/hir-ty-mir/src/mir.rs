@@ -28,7 +28,9 @@ mod storage;
 mod transform;
 pub mod type_name;
 
-pub use eval::{Evaluator, interpret_mir, render_const_using_debug_impl};
+pub use eval::{
+    Evaluator, interpret_mir, macro_call::call_with_strs, render_const_using_debug_impl,
+};
 pub use lower::is_builtin_index;
 pub use lower::{
     inline_const_at, lower_body_to_mir, lower_to_mir_with_store, mir_body_for_closure_query,

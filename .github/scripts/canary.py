@@ -25,20 +25,23 @@ train_release.py's numbering counts every tag, so the two never take the same ve
 
 The JSON is inline, a file's path, or `-` for stdin. Needs git (a checkout of main with its
 history and tags) and gh (GH_TOKEN with contents: write and actions: write for `cut` with
-`push`). Python 3.11+, stdlib.
+`push`). Python 3.11+, stdlib; `stamp` without notes runs on 3.10 too (release.yaml's
+ubuntu-22.04).
 """
-import asyncio, datetime, json, os, re, subprocess, sys, tomllib, typing
+import asyncio, datetime, json, os, re, subprocess, sys, typing
 from dataclasses import dataclass, fields
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import train_release  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
 DATED = re.compile(r"v0\.(\d{8})\.(0|[1-9]\d*)")
 # A change to nothing but these makes no canary: blaze is the same program.
 DOCS = re.compile(r"^(docs/|site/|agents/|bench/results/)|\.md$")
+# release.yaml's builds run on ubuntu-22.04, whose Python (3.10) has no tomllib: `stamp` without
+# notes needs nothing newer, and train_release.py (which imports tomllib) is imported where used.
+WORKSPACE_VERSION = re.compile(r'(\[workspace\.package\]\nversion = ")([^"]+)"')
 # How many of main's newest commits `cut` looks through for a green one.
 LOOK_BACK = 40
 
@@ -121,6 +124,7 @@ def green(sha):
 
 
 def cut(args):
+    import train_release
     main = run("git", "rev-parse", "origin/main")
     base = previous(main)
     # Main moves every few minutes and its gate takes longer than that, so HEAD is seldom green
@@ -188,7 +192,10 @@ def stamp(args):
     new = args.tag[1:]
     manifest = ROOT / "Cargo.toml"
     text = manifest.read_text()
-    old = tomllib.loads(text)["workspace"]["package"]["version"]
+    found = WORKSPACE_VERSION.search(text)
+    if not found:
+        sys.exit("canary.py: Cargo.toml has no `version` right under [workspace.package]")
+    old = found[2]
     if old == new:
         # A release commit's tag: CHANGELOG.md has its section.
         if args.notes:
@@ -199,16 +206,14 @@ def stamp(args):
         else:
             output("version", new)
         return
-    stamped = re.sub(r'(\[workspace\.package\]\nversion = ")[^"]+(")', rf"\g<1>{new}\g<2>", text, count=1)
-    if stamped == text:
-        sys.exit("canary.py: Cargo.toml has no `version` right under [workspace.package]")
-    manifest.write_text(stamped)
+    manifest.write_text(text[:found.start(2)] + new + text[found.end(2):])
     lock = ROOT / "Cargo.lock"
     lock.write_text(lock_stamped(lock.read_text(), old, new))
     print(f"stamped {new} over {old} in Cargo.toml and Cargo.lock", flush=True)
     if args.notes:
         head = run("git", "rev-parse", "HEAD")
         base = previous(args.tag, but=args.tag)
+        import train_release
         titles = asyncio.run(train_release.changes(base)) if base else []
         merged = "\n".join(f"- {title}" for title, _ in titles) or "- (none but the bots' own)"
         server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")

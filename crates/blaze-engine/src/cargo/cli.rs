@@ -111,13 +111,16 @@ const WORKER_ENV: &[&str] = &[
     "BLAZE_RUSTC_BASE",
     super::own_macro::SERVER,
     super::own_macro::WASM,
+    super::layout::NEW_LAYOUT,
 ];
 
 /// The variables of [`WORKER_ENV`] a worker has only as its build has them: unset there, they
 /// are unset for the worker too, and not the daemon's. Which proc-macro server a load uses
 /// ([`super::own_macro::SERVER`]) is the build's, read when it asks, never the one the daemon
 /// was started with (#460). So are the flags and profiles cargo reads from the environment: a
-/// build without `RUSTFLAGS` is not built with those of whoever started the daemon.
+/// build without `RUSTFLAGS` is not built with those of whoever started the daemon. So is the
+/// layout of the build directory: plain cargo's build, which the daemon loads too, is in the
+/// layout the user's cargo chose.
 const WORKER_ENV_EXACT: &[&str] = &[
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
@@ -127,6 +130,7 @@ const WORKER_ENV_EXACT: &[&str] = &[
     "CARGO_PROFILE_",
     super::own_macro::SERVER,
     super::own_macro::WASM,
+    super::layout::NEW_LAYOUT,
 ];
 
 /// `CARGO_TARGET_<triple>_RUSTFLAGS`, which cargo reads as `[target.<triple>] rustflags`.

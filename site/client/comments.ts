@@ -24,6 +24,7 @@
  * cookie, so its threads, forms and sign-in state are the reader's, as on a load.
  */
 
+import { blockControls } from './lib/blockctl';
 import { COMMENTS, SAVE, THREADS, kept, onPage } from './lib/page';
 
 const PAGE_THREAD = 'block-_page';
@@ -309,6 +310,7 @@ function start(main: HTMLElement, signal: AbortSignal) {
 
 	// Take over: from here the threads are shown by `hidden`, not by :target (styles/site.css).
 	main.classList.add('c-live');
+	blockControls(main, signal);
 	for (const b of main.querySelectorAll<HTMLAnchorElement>('.c-btn')) b.setAttribute('role', 'button');
 	for (const t of main.querySelectorAll<HTMLElement>('.c-thread')) setOpen(t, t.id === PAGE_THREAD);
 	relativeTimes(main);

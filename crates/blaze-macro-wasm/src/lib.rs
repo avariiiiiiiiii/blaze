@@ -1136,8 +1136,12 @@ struct Lazy {
     path: PathBuf,
     known: Known,
     compiled: OnceLock<Result<Arc<Wasm>, String>>,
-    sessions: Mutex<FxHashMap<(Nonce, Crate), (salsa::Revision, Result<Session, String>)>>,
+    /// Each crate's session has its own lock, so crates expand the library at once.
+    sessions: Mutex<FxHashMap<(Nonce, Crate), (salsa::Revision, Slot)>>,
 }
+
+/// A crate's session, started by its first expansion in the revision.
+type Slot = Arc<Mutex<Option<Result<Session, String>>>>;
 
 impl Lazy {
     fn get(&self) -> Result<&Arc<Wasm>, String> {
@@ -1245,17 +1249,17 @@ impl ProcMacroExpander for Expander {
         db.report_untracked_read();
         let (nonce, revision) = db.nonce_and_revision();
         let wasm = self.wasm.get().map_err(ProcMacroExpansionError::System)?;
-        let mut sessions = self.wasm.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.retain(|(owner, _), (seen, _)| *owner != nonce || *seen == revision);
-        let (_, session) = sessions.entry((nonce, calling_crate)).or_insert_with(|| {
-            (
-                revision,
-                wasm.session(env).map_err(|e| match e {
-                    ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why) => {
-                        why
-                    }
-                }),
-            )
+        let slot = {
+            let mut sessions = self.wasm.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.retain(|(owner, _), (seen, _)| *owner != nonce || *seen == revision);
+            let entry = sessions.entry((nonce, calling_crate));
+            entry.or_insert_with(|| (revision, Slot::default())).1.clone()
+        };
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let session = slot.get_or_insert_with(|| {
+            wasm.session(env).map_err(|e| match e {
+                ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why) => why,
+            })
         });
         let session = session.as_mut().map_err(|e| ProcMacroExpansionError::System(e.clone()))?;
         let call = Call { subtree, attrs, env, def_site, call_site, mixed_site };

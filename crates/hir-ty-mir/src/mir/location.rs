@@ -3,16 +3,19 @@
 //! `#[track_caller]` and panics report. The evaluator of constants and the code generator
 //! both read them.
 
-use hir_def::{DefWithBodyId, expr_store::Body, hir::ExprId};
+use hir_def::{
+    DefWithBodyId, FunctionId, ItemContainerId, Lookup, attrs::AttrFlags, expr_store::Body,
+    hir::ExprId, signatures::FunctionSignature,
+};
 use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
 use rustc_hash::FxHashMap;
-use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use unicode_width::UnicodeWidthChar;
 
-use crate::db::HirDatabase;
+use crate::{InferenceResult, db::HirDatabase, mir::{MirSpan, is_builtin_index}};
 
 /// The range of an item or a macro call without the attributes and comments on top of it,
 /// which rustc's span of it leaves out.
@@ -94,14 +97,18 @@ pub fn name_sources(
     *SOURCE_PATHS.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(paths));
 }
 
+/// What the build calls `file`, as `file!()` and `Location::file` say: none when the
+/// evaluator was not told ([`name_sources`]).
+pub fn source_path(db: &dyn HirDatabase, file: base_db::FileId) -> Option<String> {
+    let paths = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+    paths(db, file)
+}
+
 /// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
 /// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
 /// and a constant is evaluated from what it expanded them to.
 pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
-    let path = |file| {
-        let paths = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone()?;
-        paths(db, file)
-    };
+    let path = |file| source_path(db, file);
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
         let call = file_id.macro_file()?.loc(db).to_node(db);
         let mut text = String::new();
@@ -266,4 +273,114 @@ pub fn column_width(ch: char) -> usize {
         | '\u{2066}'..='\u{2069}' => 1,
         _ => UnicodeWidthChar::width(ch).unwrap_or(1),
     }
+}
+
+/// File, line and column of a place in a body, as rustc reports them, found from where the
+/// body is in its file: the code generator also finds them from the body alone.
+#[salsa::tracked]
+pub fn source_location_in_file<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let (file_id, range) = source_range(db, owner, span)?;
+    location_of(db, file_id, range)
+}
+
+/// The file a place in a body is written in, which may be what a macro expands to, and
+/// where in it rustc has the place begin.
+pub fn source_range<'db>(
+    db: &'db dyn HirDatabase,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(HirFileId, TextRange)> {
+    let source_map = &Body::with_source_map(db, owner).1;
+    let source = match span {
+        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
+        // ends where the body does.
+        MirSpan::ExprEnd(expr) => {
+            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
+                (Ok(written), _) => written,
+                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
+                    source_map.expr_syntax(*tail).ok()?
+                }
+                (Err(_), _) => return None,
+            }
+        }
+        MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
+    };
+    if let MirSpan::ExprEnd(_) = span {
+        // The brace that closes a block, which is where rustc has a scope left.
+        let range = source.value.syntax_node_ptr().text_range();
+        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
+        return Some((source.file_id, TextRange::new(last?, range.end())));
+    }
+    let range = match span {
+        MirSpan::ExprId(expr) => {
+            let root = source.file_id.parse_or_expand(db);
+            let node = source.value.syntax_node_ptr().to_node(&root);
+            reported_range(db, owner, expr, source.file_id, &node)?
+        }
+        _ => source.value.syntax_node_ptr().text_range(),
+    };
+    Some((source.file_id, range))
+}
+
+/// The part of an expression that rustc's span of it covers where it panics: a method call
+/// from the method's name on, an index through `Index` from its bracket on, and any other
+/// expression together with the parentheses it is written in.
+pub fn reported_range(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    expr: ExprId,
+    file_id: HirFileId,
+    node: &SyntaxNode,
+) -> Option<TextRange> {
+    let end = node.text_range().end();
+    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
+    }
+    if let Some(written) = ast::IndexExpr::cast(node.clone())
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
+        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
+    {
+        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
+    }
+    Some(parenthesized(db, file_id, node))
+}
+
+/// The range of an expression with the parentheses around it. rustc's span of an expression
+/// includes them when both are written in one place, and not when a macro put the
+/// parentheses around what it was passed.
+fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+    let passed_in = |range: TextRange| {
+        file_id.macro_file().is_none()
+            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
+    };
+    let inner = passed_in(node.text_range());
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
+        .last()
+        .map_or(node.text_range(), |it| it.text_range())
+}
+
+/// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
+/// impl inherits the attribute from the trait's declaration.
+pub fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    let has =
+        |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
+    if has(func) {
+        return true;
+    }
+    let ItemContainerId::ImplId(impl_id) = func.lookup(db).container else {
+        return false;
+    };
+    let Some(trait_ref) = db.impl_trait(impl_id) else {
+        return false;
+    };
+    let name = &FunctionSignature::of(db, func).name;
+    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
 }

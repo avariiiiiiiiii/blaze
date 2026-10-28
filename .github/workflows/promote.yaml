@@ -54,7 +54,10 @@ jobs:
       - id: which
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I .github/scripts/promote.py which "{\"tag\": \"${{ inputs.tag }}\"}"
+          WANTED: ${{ inputs.tag }}
+        run: |
+          jq -n --arg tag "$WANTED" '{tag: $tag}' > "$RUNNER_TEMP/which.json"
+          python3 -I .github/scripts/promote.py which "$RUNNER_TEMP/which.json"
 
   smoke:
     name: smoke (${{ matrix.os }})
@@ -95,8 +98,8 @@ jobs:
       - name: what the projects build with
         if: runner.os == 'Linux'
         run: |
-          packages=$(python3 -I harness/smoke.py apt)
-          if [ -n "$packages" ]; then sudo apt-get update -qq && sudo apt-get install -y -qq $packages; fi
+          read -ra packages <<< "$(python3 -I harness/smoke.py apt)"
+          if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
       - name: smoke corpus
         env:
           # anim is private: read with the bot's token.

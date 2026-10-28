@@ -9,7 +9,7 @@ ARM   cargo (warm target dir of main, tree /root/rb/c), cold (blaze, empty store
 /root/rb/bench.env (KEY=VALUE lines) is added to every blaze arm's environment.
 SHAPE a (no edit), b (body.patch: Symbol::intern's body), c (sig.patch: Symbol::empty's signature).
 JOB   build (cargo build -p ra-jit --release --features llvm) or test (the unit tests, as
-      harness/unittests.py runs them: root crates, then the fork's in vendor/rust-analyzer).
+      harness/unittests.py runs them: one cargo test of its crates).
 
 Blaze runs are each a fresh CI job: a fresh copy of the tree, an empty target dir, a new
 RA_JIT_HOME, and the store. Run inside `nix develop`."""
@@ -19,8 +19,8 @@ from pathlib import Path
 RB = Path("/root/rb")
 SRC, BIN, CTREE = RB / "src", RB / "bin", RB / "c"
 PATCH = {"a": None, "b": RB / "body.patch", "c": RB / "sig.patch"}
-ROOT_CRATES = ["hir-ty-codegen", "ra-jit-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "ra-jit"]
-FORK_CRATES = ["hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide"]
+CRATES = ["hir-ty-codegen", "ra-jit-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "ra-jit",
+          "hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics"]
 # Stack overflows of blaze-built hir-ide (selfhost lane's), skipped in both arms.
 SKIP = ["--", "--skip", "infer_std_crash_5", "--skip", "recursive_vars"]
 BOUND = 4 * 3600
@@ -54,8 +54,7 @@ def commands(tree, tool):
     if JOB == "build":
         return [(tree, [*tool, "build", "-p", "ra-jit", "--release", "--features", "llvm"] + (["--locked"] if tool == ["cargo"] else []))]
     test = [*tool, "test", "--release", "--no-fail-fast"]
-    return [(tree, [*test, *(f"-p{c}" for c in ROOT_CRATES), *SKIP]),
-            (tree / "vendor/rust-analyzer", [*test, *(f"-p{c}" for c in FORK_CRATES), *SKIP])]
+    return [(tree, [*test, *(f"-p{c}" for c in CRATES), *SKIP])]
 
 
 def du(p):

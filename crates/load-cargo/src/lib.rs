@@ -346,11 +346,18 @@ impl Loaded {
                                 let vfs_path = VfsPath::from(path.clone());
                                 let Some((file, _)) = vfs.file_id(&vfs_path) else {
                                     return Err(ProcMacroLoadingError::ProcMacroSrvError(
-                                        format!("the const macros of `{name}` ({path}) are not loaded")
-                                            .into(),
+                                        format!(
+                                            "the const macros of `{name}` ({path}) are not loaded"
+                                        )
+                                        .into(),
                                     ));
                                 };
-                                let text = String::from_utf8_lossy(vfs.file_contents(file));
+                                let text = std::fs::read_to_string(&path).map_err(|e| {
+                                    ProcMacroLoadingError::ProcMacroSrvError(
+                                        format!("the const macros of `{name}` ({path}): {e}")
+                                            .into(),
+                                    )
+                                })?;
                                 const_macros = true;
                                 let edition = crate_graph[crate_id].basic.edition;
                                 return Ok(ide_db::const_macro::load(file, &text, edition));

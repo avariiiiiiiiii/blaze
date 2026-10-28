@@ -609,12 +609,12 @@ pub fn why_lines(finished: &Finished, color: bool) -> Vec<String> {
             .iter()
             .enumerate()
             .map(|(at, it)| {
-                let what = it.of.as_deref().unwrap_or(it.step.whole());
                 let cores = match finished.cores.get(at).copied().flatten() {
-                    Some(busy) => format!(" ({busy:.1}/{} cores)", finished.cores_of),
+                    Some(busy) if at == 0 => format!(" ({busy:.1}/{} cores)", finished.cores_of),
+                    Some(busy) => format!(" ({busy:.1}/{})", finished.cores_of),
                     None => String::new(),
                 };
-                format!("{} {what} {}{cores}", it.step.word().to_lowercase(), took(it.took_ns))
+                format!("{} {}{cores}", short(it.step, it.of.as_deref()), took(it.took_ns))
             })
             .collect();
         lines.push(status("Took", &format!("{}: {}", took(took_ns), steps.join(", "))));
@@ -664,6 +664,17 @@ pub fn label(step: Step) -> &'static str {
         Step::Optimize => "optimize",
         Step::Store => "store",
         Step::Remote => "remote",
+    }
+}
+
+/// A step as the steps line names it, with what it is of: `codegen anim`, `std of build scripts`.
+fn short(step: Step, of: Option<&str>) -> String {
+    match of {
+        None => label(step).to_owned(),
+        Some(of) => match of.strip_prefix("the standard library ") {
+            Some(rest) => format!("{} {rest}", label(step)),
+            None => format!("{} {of}", label(step)),
+        },
     }
 }
 

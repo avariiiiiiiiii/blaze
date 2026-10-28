@@ -749,10 +749,12 @@ impl<'db> Evaluator<'db> {
         Ok(self.place_addr_and_ty_and_metadata(p, locals)?.1)
     }
 
-    /// Whether arithmetic of the body being evaluated panics when it overflows, which is
-    /// what the code compiled from the body does: a constant is what running it would give.
+    /// Whether arithmetic of the body being evaluated panics when it overflows. A function's
+    /// does what the code compiled from it does. The initializer of a constant, a static or a
+    /// discriminant always checks, as rustc builds it, whatever `-C overflow-checks` says.
     fn checks_overflow(&self, locals: &Locals<'db>) -> bool {
-        crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
+        !matches!(locals.body.owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
+            || crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
     }
 
     fn operand_ty(&self, o: &Operand, locals: &Locals<'db>) -> Result<'db, Ty<'db>> {

@@ -168,6 +168,21 @@ fn bit_op() {
 }
 
 #[test]
+fn overflow_in_a_constant() {
+    // The test crate has no `-C overflow-checks`: a constant's own arithmetic is checked
+    // regardless, and a `const fn`'s wraps, as rustc evaluates both.
+    let overflow = |op: &str| {
+        let op = format!("Overflow in {op}");
+        move |e: ConstEvalError<'_>| e == ConstEvalError::MirEvalError(MirEvalError::Panic(op))
+    };
+    check_fail(r#"const GOAL: u8 = { let x = 255u8; x + 1 };"#, overflow("Add"));
+    check_fail(r#"const GOAL: i8 = { let x = -128i8; -x };"#, overflow("Neg"));
+    check_fail(r#"const GOAL: u32 = { let x = 1u32; x << 32 };"#, overflow("Shl"));
+    check_fail(r#"const GOAL: u8 = { let x = 0u8; x - 1 };"#, overflow("Sub"));
+    check_number(r#"const fn add(a: u8, b: u8) -> u8 { a + b } const GOAL: u8 = add(255, 1);"#, 0);
+}
+
+#[test]
 fn floating_point() {
     check_number(
         r#"const GOAL: f128 = 2.0 + 3.0 * 5.5 - 8.;"#,

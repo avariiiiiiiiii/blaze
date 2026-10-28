@@ -519,10 +519,11 @@ pub fn sysroot_of() -> Option<PathBuf> {
 }
 
 /// What of `reads`, the files a run of the script `real` in `cwd` read, its kept run is kept
-/// by. A file of the script's build, the toolchain (`sysroot`) or blaze is left out: the first key has
-/// the script and the toolchain, and the store keeps nothing across builds of blaze. A
-/// directory outside the package counts only as one: a program reaches those on its way to
-/// others (git, the loader, a search on PATH).
+/// by. A file of the script's build, the toolchain (`sysroot`), blaze or its store is left out:
+/// the first key has the script and the toolchain, the store keeps nothing across builds of
+/// blaze, and what blaze as the script's rustc reads of the store (the standard library's
+/// names) is what it would make without it. A directory outside the package counts only as
+/// one: a program reaches those on its way to others (git, the loader, a search on PATH).
 fn kept_reads(
     reads: Vec<String>,
     real: &Path,
@@ -531,7 +532,8 @@ fn kept_reads(
 ) -> Vec<String> {
     let blaze = std::env::current_exe().ok().and_then(|it| Some(it.parent()?.to_owned()));
     let script = real.parent().map(Path::to_owned);
-    let apart: Vec<PathBuf> = [sysroot, blaze, script].into_iter().flatten().collect();
+    let store = super::daemon::store();
+    let apart: Vec<PathBuf> = [sysroot, blaze, script, store].into_iter().flatten().collect();
     reads
         .into_iter()
         .filter(|it| !apart.iter().any(|dir| Path::new(it).starts_with(dir)))

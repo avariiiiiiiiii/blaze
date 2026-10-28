@@ -75,10 +75,10 @@ jobs:
   tests:
     name: tests
     runs-on: ${{ inputs.os }}
-    # A store blaze's release has not compiled into yet takes over an hour on macOS's 7 GB
-    # runner (the 16-minute step of 4-cpu Linux had not ended at 48): long enough for that one
-    # run to finish and push, which the runs after it then pull. Not in the merge gate.
-    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 60 }}
+    # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
+    # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
+    # enough for that one run to finish and push, which the runs after it then pull.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 90 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
     env:
@@ -86,10 +86,6 @@ jobs:
       # main's store; main runs every test, which records each pass for the pull requests after
       # it, and says of each that passed before whether it passed again.
       BLAZE_TESTS: ${{ github.ref == 'refs/heads/main' && 'verify' || 'affected' }}
-      # As WebAssembly, the derives of hir-ty's type folding do not expand, and blaze refuses
-      # 196 of its functions (https://github.com/indexable-inc/blaze/issues/828); natively,
-      # they do. Take it out with that fix.
-      BLAZE_PROC_MACRO_WASM: "0"
     steps:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
@@ -128,12 +124,17 @@ jobs:
     name: build
     runs-on: ${{ inputs.os }}
     # As in the tests job.
-    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 60 }}
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 90 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
     env:
-      # As in the tests job (https://github.com/indexable-inc/blaze/issues/828).
-      BLAZE_PROC_MACRO_WASM: "0"
+      # The `fast` and `full` tiers (the train) build with cargo, as release.yaml does: their
+      # harnesses and benches time and test the blaze users get, and the code blaze compiles
+      # for itself runs about ten times slower than rustc's, since it inlines no function into
+      # another yet (https://github.com/indexable-inc/blaze/issues/899; the smoke corpus took
+      # 15 min instead of 74 s, unit tests 60 s instead of 5). The merge gate and main build
+      # with blaze.
+      BLAZE: ${{ !startsWith(inputs.os, 'windows') && inputs.tier != 'fast' && inputs.tier != 'full' }}
     outputs:
       parts: ${{ steps.parts.outputs.parts }}
     steps:
@@ -157,9 +158,13 @@ jobs:
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |
-          sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
-          export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
-          cargo build -p blaze-engine --release --features llvm --locked
+          if [ "$RUNNER_OS" = Windows ]; then
+            sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
+            export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
+            cargo build -p blaze-engine --release --features llvm --locked
+          else
+            nix develop --command cargo build -p blaze-engine --release --features llvm --locked
+          fi
       - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
         run: blaze stop
       - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
@@ -392,7 +397,9 @@ jobs:
     if: inputs.smoke
     needs: build
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 15
+    # 74 s with a blaze rustc built; about 17 min with the one blaze builds in the merge gate and
+    # on main (https://github.com/indexable-inc/blaze/issues/899, as in the build job).
+    timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 35 }}
     steps:
       - uses: actions/checkout@v7
       # With Nix: the build's programs ask for the dev shell's glibc, from the Nix store.

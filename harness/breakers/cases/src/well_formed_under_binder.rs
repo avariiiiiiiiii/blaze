@@ -1,7 +1,7 @@
 //! tests/ui/regions/regions-relate-bound-regions-on-closures-to-inference-variables.rs: a
 //! struct with a bound between its lifetimes, named under a `for<'b>`. What makes the struct
 //! well formed then speaks of `'b`, which means nothing outside the `for`; rustc passes over
-//! such a type, and ra-jit, asking for the bound to hold, stopped with an index out of bounds.
+//! such a type, and blaze, asking for the bound to hold, stopped with an index out of bounds.
 
 struct Context<'tcx> {
     numbers: &'tcx Vec<isize>,

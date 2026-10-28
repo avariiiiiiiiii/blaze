@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""runbench.py: how fast the programs ra-jit's LLVM builds run, against rustc's own builds.
+"""runbench.py: how fast the programs blaze's LLVM builds run, against rustc's own builds.
 
-usage: runbench.py [NAME...] [--rounds 5] [--builds release,checked,ra-jit] [--variant ...]
+usage: runbench.py [NAME...] [--rounds 5] [--builds release,checked,blaze] [--variant ...]
                    [--json out.json] [--table out.md]
 
 Every program is built each of these ways, then each of its benchmarks is run `--rounds`
@@ -9,14 +9,14 @@ times, the builds taking turns, and reported by its median wall time:
 
   release   `cargo build --release`
   checked   the same with `-C overflow-checks=on -C debug-assertions=on`: release optimization
-            with what the dev profile checks, which is what ra-jit's code of a dev build has
+            with what the dev profile checks, which is what blaze's code of a dev build has
             to keep
-  ra-jit    every crate linked into the program compiled by ra-jit (`apps.py`'s "alone"
+  blaze    every crate linked into the program compiled by blaze (`apps.py`'s "alone"
             build) with the release profile's semantics (`--release`: no overflow checks, no
             debug assertions), LLVM at -O3 (`BLAZE_BACKEND=llvm BLAZE_OPT=3`)
 
-`--variant NAME:VAR=VALUE,...` adds an ra-jit build with those variables set too (say
-`--variant ra-jit-mir2:BLAZE_MIR_OPT=2`). Before timing, each benchmark is run once with
+`--variant NAME:VAR=VALUE,...` adds an blaze build with those variables set too (say
+`--variant blaze-mir2:BLAZE_MIR_OPT=2`). Before timing, each benchmark is run once with
 every build and its exit status, stdout and stderr (scrubbed as apps.json says) have to be
 release's; a build that differs is reported and not timed.
 
@@ -26,15 +26,15 @@ numeric, jsonrt, ripgrep, fd, tokei, eza, bat.
 
 Memory is kept beside the times (memory.py, docs/benchmarks.md "Memory and disk"): each run's
 peak resident memory as the kernel kept it (`wait4`), the size of each program, and what each
-build held: `build_largest_mb`, the largest one process (rustc, ra-jit, the linker), exact, and
+build held: `build_largest_mb`, the largest one process (rustc, blaze, the linker), exact, and
 `build_peak_mb`, the most the build's processes held at once, sampled.
 
 Every build is cold, its target directory removed first, and `build_s` is the whole of it: for
-ra-jit, cargo's pass with ra-jit standing in for rustc (build scripts, proc macros, the
-libraries' metadata; `cargo_s`), ra-jit's compile (`ra_jit_s`) and the link (`link_s`).
+blaze, cargo's pass with blaze standing in for rustc (build scripts, proc macros, the
+libraries' metadata; `cargo_s`), blaze's compile (`blaze_s`) and the link (`link_s`).
 
-The ratio is ra-jit's time over release's (1.00 is as fast, 1.10 is 10% slower), with the
-geometric mean over the benchmarks. BLAZE_BIN names the ra-jit used; it needs `--features
+The ratio is blaze's time over release's (1.00 is as fast, 1.10 is 10% slower), with the
+geometric mean over the benchmarks. BLAZE_BIN names the blaze used; it needs `--features
 llvm`. Python 3.11+, stdlib only.
 """
 import argparse, json, math, os, shlex, shutil, statistics, subprocess, sys, time
@@ -82,7 +82,7 @@ def workspace(name, spec):
 
 def cargo_release(ws, spec, label, rustflags):
     target = os.path.join(ws, f"target-{label}")
-    # Cold, as ra-jit's build is: the build time is published beside it.
+    # Cold, as blaze's build is: the build time is published beside it.
     shutil.rmtree(target, ignore_errors=True)
     flags = f"--cap-lints allow {apps.own_flags(spec)} {rustflags}"
     env = {**os.environ, "CARGO_TARGET_DIR": target, "RUSTFLAGS": " ".join(flags.split())}
@@ -92,37 +92,37 @@ def cargo_release(ws, spec, label, rustflags):
     took, ran, used = memory.run(argv, ws, env)
     if ran.returncode != 0:
         raise SystemExit(f"`{shlex.join(argv)}` failed:\n{(ran.stdout + ran.stderr)[-3000:]}")
-    # Beside ra-jit's, as a program may look for files next to itself (helix its `runtime`).
+    # Beside blaze's, as a program may look for files next to itself (helix its `runtime`).
     kept = os.path.join(ws, f"bin-{label}")
     shutil.copy2(os.path.join(target, "release", spec.get("bin", spec["package"])), kept)
     return kept, took, used
 
 
-def ra_jit_release(ws, spec, label, extra):
-    """ra-jit's program of every crate, with the release profile. Returns (binary, seconds,
+def blaze_release(ws, spec, label, extra):
+    """blaze's program of every crate, with the release profile. Returns (binary, seconds,
     summary, fixture)."""
     saved = {var: os.environ.get(var) for var in OWN_VARS}
     try:
         for var in OWN_VARS:
             os.environ.pop(var, None)
-        # Not apps.FLAGS: its `-C link-dead-code` keeps the symbols of rustc's code for ra-jit's to
+        # Not apps.FLAGS: its `-C link-dead-code` keeps the symbols of rustc's code for blaze's to
         # be linked ahead of, and rustc builds none here. It would link without `-dead_strip` or
         # `--gc-sections`, as the release build does not, and one object of every function then
         # has the calls of code no build keeps (bun's of Windows' API on macOS) to resolve.
         flags = f"--cap-lints allow {apps.own_flags(spec)}"
         os.environ.update({**BLAZE_ENV, **extra, "RUSTFLAGS": flags.strip()})
         fx = apps.App(ws, {**spec, "cargo_args": [*spec.get("cargo_args", []), "--release"]}, alone=True)
-        fx.ra_jit_args = ["--release"]
-        # Cold: cargo's pass with ra-jit standing in for rustc (build scripts, proc macros,
+        fx.blaze_args = ["--release"]
+        # Cold: cargo's pass with blaze standing in for rustc (build scripts, proc macros,
         # the libraries' metadata) is part of the build, as rustc's is of cargo's.
         shutil.rmtree(os.path.join(ws, "target-alone"), ignore_errors=True)
         fx.rustc_build()
-        fx.ra_jit_build()
+        fx.blaze_build()
         kept = os.path.join(ws, f"bin-{label}")
         shutil.copy2(fx.binary, kept)
-        parts = {"cargo_s": round(fx.cargo_secs, 1), "ra_jit_s": round(fx.ra_jit_secs, 1),
+        parts = {"cargo_s": round(fx.cargo_secs, 1), "blaze_s": round(fx.blaze_secs, 1),
                  "link_s": round(fx.link_secs, 1)}
-        return kept, fx.cargo_secs + fx.ra_jit_secs + fx.link_secs, {**fx.summary(), "parts": parts}, fx
+        return kept, fx.cargo_secs + fx.blaze_secs + fx.link_secs, {**fx.summary(), "parts": parts}, fx
     finally:
         for var, value in saved.items():
             if value is None:
@@ -131,10 +131,10 @@ def ra_jit_release(ws, spec, label, extra):
                 os.environ[var] = value
 
 
-def ra_jit_measured(ws, spec, label, extra):
-    """`ra_jit_release` in a process of its own, so that the memory of what it ran (cargo with
-    ra-jit's stand-ins, ra-jit, the linker) is its alone: (binary, seconds, summary, memory)."""
-    (binary, secs, summary), used = memory.in_child(lambda: ra_jit_release(ws, spec, label, extra)[:3])
+def blaze_measured(ws, spec, label, extra):
+    """`blaze_release` in a process of its own, so that the memory of what it ran (cargo with
+    blaze's stand-ins, blaze, the linker) is its alone: (binary, seconds, summary, memory)."""
+    (binary, secs, summary), used = memory.in_child(lambda: blaze_release(ws, spec, label, extra)[:3])
     return binary, secs, summary, used
 
 
@@ -175,7 +175,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
     ap.add_argument("--rounds", type=int, default=5)
-    ap.add_argument("--builds", default="release,checked,ra-jit")
+    ap.add_argument("--builds", default="release,checked,blaze")
     ap.add_argument("--variant", action="append", default=[])
     ap.add_argument("--json")
     ap.add_argument("--table")
@@ -206,8 +206,8 @@ def main():
                         ws, spec, build, "-C overflow-checks=on -C debug-assertions=on")
                     info[build] = {"build_s": round(secs, 1)}
                 else:
-                    extra = {} if build == "ra-jit" else variants[build]
-                    binary, secs, summary, used = ra_jit_measured(ws, spec, build, extra)
+                    extra = {} if build == "blaze" else variants[build]
+                    binary, secs, summary, used = blaze_measured(ws, spec, build, extra)
                     programs[build] = binary
                     info[build] = {"build_s": round(secs, 1), **summary["parts"], "compiled": summary["compiled"],
                                    "left": summary["left"], "reasons": summary["reasons"]}
@@ -215,7 +215,7 @@ def main():
                 info[build].update(build_peak_mb=used["peak_mb"], build_largest_mb=used["largest_mb"],
                                    size_mb=round(os.path.getsize(programs[build]) / 1e6, 2))
                 print(f"  built {build} in {info[build]['build_s']} s"
-                      + (f": {info[build]['compiled']} functions by ra-jit, {info[build]['left']} left"
+                      + (f": {info[build]['compiled']} functions by blaze, {info[build]['left']} left"
                          if "compiled" in info[build] else ""), flush=True)
             except SystemExit as failed:
                 info[build] = {"error": str(failed)[-2000:]}

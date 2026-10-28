@@ -19,7 +19,7 @@ FAR = 2300 << 20
 AARCH64 = (TARGET or host()).startswith("aarch64")
 
 
-def far_object(path, size, name=b".ra_jit_far"):
+def far_object(path, size, name=b".blaze_far"):
     """A relocatable object with one section `name` of `size` zeros that is not loaded, written
     sparse."""
     names = b"\0" + name + b"\0.shstrtab\0"
@@ -81,7 +81,7 @@ STEPS = [
 if __name__ == "__main__":
     if sys.platform != "linux":
         raise SystemExit("farfile.py: an ELF program, on Linux")
-    far = os.path.join(tempfile.mkdtemp(prefix="ra-jit-farfile-"), "far.o")
+    far = os.path.join(tempfile.mkdtemp(prefix="blaze-farfile-"), "far.o")
     far_object(far, FAR)
     toml = """[package]
 name = "sinc"

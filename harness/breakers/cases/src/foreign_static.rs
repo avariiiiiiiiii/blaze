@@ -1,5 +1,5 @@
 //! tests/ui/abi/statics/static-mut-foreign.rs: a static declared in an `extern` block is
-//! defined by a library the program links, under the name it is declared with. ra-jit looked
+//! defined by a library the program links, under the name it is declared with. blaze looked
 //! for it among the symbols rustc made, found none and refused the function.
 
 #[cfg(target_os = "linux")]

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""stdcount.py: how many of the standard library's functions a build of ra-jit refuses, and
+"""stdcount.py: how many of the standard library's functions a build of blaze refuses, and
 whether that went up against another build. A toolchain bump must not make more of std rustc's
 (docs/toolchain.md, "The daily bump").
 
-    stdcount.py --bin ra-jit --toolchain nightly-YYYY-MM-DD [--json out.json]
-    stdcount.py --bin new/ra-jit --toolchain nightly-B --base old/ra-jit --base-toolchain nightly-A
+    stdcount.py --bin blaze-engine --toolchain nightly-YYYY-MM-DD [--json out.json]
+    stdcount.py --bin new/blaze --toolchain nightly-B --base old/blaze --base-toolchain nightly-A
 
 Each build compiles hello world's whole program with an empty store and BLAZE_STD_FROM=off, so
 the standard library of its toolchain's rust-src is compiled in the process, and reads the line

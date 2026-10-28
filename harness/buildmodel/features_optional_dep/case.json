@@ -10,7 +10,7 @@
     "--features",
     "with-opt"
   ],
-  "ra-jit": [
+  "blaze": [
     "--features",
     "with-opt"
   ]

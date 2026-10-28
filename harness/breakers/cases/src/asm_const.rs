@@ -1,6 +1,6 @@
 //! lzma-rust2's range decoder (through blaze's own downloads) gives `asm!` an unsuffixed
 //! literal, `const 0x0100_0000`, and a constant of the crate, `const SHIFT_BITS`, in a method
-//! of a generic type: ra-jit refused the `asm!` as "a constant that is not a literal", and
+//! of a generic type: blaze refused the `asm!` as "a constant that is not a literal", and
 //! the whole build of blaze with it.
 
 #[cfg(target_arch = "x86_64")]

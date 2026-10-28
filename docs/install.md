@@ -10,7 +10,7 @@ Then, in a project of yours:
 blaze run
 ```
 
-Change a function and run `blaze run` again: the `Finished` line now says `[ra-jit]`
+Change a function and run `blaze run` again: the `Finished` line now says `[blaze]`
 (blaze's engine), which means blaze built it instead of cargo. What to do next:
 [usage.md](usage.md).
 
@@ -82,7 +82,7 @@ nix profile install github:indexable-inc/blaze
 ```
 
 Or try it without installing anything: in a project, `nix run github:indexable-inc/blaze -- build`
-is `cargo blaze build`. In a flake, take the package from the input:
+is `blaze build`. In a flake, take the package from the input:
 
 ```nix
 {

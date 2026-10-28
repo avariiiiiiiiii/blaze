@@ -1,7 +1,7 @@
 //! Found in blaze's self-test: salsa's `#[salsa::tracked]` hands the type of an impl on to
 //! `stringify!` to name its queries, and hir-def's incremental tests compare the names of the
 //! queries that ran. rustc gives the tokens that come out of a proc macro the spacing the macro
-//! said, `Alone` for all but a joint punctuation, and spells `AstId < ast :: Macro >`; ra-jit
+//! said, `Alone` for all but a joint punctuation, and spells `AstId < ast :: Macro >`; blaze
 //! looked them up in the source they came from and spelled `AstId<ast::Macro>`.
 
 #[test]

@@ -1,6 +1,6 @@
 # The borrow checker's time on the bench apps, before and after `is_copy` and normalizing are queries and dominators are semi-NCA
 
-Made by `harness/borrowck_speed.py --jobs 1` (one `ra-jit borrowck --project DIR --timings`
+Made by `harness/borrowck_speed.py --jobs 1` (one `blaze-engine borrowck --project DIR --timings`
 per app, see docs/borrowck.md "Speed"), in an arm64 ix VM (32 vCPUs, 32 GiB), inside
 `nix develop`. `before.*` is main 5b58cc84; `after.*` is main 5b58cc84 with whether a type is
 `Copy` and normalizing canonical salsa queries, and dominators by semi-NCA. Each `.json` is

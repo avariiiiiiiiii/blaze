@@ -145,4 +145,4 @@ warning: `ripgrep` (manifest) generated 1 warning
 warning: ripgrep@15.1.0: output from `git rev-parse` is empty, so skipping embedding of commit hash
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.03s
      Waiting for blaze to load the workspace
-    Finished `dev` profile [ra-jit] target(s) in 24.86s
+    Finished `dev` profile [blaze] target(s) in 24.86s

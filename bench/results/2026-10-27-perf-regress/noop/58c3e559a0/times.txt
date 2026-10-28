@@ -3,9 +3,9 @@ noop 55ms
 noop 54ms
 noop 54ms
 noop 53ms
-cargo-ra-jit direct 15134ms
-cargo-ra-jit direct 209ms
-cargo-ra-jit direct 89ms
+blaze direct 15134ms
+blaze direct 209ms
+blaze direct 89ms
 rustup cargo --version 
 rustup cargo --version 
 rustup cargo --version 

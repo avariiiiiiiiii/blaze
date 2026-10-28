@@ -1,6 +1,6 @@
 //! The source editor on the right of the window: line-number gutter, caret-row and
 //! matching-bracket highlight, Rust highlighting, Tab as four spaces. Every edit goes to the
-//! ra-jit daemon as text, the way an editor tells a language server (`ra_jit_live::edit`):
+//! blaze-engine daemon as text, the way an editor tells a language server (`blaze_live::edit`):
 //! the daemon builds it from memory and the window applies the patch as it arrives. The file
 //! is written after that, for the edit to stay; nothing waits for it.
 
@@ -75,7 +75,7 @@ fn send_as_typed(file: PathBuf, shared: Shared) {
 
 #[cfg(any(unix, all(windows, target_arch = "x86_64")))]
 fn send(file: &Path, text: &str) -> Result<String, String> {
-    ra_jit_live::edit(file, text)
+    blaze_live::edit(file, text)
 }
 
 #[cfg(not(any(unix, all(windows, target_arch = "x86_64"))))]

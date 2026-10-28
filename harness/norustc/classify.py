@@ -41,12 +41,12 @@ def subcommand(args):
 def who(pc):
     """Who a parent's command line says it is."""
     first = pc.split(" ")[0]
-    if "rustc-wrapper" in pc or "ra-jit-rustc" in pc:
+    if "rustc-wrapper" in pc or "blaze-rustc" in pc:
         return "wrapper"
     if first.endswith("/rustdoc") or first.endswith("/rustdoc.real"):
         return "rustdoc"
     if first.endswith("/blaze-engine") and " --test " in pc and "--crate-name" in pc:
-        return "ra-jit as rustdoc"
+        return "blaze as rustdoc"
     if "build-script" in first or "/build/" in first:
         return "build script"
     if "blaze-engine cargo" in pc or first.endswith("/blaze") or first == "blaze":
@@ -54,7 +54,7 @@ def who(pc):
     if "--socket" in pc or "--spare" in pc or "blaze-engine daemon" in pc:
         return "worker"
     if "/blaze-engine " in pc or pc.startswith("blaze-engine"):
-        return "ra-jit"
+        return "blaze"
     if "cargo" in pc.split(" ")[0]:
         return "cargo"
     if "count.py" in pc or "taskset" in pc:
@@ -67,8 +67,8 @@ def kind(r, cargos):
     if r["tool"] == "cargo":
         sub = subcommand(a)
         starter = who(pc)
-        if sub == "ra-jit":
-            return "cargo ra-jit (typed)"
+        if sub == "blaze":
+            return "blaze (typed)"
         extra = ""
         for flag in ("--unit-graph", "--compile-time-deps", "--no-deps", "--doc"):
             if flag in a:
@@ -90,10 +90,10 @@ def kind(r, cargos):
             via = f" under `cargo {subcommand(c['args'])}{flags}` from {who(c['pc'])}"
     if parent == "rustdoc":
         return "rustc compiles doctest examples (rustdoc's)"
-    if parent == "ra-jit as rustdoc" and "-" in a:
+    if parent == "blaze as rustdoc" and "-" in a:
         if "--emit=metadata" in a:
-            return "rustc checks a doctest example (ra-jit as rustdoc)"
-        return "rustc links a doctest probe or example (ra-jit as rustdoc)"
+            return "rustc checks a doctest example (blaze as rustdoc)"
+        return "rustc links a doctest probe or example (blaze as rustdoc)"
     if "-vV" in a or "--version" in a or "-V" in a or (any(x.startswith("--print") for x in a) and not name):
         prints = sorted({(value([x], "--print") or (a[a.index(x) + 1] if x == "--print" and a.index(x) + 1 < len(a) else "")).split("=")[0]
                          for x in a if x.startswith("--print")})
@@ -101,18 +101,18 @@ def kind(r, cargos):
         return f"rustc query {q} (from {parent}{via})"
     if name == "___":
         return f"rustc query target info (from {parent}{via})"
-    if name == "ra_jit_asm":
+    if name == "blaze_asm":
         return "rustc assembles asm!"
     if parent == "build script":
         return "rustc probe by a build script"
-    if "-" in a and parent in ("ra-jit", "client", "worker") or (parent == "ra-jit" and "--crate-type=bin" in a):
+    if "-" in a and parent in ("blaze", "client", "worker") or (parent == "blaze" and "--crate-type=bin" in a):
         return "rustc compiles a doctest example" + (" (metadata only)" if "--emit=metadata" in a else "")
     if name.startswith("build_script_"):
         return f"rustc compiles a build script{via}"
     if "proc-macro" in ctype:
         return f"rustc compiles a proc macro{via}"
     src = next((x for x in a if x.endswith(".rs")), "")
-    if src.endswith(".ra-jit.rs"):
+    if src.endswith(".blaze.rs"):
         return f"rustc builds a stand-in{via}"
     if emit == "dep-info":
         return f"rustc writes dep-info for a daemon program{via}"

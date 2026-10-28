@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""wasmabi.py: the wasm signatures ra-jit gives `extern "C"` functions are rustc's.
+"""wasmabi.py: the wasm signatures blaze gives `extern "C"` functions are rustc's.
 
 What calls a wasm module from outside (wasm-bindgen's glue, a host) goes by the types of its
 functions, so the C ABI of wasm is the module's interface. Builds `harness/wasmabi` with rustc
-and with ra-jit for each wasm target and compares the type of every function the two objects
+and with blaze for each wasm target and compares the type of every function the two objects
 name, those they define and those they import.
 
 usage: wasmabi.py [target ...]   (default: wasm32-unknown-unknown wasm32-wasip1)
 """
 import os, re, subprocess, sys, tempfile
-from difftest import RA_JIT
+from difftest import BLAZE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "wasmabi")
@@ -128,15 +128,15 @@ def function_symbols(data, at):
 
 
 def check(target, work):
-    theirs, ours = os.path.join(work, f"{target}.rustc.o"), os.path.join(work, f"{target}.ra-jit.o")
+    theirs, ours = os.path.join(work, f"{target}.rustc.o"), os.path.join(work, f"{target}.blaze.o")
     subprocess.run(["rustc", "--edition", "2024", "--crate-type", "lib", "--crate-name", "wasmabi", "-O",
                     "--emit", f"obj={theirs}", "--target", target, os.path.join(FIXTURE, "src/lib.rs")],
                    check=True)
     symbols = [x for rlib in sysroot_rlibs(target) for x in ("--symbols", rlib)]
-    run = subprocess.run([RA_JIT, FIXTURE, "--crate", "wasmabi", "--out", ours, "--target", target, *symbols],
+    run = subprocess.run([BLAZE, FIXTURE, "--crate", "wasmabi", "--out", ours, "--target", target, *symbols],
                          capture_output=True, text=True)
     if run.returncode != 0:
-        print(f"{target}: ra-jit failed\n{run.stderr[-3000:]}")
+        print(f"{target}: blaze failed\n{run.stderr[-3000:]}")
         return False
     # The fixture's functions, not what either compiler calls of its own, as `memcpy`.
     source = open(os.path.join(FIXTURE, "src/lib.rs")).read()
@@ -145,7 +145,7 @@ def check(target, work):
     got = signatures(ours)
     wrong = [n for n in sorted(want) if got.get(n) != want[n]]
     for n in wrong:
-        print(f"  {target} {n}: rustc {want[n]}, ra-jit {got.get(n)}")
+        print(f"  {target} {n}: rustc {want[n]}, blaze {got.get(n)}")
     print(f"{target}: {len(want) - len(wrong)} of {len(want)} functions typed as rustc's")
     return not wrong
 

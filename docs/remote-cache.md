@@ -17,7 +17,7 @@ tests), which goes into the merge gate once the gate builds with blaze and a rel
 client. The client's use of `/has`, `/get`, `/put` and the index needs #283. On blaze's own store
 (`bench/remote-cache/selfbuild.tsv`, ix arm64 VM in us-west-2), a pull of 121 packs, 237.8 MB, took
 8.6 s (26.5 MiB/s), against 51 to 55 s for cargo's no-edit build with main's target dir. The build
-from a warm store is not measured yet: a cold `cargo blaze build -p ra-jit` of blaze needs more than
+from a warm store is not measured yet: a cold `blaze build -p blaze-engine` of blaze needs more than
 16 GB (OOM-killed at 14.8 GB on 4 CPUs; 28.3 GB peak where it finished, in 389.6 s), so main's
 store could not be made in the VMs that could be placed that day, and the gate's 16 GB runners hit
 the same limit on a cold store. The Worker is TypeScript rather than workers-rs: its tests run on real R2 and KV bindings
@@ -128,7 +128,7 @@ Non-goals:
 
 ## What exists today
 
-From [cache.md](cache.md) and `crates/ra-jit/src/remote.rs` (**read**):
+From [cache.md](cache.md) and `crates/blaze-engine/src/remote.rs` (**read**):
 
 - The remote is a directory, `s3://` (the AWS SDK) or a read-only `https://` address. It holds
   `packs/<sha256>.pack` (or `.pack.zst`), `keys/<sha256>` (the keys in one pack),
@@ -144,8 +144,8 @@ From [cache.md](cache.md) and `crates/ra-jit/src/remote.rs` (**read**):
 - No workflow in `.github/workflows` sets `BLAZE_REMOTE` (**read**). CI fills no remote today.
 
 The identity every store key is hashed with is `Identity(FORMAT, build, toolchain)`
-(`crates/ra-jit-store/src/lib.rs`, **read**). `build` is a hash of every source file of the
-workspace (`crates/ra-jit/build.rs`), or the executable's bytes for a blaze built elsewhere. So
+(`crates/blaze-store/src/lib.rs`, **read**). `build` is a hash of every source file of the
+workspace (`crates/blaze-engine/build.rs`), or the executable's bytes for a blaze built elsewhere. So
 any commit that touches a crate of blaze, a doc-comment fix in the CLI included, gives a new
 identity and an empty cache.
 
@@ -887,7 +887,7 @@ is a different matter: that is a bug or an attack, and must be seen and fixed.
 
 | failure | what blaze does |
 |---|---|
-| a tier cannot be reached (DNS, connect, timeout, a 5xx from the gateway after retries) | locally: the build goes on without that tier, and **every** build's `Finished` line says so (`[ra-jit, remote down: cache.<domain>: timed out]`), not one line in a log. With `BLAZE_REMOTE_REQUIRED=1`, which blaze's own CI sets, it is an error and the job fails |
+| a tier cannot be reached (DNS, connect, timeout, a 5xx from the gateway after retries) | locally: the build goes on without that tier, and **every** build's `Finished` line says so (`[blaze, remote down: cache.<domain>: timed out]`), not one line in a log. With `BLAZE_REMOTE_REQUIRED=1`, which blaze's own CI sets, it is an error and the job fails |
 | a blob that does not hash to its name | error, naming the object, the tier and the head; after one retry that asks the gateway to bypass its edge cache. Today the build compiles those functions instead; that changes to an error |
 | a head or key list with a bad signature, an unknown, revoked or expired key | error, naming the head and the key |
 | a head with an older turn than this machine has seen | the edge cache may hold a head for 60 s at a location the write did not purge, so: fetch it again asking the gateway to bypass the edge cache. If that answer is still older, error (a rollback); if it is not, go on with it. A key list older than the release's minimum turn or the remembered one is an error at once |
@@ -1059,8 +1059,8 @@ under `Sim`.
 | `blaze-gateway-core` | the gateway as state machines: token to tenant and namespaces, the access rule, `/put` checking, index-write checks, refresh planning, cache keys, meter events. Pushes its own tagged effects (`Store`: `get` with range, `head`, `put` with conditions, `copy_onto_itself`; `Locations` queries; `Meter` events) and consumes their completions, in `blaze-core`'s tag-and-completion shape | `blaze-gateway-api`, `blaze-index`, `blaze-pack`, `hmac`, `hkdf`; `blaze-core` for its tests only (`sim::Rng`, the `Peer` adapter) |
 | `blaze-gateway` | the Worker: the driver of `blaze-gateway-core`'s effects, over the R2 binding, D1, KV, the Cache API, the Rate Limiting binding and Analytics Engine, and the S3 `CopyObject` signed by `rusty-s3`. Built for `wasm32-unknown-unknown` with workers-rs | `blaze-gateway-core`, `worker` |
 | `blaze-gateway-server` | the same core natively, on a `blaze-core` driver: its `Store` is files through `Append`, `Sync` and `Read`, its locations an append-only table, its listener `Listen` and `Accept` effects (`IORING_OP_ACCEPT` on the ring) and `blaze-http`'s server side. For CI's end-to-end check and self-hosting behind a TLS terminator | `blaze-gateway-core`, `blaze-core`, `blaze-http` |
-| `ra-jit` (`remote.rs`, `keeper.rs`) | runs a `Fetch` at daemon start and a `Push` when told, on the daemon's driver (until the daemon runs one, a `Threads` driver of its own); owns policy (tenants, env vars, status lines) | `blaze-remote-proto`, `blaze-core` |
-| `ra-jit-store` | reads and writes format 4 packs through `blaze-pack` | `blaze-pack` |
+| `blaze` (`remote.rs`, `keeper.rs`) | runs a `Fetch` at daemon start and a `Push` when told, on the daemon's driver (until the daemon runs one, a `Threads` driver of its own); owns policy (tenants, env vars, status lines) | `blaze-remote-proto`, `blaze-core` |
+| `blaze-store` | reads and writes format 4 packs through `blaze-pack` | `blaze-pack` |
 
 Once #283 lands the order is: `blaze-core` gets the socket effects in its own change (with
 `Sim`'s `Peer` and tests in the shape of its existing ones), `blaze-vfs` switches its hash to
@@ -1114,7 +1114,7 @@ Ranked by what each gives. Each slice lands on its own and is measured.
    `blaze` write token in `cache-writer`. v0 serves today's layout under `v3/`: `GET` of packs,
    key lists and manifests for anyone, and `PUT` for the write token, where it hashes each pack
    and key list against its name. A new `Place::Gateway` in `remote.rs` reads and writes it; CI
-   on main pushes with today's `ra-jit cache push`, and every CI run reads. Metering from the
+   on main pushes with today's `blaze-engine cache push`, and every CI run reads. Metering from the
    first request. First run of a real object store; measures one stream and 16 through a Worker
    on our runners, and the latencies of [Cost and latency](#cost-and-latency). No format change,
    and no expiry: `v3/` is removed by hand once slice 4 has replaced it.

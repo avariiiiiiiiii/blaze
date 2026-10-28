@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""storebuilds.py: a store one build of ra-jit wrote serves another build of the same sources
+"""storebuilds.py: a store one build of blaze wrote serves another build of the same sources
 (#105).
 
-The store keyed what it kept by the bytes of the ra-jit executable that wrote it, so a rebuild
+The store keyed what it kept by the bytes of the blaze executable that wrote it, so a rebuild
 of the same commit, on another machine or after a `touch`, started from an empty store, and a
-CI runner that builds ra-jit for each commit reused nothing. It keys by what the build was made
+CI runner that builds blaze for each commit reused nothing. It keys by what the build was made
 from now: a hash of the workspace's sources, its features, target and whether debug
-assertions are on, which `crates/ra-jit/build.rs` takes.
+assertions are on, which `crates/blaze-engine/build.rs` takes.
 
 A daemon of BLAZE_BIN builds the stress workspace into an empty store and ends. A copy of the
 executable with other bytes, which is another build of the same sources, starts a daemon on
@@ -44,7 +44,7 @@ def another_build(exe, at):
 
 
 def main():
-    work, store = scratch("ra-jit-storebuilds-"), scratch("ra-jit-storebuilds-store-")
+    work, store = scratch("blaze-storebuilds-"), scratch("blaze-storebuilds-store-")
     daemons, passed = [], False
     try:
         checkout = Checkout(work)
@@ -56,7 +56,7 @@ def main():
         if added == 0:
             raise SystemExit(f"FAIL: the first daemon added nothing to the store: {first.log_path}")
 
-        storelib.RA_JIT = another_build(storelib.RA_JIT, os.path.join(work, os.path.basename(storelib.RA_JIT)))
+        storelib.BLAZE = another_build(storelib.BLAZE, os.path.join(work, os.path.basename(storelib.BLAZE)))
         second = Daemon(checkout, store, name="second")
         daemons.append(second)
         checkout.check(second, "another build's daemon")

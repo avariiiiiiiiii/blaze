@@ -1,7 +1,7 @@
 """storelib.py: a checkout of the stress workspace under a daemon that keeps a store.
 
 What storekills.py, storecorrupts.py, storefull.py and storeshared.py have in common: the
-checkout, cargo's build of it to compare with, the daemon and its store, and `ra-jit cache`
+checkout, cargo's build of it to compare with, the daemon and its store, and `blaze-engine cache`
 on that store.
 """
 import os, shutil, subprocess, sys, tempfile, time
@@ -9,7 +9,7 @@ import os, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 CRATES = ["sapp", "sbase", "smid"]
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -23,14 +23,14 @@ def scratch(prefix):
 
 
 def cache(store, *args, env=None):
-    """Runs `ra-jit cache ARGS` on the store; returns (exit status, what it printed)."""
-    ran = subprocess.run([RA_JIT, "cache", *args], capture_output=True, text=True,
+    """Runs `blaze-engine cache ARGS` on the store; returns (exit status, what it printed)."""
+    ran = subprocess.run([BLAZE, "cache", *args], capture_output=True, text=True,
                          env={**os.environ, **(env or {}), "BLAZE_CACHE": store})
     return ran.returncode, ran.stdout + ran.stderr
 
 
 def numbers(out):
-    """The `name: number` lines of what a `ra-jit cache` command printed, as a dictionary."""
+    """The `name: number` lines of what a `blaze-engine cache` command printed, as a dictionary."""
     found = {}
     for line in out.splitlines():
         name, _, value = line.partition(":")
@@ -47,7 +47,7 @@ def stats(store, env=None):
 
 
 def verify(store):
-    """`ra-jit cache verify`: (whether everything in the store is what was written, its numbers, its output)."""
+    """`blaze-engine cache verify`: (whether everything in the store is what was written, its numbers, its output)."""
     status, out = cache(store, "verify")
     return status == 0, numbers(out), out
 
@@ -68,7 +68,7 @@ class Checkout:
         fx = Fixture(self.ws, CRATES, ["-p", "sapp"])
         fx.rustc_build()
         self.obj, self.patch, self.bin = (os.path.join(work, f"{name}.{n}") for n in ("o", "patch.o", "bin"))
-        link = linkline.with_output(linkline.ahead(list(fx.link_args), [self.patch, self.obj], RA_JIT), self.bin)
+        link = linkline.with_output(linkline.ahead(list(fx.link_args), [self.patch, self.obj], BLAZE), self.bin)
         self.link = linkline.join(link)
         self.symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         self.reference = os.path.join(work, f"{name}.reference")
@@ -123,7 +123,7 @@ class Daemon:
         out = open(self.log_path, "a")
         c = checkout
         self.process = subprocess.Popen(
-            [RA_JIT, c.ws, *TARGET_ARGS, *[x for k in CRATES for x in ("--crate", k)], "--out", c.obj,
+            [BLAZE, c.ws, *TARGET_ARGS, *[x for k in CRATES for x in ("--crate", k)], "--out", c.obj,
              "--socket", self.socket, "--patch", c.patch, "--link-cmd", c.link, "--binary", c.bin, *c.symbols],
             stderr=out, stdout=out, env={**os.environ, **(env or {}), "BLAZE_CACHE": store})
         if wait:
@@ -148,7 +148,7 @@ class Daemon:
         """Asks for the program without waiting for the reply; returns the client."""
         c = self.checkout
         return subprocess.Popen(
-            [RA_JIT, "sync", self.socket, "--project", c.ws, "--crate", "sapp", "--out", c.obj,
+            [BLAZE, "sync", self.socket, "--project", c.ws, "--crate", "sapp", "--out", c.obj,
              "--patch", c.patch, "--link-cmd", c.link, "--binary", c.bin, *c.symbols],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 

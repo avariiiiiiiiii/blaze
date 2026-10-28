@@ -15,10 +15,10 @@
 87288 23:36:36.664510 +++ exited with 0 +++
 87289 23:36:36.664587 +++ exited with 0 +++
 87290 23:36:36.664701 +++ exited with 0 +++
-87295 23:36:36.686729 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515bde70900 /* 89 vars */) = 0
-87296 23:36:36.687213 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be278200 /* 87 vars */) = 0
-87297 23:36:36.687334 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be651600 /* 88 vars */ <unfinished ...>
-87298 23:36:36.687402 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515c9a2bc00 /* 89 vars */ <unfinished ...>
+87295 23:36:36.686729 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515bde70900 /* 89 vars */) = 0
+87296 23:36:36.687213 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be278200 /* 87 vars */) = 0
+87297 23:36:36.687334 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be651600 /* 88 vars */ <unfinished ...>
+87298 23:36:36.687402 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515c9a2bc00 /* 89 vars */ <unfinished ...>
 87297 23:36:36.687432 <... execve resumed>) = 0
 87298 23:36:36.687551 <... execve resumed>) = 0
 87299 23:36:36.700847 +++ exited with 0 +++
@@ -53,10 +53,10 @@
 87297 23:36:36.772127 +++ exited with 0 +++
 87292 23:36:36.772146 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=87297, si_uid=0, si_status=0, si_utime=2 /* 0.02 s */, si_stime=1 /* 0.01 s */} ---
 87298 23:36:36.772787 exit_group(0)     = ?
-87327 23:36:36.773975 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be651300 /* 89 vars */) = 0
+87327 23:36:36.773975 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be651300 /* 89 vars */) = 0
 87298 23:36:36.774767 +++ exited with 0 +++
 87291 23:36:36.774789 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=87298, si_uid=0, si_status=0, si_utime=3 /* 0.03 s */, si_stime=1 /* 0.01 s */} ---
-87328 23:36:36.776585 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515c9a2d700 /* 89 vars */) = 0
+87328 23:36:36.776585 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515c9a2d700 /* 89 vars */) = 0
 87330 23:36:36.785842 +++ exited with 0 +++
 87332 23:36:36.785982 +++ exited with 0 +++
 87331 23:36:36.786022 +++ exited with 0 +++
@@ -74,7 +74,7 @@
 87341 23:36:36.792956 +++ exited with 0 +++
 87340 23:36:36.792968 +++ exited with 0 +++
 87342 23:36:36.792977 +++ exited with 0 +++
-87343 23:36:36.793332 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515bdece300 /* 89 vars */) = 0
+87343 23:36:36.793332 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515bdece300 /* 89 vars */) = 0
 87296 23:36:36.802497 exit_group(0)     = ?
 87347 23:36:36.804529 +++ exited with 0 +++
 87296 23:36:36.804806 +++ exited with 0 +++
@@ -134,10 +134,10 @@
 87415 23:36:37.092243 +++ exited with 0 +++
 87416 23:36:37.092308 +++ exited with 0 +++
 87417 23:36:37.092463 +++ exited with 0 +++
-87422 23:36:37.113984 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515bde70900 /* 89 vars */) = 0
-87424 23:36:37.114365 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be278200 /* 87 vars */ <unfinished ...>
-87423 23:36:37.114386 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be651600 /* 88 vars */ <unfinished ...>
-87425 23:36:37.114451 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515c9a2bc00 /* 89 vars */ <unfinished ...>
+87422 23:36:37.113984 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515bde70900 /* 89 vars */) = 0
+87424 23:36:37.114365 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be278200 /* 87 vars */ <unfinished ...>
+87423 23:36:37.114386 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be651600 /* 88 vars */ <unfinished ...>
+87425 23:36:37.114451 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515c9a2bc00 /* 89 vars */ <unfinished ...>
 87424 23:36:37.114499 <... execve resumed>) = 0
 87423 23:36:37.114517 <... execve resumed>) = 0
 87425 23:36:37.114593 <... execve resumed>) = 0
@@ -173,10 +173,10 @@
 87425 23:36:37.203066 exit_group(0)     = ?
 87425 23:36:37.209439 +++ exited with 0 +++
 87418 23:36:37.209462 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=87425, si_uid=0, si_status=0, si_utime=3 /* 0.03 s */, si_stime=2 /* 0.02 s */} ---
-87454 23:36:37.211219 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515c9a2dd00 /* 89 vars */) = 0
+87454 23:36:37.211219 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515c9a2dd00 /* 89 vars */) = 0
 87423 23:36:37.212845 +++ exited with 0 +++
 87419 23:36:37.212869 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=87423, si_uid=0, si_status=0, si_utime=3 /* 0.03 s */, si_stime=2 /* 0.02 s */} ---
-87455 23:36:37.214585 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be651300 /* 89 vars */) = 0
+87455 23:36:37.214585 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be651300 /* 89 vars */) = 0
 87422 23:36:37.217455 exit_group(0)     = ?
 87459 23:36:37.222927 +++ exited with 0 +++
 87457 23:36:37.223038 +++ exited with 0 +++
@@ -194,7 +194,7 @@
 87469 23:36:37.231134 +++ exited with 0 +++
 87467 23:36:37.231171 +++ exited with 0 +++
 87468 23:36:37.231219 +++ exited with 0 +++
-87470 23:36:37.231431 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515bdece300 /* 89 vars */) = 0
+87470 23:36:37.231431 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515bdece300 /* 89 vars */) = 0
 87424 23:36:37.233585 exit_group(0)     = ?
 87471 23:36:37.243039 +++ exited with 0 +++
 87474 23:36:37.243086 +++ exited with 0 +++
@@ -250,10 +250,10 @@
 87536 23:36:37.480743 +++ exited with 0 +++
 87537 23:36:37.480855 +++ exited with 0 +++
 87538 23:36:37.481002 +++ exited with 0 +++
-87543 23:36:37.502579 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be278200 /* 89 vars */) = 0
-87545 23:36:37.502953 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be651600 /* 87 vars */ <unfinished ...>
-87544 23:36:37.502966 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515bdece300 /* 89 vars */ <unfinished ...>
-87546 23:36:37.502979 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515c9a71f00 /* 88 vars */ <unfinished ...>
+87543 23:36:37.502579 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be278200 /* 89 vars */) = 0
+87545 23:36:37.502953 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be651600 /* 87 vars */ <unfinished ...>
+87544 23:36:37.502966 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515bdece300 /* 89 vars */ <unfinished ...>
+87546 23:36:37.502979 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515c9a71f00 /* 88 vars */ <unfinished ...>
 87545 23:36:37.503061 <... execve resumed>) = 0
 87544 23:36:37.503103 <... execve resumed>) = 0
 87546 23:36:37.503118 <... execve resumed>) = 0
@@ -288,11 +288,11 @@
 87546 23:36:37.581119 exit_group(0)     = ?
 87546 23:36:37.583093 +++ exited with 0 +++
 87539 23:36:37.583120 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=87546, si_uid=0, si_status=0, si_utime=3 /* 0.03 s */, si_stime=1 /* 0.01 s */} ---
-87575 23:36:37.584923 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515c9a71c00 /* 89 vars */) = 0
+87575 23:36:37.584923 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515c9a71c00 /* 89 vars */) = 0
 87544 23:36:37.587477 exit_group(0)     = ?
 87544 23:36:37.589393 +++ exited with 0 +++
 87542 23:36:37.589422 --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=87544, si_uid=0, si_status=0, si_utime=3 /* 0.03 s */, si_stime=1 /* 0.01 s */} ---
-87576 23:36:37.591147 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515bde70900 /* 89 vars */) = 0
+87576 23:36:37.591147 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515bde70900 /* 89 vars */) = 0
 87578 23:36:37.596326 +++ exited with 0 +++
 87579 23:36:37.596463 +++ exited with 0 +++
 87580 23:36:37.596794 +++ exited with 0 +++
@@ -307,7 +307,7 @@
 87584 23:36:37.603859 +++ exited with 0 +++
 87586 23:36:37.604186 +++ exited with 0 +++
 87585 23:36:37.604738 +++ exited with 0 +++
-87589 23:36:37.605590 execve("/root/perf/bin/58c3e559a0/ra-jit", ["/root/perf/bin/58c3e559a0/ra-jit", "build-script"], 0xe515be277900 /* 89 vars */) = 0
+87589 23:36:37.605590 execve("/root/perf/bin/58c3e559a0/blaze", ["/root/perf/bin/58c3e559a0/blaze", "build-script"], 0xe515be277900 /* 89 vars */) = 0
 87590 23:36:37.606583 +++ exited with 0 +++
 87588 23:36:37.606650 +++ exited with 0 +++
 87591 23:36:37.606790 +++ exited with 0 +++

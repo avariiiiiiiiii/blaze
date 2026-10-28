@@ -6,5 +6,5 @@
     "dep"
   ],
   "cargo": [],
-  "ra-jit": []
+  "blaze": []
 }

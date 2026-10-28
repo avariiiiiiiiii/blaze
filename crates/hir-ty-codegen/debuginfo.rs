@@ -647,11 +647,11 @@ impl Dwarf {
             LineEncoding::default(),
             LineString::String(self.directory.clone()),
             None,
-            LineString::String(b"<ra-jit>".to_vec()),
+            LineString::String(b"<blaze>".to_vec()),
             None,
         );
-        let producer = self.text(concat!("ra-jit ", env!("CARGO_PKG_VERSION")).as_bytes());
-        let name = self.text(b"<ra-jit>");
+        let producer = self.text(concat!("blaze ", env!("CARGO_PKG_VERSION")).as_bytes());
+        let name = self.text(b"<blaze>");
         let directory = self.text(&self.directory.clone());
         let unit = &mut self.dwarf.unit;
         let root = unit.get_mut(unit.root());
@@ -1208,7 +1208,7 @@ impl Dwarf {
     ///
     /// Grouped, each unit has its own sections, and only the strings are shared: what a
     /// unit refers to is then its functions and the strings, and an object can be cut into
-    /// several with each unit beside its functions (`ra-jit`'s `link/split.rs`), which the
+    /// several with each unit beside its functions (`blaze`'s `link/split.rs`), which the
     /// linker reads on threads of their own.
     fn sections(mut self) -> Result<Vec<Section>, String> {
         self.end_unit();

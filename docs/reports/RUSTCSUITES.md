@@ -1,9 +1,9 @@
-# rustc's own test suites through ra-jit
+# rustc's own test suites through blaze
 
-Branch `ra-jit-rustc-suites`, off `ra-jit-collate`; round two merges `ra-jit-collate` again, last at
+Branch `blaze-rustc-suites`, off `blaze-collate`; round two merges `blaze-collate` again, last at
 `3d47ed59bf`. Everything below was measured on one Linux x86-64 VM with stable
 `rustc 1.99.0` and the rust-lang/rust checkout at the `1.99.0` tag. Each number is from a
-single run unless it says otherwise. "Cranelift" is `cargo build -p ra-jit --release`; "LLVM"
+single run unless it says otherwise. "Cranelift" is `cargo build -p blaze-engine --release`; "LLVM"
 is the same with `--features llvm` (`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20`), run with
 `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`. Both binaries are built from the head of
 this branch.
@@ -14,7 +14,7 @@ they say otherwise.
 
 ## Summary
 
-| suite | backend | tests run | matching | differing | left out | functions from ra-jit | left to rustc |
+| suite | backend | tests run | matching | differing | left out | functions from blaze | left to rustc |
 |---|---|---|---|---|---|---|---|
 | `tests/ui` run-pass | Cranelift | 2787 | 2773 | 14 | 995 | 5726 of 5750 | 24 |
 | `tests/ui` run-pass | LLVM | 2785 | 2770 | 15 | 997 | 5723 of 5745 | 22 |
@@ -25,7 +25,7 @@ they say otherwise.
 | std's tests (28 binaries) | Cranelift | 252 | 252 | 0 | | 380 of 381 | 1 |
 | std's tests (28 binaries) | LLVM | 252 | 252 | 0 | | 380 of 381 | 1 |
 
-No ra-jit crash, hang or link error in any of the eight runs.
+No blaze crash, hang or link error in any of the eight runs.
 
 Round one ended at 2690 `tests/ui` tests run, 4 differing, 57 functions left to rustc, and 11
 left in the libraries. Round two runs about 96 more tests and leaves 24 + 6 functions to rustc (22 + 6 on LLVM).
@@ -38,7 +38,7 @@ run, not because anything that matched stopped matching: 9 of the new ones are a
 tests marked `known-bug` upstream, one needs the optimiser, and the LLVM one comes from the
 gate's own `BLAZE_OPT=2`. They are listed under "Round two: differing".
 
-Where round one started, with `ra-jit-collate` as found: Cranelift 2650 tests run, 16
+Where round one started, with `blaze-collate` as found: Cranelift 2650 tests run, 16
 differing, 1 link error; LLVM 2649 run, 17 differing, 1 link error; `coretests` hung.
 
 ## Round two
@@ -63,18 +63,18 @@ function by function.
 | 1 + 2 (libraries) | `PinMacroHelper<[PhantomPinned]>`, and an empty array compared with a slice: the element type was never inferred | well-formedness goals for the types of an expectation | `expectation_not_well_formed`, `empty_array_by_impl` |
 | not counted apart | `panic!` in a macro of an older edition | the rustc rule: walk up from where the call is written, through sysroot macros, to the edition of the code that wrote it | `panic_of_old_edition` |
 | 1 (part) | `m! {} | 1` as a match arm: a braced macro call ended the arm | a braced macro call is an expression in a match arm | `braced_macro_arm`, parser test `match_arm_braced_macro_operand` |
-| 1 | a static of an `extern` block: ra-jit looked for it among rustc's symbols | import it under its link name | `foreign_static` |
+| 1 | a static of an `extern` block: blaze looked for it among rustc's symbols | import it under its link name | `foreign_static` |
 | 1 | a trait method whose own `where` clause the type does not meet was compiled for the vtable | leave the slot empty, as rustc does | `uncallable_vtable_slot` |
 | not counted apart | proc-macro crates and `proc_macro` loaded as if their impls were in scope | a proc-macro crate gives its macros and nothing else | covered by the `proc-macro/*` tests only |
 
 Two things found on the way that were worse than a refusal:
 
-- The well-formedness goals above made ra-jit crash on
+- The well-formedness goals above made blaze crash on
   `regions/regions-relate-bound-regions-on-closures-to-inference-variables.rs` (index out of
   bounds in the solver) during this round. Types under a `for<..>` they name are now passed
   over. Breaker `well_formed_under_binder`. The crash never reached a pushed commit.
-- With `-O`, a small `main` that ra-jit refused left the program with a C `main` calling a
-  function that was not there, and the link failed. ra-jit now drops its start shim when the
+- With `-O`, a small `main` that blaze refused left the program with a C `main` calling a
+  function that was not there, and the link failed. blaze now drops its start shim when the
   `main` behind it is left to rustc. I verified this by hand and have no breaker for it,
   because the corpus is not built with `-O`.
 
@@ -86,25 +86,25 @@ been hiding one skipped function that way.
 What is still left to rustc, with why. Every one is refused with the reason in the second
 column, and the test still matches because rustc's copy of the function runs.
 
-| functions | reason ra-jit gives | tests | why it is left |
+| functions | reason blaze gives | tests | why it is left |
 |---|---|---|---|
-| 6 | names or bodies missing because "a macro of the crate did not expand: proc-macro panicked" | `proc-macro/attr-args.rs`, `attr-cfg.rs`, `attr-on-trait.rs`, `derive-same-struct.rs`, `expand-with-a-macro.rs`, `load-two.rs` | These macros `assert_eq!` on `TokenStream::to_string()` of their input. ra-jit runs proc macros through the toolchain's proc-macro server, whose token streams do not print with rustc's spacing, so the macro panics. ra-jit should refuse here: it cannot give the macro the input rustc gives it. Breaker `macro_reads_its_spelling` (left). The reason names the first macro of the crate that failed, which may not be the one the function uses. |
-| 4 | calling convention `win64` | `asm/x86_64/multiple-clobber-abi.rs`, `c-variadic/same-program-multiple-abis-x86_64.rs` (2), `extern/extern-calling-convention-test.rs` | `extern "win64"` on Linux. The Windows x64 argument code exists in ra-jit but is only selected for Windows targets; choosing an ABI per function is the work on `ra-jit-plat-abi2`. |
-| 2 | `asm!` with a `sym` | `abi/abi-sysv64-register-usage.rs`, `asm/x86_64/multiple-clobber-abi.rs` | ra-jit assembles `asm!` text itself. The `ra-jit-plat-abi2` work that came in with `ra-jit-collate` puts one `sym` operand into it, which is what took `c-variadic/naked.rs` off this list; these two have more than one. Not done here. |
-| 1 | an `asm!` constant that is not a literal | `asm/x86_64/const.rs` | `const constfn(5)` as an operand. ra-jit lowers a `const { }` expression as ordinary code in the body, so there is no value when the text is assembled. Not done. |
-| 2 | incomplete expression | `rust-2021/reserved-prefixes-via-macro.rs`, `rust-2024/reserved-guarded-strings-via-macro.rs` | A proc macro makes tokens that would be a reserved prefix if written in the source. ra-jit turns the stream back into text and parses it again, where they are one token. Not done. |
-| 1 | body has errors | `parser/macro/statement-boundaries.rs` | An `$e:expr` fragment that is an `if` or block, followed by something that could continue it. rustc keeps the fragment as one expression; ra-jit pastes its tokens and reads a statement boundary. Breaker `fragment_ends_statement` (left). |
+| 6 | names or bodies missing because "a macro of the crate did not expand: proc-macro panicked" | `proc-macro/attr-args.rs`, `attr-cfg.rs`, `attr-on-trait.rs`, `derive-same-struct.rs`, `expand-with-a-macro.rs`, `load-two.rs` | These macros `assert_eq!` on `TokenStream::to_string()` of their input. blaze runs proc macros through the toolchain's proc-macro server, whose token streams do not print with rustc's spacing, so the macro panics. blaze should refuse here: it cannot give the macro the input rustc gives it. Breaker `macro_reads_its_spelling` (left). The reason names the first macro of the crate that failed, which may not be the one the function uses. |
+| 4 | calling convention `win64` | `asm/x86_64/multiple-clobber-abi.rs`, `c-variadic/same-program-multiple-abis-x86_64.rs` (2), `extern/extern-calling-convention-test.rs` | `extern "win64"` on Linux. The Windows x64 argument code exists in blaze but is only selected for Windows targets; choosing an ABI per function is the work on `blaze-plat-abi2`. |
+| 2 | `asm!` with a `sym` | `abi/abi-sysv64-register-usage.rs`, `asm/x86_64/multiple-clobber-abi.rs` | blaze assembles `asm!` text itself. The `blaze-plat-abi2` work that came in with `blaze-collate` puts one `sym` operand into it, which is what took `c-variadic/naked.rs` off this list; these two have more than one. Not done here. |
+| 1 | an `asm!` constant that is not a literal | `asm/x86_64/const.rs` | `const constfn(5)` as an operand. blaze lowers a `const { }` expression as ordinary code in the body, so there is no value when the text is assembled. Not done. |
+| 2 | incomplete expression | `rust-2021/reserved-prefixes-via-macro.rs`, `rust-2024/reserved-guarded-strings-via-macro.rs` | A proc macro makes tokens that would be a reserved prefix if written in the source. blaze turns the stream back into text and parses it again, where they are one token. Not done. |
+| 1 | body has errors | `parser/macro/statement-boundaries.rs` | An `$e:expr` fragment that is an `if` or block, followed by something that could continue it. rustc keeps the fragment as one expression; blaze pastes its tokens and reads a statement boundary. Breaker `fragment_ends_statement` (left). |
 | 3 | instantiation fails with a type or constant error | `const-generics/min_const_generics/macro.rs`, `impl-trait/closure-in-impl-trait.rs`, `closure-in-impl-trait-arg.rs` | A closure or a `macro_rules!` definition inside an array length or const argument in a signature. The analysis gives such an anonymous constant no body of its own. Not done, no breaker. |
 | 1 | method `len` does not resolve | `coherence/pr-review-132289-2.rs` | The test pins which impl a `dyn Trait<P, Assoc = A>` projection picks when a blanket impl in another crate also applies; the analysis leaves the type unknown. Not done, no breaker. |
-| 1 | `type_id` of a type with lifetimes in a constant | `consts/const-typeid-of-rpass.rs` | ra-jit does not compute rustc's `TypeId` hashes at compile time, so a constant that holds a `TypeId` is refused whatever the type; it only answers constants that compare two. ra-jit should refuse until it can compute the hash. |
-| 1 | writable static `CACHE` without a rustc symbol | `rfcs/rfc-2396-target_feature-11/return-fn-ptr.rs` | `is_x86_feature_detected!` reads a private static of `std` with interior mutability. rustc's `std` exports no symbol for it, and a second copy would not be the one `std` writes. ra-jit should refuse. |
+| 1 | `type_id` of a type with lifetimes in a constant | `consts/const-typeid-of-rpass.rs` | blaze does not compute rustc's `TypeId` hashes at compile time, so a constant that holds a `TypeId` is refused whatever the type; it only answers constants that compare two. blaze should refuse until it can compute the hash. |
+| 1 | writable static `CACHE` without a rustc symbol | `rfcs/rfc-2396-target_feature-11/return-fn-ptr.rs` | `is_x86_feature_detected!` reads a private static of `std` with interior mutability. rustc's `std` exports no symbol for it, and a second copy would not be the one `std` writes. blaze should refuse. |
 | 2 (Cranelift only) | `ImplLimitExceeded` | `codegen/huge-stacks.rs`, both revisions | A stack frame of 4 GB and more, past what Cranelift takes. LLVM compiles them. |
-| 5 (`coretests`) | the caller's location in a constant | `panic::location::*` | ra-jit does not know the file name rustc records there. Breaker `caller_in_constant` (left). |
+| 5 (`coretests`) | the caller's location in a constant | `panic::location::*` | blaze does not know the file name rustc records there. Breaker `caller_in_constant` (left). |
 | 1 (std) | `type_name` of a function item with type arguments | `type-name-unsized.rs` | Not done. |
 
 So the list is not down to "nightly-only or should be refused". By my reading 12 of the 30
-are refusals ra-jit should keep making (proc-macro spelling 6, `TypeId` constant 1, `CACHE` 1,
-Win64 until `ra-jit-plat-abi2` 4), 2 are a Cranelift limit, and 16 are gaps I did not close
+are refusals blaze should keep making (proc-macro spelling 6, `TypeId` constant 1, `CACHE` 1,
+Win64 until `blaze-plat-abi2` 4), 2 are a Cranelift limit, and 16 are gaps I did not close
 (`asm!` 3, reserved prefixes 2, fragment boundary 1, anonymous constants 3, the coherence
 case 1, caller location 5, `type_name` 1). None is silent.
 
@@ -113,7 +113,7 @@ case 1, caller location 5, `type_name` 1). None is silent.
 Round one left out 60 tests for flags: 47 set an optimisation level, 5 turn checks off, 8
 ask for LTO. The harness now passes `-O`, `-C opt-level`, `-C debug-assertions`,
 `-C overflow-checks`, `-C panic=abort` and `-C target-feature`/`target-cpu` to cargo for the
-workspace the test is built in, and ra-jit reads them from the build as it reads a profile. Counted over the tests
+workspace the test is built in, and blaze reads them from the build as it reads a profile. Counted over the tests
 that ran in an earlier Cranelift run of this round (2787 tests run; the set has not changed
 since but for the tests that race):
 
@@ -123,10 +123,10 @@ since but for the tests that race):
 | `-C debug-assertions` or `-C overflow-checks`, on or off | 31 | 31 | 0 |
 | `-C panic=abort` or `=unwind` | 4 | 4 | 0 |
 
-What "release mode" means here: rustc's side is optimised as the test asks. On ra-jit's side
+What "release mode" means here: rustc's side is optimised as the test asks. On blaze's side
 the checks and the panic strategy follow the flags; Cranelift does not optimise, and LLVM
 runs at `BLAZE_OPT=2` whatever the test says. The 11 LTO tests are still left out: with LTO
-rustc inlines the test into the program and nothing of ra-jit's would run.
+rustc inlines the test into the program and nothing of blaze's would run.
 
 Two bugs came out of this and are fixed: a closure with
 `#[rustc_inherit_overflow_checks]` in a library (`iter().sum()` overflow) did not take the
@@ -155,7 +155,7 @@ that this accounts for all 22. By limit:
 are left out in each run because rustc's own program prints something else every time; the
 exact tests vary between runs.
 
-`check-run-results`: the harness now holds what ra-jit's program prints against the test's
+`check-run-results`: the harness now holds what blaze's program prints against the test's
 `.run.stdout` and `.run.stderr` files (a missing file meaning nothing is printed), after
 taking out source paths with their line and column and the thread id, which a build in a
 package changes. In the last run, on each backend, all 28 tests with the directive match rustc's program, and
@@ -187,7 +187,7 @@ compiler output.
 
 ### 6. Deslop pass
 
-Done over the round-two diff against the merge of `ra-jit-collate`, with the checklist of the
+Done over the round-two diff against the merge of `blaze-collate`, with the checklist of the
 `deslop-rust-skill`: no `unwrap` or `expect` added on an input path, no comment that narrates
 an edit, no comment trailing its code, new items private except `inherits_overflow_checks` (a method in `hir-def` and a field of
 the MIR body), which code generation reads. `cargo clippy` over the changed crates reported
@@ -201,8 +201,8 @@ now run:
 
 | test | backend | cause |
 |---|---|---|
-| `codegen/equal-pointers-unequal/{as-cast,exposed-provenance,strict-provenance}/{inline1,inline2,zero}.rs` (9) | both | Marked `known-bug` for rust-lang/rust#107975, built with `-O`. Each asserts that two pointers with equal addresses compare unequal, which is the LLVM miscompilation the issue is about. ra-jit's program compares them equal. No breaker: there is nothing to reduce to but the bug. |
-| `codegen/issue-28950.rs` | both | Built with `-O`. A thread with a 16 KB stack makes a large temporary that the test expects the optimiser to remove. rustc `-O` removes it; ra-jit's code keeps it and the thread overflows its stack (signal 11 on Cranelift, abort on LLVM). Open, no breaker: the corpus is not built with `-O`. |
+| `codegen/equal-pointers-unequal/{as-cast,exposed-provenance,strict-provenance}/{inline1,inline2,zero}.rs` (9) | both | Marked `known-bug` for rust-lang/rust#107975, built with `-O`. Each asserts that two pointers with equal addresses compare unequal, which is the LLVM miscompilation the issue is about. blaze's program compares them equal. No breaker: there is nothing to reduce to but the bug. |
+| `codegen/issue-28950.rs` | both | Built with `-O`. A thread with a 16 KB stack makes a large temporary that the test expects the optimiser to remove. rustc `-O` removes it; blaze's code keeps it and the thread overflows its stack (signal 11 on Cranelift, abort on LLVM). Open, no breaker: the corpus is not built with `-O`. |
 | `panics/panic-abort-backtrace-without-debuginfo.rs` | LLVM | The test asks for `opt-level=0` so that two functions stay in the backtrace. The gate's `BLAZE_OPT=2` inlines them. With `BLAZE_OPT=0` the test matches (measured once). |
 
 The harness prints the `known-bug` issue next to a differing test and counts them: 10 of the
@@ -210,48 +210,48 @@ The harness prints the `known-bug` issue next to a differing test and counts the
 
 `array-slice-vec/nested-vec-3.rs` differed for a while in this round and matches at this
 head. It builds a `vec!` of `vec!`s and panics in the middle, and checks the order of the
-drops. `ra-jit-collate` at `8f21942505` dropped the finished inner vectors before the
+drops. `blaze-collate` at `8f21942505` dropped the finished inner vectors before the
 elements of the one under construction, where rustc drops the innermost operands first; it
-matched at `ce52276cf5`. The `ra-jit-fuzz` branch had fixed the same thing from a fuzzer
+matched at `ce52276cf5`. The `blaze-fuzz` branch had fixed the same thing from a fuzzer
 finding (`5fba09c841`, breaker `unwind_nested_operands`), so that commit is cherry-picked
-here unchanged apart from its context lines. `ra-jit-collate` has it too as of `3d47ed59bf`.
+here unchanged apart from its context lines. `blaze-collate` has it too as of `3d47ed59bf`.
 
-Two things broke when `ra-jit-collate` `14ee89181b` was merged, and both are fixed here:
+Two things broke when `blaze-collate` `14ee89181b` was merged, and both are fixed here:
 
 - Four tests differed on Cranelift (`io-checks/write-macro-error.rs`,
   `iterators/iter-filter-count-debug-check.rs`, `iterators/iter-sum-overflow-debug.rs`,
   `iterators/iter-sum-overflow-overflow-checks.rs`; the LLVM run was not made at that
   point). Each panics in code of the standard library that is compiled into the test, and
   prints where. rustc names the file where the sources are installed
-  (`~/.rustup/toolchains/../lib/rustlib/src/rust/library/..`); ra-jit printed
+  (`~/.rustup/toolchains/../lib/rustlib/src/rust/library/..`); blaze printed
   `/rustc/<commit>/library/..`. The collated store names library files by where they were
   built so that an entry means the same on every machine, and the same name had become
   what the program says. Now the program is given the installed path, and the path is
   rewritten to the built one when an entry is stored and back when it is loaded, as is
   already done for files under the cargo home. Breaker `library_panic_location`, and a unit
   test in `codegen/cached.rs` for the round trip.
-- `coretests` did not finish compiling: after 12 minutes ra-jit was still in
+- `coretests` did not finish compiling: after 12 minutes blaze was still in
   `Evaluator::patch_addresses`. `tests/slice.rs` has `const EMPTY_MAX: &[()] = &[(); usize::MAX]`
-  and takes a reference to it. When a constant's memory is copied, ra-jit goes over every
+  and takes a reference to it. When a constant's memory is copied, blaze goes over every
   element behind a slice to carry addresses over, and did so for elements of no size too.
   A value without bytes is now skipped. Breaker `unit_slice_constant`; it hangs on the
   binary from before the fix (stopped after 60 seconds) and takes seconds after.
 
 One mistake of mine to report: a probe script ran in my home directory after a failed `cd`
-and executed `rm -rf ra-jit; mkdir ra-jit` there. I found no sign a `~/ra-jit` existed before,
+and executed `rm -rf blaze; mkdir blaze` there. I found no sign a `~/blaze` existed before,
 and removed what the script made. The repository checkout is elsewhere and was not touched.
 
 ### Round two: gate
 
-This gate was run on the merge of `ra-jit-collate` `14ee89181b` (`617524cf63`, pushed as
+This gate was run on the merge of `blaze-collate` `14ee89181b` (`617524cf63`, pushed as
 `f8b880e65a`), not on the head of the branch. On the head, which merges `3d47ed59bf`, both
 binaries build, the four suites were run on both backends (the Summary numbers), and the
 Cranelift leg of the gate passed its first nine scripts (`difftest.py` through
 `worktrees.py`) before the run was stopped; the rest of that leg, the LLVM leg and
 `cargo test` were not run on it.
 
-The harness list of `.github/workflows/ra-jit.yaml` as of `ra-jit-collate` `14ee89181b`, run
-from `harness/` with `BLAZE_BIN` at each binary, plus `cargo_ra_jit.py --small`. Every script
+The harness list of `.github/workflows/blaze.yaml` as of `blaze-collate` `14ee89181b`, run
+from `harness/` with `BLAZE_BIN` at each binary, plus `blaze_cli.py --small`. Every script
 exited 0 on both backends. `buildmodel.py` runs on the Cranelift leg and `backends.py` on
 the LLVM leg, as in the workflow. `remote.py` was not run: there is no MinIO on this machine.
 
@@ -268,28 +268,28 @@ the LLVM leg, as in the workflow. `remote.py` was not run: there is no MinIO on 
 | `debuginfo.py` | all right | all right |
 | `buildmodel.py` | 194 of 194 | not part of this leg |
 | `storekills.py --kills 100`, `storecorrupts.py --rounds 4`, `storefull.py`, `storeshared.py`, `storeguards.py`, `selects.py` | pass | pass |
-| `cargo_ra_jit.py --small` | pass | pass |
+| `blaze_cli.py --small` | pass | pass |
 
 The 8 that `breakers.py` calls open are five cases that still differ (`assert_message`,
 `unreachable_arm_move`, `raw_write_then_match`, `future_unwind_flags`,
-`fragment_edition_through_macro`) and three that ra-jit refuses with a reason
+`fragment_edition_through_macro`) and three that blaze refuses with a reason
 (`caller_in_constant`, `fragment_ends_statement`, `macro_reads_its_spelling`).
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p ra-jit`: 1013 passed, 0 failed. One expectation was changed for that:
+-p syntax -p blaze-engine`: 1013 passed, 0 failed. One expectation was changed for that:
 `test_assert_expand_2015` in `hir-def` carried a FIXME saying its expected expansion was the
 wrong one (`panic_2021!` in a 2015 crate); with the panic-edition rule of this round the
 expansion is `$crate::panic!`, and the test now expects that.
 
 ### Where this stands
 
-Done: the merge of `ra-jit-collate` `3d47ed59bf`, the suite runs on it under both backends,
+Done: the merge of `blaze-collate` `3d47ed59bf`, the suite runs on it under both backends,
 the two regressions the `14ee89181b` merge brought (`library_panic_location`,
 `unit_slice_constant`), and items 2, 3, 5 and 6 of round two.
 
 Half-done: the gate on the head, as said above. Item 1: 24 + 6 functions are still left to
 rustc (22 + 6 on LLVM), each with a stated reason, but the list is not down to "nightly-only
-or should be refused"; the table in item 1 says which are not done. `ra-jit-collate-next` is
+or should be refused"; the table in item 1 says which are not done. `blaze-collate-next` is
 not merged.
 
 Not done: item 4 (`tests/run-make`), `remote.py`, and any target but Linux x86-64.
@@ -304,7 +304,7 @@ which needs the large temporary removed without an optimiser.
 
     git clone --filter=blob:none --sparse https://github.com/rust-lang/rust -b 1.99.0
     git sparse-checkout set tests/ui tests/codegen-units library
-    BLAZE_BIN=<ra-jit> python3 harness/uitest.py <rust> --work <dir> --fresh --json ui.json
+    BLAZE_BIN=<blaze> python3 harness/uitest.py <rust> --work <dir> --fresh --json ui.json
 
 `harness/uitest.py` was there; it ran tests one at a time and left out anything with an
 auxiliary crate. It now accounts for every file marked `//@ run-pass` (3760 files, 3804 with
@@ -312,12 +312,12 @@ revisions counted separately): a test is either run, once per revision, or left 
 reason that is counted. A test that runs becomes a cargo package whose library is the test
 and whose binary calls its `main`. `aux-build`, `aux-crate` and `proc-macro` files become
 packages it depends on; files named by `mod`, `#[path]` and `include!` are copied beside it;
-`exec-env`, `run-flags` and `edition` are honoured. rustc builds the package, ra-jit rebuilds
+`exec-env`, `run-flags` and `edition` are honoured. rustc builds the package, blaze rebuilds
 the library's functions and they are linked in front of rustc's, and the two programs must
 exit with the same status and print the same on stdout and stderr.
 
 Tests are built a workspace at a time, several workspaces at once (`--jobs`). Each
-workspace's result is kept under `<work>/results`, keyed by its tests, the ra-jit binary and
+workspace's result is kept under `<work>/results`, keyed by its tests, the blaze binary and
 the backend, so a stopped run picks up where it was. A whole run takes about three minutes
 on this machine.
 
@@ -329,9 +329,9 @@ Three things the harness does so that a difference means something:
 - It runs rustc's program twice. If the two runs differ, the test is left out as "prints
   something else in every run" (addresses, hash order, thread interleaving). This is 8 to 10
   tests depending on the run.
-- When ra-jit's program differs, it is run six more times, and rustc's program is run over
-  and over for 20 seconds to see whether it ever does what ra-jit's did. If it does, the test
-  races and is left out with the reason "races"; if ra-jit's program differs once and never
+- When blaze's program differs, it is run six more times, and rustc's program is run over
+  and over for 20 seconds to see whether it ever does what blaze's did. If it does, the test
+  races and is left out with the reason "races"; if blaze's program differs once and never
   again, it is counted as "differing in one run only" and fails the run. This came from
   `threads-sendsync/yield1.rs` and `panics/panic-handler-flail-wildly.rs`, which each differed
   in one sweep and not in the others. For `yield1.rs` I saw rustc's own binary print `2` before `1` twice in
@@ -371,7 +371,7 @@ that print something else in every run.
 | 1 | differs when relinked from rustc's objects alone |
 
 The full list with every count is at the end of the harness's output. Some of these are the
-harness's limits and not ra-jit's: the 73 without a top-level `main`, the 18 + 9 that do not
+harness's limits and not blaze's: the 73 without a top-level `main`, the 18 + 9 that do not
 survive being turned into a package, and the 12 auxiliary crates with their own flags could
 be run with more work on the harness. The optimisation, LTO and assertion flags (60 tests)
 are left out because the harness compares against a debug build; nothing was measured about
@@ -382,7 +382,7 @@ them.
 The current list is in "Round two", item 1. Round one: 57 functions, the same on both backends. The harness prints them under "functions left to
 rustc by reason".
 
-| functions | reason ra-jit gives | tests |
+| functions | reason blaze gives | tests |
 |---|---|---|
 | 13 | a local that cannot be reached in an `async fn` taking `ref` pattern parameters (9), and the functions that share an `async` block with those (4) | `async-await/drop-order/drop-order-for-async-fn-parameters-by-ref-binding.rs` |
 | 7 | pattern matching on a union | `union/*` (4 tests), `structs-enums/align-struct.rs` |
@@ -420,7 +420,7 @@ test function when the error is in one, otherwise the `use`, helper or macro, wh
 in the next round. Nothing is rewritten, so a test either runs as written or is not there.
 What is deleted is counted by error code in `<work>/<suite>/pruned.json`. The package that is
 left goes to `harness/cratetest.py`, which builds each test binary with rustc and again with
-ra-jit's objects in front, runs both and compares every test by name.
+blaze's objects in front, runs both and compares every test by name.
 
 | suite | `#[test]` functions in the source | build on stable | deleted, by the error that deleted the item |
 |---|---|---|---|
@@ -446,7 +446,7 @@ Functions left to rustc in round one, the same on both backends (now 5, 0 and 1;
 
 | suite | functions | reason | reduced case |
 |---|---|---|---|
-| `coretests` | 5 | `Location::caller()` in a constant: ra-jit does not know what rustc names the file there, so it refuses | `caller_in_constant` |
+| `coretests` | 5 | `Location::caller()` in a constant: blaze does not know what rustc names the file there, so it refuses | `caller_in_constant` |
 | `coretests` | 2 | `type_name` of a function item and of a `dyn` type with a binder | none |
 | `coretests` | 1 | layout of `PinMacroHelper<[PhantomPinned]>` (an unsized coercion inside `pin!`) | none |
 | `alloctests` | 2 | an empty array compared with a slice or `VecDeque`: inference leaves the element type unknown, so there is no layout | `empty_array_by_impl` |
@@ -455,7 +455,7 @@ Functions left to rustc in round one, the same on both backends (now 5, 0 and 1;
 ## What was fixed
 
 Each row was found by a differing or crashing test, reduced to a case under
-`harness/breakers/` and fixed in ra-jit. `python3 harness/breakers.py` runs them all.
+`harness/breakers/` and fixed in blaze. `python3 harness/breakers.py` runs them all.
 
 | cause | found by | reduced case |
 |---|---|---|
@@ -506,7 +506,7 @@ rust-lang/rust at `1.99.0`.
   `#[rustc_pass_indirectly_in_non_rustic_abis]`;
   `compiler/rustc_abi/src/layout/ty.rs:244-264` describes the flag and follows transparent
   wrappers, and `compiler/rustc_target/src/callconv/x86_64.rs`, `aarch64.rs` and
-  `x86_win64.rs` make such an argument indirect. ra-jit now does the same for SysV x86-64,
+  `x86_win64.rs` make such an argument indirect. blaze now does the same for SysV x86-64,
   AAPCS64 and Windows x64. Only the first was run here.
 - A const parameter in a promotable expression (`crates/hir-ty/src/mir/lower.rs`). This
   follows what `tests/ui/const-generics/promotion.rs` requires; I did not trace it to a line
@@ -522,12 +522,12 @@ differing". Each of the four is marked open in `harness/breakers.py`.
 
 | test | reduced case | cause |
 |---|---|---|
-| `async-await/async-fn-size-moved-locals.rs`, `async-fn-size-uninit-locals.rs` | `future_unwind_flags` | The tests assert the size of a future. rustc shares the unwind cleanup of a local between two calls and keeps a drop flag for it, which becomes a byte of the future. ra-jit drops by where the call is and keeps no flag, so its future is smaller. The program is otherwise right; matching it means reproducing rustc's coroutine layout decisions. |
-| `drop/issue-90752-raw-ptr-shenanigans.rs` | `raw_write_then_match` | A local known to be `None` is written through a raw pointer and then partly moved out of. rustc's drop elaboration does not see the write and leaks the rest; the test pins that. ra-jit drops it. |
-| `macros/metavar_cross_edition_recursive_macros.rs` | `fragment_edition_through_macro` | The test is marked `known-bug` for rust-lang/rust#130484. rustc reads an `expr` fragment by the edition of the macro that wrote the name; ra-jit reads it by the edition where it was written, which is what the test says rustc will do when the bug is fixed. |
+| `async-await/async-fn-size-moved-locals.rs`, `async-fn-size-uninit-locals.rs` | `future_unwind_flags` | The tests assert the size of a future. rustc shares the unwind cleanup of a local between two calls and keeps a drop flag for it, which becomes a byte of the future. blaze drops by where the call is and keeps no flag, so its future is smaller. The program is otherwise right; matching it means reproducing rustc's coroutine layout decisions. |
+| `drop/issue-90752-raw-ptr-shenanigans.rs` | `raw_write_then_match` | A local known to be `None` is written through a raw pointer and then partly moved out of. rustc's drop elaboration does not see the write and leaks the rest; the test pins that. blaze drops it. |
+| `macros/metavar_cross_edition_recursive_macros.rs` | `fragment_edition_through_macro` | The test is marked `known-bug` for rust-lang/rust#130484. rustc reads an `expr` fragment by the edition of the macro that wrote the name; blaze reads it by the edition where it was written, which is what the test says rustc will do when the bug is fixed. |
 
-In all three ra-jit is not doing what rustc 1.99 does. In the last two, what rustc does is
-something the Rust project calls a bug or an accident; I left ra-jit as it is and say so
+In all three blaze is not doing what rustc 1.99 does. In the last two, what rustc does is
+something the Rust project calls a bug or an accident; I left blaze as it is and say so
 here instead of copying it. The first is a real gap if anything depends on the exact size
 of a future.
 
@@ -548,7 +548,7 @@ Run from `harness/` with `BLAZE_BIN` at each binary, once per backend. All passe
 | `worktrees.py` | 58 of 58 | 58 of 58 |
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p ra-jit`: 913 passed, 0 failed.
+-p syntax -p blaze-engine`: 913 passed, 0 failed.
 
 ## What is open
 

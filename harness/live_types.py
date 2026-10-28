@@ -3,7 +3,7 @@
 components change while it runs: a component is never changed in place, a new type takes its
 place ([live.md](../docs/live.md#types)).
 
-usage: live_types.py        (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: live_types.py        (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 The daemon builds its own base (BLAZE_RUSTC_BASE=0): over rustc's executable an edit that is more
 than function bodies takes a build in full.
@@ -114,11 +114,11 @@ async def edit(step: str, program: Running, source: Path, stage: int, project: P
 async def main() -> None:
     own_home()
     bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
-    work = Path(tempfile.mkdtemp(prefix="ra-jit-live-types-"))
+    work = Path(tempfile.mkdtemp(prefix="blaze-live-types-"))
     started: list[Running] = []
     try:
         for copy in [work, work / "reference"]:
-            shutil.copytree(ROOT / "crates" / "ra-jit-live", copy / "crates" / "ra-jit-live")
+            shutil.copytree(ROOT / "crates" / "blaze-live", copy / "crates" / "blaze-live")
             shutil.copytree(PROGRAM, copy / "harness" / "live-types", ignore=shutil.ignore_patterns("target"))
         stages = [0, 1, 2, 3]
         expected = {}

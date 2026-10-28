@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L7-50-c6.rs`): when the temporaries of
 //! what an `if let` matches on are dropped. Before the 2024 edition they live as long as those
 //! of the expression the `if` is in: to the end of the statement, or past the locals of the
-//! block when the `if` is its tail. Only what the pattern binds ends with the branch. ra-jit
+//! block when the `if` is its tail. Only what the pattern binds ends with the branch. blaze
 //! dropped them where the branch ended.
 
 use std::cell::RefCell;

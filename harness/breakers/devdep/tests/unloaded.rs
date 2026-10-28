@@ -1,6 +1,6 @@
 //! rustc loads a dependency when something names it, and knows the impls of the crates it
 //! loaded. `unnamed` is a dev-dependency nothing here names, so its `impl PartialEq<Value> for
-//! f64` is not there and `parse` below is of an `f64`. ra-jit knew the impls of every crate
+//! f64` is not there and `parse` below is of an `f64`. blaze knew the impls of every crate
 //! below this one and could not tell which `parse` it was: ryu's tests, whose benches bring in
 //! serde_json and its `impl PartialEq<Value> for f64`.
 

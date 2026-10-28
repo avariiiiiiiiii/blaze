@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """testselectbench.py: what `BLAZE_TESTS=affected` saves on real projects. Measures, and fails
-when a build after the daemon first served one went to cargo, which ra-jit is never to do (#84):
+when a build after the daemon first served one went to cargo, which blaze is never to do (#84):
 an edit's tests are the daemon's to build.
 
 usage: testselectbench.py [--json FILE] [--keep DIR] [--args ARG,ARG...] [project ...]
-       (BLAZE_BIN names the ra-jit built; the projects are bench.py's, ripgrep, helix and
+       (BLAZE_BIN names the blaze built; the projects are bench.py's, ripgrep, helix and
        nushell by default, at their pinned revisions and on harness/toolchain, tested with
        bench.py's `test` arguments)
 
-Each project is copied to a scratch directory, opted into sandboxed tests, and tested with `cargo ra-jit test` until the
+Each project is copied to a scratch directory, opted into sandboxed tests, and tested with `blaze test` until the
 daemon serves the build. Then, each a row: every test (`BLAZE_TESTS=all`); the affected
 ones twice, the first recording what passed; the affected ones after bench.py's `leaf` edit
 (the first build after it may be cargo's), after a second edit of the same function, and every
@@ -29,7 +29,7 @@ import tempfile
 import time
 
 import bench
-from cargo_ra_jit import RA_JIT, TOOLCHAIN, fetch, timed
+from blaze_cli import BLAZE, TOOLCHAIN, fetch, timed
 
 TIMEOUT = 7200
 KEEP = None
@@ -63,7 +63,7 @@ def reach(dirs):
 
 
 def row(ws, env, args, mode, what):
-    took, ran = timed(["cargo", "ra-jit", "test", *args], ws, dict(env, BLAZE_TESTS=mode), TIMEOUT)
+    took, ran = timed(["blaze", "test", *args], ws, dict(env, BLAZE_TESTS=mode), TIMEOUT)
     said = ran.stdout + ran.stderr
     if KEEP:
         os.makedirs(KEEP, exist_ok=True)
@@ -71,7 +71,7 @@ def row(ws, env, args, mode, what):
         open(os.path.join(KEEP, f"{name}.log"), "w").write(said)
     skipped = sum(int(n) for n in SKIPPED.findall(said))
     listed, sandboxed, always, by = reach([os.path.join(ws, "target"), env["BLAZE_HOME"]])
-    # Why a build was cargo's, as `cargo ra-jit` says it; not the doc tests rustc builds.
+    # Why a build was cargo's, as `blaze` says it; not the doc tests rustc builds.
     fell = [it for it in dict.fromkeys(FELL.findall(ran.stderr)) if "is rustc's" not in it and "rustdoc" not in it]
     return dict(step=what, mode=mode, exit=ran.returncode, seconds=round(took, 1), served="[blaze]" in said, fell=fell[:3],
                 ran=len(RAN.findall(ran.stdout)), skipped=skipped, listed=listed, always=sum(always.values()), sandboxed=sandboxed,
@@ -112,14 +112,14 @@ class Rows(list):
 def project(name, args):
     spec = bench.PROJECTS[name]
     source = fetch(name, spec)
-    root = tempfile.mkdtemp(prefix=f"ra-jit-tsb-{name}-")
+    root = tempfile.mkdtemp(prefix=f"blaze-tsb-{name}-")
     home = tempfile.mkdtemp(prefix="rj-tsb-", dir="/tmp")
     ws = os.path.join(root, name)
     shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target"))
     # A pass is kept only for a sandboxed test, an experiment the workspace opts into.
     with open(os.path.join(ws, "Cargo.toml"), "a") as manifest:
         manifest.write('\n[workspace.metadata.blaze]\nexperimental = ["sandboxed-tests"]\n')
-    bin_dir = os.path.dirname(os.path.abspath(RA_JIT))
+    bin_dir = os.path.dirname(os.path.abspath(BLAZE))
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
                RUST_BACKTRACE="0", RUSTUP_TOOLCHAIN=TOOLCHAIN, **spec.get("env", {}))
     for var in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "BLAZE_TESTS"):
@@ -150,7 +150,7 @@ def project(name, args):
         rows.append(row(ws, env, args, "affected", "affected, second edit"))
         rows.append(row(ws, env, args, "all", "every test, after it"))
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=300)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=300)
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(home, ignore_errors=True)
     return rows

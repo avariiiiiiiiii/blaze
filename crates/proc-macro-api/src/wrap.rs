@@ -1,5 +1,5 @@
 //! A process-wide hook that wraps the command a proc-macro server is started with, so that a
-//! caller can start every server in a sandbox (ra-jit's `ra-jit sandbox SPEC -- SERVER`). The
+//! caller can start every server in a sandbox (blaze's `blaze sandbox SPEC -- SERVER`). The
 //! server's own `--version` question runs no macro and is not wrapped.
 
 use std::{io, process::Command, sync::OnceLock};

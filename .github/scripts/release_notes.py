@@ -91,7 +91,7 @@ def main() -> None:
 
     notes = fit(section((ROOT / "CHANGELOG.md").read_text(), version), version)
     args.out.write_text(notes)
-    print(f"ra-jit {version}: {len(notes.splitlines())} lines of notes -> {args.out}")
+    print(f"blaze {version}: {len(notes.splitlines())} lines of notes -> {args.out}")
     print(notes)
 
     if output := os.environ.get("GITHUB_OUTPUT"):

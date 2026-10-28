@@ -1,5 +1,5 @@
 //! Found in den-native: `Link::start(wake: impl Fn())` spawned a task that awaited
-//! `Client::connect`, a function ra-jit left to rustc. Roots that hold a future of a function
+//! `Client::connect`, a function blaze left to rustc. Roots that hold a future of a function
 //! left to rustc are left too, but `start` is generic, so its task was an instance of ours: it
 //! polled rustc's future with our poll, read the `&self` rustc had put elsewhere as null, and
 //! crashed. Here `once` is left to rustc for the constant `caller_in_constant` is about, so

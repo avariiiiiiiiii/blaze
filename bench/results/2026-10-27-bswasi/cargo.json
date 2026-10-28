@@ -5,7 +5,7 @@
  "failed": [
   "build-rs-test-lib v0.0.0 (/root/bsw/work/src/cargo/crates/build-rs-test-lib)"
  ],
- "stderr_tail": "_cfg_target_has_atomic() = [\n      \"128\",\n      \"16\",\n      \"32\",\n      \"64\",\n      \"8\",\n      \"ptr\",\n  ]\n  [crates/build-rs-test-lib/build.rs:38:5] cargo_cfg_target_os() = \"linux\"\n  [crates/build-rs-test-lib/build.rs:39:5] cargo_cfg_target_pointer_width() = 64\n  [crates/build-rs-test-lib/build.rs:42:5] cargo_cfg_target_vendor() = \"unknown\"\n  [crates/build-rs-test-lib/build.rs:45:5] cargo_cfg_unix() = true\n  [crates/build-rs-test-lib/build.rs:46:5] cargo_cfg_windows() = false\n  [crates/build-rs-test-lib/build.rs:47:5] cargo_encoded_rustflags() = []\n  [crates/build-rs-test-lib/build.rs:48:5] cargo_feature(\"unstable\") = false\n  [crates/build-rs-test-lib/build.rs:49:5] cargo_manifest_dir() = \"/root/bsw/work/src/cargo/crates/build-rs-test-lib\"\n  [crates/build-rs-test-lib/build.rs:50:5] cargo_manifest_path() = \"/root/bsw/work/src/cargo/crates/build-rs-test-lib/Cargo.toml\"\n  [crates/build-rs-test-lib/build.rs:51:5] cargo_manifest_links() = None\n  [crates/build-rs-test-lib/build.rs:52:5] cargo_pkg_authors() = []\n  [crates/build-rs-test-lib/build.rs:53:5] cargo_pkg_description() = None\n  [crates/build-rs-test-lib/build.rs:54:5] cargo_pkg_homepage() = None\n  [crates/build-rs-test-lib/build.rs:55:5] cargo_pkg_license() = None\n  [crates/build-rs-test-lib/build.rs:56:5] cargo_pkg_license_file() = None\n  [crates/build-rs-test-lib/build.rs:57:5] cargo_pkg_name() = \"build-rs-test-lib\"\n  [crates/build-rs-test-lib/build.rs:58:5] cargo_pkg_readme() = None\n  [crates/build-rs-test-lib/build.rs:59:5] cargo_pkg_repository() = None\n  [crates/build-rs-test-lib/build.rs:60:5] cargo_pkg_rust_version() = None\n  [crates/build-rs-test-lib/build.rs:61:5] cargo_pkg_version() = \"0.0.0\"\n  [crates/build-rs-test-lib/build.rs:62:5] cargo_pkg_version_major() = 0\n  [crates/build-rs-test-lib/build.rs:63:5] cargo_pkg_version_minor() = 0\n  [crates/build-rs-test-lib/build.rs:64:5] cargo_pkg_version_patch() = 0\n  [crates/build-rs-test-lib/build.rs:65:5] cargo_pkg_version_pre() = None\n  [crates/build-rs-test-lib/build.rs:66:5] debug() = \"true\"\n  [crates/build-rs-test-lib/build.rs:67:5] dep_metadata(\"z\", \"include\") = None\n  [crates/build-rs-test-lib/build.rs:68:5] host() = \"aarch64-unknown-linux-gnu\"\n  [crates/build-rs-test-lib/build.rs:69:5] num_jobs() = 6\n  [crates/build-rs-test-lib/build.rs:70:5] opt_level() = \"0\"\n  [crates/build-rs-test-lib/build.rs:71:5] out_dir() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/out\"\n  [crates/build-rs-test-lib/build.rs:72:5] profile() = \"debug\"\n  [crates/build-rs-test-lib/build.rs:73:5] rustc() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/ra-jit-rustc/rustc\"\n  [crates/build-rs-test-lib/build.rs:74:5] rustc_linker() = Some(\n      \"/nix/store/9ybki05zzk37qgjbhixa5wqi1frv2w3a-ix-mold-cc/bin/cc\",\n  )\n  [crates/build-rs-test-lib/build.rs:75:5] rustc_workspace_wrapper() = None\n  [crates/build-rs-test-lib/build.rs:76:5] rustc_wrapper() = None\n  [crates/build-rs-test-lib/build.rs:77:5] rustdoc() = \"rustdoc\"\n  [crates/build-rs-test-lib/build.rs:78:5] target() = \"aarch64-unknown-linux-gnu\"\n  error: the build script of `build-rs-test-lib` reads `RUSTC_WRAPPER`, set where cargo ran, which a build script in the sandbox is not given: what it prints and writes would be of it unset; give it with `build-script-env = [\"RUSTC_WRAPPER\"]` under `[workspace.metadata.blaze.sandbox]` in /root/bsw/work/src/cargo/Cargo.toml, and its value keys the kept run\nwarning: build failed, waiting for other jobs to finish...\n   Compiling derive_builder_macro v0.20.2\n   Compiling color-print-proc-macro v0.3.7\n   Compiling maybe-async v0.2.10\n   Compiling serde_derive v1.0.219\n   Compiling zerovec-derive v0.11.1\n   Compiling tracing-attributes v0.1.30\n   Compiling zerofrom-derive v0.1.6\n   Compiling thiserror-impl v1.0.69\n   Compiling displaydoc v0.2.5\n   Compiling yoke-derive v0.8.0\n   Compiling partial_ref_derive v0.3.3\n   Compiling cargo-test-macro v0.4.6 (/root/bsw/work/src/cargo/crates/cargo-test-macro)\n",
+ "stderr_tail": "_cfg_target_has_atomic() = [\n      \"128\",\n      \"16\",\n      \"32\",\n      \"64\",\n      \"8\",\n      \"ptr\",\n  ]\n  [crates/build-rs-test-lib/build.rs:38:5] cargo_cfg_target_os() = \"linux\"\n  [crates/build-rs-test-lib/build.rs:39:5] cargo_cfg_target_pointer_width() = 64\n  [crates/build-rs-test-lib/build.rs:42:5] cargo_cfg_target_vendor() = \"unknown\"\n  [crates/build-rs-test-lib/build.rs:45:5] cargo_cfg_unix() = true\n  [crates/build-rs-test-lib/build.rs:46:5] cargo_cfg_windows() = false\n  [crates/build-rs-test-lib/build.rs:47:5] cargo_encoded_rustflags() = []\n  [crates/build-rs-test-lib/build.rs:48:5] cargo_feature(\"unstable\") = false\n  [crates/build-rs-test-lib/build.rs:49:5] cargo_manifest_dir() = \"/root/bsw/work/src/cargo/crates/build-rs-test-lib\"\n  [crates/build-rs-test-lib/build.rs:50:5] cargo_manifest_path() = \"/root/bsw/work/src/cargo/crates/build-rs-test-lib/Cargo.toml\"\n  [crates/build-rs-test-lib/build.rs:51:5] cargo_manifest_links() = None\n  [crates/build-rs-test-lib/build.rs:52:5] cargo_pkg_authors() = []\n  [crates/build-rs-test-lib/build.rs:53:5] cargo_pkg_description() = None\n  [crates/build-rs-test-lib/build.rs:54:5] cargo_pkg_homepage() = None\n  [crates/build-rs-test-lib/build.rs:55:5] cargo_pkg_license() = None\n  [crates/build-rs-test-lib/build.rs:56:5] cargo_pkg_license_file() = None\n  [crates/build-rs-test-lib/build.rs:57:5] cargo_pkg_name() = \"build-rs-test-lib\"\n  [crates/build-rs-test-lib/build.rs:58:5] cargo_pkg_readme() = None\n  [crates/build-rs-test-lib/build.rs:59:5] cargo_pkg_repository() = None\n  [crates/build-rs-test-lib/build.rs:60:5] cargo_pkg_rust_version() = None\n  [crates/build-rs-test-lib/build.rs:61:5] cargo_pkg_version() = \"0.0.0\"\n  [crates/build-rs-test-lib/build.rs:62:5] cargo_pkg_version_major() = 0\n  [crates/build-rs-test-lib/build.rs:63:5] cargo_pkg_version_minor() = 0\n  [crates/build-rs-test-lib/build.rs:64:5] cargo_pkg_version_patch() = 0\n  [crates/build-rs-test-lib/build.rs:65:5] cargo_pkg_version_pre() = None\n  [crates/build-rs-test-lib/build.rs:66:5] debug() = \"true\"\n  [crates/build-rs-test-lib/build.rs:67:5] dep_metadata(\"z\", \"include\") = None\n  [crates/build-rs-test-lib/build.rs:68:5] host() = \"aarch64-unknown-linux-gnu\"\n  [crates/build-rs-test-lib/build.rs:69:5] num_jobs() = 6\n  [crates/build-rs-test-lib/build.rs:70:5] opt_level() = \"0\"\n  [crates/build-rs-test-lib/build.rs:71:5] out_dir() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/out\"\n  [crates/build-rs-test-lib/build.rs:72:5] profile() = \"debug\"\n  [crates/build-rs-test-lib/build.rs:73:5] rustc() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/blaze-rustc/rustc\"\n  [crates/build-rs-test-lib/build.rs:74:5] rustc_linker() = Some(\n      \"/nix/store/9ybki05zzk37qgjbhixa5wqi1frv2w3a-ix-mold-cc/bin/cc\",\n  )\n  [crates/build-rs-test-lib/build.rs:75:5] rustc_workspace_wrapper() = None\n  [crates/build-rs-test-lib/build.rs:76:5] rustc_wrapper() = None\n  [crates/build-rs-test-lib/build.rs:77:5] rustdoc() = \"rustdoc\"\n  [crates/build-rs-test-lib/build.rs:78:5] target() = \"aarch64-unknown-linux-gnu\"\n  error: the build script of `build-rs-test-lib` reads `RUSTC_WRAPPER`, set where cargo ran, which a build script in the sandbox is not given: what it prints and writes would be of it unset; give it with `build-script-env = [\"RUSTC_WRAPPER\"]` under `[workspace.metadata.blaze.sandbox]` in /root/bsw/work/src/cargo/Cargo.toml, and its value keys the kept run\nwarning: build failed, waiting for other jobs to finish...\n   Compiling derive_builder_macro v0.20.2\n   Compiling color-print-proc-macro v0.3.7\n   Compiling maybe-async v0.2.10\n   Compiling serde_derive v1.0.219\n   Compiling zerovec-derive v0.11.1\n   Compiling tracing-attributes v0.1.30\n   Compiling zerofrom-derive v0.1.6\n   Compiling thiserror-impl v1.0.69\n   Compiling displaydoc v0.2.5\n   Compiling yoke-derive v0.8.0\n   Compiling partial_ref_derive v0.3.3\n   Compiling cargo-test-macro v0.4.6 (/root/bsw/work/src/cargo/crates/cargo-test-macro)\n",
  "source": "/root/bsw/work/src/cargo",
  "target": "/root/bsw/work/target/cargo",
  "runs": [
@@ -31,8 +31,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.99",
       "error": null,
       "ms": 3338,
-      "program": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -43,8 +43,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.99",
       "error": null,
       "ms": 10,
-      "program": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/anyhow/18d2a0e1ba4d01a6/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -170,7 +170,7 @@
     "trap": null,
     "tools_by_program": {}
    },
-   "wasi_stderr": "t/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:50:5] cargo_manifest_path() = \"/root/bsw/work/src/cargo/crates/build-rs-test-lib/Cargo.toml\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:51:5] cargo_manifest_links() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:52:5] cargo_pkg_authors() = []\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:53:5] cargo_pkg_description() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:54:5] cargo_pkg_homepage() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:55:5] cargo_pkg_license() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:56:5] cargo_pkg_license_file() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:57:5] cargo_pkg_name() = \"build-rs-test-lib\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:58:5] cargo_pkg_readme() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:59:5] cargo_pkg_repository() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:60:5] cargo_pkg_rust_version() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:61:5] cargo_pkg_version() = \"0.0.0\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:62:5] cargo_pkg_version_major() = 0\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:63:5] cargo_pkg_version_minor() = 0\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:64:5] cargo_pkg_version_patch() = 0\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:65:5] cargo_pkg_version_pre() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:66:5] debug() = \"true\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:67:5] dep_metadata(\"z\", \"include\") = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:68:5] host() = \"aarch64-unknown-linux-gnu\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:69:5] num_jobs() = 6\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:70:5] opt_level() = \"0\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:71:5] out_dir() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/out\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:72:5] profile() = \"debug\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:73:5] rustc() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/ra-jit-rustc/rustc\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:74:5] rustc_linker() = Some(\n    \"/nix/store/9ybki05zzk37qgjbhixa5wqi1frv2w3a-ix-mold-cc/bin/cc\",\n)\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:75:5] rustc_workspace_wrapper() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:76:5] rustc_wrapper() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:77:5] rustdoc() = \"rustdoc\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:78:5] target() = \"aarch64-unknown-linux-gnu\"\n",
+   "wasi_stderr": "t/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:50:5] cargo_manifest_path() = \"/root/bsw/work/src/cargo/crates/build-rs-test-lib/Cargo.toml\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:51:5] cargo_manifest_links() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:52:5] cargo_pkg_authors() = []\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:53:5] cargo_pkg_description() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:54:5] cargo_pkg_homepage() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:55:5] cargo_pkg_license() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:56:5] cargo_pkg_license_file() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:57:5] cargo_pkg_name() = \"build-rs-test-lib\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:58:5] cargo_pkg_readme() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:59:5] cargo_pkg_repository() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:60:5] cargo_pkg_rust_version() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:61:5] cargo_pkg_version() = \"0.0.0\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:62:5] cargo_pkg_version_major() = 0\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:63:5] cargo_pkg_version_minor() = 0\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:64:5] cargo_pkg_version_patch() = 0\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:65:5] cargo_pkg_version_pre() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:66:5] debug() = \"true\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:67:5] dep_metadata(\"z\", \"include\") = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:68:5] host() = \"aarch64-unknown-linux-gnu\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:69:5] num_jobs() = 6\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:70:5] opt_level() = \"0\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:71:5] out_dir() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/out\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:72:5] profile() = \"debug\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:73:5] rustc() = \"/root/bsw/work/target/cargo/debug/build/build-rs-test-lib/4d3b328e9f63b7ac/blaze-rustc/rustc\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:74:5] rustc_linker() = Some(\n    \"/nix/store/9ybki05zzk37qgjbhixa5wqi1frv2w3a-ix-mold-cc/bin/cc\",\n)\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:75:5] rustc_workspace_wrapper() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:76:5] rustc_wrapper() = None\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:77:5] rustdoc() = \"rustdoc\"\n[/root/bsw/work/src/cargo/crates/build-rs-test-lib/build.rs:78:5] target() = \"aarch64-unknown-linux-gnu\"\n",
    "native_stdout_known": false,
    "stdout_same": false,
    "files_same": true,
@@ -218,8 +218,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/camino-1.1.12",
       "error": null,
       "ms": 35,
-      "program": "/root/bsw/work/target/cargo/debug/build/camino/4379a33e8490ac25/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/camino/4379a33e8490ac25/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/camino/4379a33e8490ac25/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/camino/4379a33e8490ac25/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -266,7 +266,7 @@
       "status": null
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x47c169 - build_script_build.wasm!abort\n    1: 0x45e942 - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x428a2c - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x3ead15 - build_script_build.wasm!__rust_abort\n    4: 0x3eacdf - build_script_build.wasm!__rust_start_panic\n    5: 0x42dbbe - build_script_build.wasm!rust_panic\n    6: 0x42cf85 - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x26bb78 - build_script_build.wasm!ra-jit::{closure}::6245\n    8: 0x2071ab - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x3c54f2 - build_script_build.wasm!panic_impl\n   10: 0x3674be - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x361834 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic\n   12: 0x37c6d8 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::unimplemented_default_msg\n   13: 0x142486 - build_script_build.wasm!ra-jit.2fe35f87296df46a.<tar[2fe35f87296df46a]::header::Header>::fill_platform_from\n   14: 0x13645d - build_script_build.wasm!ra-jit.2fe35f87296df46a.<tar[2fe35f87296df46a]::header::Header>::fill_from\n   15: 0x12f059 - build_script_build.wasm!ra-jit.2fe35f87296df46a.<tar[2fe35f87296df46a]::header::Header>::set_metadata_in_mode\n   16: 0x127f0a - build_script_build.wasm!ra-jit.2fe35f87296df46a.tar[2fe35f87296df46a]::builder::append_file\n   17: 0x1252af - build_script_build.wasm!ra-jit.2fe35f87296df46a.tar[2fe35f87296df46a]::builder::append_path_with_name\n   18:  0x17478 - build_script_build.wasm!ra-jit::append_path_with_name::70\n   19:   0x4d0b - build_script_build.wasm!ra-jit::{closure}::23\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x47c169 - build_script_build.wasm!abort\n    1: 0x45e942 - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x428a2c - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x3ead15 - build_script_build.wasm!__rust_abort\n    4: 0x3eacdf - build_script_build.wasm!__rust_start_panic\n    5: 0x42dbbe - build_script_build.wasm!rust_panic\n    6: 0x42cf85 - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x26bb78 - build_script_build.wasm!blaze::{closure}::6245\n    8: 0x2071ab - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x3c54f2 - build_script_build.wasm!panic_impl\n   10: 0x3674be - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x361834 - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic\n   12: 0x37c6d8 - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::unimplemented_default_msg\n   13: 0x142486 - build_script_build.wasm!blaze.2fe35f87296df46a.<tar[2fe35f87296df46a]::header::Header>::fill_platform_from\n   14: 0x13645d - build_script_build.wasm!blaze.2fe35f87296df46a.<tar[2fe35f87296df46a]::header::Header>::fill_from\n   15: 0x12f059 - build_script_build.wasm!blaze.2fe35f87296df46a.<tar[2fe35f87296df46a]::header::Header>::set_metadata_in_mode\n   16: 0x127f0a - build_script_build.wasm!blaze.2fe35f87296df46a.tar[2fe35f87296df46a]::builder::append_file\n   17: 0x1252af - build_script_build.wasm!blaze.2fe35f87296df46a.tar[2fe35f87296df46a]::builder::append_path_with_name\n   18:  0x17478 - build_script_build.wasm!blaze::append_path_with_name::70\n   19:   0x4d0b - build_script_build.wasm!blaze::{closure}::23\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "git": 1
     }
@@ -344,8 +344,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.0",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/cargo/debug/build/crc32fast/2139661cac844a9e/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/crc32fast/2139661cac844a9e/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/crc32fast/2139661cac844a9e/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/crc32fast/2139661cac844a9e/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -602,8 +602,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7",
       "error": null,
       "ms": 20,
-      "program": "/root/bsw/work/target/cargo/debug/build/generic-array/6f3c991025b346c4/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/generic-array/6f3c991025b346c4/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/generic-array/6f3c991025b346c4/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/generic-array/6f3c991025b346c4/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -733,8 +733,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/im-rc-15.1.0",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/cargo/debug/build/im-rc/2c2f177f1a7646d7/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/im-rc/2c2f177f1a7646d7/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/im-rc/2c2f177f1a7646d7/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/im-rc/2c2f177f1a7646d7/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -771,8 +771,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.174",
       "error": null,
       "ms": 18,
-      "program": "/root/bsw/work/target/cargo/debug/build/libc/6e5e2fc462295101/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/libc/6e5e2fc462295101/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/libc/6e5e2fc462295101/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/libc/6e5e2fc462295101/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -1157,7 +1157,7 @@
       "status": null
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x6b891b - build_script_build.wasm!abort\n    1: 0x681b7a - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x63bc95 - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x5fdf7e - build_script_build.wasm!__rust_abort\n    4: 0x5fdf48 - build_script_build.wasm!__rust_start_panic\n    5: 0x640e27 - build_script_build.wasm!rust_panic\n    6: 0x6401ee - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x3c7c97 - build_script_build.wasm!ra-jit::{closure}::6245\n    8: 0x342da6 - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x5c34a0 - build_script_build.wasm!panic_impl\n   10: 0x54b61e - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x66c8fb - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::paths::unsupported::split_paths\n   12:   0x79cd - build_script_build.wasm!ra_jit::split_paths::n34\n   13: 0x1fb4c1 - build_script_build.wasm!ra-jit.c3a2850baee6d000.build_script_build[c3a2850baee6d000]::main\n   14: 0x193967 - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n3584\n   15: 0x193839 - build_script_build.wasm!ra_jit::{closure}::n3583\n   16: 0x501a67 - build_script_build.wasm!ra-jit::do_call::12179\n   17: 0x4da32f - build_script_build.wasm!ra-jit::catch_unwind::11616\n   18: 0x4b3054 - build_script_build.wasm!ra-jit::catch_unwind::10908\n   19: 0x484b55 - build_script_build.wasm!ra-jit::{closure}::9978\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x6b891b - build_script_build.wasm!abort\n    1: 0x681b7a - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x63bc95 - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x5fdf7e - build_script_build.wasm!__rust_abort\n    4: 0x5fdf48 - build_script_build.wasm!__rust_start_panic\n    5: 0x640e27 - build_script_build.wasm!rust_panic\n    6: 0x6401ee - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x3c7c97 - build_script_build.wasm!blaze::{closure}::6245\n    8: 0x342da6 - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x5c34a0 - build_script_build.wasm!panic_impl\n   10: 0x54b61e - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x66c8fb - build_script_build.wasm!blaze.5502588822008fc7.std::sys::paths::unsupported::split_paths\n   12:   0x79cd - build_script_build.wasm!blaze::split_paths::n34\n   13: 0x1fb4c1 - build_script_build.wasm!blaze.c3a2850baee6d000.build_script_build[c3a2850baee6d000]::main\n   14: 0x193967 - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n3584\n   15: 0x193839 - build_script_build.wasm!blaze::{closure}::n3583\n   16: 0x501a67 - build_script_build.wasm!blaze::do_call::12179\n   17: 0x4da32f - build_script_build.wasm!blaze::catch_unwind::11616\n   18: 0x4b3054 - build_script_build.wasm!blaze::catch_unwind::10908\n   19: 0x484b55 - build_script_build.wasm!blaze::{closure}::9978\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "git": 1
     }
@@ -1323,13 +1323,13 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/lock_api-0.4.13",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/cargo/debug/build/lock_api/8cb9a788574df9f6/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/lock_api/8cb9a788574df9f6/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/lock_api/8cb9a788574df9f6/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/lock_api/8cb9a788574df9f6/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x319452 - build_script_build.wasm!abort\n    1: 0x2f87fa - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2c91aa - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x28b493 - build_script_build.wasm!__rust_abort\n    4: 0x28b45d - build_script_build.wasm!__rust_start_panic\n    5: 0x2ce33c - build_script_build.wasm!rust_panic\n    6: 0x2cd703 - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10a7ab - build_script_build.wasm!ra-jit::{closure}::6245\n    8:  0xabb5e - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x25a97b - build_script_build.wasm!panic_impl\n   10: 0x1faffb - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x27d6ad - build_script_build.wasm!ra-jit.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x3794 - build_script_build.wasm!ra-jit::unwrap_failed::11\n   13:   0x1d37 - build_script_build.wasm!ra-jit::unwrap::2\n   14:  0x47a28 - build_script_build.wasm!ra-jit.7b0458554a30969f.autocfg[7b0458554a30969f]::new\n   15:  0x47757 - build_script_build.wasm!ra-jit.ca6f1ade8f44ba80.build_script_build[ca6f1ade8f44ba80]::main\n   16:   0x57a6 - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n41\n   17:   0x5678 - build_script_build.wasm!ra_jit::{closure}::n40\n   18: 0x1ce3f0 - build_script_build.wasm!ra-jit::do_call::12179\n   19: 0x1b63fa - build_script_build.wasm!ra-jit::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x319452 - build_script_build.wasm!abort\n    1: 0x2f87fa - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2c91aa - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x28b493 - build_script_build.wasm!__rust_abort\n    4: 0x28b45d - build_script_build.wasm!__rust_start_panic\n    5: 0x2ce33c - build_script_build.wasm!rust_panic\n    6: 0x2cd703 - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10a7ab - build_script_build.wasm!blaze::{closure}::6245\n    8:  0xabb5e - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x25a97b - build_script_build.wasm!panic_impl\n   10: 0x1faffb - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x27d6ad - build_script_build.wasm!blaze.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x3794 - build_script_build.wasm!blaze::unwrap_failed::11\n   13:   0x1d37 - build_script_build.wasm!blaze::unwrap::2\n   14:  0x47a28 - build_script_build.wasm!blaze.7b0458554a30969f.autocfg[7b0458554a30969f]::new\n   15:  0x47757 - build_script_build.wasm!blaze.ca6f1ade8f44ba80.build_script_build[ca6f1ade8f44ba80]::main\n   16:   0x57a6 - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n41\n   17:   0x5678 - build_script_build.wasm!blaze::{closure}::n40\n   18: 0x1ce3f0 - build_script_build.wasm!blaze::do_call::12179\n   19: 0x1b63fa - build_script_build.wasm!blaze::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "rustc": 1
     }
@@ -1366,13 +1366,13 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/num-traits-0.2.19",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/cargo/debug/build/num-traits/5444906ada933885/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/num-traits/5444906ada933885/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/num-traits/5444906ada933885/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/num-traits/5444906ada933885/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
     ],
-    "trap": "error while executing at wasm backtrace:\n    0: 0x3193da - build_script_build.wasm!abort\n    1: 0x2f8782 - build_script_build.wasm!ra-jit.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2c9132 - build_script_build.wasm!ra-jit.5502588822008fc7.std::process::abort\n    3: 0x28b41b - build_script_build.wasm!__rust_abort\n    4: 0x28b3e5 - build_script_build.wasm!__rust_start_panic\n    5: 0x2ce2c4 - build_script_build.wasm!rust_panic\n    6: 0x2cd68b - build_script_build.wasm!ra-jit.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10a9c0 - build_script_build.wasm!ra-jit::{closure}::6245\n    8:  0xabd73 - build_script_build.wasm!ra-jit::__rust_end_short_backtrace::3289\n    9: 0x25a9be - build_script_build.wasm!panic_impl\n   10: 0x1fb127 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x27d635 - build_script_build.wasm!ra-jit.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x727e - build_script_build.wasm!ra-jit::unwrap_failed::50\n   13:   0x1d3f - build_script_build.wasm!ra-jit::unwrap::2\n   14:  0x47b38 - build_script_build.wasm!ra-jit.7b0458554a30969f.autocfg[7b0458554a30969f]::new\n   15:  0x47915 - build_script_build.wasm!ra-jit.e8d0093088c022b3.build_script_build[e8d0093088c022b3]::main\n   16:  0x18ca5 - build_script_build.wasm!ra_jit::__rust_begin_short_backtrace::n231\n   17:  0x18b77 - build_script_build.wasm!ra_jit::{closure}::n230\n   18: 0x1ce605 - build_script_build.wasm!ra-jit::do_call::12179\n   19: 0x1b660f - build_script_build.wasm!ra-jit::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
+    "trap": "error while executing at wasm backtrace:\n    0: 0x3193da - build_script_build.wasm!abort\n    1: 0x2f8782 - build_script_build.wasm!blaze.5502588822008fc7.std::sys::pal::wasi::abort_internal\n    2: 0x2c9132 - build_script_build.wasm!blaze.5502588822008fc7.std::process::abort\n    3: 0x28b41b - build_script_build.wasm!__rust_abort\n    4: 0x28b3e5 - build_script_build.wasm!__rust_start_panic\n    5: 0x2ce2c4 - build_script_build.wasm!rust_panic\n    6: 0x2cd68b - build_script_build.wasm!blaze.5502588822008fc7.std::panicking::panic_with_hook\n    7: 0x10a9c0 - build_script_build.wasm!blaze::{closure}::6245\n    8:  0xabd73 - build_script_build.wasm!blaze::__rust_end_short_backtrace::3289\n    9: 0x25a9be - build_script_build.wasm!panic_impl\n   10: 0x1fb127 - build_script_build.wasm!blaze.a65469441c0c3297.core::panicking::panic_fmt\n   11: 0x27d635 - build_script_build.wasm!blaze.a65469441c0c3297.core::result::unwrap_failed::unwrap_failed_inner.505552b3f8164a87\n   12:   0x727e - build_script_build.wasm!blaze::unwrap_failed::50\n   13:   0x1d3f - build_script_build.wasm!blaze::unwrap::2\n   14:  0x47b38 - build_script_build.wasm!blaze.7b0458554a30969f.autocfg[7b0458554a30969f]::new\n   15:  0x47915 - build_script_build.wasm!blaze.e8d0093088c022b3.build_script_build[e8d0093088c022b3]::main\n   16:  0x18ca5 - build_script_build.wasm!blaze::__rust_begin_short_backtrace::n231\n   17:  0x18b77 - build_script_build.wasm!blaze::{closure}::n230\n   18: 0x1ce605 - build_script_build.wasm!blaze::do_call::12179\n   19: 0x1b660f - build_script_build.wasm!blaze::catch_unwind::11616\n\nCaused by:\n    wasm trap: wasm `unreachable` instruction executed\n",
     "tools_by_program": {
      "rustc": 1
     }
@@ -1518,8 +1518,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.101",
       "error": null,
       "ms": 14,
-      "program": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -1536,8 +1536,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.101",
       "error": null,
       "ms": 3299,
-      "program": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/proc-macro2/f058d7e8d12064f2/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -1628,8 +1628,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.0.8",
       "error": null,
       "ms": 3450,
-      "program": "/root/bsw/work/target/cargo/debug/build/rustix/9678919f468bad68/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/rustix/9678919f468bad68/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/rustix/9678919f468bad68/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/rustix/9678919f468bad68/blaze-rustc/rustc",
       "refused": null,
       "status": 1
      }
@@ -1666,8 +1666,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/semver-1.0.26",
       "error": null,
       "ms": 11,
-      "program": "/root/bsw/work/target/cargo/debug/build/semver/8cb5439d52421beb/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/semver/8cb5439d52421beb/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/semver/8cb5439d52421beb/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/semver/8cb5439d52421beb/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -1704,8 +1704,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.219",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/cargo/debug/build/serde/a35d8e24675e501f/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/serde/a35d8e24675e501f/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/serde/a35d8e24675e501f/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/serde/a35d8e24675e501f/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -1765,8 +1765,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/syn-1.0.109",
       "error": null,
       "ms": 19,
-      "program": "/root/bsw/work/target/cargo/debug/build/syn/c4407ddb8ab3d914/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/syn/c4407ddb8ab3d914/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/syn/c4407ddb8ab3d914/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/syn/c4407ddb8ab3d914/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -1809,8 +1809,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-1.0.69",
       "error": null,
       "ms": 3509,
-      "program": "/root/bsw/work/target/cargo/debug/build/thiserror/7f80e853096c2a04/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/thiserror/7f80e853096c2a04/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/thiserror/7f80e853096c2a04/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/thiserror/7f80e853096c2a04/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -1853,8 +1853,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.16",
       "error": null,
       "ms": 3493,
-      "program": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -1865,8 +1865,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.16",
       "error": null,
       "ms": 10,
-      "program": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/thiserror/d689174bf35f2fb9/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -1905,8 +1905,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/typeid-1.0.3",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/cargo/debug/build/typeid/8405aa034911ca68/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/typeid/8405aa034911ca68/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/typeid/8405aa034911ca68/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/typeid/8405aa034911ca68/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -2021,8 +2021,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zerocopy-0.8.26",
       "error": null,
       "ms": 10,
-      "program": "/root/bsw/work/target/cargo/debug/build/zerocopy/dd3cc12f0022be46/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/cargo/debug/build/zerocopy/dd3cc12f0022be46/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/cargo/debug/build/zerocopy/dd3cc12f0022be46/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/cargo/debug/build/zerocopy/dd3cc12f0022be46/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }

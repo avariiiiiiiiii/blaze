@@ -46,7 +46,7 @@ said plainly when it happens:
 ## What blaze takes from a Rust toolchain today
 
 Measured on main at 012f0e91e3 (2026-10-25); the sizes are those of `nightly-2026-10-25`'s
-components, as `crates/ra-jit/src/cargo/toolchain/pins.txt` lists them. Each piece, what uses
+components, as `crates/blaze-engine/src/cargo/toolchain/pins.txt` lists them. Each piece, what uses
 it, and the step that ends the need for it ([no-rustc.md](no-rustc.md#the-plan)).
 
 | Piece | Size (xz, Linux x86-64) | What uses it | Removed by |
@@ -80,7 +80,7 @@ to it, that no project's pin or `PATH` changes:
   lays out a toolchain, with its channel manifest, so that blaze's sysroot rules read it
   unchanged.
 - **Checked:** the sha256 of each component is compiled into blaze, from the channel
-  manifest of the nightly (`crates/ra-jit/src/cargo/toolchain/pins.txt`); a download whose
+  manifest of the nightly (`crates/blaze-engine/src/cargo/toolchain/pins.txt`); a download whose
   bytes differ is not used.
 - **When:** install.sh fetches it after installing blaze, and blaze fetches it itself on the
   first build that needs it and finds no other copy (a `cargo install` of blaze, a deleted
@@ -161,7 +161,7 @@ leaves to cargo (#321); bun, swc and agave cargo 1.99.0 (the oracle then) does n
 whole build builds (5.9 and 6.5 s in two runs, cargo's 6.2 and 6.1 s, on a shared host): its example no longer reaches `mime_guess`, whose
 build script its build never ran. Left: the unit graph (#335), choosing versions (#321).
 
-2026-10-25, the programs of a whole build: `cargo blaze build` with `BLAZE_WHOLE_BUILD=1`
+2026-10-25, the programs of a whole build: `blaze build` with `BLAZE_WHOLE_BUILD=1`
 takes the programs it links from blaze-metadata's `programs` (the binaries of the build's
 members whose `required-features` it has, or the `--bin` or `--example` named), for the
 target's cfg as blaze answers `rustc --print cfg` itself, instead of `cargo build
@@ -218,23 +218,23 @@ serde_derive, thiserror-impl, tokio-macros and clap_derive equal to the toolchai
 #310 (54301ec5's first-build lane), cargo builds the workspace and the daemon takes over after.
 K replaces cargo's build in that flow, keeping 54301ec5's lane on the rest of it:
 
-1. `cargo blaze build` and `run` from nothing build the program whole with blaze (step G's
+1. `blaze build` and `run` from nothing build the program whole with blaze (step G's
    build, every crate from source over the shipped standard library, linked by blaze), and
    write each executable where cargo would, so `run`, scripts and IDEs find it. The build
    scripts are compiled by blaze (I) and run by blaze's runner ([build scripts](#build-scripts));
    the proc macros are J's. What blaze cannot compile and the program reaches fails the build
    with the reason: there is no build by cargo to go to. While it is shown equal on the bench
-   apps (each program's runs printing what cargo's does, as `allrajit.py` checks), it is behind
+   apps (each program's runs printing what cargo's does, as `allblaze.py` checks), it is behind
    a setting, then the default. Behind `BLAZE_WHOLE_BUILD=1` since 2026-10-25, with the build
    scripts and proc macros still the load's ([Status](#status)).
 2. The first edits patch blaze's own executable, not rustc's (#11): no rustc base.
-3. `cargo blaze test` from nothing the same, with blaze's harness (H).
+3. `blaze test` from nothing the same, with blaze's harness (H).
 
 The bar is step K's: with a warm remote, no slower than cargo's cold build; with an empty
 store, measured and published beside cargo's.
 
 **M, the wrapper and the fallback** ([#93](https://github.com/indexable-inc/blaze/issues/93)).
-Once K and J are the default: `ra-jit-rustc`, `ra-jit-rustc-first`, the stand-ins, the dep-info
+Once K and J are the default: `blaze-rustc`, `blaze-rustc-first`, the stand-ins, the dep-info
 runs, `settle`, `by_cargo`, `ToCargo` and `only_cargo` are deleted; plain cargo after `blaze
 enable` names blaze as `build.rustc`; the count of [no-rustc.md](no-rustc.md#how-often) is zero.
 Then blaze's own toolchain loses `rustc` and `rust-std`. The link still needs an lld on ELF
@@ -243,7 +243,7 @@ with the system's `cc` and an lld it finds, a choice for that step, measured on 
 
 ## The whole build in place of `cargo build`: what stands between them (2026-10-25)
 
-Step G's whole build (`ra-jit <package> --crate <root> --out --exe`, every crate compiled by
+Step G's whole build (`blaze <package> --crate <root> --out --exe`, every crate compiled by
 blaze over the shipped standard library and linked by blaze) run on bench.py's projects from an
 empty store, then again on the store it filled, against cargo's own cold build into a target
 directory of its own, on dev-aws-8 (Cranelift, main at 3e03d4298a, the host shared at a load
@@ -280,9 +280,9 @@ All **read**. What stands between this and replacing `cargo build`:
   blaze compiled. **read**
 - **Time.** On an empty store blaze is 1.7-3.7 times cargo's cold build (fd is the exception,
   where cargo's is slow), and 2.6 times on nushell. Part is the standard library: the remote
-  `ra-jit std` makes has only the unit of the do-nothing build script, at no debug info, and a
+  `blaze-engine std` makes has only the unit of the do-nothing build script, at no debug info, and a
   program's dev build keys its unit at line tables, so every build compiled the library again
-  (about 10 s, 22,920 of 39,232 functions). **read**. `ra-jit std` now ships the dev program's
+  (about 10 s, 22,920 of 39,232 functions). **read**. `blaze-engine std` now ships the dev program's
   unit too ([#330](https://github.com/indexable-inc/blaze/pull/330)): ripgrep from an empty store
   went from 19.4 s to 9.9 s. **read**. The warm store is not yet as warm as it can be: nushell's second
   build found 88,116 entries that "call what cannot be used" and compiled 95,813 functions
@@ -292,7 +292,7 @@ All **read**. What stands between this and replacing `cargo build`:
   That is M's and the resolver's. **read**
 - biome's load expanded 13,548 proc-macro calls in 167 s, 5,478 function-like ones in 136 s,
   and the build held 38 GB. **read**
-- `harness/allrajit.py`'s set (five programs, a shared library, a proc-macro crate, built whole,
+- `harness/allblaze.py`'s set (five programs, a shared library, a proc-macro crate, built whole,
   over the unit and stored) passes on the same host: each built and linked in 1.6-17.5 s and
   ran as cargo's build does. **read**
 
@@ -344,33 +344,33 @@ and zed's vendored packages 51/51 and 1533/1533. Not yet: blaze-resolve's `Regis
 registries that need credentials (#315), git indexes (#316), cargo's last-use record (#317),
 a path package's file list (#318).
 
-2026-10-25, J (proc macros): with `BLAZE_PROC_MACRO_SERVER`, a load into ra-jit's own
-target directory has ra-jit link the proc macros and its server expand them; over fd, bat,
+2026-10-25, J (proc macros): with `BLAZE_PROC_MACRO_SERVER`, a load into blaze's own
+target directory has blaze link the proc macros and its server expand them; over fd, bat,
 hyperfine, just, nushell and helix, 3,465 calls expanded the same as the toolchain's server
 with rustc's libraries, 12 not compared (`pest_consume_macros`,
 [#327](https://github.com/indexable-inc/blaze/issues/327)). The Linux archive has the server
-beside `ra-jit` (built by it in 30 s on dev-aws-8), and `BLAZE_PROC_MACRO_SERVER=1` takes it
+beside `blaze` (built by it in 30 s on dev-aws-8), and `BLAZE_PROC_MACRO_SERVER=1` takes it
 from there: a load of fd starts no toolchain server. It is the default: the daemon's loads,
 the checker's and build scripts' expand with blaze's libraries, made from each crate's record
 and kept in the store; built again over that store, the six apps link none again and expand
 the same 3,465 calls.
 
-2026-10-25, no rustup: `cargo blaze` reads the workspace with blaze-manifest where it ran
+2026-10-25, no rustup: `blaze` reads the workspace with blaze-manifest where it ran
 `cargo metadata --no-deps` (#319; 385 of 385 workspaces equal, [resolve.md](resolve.md)), and
 install.sh installs blaze on a machine with no Rust: blaze downloads its own 1.99.0 (#322 and
 #340, landed together in #340). Measured on dev-aws-8 in a Debian 13 container with curl and
 gcc and no rustup, cargo or rustc, the archive served from the host and Rust from
 static.rust-lang.org over AWS's network: install.sh 5.5 s, the first `blaze run` of a new
-project 3.8 s (the daemon's load; `Finished ... [ra-jit]`), 9.2 s from the first `curl` to
+project 3.8 s (the daemon's load; `Finished ... [blaze]`), 9.2 s from the first `curl` to
 `Hello, world!`. On disk: 88 MB in `~/.cargo/bin`, 672 MB in `~/.blaze/toolchains`, 17 MB in
 `~/.cache`, no `~/.rustup`. The same install through rustup before (Debian 12, 2026-10-25):
 10.7 s, 91 MB and 672 MB in `~/.rustup`. All **read**. The Linux release needs glibc 2.39, so
 Debian 12 cannot run it ([#351](https://github.com/indexable-inc/blaze/issues/351)).
 
-2026-10-25, K's first part: with `BLAZE_WHOLE_BUILD=1`, `cargo blaze build` and `run` from
+2026-10-25, K's first part: with `BLAZE_WHOLE_BUILD=1`, `blaze build` and `run` from
 nothing are the whole build above, no `cargo build` ([cargo.md](cargo.md#what-a-build-does));
 `harness/coldbuild.py` holds its fixtures to cargo's, and with `bench` does bench.py's projects:
-`cargo blaze build` from nothing against `cargo build`, each program's output the same, on
+`blaze build` from nothing against `cargo build`, each program's output the same, on
 dev-aws-8 (loaded): ripgrep 22.2 s against 6.0 s, fd 48.4 against 28.6, hyperfine 24.5 against
 5.8, just 29.2 against 8.3, bat 33.2 against 10.5, nushell 102.4 against 36.2. **read**. Off by
 default until axum's and biome's builds are whole and the cold times are near cargo's.

@@ -2,7 +2,7 @@
 """netdown.py: a build never waits on the network (docs/cache.md, "The standard library").
 
 The standard library a release ships is fetched from a remote over HTTP. Here that remote is
-made by the ra-jit under test (`ra-jit std`) and served from this process, as it is, slowly
+made by the blaze under test (`blaze-engine std`) and served from this process, as it is, slowly
 (each answer after SLOW seconds), as a server that takes the connection and never answers
 (`hang`), and as an address nothing answers at (`dead`, an unroutable one: the connection is
 never made). Each build is hello world's whole program, which starts from the standard library.
@@ -15,7 +15,7 @@ never made). Each build is hello world's whole program, which starts from the st
     fetch nothing (BLAZE_STD_FROM=off), within 5% or 0.5 s, where waiting would cost SLOW
     seconds or more, and says that the fetch failed in one line at most.
 
-    netdown.py --bin target/release/ra-jit [--toolchain nightly-YYYY-MM-DD]
+    netdown.py --bin target/release/blaze-engine [--toolchain nightly-YYYY-MM-DD]
 
 rustup has to have the toolchain (harness/toolchain by default), with rust-src. Python 3,
 stdlib only.
@@ -126,7 +126,7 @@ def main():
         made = subprocess.run([binary, "std", remote, sysroot], env=builds.env(os.path.join(work, "std-store"), "off"),
                               capture_output=True, text=True, timeout=3600)
         if made.returncode != 0:
-            sys.exit(f"error: netdown: ra-jit std failed:\n{made.stderr[-3000:]}")
+            sys.exit(f"error: netdown: blaze-engine std failed:\n{made.stderr[-3000:]}")
         served = os.path.join(work, "served")
         os.makedirs(served)
         for dir, _, files in os.walk(remote):

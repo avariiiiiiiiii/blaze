@@ -3,7 +3,7 @@
 // Reduced in 84 builds. Again: fuzz.py check differs-checksum-L2-372-c9.rs
 // rustc:
 // c9 606d53f1c3cd6678 ok
-// ra-jit:
+// blaze:
 // c9 ca7633d1ee1586d1 ok
 mod c9 {
     use super::*;

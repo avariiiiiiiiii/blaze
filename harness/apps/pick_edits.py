@@ -11,7 +11,7 @@ condition  `x.is_empty()` written as `x.len() == 0`
 
 Candidates are taken from the package's own `src`, spread over its files in a fixed order, and
 each is kept only if `cargo check` still passes with it on top of the ones before it, as the
-edit loop applies them. Nothing is chosen by what ra-jit does with it.
+edit loop applies them. Nothing is chosen by what blaze does with it.
 """
 import json, os, re, subprocess, sys
 

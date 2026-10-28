@@ -14,7 +14,7 @@ that deleted it and written to `<work>/<suite>/pruned.json`. Nothing is rewritte
 runs as the Rust project wrote it or is not there.
 
 The package that is left is then given to cratetest.py, which builds each test binary with
-rustc and again with ra-jit's objects in front, runs both and compares every test by name.
+rustc and again with blaze's objects in front, runs both and compares every test by name.
 """
 import argparse, collections, json, os, re, shutil, subprocess, sys
 
@@ -238,7 +238,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("checkout")
     ap.add_argument("suite", choices=sorted(SUITES))
-    ap.add_argument("--work", default=os.path.expanduser("~/ra-jit-lib"))
+    ap.add_argument("--work", default=os.path.expanduser("~/blaze-lib"))
     ap.add_argument("--prepare-only", action="store_true")
     ap.add_argument("--limit", type=int, default=60, help="seconds a test may run in rustc's own binary")
     own = sys.argv[1:sys.argv.index("--")] if "--" in sys.argv else sys.argv[1:]

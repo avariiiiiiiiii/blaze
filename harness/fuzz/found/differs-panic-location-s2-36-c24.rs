@@ -5,7 +5,7 @@
 // panic: panicked at src/main.rs:408:32:
 // index out of bounds: the len is 3 but the index is 10
 // c24 dead786553ac6654 ok
-// ra-jit:
+// blaze:
 // panic: panicked at src/main.rs:408:21:
 // index out of bounds: the len is 3 but the index is 10
 // c24 dead786553ac6654 ok

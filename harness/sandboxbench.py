@@ -2,21 +2,21 @@
 """sandboxbench.py: what the sandbox a test runs in costs, on Linux and macOS.
 
 usage: sandboxbench.py [--cpus 0-15] [--rounds 5] [--runs 600] [--tests 600] [--io 50]
-       (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+       (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 Two measurements, each in `--rounds` rounds whose setups alternate, as medians with the
 lowest and highest of the rounds:
 
 - a program that does nothing, run `--runs` times one after another and 16 at a time, bare
-  and in `ra-jit sandbox` (with no record, which installs no seccomp filter, and with a
+  and in `blaze sandbox` (with no record, which installs no seccomp filter, and with a
   record of what it wrote and reached);
 - a generated library, opted into sandboxed tests, with `--tests` unit tests, `--io` of which
-  read a file of the package and write one in the package and one in `std::env::temp_dir()`, under `cargo ra-jit test`
+  read a file of the package and write one in the package and one in `std::env::temp_dir()`, under `blaze test`
   once the daemon serves its build: with `BLAZE_SANDBOX=off`, in the sandbox under
   `BLAZE_TESTS=all`, under `affected` with what passed forgotten before each run (so every
   test runs and records what it reads), and as one process per test (`--exact name`, 16 at a
   time), in a sandbox each and bare. The command's wall time is given whole and less that of
-  `cargo ra-jit test --no-run` (the build and the daemon's answer, which every setup has).
+  `blaze test --no-run` (the build and the daemon's answer, which every setup has).
   It is `--lib`: the doc tests, which load the workspace whatever runs them, are not measured.
 
 On Linux the process and what it runs are kept to `--cpus` (`sched_setaffinity`, which
@@ -156,12 +156,12 @@ async def main():
     pinned = hasattr(os, "sched_setaffinity")
     if pinned:
         os.sched_setaffinity(0, cpus)
-    ra_jit = os.environ["BLAZE_BIN"]
-    bin_dir = os.path.dirname(os.path.abspath(ra_jit))
+    blaze = os.environ["BLAZE_BIN"]
+    bin_dir = os.path.dirname(os.path.abspath(blaze))
     where = f"cpus {args.cpus}" if pinned else f"{os.cpu_count()} cpus, not pinned"
     print(f"{sys.platform}: {where}, {parallel} at a time; load {os.getloadavg()}", flush=True)
 
-    root = tempfile.mkdtemp(prefix="ra-jit-sandboxbench-")
+    root = tempfile.mkdtemp(prefix="blaze-sandboxbench-")
     home = tempfile.mkdtemp(prefix="rj-sb-", dir="/tmp")
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
                RUST_BACKTRACE="0")
@@ -180,8 +180,8 @@ async def main():
         rec_spec = spec(os.path.join(root, "rec.json"), root, env, [root], os.path.join(root, "rec"))
         setups = {
             "bare": [nothing],
-            "sandbox": [ra_jit, "sandbox", bare_spec, "--", nothing],
-            "sandbox+record": [ra_jit, "sandbox", rec_spec, "--", nothing],
+            "sandbox": [blaze, "sandbox", bare_spec, "--", nothing],
+            "sandbox+record": [blaze, "sandbox", rec_spec, "--", nothing],
         }
         trivial = {f"{name}, {way}": [] for name in setups for way in ("1 at a time", f"{parallel} at a time")}
         for _ in range(args.rounds):
@@ -196,7 +196,7 @@ async def main():
 
         # The library of tests.
         library(pkg, args.tests, args.io)
-        test = ["cargo", "ra-jit", "test", "--lib"]
+        test = ["blaze", "test", "--lib"]
         deadline = time.monotonic() + 600
         while True:
             _, said = await run(test, cwd=pkg, env=env)
@@ -226,7 +226,7 @@ async def main():
                     path = os.path.join(specs, f"{i}.json")
                     with open(path, "w") as f:
                         json.dump(it, f)
-                    argv = [ra_jit, "sandbox", path, "--", *argv]
+                    argv = [blaze, "sandbox", path, "--", *argv]
                 argvs.append(argv)
             return await timed(argvs, parallel, cwd=pkg, env=env)
 
@@ -258,7 +258,7 @@ async def main():
         for _ in range(args.rounds):
             for name, measure in modes.items():
                 times[name].append(await measure())
-        print(f"\n`cargo ra-jit test` of {args.tests} tests ({args.io} that read and write files), whole command")
+        print(f"\n`blaze test` of {args.tests} tests ({args.io} that read and write files), whole command")
         table(times)
         base = statistics.median(times["build only (--no-run)"])
         print(f"\nless the build's median ({base:.3f} s): the tests' part")
@@ -266,7 +266,7 @@ async def main():
             print(f"  {name}: {statistics.median(times[name]) - base:.3f}")
     finally:
         if os.path.isdir(pkg):
-            await run(["cargo", "ra-jit", "stop"], cwd=pkg, env=env, timeout=120, ok=None)
+            await run(["blaze", "stop"], cwd=pkg, env=env, timeout=120, ok=None)
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(home, ignore_errors=True)
 

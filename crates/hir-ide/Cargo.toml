@@ -25,10 +25,10 @@ typed-arena = "2.0.2"
 rustc_apfloat = "0.2.3"
 salsa.workspace = true
 
-ra-ap-rustc_abi.workspace = true
+rustc_abi.workspace = true
 ra-ap-rustc_pattern_analysis.workspace = true
 ra-ap-rustc_ast_ir.workspace = true
-ra-ap-rustc_type_ir.workspace = true
+rustc_type_ir.workspace = true
 
 # local deps
 stdx.workspace = true

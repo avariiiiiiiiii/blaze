@@ -1,4 +1,4 @@
-# bun (oven-sh/bun 1.4.3, its Rust port: 1.25M lines in 103 crates) built through ra-jit on each
+# bun (oven-sh/bun 1.4.3, its Rust port: 1.25M lines in 103 crates) built through blaze on each
 # platform's dedicated benchmark machine, nightly: the edits of harness/bench.py and the runtime
 # of harness/runbench.py, stored as docs/benchmarks/bun-<platform>.json and
 # runtime-bun-<platform>.json (`benchreport.py --name bun`) and shown as a project like the others
@@ -6,7 +6,7 @@
 # (docs/research/bun.md says what it is). The platforms and their runners are bench-readme's
 # (harness/benchplatforms.py, BENCH_RUNNERS); one whose runner is not registered is skipped and
 # keeps its last numbers. Too slow for every push: bun's own build of its C and C++ (once per
-# revision, kept in BENCH_HOME), cargo's cold build and ra-jit's whole-program LLVM build each
+# revision, kept in BENCH_HOME), cargo's cold build and blaze's whole-program LLVM build each
 # take minutes. It shares bench-readme's concurrency group, so the two never run at once on the
 # machines.
 name: bench-bun
@@ -56,14 +56,14 @@ jobs:
     runs-on: ${{ matrix.labels }}
     timeout-minutes: 360
     env:
-      # Kept between runs, outside the checkout, as bench-readme's: ra-jit builds
+      # Kept between runs, outside the checkout, as bench-readme's: blaze builds
       # incrementally, bun is cloned once and its C and C++ built once per revision.
       BENCH_HOME: ${{ github.workspace }}/../bench-state
       BENCH_WORK: ${{ matrix.work }}
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v7
-      # bench.py runs the projects' tests with `cargo ra-jit test`, which sandboxes them in
+      # bench.py runs the projects' tests with `blaze test`, which sandboxes them in
       # namespaces a user makes; Ubuntu's AppArmor keeps users from that unless told otherwise.
       - name: user namespaces
         if: runner.os == 'Linux'
@@ -71,17 +71,17 @@ jobs:
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
             sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Build ra-jit (as released, and with the llvm feature)
+      - name: Build blaze (as released, and with the llvm feature)
         run: |
           mkdir -p "$BENCH_HOME"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p ra-jit --release
-          CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p ra-jit --release --features llvm
+          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p blaze-engine --release
+          CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p blaze-engine --release --features llvm
       # Edits: bun's own build of its C and C++ goes to BLAZE_PROJECTS/bun-native once per
       # revision (bunprep.py); the measured trees are copies of it.
       - name: Bench
         id: bench
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target/release/ra-jit" BLAZE_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit" BLAZE_PROJECTS="$BENCH_HOME/projects"
+          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine" BLAZE_LLVM_BIN="$BENCH_HOME/target-llvm/release/blaze-engine" BLAZE_PROJECTS="$BENCH_HOME/projects"
           work=${BENCH_WORK:+$BENCH_WORK-bun}
           work=${work:-$BENCH_HOME/work-bun}
           rm -rf "$work" "$BENCH_HOME/reference-bun"
@@ -92,7 +92,7 @@ jobs:
       - name: Runtime bench
         continue-on-error: true
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
+          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/blaze-engine" APPS_DIR="$BENCH_HOME/apps"
           nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime bun \
             --runs 5 --out "$RUNNER_TEMP/results/runtime-bun.json"
       - uses: actions/upload-artifact@v7
@@ -104,7 +104,7 @@ jobs:
       - name: Fail on a wrong result
         if: steps.bench.outputs.wrong == 'true'
         run: |
-          echo "::error::under ra-jit bun said something else than under cargo: see the Bench step"
+          echo "::error::under blaze bun said something else than under cargo: see the Bench step"
           exit 1
 
   publish:
@@ -118,7 +118,7 @@ jobs:
           fetch-depth: 0
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v8
         with:
           pattern: bench-bun-*

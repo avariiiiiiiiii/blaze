@@ -1,13 +1,13 @@
 # The disk store and the remote
 
-ra-jit keeps compiled functions in memory while a daemon runs. Two more layers keep them
+blaze keeps compiled functions in memory while a daemon runs. Two more layers keep them
 longer. The disk store is one directory on this machine that every daemon and every
 checkout of the user shares, on by default. The remote is a directory or an S3 bucket that
 several machines push to and pull from, off until you configure it.
 
 The reports behind this file are [reports/DISKCACHE.md](reports/DISKCACHE.md) and
 [reports/REMOTE.md](reports/REMOTE.md). The variables and commands below were checked
-against `crates/ra-jit-store/src/lib.rs` and `crates/ra-jit/src/remote.rs`.
+against `crates/blaze-store/src/lib.rs` and `crates/blaze-engine/src/remote.rs`.
 
 ## What is stored and under what key
 
@@ -37,19 +37,19 @@ with it, so a daemon that starts on a store holding the checkout's code takes th
 it is, and the first edit recompiles only what it touched. Before, those marks hashed ids
 of one process, and a started daemon compiled all it took of the checkout again before the
 first edit could be a patch (nushell: 73,586 functions, 9.4 s). A program that links
-rustc's code beside ra-jit's, an LLVM build and `#[ra_jit::cache]` functions keep no mark
-and still take that build ([#105](https://github.com/indexable-inc/ra-jit/issues/105)).
+rustc's code beside blaze's, an LLVM build and `#[blaze::cache]` functions keep no mark
+and still take that build ([#105](https://github.com/indexable-inc/blaze/issues/105)).
 
 Before a record is written, the store hashes that key together with the store format, what
-ra-jit was built from and the toolchain's commit. What it was built from is a hash
-`crates/ra-jit/build.rs` takes of every file of the workspace's crates and the vendored
+blaze was built from and the toolchain's commit. What it was built from is a hash
+`crates/blaze-engine/build.rs` takes of every file of the workspace's crates and the vendored
 ones, of `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml` and `harness/toolchain`, of the
 features, the target and whether debug assertions are on. An entry is
-therefore found by any build of ra-jit from the same sources on any machine, for the same
-toolchain: a CI runner that builds ra-jit for a commit that changes only the harnesses or
-the docs reuses the store of the commit before (`harness/storebuilds.py`). A ra-jit built
+therefore found by any build of blaze from the same sources on any machine, for the same
+toolchain: a CI runner that builds blaze for a commit that changes only the harnesses or
+the docs reuses the store of the commit before (`harness/storebuilds.py`). A blaze built
 outside this workspace (the published crate) keys by the bytes of its executable, as every
-build did before. Upgrading ra-jit makes the old
+build did before. Upgrading blaze makes the old
 entries unreachable; they are removed over time as least recently used.
 
 A build script's run is kept under a key with the checkout and the target directory apart:
@@ -57,7 +57,7 @@ its package's directory and the target directory its `OUT_DIR` is in are named b
 for them in the key and in what it printed and wrote, and put back as the checkout that reads
 it has them. A run that wrote a file that is no text naming either is kept for its own place
 alone, since a path of another length would break that file. The key still hashes the
-script's executable, which differs between target directories (what ra-jit links differs
+script's executable, which differs between target directories (what blaze links differs
 with what the store had, and an rlib holds the `OUT_DIR` an `include!` named), so a second
 checkout runs its scripts again until a script is keyed by what it was built from
 ([#105](https://github.com/indexable-inc/blaze/issues/105)).
@@ -69,7 +69,7 @@ change still prints what cargo's build prints.
 ### Proc-macro expansions
 
 The store also keeps what derive and attribute macros expand to, so a daemon that loads a
-workspace again does not run them again (`crates/ra-jit-expand`). This output cache applies
+workspace again does not run them again (`crates/blaze-expand`). This output cache applies
 to native proc macros. Default WASM proc macros retain session state and rerun expansions
 at every new database revision, including client requests without source changes ([cargo.md](cargo.md#proc-macros-run-as-webassembly)). The key is a SHA-256 of
 the macro library's content, the macro's name and kind, its input with each span replaced
@@ -94,18 +94,18 @@ keeps derives only ([research/proc-macro-cache.md](research/proc-macro-cache.md)
 
 ## The disk store
 
-The store is `ra-jit/store` in the user's cache directory (`$XDG_CACHE_HOME`, else
+The store is `blaze/store` in the user's cache directory (`$XDG_CACHE_HOME`, else
 `~/.cache`), whatever the checkout: two checkouts, or two projects with dependencies in
 common, keep a function once. `BLAZE_CACHE` names another directory, or `off` for none.
-The daemon reads the variable when it starts, so under `cargo blaze` it has to be set in
-the environment of the command that starts the daemon; run `cargo blaze stop` first if
-one is running. `cargo blaze status` says how much the store holds, the most it may hold,
+The daemon reads the variable when it starts, so under `blaze` it has to be set in
+the environment of the command that starts the daemon; run `blaze stop` first if
+one is running. `blaze status` says how much the store holds, the most it may hold,
 and where it is. A setting under its name from before the rename stops blaze, which says what
 it is called now ([rename.md](rename.md)).
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `BLAZE_CACHE` | the store's directory, or `off` | `ra-jit/store` in the user's cache directory |
+| `BLAZE_CACHE` | the store's directory, or `off` | `blaze/store` in the user's cache directory |
 | `BLAZE_CACHE_MAX` | the most the sealed packs may take: bytes, or a number with `K`, `M` or `G`, or `off` | a tenth of the disk the store is on that is free or the store's, at least 256M and at most 32G |
 | `BLAZE_CACHE_SEAL_AT` | size at which an open pack is sealed at the end of a build; exists for the harnesses | 4M |
 
@@ -156,7 +156,7 @@ at all it prints `store: not used: ...` and runs without a store.
 ### Size and collection
 
 A collection runs when a daemon opens the store, after it seals a pack, and on
-`ra-jit cache gc`. It seals open packs left behind, removes old temporaries, merges sealed
+`blaze-engine cache gc`. It seals open packs left behind, removes old temporaries, merges sealed
 packs smaller than 4M into one when there are more than 16 of them, and then removes the
 least recently used packs until the rest fit under `BLAZE_CACHE_MAX`. A pack counts as used
 when a daemon read a value from it during a build.
@@ -165,16 +165,16 @@ Eviction is by pack, not by record. One recently used record keeps its whole pac
 holds up to 64M of values (some 13M on disk), so a limit smaller than a few packs evicts
 nearly everything. The limit counts bytes on disk, compressed.
 
-Upgrading ra-jit leaves the old build's entries in the store, unreachable, until they are
-the least recently used; `ra-jit cache gc --max 0` empties the store at once.
+Upgrading blaze leaves the old build's entries in the store, unreachable, until they are
+the least recently used; `blaze-engine cache gc --max 0` empties the store at once.
 
 ### Commands
 
-These act on the store `cargo blaze status` names.
+These act on the store `blaze status` names.
 
-    ra-jit cache stats                 format, packs, bytes, limit, oldest and newest use
-    ra-jit cache verify                read everything; exit 1 if a pack is not what was written
-    ra-jit cache gc [--max SIZE]       collect now, to BLAZE_CACHE_MAX or to SIZE
+    blaze-engine cache stats                 format, packs, bytes, limit, oldest and newest use
+    blaze-engine cache verify                read everything; exit 1 if a pack is not what was written
+    blaze-engine cache gc [--max SIZE]       collect now, to BLAZE_CACHE_MAX or to SIZE
 
 ### Limits
 
@@ -195,7 +195,7 @@ standard library" below), or a tenant of blaze's cache gateway,
 from the variable `?token=env:NAME` names; without one the tenant is read anonymously, which a
 public tenant allows, and nothing is sent. Packs of 16 MB and more are fetched from it in ranges
 of 8 MB, `BLAZE_REMOTE_JOBS` at a time, and objects over 90 MB go up in parts. A gateway is not
-listed, so `ra-jit cache gc --remote` does not apply to it. It holds sealed packs under the hash of
+listed, so `blaze-engine cache gc --remote` does not apply to it. It holds sealed packs under the hash of
 their bytes, a list of the keys in each pack, and one manifest per project that lists the
 packs that project's builds were served from.
 
@@ -213,8 +213,8 @@ virtual-hosted addressing, IAM errors and role credentials are untested.
 
 ### By hand
 
-    ra-jit cache push REMOTE [PROJECT]
-    ra-jit cache pull REMOTE [PROJECT]
+    blaze-engine cache push REMOTE [PROJECT]
+    blaze-engine cache pull REMOTE [PROJECT]
 
 `push` sends the packs the manifest lacks and adds them to it. `pull` fetches the packs the
 manifest lists that are not in the local store, as many as fit under `BLAZE_CACHE_MAX`.
@@ -264,9 +264,9 @@ or the build), so a cache that stopped working is not a slowdown nobody sees.
 
 ### The standard library
 
-A build with nothing of rustc's (a build script, `--exe` with every crate ra-jit's) starts
-from the standard library compiled by ra-jit, which takes seconds on many cores. A release
-ships it: `ra-jit std REMOTE TOOLCHAIN` builds it for the binary and the toolchain at that sysroot and pushes it as
+A build with nothing of rustc's (a build script, `--exe` with every crate blaze's) starts
+from the standard library compiled by blaze, which takes seconds on many cores. A release
+ships it: `blaze-engine std REMOTE TOOLCHAIN` builds it for the binary and the toolchain at that sysroot and pushes it as
 the project `std-<target>-<build>`, and the release attaches that remote's files. Such a
 build fetches the project once per store, from:
 
@@ -295,11 +295,11 @@ compiles the library itself, once per store.
 
 Whatever the address leaves out comes from where the AWS tools look: `AWS_ENDPOINT_URL`,
 `AWS_REGION`, `AWS_PROFILE`, `~/.aws/config`. An unknown option is refused by name. With an
-endpoint of its own, ra-jit addresses the bucket by path unless told `path-style=false`.
+endpoint of its own, blaze addresses the bucket by path unless told `path-style=false`.
 
-ra-jit does not hold credentials; the AWS SDK finds them (environment, shared config and
+blaze does not hold credentials; the AWS SDK finds them (environment, shared config and
 profiles, web identity, container and instance roles). They are not printed. The harness
-searches everything ra-jit printed in a run for the secret key.
+searches everything blaze printed in a run for the secret key.
 
 ### Trust and signing
 
@@ -310,25 +310,25 @@ hashed after the fetch and before it is put in the store. A remote, proxy or dis
 returns other bytes has them thrown away and reported, and the build compiles those
 functions itself. Key lists and cargo units are checked the same way.
 
-Can someone with write access make ra-jit use the wrong code? Without signing, yes. The
+Can someone with write access make blaze use the wrong code? Without signing, yes. The
 manifest is the one mutable object. Somebody who can write to the bucket can upload a
 well-formed pack with wrong code under real keys and list it. Content addressing does not
 catch that.
 
 Signing does. Make a key and note the public half it prints:
 
-    ra-jit cache keygen ~/.config/ra-jit/sign.key
+    blaze-engine cache keygen ~/.config/blaze/sign.key
 
 A machine with `BLAZE_REMOTE_SIGN` naming that file signs each manifest it writes
 (Ed25519, over the manifest's name and body). A machine with `BLAZE_REMOTE_TRUST` listing
 public keys refuses any manifest not signed by one of them. A machine that trusts keys but
 has none to sign with refuses to push.
 
-So: with `BLAZE_REMOTE_TRUST` set, nobody without a trusted signing key can make ra-jit emit
+So: with `BLAZE_REMOTE_TRUST` set, nobody without a trusted signing key can make blaze emit
 code other than what a local build gives, whatever they do to the bucket. Without it,
 whoever can write to the bucket is trusted, as with sccache or a registry mirror. A trusted
-signer is trusted completely; ra-jit does not compile again to check them. Under all of it
-sits one assumption: two machines with the same ra-jit binary compile the same key to
+signer is trusted completely; blaze does not compile again to check them. Under all of it
+sits one assumption: two machines with the same blaze binary compile the same key to
 equivalent code.
 
 The harness checks, against both servers: a pack truncated, extended, emptied or with one
@@ -339,7 +339,7 @@ There is no `SECURITY.md` in the repository at the commit these docs were writte
 
 ### Collecting a remote
 
-    ra-jit cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] [--dry-run]
+    blaze-engine cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] [--dry-run]
 
 An age is a number and `s`, `m`, `h` or `d`. The run first takes lines out of manifests:
 with `--older-than`, the lines of packs written longer ago than that, and always the lines
@@ -354,8 +354,8 @@ outside what it promises. Nothing runs a remote collection on its own.
 
 ### Dependencies built by cargo
 
-    ra-jit deps push REMOTE DIR [PROJECT]
-    ra-jit deps pull REMOTE DIR [PROJECT]
+    blaze-engine deps push REMOTE DIR [PROJECT]
+    blaze-engine deps pull REMOTE DIR [PROJECT]
 
 Run in the directory of `Cargo.lock`, where `DIR` is the directory cargo builds a profile
 in, such as `target/debug`. This sends and fetches what cargo built of registry and git
@@ -367,9 +367,9 @@ cargo build finds them fresh. It is separate from the function store and is test
 
 On one machine over loopback, a fresh second "machine" (another home directory, checkout
 and store) building ripgrep 14.1.1 took 16.8 s to a running program with no remote, 14.3 s
-with ra-jit's packs, and 9.6 s with packs and cargo's units. For cargo 0.92.0 the same three
-were 152.4 s, 117.1 s and 94.4 s. In each case with a remote, ra-jit compiled 0 functions.
-What is left is cargo running build scripts and proc macros, and ra-jit loading the
+with blaze's packs, and 9.6 s with packs and cargo's units. For cargo 0.92.0 the same three
+were 152.4 s, 117.1 s and 94.4 s. In each case with a remote, blaze compiled 0 functions.
+What is left is cargo running build scripts and proc macros, and blaze loading the
 workspace and walking every instance to find its key. Lazy fetching was slightly slower
 than fetching everything in both. Transfer times over loopback are a lower bound and say
 nothing about a real network. The full tables are in [results.md](results.md).

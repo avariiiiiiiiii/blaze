@@ -1,5 +1,5 @@
 //! Proc macros compiled to WebAssembly, which no proc-macro server loads: a caller that runs
-//! them (ra-jit, `crates/ra-jit-macro-wasm`) loads them itself, in its own process.
+//! them (blaze, `crates/blaze-macro-wasm`) loads them itself, in its own process.
 
 use std::sync::OnceLock;
 

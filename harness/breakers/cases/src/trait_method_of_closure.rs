@@ -1,7 +1,7 @@
 //! A generic trait method called on closures, a `Signal` and a `&str`, through a dependency's
 //! `impl<T, U: Into<T>, F: Fn() -> U> IntoReactive<T> for F` and its impls for concrete types,
 //! from a generic function of the dependency and from one of this crate: the shape of nsh-core's
-//! `IntoReactive`, which an app's patches were refused on (ra-jit #224) with "call to
+//! `IntoReactive`, which an app's patches were refused on (blaze #224) with "call to
 //! `into_reactive`, which has no body and no rustc symbol".
 
 use reactive::{IntoReactive, Reactive, Signal, bind_value};

@@ -3,14 +3,14 @@
 `harness/freshwarm.py <project> --edits none`: a seed build pushes its store to a directory
 remote; a fresh home and store at the same paths pull it and build again, as a CI runner with
 nothing but the checkout and the remote does. ix VM `bscache-fw2`, arm64, 16 cpus, 32 GB
-committed, `CARGO_BUILD_JOBS=8`, ra-jit of this branch (43671a2aac, origin/main 0ef4868a15
+committed, `CARGO_BUILD_JOBS=8`, blaze of this branch (43671a2aac, origin/main 0ef4868a15
 merged), the rustup toolchain nightly-2026-10-25 first on `PATH`.
 
 - before: build scripts as on main (`BLAZE_SCRIPT_VIEW` unset).
 - after: `BLAZE_SCRIPT_VIEW=on`, the closure taken from `BLAZE_REMOTE` (project
-  `nix-closure`, pushed by `ra-jit closure fetch` + `ra-jit cache push` once: 37.9 s, 0.58 s).
+  `nix-closure`, pushed by `blaze-engine closure fetch` + `blaze-engine cache push` once: 37.9 s, 0.58 s).
   `BLAZE_HOME` is one per project for both steps, so the fresh step finds the closure laid out
-  (`ra-jit closure materialize` from the remote into an empty home: 36 s for all 203 paths).
+  (`blaze-engine closure materialize` from the remote into an empty home: 36 s for all 203 paths).
 
 | project | arm | seed build s | fresh pull s | fresh build s | fresh store MB | right |
 |---|---|---|---|---|---|---|
@@ -33,5 +33,5 @@ merged), the rustup toolchain nightly-2026-10-25 first on `PATH`.
 - Before this branch's last fix, the after arm failed: the scripts of one build pulled the
   closure into one store at once, and a pack another process was fetching was taken for one the
   remote lacked ("blaze's store has no copy of /nix/store/...-libidn2-2.3.8").
-- In `nix develop .#bench` rustc is rust-overlay's, which has no rustup channel manifest: ra-jit
+- In `nix develop .#bench` rustc is rust-overlay's, which has no rustup channel manifest: blaze
   can't answer `rustc -vV` for it and every load fails, on main too. Hence the rustup toolchain.

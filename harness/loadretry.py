@@ -4,11 +4,11 @@
 An unchanged refusal must still fail, and changing the refused flag must report the new
 flag. Removing or rewriting the configuration then has to build and run without stopping
 the daemon. Both cargo configuration filenames and a configuration above the workspace
-are covered. BLAZE_BIN names the compiler, with cargo-ra-jit beside it.
+are covered. BLAZE_BIN names the compiler, with blaze beside it.
 """
 import os, re, shutil, subprocess, tempfile
 
-from cargo_ra_jit import base_env
+from blaze_cli import base_env
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
     pid = None
 
     def blaze(*args):
-        return subprocess.run(["cargo", "ra-jit", *args], cwd=ws, env=env,
+        return subprocess.run(["blaze", *args], cwd=ws, env=env,
                               capture_output=True, text=True, timeout=300)
 
     def same_daemon():

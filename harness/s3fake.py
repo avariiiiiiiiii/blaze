@@ -1,14 +1,14 @@
-"""What remote.py puts between ra-jit and an S3 service: the service itself, started here, a
+"""What remote.py puts between blaze and an S3 service: the service itself, started here, a
 client that signs requests the way the service asks (so the harness can look at a bucket and
-spoil what is in it without ra-jit), and a proxy that counts the requests and breaks them.
+spoil what is in it without blaze), and a proxy that counts the requests and breaks them.
 
-Nothing here is ra-jit's: the client is the standard library's, so that a mistake in how ra-jit
+Nothing here is blaze's: the client is the standard library's, so that a mistake in how blaze
 signs or addresses is not made twice."""
 import datetime, hashlib, hmac, http.client, os, re, select, shutil, signal, socket, ssl, subprocess, threading, time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
-ACCESS, SECRET = "rajitharness", "rajitharness-not-a-secret"
+ACCESS, SECRET = "blazeharness", "blazeharness-not-a-secret"
 
 
 def free_port(below=65536):
@@ -53,7 +53,7 @@ class Server:
                        f"127.0.0.1:{free_port()}", *(["--certs-dir", self.certs] if self.certs else [])]
         else:
             config = os.path.join(self.dir, "s3.json")
-            open(config, "w").write('{"identities":[{"name":"ra-jit","credentials":[{"accessKey":"%s","secretKey":"%s"}],'
+            open(config, "w").write('{"identities":[{"name":"blaze","credentials":[{"accessKey":"%s","secretKey":"%s"}],'
                                     '"actions":["Admin","Read","Write","List","Tagging"]}]}' % (ACCESS, SECRET))
             if not hasattr(self, "ports"):
                 self.ports = [free_port(50000) for _ in range(3)]

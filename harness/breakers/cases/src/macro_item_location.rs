@@ -1,4 +1,4 @@
-//! A panic in what a macro wrote is reported from where the macro is called. ra-jit took that
+//! A panic in what a macro wrote is reported from where the macro is called. blaze took that
 //! to start at the comments and attributes on top of a call in item position, lines too early:
 //! simd-json's `fail!(fail02);` under a comment panicked a line above where rustc said.
 

@@ -1,11 +1,11 @@
 ---
 name: flecs
-description: Flecs (v4.1.6) as ra-jit's site uses it: every page is a Flecs script (site/content/*.flecs) built from prefabs and element types in schema.flecs, run at build time by Flecs compiled to wasm (site/flecs/flecs-doc.wasm) and rendered to HTML by site/gen. Covers the script syntax and its traps (string escapes, keywords, names), the schema's conventions, relationship traits, and how to rebuild the wasm. Load before editing any .flecs file, site/gen/tree.ts or site/flecs/.
+description: Flecs (v4.1.6) as blaze's site uses it: every page is a Flecs script (site/content/*.flecs) built from prefabs and element types in schema.flecs, run at build time by Flecs compiled to wasm (site/flecs/flecs-doc.wasm) and rendered to HTML by site/gen. Covers the script syntax and its traps (string escapes, keywords, names), the schema's conventions, relationship traits, and how to rebuild the wasm. Load before editing any .flecs file, site/gen/tree.ts or site/flecs/.
 ---
 
-# Flecs in ra-jit
+# Flecs in blaze
 
-Adapted from den's flecs skill (`den-flecs`, same Flecs version); den's Rust API and app conventions are left out because ra-jit uses Flecs only through script. Script reference: `script.md`.
+Adapted from den's flecs skill (`den-flecs`, same Flecs version); den's Rust API and app conventions are left out because blaze uses Flecs only through script. Script reference: `script.md`.
 
 ## Where Flecs runs
 

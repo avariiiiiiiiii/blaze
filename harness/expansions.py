@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """expansions.py: a daemon that loads a workspace again finds its proc-macro expansions in the
-store instead of expanding them (crates/ra-jit-expand).
+store instead of expanding them (crates/blaze-expand).
 
 A workspace with a proc-macro crate of its own (a derive, an attribute, and a derive that reads
 the text of a span, which asks the database) is built by three daemons on one store:
@@ -22,7 +22,7 @@ import os, re, shutil, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, TARGET_ARGS, built
+from difftest import Fixture, BLAZE, sysroot_rlibs, TARGET_ARGS, built
 from storelib import run, scratch
 
 STRUCTS = 40
@@ -142,7 +142,7 @@ def counts(log):
 def main():
     # This harness verifies the native server's output cache, not WASM sessions.
     os.environ["BLAZE_PROC_MACRO_WASM"] = "0"
-    work, store = scratch("ra-jit-expansions-"), scratch("ra-jit-expansions-store-")
+    work, store = scratch("blaze-expansions-"), scratch("blaze-expansions-store-")
     ws = os.path.join(work, "app")
     os.makedirs(os.path.join(ws, "src"))
     os.makedirs(os.path.join(ws, "pm", "src"))
@@ -152,7 +152,7 @@ def main():
     fx = Fixture(ws, ["app"], ["-p", "app"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"app.{n}") for n in ("o", "patch.o", "bin"))
-    link = linkline.join(linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], RA_JIT), binary))
+    link = linkline.join(linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], BLAZE), binary))
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     ask = ["--crate", "app", "--out", obj, "--patch", patch, "--link-cmd", link, "--binary", binary, *symbols]
     reference = os.path.join(work, "reference")
@@ -167,14 +167,14 @@ def main():
         log_path, socket = os.path.join(work, f"{name}.log"), os.path.join(work, f"{name}.sock")
         want = cargo()
         with open(log_path, "w") as out:
-            proc = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out,
+            proc = subprocess.Popen([BLAZE, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out,
                                     env={**os.environ, "BLAZE_CACHE": store, **env})
         try:
             while "watching" not in open(log_path).read():
                 if proc.poll() is not None:
                     raise SystemExit(f"FAIL: the {name} daemon did not start: {log_path}")
                 time.sleep(0.05)
-            reply = subprocess.run([RA_JIT, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
+            reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
             got = ran(binary)
             if got != want:
                 raise SystemExit(f"FAIL: the {name} daemon's program prints\n{got}\nand cargo's\n{want}\n"

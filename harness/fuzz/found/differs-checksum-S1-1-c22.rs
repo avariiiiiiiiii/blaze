@@ -6,7 +6,7 @@
 // panic: panicked at src/main.rs:362:9
 // panic: panicked at src/main.rs:362:9
 // c22 69cd4e290aa883a6 ok
-// ra-jit:
+// blaze:
 // panic: panicked at src/main.rs:362:9
 // panic: panicked at src/main.rs:362:9
 // panic: panicked at src/main.rs:362:9

@@ -4,7 +4,7 @@
 //! drew into meshes, as it would for a window; nothing is put on a screen. Many of its widgets
 //! are generic, as egui code tends to be (closures, `impl Display`, `Into<f64>`).
 //!
-//! It takes edits while it runs: ra-jit-live applies each patch the moment it lands, and the
+//! It takes edits while it runs: blaze-live applies each patch the moment it lands, and the
 //! next frame runs the new code. `answer()` is what live_latency.py's socket and burst modes
 //! edit; the frame loop prints it when it changes (`answer N at_us=`), and each patch's outcome.
 
@@ -541,7 +541,7 @@ fn input(frame: u64, since: Duration) -> egui::RawInput {
 }
 
 fn main() {
-    let live = match ra_jit_live::Live::start() {
+    let live = match blaze_live::Live::start() {
         Ok(live) => live,
         Err(why) => {
             println!("no live edits: {why}");

@@ -7,38 +7,38 @@ Not installed yet: [install.md](install.md). Every command and setting in detail
 
 ```sh
 cd my-project
-cargo blaze build
+blaze build
 ```
 
 The first build starts a background process, the daemon, which loads your project and compiles
 every crate of it from source. No `cargo build` and no rustc run:
 
 ```
-    Finished `dev` profile [ra-jit] target(s) in 41.20s
+    Finished `dev` profile [blaze] target(s) in 41.20s
 ```
 
 From then on, an edit builds like this:
 
 ```
-$ cargo blaze build
-    Finished `dev` profile [ra-jit] target(s) in 0.02s
+$ blaze build
+    Finished `dev` profile [blaze] target(s) in 0.02s
 ```
 
-`[ra-jit]` means blaze built it. The program is where cargo would have put it, under `target/`.
+`[blaze]` means blaze built it. The program is where cargo would have put it, under `target/`.
 
-- `cargo blaze build`, `cargo blaze run` and `cargo blaze test` take cargo's flags and do what
+- `blaze build`, `blaze run` and `blaze test` take cargo's flags and do what
   cargo's commands do: `run` passes what follows `--` to your program, and `test` runs and reports
   the tests as `cargo test` does.
-- `cargo blaze check` reports the errors a build would fail with.
-- `cargo blaze status` shows what the daemon has loaded, how many builds it did and how many it
+- `blaze check` reports the errors a build would fail with.
+- `blaze status` shows what the daemon has loaded, how many builds it did and how many it
   left to cargo, and why.
-- `cargo blaze stop` stops the daemon. It also stops by itself after 30 minutes without a build.
+- `blaze stop` stops the daemon. It also stops by itself after 30 minutes without a build.
 
 Every other subcommand is blaze's own too (`fmt`, `clippy`, `doc`, `tree` and the rest); one blaze
 has not written yet fails and says so. None of them runs cargo. A build blaze can't do yet fails
 with the reason, `blaze does not build ... yet`, and is not handed to cargo: so far that is a few
 flags such as `--message-format`, cargo's own `-Z` and several `--target`s at once, and code blaze
-can't compile. Each is a bug ([#84](https://github.com/indexable-inc/ra-jit/issues/84),
+can't compile. Each is a bug ([#84](https://github.com/indexable-inc/blaze/issues/84),
 [the plan](no-rustc.md)).
 rustc's `-Z` flags in `RUSTFLAGS` or `rustflags`, such as `-Zthreads=8`, are another matter: rustc
 still gets them, and what blaze does with each is in [support.md](support.md#-z-flags-for-rustc).
@@ -49,7 +49,7 @@ blaze has no watch mode of its own; any file watcher can run it. With
 [watchexec](https://github.com/watchexec/watchexec):
 
 ```sh
-watchexec -e rs -- cargo blaze build
+watchexec -e rs -- blaze build
 ```
 
 ## Make plain `cargo build` use blaze
@@ -57,38 +57,38 @@ watchexec -e rs -- cargo blaze build
 For editors, scripts and agents that run `cargo build` themselves:
 
 ```sh
-cargo blaze enable
+blaze enable
 ```
 
 From then on plain `cargo build`, `run`, `test` and `check` go through blaze, in every project of
-your user. It adds one setting to `~/.cargo/config.toml`, and `cargo blaze disable` puts the file back
-as it was. Edits are slower this way than with `cargo blaze`, and on some projects slower than plain
+your user. It adds one setting to `~/.cargo/config.toml`, and `blaze disable` puts the file back
+as it was. Edits are slower this way than with `blaze`, and on some projects slower than plain
 cargo ([why](cargo.md#plain-cargo-switched-on-globally)).
 
 ## Change a running program
 
-A program that links the `ra-jit-live` crate takes each edit while it runs, and keeps its state:
+A program that links the `blaze-live` crate takes each edit while it runs, and keeps its state:
 useful for games, GUIs and anything slow to get back to where you were.
 
 ```toml
 [dependencies]
-ra-jit-live = "0.1"
+blaze-live = "0.1"
 ```
 
 ```rust
-let mut live = ra_jit_live::Live::start().ok();
+let mut live = blaze_live::Live::start().ok();
 loop {
     if let Some(outcome) = live.as_mut().and_then(|it| it.poll()) {
-        eprintln!("ra-jit: {outcome}");
+        eprintln!("blaze: {outcome}");
     }
     // ...one frame of your program
 }
 ```
 
-Start it with `cargo blaze run`. In another terminal, build after each edit with
-`cargo blaze build` (or the `watchexec` line above). The next `poll` swaps in the functions that
+Start it with `blaze run`. In another terminal, build after each edit with
+`blaze build` (or the `watchexec` line above). The next `poll` swaps in the functions that
 changed, usually in under a millisecond, and prints
-`ra-jit: edit ... applied: 1 functions in 745.4µs`. An edit that changes a type the program is
+`blaze: edit ... applied: 1 functions in 745.4µs`. An edit that changes a type the program is
 holding, such as a struct's fields, can't be applied to data that already exists, so `poll` asks
 for a restart instead.
 
@@ -107,9 +107,9 @@ and comes with the next release. How it works, and how fast from a keystroke to 
   code both build; code that needs what that nightly lacks, such as a feature it removed, fails
   with rustc's error (see [install.md](install.md#what-you-need) and
   [support.md](support.md#toolchain)).
-- **Not everything builds yet.** Under `cargo blaze`, the flags listed above and code blaze can't
+- **Not everything builds yet.** Under `blaze`, the flags listed above and code blaze can't
   compile yet fail the build with the reason; nothing goes to cargo. Plain cargo after
-  `cargo blaze enable` still has rustc build what blaze does not, and `cargo blaze status` counts
+  `blaze enable` still has rustc build what blaze does not, and `blaze status` counts
   those builds. In the benchmark tables, `(c)` marks an edit that went to cargo when it was
   measured.
 - **Errors.** An edit with a type error fails to build, as it would under cargo. The borrow checker

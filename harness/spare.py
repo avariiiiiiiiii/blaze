@@ -4,14 +4,14 @@ daemon holds meanwhile, for each way of running it (issue #56).
 
     spare.py [PROJECT...] --variant LABEL:BIN[:VAR=VALUE...]... [--rounds N] [--out FILE] [--work DIR]
 
-A variant is a ra-jit and the variables it runs with, for example
-`--variant asked:target/release/ra-jit --variant ready:target/release/ra-jit:BLAZE_SPARE=ready`.
+A variant is a blaze and the variables it runs with, for example
+`--variant asked:target/release/blaze-engine --variant ready:target/release/blaze-engine:BLAZE_SPARE=ready`.
 Each round runs every variant once, in turn, for each PROJECT (bench.py's, default ripgrep fd
 nushell), each with a home and a store of its own:
-  first   a small package of no dependencies is built with `cargo ra-jit build`, which starts the
+  first   a small package of no dependencies is built with `blaze build`, which starts the
           daemon; once the daemon has it loaded and any spare worker has loaded the library, what
           the daemon's tree holds (`first_mb`)
-  cold    the project from a copy with no target directory: `cargo ra-jit build` and the wait
+  cold    the project from a copy with no target directory: `blaze build` and the wait
           until the daemon has it loaded (`cold_s`, with `cold_build_s` the command alone), the
           most the daemon's tree and the command's held meanwhile (`cold_peak_mb`), and what the
           daemon holds once it is ready (`cold_mb`)
@@ -22,9 +22,9 @@ The result has every sample and the median of each; the table printed at the end
 """
 import glob, json, os, shutil, statistics, subprocess, sys, tempfile, time
 
-import cargo_ra_jit, memory
+import blaze_cli, memory
 from bench import PROJECTS, options
-from cargo_ra_jit import Side, fetch, how_built, wait_warm
+from blaze_cli import Side, fetch, how_built, wait_warm
 
 FIRST_TOML = '[package]\nname = "first"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n'
 FIRST_MAIN = 'fn main() {\n    println!("{}", (1..10u32).sum::<u32>());\n}\n'
@@ -59,7 +59,7 @@ def held(side):
 
 
 def started(side, label):
-    """`cargo ra-jit build` on `side` and the wait until its daemon has it loaded: the seconds of
+    """`blaze build` on `side` and the wait until its daemon has it loaded: the seconds of
     the command, of the command and the wait, and the most the daemon's tree and the command's
     held at once meanwhile."""
     with memory.Sampler() as sampler:
@@ -68,7 +68,7 @@ def started(side, label):
             sampler.add(pid)
         took, ran, used = memory.run(side.argv("build"), side.ws, side.env, 7200, sampler=sampler)
         if ran.returncode != 0:
-            raise SystemExit(f"{label}: `cargo ra-jit build` failed:\n{ran.stderr[-3000:]}")
+            raise SystemExit(f"{label}: `blaze build` failed:\n{ran.stderr[-3000:]}")
         waited, states = wait_warm(side, side.ws)
     if states != ["ready"]:
         raise SystemExit(f"{label}: the daemon did not get ready: {states}\n{ran.stderr[-3000:]}")
@@ -85,7 +85,7 @@ def sequence(name, spec, source, variant, work):
     open(os.path.join(first_ws, "Cargo.toml"), "w").write(FIRST_TOML)
     open(os.path.join(first_ws, "src/main.rs"), "w").write(FIRST_MAIN)
     shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", ".git"))
-    env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), BLAZE_CACHE=store, **variables)
+    env = dict(blaze_cli.base_env(home), **spec.get("env", {}), BLAZE_CACHE=store, **variables)
     env["PATH"] = os.path.dirname(os.path.abspath(binary)) + os.pathsep + env["PATH"]
     env.pop("RUSTC_WRAPPER", None)
     if "BLAZE_SPARE" not in variables:
@@ -123,8 +123,8 @@ def main():
     if not variants:
         raise SystemExit("spare.py needs at least one --variant LABEL:BIN[:VAR=VALUE...]")
     rounds = int(options(argv, "--rounds", "3")[0])
-    out = options(argv, "--out", os.path.join(cargo_ra_jit.HERE, "spare.json"))[0]
-    work = (options(argv, "--work") or [None])[0] or tempfile.mkdtemp(prefix="ra-jit-spare-")
+    out = options(argv, "--out", os.path.join(blaze_cli.HERE, "spare.json"))[0]
+    work = (options(argv, "--work") or [None])[0] or tempfile.mkdtemp(prefix="blaze-spare-")
     names = argv or ["ripgrep", "fd", "nushell"]
     result = dict(machine=os.environ.get("BLAZE_BENCH_MACHINE", ""), rounds=rounds,
                   variants=[dict(label=l, bin=b, env=v) for l, b, v in variants], projects={})
@@ -132,7 +132,7 @@ def main():
         spec = PROJECTS[name]
         source = fetch(name, spec)
         subprocess.run(["cargo", "fetch"], cwd=source, capture_output=True,
-                       env=dict(os.environ, RUSTUP_TOOLCHAIN=cargo_ra_jit.TOOLCHAIN))
+                       env=dict(os.environ, RUSTUP_TOOLCHAIN=blaze_cli.TOOLCHAIN))
         samples = {label: [] for label, _, _ in variants}
         for turn in range(rounds):
             for variant in variants:

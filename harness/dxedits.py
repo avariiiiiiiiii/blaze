@@ -12,10 +12,10 @@ import linkline
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["BLAZE_STATS"] = "1"
-RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(HERE, "../target/release/ra-jit")
-BODY = "let _ra_jit_edit = 1u32;"
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(HERE, "../target/release/blaze-engine")
+BODY = "let _blaze_edit = 1u32;"
 ASYNC_MAIN = "async fn main() -> ExitCode {\n"
-NEW_FN = "\nfn ra_jit_new_item(x: u32) -> u32 { x + 1 }\n"
+NEW_FN = "\nfn blaze_new_item(x: u32) -> u32 { x + 1 }\n"
 # The first function in a file that is written plainly.
 PLAIN_FN = re.compile(r"^ *(?:pub(?:\([a-z]+\))? )?fn \w+\([^)]*\)[^{;]*\{\n", re.M)
 
@@ -67,11 +67,11 @@ def main():
     log = open(log_path)
     args = [x for c in crates for x in ("--crate", c)]
     # DXEDITS_PATCH: the daemon links after each build, with a patch object ahead of the first one.
-    binary = os.path.join(work, "dx-ra-jit-bin")
+    binary = os.path.join(work, "dx-blaze-bin")
     if os.environ.get("DXEDITS_PATCH"):
         link = list(json.load(open(os.path.join(work, "fixture.json")))["link_args"])
         patch = os.path.join(work, "dx.patch.o")
-        link = linkline.ahead(link, [patch, os.path.join(work, "dx.o")], RA_JIT)
+        link = linkline.ahead(link, [patch, os.path.join(work, "dx.o")], BLAZE)
         link[link.index("-o") + 1] = binary
         # DXEDITS_LD: a directory holding the `ld` to link with, instead of rustc's lld.
         if ld := os.environ.get("DXEDITS_LD"):
@@ -82,10 +82,10 @@ def main():
         args += ["--binary", binary]
     # DXEDITS_REQUEST: `sync` or `patch`; each build is then asked for once the file is written.
     request = os.environ.get("DXEDITS_REQUEST")
-    socket = os.path.join(work, "ra-jit.sock")
+    socket = os.path.join(work, "blaze.sock")
     trigger = ["--socket", socket] if request else ["--watch"]
     start = time.time()
-    daemon = subprocess.Popen([RA_JIT, os.path.join(root, "packages/cli"), *args, "--out", os.path.join(work, "dx.o"), *trigger, *symbols],
+    daemon = subprocess.Popen([BLAZE, os.path.join(root, "packages/cli"), *args, "--out", os.path.join(work, "dx.o"), *trigger, *symbols],
                               stderr=out, stdout=out)
 
     def wait(pattern, seen):
@@ -135,7 +135,7 @@ def main():
                 for p, text in zip(paths, texts):
                     open(p, "w").write(text)
                 if request:
-                    reply = subprocess.check_output([RA_JIT, request, socket], text=True)
+                    reply = subprocess.check_output([BLAZE, request, socket], text=True)
                     print(f"    {reply.strip()}  round trip {(time.time() - saved) * 1000:.0f}ms")
                 found = wait(r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*stats: (\d+) of (\d+) functions compiled.*\n(?:(?:no )?patch: .*\n)?.*\n(?:link: .*\n)?(?:timeline-us: (.*)\n)?(?:asked: .*\n)?edit-to-binary: (\S+)", done)
                 done = len(found)

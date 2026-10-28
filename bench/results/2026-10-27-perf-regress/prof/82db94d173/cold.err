@@ -1,6 +1,6 @@
    Compiling ripgrep v15.1.0 (/root/perf/prof-ws/82db94d173/rg)
     Finished `dev` profile [blaze] target(s) in 34.12s
-	Command being timed: "taskset -c 0-3 cargo ra-jit build"
+	Command being timed: "taskset -c 0-3 blaze build"
 	User time (seconds): 0.02
 	System time (seconds): 0.03
 	Percent of CPU this job got: 0%

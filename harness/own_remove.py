@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""own_remove.py: `cargo blaze remove` against `cargo remove`. cargo is the oracle; blaze never
+"""own_remove.py: `blaze remove` against `cargo remove`. cargo is the oracle; blaze never
 runs it outside this harness.
 
 usage: own_remove.py --ripgrep DIR [--blaze BIN] [--out FILE]
@@ -10,7 +10,7 @@ dependencies, and a made-up one of path packages whose root manifest has
 `[workspace.dependencies]`, `[profile.*.package]` and `[patch]` entries and whose member's
 features name its dependencies every way a feature can (`dep:`, `?/`, `/`), with comments
 inside the arrays. Each case runs `cargo remove ARGS` and `BIN cargo remove ARGS` (BIN:
-`ra-jit`, default `target/release/ra-jit`) offline, comparing the exit status, standard
+`blaze`, default `target/release/blaze-engine`) offline, comparing the exit status, standard
 output and standard error, and then every `Cargo.toml` and `Cargo.lock` of the copy.
 """
 import argparse, json, os, shutil, subprocess, sys, tempfile
@@ -149,7 +149,7 @@ def files(top):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ripgrep", required=True)
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     opts = ap.parse_args()
     env = {k: v for k, v in os.environ.items() if not k.startswith("CARGO_") or k == "CARGO_HOME"}
@@ -168,7 +168,7 @@ def main():
     cases = []
     for fixture, at, args in CASES:
         outs = {}
-        for who in ("cargo", "blaze"):
+        for who in ("blaze"):
             work = tempfile.mkdtemp(prefix="own-remove-case-")
             top = os.path.join(work, "ws")
             shutil.copytree(os.path.join(templates, fixture), top)

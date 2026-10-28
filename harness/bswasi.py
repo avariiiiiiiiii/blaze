@@ -2,15 +2,15 @@
 """bswasi.py: which build scripts of the bench corpus run unchanged under WASI (docs/cargo.md,
 "Build scripts under WASI"), and why each other one does not.
 
-usage: bswasi.py record [PROJECT...] --ra-jit BIN [--work DIR] [--out DIR] [--jobs N]
+usage: bswasi.py record [PROJECT...] --blaze BIN [--work DIR] [--out DIR] [--jobs N]
        bswasi.py report --out DIR
 
 `record` fetches each project of harness/bench.py at its pinned revision (all of them when none
-is named) and runs `cargo check --compile-time-deps --workspace --all-targets` through ra-jit's
-wrapper (RUSTC_WRAPPER=ra-jit-rustc beside BIN), as harness/bscache.py does, with an empty store
+is named) and runs `cargo check --compile-time-deps --workspace --all-targets` through blaze's
+wrapper (RUSTC_WRAPPER=blaze-rustc beside BIN), as harness/bscache.py does, with an empty store
 of its own, but with BLAZE_BUILD_SCRIPTS=wasi-compare and BLAZE_SCRIPTS_BY_RUSTC=1: every
-build script is compiled by rustc for the host and by ra-jit for wasm32-wasip1, and each run
-runs the module under Wasmtime first, setting aside what it printed and wrote (`ra-jit-wasi/`
+build script is compiled by rustc for the host and by blaze for wasm32-wasip1, and each run
+runs the module under Wasmtime first, setting aside what it printed and wrote (`blaze-wasi/`
 beside OUT_DIR), then the native executable in the sandbox, for cargo. BIN is built with the
 feature `wasi`. BLAZE_ONLY_ASKS is not set: the module's description needs the records the
 wrapper keeps of the libraries rustc compiles. Each project's runs, each compared, are collected
@@ -40,8 +40,8 @@ sys.path.insert(0, HERE)
 from bscache import RAN, projects, run_dirs  # noqa: E402
 from resolve import fetch_git, option  # noqa: E402
 
-ASIDE = "ra-jit-wasi"
-TOOLS = "ra-jit-wasi-tools.jsonl"
+ASIDE = "blaze-wasi"
+TOOLS = "blaze-wasi-tools.jsonl"
 HOST_CFG = re.compile(
     r"cfg!\s*\(|#\s*\[\s*cfg\s*\(|cfg_attr\s*\(|env::consts|std::env::consts"
 )
@@ -64,7 +64,7 @@ WASI = dict(
 PHF_011 = {"chrono-tz", "markup5ever", "web_atoms", "selectors", "htmlize"}
 
 
-def record(name, repo, rev, work, ra_jit, jobs):
+def record(name, repo, rev, work, blaze, jobs):
     source = os.path.join(work, "src", name)
     fetch_git(repo, rev, source)
     target = os.path.join(work, "target", name)
@@ -76,7 +76,7 @@ def record(name, repo, rev, work, ra_jit, jobs):
         if key.startswith(("CARGO_", "BLAZE_", "RUSTC_")) and key != "CARGO_HOME":
             del env[key]
     env.update(
-        RUSTC_WRAPPER=os.path.join(os.path.dirname(ra_jit), "ra-jit-rustc"),
+        RUSTC_WRAPPER=os.path.join(os.path.dirname(blaze), "blaze-rustc"),
         BLAZE_PROC_MACRO_SERVER="0",
         BLAZE_SCRIPTS_BY_RUSTC="1",
         BLAZE_BUILD_SCRIPTS="wasi-compare",
@@ -87,7 +87,7 @@ def record(name, repo, rev, work, ra_jit, jobs):
         CARGO_HOME=os.path.join(work, "cargo-home"),
         RUST_BACKTRACE="0",
     )
-    # Cargo of a Nix shell gives scripts `RUSTC=rustc`, a name, which ra-jit's rustc for them
+    # Cargo of a Nix shell gives scripts `RUSTC=rustc`, a name, which blaze's rustc for them
     # (as_rustc.rs) does not take for the toolchain's: a path is.
     rustc = shutil.which("rustc", path=env.get("PATH"))
     if rustc:
@@ -216,7 +216,7 @@ def category(run, native_failed):
     """The category of `run` and what tells it."""
     result = run["result"]
     if result is None:
-        return "other: not run under WASI", "no ra-jit-wasi/result.json"
+        return "other: not run under WASI", "no blaze-wasi/result.json"
     if "error" in result:
         error = result["error"]
         if "did not build" in error:
@@ -289,7 +289,7 @@ def kept_tools(tools):
 
 def trimmed(tool):
     """`tool`, a command a run asked for, with its arguments cut to the first four and the
-    last two (a C compiler's are hundreds): the record kept is ra-jit-wasi-tools.jsonl's."""
+    last two (a C compiler's are hundreds): the record kept is blaze-wasi-tools.jsonl's."""
     args = tool.get("args", [])
     if len(args) > 8:
         args = args[:4] + [f"... {len(args) - 6} more"] + args[-2:]
@@ -389,13 +389,13 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     if mode == "report":
         return report(out_dir)
-    ra_jit = os.path.abspath(option(argv, "--ra-jit") or sys.exit("--ra-jit BIN"))
+    blaze = os.path.abspath(option(argv, "--blaze") or sys.exit("--blaze BIN"))
     work = option(argv, "--work", os.path.join(os.environ.get("TMPDIR", "/tmp"), "blaze-bswasi"))
     jobs = int(option(argv, "--jobs", "8"))
     corpus = projects()
     for name in argv or list(corpus):
         repo, rev = corpus[name]
-        result = record(name, repo, rev, work, ra_jit, jobs)
+        result = record(name, repo, rev, work, blaze, jobs)
         json.dump(result, open(os.path.join(out_dir, f"{name}.json"), "w"), indent=1)
         print(f"{name}: cargo {result['status']}, {len(result['runs'])} runs, failed {result['failed']}", flush=True)
 

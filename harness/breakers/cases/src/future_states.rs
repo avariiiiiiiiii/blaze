@@ -4,7 +4,7 @@
 //! times and then dropped, and says what it dropped.
 //!
 //! The size of each is told too. A local a part of which is moved out (`in_parts`) had a word
-//! of drop flags in ra-jit's future, where a byte holds the few bits it needs.
+//! of drop flags in blaze's future, where a byte holds the few bits it needs.
 
 use std::cell::RefCell;
 use std::future::Future;

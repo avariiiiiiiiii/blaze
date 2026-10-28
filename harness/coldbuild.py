@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""coldbuild.py: `cargo blaze build` and `run` from nothing are blaze's own whole build, with
+"""coldbuild.py: `blaze build` and `run` from nothing are blaze's own whole build, with
 no `cargo build` (docs/no-rustc.md, step K, #91).
 
     python3 coldbuild.py                 # the fixtures
@@ -8,30 +8,30 @@ no `cargo build` (docs/no-rustc.md, step K, #91).
     python3 coldbuild.py bench --keep    # and what they built, with the daemon's logs, kept
 
 The fixtures are a workspace of a program, an example and a library with a build script,
-built from nothing by `cargo blaze build` (dev, then release) and `cargo blaze run --example`:
+built from nothing by `blaze build` (dev, then release) and `blaze run --example`:
 each executable has to be where cargo puts it and print what cargo's build of the same source
 does, and no `cargo build` may run (cargo would leave `.fingerprint` in the target directory).
 An edit to a body after the first build is built by the daemon on what it loaded. A program that reaches a function blaze cannot compile fails its build with what it is, exit
 101, and leaves no executable and no cargo build behind. A program whose own crates have writable
 statics (`OnceLock`, `Mutex`, atomics, `static mut`) that `main` reaches is run by
-`cargo blaze run`, dev and `--release`, and has to print what it should, as cargo's build does:
+`blaze run`, dev and `--release`, and has to print what it should, as cargo's build does:
 blaze defines those statics itself, with no rustc symbol behind them.
 
 `bench` does the same for bench.py's projects, the program run with bench.py's `run`
 arguments, and says how long blaze's cold build took against cargo's, then its body and
 signature edits (bench.py's) against cargo's incremental build of each. The edits are built
 by the daemon's worker on what it loaded for the cold build. The standard library comes from
-a remote `ra-jit std` made once, as a release's does.
+a remote `blaze-engine std` made once, as a release's does.
 
-BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, as allrajit.py;
+BLAZE_BIN names the blaze built; blaze is found next to it. Linux, as allblaze.py;
 `statics` on macOS too.
 """
 import os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import cargo_ra_jit
-from cargo_ra_jit import RA_JIT, base_env
+import blaze_cli
+from blaze_cli import BLAZE, base_env
 
 TIMEOUT = 3600
 FILES = {
@@ -190,7 +190,7 @@ def env_for(root, remote=None):
 
 def blaze(ws, env, *args):
     start = time.monotonic()
-    ran = subprocess.run(["cargo", "ra-jit", *args], cwd=ws, env=env, capture_output=True, text=True,
+    ran = subprocess.run(["blaze", *args], cwd=ws, env=env, capture_output=True, text=True,
                          timeout=TIMEOUT)
     return ran, time.monotonic() - start
 
@@ -223,13 +223,13 @@ def cargo_built(target):
 
 
 def statics(root, env, check):
-    """`cargo blaze run` of STATICS, dev and release: it prints STATICS_PRINT, as cargo's does."""
+    """`blaze run` of STATICS, dev and release: it prints STATICS_PRINT, as cargo's does."""
     ws = os.path.join(root, "statics")
     write(ws, STATICS)
     for flags in ([], ["--release"]):
         ran, _ = blaze(ws, env, "run", "-q", *flags)
         said = ran.stdout + ran.stderr
-        named = " ".join(["`cargo blaze run", *flags]) + "`"
+        named = " ".join(["`blaze run", *flags]) + "`"
         check(f"{named} of a program's own writable statics runs", (ran.returncode, ran.stdout) == (0, STATICS_PRINT),
               f"blaze's: exit {ran.returncode} {ran.stdout!r}\n{ran.stderr}")
         check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(ws, "target")), said)
@@ -240,7 +240,7 @@ def statics(root, env, check):
 
 
 def fixtures(only_statics=False):
-    root = tempfile.mkdtemp(prefix="ra-jit-coldbuild-", dir="/tmp")
+    root = tempfile.mkdtemp(prefix="blaze-coldbuild-", dir="/tmp")
     env = env_for(root)
     wrong = []
 
@@ -254,7 +254,7 @@ def fixtures(only_statics=False):
     ws = statics(root, env, check)
     if not only_statics:
         whole(root, env, check)
-    subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+    subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     if wrong:
         sys.exit(f"coldbuild.py: {len(wrong)} wrong; under {root}")
     print("coldbuild.py: all right")
@@ -269,7 +269,7 @@ def whole(root, env, check):
     for profile, flags in (("debug", []), ("release", ["--release"])):
         ran, took = blaze(ws, env, "build", *flags)
         said = ran.stdout + ran.stderr
-        check(f"`cargo blaze build {' '.join(flags)}` from nothing builds", ran.returncode == 0, said)
+        check(f"`blaze build {' '.join(flags)}` from nothing builds", ran.returncode == 0, said)
         check(f"  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(ws, "target")), said)
         program = os.path.join(ws, "target", profile, "kapp")
         reference, _ = cargo(ws, env, os.path.join(root, "ref"), "build", *flags)
@@ -297,7 +297,7 @@ def whole(root, env, check):
     shutil.rmtree(os.path.join(ws, "target"))
     ran, _ = blaze(ws, env, "run", "-q", "--example", "kex", "--", "a", "b", "a")
     reference, _ = cargo(ws, env, os.path.join(root, "ref"), "run", "-q", "--example", "kex", "--", "a", "b", "a")
-    check("`cargo blaze run --example kex` from nothing runs it", (ran.returncode, ran.stdout) == (reference.returncode, reference.stdout),
+    check("`blaze run --example kex` from nothing runs it", (ran.returncode, ran.stdout) == (reference.returncode, reference.stdout),
           f"blaze's: {ran.returncode} {ran.stdout!r}\n{ran.stderr}\ncargo's: {reference.stdout!r}")
     check("  ... and it is in target/debug/examples", os.path.exists(os.path.join(ws, "target", "debug", "examples", "kex")))
 
@@ -344,13 +344,13 @@ def edited(ws, root, name, env, build, changes, spec):
 
 def bench(names, keep=False):
     import bench as benchpy
-    root = tempfile.mkdtemp(prefix="ra-jit-coldbuild-bench-", dir="/tmp")
-    remote, made = benchpy.shipped_std(RA_JIT, "cranelift", root)
+    root = tempfile.mkdtemp(prefix="blaze-coldbuild-bench-", dir="/tmp")
+    remote, made = benchpy.shipped_std(BLAZE, "cranelift", root)
     rows, wrong = [], 0
     for name in names:
         spec = benchpy.PROJECTS[name]
         ws = os.path.join(root, name)
-        shutil.copytree(cargo_ra_jit.fetch(name, spec), ws, symlinks=True,
+        shutil.copytree(blaze_cli.fetch(name, spec), ws, symlinks=True,
                         ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
         env = dict(env_for(os.path.join(root, f"{name}-h"), remote), **spec.get("env", {}))
         subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
@@ -382,7 +382,7 @@ def bench(names, keep=False):
                 if why:
                     verdict = f"{kind} edit {why}"
                     break
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         wrong += verdict not in ("same output", "builds", "cargo's build fails")
         rows.append((name, verdict, took, cargo_took))
         print(f"{name:12} {verdict:40} blaze {took:7.1f}s  cargo {cargo_took:7.1f}s{edits}", flush=True)
@@ -394,8 +394,8 @@ def bench(names, keep=False):
 
 
 def main():
-    if not shutil.which("cargo-ra-jit", path=os.path.dirname(RA_JIT)):
-        sys.exit(f"no cargo-ra-jit beside {RA_JIT}")
+    if not shutil.which("blaze", path=os.path.dirname(BLAZE)):
+        sys.exit(f"no blaze beside {BLAZE}")
     if sys.argv[1:2] == ["bench"]:
         names = [it for it in sys.argv[2:] if it != "--keep"]
         bench(names or ["ripgrep", "fd", "hyperfine"], "--keep" in sys.argv)

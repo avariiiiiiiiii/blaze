@@ -4,7 +4,7 @@ CREATE TABLE signups (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   email TEXT NOT NULL UNIQUE,          -- trimmed, lowercased
   company TEXT,                        -- optional
-  why TEXT,                            -- "Why do you want to use ra-jit?", optional
+  why TEXT,                            -- "Why do you want to use blaze?", optional
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   -- request.cf

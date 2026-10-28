@@ -1812,7 +1812,7 @@
    ],
    [
     "-e",
-    "console.log(Bun.hash('ra-jit'), Bun.semver.order('1.2.3', '1.10.0'), new URL('https://a.b/c?d=1').searchParams.get('d'), JSON.stringify(Bun.deepEquals({a: [1]}, {a: [1]})))"
+    "console.log(Bun.hash('blaze'), Bun.semver.order('1.2.3', '1.10.0'), new URL('https://a.b/c?d=1').searchParams.get('d'), JSON.stringify(Bun.deepEquals({a: [1]}, {a: [1]})))"
    ],
    [
     "build",

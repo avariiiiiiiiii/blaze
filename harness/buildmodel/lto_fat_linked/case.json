@@ -1,5 +1,5 @@
 {
-  "row": "`lto = true`, and what ra-jit links against built with it",
+  "row": "`lto = true`, and what blaze links against built with it",
   "package": "app",
   "crates": [
     "app",
@@ -8,7 +8,7 @@
   "cargo": [
     "--release"
   ],
-  "ra-jit": [
+  "blaze": [
     "--release"
   ],
   "expect": "refused"

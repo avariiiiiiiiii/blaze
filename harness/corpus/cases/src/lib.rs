@@ -1,4 +1,4 @@
-//! Differential-test corpus. Every `pub fn` here is compiled by ra-jit and called from the
+//! Differential-test corpus. Every `pub fn` here is compiled by blaze and called from the
 //! rustc-built `runner`; the output must match an all-rustc build.
 //!
 //! One module per backend feature area, so a bisected culprit names the area.
@@ -9,7 +9,7 @@
     feature(deref_patterns, c_variadic_int128, portable_simd, core_intrinsics, f16, f128, f16b, unsized_fn_params)
 )]
 #![cfg_attr(all(feature = "nightly", target_arch = "aarch64"), feature(stdarch_aarch64_sve))]
-// The intrinsics `simd_wasm_lowered` and `x86_lowered` call directly, so that ra-jit compiles
+// The intrinsics `simd_wasm_lowered` and `x86_lowered` call directly, so that blaze compiles
 // them rather than linking `core::arch`'s functions of rustc's.
 #![cfg_attr(
     all(feature = "nightly", any(target_arch = "wasm32", target_arch = "x86_64")),
@@ -2598,8 +2598,8 @@ pub mod packed_drop {
 }
 
 /// `offset_of!` of a field of a packed struct takes no reference to it. The struct is never laid
-/// out by ra-jit, and --layouts compares types by their names without paths: named `Header`, it
-/// was compared with std's Windows allocator `Header(*mut u8)`, which ra-jit lays out.
+/// out by blaze, and --layouts compares types by their names without paths: named `Header`, it
+/// was compared with std's Windows allocator `Header(*mut u8)`, which blaze lays out.
 pub mod packed_offset_of {
     #[repr(C, packed)]
     pub struct PackedHeader {
@@ -7139,7 +7139,7 @@ pub mod sve {
     }
 }
 
-/// Each function of `core::arch`'s SVE and SVE2 of an LLVM intrinsic ra-jit has a stub of,
+/// Each function of `core::arch`'s SVE and SVE2 of an LLVM intrinsic blaze has a stub of,
 /// generated (`sve_ops.rs`).
 #[cfg(all(feature = "nightly", target_arch = "aarch64"))]
 pub mod sve_ops;
@@ -11351,7 +11351,7 @@ pub mod relaxed_wasm {
 }
 
 /// The vector operations of `simd_wasm` written as the intrinsics `core::arch::wasm32` is made
-/// of, so that ra-jit compiles each of them where rustc's `core::arch` functions would otherwise
+/// of, so that blaze compiles each of them where rustc's `core::arch` functions would otherwise
 /// be linked: platform intrinsics over `Simd` types, the `llvm.wasm.*` and vector `llvm.*`
 /// functions, and 128-bit rotations, minimums and negations.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "nightly"))]

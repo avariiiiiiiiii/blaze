@@ -14,12 +14,12 @@ use std::{
     marker::PhantomData,
 };
 
-use rowan::TextRange;
+use syntax_tree::TextRange;
 
 use crate::{AstNode, SyntaxNode, syntax_node::RustLanguage};
 
 /// A "pointer" to a [`SyntaxNode`], via location in the source code.
-pub type SyntaxNodePtr = rowan::ast::SyntaxNodePtr<RustLanguage>;
+pub type SyntaxNodePtr = syntax_tree::ast::SyntaxNodePtr<RustLanguage>;
 
 /// Like [`SyntaxNodePtr`], but remembers the type of node.
 pub struct AstPtr<N: AstNode> {

@@ -27,7 +27,7 @@ are printed as short unified diffs.
 
 The oracle is `cargo +<harness/toolchain> fmt` and that toolchain's rustfmt. Ours is the
 `cargo-fmt` and `rustfmt` examples of crates/blaze-fmt (built in release unless the commands
-are given), until `cargo blaze fmt` dispatches to it. TERM is unset for both, so neither
+are given), until `blaze fmt` dispatches to it. TERM is unset for both, so neither
 colours its output.
 """
 import argparse, collections, concurrent.futures, difflib, json, os, re, shutil, subprocess, sys, tempfile

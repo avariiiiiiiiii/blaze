@@ -5,7 +5,7 @@
 // Fixed by 2a3a0a35: LLVM's store key includes asm! text. fuzz/store.py covers the collision.
 // rustc:
 // c16 f58220087df0d8bc ok
-// ra-jit:
+// blaze:
 // c16 36432f6a1cd4f5a3 ok
 mod c16 {
     use super::*;

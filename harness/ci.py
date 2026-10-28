@@ -22,7 +22,7 @@ daemon or socket of one harness is seen by the next. BLAZE_CACHE is left alone: 
 the store on.
 
 Every harness in a part runs even when one before it fails; the part fails at the end and names
-them. BLAZE_BIN is the ra-jit the harnesses run, as for each harness on its own.
+them. BLAZE_BIN is the blaze the harnesses run, as for each harness on its own.
 """
 import json, math, os, platform, shutil, subprocess, sys, tempfile, time
 
@@ -59,7 +59,7 @@ HARNESSES = [
     # 11 to 22 minutes a run, longer than the rest of the fast tier, and it caught nothing there
     # in 2026-10-25 and 26's 270 runs: the full tier's alone.
     ("core", ["wholeprogram.py"], {}, on("linux", "macos"), None),
-    # `cargo blaze build` from nothing: G's whole build, no cargo build.
+    # `blaze build` from nothing: G's whole build, no cargo build.
     ("core", ["coldbuild.py"], {}, on("linux"), 2),
     # A load refused for configuration must be retried without stopping the daemon (#597).
     ("core", ["loadretry.py"], {}, on("linux", "macos"), 2),
@@ -83,7 +83,7 @@ HARNESSES = [
     ("core", ["farfile.py"], {}, on("linux"), None),
     # 220 MB of code, 16 MB of frames and, on Linux, 4.2 GB of DWARF: no size is a full link.
     ("core", ["bigbinary.py"], {}, on("linux", "macos"), None),
-    # `cargo ra-jit` hands Windows builds to cargo, so there the daemon links nothing to test.
+    # `blaze` hands Windows builds to cargo, so there the daemon links nothing to test.
     ("core", ["unreached.py"], {}, on("linux", "macos"), 1),
     ("core", ["anonstatics.py"], {}, on("linux", "macos"), 1),
     # A static with state LLVM renamed (`SERVING.0`) at opt-level 1 is rustc's copy for both.
@@ -94,17 +94,17 @@ HARNESSES = [
     ("core", ["testselect.py"], {}, on("linux", "macos"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
     ("core", ["asmedits.py"], {}, EVERYWHERE, 1),
-    # The assembler of a build of ra-jit without LLVM, which is the release's.
+    # The assembler of a build of blaze without LLVM, which is the release's.
     ("core", ["asmedits.py"], {"BLAZE_ASSEMBLER": "cc"}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["includes.py"], {}, EVERYWHERE, 1),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
-    # `cargo ra-jit check`'s diagnostics, in each `--message-format`, against rustc's.
+    # `blaze check`'s diagnostics, in each `--message-format`, against rustc's.
     ("core", ["check_json.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     ("core", ["checktargets.py"], {}, on("linux", "macos", backend="cranelift"), 2),
-    # ra-jit answers what is asked of rustc as rustc answers it, on every target it knows.
+    # blaze answers what is asked of rustc as rustc answers it, on every target it knows.
     ("core", ["answers.py"], {}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["worktrees.py"], {}, EVERYWHERE, 2),
     ("core", ["worktrees.py", "--join", "--together"], {}, on("macos"), 2),
@@ -117,7 +117,7 @@ HARNESSES = [
     # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR.
     ("core", ["fuzz/store.py", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
     ("core", ["fuzz/edits.py", "smoke", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
-    # Every reduced program fuzzing found ra-jit building wrong, on both architectures they
+    # Every reduced program fuzzing found blaze building wrong, on both architectures they
     # were found on; a part of its own, as it takes minutes.
     ("core", ["fuzz/fuzz.py", "check", "--backends", BACKEND], {}, on("linux"), 3),
     # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
@@ -332,9 +332,9 @@ def run_one(args, env):
     own = {"BLAZE_HOME": home}
     status = subprocess.run([sys.executable, *args], cwd=HERE, env={**os.environ, **own, **env}).returncode
     # A daemon the harness left running in that home, which nothing after it may talk to.
-    cargo_ra_jit = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", ""))), "cargo-ra-jit")
-    if os.environ.get("BLAZE_BIN") and os.path.exists(cargo_ra_jit + (".exe" if SYSTEM == "windows" else "")):
-        subprocess.run([cargo_ra_jit, "ra-jit", "stop"], env={**os.environ, **own}, capture_output=True, timeout=120)
+    blaze_cli = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", ""))), "blaze")
+    if os.environ.get("BLAZE_BIN") and os.path.exists(blaze_cli + (".exe" if SYSTEM == "windows" else "")):
+        subprocess.run([blaze_cli, "blaze", "stop"], env={**os.environ, **own}, capture_output=True, timeout=120)
     if status == 0:
         shutil.rmtree(home, ignore_errors=True)
     return status

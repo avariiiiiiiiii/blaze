@@ -4,9 +4,9 @@
 
 program  arguments of `cargo test` that pick test binaries which start the program
          (`["--test", "integration"]`). Cargo builds them once; each is run with cargo's
-         program beside it and then with ra-jit's in its place.
+         program beside it and then with blaze's in its place.
 crates   directories of workspace crates whose unit and integration tests are linked again
-         with ra-jit's objects for the crate, by cratetest.py.
+         with blaze's objects for the crate, by cratetest.py.
 
 A test counts by its name and its result in both runs; the ones that differ are listed.
 """
@@ -56,7 +56,7 @@ def program_tests(fx, ws, spec, args, skip):
     want, got = seen
     differing = sorted(test for test in want.keys() | got.keys() if want.get(test) != got.get(test))
     for test in differing[:40]:
-        print(f"  DIFFERS {test}: with cargo's program {want.get(test)}, with ra-jit's {got.get(test)}")
+        print(f"  DIFFERS {test}: with cargo's program {want.get(test)}, with blaze's {got.get(test)}")
     return len(want), differing
 
 

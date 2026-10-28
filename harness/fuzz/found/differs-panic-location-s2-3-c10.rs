@@ -5,8 +5,8 @@
 // panic: panicked at src/main.rs:342:39:
 // index out of bounds: the len is 3 but the index is 16
 // c10 0000000000000000 ok
-// ra-jit:
-// panic: panicked at <ra-jit>:0:0:
+// blaze:
+// panic: panicked at <blaze>:0:0:
 // index out of bounds: the len is 3 but the index is 16
 // c10 0000000000000000 ok
 mod c10 {

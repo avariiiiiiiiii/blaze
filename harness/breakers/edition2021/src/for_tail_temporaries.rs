@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L6-176-c3.rs`): when the temporaries of
 //! what a `for` iterates over are dropped. rustc drops them where the loop ends. Before the
 //! 2024 edition that shows when the loop is the tail of a block: the temporaries of any other
-//! tail outlive the locals of the block, and those of a `for` do not. ra-jit kept them like
+//! tail outlive the locals of the block, and those of a `for` do not. blaze kept them like
 //! any other tail's.
 
 use std::cell::RefCell;

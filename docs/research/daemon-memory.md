@@ -1,8 +1,8 @@
 # What the daemon's memory is, and what salsa's `lru` can do about it
 
-2026-10-21, for [#39](https://github.com/indexable-inc/ra-jit/issues/39) (Glancer item 5,
+2026-10-21, for [#39](https://github.com/indexable-inc/blaze/issues/39) (Glancer item 5,
 [docs/glancer.md](../glancer.md#item-5-memo-eviction-and-per-phase-memory)). Measured on
-Andrew's Mac (Apple silicon, macOS, shared with other builds), ra-jit at `8b25a045da`,
+Andrew's Mac (Apple silicon, macOS, shared with other builds), blaze at `8b25a045da`,
 Cranelift, the `bench.py` projects. Each claim is **read** (measured, or read in a source),
 **reported** (someone says so) or **unverified** (our inference). The salsa source read is in
 [docs/upstream/daemon-memory/](../upstream/daemon-memory/SOURCE.md).
@@ -48,7 +48,7 @@ Live heap by phase, jemalloc's count (**read**):
 | nushell | 1,880 MB | 2,206 MB | 10,249 MB | 10,030 MB |
 
 nushell's cold build compiled 6,399 functions and 152,692 instances in 14.3 s. Its heap once
-ready, by holder (9.1 GB sampled: values 6.2 GB, salsa's records 1.5 GB, ra-jit's own
+ready, by holder (9.1 GB sampled: values 6.2 GB, salsa's records 1.5 GB, blaze's own
 1.0 GB, interned 0.4 GB) (**read**):
 
 | holder | value | record | memos |
@@ -60,9 +60,9 @@ ready, by holder (9.1 GB sampled: values 6.2 GB, salsa's records 1.5 GB, ra-jit'
 | `parse` | 400 MB | | |
 | `mir_body` | 371 MB | | 22,615 |
 | vfs and loading | 277-293 MB | | |
-| splice (ra-jit) | 249 MB | | |
+| splice (blaze) | 249 MB | | |
 | `infer` | 236 MB | 53 MB | 22,559 |
-| symbol table (ra-jit) | 229 MB | | |
+| symbol table (blaze) | 229 MB | | |
 | `Body::relative` | 186 MB | | 135,996 |
 | `inlinable` | 121 MB | 140 MB | 118,693 |
 | `crate_local_def_map` | 99 MB | | |
@@ -88,7 +88,7 @@ holds the green subtree of every body, which keeps the trees' nodes alive. `Body
 `Arc<Body>` for every body, so `Body::relative`'s `lru = 4096` frees little (**unverified**:
 read from the code and the counts, not measured by evicting).
 
-The spare: after the first request the daemon starts `ra-jit --spare` with the 21 crates of the
+The spare: after the first request the daemon starts `blaze-engine --spare` with the 21 crates of the
 standard library loaded ("spare: 21 crates in 5.4s"), for the next project to start from. On
 ripgrep after an edit: worker 1,909 MB, spare 940 MB (`footprint` of each process) (**read**).
 That is the step from "once ready" to "after the no-op" in `bench.py`: ripgrep 2,309 to
@@ -151,9 +151,9 @@ nushell, whose processes were not measured one by one).
 
 ## 2026-10-22: the spare and eviction
 
-For [#56](https://github.com/indexable-inc/ra-jit/issues/56) and
-[#57](https://github.com/indexable-inc/ra-jit/issues/57). Measured on an AWS c8a.48xlarge (AMD
-EPYC 9R45, Linux 6.18), each run pinned to 16 of its cores, ra-jit at `494f0ee948` and branches
+For [#56](https://github.com/indexable-inc/blaze/issues/56) and
+[#57](https://github.com/indexable-inc/blaze/issues/57). Measured on an AWS c8a.48xlarge (AMD
+EPYC 9R45, Linux 6.18), each run pinned to 16 of its cores, blaze at `494f0ee948` and branches
 of it, Cranelift. Before and after ran on the same host; `spare.py` interleaves its variants
 round by round, `bench.py` ran main's and the branch's three runs of a project one after the
 other.
@@ -216,16 +216,16 @@ other.
 
 ## 2026-10-23: the own base, and the allocator
 
-For [#39](https://github.com/indexable-inc/ra-jit/issues/39). Measured on an AWS c7i.16xlarge
+For [#39](https://github.com/indexable-inc/blaze/issues/39). Measured on an AWS c7i.16xlarge
 (dev-aws-7, Intel Xeon, Linux, transparent huge pages on `madvise`), each run on 16 cores of
-its own, ra-jit at `d6291bd7cb` (main) and the `mem-39` branch, Cranelift. Per process with
+its own, blaze at `d6291bd7cb` (main) and the `mem-39` branch, Cranelift. Per process with
 `harness/memsplit.py`, per allocation with `heap.py` on jemalloc profiles, the whole tree with
 `bench.py`.
 
 ### Why the daemon doubles after ready
 
 - It is not the first edit. One second after the daemon is ready with nothing asked, it builds
-  its own base: every function of the workspace compiled by ra-jit, so that later edits patch
+  its own base: every function of the workspace compiled by blaze, so that later edits patch
   its code (`build_own_base`). `bench.py`'s first edit comes after cargo's reference build, by
   which time that is over, and the no-op before it already shows it: nushell 6.2 GB ready, 10.8
   GB after; helix 4.0 and 16.2 GB (12.1 once the first edit is over); bun 12.3 and 24.9 GB
@@ -258,7 +258,7 @@ its own, ra-jit at `d6291bd7cb` (main) and the `mem-39` branch, Cranelift. Per p
 
 ### The allocator
 
-- ra-jit allocated with mimalloc 3.3.2 (`libmimalloc-sys` 0.1.49 builds its v3 unless told
+- blaze allocated with mimalloc 3.3.2 (`libmimalloc-sys` 0.1.49 builds its v3 unless told
   `v2`). It asks for transparent huge pages (`allow_thp` is 1 by default) and purges freed
   pages after a second (**read**, `options.c`). On a host with THP on `madvise`, nushell's
   worker held 2.5-2.9 GB more than with jemalloc after the same build and edits
@@ -307,8 +307,8 @@ its own, ra-jit at `d6291bd7cb` (main) and the `mem-39` branch, Cranelift. Per p
 
 ## 2026-10-23: sharing `described` (#55)
 
-For [#55](https://github.com/indexable-inc/ra-jit/issues/55). Same host as above (dev-aws-7,
-124 GiB), ra-jit main at `04bdd5b01e` (with jemalloc) and the `share-types-4` branch merged
+For [#55](https://github.com/indexable-inc/blaze/issues/55). Same host as above (dev-aws-7,
+124 GiB), blaze main at `04bdd5b01e` (with jemalloc) and the `share-types-4` branch merged
 onto it, Cranelift, each pair at once on two sets of 16 cores, one run each, with
 `harness/memsplit.py` (the edits body and add-a-function; bun's signature and
 add-a-function).
@@ -330,7 +330,7 @@ add-a-function).
 
 ### The DWARF is the same
 
-- The objects of a parallel build differ between two runs of the same ra-jit: which unit a
+- The objects of a parallel build differ between two runs of the same blaze: which unit a
   type's entry is shared in follows the order functions are compiled in (`debuginfo.py`'s
   rung2, stress and corpus objects, main against main: 17 of 99 with debug info differ in
   their DIEs) (**read**).
@@ -340,7 +340,7 @@ add-a-function).
   --debug-line`, once the checkout's path and the temporary directories' names are set aside;
   the `.debug_info` and `.debug_line` bytes are the same, `.debug_str` one byte shorter for the
   shorter checkout path (**read**). `debuginfo.py` in full passes on both, perf unwinding by
-  `.eh_frame` included (341 and 338 frames of ra-jit's functions in about 400 samples, none
+  `.eh_frame` included (341 and 338 frames of blaze's functions in about 400 samples, none
   without a line) (**read**).
 
 ### Memory, main → branch
@@ -370,8 +370,8 @@ stays open.
 
 ## 2026-10-23: each type once (#29)
 
-For [#29](https://github.com/indexable-inc/ra-jit/issues/29). Same host (dev-aws-7, 124 GiB),
-ra-jit's `described-nodes` branch, Cranelift, 16 cores, `harness/memsplit.py` with
+For [#29](https://github.com/indexable-inc/blaze/issues/29). Same host (dev-aws-7, 124 GiB),
+blaze's `described-nodes` branch, Cranelift, 16 cores, `harness/memsplit.py` with
 `BLAZE_OWN_BASE_MEMORY=off` under a 64 GB cgroup, profiles with `heap.py`.
 
 ### What changed
@@ -432,14 +432,14 @@ why ready holds more was not looked at (**unverified**).
   memos, `layout_of_ty` 4.26M, `row_place` 2.85M, `layout_of_adt` 2.21M,
   `compiled_instance` 1.91M, `inlinable` 1.37M), MIR about 8.9 GB (`runtime_mir_body` 2.2,
   `monomorphized_runtime_mir_body_for_coroutine` 2.1, `mir_body` 1.9), `compiled_instance`'s
-  code 3.9 GB, inference 2.8 GB, ra-jit's symbol table 1.9 GB, `inlinable` 1.5 GB,
+  code 3.9 GB, inference 2.8 GB, blaze's symbol table 1.9 GB, `inlinable` 1.5 GB,
   `told_type` 1.4 GB, layouts 1.6 GB.
 - Under the default bound, a quarter of memory (31.7 GB here), the base is still given up,
   and zed's edits patch rustc's executable (#159). All of it is held in the one revision the
   base is built in, where salsa evicts nothing (above): the base would have to be built in
   pieces, revisions apart, for `lru` to bound it
-  ([#188](https://github.com/indexable-inc/ra-jit/issues/188)) (**unverified** as a fix).
-- `memsplit.py`'s body edit of zed is in `crates/zed/src/main.rs`, whose `main` ra-jit leaves
+  ([#188](https://github.com/indexable-inc/blaze/issues/188)) (**unverified** as a fix).
+- `memsplit.py`'s body edit of zed is in `crates/zed/src/main.rs`, whose `main` blaze leaves
   to rustc (it awaits through `async` blocks whose coroutine layout it can't make), so it
   is no patch: the build in full is refused, cargo builds it, and in the same cgroup as the
   59 GB worker cargo's build was killed (**read**).
@@ -450,7 +450,7 @@ For [#261](https://github.com/indexable-inc/blaze/issues/261). Measured on dev-a
 Linux, 370 GB), blaze main at `598936fc68` and the `mem-261` branch, Cranelift, reth at
 `482366d170` (`--bin reth --no-default-features --features jemalloc,otlp,otlp-logs,js-tracer,
 keccak-cache-global,asm-keccak,gmp,min-trace-logs,portable`; the default features want LLVM
-23), each run on 6 to 24 cores of its own, a driver that does a cold `cargo ra-jit build`, waits
+23), each run on 6 to 24 cores of its own, a driver that does a cold `blaze build`, waits
 for the own base's end in the worker's log, then edits: a body, a leaf body, a new function and
 a signature with its caller, each made and taken back, with the worker's `VmRSS`, `VmHWM` and
 jemalloc's live count after each.
@@ -468,10 +468,10 @@ jemalloc's live count after each.
 ### What the own base keeps
 
 jemalloc's sampled live heap after the 50th edit, 12.9 GB (**read**, `heap.py`): values 6.5
-GB, salsa's records 3.0 GB, ra-jit's own 2.2 GB, interned 1.0 GB. By holder: the MIR queries
+GB, salsa's records 3.0 GB, blaze's own 2.2 GB, interned 1.0 GB. By holder: the MIR queries
 (`runtime_mir_body`, `mir_body`, their closure, coroutine and monomorphized copies) about
 2.3 GB, `compiled_instance` 0.95 GB of code and 0.61 GB of records, `infer` 0.86 GB and 0.12
-GB, `inlinable` 0.32 GB and 0.39 GB, ra-jit's symbols of what rustc linked 1.4 GB (the symbol
+GB, `inlinable` 0.32 GB and 0.39 GB, blaze's symbols of what rustc linked 1.4 GB (the symbol
 table 0.53 GB, `symbols::Linked` 0.58 GB, `symbols::Named` 0.28 GB), splice 0.38 GB, vfs 0.35
 GB, `Body::relative` 0.30 GB, layouts 0.26 GB. What the own base adds to ready is about 7.6
 GB of it. The worker's resident figure is 3.2 GB over the live count: jemalloc returns freed
@@ -519,7 +519,7 @@ Two runs of each at once, 6 cores each (**read**):
   edits, 9.9-10.1 GB live, the first body edit 6.9 s (**read**, one run each).
 - The most the worker holds is the same: the own base is built in one revision, in which salsa
   lets nothing go. Bounding that is building it in pieces
-  ([#188](https://github.com/indexable-inc/ra-jit/issues/188)).
+  ([#188](https://github.com/indexable-inc/blaze/issues/188)).
 
 ### Tempo
 

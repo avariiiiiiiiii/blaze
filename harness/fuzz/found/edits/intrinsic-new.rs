@@ -2,7 +2,7 @@
 // The edit (regen.fn): the first use of `powi` in the program, so rustc's first build has no
 // copy of it for the daemon to call.
 // Again: edits.py check intrinsic-new.rs
-// refused: `run` is not compiled by ra-jit and rustc's copy is from before the edit, build
+// refused: `run` is not compiled by blaze and rustc's copy is from before the edit, build
 // with cargo: unsupported: callee `powi`: callee `powi`: unsupported: intrinsic `powif32`
 mod c0 {
     use super::*;

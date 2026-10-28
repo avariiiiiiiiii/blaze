@@ -82,7 +82,7 @@ pub(super) struct CachedFunc {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) enum CachedTarget {
-    /// `checked` when the symbol was one of the program's rustc build or of an object ra-jit
+    /// `checked` when the symbol was one of the program's rustc build or of an object blaze
     /// built before (the standard library's unit), which another program's may lack.
     Import { symbol: String, checked: bool },
     /// The entry of this name, or whatever else the build has for the instance.
@@ -249,7 +249,7 @@ impl StoredCode {
         let isa = super::target().ok()?;
         let ir = cranelift_codegen::incremental_cache::compute_cache_key(&**isa, func);
         let mut hasher = Sha256::new();
-        hasher.update(b"ra-jit llvm 9");
+        hasher.update(b"blaze llvm 9");
         // Nor what the types of the parameters say of the memory they point to.
         for (at, pointee) in pointees {
             let super::fragment::Pointee { unique, frozen, size, align } = *pointee;
@@ -436,7 +436,7 @@ impl Entry {
             hasher.update(bytes);
         };
         // 12: an import of the standard library's unit is checked (#328).
-        field(b"ra-jit entry 12");
+        field(b"blaze entry 12");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -651,7 +651,7 @@ impl KeptTypes {
         }
         let bytes = postcard::to_allocvec(&types.to_vec()).unwrap_or_default();
         let mut hasher = Sha256::new();
-        hasher.update(b"ra-jit types 1");
+        hasher.update(b"blaze types 1");
         hasher.update(&bytes);
         let key = hasher.finalize().into();
         store.insert(&key, &bytes);
@@ -733,7 +733,7 @@ impl Writer {
                         }
                         std::mem::take(&mut writer.written)
                     };
-                    std::thread::Builder::new().name("ra-jit store".to_owned()).spawn(work).ok()
+                    std::thread::Builder::new().name("blaze store".to_owned()).spawn(work).ok()
                 })
                 .collect();
             match threads.is_empty() {
@@ -1034,7 +1034,7 @@ mod tests {
         isa::CallConv,
     };
     use cranelift_module::{DataId, FuncId};
-    use ra_jit_fuzz as fuzz;
+    use blaze_fuzz as fuzz;
 
     use super::{
         super::{

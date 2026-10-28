@@ -1,5 +1,5 @@
 //! tests/ui/union/union-pat-refutability.rs: a union is matched by one of its fields, read
-//! where the union is. ra-jit had no lowering for the pattern and left the function to rustc.
+//! where the union is. blaze had no lowering for the pattern and left the function to rustc.
 
 #[derive(Clone, Copy)]
 #[repr(u32)]

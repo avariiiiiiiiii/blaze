@@ -77,7 +77,7 @@ impl World {
 }
 
 fn main() {
-    match ra_jit_live::Live::start() {
+    match blaze_live::Live::start() {
         // Applied the moment it arrives, as a game's window does.
         Ok(live) => live.apply_as_they_come(|outcome| {
             println!("outcome: {outcome}");

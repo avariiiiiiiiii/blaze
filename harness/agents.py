@@ -5,7 +5,7 @@ usage: agents.py WORKSPACE PACKAGE CRATE[,CRATE...] [--steps N] [--seed S] [--ta
                  [--noise FILE,FILE...] [-- RUN_ARG...]
 
 The workspace is copied. Each step changes the copy, asks the daemon for a build with
-`ra-jit sync`, builds the same source with cargo in a directory of its own and runs both programs:
+`blaze sync`, builds the same source with cargo in a directory of its own and runs both programs:
 they have to print the same. A step is one of
   - a unit added: a new module of the program (functions, a struct with derives, a trait with
     impls, generics, a macro, statics, closures, an `async fn`, collections, an enum, operators
@@ -29,7 +29,7 @@ import os, random, re, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, profile_dir
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, profile_dir
 
 MAIN = re.compile(r"fn main\(\)[^{;]*\{\n")
 ITEM = re.compile(r"(use|mod|fn|pub|#\[|static|const|struct|enum|extern|type|macro_rules|impl|trait|async|unsafe)\b")
@@ -153,7 +153,7 @@ def user(k, v):
     label = " + c.label.len() as u64" if s % 3 == 2 else ""
     third = ", 3" if s % 4 >= 2 else ""
     describe = "Item(1).describe()" if s % 2 else '"-"'
-    return (f"use super::ra_jit_ushared::{{self as shared, Config, Mode, Scaled}};\n\nstruct Item(u32);\n\nimpl Scaled for Item {{\n    fn scaled(&self, c: &Config) -> u64 {{\n        (self.0 * c.scale) as u64 + {v}{offset}{label}\n    }}\n}}\n\npub fn used() -> String {{\n    let c = Config::new();\n    let arr = [0u8; shared::konst()];\n    let comb = shared::combine({k}, {v}{third}) as u64;\n    let modes = [Mode::Fast, Mode::Slow];\n    format!(\"{{}} {{}} {{}} {{}} {{}} {{}}\", Item({k}).scaled(&c), comb, shared::shared_sum!(1, {v}), modes.iter().map(|m| m.cost()).sum::<u32>(), shared::BASE + arr.len() as u32, {describe})\n}}\n",
+    return (f"use super::blaze_ushared::{{self as shared, Config, Mode, Scaled}};\n\nstruct Item(u32);\n\nimpl Scaled for Item {{\n    fn scaled(&self, c: &Config) -> u64 {{\n        (self.0 * c.scale) as u64 + {v}{offset}{label}\n    }}\n}}\n\npub fn used() -> String {{\n    let c = Config::new();\n    let arr = [0u8; shared::konst()];\n    let comb = shared::combine({k}, {v}{third}) as u64;\n    let modes = [Mode::Fast, Mode::Slow];\n    format!(\"{{}} {{}} {{}} {{}} {{}} {{}}\", Item({k}).scaled(&c), comb, shared::shared_sum!(1, {v}), modes.iter().map(|m| m.cost()).sum::<u32>(), shared::BASE + arr.len() as u32, {describe})\n}}\n",
             "used()")
 
 
@@ -173,7 +173,7 @@ class Source:
         self.text = dict(self.first)
 
     def unit_path(self, k):
-        return os.path.join(os.path.dirname(self.main), f"ra_jit_u{k}.rs")
+        return os.path.join(os.path.dirname(self.main), f"blaze_u{k}.rs")
 
     def files(self):
         """Every file the steps own or change, as it should be now."""
@@ -182,20 +182,20 @@ class Source:
         out = dict(self.text)
         mods, probes = "", ""
         if any(kind.startswith("user") for kind, _ in self.units.values()):
-            out[os.path.join(os.path.dirname(self.main), "ra_jit_ushared.rs")] = shared_text(self.shared).replace("pub ", "pub(crate) ")
-            mods += "mod ra_jit_ushared;\n"
+            out[os.path.join(os.path.dirname(self.main), "blaze_ushared.rs")] = shared_text(self.shared).replace("pub ", "pub(crate) ")
+            mods += "mod blaze_ushared;\n"
         for k, (kind, v) in sorted(self.units.items()):
             text, call = KINDS[kind](k, v)
             # A program can deny `unreachable_pub`.
             out[self.unit_path(k)] = text.replace("pub ", "pub(crate) ")
-            mods += f"mod ra_jit_u{k};\n"
-            probes += f'    eprintln!("unit {k} {kind}: {{}}", ra_jit_u{k}::{call});\n'
+            mods += f"mod blaze_u{k};\n"
+            probes += f'    eprintln!("unit {k} {kind}: {{}}", blaze_u{k}::{call});\n'
         for k, v in sorted(self.libs.items()):
             args = ", ".join(str(i + 1) for i in range(1 + v % 3))
             params = ", ".join(f"p{i}: u64" for i in range(1 + v % 3))
             total = " + ".join(f"p{i}" for i in range(1 + v % 3))
-            out[self.lib[0]] += f"\n/// Added.\npub fn ra_jit_lib_{k}({params}) -> u64 {{\n    ({total}) * {k + 2} + {v}\n}}\n"
-            probes += f'    eprintln!("lib {k}: {{}}", {self.lib[1]}::ra_jit_lib_{k}({args}));\n'
+            out[self.lib[0]] += f"\n/// Added.\npub fn blaze_lib_{k}({params}) -> u64 {{\n    ({total}) * {k + 2} + {v}\n}}\n"
+            probes += f'    eprintln!("lib {k}: {{}}", {self.lib[1]}::blaze_lib_{k}({args}));\n'
         main = out[self.main]
         main = MAIN.sub(lambda m: m[0] + probes, main, 1)
         # After the inner attributes and doc comment of the crate, which have to come first.
@@ -226,12 +226,12 @@ class Source:
             path = self.rng.choice(list(self.files()))
             how = self.rng.choice([
                 ("syntax error", lambda t: t.replace("{", "{ (", 1)),
-                ("type error", lambda t: t + "\nfn ra_jit_wrong() -> u32 {\n    \"text\"\n}\n"),
-                ("unresolved name", lambda t: t + "\nfn ra_jit_wrong() -> u32 {\n    ra_jit_missing(1)\n}\n"),
-                ("missing match arm", lambda t: t + "\n#[allow(dead_code)]\nfn ra_jit_wrong(x: Option<u8>) -> u8 {\n    match x {\n        Some(n) => n,\n    }\n}\n"),
-                ("wrong argument count", lambda t: t + "\n#[allow(dead_code)]\nfn ra_jit_wrong() -> u32 {\n    ra_jit_two(1)\n}\n\n#[allow(dead_code)]\nfn ra_jit_two(a: u32, b: u32) -> u32 {\n    a + b\n}\n"),
-                ("missing trait item", lambda t: t + "\n#[allow(dead_code)]\ntrait RaJitT {\n    fn f(&self);\n}\n\nimpl RaJitT for u8 {}\n"),
-                ("missing field", lambda t: t + "\n#[allow(dead_code)]\nstruct RaJitS {\n    a: u8,\n    b: u8,\n}\n\n#[allow(dead_code)]\nfn ra_jit_wrong() -> RaJitS {\n    RaJitS { a: 1 }\n}\n"),
+                ("type error", lambda t: t + "\nfn blaze_wrong() -> u32 {\n    \"text\"\n}\n"),
+                ("unresolved name", lambda t: t + "\nfn blaze_wrong() -> u32 {\n    blaze_missing(1)\n}\n"),
+                ("missing match arm", lambda t: t + "\n#[allow(dead_code)]\nfn blaze_wrong(x: Option<u8>) -> u8 {\n    match x {\n        Some(n) => n,\n    }\n}\n"),
+                ("wrong argument count", lambda t: t + "\n#[allow(dead_code)]\nfn blaze_wrong() -> u32 {\n    blaze_two(1)\n}\n\n#[allow(dead_code)]\nfn blaze_two(a: u32, b: u32) -> u32 {\n    a + b\n}\n"),
+                ("missing trait item", lambda t: t + "\n#[allow(dead_code)]\ntrait BlazeT {\n    fn f(&self);\n}\n\nimpl BlazeT for u8 {}\n"),
+                ("missing field", lambda t: t + "\n#[allow(dead_code)]\nstruct BlazeS {\n    a: u8,\n    b: u8,\n}\n\n#[allow(dead_code)]\nfn blaze_wrong() -> BlazeS {\n    BlazeS { a: 1 }\n}\n"),
             ])
             self.broken = (path, how[1])
             return f"BROKEN: {how[0]} in {os.path.relpath(path, self.ws)}", False
@@ -279,9 +279,9 @@ class Source:
             self.text[path] = text + f"// note {n}\n"
         elif how == "let":
             at = rng.choice(spots)
-            self.text[path] = text[:at] + f"let _ra_jit_{n} = {n}u32;\n" + text[at:]
+            self.text[path] = text[:at] + f"let _blaze_{n} = {n}u32;\n" + text[at:]
         else:
-            self.text[path] = text + f"\n#[allow(dead_code)]\nfn ra_jit_unused_{n}(x: u32) -> u32 {{\n    x + {n}\n}}\n"
+            self.text[path] = text + f"\n#[allow(dead_code)]\nfn blaze_unused_{n}(x: u32) -> u32 {{\n    x + {n}\n}}\n"
         return f"{how} in {os.path.relpath(path, self.ws)}"
 
     def write(self, files=None):
@@ -289,7 +289,7 @@ class Source:
         folder = os.path.dirname(self.main)
         for name in os.listdir(folder):
             path = os.path.join(folder, name)
-            if name.startswith("ra_jit_u") and path not in files:
+            if name.startswith("blaze_u") and path not in files:
                 os.remove(path)
         for path, text in files.items():
             if not os.path.exists(path) or open(path).read() != text:
@@ -303,11 +303,11 @@ def main():
     opt = lambda name, default=None: argv[argv.index(name) + 1] if name in argv else default
     workspace, package, crates = argv[0], argv[1], argv[2].split(",")
     steps, seed = int(opt("--steps", "60")), int(opt("--seed", "1"))
-    ws = tempfile.mkdtemp(prefix="ra-jit-agents-")
+    ws = tempfile.mkdtemp(prefix="blaze-agents-")
     shutil.copytree(workspace, ws, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns("target", "target-*", ".git"))
-    work = tempfile.mkdtemp(prefix="ra-jit-agents-out-")
-    obj, patch, binary = (os.path.join(work, n) for n in ("ra-jit.o", "ra-jit.patch.o", "bin-ra-jit"))
-    socket, log_path, reference = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log"), os.path.join(work, "reference")
+    work = tempfile.mkdtemp(prefix="blaze-agents-out-")
+    obj, patch, binary = (os.path.join(work, n) for n in ("blaze.o", "blaze.patch.o", "bin-blaze"))
+    socket, log_path, reference = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log"), os.path.join(work, "reference")
     out = open(log_path, "a")
     fx = Fixture(ws, crates, ["-p", package])
     import json
@@ -323,7 +323,7 @@ def main():
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         link = list(fx.link_args)
-        link = linkline.ahead(link, [patch, obj], RA_JIT)
+        link = linkline.ahead(link, [patch, obj], BLAZE)
         link[link.index("-o") + 1] = binary
         for path in (socket, binary):
             if os.path.exists(path):
@@ -331,7 +331,7 @@ def main():
         seen = len(open(log_path).read())
         began = time.time()
         daemon = subprocess.Popen(
-            [RA_JIT, os.path.join(ws, opt("--project", "")), *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
+            [BLAZE, os.path.join(ws, opt("--project", "")), *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
              "--patch", patch, "--link-cmd", shlex.join(link), *symbols], stderr=out, stdout=out)
         while "watching" not in open(log_path).read()[seen:]:
             if daemon.poll() is not None:
@@ -343,7 +343,7 @@ def main():
         try:
             p = subprocess.run([*RUNNER, path, *run_args], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
             # A usage line names the program by its file name, which is not the same for the two.
-            return f"{p.stdout}\n--\n{p.stderr}\n[exit {p.returncode}]".replace(path, "BIN").replace("bin-ra-jit", bin_name)
+            return f"{p.stdout}\n--\n{p.stderr}\n[exit {p.returncode}]".replace(path, "BIN").replace("bin-blaze", bin_name)
         except Exception as error:
             return f"[{type(error).__name__}]"
 
@@ -368,7 +368,7 @@ def main():
             source.write()
         asked = time.time()
         try:
-            got = subprocess.run([RA_JIT, "sync", socket], capture_output=True, text=True, timeout=300)
+            got = subprocess.run([BLAZE, "sync", socket], capture_output=True, text=True, timeout=300)
             reply = got.stdout.strip() or got.stderr.strip().removeprefix("Error: daemon: ")
         except subprocess.TimeoutExpired:
             reply = "no reply in 300 s"

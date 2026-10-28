@@ -822,7 +822,7 @@
      "hyper-util",
      "libc",
      "percent-encoding",
-     "ra-jit-store",
+     "blaze-store",
      "rustc-hash 2.1.2",
      "semver",
      "serde",
@@ -2097,7 +2097,7 @@
      "intern",
      "itertools 0.15.0",
      "la-arena",
-     "ra-ap-rustc_type_ir",
+     "rustc_type_ir",
      "rustc-hash 2.1.2",
      "salsa",
      "serde_json",
@@ -2133,7 +2133,7 @@
      "intern",
      "itertools 0.15.0",
      "la-arena",
-     "ra-ap-rustc_abi",
+     "rustc_abi",
      "ra-ap-rustc_parse_format",
      "rustc-hash 2.1.2",
      "rustc_apfloat",
@@ -2194,10 +2194,10 @@
      "la-arena",
      "macros",
      "project-model",
-     "ra-ap-rustc_abi",
+     "rustc_abi",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_pattern_analysis",
-     "ra-ap-rustc_type_ir",
+     "rustc_type_ir",
      "rustc-hash 2.1.2",
      "rustc_apfloat",
      "salsa",
@@ -2231,11 +2231,11 @@
      "la-arena",
      "macros",
      "oorandom",
-     "ra-ap-rustc_abi",
+     "rustc_abi",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_index",
-     "ra-ap-rustc_next_trait_solver",
-     "ra-ap-rustc_type_ir",
+     "rustc_next_trait_solver",
+     "rustc_type_ir",
      "rustc-hash 2.1.2",
      "rustc_apfloat",
      "salsa",
@@ -2264,7 +2264,7 @@
      "hir-ty-wfcheck",
      "la-arena",
      "ra-ap-rustc_ast_ir",
-     "ra-ap-rustc_type_ir",
+     "rustc_type_ir",
      "rustc-hash 2.1.2",
      "salsa",
      "smallvec",
@@ -2291,12 +2291,12 @@
      "la-arena",
      "object 0.37.3",
      "postcard",
-     "ra-ap-rustc_abi",
+     "rustc_abi",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_index",
-     "ra-ap-rustc_type_ir",
-     "ra-jit-fuzz",
-     "ra-jit-store",
+     "rustc_type_ir",
+     "blaze-fuzz",
+     "blaze-store",
      "rustc-demangle",
      "rustc-hash 2.1.2",
      "rustc-stable-hash",
@@ -2319,7 +2319,7 @@
     "dependencies": [
      "hir-def",
      "hir-ty",
-     "ra-ap-rustc_type_ir",
+     "rustc_type_ir",
      "rustc-hash 2.1.2",
      "salsa"
     ],
@@ -3680,7 +3680,7 @@
      "ra-ap-rustc_index",
      "tracing"
     ],
-    "name": "ra-ap-rustc_abi",
+    "name": "rustc_abi",
     "version": "0.166.0"
    },
    {
@@ -3733,11 +3733,11 @@
     "dependencies": [
      "derive-where",
      "ra-ap-rustc_index",
-     "ra-ap-rustc_type_ir",
+     "rustc_type_ir",
      "ra-ap-rustc_type_ir_macros",
      "tracing"
     ],
-    "name": "ra-ap-rustc_next_trait_solver",
+    "name": "rustc_next_trait_solver",
     "version": "0.166.0"
    },
    {
@@ -3770,7 +3770,7 @@
      "derive-where",
      "ena",
      "indexmap",
-     "ra-ap-rustc_abi",
+     "rustc_abi",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_index",
      "ra-ap-rustc_type_ir_macros",
@@ -3779,7 +3779,7 @@
      "thin-vec",
      "tracing"
     ],
-    "name": "ra-ap-rustc_type_ir",
+    "name": "rustc_type_ir",
     "version": "0.166.0"
    },
    {
@@ -3848,11 +3848,11 @@
      "proc-macro-api",
      "project-model",
      "pulldown-cmark",
-     "ra-jit-cache",
-     "ra-jit-expand",
-     "ra-jit-live",
-     "ra-jit-macro-wasm",
-     "ra-jit-store",
+     "blaze-cache",
+     "blaze-expand",
+     "blaze-live",
+     "blaze-macro-wasm",
+     "blaze-store",
      "rustc-demangle",
      "rustc-hash 2.1.2",
      "rustls",
@@ -3888,29 +3888,29 @@
      "zip",
      "zstd"
     ],
-    "name": "ra-jit",
+    "name": "blaze",
     "version": "0.20261027.0"
    },
    {
     "dependencies": [
      "hir-ty-codegen",
-     "ra-jit-store",
+     "blaze-store",
      "tango-bench"
     ],
-    "name": "ra-jit-bench",
+    "name": "blaze-bench",
     "version": "0.20261027.0"
    },
    {
     "dependencies": [
      "postcard",
-     "ra-jit-cache-macros",
+     "blaze-cache-macros",
      "serde"
     ],
-    "name": "ra-jit-cache",
+    "name": "blaze-cache",
     "version": "0.1.0"
    },
    {
-    "name": "ra-jit-cache-macros",
+    "name": "blaze-cache-macros",
     "version": "0.1.0"
    },
    {
@@ -3921,21 +3921,21 @@
      "paths",
      "postcard",
      "proc-macro-api",
-     "ra-jit-store",
+     "blaze-store",
      "rustc-hash 2.1.2",
      "sha2 0.10.9",
      "span",
      "tt"
     ],
-    "name": "ra-jit-expand",
+    "name": "blaze-expand",
     "version": "0.20261027.0"
    },
    {
-    "name": "ra-jit-fuzz",
+    "name": "blaze-fuzz",
     "version": "0.20261027.0"
    },
    {
-    "name": "ra-jit-live",
+    "name": "blaze-live",
     "version": "0.1.0"
    },
    {
@@ -3947,7 +3947,7 @@
      "paths",
      "proc-macro-api",
      "ra-ap-rustc_lexer",
-     "ra-jit-store",
+     "blaze-store",
      "rustc-hash 2.1.2",
      "salsa",
      "sha2 0.10.9",
@@ -3955,7 +3955,7 @@
      "tt",
      "wasmtime"
     ],
-    "name": "ra-jit-macro-wasm",
+    "name": "blaze-macro-wasm",
     "version": "0.20261027.0"
    },
    {
@@ -3963,13 +3963,13 @@
      "crc32fast",
      "libc",
      "memmap2",
-     "ra-jit-fuzz",
+     "blaze-fuzz",
      "rustc-hash 2.1.2",
      "sha2 0.10.9",
      "windows-sys 0.61.2",
      "zstd"
     ],
-    "name": "ra-jit-store",
+    "name": "blaze-store",
     "version": "0.20261027.0"
    },
    {
@@ -4101,7 +4101,7 @@
      "serde",
      "text-size"
     ],
-    "name": "rowan",
+    "name": "syntax-tree",
     "version": "0.17.0"
    },
    {
@@ -4690,7 +4690,7 @@
      "parser",
      "ra-ap-rustc_lexer",
      "rayon",
-     "rowan",
+     "syntax-tree",
      "rustc-hash 2.1.2",
      "rustc-literal-escaper",
      "rustc_apfloat",
@@ -6504,17 +6504,17 @@
     "llvm-sys": {
      "path": "vendor/llvm-sys"
     },
-    "ra-ap-rustc_abi": {
+    "rustc_abi": {
      "path": "crates/rustc_abi"
     },
-    "ra-ap-rustc_next_trait_solver": {
+    "rustc_next_trait_solver": {
      "path": "vendor/rustc_next_trait_solver"
     },
-    "ra-ap-rustc_type_ir": {
+    "rustc_type_ir": {
      "path": "vendor/rustc_type_ir"
     },
-    "rowan": {
-     "path": "crates/rowan"
+    "syntax-tree": {
+     "path": "crates/syntax-tree"
     },
     "salsa": {
      "path": "vendor/salsa"
@@ -6537,7 +6537,7 @@
      "miniz_oxide": {
       "opt-level": 3
      },
-     "rowan": {
+     "syntax-tree": {
       "opt-level": 3
      },
      "rustc-hash": {
@@ -6741,7 +6741,7 @@
      "default-features": false,
      "version": "0.9.6"
     },
-    "ra-ap-rustc_abi": {
+    "rustc_abi": {
      "default-features": false,
      "version": "0.166"
     },
@@ -6757,7 +6757,7 @@
      "default-features": false,
      "version": "0.166"
     },
-    "ra-ap-rustc_next_trait_solver": {
+    "rustc_next_trait_solver": {
      "default-features": false,
      "version": "0.166"
     },
@@ -6769,24 +6769,24 @@
      "default-features": false,
      "version": "0.166"
     },
-    "ra-ap-rustc_type_ir": {
+    "rustc_type_ir": {
      "default-features": false,
      "version": "0.166"
     },
-    "ra-jit-expand": {
-     "path": "crates/ra-jit-expand"
+    "blaze-expand": {
+     "path": "crates/blaze-expand"
     },
-    "ra-jit-fuzz": {
-     "path": "crates/ra-jit-fuzz"
+    "blaze-fuzz": {
+     "path": "crates/blaze-fuzz"
     },
-    "ra-jit-macro-wasm": {
-     "path": "crates/ra-jit-macro-wasm"
+    "blaze-macro-wasm": {
+     "path": "crates/blaze-macro-wasm"
     },
-    "ra-jit-store": {
-     "path": "crates/ra-jit-store"
+    "blaze-store": {
+     "path": "crates/blaze-store"
     },
     "rayon": "1.10.0",
-    "rowan": "0.17.0",
+    "syntax-tree": "0.17.0",
     "rustc-hash": "2.1.1",
     "rustc-literal-escaper": "0.0.7",
     "salsa": {
@@ -6892,7 +6892,7 @@
     }
    },
    "exclude": [
-    "crates/ra-jit-wasm",
+    "crates/blaze-wasm",
     "demo",
     "harness",
     "vendor/proc-macro-srv",
@@ -10118,7 +10118,7 @@
   },
   "hir-ty-codegen@0.20261027.0": {
    "authors": "blaze contributors",
-   "description": "ra-jit's code generator: rust-analyzer's MIR to machine code through Cranelift, LLVM or wasm",
+   "description": "blaze's code generator: rust-analyzer's MIR to machine code through Cranelift, LLVM or wasm",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
@@ -12292,14 +12292,14 @@
    },
    "version": "6.0.0"
   },
-  "ra-ap-rustc_abi@0.166.0": {
+  "rustc_abi@0.166.0": {
    "authors": "",
    "description": "",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-ap-rustc_abi",
+   "name": "rustc_abi",
    "readme": "",
    "repository": "",
    "rust_version": "",
@@ -12394,14 +12394,14 @@
    },
    "version": "0.166.0"
   },
-  "ra-ap-rustc_next_trait_solver@0.166.0": {
+  "rustc_next_trait_solver@0.166.0": {
    "authors": "",
    "description": "\nAutomatically published version of the package `rustc_next_trait_solver`\nin the rust-lang/rust repository from commit ce89c898570852a1bb441d77570596e50bf362c2\n\nThe publishing script for this crate lives at:\nhttps://github.com/rust-analyzer/rustc-auto-publish\n",
    "homepage": "",
    "license": "MIT / Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-ap-rustc_next_trait_solver",
+   "name": "rustc_next_trait_solver",
    "readme": "",
    "repository": "https://github.com/rust-lang/rust",
    "rust_version": "",
@@ -12445,14 +12445,14 @@
    },
    "version": "0.166.0"
   },
-  "ra-ap-rustc_type_ir@0.166.0": {
+  "rustc_type_ir@0.166.0": {
    "authors": "",
    "description": "\nAutomatically published version of the package `rustc_type_ir`\nin the rust-lang/rust repository from commit ce89c898570852a1bb441d77570596e50bf362c2\n\nThe publishing script for this crate lives at:\nhttps://github.com/rust-analyzer/rustc-auto-publish\n",
    "homepage": "",
    "license": "MIT / Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-ap-rustc_type_ir",
+   "name": "rustc_type_ir",
    "readme": "",
    "repository": "https://github.com/rust-lang/rust",
    "rust_version": "",
@@ -12479,155 +12479,155 @@
    },
    "version": "0.166.0"
   },
-  "ra-jit-bench@0.20261027.0": {
+  "blaze-bench@0.20261027.0": {
    "authors": "blaze contributors",
-   "description": "Microbenchmarks of ra-jit's hot paths, run by tango in pairs: a change against its base",
+   "description": "Microbenchmarks of blaze's hot paths, run by tango in pairs: a change against its base",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-bench",
+   "name": "blaze-bench",
    "readme": "",
    "repository": "",
    "rust_version": "1.101",
    "source": {
-    "dir": "crates/ra-jit-bench",
+    "dir": "crates/blaze-bench",
     "kind": "path"
    },
    "version": "0.20261027.0"
   },
-  "ra-jit-cache-macros@0.1.0": {
+  "blaze-cache-macros@0.1.0": {
    "authors": "Indexable, Inc.",
-   "description": "The #[cache] attribute of ra-jit-cache",
+   "description": "The #[cache] attribute of blaze-cache",
    "homepage": "https://ix.dev/blaze",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-cache-macros",
+   "name": "blaze-cache-macros",
    "readme": "",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "",
    "source": {
-    "dir": "crates/ra-jit-cache-macros",
+    "dir": "crates/blaze-cache-macros",
     "kind": "path"
    },
    "version": "0.1.0"
   },
-  "ra-jit-cache@0.1.0": {
+  "blaze-cache@0.1.0": {
    "authors": "Indexable, Inc.",
-   "description": "#[ra_jit::cache]: results of pure functions kept across runs, dropped when the code they reach changes",
+   "description": "#[blaze::cache]: results of pure functions kept across runs, dropped when the code they reach changes",
    "homepage": "https://ix.dev/blaze",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-cache",
+   "name": "blaze-cache",
    "readme": "README.md",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "",
    "source": {
-    "dir": "crates/ra-jit-cache",
+    "dir": "crates/blaze-cache",
     "kind": "path"
    },
    "version": "0.1.0"
   },
-  "ra-jit-expand@0.20261027.0": {
+  "blaze-expand@0.20261027.0": {
    "authors": "blaze contributors",
-   "description": "ra-jit's proc-macro expansions kept in the store, so that a daemon that loads a workspace again expands no macro it expanded before",
+   "description": "blaze's proc-macro expansions kept in the store, so that a daemon that loads a workspace again expands no macro it expanded before",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-expand",
+   "name": "blaze-expand",
    "readme": "",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "1.101",
    "source": {
-    "dir": "crates/ra-jit-expand",
+    "dir": "crates/blaze-expand",
     "kind": "path"
    },
    "version": "0.20261027.0"
   },
-  "ra-jit-fuzz@0.20261027.0": {
+  "blaze-fuzz@0.20261027.0": {
    "authors": "blaze contributors",
    "description": "Changed and made-up inputs for the tests of what reads the store, and how much memory a read asks for",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-fuzz",
+   "name": "blaze-fuzz",
    "readme": "",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "1.101",
    "source": {
-    "dir": "crates/ra-jit-fuzz",
+    "dir": "crates/blaze-fuzz",
     "kind": "path"
    },
    "version": "0.20261027.0"
   },
-  "ra-jit-live@0.1.0": {
+  "blaze-live@0.1.0": {
    "authors": "Indexable, Inc.",
-   "description": "Applies ra-jit's edits to a program while it runs",
+   "description": "Applies blaze's edits to a program while it runs",
    "homepage": "https://ix.dev/blaze",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-live",
+   "name": "blaze-live",
    "readme": "README.md",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "",
    "source": {
-    "dir": "crates/ra-jit-live",
+    "dir": "crates/blaze-live",
     "kind": "path"
    },
    "version": "0.1.0"
   },
-  "ra-jit-macro-wasm@0.20261027.0": {
+  "blaze-macro-wasm@0.20261027.0": {
    "authors": "blaze contributors",
-   "description": "Proc macros compiled to WebAssembly and run by ra-jit under Wasmtime, as dtolnay's watt runs them: the `proc_macro` that stands in for the standard library's there, and the host it asks",
+   "description": "Proc macros compiled to WebAssembly and run by blaze under Wasmtime, as dtolnay's watt runs them: the `proc_macro` that stands in for the standard library's there, and the host it asks",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-macro-wasm",
+   "name": "blaze-macro-wasm",
    "readme": "",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "1.101",
    "source": {
-    "dir": "crates/ra-jit-macro-wasm",
+    "dir": "crates/blaze-macro-wasm",
     "kind": "path"
    },
    "version": "0.20261027.0"
   },
-  "ra-jit-store@0.20261027.0": {
+  "blaze-store@0.20261027.0": {
    "authors": "blaze contributors",
-   "description": "ra-jit's disk store: values kept by the hash of what they were made from, in packs a directory or a bucket can share",
+   "description": "blaze's disk store: values kept by the hash of what they were made from, in packs a directory or a bucket can share",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-store",
+   "name": "blaze-store",
    "readme": "",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "1.101",
    "source": {
-    "dir": "crates/ra-jit-store",
+    "dir": "crates/blaze-store",
     "kind": "path"
    },
    "version": "0.20261027.0"
   },
-  "ra-jit@0.20261027.0": {
+  "blaze@0.20261027.0": {
    "authors": "blaze contributors",
    "description": "blaze: cargo build, test and run from a daemon that keeps your workspace compiled, with live edits",
    "homepage": "https://ix.dev/blaze",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit",
+   "name": "blaze",
    "readme": "",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "1.101",
    "source": {
-    "dir": "crates/ra-jit",
+    "dir": "crates/blaze-engine",
     "kind": "path"
    },
    "version": "0.20261027.0"
@@ -12802,19 +12802,19 @@
    },
    "version": "0.17.14"
   },
-  "rowan@0.17.0": {
+  "syntax-tree@0.17.0": {
    "authors": "Aleksey Kladov <aleksey.kladov@gmail.com>",
    "description": "Library for generic lossless syntax trees",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "rowan",
+   "name": "syntax-tree",
    "readme": "README.md",
    "repository": "https://github.com/rust-analyzer/rowan",
    "rust_version": "",
    "source": {
-    "dir": "crates/rowan",
+    "dir": "crates/syntax-tree",
     "kind": "path"
    },
    "version": "0.17.0"
@@ -16580,12 +16580,12 @@
  "systems": {
   "aarch64-darwin": {
    "roots": [
-    "ra-jit@0.20261027.0 bin blaze build",
-    "ra-jit@0.20261027.0 bin cargo-blaze build",
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build"
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze-rustc build",
+    "blaze@0.20261027.0 bin blaze-rustc-first build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -19268,8 +19268,8 @@
        "unit": "percent-encoding@2.3.2 lib percent_encoding build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -23324,8 +23324,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_parse_format",
@@ -23542,8 +23542,8 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -23554,8 +23554,8 @@
        "unit": "ra-ap-rustc_pattern_analysis@0.166.0 lib ra_ap_rustc_pattern_analysis build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -23647,8 +23647,8 @@
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -23797,8 +23797,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -23809,12 +23809,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_demangle",
@@ -23902,8 +23902,8 @@
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -23995,8 +23995,8 @@
        "unit": "oorandom@11.1.5 lib oorandom build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -24007,12 +24007,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_next_trait_solver",
-       "unit": "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build"
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -24144,8 +24144,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -28908,7 +28908,7 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build": {
+    "rustc_abi@0.166.0 lib rustc_abi build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -28932,7 +28932,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_abi@0.166.0",
+     "pkg": "rustc_abi@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -28943,7 +28943,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_abi"
+     "target": "rustc_abi"
     },
     "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build": {
      "crate_type": "lib",
@@ -29081,7 +29081,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_lexer"
     },
-    "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build": {
+    "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -29094,7 +29094,7 @@
       },
       {
        "name": "rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_type_ir_macros",
@@ -29109,7 +29109,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_next_trait_solver@0.166.0",
+     "pkg": "rustc_next_trait_solver@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29120,7 +29120,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_next_trait_solver"
+     "target": "rustc_next_trait_solver"
     },
     "ra-ap-rustc_parse_format@0.166.0 lib ra_ap_rustc_parse_format build": {
      "crate_type": "lib",
@@ -29192,7 +29192,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_pattern_analysis"
     },
-    "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build": {
+    "rustc_type_ir@0.166.0 lib rustc_type_ir build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -29217,7 +29217,7 @@
       },
       {
        "name": "rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "rustc_ast_ir",
@@ -29252,7 +29252,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_type_ir@0.166.0",
+     "pkg": "rustc_type_ir@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29263,7 +29263,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_type_ir"
+     "target": "rustc_type_ir"
     },
     "ra-ap-rustc_type_ir_macros@0.166.0 proc-macro ra_ap_rustc_type_ir_macros build host": {
      "crate_type": "proc-macro",
@@ -29302,14 +29302,14 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_type_ir_macros"
     },
-    "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host": {
+    "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host": {
      "crate_type": "proc-macro",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "proc-macro",
      "mode": "build",
-     "pkg": "ra-jit-cache-macros@0.1.0",
+     "pkg": "blaze-cache-macros@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29320,9 +29320,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_cache_macros"
+     "target": "blaze_cache_macros"
     },
-    "ra-jit-cache@0.1.0 lib ra_jit build": {
+    "blaze-cache@0.1.0 lib blaze build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -29330,8 +29330,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_jit_cache_macros",
-       "unit": "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host"
+       "name": "blaze_cache_macros",
+       "unit": "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host"
       },
       {
        "name": "serde",
@@ -29342,7 +29342,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-cache@0.1.0",
+     "pkg": "blaze-cache@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29353,9 +29353,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit"
+     "target": "blaze"
     },
-    "ra-jit-expand@0.20261027.0 lib ra_jit_expand build": {
+    "blaze-expand@0.20261027.0 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -29383,8 +29383,8 @@
        "unit": "proc-macro-api@0.0.0 lib proc_macro_api build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -29407,7 +29407,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-expand@0.20261027.0",
+     "pkg": "blaze-expand@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29418,16 +29418,16 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_expand"
+     "target": "blaze_expand"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29438,9 +29438,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
-    "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build": {
+    "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -29472,8 +29472,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -29504,7 +29504,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-macro-wasm@0.20261027.0",
+     "pkg": "blaze-macro-wasm@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29515,9 +29515,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_macro_wasm"
+     "target": "blaze_macro_wasm"
     },
-    "ra-jit-store@0.20261027.0 lib ra_jit_store build": {
+    "blaze-store@0.20261027.0 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -29549,7 +29549,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-store@0.20261027.0",
+     "pkg": "blaze-store@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29560,9 +29560,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_store"
+     "target": "blaze_store"
     },
-    "ra-jit@0.20261027.0 bin blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -29767,27 +29767,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -29914,7 +29914,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -29927,7 +29927,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -30132,27 +30132,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -30279,7 +30279,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -30289,10 +30289,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-blaze.rs",
-     "target": "cargo-blaze"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -30497,27 +30497,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -30644,7 +30644,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -30654,10 +30654,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-ra-jit.rs",
-     "target": "cargo-ra-jit"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -30862,27 +30862,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -31009,7 +31009,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -31020,9 +31020,9 @@
       "panic": "unwind"
      },
      "src": "src/main.rs",
-     "target": "ra-jit"
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build": {
+    "blaze@0.20261027.0 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -31227,27 +31227,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -31374,7 +31374,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -31384,10 +31384,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc.rs",
-     "target": "ra-jit-rustc"
+     "src": "src/bin/blaze-rustc.rs",
+     "target": "blaze-rustc"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build": {
+    "blaze@0.20261027.0 bin blaze-rustc-first build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -31592,27 +31592,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -31739,7 +31739,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -31749,17 +31749,17 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc-first.rs",
-     "target": "ra-jit-rustc-first"
+     "src": "src/bin/blaze-rustc-first.rs",
+     "target": "blaze-rustc-first"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build build host": {
+    "blaze@0.20261027.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -31772,12 +31772,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build": {
+    "blaze@0.20261027.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build build host"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -31788,7 +31788,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -32135,7 +32135,7 @@
      "src": "src/lib.rs",
      "target": "ring"
     },
-    "rowan@0.17.0 lib rowan build": {
+    "syntax-tree@0.17.0 lib syntax-tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -32163,7 +32163,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "rowan@0.17.0",
+     "pkg": "syntax-tree@0.17.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -32174,7 +32174,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "rowan"
+     "target": "syntax-tree"
     },
     "rustc-demangle@0.1.28 lib rustc_demangle build": {
      "crate_type": "lib",
@@ -34460,8 +34460,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "rowan",
-       "unit": "rowan@0.17.0 lib rowan build"
+       "name": "syntax-tree",
+       "unit": "syntax-tree@0.17.0 lib syntax-tree build"
       },
       {
        "name": "rustc_hash",
@@ -38353,12 +38353,12 @@
   },
   "aarch64-linux": {
    "roots": [
-    "ra-jit@0.20261027.0 bin blaze build",
-    "ra-jit@0.20261027.0 bin cargo-blaze build",
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build"
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze-rustc build",
+    "blaze@0.20261027.0 bin blaze-rustc-first build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -41041,8 +41041,8 @@
        "unit": "percent-encoding@2.3.2 lib percent_encoding build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -44997,8 +44997,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_parse_format",
@@ -45215,8 +45215,8 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -45227,8 +45227,8 @@
        "unit": "ra-ap-rustc_pattern_analysis@0.166.0 lib ra_ap_rustc_pattern_analysis build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -45320,8 +45320,8 @@
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -45470,8 +45470,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -45482,12 +45482,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_demangle",
@@ -45575,8 +45575,8 @@
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -45668,8 +45668,8 @@
        "unit": "oorandom@11.1.5 lib oorandom build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -45680,12 +45680,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_next_trait_solver",
-       "unit": "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build"
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -45817,8 +45817,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -50637,7 +50637,7 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build": {
+    "rustc_abi@0.166.0 lib rustc_abi build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -50661,7 +50661,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_abi@0.166.0",
+     "pkg": "rustc_abi@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -50672,7 +50672,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_abi"
+     "target": "rustc_abi"
     },
     "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build": {
      "crate_type": "lib",
@@ -50810,7 +50810,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_lexer"
     },
-    "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build": {
+    "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -50823,7 +50823,7 @@
       },
       {
        "name": "rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_type_ir_macros",
@@ -50838,7 +50838,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_next_trait_solver@0.166.0",
+     "pkg": "rustc_next_trait_solver@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -50849,7 +50849,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_next_trait_solver"
+     "target": "rustc_next_trait_solver"
     },
     "ra-ap-rustc_parse_format@0.166.0 lib ra_ap_rustc_parse_format build": {
      "crate_type": "lib",
@@ -50921,7 +50921,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_pattern_analysis"
     },
-    "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build": {
+    "rustc_type_ir@0.166.0 lib rustc_type_ir build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -50946,7 +50946,7 @@
       },
       {
        "name": "rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "rustc_ast_ir",
@@ -50981,7 +50981,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_type_ir@0.166.0",
+     "pkg": "rustc_type_ir@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -50992,7 +50992,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_type_ir"
+     "target": "rustc_type_ir"
     },
     "ra-ap-rustc_type_ir_macros@0.166.0 proc-macro ra_ap_rustc_type_ir_macros build host": {
      "crate_type": "proc-macro",
@@ -51031,14 +51031,14 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_type_ir_macros"
     },
-    "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host": {
+    "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host": {
      "crate_type": "proc-macro",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "proc-macro",
      "mode": "build",
-     "pkg": "ra-jit-cache-macros@0.1.0",
+     "pkg": "blaze-cache-macros@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -51049,9 +51049,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_cache_macros"
+     "target": "blaze_cache_macros"
     },
-    "ra-jit-cache@0.1.0 lib ra_jit build": {
+    "blaze-cache@0.1.0 lib blaze build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -51059,8 +51059,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_jit_cache_macros",
-       "unit": "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host"
+       "name": "blaze_cache_macros",
+       "unit": "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host"
       },
       {
        "name": "serde",
@@ -51071,7 +51071,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-cache@0.1.0",
+     "pkg": "blaze-cache@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -51082,9 +51082,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit"
+     "target": "blaze"
     },
-    "ra-jit-expand@0.20261027.0 lib ra_jit_expand build": {
+    "blaze-expand@0.20261027.0 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -51112,8 +51112,8 @@
        "unit": "proc-macro-api@0.0.0 lib proc_macro_api build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -51136,7 +51136,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-expand@0.20261027.0",
+     "pkg": "blaze-expand@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -51147,16 +51147,16 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_expand"
+     "target": "blaze_expand"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -51167,9 +51167,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
-    "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build": {
+    "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -51201,8 +51201,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -51233,7 +51233,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-macro-wasm@0.20261027.0",
+     "pkg": "blaze-macro-wasm@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -51244,9 +51244,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_macro_wasm"
+     "target": "blaze_macro_wasm"
     },
-    "ra-jit-store@0.20261027.0 lib ra_jit_store build": {
+    "blaze-store@0.20261027.0 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -51278,7 +51278,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-store@0.20261027.0",
+     "pkg": "blaze-store@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -51289,9 +51289,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_store"
+     "target": "blaze_store"
     },
-    "ra-jit@0.20261027.0 bin blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -51496,27 +51496,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -51643,7 +51643,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -51656,7 +51656,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -51861,27 +51861,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -52008,7 +52008,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -52018,10 +52018,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-blaze.rs",
-     "target": "cargo-blaze"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -52226,27 +52226,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -52373,7 +52373,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -52383,10 +52383,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-ra-jit.rs",
-     "target": "cargo-ra-jit"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -52591,27 +52591,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -52738,7 +52738,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -52749,9 +52749,9 @@
       "panic": "unwind"
      },
      "src": "src/main.rs",
-     "target": "ra-jit"
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build": {
+    "blaze@0.20261027.0 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -52956,27 +52956,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -53103,7 +53103,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -53113,10 +53113,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc.rs",
-     "target": "ra-jit-rustc"
+     "src": "src/bin/blaze-rustc.rs",
+     "target": "blaze-rustc"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build": {
+    "blaze@0.20261027.0 bin blaze-rustc-first build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -53321,27 +53321,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -53468,7 +53468,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -53478,17 +53478,17 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc-first.rs",
-     "target": "ra-jit-rustc-first"
+     "src": "src/bin/blaze-rustc-first.rs",
+     "target": "blaze-rustc-first"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build build host": {
+    "blaze@0.20261027.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -53501,12 +53501,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build": {
+    "blaze@0.20261027.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build build host"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -53517,7 +53517,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -53864,7 +53864,7 @@
      "src": "src/lib.rs",
      "target": "ring"
     },
-    "rowan@0.17.0 lib rowan build": {
+    "syntax-tree@0.17.0 lib syntax-tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -53892,7 +53892,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "rowan@0.17.0",
+     "pkg": "syntax-tree@0.17.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -53903,7 +53903,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "rowan"
+     "target": "syntax-tree"
     },
     "rustc-demangle@0.1.28 lib rustc_demangle build": {
      "crate_type": "lib",
@@ -56110,8 +56110,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "rowan",
-       "unit": "rowan@0.17.0 lib rowan build"
+       "name": "syntax-tree",
+       "unit": "syntax-tree@0.17.0 lib syntax-tree build"
       },
       {
        "name": "rustc_hash",
@@ -59999,12 +59999,12 @@
   },
   "x86_64-darwin": {
    "roots": [
-    "ra-jit@0.20261027.0 bin blaze build",
-    "ra-jit@0.20261027.0 bin cargo-blaze build",
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build"
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze-rustc build",
+    "blaze@0.20261027.0 bin blaze-rustc-first build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -62687,8 +62687,8 @@
        "unit": "percent-encoding@2.3.2 lib percent_encoding build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -66774,8 +66774,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_parse_format",
@@ -66992,8 +66992,8 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -67004,8 +67004,8 @@
        "unit": "ra-ap-rustc_pattern_analysis@0.166.0 lib ra_ap_rustc_pattern_analysis build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -67097,8 +67097,8 @@
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -67247,8 +67247,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -67259,12 +67259,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_demangle",
@@ -67352,8 +67352,8 @@
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -67445,8 +67445,8 @@
        "unit": "oorandom@11.1.5 lib oorandom build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -67457,12 +67457,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_next_trait_solver",
-       "unit": "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build"
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -67594,8 +67594,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -72358,7 +72358,7 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build": {
+    "rustc_abi@0.166.0 lib rustc_abi build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -72382,7 +72382,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_abi@0.166.0",
+     "pkg": "rustc_abi@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72393,7 +72393,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_abi"
+     "target": "rustc_abi"
     },
     "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build": {
      "crate_type": "lib",
@@ -72531,7 +72531,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_lexer"
     },
-    "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build": {
+    "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -72544,7 +72544,7 @@
       },
       {
        "name": "rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_type_ir_macros",
@@ -72559,7 +72559,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_next_trait_solver@0.166.0",
+     "pkg": "rustc_next_trait_solver@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72570,7 +72570,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_next_trait_solver"
+     "target": "rustc_next_trait_solver"
     },
     "ra-ap-rustc_parse_format@0.166.0 lib ra_ap_rustc_parse_format build": {
      "crate_type": "lib",
@@ -72642,7 +72642,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_pattern_analysis"
     },
-    "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build": {
+    "rustc_type_ir@0.166.0 lib rustc_type_ir build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -72667,7 +72667,7 @@
       },
       {
        "name": "rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "rustc_ast_ir",
@@ -72702,7 +72702,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_type_ir@0.166.0",
+     "pkg": "rustc_type_ir@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72713,7 +72713,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_type_ir"
+     "target": "rustc_type_ir"
     },
     "ra-ap-rustc_type_ir_macros@0.166.0 proc-macro ra_ap_rustc_type_ir_macros build host": {
      "crate_type": "proc-macro",
@@ -72752,14 +72752,14 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_type_ir_macros"
     },
-    "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host": {
+    "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host": {
      "crate_type": "proc-macro",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "proc-macro",
      "mode": "build",
-     "pkg": "ra-jit-cache-macros@0.1.0",
+     "pkg": "blaze-cache-macros@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72770,9 +72770,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_cache_macros"
+     "target": "blaze_cache_macros"
     },
-    "ra-jit-cache@0.1.0 lib ra_jit build": {
+    "blaze-cache@0.1.0 lib blaze build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -72780,8 +72780,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_jit_cache_macros",
-       "unit": "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host"
+       "name": "blaze_cache_macros",
+       "unit": "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host"
       },
       {
        "name": "serde",
@@ -72792,7 +72792,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-cache@0.1.0",
+     "pkg": "blaze-cache@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72803,9 +72803,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit"
+     "target": "blaze"
     },
-    "ra-jit-expand@0.20261027.0 lib ra_jit_expand build": {
+    "blaze-expand@0.20261027.0 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -72833,8 +72833,8 @@
        "unit": "proc-macro-api@0.0.0 lib proc_macro_api build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -72857,7 +72857,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-expand@0.20261027.0",
+     "pkg": "blaze-expand@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72868,16 +72868,16 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_expand"
+     "target": "blaze_expand"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72888,9 +72888,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
-    "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build": {
+    "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -72922,8 +72922,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -72954,7 +72954,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-macro-wasm@0.20261027.0",
+     "pkg": "blaze-macro-wasm@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -72965,9 +72965,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_macro_wasm"
+     "target": "blaze_macro_wasm"
     },
-    "ra-jit-store@0.20261027.0 lib ra_jit_store build": {
+    "blaze-store@0.20261027.0 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -72999,7 +72999,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-store@0.20261027.0",
+     "pkg": "blaze-store@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -73010,9 +73010,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_store"
+     "target": "blaze_store"
     },
-    "ra-jit@0.20261027.0 bin blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -73217,27 +73217,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -73364,7 +73364,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -73377,7 +73377,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -73582,27 +73582,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -73729,7 +73729,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -73739,10 +73739,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-blaze.rs",
-     "target": "cargo-blaze"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -73947,27 +73947,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -74094,7 +74094,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -74104,10 +74104,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-ra-jit.rs",
-     "target": "cargo-ra-jit"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -74312,27 +74312,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -74459,7 +74459,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -74470,9 +74470,9 @@
       "panic": "unwind"
      },
      "src": "src/main.rs",
-     "target": "ra-jit"
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build": {
+    "blaze@0.20261027.0 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -74677,27 +74677,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -74824,7 +74824,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -74834,10 +74834,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc.rs",
-     "target": "ra-jit-rustc"
+     "src": "src/bin/blaze-rustc.rs",
+     "target": "blaze-rustc"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build": {
+    "blaze@0.20261027.0 bin blaze-rustc-first build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -75042,27 +75042,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -75189,7 +75189,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -75199,17 +75199,17 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc-first.rs",
-     "target": "ra-jit-rustc-first"
+     "src": "src/bin/blaze-rustc-first.rs",
+     "target": "blaze-rustc-first"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build build host": {
+    "blaze@0.20261027.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -75222,12 +75222,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build": {
+    "blaze@0.20261027.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build build host"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -75238,7 +75238,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -75581,7 +75581,7 @@
      "src": "src/lib.rs",
      "target": "ring"
     },
-    "rowan@0.17.0 lib rowan build": {
+    "syntax-tree@0.17.0 lib syntax-tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -75609,7 +75609,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "rowan@0.17.0",
+     "pkg": "syntax-tree@0.17.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -75620,7 +75620,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "rowan"
+     "target": "syntax-tree"
     },
     "rustc-demangle@0.1.28 lib rustc_demangle build": {
      "crate_type": "lib",
@@ -77906,8 +77906,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "rowan",
-       "unit": "rowan@0.17.0 lib rowan build"
+       "name": "syntax-tree",
+       "unit": "syntax-tree@0.17.0 lib syntax-tree build"
       },
       {
        "name": "rustc_hash",
@@ -81799,12 +81799,12 @@
   },
   "x86_64-linux": {
    "roots": [
-    "ra-jit@0.20261027.0 bin blaze build",
-    "ra-jit@0.20261027.0 bin cargo-blaze build",
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build",
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build"
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze build",
+    "blaze@0.20261027.0 bin blaze-rustc build",
+    "blaze@0.20261027.0 bin blaze-rustc-first build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -84487,8 +84487,8 @@
        "unit": "percent-encoding@2.3.2 lib percent_encoding build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -88474,8 +88474,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_parse_format",
@@ -88692,8 +88692,8 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -88704,8 +88704,8 @@
        "unit": "ra-ap-rustc_pattern_analysis@0.166.0 lib ra_ap_rustc_pattern_analysis build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -88797,8 +88797,8 @@
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -88947,8 +88947,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -88959,12 +88959,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_demangle",
@@ -89052,8 +89052,8 @@
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -89145,8 +89145,8 @@
        "unit": "oorandom@11.1.5 lib oorandom build"
       },
       {
-       "name": "ra_ap_rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "ra_ap_rustc_ast_ir",
@@ -89157,12 +89157,12 @@
        "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
       },
       {
-       "name": "ra_ap_rustc_next_trait_solver",
-       "unit": "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build"
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -89294,8 +89294,8 @@
        "unit": "la-arena@0.3.1 lib la_arena build"
       },
       {
-       "name": "ra_ap_rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_hash",
@@ -94114,7 +94114,7 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build": {
+    "rustc_abi@0.166.0 lib rustc_abi build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -94138,7 +94138,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_abi@0.166.0",
+     "pkg": "rustc_abi@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94149,7 +94149,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_abi"
+     "target": "rustc_abi"
     },
     "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build": {
      "crate_type": "lib",
@@ -94287,7 +94287,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_lexer"
     },
-    "ra-ap-rustc_next_trait_solver@0.166.0 lib ra_ap_rustc_next_trait_solver build": {
+    "rustc_next_trait_solver@0.166.0 lib rustc_next_trait_solver build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -94300,7 +94300,7 @@
       },
       {
        "name": "rustc_type_ir",
-       "unit": "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build"
+       "unit": "rustc_type_ir@0.166.0 lib rustc_type_ir build"
       },
       {
        "name": "rustc_type_ir_macros",
@@ -94315,7 +94315,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_next_trait_solver@0.166.0",
+     "pkg": "rustc_next_trait_solver@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94326,7 +94326,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_next_trait_solver"
+     "target": "rustc_next_trait_solver"
     },
     "ra-ap-rustc_parse_format@0.166.0 lib ra_ap_rustc_parse_format build": {
      "crate_type": "lib",
@@ -94398,7 +94398,7 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_pattern_analysis"
     },
-    "ra-ap-rustc_type_ir@0.166.0 lib ra_ap_rustc_type_ir build": {
+    "rustc_type_ir@0.166.0 lib rustc_type_ir build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -94423,7 +94423,7 @@
       },
       {
        "name": "rustc_abi",
-       "unit": "ra-ap-rustc_abi@0.166.0 lib ra_ap_rustc_abi build"
+       "unit": "rustc_abi@0.166.0 lib rustc_abi build"
       },
       {
        "name": "rustc_ast_ir",
@@ -94458,7 +94458,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-ap-rustc_type_ir@0.166.0",
+     "pkg": "rustc_type_ir@0.166.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94469,7 +94469,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_ap_rustc_type_ir"
+     "target": "rustc_type_ir"
     },
     "ra-ap-rustc_type_ir_macros@0.166.0 proc-macro ra_ap_rustc_type_ir_macros build host": {
      "crate_type": "proc-macro",
@@ -94508,14 +94508,14 @@
      "src": "src/lib.rs",
      "target": "ra_ap_rustc_type_ir_macros"
     },
-    "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host": {
+    "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host": {
      "crate_type": "proc-macro",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "proc-macro",
      "mode": "build",
-     "pkg": "ra-jit-cache-macros@0.1.0",
+     "pkg": "blaze-cache-macros@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94526,9 +94526,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_cache_macros"
+     "target": "blaze_cache_macros"
     },
-    "ra-jit-cache@0.1.0 lib ra_jit build": {
+    "blaze-cache@0.1.0 lib blaze build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -94536,8 +94536,8 @@
        "unit": "postcard@1.1.3 lib postcard build"
       },
       {
-       "name": "ra_jit_cache_macros",
-       "unit": "ra-jit-cache-macros@0.1.0 proc-macro ra_jit_cache_macros build host"
+       "name": "blaze_cache_macros",
+       "unit": "blaze-cache-macros@0.1.0 proc-macro blaze_cache_macros build host"
       },
       {
        "name": "serde",
@@ -94548,7 +94548,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-cache@0.1.0",
+     "pkg": "blaze-cache@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94559,9 +94559,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit"
+     "target": "blaze"
     },
-    "ra-jit-expand@0.20261027.0 lib ra_jit_expand build": {
+    "blaze-expand@0.20261027.0 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -94589,8 +94589,8 @@
        "unit": "proc-macro-api@0.0.0 lib proc_macro_api build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -94613,7 +94613,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-expand@0.20261027.0",
+     "pkg": "blaze-expand@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94624,16 +94624,16 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_expand"
+     "target": "blaze_expand"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94644,9 +94644,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
-    "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build": {
+    "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -94678,8 +94678,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "rustc_hash",
@@ -94710,7 +94710,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-macro-wasm@0.20261027.0",
+     "pkg": "blaze-macro-wasm@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94721,9 +94721,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_macro_wasm"
+     "target": "blaze_macro_wasm"
     },
-    "ra-jit-store@0.20261027.0 lib ra_jit_store build": {
+    "blaze-store@0.20261027.0 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -94755,7 +94755,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-store@0.20261027.0",
+     "pkg": "blaze-store@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -94766,9 +94766,9 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_store"
+     "target": "blaze_store"
     },
-    "ra-jit@0.20261027.0 bin blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -94973,27 +94973,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -95120,7 +95120,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -95133,7 +95133,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-blaze build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -95338,27 +95338,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -95485,7 +95485,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -95495,10 +95495,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-blaze.rs",
-     "target": "cargo-blaze"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin cargo-ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -95703,27 +95703,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -95850,7 +95850,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -95860,10 +95860,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/cargo-ra-jit.rs",
-     "target": "cargo-ra-jit"
+     "src": "src/bin/blaze.rs",
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit build": {
+    "blaze@0.20261027.0 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -96068,27 +96068,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -96215,7 +96215,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -96226,9 +96226,9 @@
       "panic": "unwind"
      },
      "src": "src/main.rs",
-     "target": "ra-jit"
+     "target": "blaze"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc build": {
+    "blaze@0.20261027.0 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -96433,27 +96433,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -96580,7 +96580,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -96590,10 +96590,10 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc.rs",
-     "target": "ra-jit-rustc"
+     "src": "src/bin/blaze-rustc.rs",
+     "target": "blaze-rustc"
     },
-    "ra-jit@0.20261027.0 bin ra-jit-rustc-first build": {
+    "blaze@0.20261027.0 bin blaze-rustc-first build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -96798,27 +96798,27 @@
       },
       {
        "name": "fn_cache",
-       "unit": "ra-jit-cache@0.1.0 lib ra_jit build"
+       "unit": "blaze-cache@0.1.0 lib blaze build"
       },
       {
-       "name": "ra_jit_expand",
-       "unit": "ra-jit-expand@0.20261027.0 lib ra_jit_expand build"
+       "name": "blaze_expand",
+       "unit": "blaze-expand@0.20261027.0 lib blaze_expand build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       },
       {
-       "name": "ra_jit_macro_wasm",
-       "unit": "ra-jit-macro-wasm@0.20261027.0 lib ra_jit_macro_wasm build"
+       "name": "blaze_macro_wasm",
+       "unit": "blaze-macro-wasm@0.20261027.0 lib blaze_macro_wasm build"
       },
       {
-       "name": "ra_jit_store",
-       "unit": "ra-jit-store@0.20261027.0 lib ra_jit_store build"
+       "name": "blaze_store",
+       "unit": "blaze-store@0.20261027.0 lib blaze_store build"
       },
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "rustc_demangle",
@@ -96945,7 +96945,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -96955,17 +96955,17 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "src/bin/ra-jit-rustc-first.rs",
-     "target": "ra-jit-rustc-first"
+     "src": "src/bin/blaze-rustc-first.rs",
+     "target": "blaze-rustc-first"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build build host": {
+    "blaze@0.20261027.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -96978,12 +96978,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "ra-jit@0.20261027.0 custom-build build-script-build run-custom-build": {
+    "blaze@0.20261027.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "ra-jit@0.20261027.0 custom-build build-script-build build host"
+       "unit": "blaze@0.20261027.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -96994,7 +96994,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "ra-jit@0.20261027.0",
+     "pkg": "blaze@0.20261027.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -97337,7 +97337,7 @@
      "src": "src/lib.rs",
      "target": "ring"
     },
-    "rowan@0.17.0 lib rowan build": {
+    "syntax-tree@0.17.0 lib syntax-tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -97365,7 +97365,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "rowan@0.17.0",
+     "pkg": "syntax-tree@0.17.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -97376,7 +97376,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "rowan"
+     "target": "syntax-tree"
     },
     "rustc-demangle@0.1.28 lib rustc_demangle build": {
      "crate_type": "lib",
@@ -99583,8 +99583,8 @@
        "unit": "ra-ap-rustc_lexer@0.166.0 lib ra_ap_rustc_lexer build"
       },
       {
-       "name": "rowan",
-       "unit": "rowan@0.17.0 lib rowan build"
+       "name": "syntax-tree",
+       "unit": "syntax-tree@0.17.0 lib syntax-tree build"
       },
       {
        "name": "rustc_hash",

@@ -1,11 +1,11 @@
 # Test passes from the store on a fresh runner (lane testcache, #647)
 
 What `BLAZE_TESTS=affected` does on the shape of a CI test job: a fresh target directory and a
-fresh daemon, with a store that main's run filled (as `ra-jit cache pull` gives a runner).
+fresh daemon, with a store that main's run filled (as `blaze-engine cache pull` gives a runner).
 
 ix VM, arm64 Neoverse-V3, 16 vCPU, 16 GiB committed, cranelift, nightly-2026-10-25, main
-2b97b978ed (#647 merged). Each step one `cargo ra-jit test --no-fail-fast` with the project's
-`cargo_ra_jit.py` test arguments, timed whole (the build from the store and the tests), in a
+2b97b978ed (#647 merged). Each step one `blaze test --no-fail-fast` with the project's
+`blaze_cli.py` test arguments, timed whole (the build from the store and the tests), in a
 systemd unit with `MemoryMax=12G`. `BLAZE_MANIFEST=off` throughout: with the build manifest
 (#550) a fresh target with a warm store fails to build fd and ripgrep (`.md` inputs parsed as
 Rust; reported to lane warmstate). The failing tests are the projects' own on this machine (the

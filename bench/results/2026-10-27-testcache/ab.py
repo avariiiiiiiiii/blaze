@@ -8,7 +8,7 @@ import glob, json, os, re, shutil, subprocess, sys, time
 
 sys.path.insert(0, "/root/tc/src/harness")
 import bench  # noqa: E402
-import cargo_ra_jit  # noqa: E402
+import blaze_cli  # noqa: E402
 
 APPS = "/root/apps"
 OUT = f"{APPS}/ab.json"
@@ -20,10 +20,10 @@ REACH = re.compile(r"tests-reach-us: (\d+)")
 
 def run(ws, env, args, log):
     start = time.monotonic()
-    out = subprocess.run(["cargo", "ra-jit", "test", *args, "--no-fail-fast"], cwd=ws, env=env,
+    out = subprocess.run(["blaze", "test", *args, "--no-fail-fast"], cwd=ws, env=env,
                          capture_output=True, text=True, timeout=3600)
     took = time.monotonic() - start
-    subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+    subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     said = out.stdout + out.stderr
     open(log, "w").write(said)
     logs = glob.glob(os.path.join(env["BLAZE_HOME"], "workers", "*", "log"))
@@ -38,7 +38,7 @@ def main():
     names = sys.argv[1:]
     results = json.load(open(OUT)) if os.path.exists(OUT) else {}
     for name in names:
-        spec = cargo_ra_jit.PROJECTS[name]
+        spec = blaze_cli.PROJECTS[name]
         ws = os.path.join(APPS, name)
         args = spec.get("test", [])
         (path, old, new), = bench.PROJECTS[name]["edits"]["leaf"]

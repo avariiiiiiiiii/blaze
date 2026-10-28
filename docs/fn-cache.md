@@ -1,36 +1,36 @@
 # Cached functions
 
-`#[ra_jit::cache]` on a pure function keeps what it returns, in memory for the run and on
+`#[blaze::cache]` on a pure function keeps what it returns, in memory for the run and on
 disk for the runs after it. A run that calls it again with the same arguments gets the
 result without running it, for as long as the function's code, and the code of everything
 it calls, is what it was. An edit to a comment, the formatting, or a function it does not
 reach keeps the results; an edit to anything it reaches drops them.
-([#17](https://github.com/indexable-inc/ra-jit/issues/17))
+([#17](https://github.com/indexable-inc/blaze/issues/17))
 
 ```toml
 [dependencies]
-ra-jit-cache = { git = "https://github.com/indexable-inc/ra-jit" }
+blaze-cache = { git = "https://github.com/indexable-inc/blaze" }
 ```
 
 ```rust
-#[ra_jit::cache]
+#[blaze::cache]
 fn simulate(seed: u64, steps: u32) -> Vec<f64> {
     // ...
 }
 ```
 
 Under plain `cargo build` the attribute does nothing: every call runs, as it is written. Only
-a program ra-jit built caches.
+a program blaze built caches.
 
 ## What a result is kept by
 
 The key of a call is three things:
 
-- **The arguments**, written with serde in a form of their own (`crates/ra-jit-cache/src/key.rs`):
+- **The arguments**, written with serde in a form of their own (`crates/blaze-cache/src/key.rs`):
   each value says what it is and each sequence where it ends, and the entries of a std `HashMap`
   or `HashSet` of `RandomState` are sorted, so the same map is the same key whatever order its
   random seed gave its entries. Any other map keeps its order (an `IndexMap`'s is what it is).
-- **The code.** The hash of the machine code ra-jit compiled for the function's body and of
+- **The code.** The hash of the machine code blaze compiled for the function's body and of
   everything that code can reach: every function it calls, directly or through others, as the
   instance it is (`largest::<u32>` and `largest::<i64>` are two), every vtable it builds and the
   methods in it, and the value of every static it reads. It is the code without what says where
@@ -43,7 +43,7 @@ The key of a call is three things:
   so a library rebuilt under the same toolchain (`-Zbuild-std`, a patched sysroot) is another.
   The code store keys by the same.
 
-The hash is a salsa query, `cache_code`, of the database ra-jit compiles from
+The hash is a salsa query, `cache_code`, of the database blaze compiles from
 (`crates/hir-ty-codegen/fncache.rs`), so a daemon works it out once per edit, and two daemons
 work out the same one.
 
@@ -52,12 +52,12 @@ rest. A `dyn` can't be an argument.
 
 ## What can't be cached
 
-A function is refused when what it returns could depend on more than its arguments. ra-jit
+A function is refused when what it returns could depend on more than its arguments. blaze
 says why when the program first calls it, with where the reason is written:
 
 ```
-ra-jit: `app::counted` is not cached: it reads the static `app::CALLS`, which can change, at src/main.rs:37:5
-ra-jit: `app::noisy` is not cached: it reaches `std::io::stdio::_print` → …, which calls the foreign function `write`, at src/main.rs:43:5
+blaze: `app::counted` is not cached: it reads the static `app::CALLS`, which can change, at src/main.rs:37:5
+blaze: `app::noisy` is not cached: it reaches `std::io::stdio::_print` → …, which calls the foreign function `write`, at src/main.rs:43:5
 ```
 
 It is refused when anything it reaches:
@@ -81,7 +81,7 @@ It is refused when anything it reaches:
 - when an argument holds an `Rc` or an `Arc`, reads a count (`strong_count`, `get_mut`,
   `make_mut`, `try_unwrap`, `Weak::upgrade`, …) or `ptr_eq`: the key is the value, not who else
   holds it;
-- can't be compiled by ra-jit.
+- can't be compiled by blaze.
 
 The functions those are told by are always compiled as calls, never built into their caller,
 so the walk sees them.
@@ -113,7 +113,7 @@ The attribute takes plain `name: Type` parameters; not `self` (take `this: &Self
 
 ## Where results are kept
 
-In memory, up to 256 MiB for the run. On disk under `target/ra-jit/fn-cache` of the target
+In memory, up to 256 MiB for the run. On disk under `target/blaze/fn-cache` of the target
 directory the program was built in, or `BLAZE_FN_CACHE_DIR`, up to 512 MiB
 (`BLAZE_FN_CACHE_SIZE`), the entries used least recently going first. Each entry is written to
 a file of its own and renamed into place, so a run that stops partway leaves a whole entry or
@@ -135,9 +135,9 @@ A function's results on disk are kept for the code it has and the two codes befo
 first call of a run with code the function did not have drops what any older code computed,
 at once rather than when the size is reached.
 
-`cargo blaze cache` lists what each function holds, for its code and for the older ones;
-`cargo blaze cache clear --stale` forgets all but what each function's code computed, and
-`cargo blaze cache clear` everything.
+`blaze cache` lists what each function holds, for its code and for the older ones;
+`blaze cache clear --stale` forgets all but what each function's code computed, and
+`blaze cache clear` everything.
 
 ## Live edits
 
@@ -148,15 +148,15 @@ found again if the edit is taken back.
 
 ## How it is built
 
-- `crates/ra-jit-cache-macros`: the attribute. It keeps the body in a closure and has the
-  function ask `ra_jit::__private::__ra_jit_cache_code(&closure)` for the code of it, then look
+- `crates/blaze-cache-macros`: the attribute. It keeps the body in a closure and has the
+  function ask `blaze::__private::__blaze_cache_code(&closure)` for the code of it, then look
   the call up.
-- `crates/ra-jit-cache` (the `ra_jit` library): the store and that function, whose body
+- `crates/blaze-cache` (the `blaze` library): the store and that function, whose body
   answers "unknown", so under rustc nothing is cached.
-- `crates/hir-ty-codegen/fncache.rs`: ra-jit compiles a call of `__ra_jit_cache_code` into the
+- `crates/hir-ty-codegen/fncache.rs`: blaze compiles a call of `__blaze_cache_code` into the
   hash (or why the function can't be cached) as a constant. The function asking is compiled
   again after any edit, since its constant can change with code in any file
-  (`patch.rs`, `cached_roots`). Only crates with `ra_jit` as a dependency are looked through
+  (`patch.rs`, `cached_roots`). Only crates with `blaze` as a dependency are looked through
   for such functions, and nothing is hashed or compiled for the hash unless one is called, so
   a workspace without the attribute builds and patches as it did before.
 

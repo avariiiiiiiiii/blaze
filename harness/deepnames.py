@@ -20,7 +20,7 @@ import os, re, shutil, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, TARGET_ARGS, built
+from difftest import Fixture, BLAZE, sysroot_rlibs, TARGET_ARGS, built
 from storelib import run, scratch
 
 DEPTH = 20
@@ -61,7 +61,7 @@ def size(store):
 
 
 def main():
-    work, store = scratch("ra-jit-deepnames-"), scratch("ra-jit-deepnames-store-")
+    work, store = scratch("blaze-deepnames-"), scratch("blaze-deepnames-store-")
     ws = os.path.join(work, "deep")
     os.makedirs(os.path.join(ws, "src"))
     levels = "".join(f"    let f = wrap(f, {k});\n" for k in range(DEPTH))
@@ -70,7 +70,7 @@ def main():
     fx = Fixture(ws, ["deep"], ["-p", "deep"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"deep.{n}") for n in ("o", "patch.o", "bin"))
-    link = linkline.join(linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], RA_JIT), binary))
+    link = linkline.join(linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], BLAZE), binary))
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     ask = ["--crate", "deep", "--out", obj, "--patch", patch, "--link-cmd", link, "--binary", binary, *symbols]
     reference = os.path.join(work, "reference")
@@ -86,7 +86,7 @@ def main():
             socket = os.path.join(work, f"{name}.sock")
             began = time.monotonic()
             with open(log_path, "w") as out:
-                daemon = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--socket", socket, *ask],
+                daemon = subprocess.Popen([BLAZE, ws, *TARGET_ARGS, "--socket", socket, *ask],
                                           stderr=out, stdout=out, env={**os.environ, "BLAZE_CACHE": store})
             try:
                 while "watching" not in open(log_path).read():
@@ -94,7 +94,7 @@ def main():
                         raise SystemExit(f"FAIL: the {name} daemon did not start: {log_path}")
                     time.sleep(0.05)
                 took = time.monotonic() - began
-                reply = subprocess.run([RA_JIT, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
+                reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
                 # What came from the store of the checkout is compiled again, and linked, by itself,
                 # and the reply can come before the daemon says it does.
                 asked, deadline = time.monotonic(), time.monotonic() + 120

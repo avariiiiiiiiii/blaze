@@ -5,10 +5,10 @@ and why it changed as it did.
 
 ## What I measured
 
-I pulled every run of `ra-jit.yaml` since 2026-10-20 (269 runs) with `gh api
-.../actions/workflows/ra-jit.yaml/runs` and the jobs and steps of each, and read the logs of the
+I pulled every run of `blaze.yaml` since 2026-10-20 (269 runs) with `gh api
+.../actions/workflows/blaze.yaml/runs` and the jobs and steps of each, and read the logs of the
 slowest jobs. The numbers below are for the runs after the fast and full tiers split
-([#67](https://github.com/indexable-inc/ra-jit/pull/67), 03:52Z), unless they say otherwise.
+([#67](https://github.com/indexable-inc/blaze/pull/67), 03:52Z), unless they say otherwise.
 Times are wall times from the run's start; "queue wait" is a job's creation to its start.
 
 - **The fast tier on main: 13.3 minutes at the median, 20.4 at p90** (22 runs that built code,
@@ -52,7 +52,7 @@ Times are wall times from the run's start; "queue wait" is a job's creation to i
 
 ## What changed
 
-- `norustc.py` keeps its work directory under `/tmp` on macOS, as `cargo_ra_jit.py`,
+- `norustc.py` keeps its work directory under `/tmp` on macOS, as `blaze_cli.py`,
   `loadedits.py` and `headerpad.py` already did. Expected: macOS `quick-2` back to about 5
   minutes, the fast tier back to about 11.
 - The harness jobs install their Ubuntu packages through `.github/actions/apt`, which keeps the
@@ -85,7 +85,7 @@ Times are wall times from the run's start; "queue wait" is a job's creation to i
 
 ## 2026-10-26: a lean pull request and queue, the rest nightly
 
-Measured from every `ra-jit.yaml` run of 2026-10-25 10:21Z to 10-27 00:33Z (the jobs, steps and
+Measured from every `blaze.yaml` run of 2026-10-25 10:21Z to 10-27 00:33Z (the jobs, steps and
 the logs of every failed job, with `gh api`):
 
 - **Merge queue: 140 runs, 51 failed (37%).** Passing runs took 39.5 minutes at the median and
@@ -124,7 +124,7 @@ the builds took 2 to 5 minutes (sccache hits), the unit tests 3 to 6, and the re
 harnesses, `quick-2` taking 20 to 30 minutes on each platform. Every entry of the queue paid
 that, for failures the harnesses could as well report on main with the commits they came in.
 
-What changed: the merge gate (`ra-jit.yaml`, the `ci` check) is the build and the unit tests on
+What changed: the merge gate (`blaze.yaml`, the `ci` check) is the build and the unit tests on
 Linux x86-64, `harness/imports.py` and `harness/rustcsites.py`; `cargo fmt --check` is gone,
 and `fmt.yaml` formats main after each push. Everything else is the release train
 (`train.yaml`), on each push to main, one at a time on the newest commit: the full tier on four
@@ -133,4 +133,4 @@ platforms, and `nix-live.yaml` (not blocking until it has been green a while). I
 `core-N` by measured seconds, so that no part is longer than `wholeprogram.py` (19 minutes on
 macOS). A green train releases main when it has changes since the last release, through
 `pgo.yaml` and `release.yaml`; a red one opens or adds to one issue. The nightly schedules of
-`ra-jit.yaml` and `nix-live.yaml` are gone; `nix/units` was regenerated, after a week stale.
+`blaze.yaml` and `nix-live.yaml` are gone; `nix/units` was regenerated, after a week stale.

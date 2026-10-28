@@ -29,17 +29,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: live-debug
-      - run: cargo build --release -p ra-jit
+      - run: cargo build --release -p blaze-engine
       - name: edit a running program, edit after edit
         env:
           LIVE_EDITS: ${{ inputs.edits || '8' }}
           RUST_BACKTRACE: "1"
           BLAZE_IDLE_SECS: "0"
-        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_e2e.py
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_e2e.py
       - name: what the daemon and its workers said
         if: always()
         run: |
-          home="$HOME/.cache/ra-jit"
+          home="$HOME/.cache/blaze"
           echo "::group::daemon.log"; cat "$home/daemon.log" || true; echo "::endgroup::"
           for log in "$home"/workers/*/log "$home"/spares/*/log; do
             [ -f "$log" ] || continue
@@ -51,10 +51,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ra-jit-logs
+          name: blaze-logs
           path: |
-            ~/.cache/ra-jit/daemon.log
-            ~/.cache/ra-jit/workers/*/log
-            ~/.cache/ra-jit/spares/*/log
-            ~/.cache/ra-jit/live
+            ~/.cache/blaze/daemon.log
+            ~/.cache/blaze/workers/*/log
+            ~/.cache/blaze/spares/*/log
+            ~/.cache/blaze/live
           if-no-files-found: warn

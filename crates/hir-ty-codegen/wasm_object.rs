@@ -107,7 +107,7 @@ struct Writer {
     segment_count: u32,
 }
 
-const IMPORT: &str = "ra-jit.import.";
+const IMPORT: &str = "blaze.import.";
 
 /// The symbol of the function `field` that the module imports from `module`
 /// (`wasm_import_module`), rather than from an `env` that some other object defines: the

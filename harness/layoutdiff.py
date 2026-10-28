@@ -1,7 +1,7 @@
 """Compares the size and alignment rust-analyzer computes for types against rustc's, and for
 the futures of `async fn`s where each variant keeps what it keeps.
 
-rustc's side is `-Zprint-type-sizes`; ra-jit's is the `BLAZE_LAYOUTS` log of every type its
+rustc's side is `-Zprint-type-sizes`; blaze's is the `BLAZE_LAYOUTS` log of every type its
 backend laid out. The two print types differently, so both are reduced to a common spelling
 and only types that reduce to one unambiguous rustc layout are compared. A mismatch here is a
 miscompile found without running anything.
@@ -79,7 +79,7 @@ def rustc_coroutines(text):
             for name, size, align, variants in found]
 
 
-def ra_jit_layouts(path):
+def blaze_layouts(path):
     layouts = {}
     for line in open(path):
         name, size, align = line.rstrip("\n").rsplit("\t", 2)
@@ -100,7 +100,7 @@ def diff(workspace, crates, log):
     for crate in crates:
         for name, sizes in rustc_layouts(workspace, crate).items():
             theirs.setdefault(name, set()).update(sizes)
-    ours = ra_jit_layouts(log)
+    ours = blaze_layouts(log)
     compared, wrong = 0, []
     for name, sizes in sorted(ours.items()):
         want = theirs.get(name)

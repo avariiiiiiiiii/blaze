@@ -2074,7 +2074,7 @@ class Gen(Scenes):
             self.cov["panic.assert"] += 1
             compared = self.ty(lambda x: x.kind != "param" and x.leaves <= 6)
             # The message of `assert!` is the condition as rustc prints it back, which breaks
-            # lines where ra-jit does not (found/assert-message.rs): the condition is kept short.
+            # lines where blaze does not (found/assert-message.rs): the condition is kept short.
             held = self.fresh()
             self.emit(f"let {held}: bool = {self.cond()};")
             self.emit(self.r.choice([f"assert!({held});", f"assert!(!{held}, \"held {{}}\", {self.expr(self.t.u32, 1)});",

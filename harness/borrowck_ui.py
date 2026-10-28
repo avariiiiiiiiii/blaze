@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Scores ra-jit's borrow checker against rustc's own borrow-check UI tests.
+"""Scores blaze's borrow checker against rustc's own borrow-check UI tests.
 
-usage: borrowck_ui.py <rust checkout> [--bin ra-jit] [--work dir] [--jobs N] [--filter substr]
+usage: borrowck_ui.py <rust checkout> [--bin blaze-engine] [--work dir] [--jobs N] [--filter substr]
                       [--json out.json] [--toolchain nightly-YYYY-MM-DD] [--mode polonius|nll|both]
                       [--list causes|failing|out] [--min-pass N]
 
@@ -16,7 +16,7 @@ alpha) and once without (NLL, the secondary score). The errors rustc reports are
 against the test's own `//~ ERROR` annotations for the revision's own mode, and the units
 where the two disagree are counted, so a harness mistake shows.
 
-A unit passes when the borrow-check errors ra-jit reports and the ones rustc reports are the
+A unit passes when the borrow-check errors blaze reports and the ones rustc reports are the
 same set of (error code, line); an error rustc gives no code ("lifetime may not live long
 enough") is named by its message (`CODELESS`). Message text is recorded, not scored.
 
@@ -294,8 +294,8 @@ def rustc_errors(toolchain, unit, mode, cache, work):
     return errors
 
 
-def ra_jit_run(binary, units, mode, jobs, work):
-    """What ra-jit reports for each unit: {label: {"diagnostics": [...]} or {"panic": ...}}."""
+def blaze_run(binary, units, mode, jobs, work):
+    """What blaze reports for each unit: {label: {"diagnostics": [...]} or {"panic": ...}}."""
     by_edition = collections.defaultdict(list)
     files = {}
     for unit in units:
@@ -325,7 +325,7 @@ def ra_jit_run(binary, units, mode, jobs, work):
         for line in chunk:
             path = line.split("\t", 1)[0]
             if files[path] not in got:
-                got[files[path]] = {"panic": f"ra-jit exited ({proc.returncode}): {proc.stderr[-300:]}"}
+                got[files[path]] = {"panic": f"blaze exited ({proc.returncode}): {proc.stderr[-300:]}"}
         return got
 
     work_items = []
@@ -352,7 +352,7 @@ def score(units, expected, actual, mode):
             continue
         got = actual.get(unit.label, {})
         if "panic" in got:
-            verdicts[unit.label] = ("fail", "ra-jit panicked: " + got["panic"].splitlines()[0][:120], None)
+            verdicts[unit.label] = ("fail", "blaze panicked: " + got["panic"].splitlines()[0][:120], None)
             continue
         diags = got.get("diagnostics", [])
         rustc_keys = {k for k, _, _ in want}
@@ -393,7 +393,7 @@ def score(units, expected, actual, mode):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("rust")
-    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "blaze-engine"))
     ap.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "borrowck-ui"))
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
     ap.add_argument("--filter")
@@ -402,7 +402,7 @@ def main():
     ap.add_argument("--mode", default="both", choices=["polonius", "nll", "both"])
     ap.add_argument("--list", choices=["causes", "failing", "out", "passing"], action="append", default=[])
     ap.add_argument("--min-pass", type=int, help="exit 1 if fewer in-scope Polonius units pass")
-    ap.add_argument("--no-ra-jit", action="store_true", help="only collect and check rustc's verdicts")
+    ap.add_argument("--no-blaze", action="store_true", help="only collect and check rustc's verdicts")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
     cache_path = os.path.join(args.work, "rustc-cache.json")
@@ -453,7 +453,7 @@ def main():
 
     report = {"toolchain": args.toolchain, "rust": args.rust, "files": len(files), "units": len(units),
               "annotations_agree": agree, "annotations_disagree": disagreeing, "modes": {}}
-    if args.no_ra_jit:
+    if args.no_blaze:
         print(f"rustc agrees with the annotations on {agree} units, not on {disagree}")
         for label in disagreeing:
             print(f"  {label}")
@@ -462,7 +462,7 @@ def main():
     for mode in modes:
         todo = [u for u in in_mode[mode] if not u.out and not isinstance(expected[mode].get(u.label), str)]
         started = time.time()
-        actual = ra_jit_run(args.bin, todo, mode, args.jobs, args.work)
+        actual = blaze_run(args.bin, todo, mode, args.jobs, args.work)
         took = time.time() - started
         verdicts = score(in_mode[mode], expected[mode], actual, mode)
         count = collections.Counter(v[0] for v in verdicts.values())
@@ -473,7 +473,7 @@ def main():
                            and bool(v[2]["want"]) == bool(v[2]["got"]))
         skipped_pass = sum(1 for v in verdicts.values() if v[0] == "pass" and v[2] and v[2]["skipped"])
         print(f"\n== {mode}: {count['pass']} of {inscope} in-scope units pass "
-              f"({100 * count['pass'] / max(inscope, 1):.1f}%), {count['out']} out of scope; ra-jit took {took:.0f}s")
+              f"({100 * count['pass'] / max(inscope, 1):.1f}%), {count['out']} out of scope; blaze took {took:.0f}s")
         print(f"   accept/reject agrees on {accept_agree} of {inscope}; {skipped_pass} passing units had a body skipped")
         print("   out of scope:")
         for why, n in out.most_common():
@@ -496,11 +496,11 @@ def main():
         if args.min_pass is not None and mode == "polonius" and count["pass"] < args.min_pass:
             print(f"FAIL: {count['pass']} in-scope Polonius units pass, fewer than {args.min_pass}")
             exit_code = 1
-        # A unit ra-jit panics on has none of its errors reported, and an error on a unit
+        # A unit blaze panics on has none of its errors reported, and an error on a unit
         # rustc accepts is a false one: either fails the run, whatever the passes.
-        panicked = sorted(l for l, v in verdicts.items() if v[0] == "fail" and v[1].startswith("ra-jit panicked"))
+        panicked = sorted(l for l, v in verdicts.items() if v[0] == "fail" and v[1].startswith("blaze panicked"))
         false_errors = sorted(l for l, v in verdicts.items() if v[0] == "fail" and v[2] and not v[2]["want"])
-        for what, labels in (("ra-jit panicked on", panicked), ("errors rustc does not report on", false_errors)):
+        for what, labels in (("blaze panicked on", panicked), ("errors rustc does not report on", false_errors)):
             if labels:
                 print(f"FAIL ({mode}): {what} {len(labels)} units")
                 for label in labels:

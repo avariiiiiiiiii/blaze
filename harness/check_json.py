@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""check_json.py: `cargo ra-jit check --message-format=...` against `cargo check` on the same errors.
+"""check_json.py: `blaze check --message-format=...` against `cargo check` on the same errors.
 
     check_json.py [CASE...] [--keep]
 
 Each case below is a small package with errors the daemon reports. It is checked by plain
-cargo (rustc) and by `cargo ra-jit check` (the daemon's checker, which runs no rustc), in a
+cargo (rustc) and by `blaze check` (the daemon's checker, which runs no rustc), in a
 daemon home of its own, with each `--message-format` an editor or a person asks for:
 
   json                          every error's `compiler-message` has to be rustc's: the package,
@@ -22,7 +22,7 @@ What only rustc has is left out of the comparison and counted: a message worded 
 spans of an error) and `code.explanation`. A package without errors has to give
 `build-finished` with success true; rustc's `compiler-artifact` lines are not compared.
 
-BLAZE_BIN (default target/release/ra-jit) is the ra-jit with `cargo-ra-jit` and `ra-jit-rustc`
+BLAZE_BIN (default target/release/blaze-engine) is the blaze with `blaze` and `blaze-rustc`
 next to it. Exits 1 when anything compared differs.
 """
 import json, os, re, shutil, subprocess, sys, tempfile
@@ -30,7 +30,7 @@ import json, os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 EXE = ".exe" if os.name == "nt" else ""
-RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit" + EXE)
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine" + EXE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 ALLOW = "#![allow(unused, dead_code)]\n"
 
@@ -88,7 +88,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 def env(home):
     it = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, RUST_BACKTRACE="0")
     it["BLAZE_CACHE"] = os.path.join(home, "store")
-    it["PATH"] = os.path.dirname(RA_JIT) + os.pathsep + it["PATH"]
+    it["PATH"] = os.path.dirname(BLAZE) + os.pathsep + it["PATH"]
     for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_TERM_COLOR"):
         it.pop(name, None)
     return it
@@ -134,7 +134,7 @@ SPAN_FIELDS = ["file_name", "byte_start", "byte_end", "line_start", "line_end", 
 
 
 def frame(rendered, span):
-    """The lines of `rendered` that ra-jit writes as rustc does: the header without the message,
+    """The lines of `rendered` that blaze writes as rustc does: the header without the message,
     the first `-->` line, and the source lines of the primary `span` with their gutter, the
     first time each is shown (rustc shows the lines of its other spans and suggestions too)."""
     lines = rendered.splitlines()
@@ -163,7 +163,7 @@ class Tally:
     def same(self, case, fmt, what, ours, theirs):
         self.compared += 1
         if ours != theirs:
-            self.differs.append(f"{case} {fmt}: {what}\n      ra-jit: {ours!r}\n      rustc:  {theirs!r}")
+            self.differs.append(f"{case} {fmt}: {what}\n      blaze: {ours!r}\n      rustc:  {theirs!r}")
 
 
 def compare_json(tally, case, fmt, ours, theirs):
@@ -250,10 +250,10 @@ def main():
             at = make(work, name, files)
             for fmt in FORMATS:
                 theirs, their_err, their_status = run(at, [], fmt, home)
-                ours, our_err, our_status = run(at, ["ra-jit"], fmt, home)
+                ours, our_err, our_status = run(at, ["blaze"], fmt, home)
                 tally.same(name, fmt, "status", our_status, their_status)
                 if our_status != their_status and our_err:
-                    print(f"{name} {fmt}: ra-jit exited {our_status}: {our_err[-1]}", flush=True)
+                    print(f"{name} {fmt}: blaze exited {our_status}: {our_err[-1]}", flush=True)
                 tally.same(name, fmt, "checked without rustc", [l for l in our_err if "Checking probe" in l], [])
                 if fmt.startswith("json"):
                     compare_json(tally, name, fmt, ours, theirs)
@@ -262,7 +262,7 @@ def main():
                     compare_text(tally, name, fmt, our_err, their_err)
             print(f"{name}: done", flush=True)
     finally:
-        subprocess.run([RA_JIT, "stop"], env=env(home), capture_output=True)
+        subprocess.run([BLAZE, "stop"], env=env(home), capture_output=True)
         if not keep:
             shutil.rmtree(work, ignore_errors=True)
         else:

@@ -1,16 +1,16 @@
-# A CI runner of our own: a warm ra-jit VM per repository, a fork per branch
+# A CI runner of our own: a warm blaze VM per repository, a fork per branch
 
-2026-10-24. Status: design, nothing built. Written against ra-jit main `d4f6027e82` and ix
+2026-10-24. Status: design, nothing built. Written against blaze main `d4f6027e82` and ix
 `4a647c63ef`. Each claim is marked **read** (in a source we read, or measured by us),
 **reported** (a document or someone says so, not re-checked here) or **unverified** (our
 inference or an estimate). What was fetched is in [upstream/ci-runner/](upstream/ci-runner/SOURCE.md).
-The umbrella issue is [#264](https://github.com/indexable-inc/ra-jit/issues/264).
+The umbrella issue is [#264](https://github.com/indexable-inc/blaze/issues/264).
 
 Andrew's requirements: our own runner, warm per repository, on our VM product, working with git;
 as fast as possible ("I don't know if RE will be the best protocol; maybe we want to control
 it"); tests sandboxed to remove nondeterminism; never fall back to cargo; a cache that works
 across branches and worktrees. And, settling the concurrency question: "our VM DOES support CoW
-... we would not load multiple branches into the main ra-jit, so people would be forced into our
+... we would not load multiple branches into the main blaze, so people would be forced into our
 fork VM".
 
 ## Short version
@@ -21,11 +21,11 @@ fork VM".
   "shares the snapshot's bytes and writes its own changes beside them", running processes
   included (**read**, public docs). ix already runs CI jobs as forks of a warm VM
   (`crates/ci/fast`) and has seen a buck2 daemon's in-memory graph survive the fork (**reported**).
-- **The design.** One persistent VM per repository (the *seed*) runs a ra-jit daemon warm on
+- **The design.** One persistent VM per repository (the *seed*) runs a blaze-engine daemon warm on
   `main`. A push forks the seed's latest snapshot; the fork checks out the pushed tree in place,
   so the daemon sees the difference as an edit, builds, runs the affected tests each in a
   sandbox, reports a GitHub check and is thrown away, or kept as a snapshot for that branch's
-  next push. ra-jit stays one branch per daemon; many branches are many forks.
+  next push. blaze stays one branch per daemon; many branches are many forks.
 - **Fork, not edit, is the long pole.** A nushell edit is 258 to 277 ms in a live daemon
   (**read**); an ix fork is 1.7 s for a seed restore (**reported**) and 4 to 36 s for seeds with
   8 to 27 GiB of touched memory on the older fork path (**reported**). So forks are made ahead:
@@ -33,12 +33,12 @@ fork VM".
   17 to 42 ms, **reported**).
 - **Protocol: none on the hot path.** Inside a VM the daemon, its store and the tests share a
   file system and memory; between the seed and its forks the transfer is ix's copy-on-write
-  fork; across machines it is ra-jit's existing remote (sealed, content-addressed packs of
+  fork; across machines it is blaze's existing remote (sealed, content-addressed packs of
   thousands of functions each, signed manifests). REAPI's action cache has no batch lookup
   (**read**): 165,752 per-function lookups at a gRPC unary median of 112 us is 18.6 s serial,
   against about ten pack fetches for the same 64 MB (**unverified** arithmetic). REAPI stays an edge
-  adapter for teams with a Bazel cache ([#226](https://github.com/indexable-inc/ra-jit/issues/226), P3); no `Execution`.
-- **Sandbox: `ra-jit sandbox` per test executable** ([#257](https://github.com/indexable-inc/ra-jit/issues/257)):
+  adapter for teams with a Bazel cache ([#226](https://github.com/indexable-inc/blaze/issues/226), P3); no `Execution`.
+- **Sandbox: `blaze sandbox` per test executable** ([#257](https://github.com/indexable-inc/blaze/issues/257)):
   every test, by default; user, mount, network, IPC and PID namespaces, read-only mounts,
   overlays, seccomp-notify recording of every path each test touches, by test; about 8 ms per
   executable on Linux x86-64 (**measured**, [cargo.md](cargo.md#sandboxed-tests-an-experiment-opt-in)). The fork is the boundary around
@@ -131,16 +131,16 @@ From [docs/machines](https://ix.dev/docs/machines), [docs/snapshots](https://ix.
   (**read**, file list). ix decided against remote execution for its own CI after measuring a
   192-thread box: width beyond one box buys about 5% (`docs/ci/remote-execution.md`, **reported**).
 
-## What ra-jit gives, and what is per checkout
+## What blaze gives, and what is per checkout
 
 - **A warm daemon is where the speed is.** nushell: ready in 52.1 s from nothing, a warm restart
   37.2 s that reused nothing, cargo 46.3 s beside it; in a live daemon a body edit 258 ms and a
   signature edit 277 ms ([research/lean-frontend.md](research/lean-frontend.md), **read**).
   ripgrep: a first build 14.5 s, an edit 0.09 s ([research/warm-start.md](research/warm-start.md),
   **read**). A fork carries the live daemon, so the runner never pays the start.
-- **The store.** Keys hash the store format, the bytes of the ra-jit executable and the
-  toolchain's commit (`Identity` and `program()` in `crates/ra-jit-store/src/lib.rs`, **read**).
-  A seed therefore pins one ra-jit binary; a new binary is a new seed. A crate of the checkout
+- **The store.** Keys hash the store format, the bytes of the blaze executable and the
+  toolchain's commit (`Identity` and `program()` in `crates/blaze-store/src/lib.rs`, **read**).
+  A seed therefore pins one blaze binary; a new binary is a new seed. A crate of the checkout
   is named by a hash of its source, so an edit renames the edited crate and its dependents
   ([cache.md](cache.md), **read**); agent c18d96d6 is making a warm start reuse the store and
   the keys content-only and independent of path and branch (**reported**). This design takes
@@ -153,15 +153,15 @@ From [docs/machines](https://ix.dev/docs/machines), [docs/snapshots](https://ix.
   sets it.
 - **Per checkout today.** `tests-reach` and `tests-passed` live beside each test program in the
   target directory (`cargo/affected.rs`, **read**). Affected selection runs everything when cargo
-  built the program or `tests-reach` is missing ([#227](https://github.com/indexable-inc/ra-jit/issues/227),
+  built the program or `tests-reach` is missing ([#227](https://github.com/indexable-inc/blaze/issues/227),
   **read**). Integration tests are rerun when a binary's size or modification time changed
   (`affected.rs` lines 174 to 187, **read**). In a fork that is mostly fine (the fork inherits the
   seed's target directory and times), but none of it is shared between branches.
 - **GC.** `StoreDir::collect` evicts sealed packs least recently used (by modification time)
   down to `BLAZE_CACHE_MAX`, by default a tenth of the free disk between 256 MB and 32 GB, after
-  sealing, merging small packs and removing temporaries (`crates/ra-jit-store/src/lib.rs`,
-  **read**). `ra-jit cache gc` runs it; `ra-jit cache gc --remote` takes old lines off remote
-  manifests and removes unlisted objects (`crates/ra-jit/src/remote/collect.rs`, **read**).
+  sealing, merging small packs and removing temporaries (`crates/blaze-store/src/lib.rs`,
+  **read**). `blaze-engine cache gc` runs it; `blaze-engine cache gc --remote` takes old lines off remote
+  manifests and removes unlisted objects (`crates/blaze-engine/src/remote/collect.rs`, **read**).
   Neither knows what is live.
 
 ## The design
@@ -173,9 +173,9 @@ The seed is an ix machine, persistent, of the repository's architecture. It hold
 - a partial clone of the repository (`--filter=blob:none`, unshallowed: ix measured a new commit
   fetched in 0.40 s that way against 5 to 8 s shallow, **reported**), checked out at one stable
   path;
-- the pinned ra-jit binary and toolchain, and the target directory and store on tmpfs or the
+- the pinned blaze binary and toolchain, and the target directory and store on tmpfs or the
   page cache, so they are inside the memory snapshot (the guest disk was 40 MB/s, above);
-- one ra-jit daemon for the checkout, started with `BLAZE_RUSTC_BASE=0`, `BLAZE_TESTS=affected`
+- one blaze-engine daemon for the checkout, started with `BLAZE_RUSTC_BASE=0`, `BLAZE_TESTS=affected`
   and the daemon's idle exit off (a fork resumes with a clock that jumped, and an idle timer must
   not end the daemon the job came for: **unverified** what the daemon does today);
 - after a build of `main`'s tests: the daemon's own base, the test programs built, and the test
@@ -194,9 +194,9 @@ the next one, as ix's seeds do at most once a minute (**reported**). The seed fo
 or red: its job is to hold main's compiled state, and a red main is reported on main's commit.
 
 **Starting over.** The seed is rebuilt from nothing (and its spares and branch snapshots
-dropped) when the ra-jit binary or the toolchain changes (the store's identity), when the
+dropped) when the blaze binary or the toolchain changes (the store's identity), when the
 worker's key changes (target, features), when the daemon's memory passes a budget (workers grow
-with edits, [#261](https://github.com/indexable-inc/ra-jit/issues/261)), and once a day as a
+with edits, [#261](https://github.com/indexable-inc/blaze/issues/261)), and once a day as a
 backstop. A rebuild boots a fresh VM beside the old seed and swaps when ready; jobs keep forking
 the old snapshot meanwhile. Its cost is the cold start (52 s on nushell today), and a warm start
 on the store gets cheaper with #41/#216 and c18d96d6's work.
@@ -213,7 +213,7 @@ on the store gets cheaper with #41/#216 and c18d96d6's work.
    crates whose files changed, plus their dependents in the crate graph, with a manifest or lock
    file change counting as a reload of the crates it touches. The runner keeps the crate graph of
    `M` to compute this without a daemon. Usually: the branch's own snapshot for a follow-up push,
-   the seed for a new branch. A branch snapshot built by another ra-jit binary, or older than the
+   the seed for a new branch. A branch snapshot built by another blaze binary, or older than the
    seed's last rebuild, is not a candidate. When a branch is far behind main, `M` usually wins,
    because the test merge `T` contains main.
 3. **Fork.** Claim a running spare of `W` (a fork made ahead and warmed, below), or restore `W`
@@ -222,7 +222,7 @@ on the store gets cheaper with #41/#216 and c18d96d6's work.
 4. **Check out and edit.** `git fetch` the commit, `git checkout --detach T` in place at the seed's
    path. Only changed files are written; the daemon finds them at the next build request
    (`tree.rs`) or, better, the runner hands it the changed paths from `git diff --name-status`.
-5. **Build and test.** `cargo ra-jit test` with `BLAZE_TESTS=affected`: only the edited
+5. **Build and test.** `blaze test` with `BLAZE_TESTS=affected`: only the edited
    functions are compiled and patched; each test program runs the tests whose code or recorded
    inputs changed, each in its sandbox; the rest are skipped because the same key passed before,
    on main or on this branch.
@@ -238,7 +238,7 @@ Why the fork and not a daemon per branch inside one VM: the daemon's state for a
 is gigabytes (nushell 5.2 GB resident when ready, 7.5 GB after its own base, 11.2 GB at peak:
 **read**), so a second daemon per branch costs a second cold start and a second copy; a fork costs
 neither, starts with the loaded workspace and the salsa memos, and gives each job its own kernel.
-ra-jit needs no change to its one-branch model for this, which is the point: the product does the
+blaze needs no change to its one-branch model for this, which is the point: the product does the
 branching.
 
 ### Fork latency against the edit budget
@@ -266,7 +266,7 @@ A fork's daemon writes what it compiled to its store, on its own copy-on-write d
 vanishes with the fork unless shipped. The packs are sealed, named by the SHA-256 of their bytes
 and checked on fetch, and the keys are content-only after c18d96d6's work, so a pack made on any
 branch serves every branch with the same code. Shipping is the existing remote: at job end the
-fork runs `ra-jit cache push` to the repository's remote (an S3 prefix or a directory on a shared
+fork runs `blaze-engine cache push` to the repository's remote (an S3 prefix or a directory on a shared
 volume), off the push's path; the seed pulls lazily (`BLAZE_REMOTE_LAZY`) at its next refresh,
 and so do new forks.
 
@@ -278,7 +278,7 @@ every branch would then link. So only trusted lineages push: the seed always, fo
 requests from the repository itself (members), never forks of pull requests from forked
 repositories (`trusted = false` in `github-events`). A manifest stays signed (`BLAZE_REMOTE_SIGN`)
 by the runner, never by the fork. Later, if compiling one function is deterministic (**unverified**;
-whole-program layout is not, [#200](https://github.com/indexable-inc/ra-jit/issues/200)), the
+whole-program layout is not, [#200](https://github.com/indexable-inc/blaze/issues/200)), the
 seed can check a sample of pushed entries by compiling them again.
 
 ### Memory with many forks
@@ -302,7 +302,7 @@ seed can check a sample of pushed entries by compiling them again.
 ### Git
 
 - **Webhooks first.** ix's App ingress already receives `push` and `pull_request`, records a run
-  and posts check runs (`crates/ci/fast`, `crates/ci/runners`): ra-jit's runner is a job script
+  and posts check runs (`crates/ci/fast`, `crates/ci/runners`): blaze's runner is a job script
   and a seed recipe on that, not a second ingress.
 - **The runner as a git remote, second.** For agents (den) that push many times a minute, the
   webhook's second is the largest fixed cost left. A `git push ix-ci HEAD` to a bare repository
@@ -331,9 +331,9 @@ The question was REAPI v2 (CAS, ActionCache, Execution over gRPC) or our own. Wh
 |---|---|---|
 | inside the fork: daemon, store, test runner | functions, programs, verdicts | memory and the file system; the store's packs are local files |
 | seed to fork | everything: the daemon's heap, the store, the target directory, the checkout | ix's copy-on-write fork; nothing is copied |
-| fork to store (trusted lineages) | new packs, at job end | `ra-jit cache push` to the repository's remote |
+| fork to store (trusted lineages) | new packs, at job end | `blaze-engine cache push` to the repository's remote |
 | runner to fork | the job, its output | ix RPC: `vm.exec` with streamed output |
-| machine to machine, cold | packs and signed manifests | ra-jit's remote: S3, a directory, https |
+| machine to machine, cold | packs and signed manifests | blaze's remote: S3, a directory, https |
 
 The numbers that decide it:
 
@@ -350,7 +350,7 @@ The numbers that decide it:
   112 us each serially, or about 3.5 s of server CPU however wide (**unverified** arithmetic).
   The CAS batches (`BatchReadBlobs`, `FindMissingBlobs`), but under the server's size limit
   (NativeLink's default message is 4 MiB, **reported** in #226), and still needs the AC to map a
-  key to a blob. ra-jit's packs already batch: a pack is sealed at 4 MB or more (`SEAL_AT`) and
+  key to a blob. blaze's packs already batch: a pack is sealed at 4 MB or more (`SEAL_AT`) and
   small ones are merged (`merge_small`, **read**), so one pack holds thousands of functions and
   the same 64 MB is on the order of ten objects (**unverified** arithmetic).
 - **What a build actually waits on.** helix's warm start read 118,698 entries with "store read"
@@ -367,10 +367,10 @@ The numbers that decide it:
   ix measured that more width than one big box buys about 5% for its own CI (**reported**).
 
 So: no RPC inside the fork, ix's fork between the seed and its forks, and the existing pack remote
-between machines. "Our own protocol" here means ra-jit's pack and manifest format, which is
+between machines. "Our own protocol" here means blaze's pack and manifest format, which is
 already ours; the one new message is a job's report (verdicts per test key), which travels in the
 job's output over `vm.exec`. REAPI is worth one thing: letting a team that already runs
-NativeLink or BuildBuddy hold ra-jit's packs, as an `BLAZE_REMOTE=grpc://` place mapping a pack
+NativeLink or BuildBuddy hold blaze's packs, as an `BLAZE_REMOTE=grpc://` place mapping a pack
 to a CAS blob and a manifest to an AC entry, exactly as #226 lays out. That is P3 and outside the
 runner. A read-only REAPI view for Bazel users, and `Execution`, are not planned.
 
@@ -378,13 +378,13 @@ runner. A read-only REAPI view for Bazel users, and `Execution`, are not planned
 
 ### Each test
 
-The sandbox is [#257](https://github.com/indexable-inc/ra-jit/issues/257)'s `ra-jit sandbox`,
-landing first in [PR #263](https://github.com/indexable-inc/ra-jit/pull/263) (**read**, issue
+The sandbox is [#257](https://github.com/indexable-inc/blaze/issues/257)'s `blaze sandbox`,
+landing first in [PR #263](https://github.com/indexable-inc/blaze/pull/263) (**read**, issue
 and PR): new user, mount, network, IPC and PID namespaces; every mount recursively read-only; the
 workspace and target directory under overlayfs with a private upper layer; fresh `/tmp`,
 `/var/tmp` and `/dev/shm`; loopback only; a seccomp user-notification filter on every
 path-taking syscall whose supervisor, outside the sandbox, records each path and its digest when
-the test ends. ra-jit writes the test harness ([#88](https://github.com/indexable-inc/ra-jit/issues/88)),
+the test ends. blaze writes the test harness ([#88](https://github.com/indexable-inc/blaze/issues/88)),
 so the harness marks, on each thread, which test it is running, and the supervisor files each
 path under that test. Every test runs sandboxed, by default, one sandbox per test executable
 with libtest's threads inside: a launch costs about 8 ms on Linux x86-64 (9 ms recording reads),
@@ -393,8 +393,8 @@ test cost ten times as much (**measured**, `harness/sandboxbench.py`;
 [cargo.md](cargo.md#sandboxed-tests-an-experiment-opt-in)). macOS has the same sandbox from Seatbelt
 and an interposer.
 
-Build scripts and proc macros go through the same `ra-jit sandbox`
-([#147](https://github.com/indexable-inc/ra-jit/issues/147)), with what they read recorded into
+Build scripts and proc macros go through the same `blaze sandbox`
+([#147](https://github.com/indexable-inc/blaze/issues/147)), with what they read recorded into
 their keys the same way.
 
 ### Can a test's sandbox be a copy-on-write fork?
@@ -402,13 +402,13 @@ their keys the same way.
 | primitive | per test | what it gives | use |
 |---|---|---|---|
 | a thread in libtest's process | about 0 | nothing beyond Rust's own rules | not in CI |
-| `ra-jit sandbox`: exec under namespaces and seccomp-notify, one per test executable | about 8 ms a launch, shared by its tests (measured) | a private file system view, no network, recorded inputs by test | every test, the default |
+| `blaze sandbox`: exec under namespaces and seccomp-notify, one per test executable | about 8 ms a launch, shared by its tests (measured) | a private file system view, no network, recorded inputs by test | every test, the default |
 | process fork from a loaded test program, into new namespaces | about 1 to 5 ms (unverified) | the same, with the program's loaded memory shared copy-on-write | a follow-up to #257 |
 | an ix VM fork per test | 250 ms at the worker to 1.7 s or more (reported) | its own kernel | tests that need root, KVM (x86 only) or kernel state; shards |
 
 A VM fork per test is a hundred times the namespace sandbox and runs into the machine quotas, so
 it is the exception, asked for per test. The cheap copy-on-write fork is one level down: the test
-program, which ra-jit links and whose harness ra-jit writes, starts once, loads, and before
+program, which blaze links and whose harness blaze writes, starts once, loads, and before
 starting any thread forks a child per test with `clone3` into fresh namespaces (pre-made network
 namespaces from a pool, since making one costs more than the rest, **unverified**). The child
 shares the parent's loaded pages copy-on-write and skips exec and dynamic loading, which is most of
@@ -422,7 +422,7 @@ job except the report and, for trusted lineages, packs.
 
 ### What a test result is keyed by
 
-A test's verdict is kept under the hash of: the ra-jit identity and target; the test's reach hash
+A test's verdict is kept under the hash of: the blaze identity and target; the test's reach hash
 from `tests-reach` (its code and every function it reaches, by code identity); its attributes;
 the fixed environment; the content (not the size and time) of each `CARGO_BIN_EXE_*` program it
 runs; and the digests of every path its sandbox recorded, including paths found absent. A pass is
@@ -457,28 +457,28 @@ difference. It does not remove the clock, threads or, by default, randomness (#2
 
 ## Never falling back to cargo
 
-The runner's rule: any job in which ra-jit prints `ra-jit: bug: <reason>; building with cargo` (the
-line #258 added) fails, as a ra-jit bug with the reason and the issue, and never goes green through
+The runner's rule: any job in which blaze prints `blaze: bug: <reason>; building with cargo` (the
+line #258 added) fails, as a blaze bug with the reason and the issue, and never goes green through
 cargo. It never sets `BLAZE_TESTS=all` or `BLAZE_SANDBOX=off` on its own. What is missing for
 that rule to hold on real repositories, from [no-rustc.md](no-rustc.md) and the open issues
 (**read**):
 
-- [#258](https://github.com/indexable-inc/ra-jit/issues/258) (P1): test edits went to cargo on
+- [#258](https://github.com/indexable-inc/blaze/issues/258) (P1): test edits went to cargo on
   ripgrep and helix-core; three causes, fixes in flight.
-- [#91](https://github.com/indexable-inc/ra-jit/issues/91) (no-rustc K): the cold build is cargo's
+- [#91](https://github.com/indexable-inc/blaze/issues/91) (no-rustc K): the cold build is cargo's
   unless `BLAZE_RUSTC_BASE=0`; the seed sets it, and K makes it the only path.
-- [#86](https://github.com/indexable-inc/ra-jit/issues/86), [#87](https://github.com/indexable-inc/ra-jit/issues/87),
-  [#89](https://github.com/indexable-inc/ra-jit/issues/89), [#90](https://github.com/indexable-inc/ra-jit/issues/90)
-  (F, G, I, J): std, every crate, build scripts and proc macros by ra-jit. Until they land the seed's
+- [#86](https://github.com/indexable-inc/blaze/issues/86), [#87](https://github.com/indexable-inc/blaze/issues/87),
+  [#89](https://github.com/indexable-inc/blaze/issues/89), [#90](https://github.com/indexable-inc/blaze/issues/90)
+  (F, G, I, J): std, every crate, build scripts and proc macros by blaze. Until they land the seed's
   warm-up still uses rustc's std rlibs, proc macros and parts of build scripts. That is counted
   rustc use in the seed, not a fallback in a job, and it is the reason the seed is built once and
   forked many times.
-- [#92](https://github.com/indexable-inc/ra-jit/issues/92) (L): doctests; [#93](https://github.com/indexable-inc/ra-jit/issues/93) (M):
+- [#92](https://github.com/indexable-inc/blaze/issues/92) (L): doctests; [#93](https://github.com/indexable-inc/blaze/issues/93) (M):
   the wrapper and the fallback removed.
-- Edit refusals that end in cargo today: [#262](https://github.com/indexable-inc/ra-jit/issues/262)
-  (cdylib-only packages), [#260](https://github.com/indexable-inc/ra-jit/issues/260),
-  [#233](https://github.com/indexable-inc/ra-jit/issues/233), [#224](https://github.com/indexable-inc/ra-jit/issues/224),
-  [#242](https://github.com/indexable-inc/ra-jit/issues/242).
+- Edit refusals that end in cargo today: [#262](https://github.com/indexable-inc/blaze/issues/262)
+  (cdylib-only packages), [#260](https://github.com/indexable-inc/blaze/issues/260),
+  [#233](https://github.com/indexable-inc/blaze/issues/233), [#224](https://github.com/indexable-inc/blaze/issues/224),
+  [#242](https://github.com/indexable-inc/blaze/issues/242).
 - In the affected path: a program cargo built, or a missing `tests-reach`, runs everything (#227).
   In the runner that becomes a failed job naming why.
 
@@ -495,7 +495,7 @@ What is kept: everything reachable from a live root, then the rest by last use w
   remote's collector can read it.
 - **The local store** inside a seed or fork needs no root logic: the fork is thrown away, and the
   seed's store is bounded by `BLAZE_CACHE_MAX` as today.
-- **The repository's remote.** `ra-jit cache gc --remote` keeps every pack named by a live root
+- **The repository's remote.** `blaze-engine cache gc --remote` keeps every pack named by a live root
   manifest and applies its age rules only to the rest (a change to `remote/collect.rs`, which today
   ages manifests' lines regardless of roots). Results rows the same.
 - **ix's side.** A branch snapshot is deleted when its branch stops being live; a deleted fork frees
@@ -522,7 +522,7 @@ projects' own recent runs (2026-10-23/24).
 | GitHub Actions, whole pull request run | 5.3 to 11.0 min wall (10 runs; the stable Linux test job 3.5 min in run 39981832373) | 13.4 to 29.7 min wall (3 runs; a fourth took 53 min; the Linux job 4.9 min in run 40045770215, with Swatinem/rust-cache) | same |
 
 A lock file change reloads the changed crates and builds them from the store or from source: tens
-of seconds on nushell (**unverified**). A new ra-jit binary is a new seed: one cold start (52 s on
+of seconds on nushell (**unverified**). A new blaze binary is a new seed: one cold start (52 s on
 nushell) per repository, made beside the old seed. Actions runs include their OS matrix; ours is
 Linux only until the runner has macOS and Windows forks, which ix does not have.
 
@@ -531,8 +531,8 @@ Linux only until the runner has macOS and Windows forks, which ix does not have.
 Ranked by what each unblocks. Blockers named; ix rollout state is ix's.
 
 1. **R1. One seed, one job, end to end, on ripgrep then nushell.** A seed recipe (clone, pinned
-   ra-jit, `BLAZE_RUSTC_BASE=0`, daemon warm on main, idle exit off, store and target in memory,
-   snapshot), and a `crates/ci/fast` job script: fork, fetch, check out in place, `cargo ra-jit
+   blaze, `BLAZE_RUSTC_BASE=0`, daemon warm on main, idle exit off, store and target in memory,
+   snapshot), and a `crates/ci/fast` job script: fork, fetch, check out in place, `blaze
    test` under `affected`, check run, delete. Fails the job on any `building with cargo` line.
    Measures: push to green, fork time, the fork's dirty memory, whether the daemon survives the
    fork (clock jump, sockets, idle timer). Blockers: #258; ix restores reliable for a seed of the
@@ -547,14 +547,14 @@ Ranked by what each unblocks. Blockers named; ix rollout state is ix's.
 4. **R4. Spares and branch snapshots.** `k` warmed spares per repository on the donor's host,
    branch snapshots at job end, the warm-state choice by crate-level diff cost. Blockers: ix
    admission charging forks the seed's plug; same-host placement for spares.
-5. **R5. Packs back to the store.** `ra-jit cache push` at job end for trusted lineages, signed
+5. **R5. Packs back to the store.** `blaze-engine cache push` at job end for trusted lineages, signed
    manifests by the runner, lazy pulls in the seed and new forks. Blocker: c18d96d6.
 6. **R6. GC by live roots.** Root manifests from the seed, branch snapshots and spares;
    `cache gc --remote` keeps what they name; branch snapshots deleted with their branches.
 7. **R7. Shards over forks** for suites that take tens of seconds. Blocker: cheap job-level forks.
 8. **R8. No rustc in the seed.** #147 for build scripts and proc macros in the sandbox, then
    no-rustc F, G, I, J, K and M. Long; the runner's counts of rustc use in seeds track it.
-9. **R9. The REAPI edge** ([#226](https://github.com/indexable-inc/ra-jit/issues/226), P3): packs
+9. **R9. The REAPI edge** ([#226](https://github.com/indexable-inc/blaze/issues/226), P3): packs
    and manifests on a team's NativeLink or BuildBuddy. Independent of the runner.
 
 Also worth doing after R4: the runner as a git remote for agents, and the per-test process fork

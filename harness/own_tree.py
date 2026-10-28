@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""own_tree.py: `cargo blaze tree`, which blaze-tree makes with no cargo, against `cargo tree`,
+"""own_tree.py: `blaze tree`, which blaze-tree makes with no cargo, against `cargo tree`,
 over workspaces. cargo is the oracle; blaze never runs it outside this harness.
 
 usage: own_tree.py [--blaze BIN] [--args "ARGS" ...] [--out FILE] DIR...
 
 Each DIR is a workspace with its Cargo.lock, whose packages are fetched already (`cargo fetch`).
 In each, every form of `--args` (by default the forms in FORMS) is run as `cargo tree ARGS` and
-as `BIN cargo tree ARGS` (BIN: `ra-jit`, default `target/release/ra-jit`), both with
+as `BIN cargo tree ARGS` (BIN: `blaze`, default `target/release/blaze-engine`), both with
 `--color never` and their output piped; standard output and the exit status are compared.
 A case is equal, different, blaze-failed or cargo-failed; the first differing line of each
 that is not equal is printed, `--out` writes them all as JSON, and the exit status is 1 when
@@ -64,7 +64,7 @@ def first_difference(a, b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--args", action="append")
     ap.add_argument("--out")
     opts = ap.parse_args()

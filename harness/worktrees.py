@@ -3,7 +3,7 @@
 
 The stress workspace is copied COUNT times. The daemon is started in the first copy with the
 others as `--also`; each step edits files of some checkouts and asks for the program of some by
-`ra-jit sync SOCKET --project ...`. Every program asked for is run and compared with what
+`blaze sync SOCKET --project ...`. Every program asked for is run and compared with what
 `cargo build` of that checkout prints.
 
 With `--join` the daemon is started in the first copy alone, and the others join it when they
@@ -14,7 +14,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -116,8 +116,8 @@ def unanswered(daemon, log_path, since):
 
 def main():
     # cargo names a checkout by its real path, and the temporary directory of macOS is a link.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-worktrees-"))
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = os.path.realpath(tempfile.mkdtemp(prefix="blaze-worktrees-"))
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     crates = ["sapp", "sbase", "smid"]
     checkouts = []
     for at in range(COUNT):
@@ -141,14 +141,14 @@ def main():
             fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"sapp{at}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        link = linkline.with_output(linkline.ahead(link, [patch, obj], RA_JIT), binary)
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         checkouts.append({"ws": ws, "obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link),
                           "symbols": symbols, "reference": os.path.join(work, f"reference{at}")})
     first = checkouts[0]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
-        [RA_JIT, first["ws"], *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
+        [BLAZE, first["ws"], *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
          *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
         stderr=out, stdout=out,
@@ -187,7 +187,7 @@ def main():
         def ask(at):
             checkout = checkouts[at]
             return time.time(), subprocess.Popen(
-                [RA_JIT, "sync", socket, "--project", checkout["ws"], "--crate", "sapp", "--out", checkout["obj"],
+                [BLAZE, "sync", socket, "--project", checkout["ws"], "--crate", "sapp", "--out", checkout["obj"],
                  "--patch", checkout["patch"], "--link-cmd", checkout["link"], *splice(checkout), *checkout["symbols"]],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 

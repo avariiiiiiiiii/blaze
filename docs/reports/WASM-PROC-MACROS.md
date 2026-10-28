@@ -1,7 +1,7 @@
 # Proc macros run as WebAssembly
 
 The report for the `pmwasm` lane of wasm32: proc macros built by blaze as `wasm32-wasip1`
-modules and expanded in ra-jit's process under Wasmtime and Cranelift. The user's side is in
+modules and expanded in blaze's process under Wasmtime and Cranelift. The user's side is in
 [cargo.md](../cargo.md#proc-macros-run-as-webassembly).
 
 Every number here was measured on one ix VM: arm64, 16 cores, 16 GiB, nothing else running,
@@ -10,14 +10,14 @@ otherwise.
 
 ## What runs
 
-- `crates/ra-jit-macro-wasm/guest/proc_macro.rs` is the guest's `proc_macro` crate. ra-jit's
+- `crates/blaze-macro-wasm/guest/proc_macro.rs` is the guest's `proc_macro` crate. blaze's
   build of a proc macro for a wasm target puts it in place of the toolchain's
   (`main.rs`, `harnesses`). `syn`, `quote` and `proc-macro2` build against it unchanged. Its
   `TokenStream`, `Span`, `Ident`, `Literal` and `Group` hold numbers. Each operation the
   guest can't do itself goes to the host through an import of module `blaze_proc_macro`: a
   span's source, line or join, `from_str`, `Literal::subspan`, a tracked path or variable.
   Streams cross as bytes, in `src/wire.rs`'s format.
-- ra-jit (`--target wasm32-wasip1 --crate proc_macro --shared`) links the macro crate and
+- blaze (`--target wasm32-wasip1 --crate proc_macro --shared`) links the macro crate and
   everything it uses into a WASI reactor that exports `blaze_proc_macro_list` and
   `blaze_proc_macro_expand`. No rustc-built code is in it.
 - The host (`src/lib.rs`, `src/wasi.rs`) compiles the module with Cranelift where blaze builds
@@ -36,7 +36,7 @@ otherwise.
   The environment holds only cargo's variables for the crate. The clock reads 0 and random
   bytes are fixed. Every other call answers `ENOSYS`.
 - Expansions are kept in `cargo/keyed.rs`'s two-level format (`src/keyed.rs`), under
-  `Store::{get,insert}_lasting`, which leave out the build of ra-jit, the toolchain and the
+  `Store::{get,insert}_lasting`, which leave out the build of blaze, the toolchain and the
   host:
   - the first key is what the module was built of (its `.made-of` key, since two builds of
     one source are not the same bytes), the macro, its kind, the input and attribute bytes,
@@ -49,8 +49,8 @@ otherwise.
 
 A workspace depending on serde (derive), tokio (macros), clap (derive), thiserror,
 async-trait, pin-project, derive_more (full) and strum (derive). Each proc-macro crate was
-built by `ra-jit <ws> --crate <c> --crate proc_macro --shared --target wasm32-wasip1`, then
-one macro of it was expanded with `ra-jit proc-macro-wasm`. The same input was expanded
+built by `blaze <ws> --crate <c> --crate proc_macro --shared --target wasm32-wasip1`, then
+one macro of it was expanded with `blaze-engine proc-macro-wasm`. The same input was expanded
 natively: rustc's dylib, through the toolchain's `rust-analyzer-proc-macro-srv`. The outputs
 were compared as text.
 
@@ -71,7 +71,7 @@ call of LibCall(Memcpy)`. A `memcpy` reached through `try_call` had no wasm lowe
 
 ## Expansion time, native against wasm
 
-`ra-jit proc-macro-wasm <module> --macro M --input F --runs 20 --native <rustc's dylib>
+`blaze-engine proc-macro-wasm <module> --macro M --input F --runs 20 --native <rustc's dylib>
 --server <toolchain's server> --store <dir>`. The rows are:
 
 - **wasm compile**: Cranelift's compile of the module (cold), or the load of its machine code
@@ -99,7 +99,7 @@ So:
   server's start (5 to 15 ms). It is paid once per module and machine. A new process loads the
   machine code from the store in about 3 ms, which is less than a server's start.
 - **Warm:** wasm expands 2 to 5 times slower than native: serde Deserialize 8.8 against
-  2.0 ms, clap Parser 8.1 against 1.8. The code ra-jit emits for wasm32 is not optimized the
+  2.0 ms, clap Parser 8.1 against 1.8. The code blaze emits for wasm32 is not optimized the
   way rustc's release build of the dylib is, and Cranelift recompiles it from wasm.
 - **Found:** an expansion the store kept costs 0.02 to 0.25 ms in a new process, faster than
   native's warm expansion. Over a build, most expansions repeat, so found is the common case.
@@ -109,8 +109,8 @@ So:
 
 ## Builds, end to end
 
-`ra-jit <workspace> --crate <bin> --out <o> --exe <exe>` with `BLAZE_CACHE` set to a store
-of the run's own, total wall time and ra-jit's "load workspace" line, seconds. "cold" is the
+`blaze <workspace> --crate <bin> --out <o> --exe <exe>` with `BLAZE_CACHE` set to a store
+of the run's own, total wall time and blaze's "load workspace" line, seconds. "cold" is the
 first run with an empty store and no module built; "again" is the next run; "native" is
 `BLAZE_PROC_MACRO_WASM=0` (rustc's dylibs, through the toolchain's server), after the
 others. tiny is one derive and one function-like macro; corpus is the workspace above with
@@ -155,7 +155,7 @@ left of the cold gap. Cranelift's `OptLevel::None` compiles no faster than `Spee
   rust-project description, which has the checkout's absolute paths. So another checkout or
   machine builds the module again, and its expansions are found only by the same checkout.
   Taking the paths out of that key, as a build script's run already does, makes both travel.
-- Warm expansion is 2 to 5 times slower than native. Optimizing ra-jit's wasm32 output
+- Warm expansion is 2 to 5 times slower than native. Optimizing blaze's wasm32 output
   is the lever.
 - Line and column of a span, `Span::source_text`, `Span::file` and `local_file` ask the
   database, and an expansion that asked is not kept. The serde, tokio and clap expansions

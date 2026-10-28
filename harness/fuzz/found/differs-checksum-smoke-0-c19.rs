@@ -3,7 +3,7 @@
 // Reduced. Again: fuzz.py check differs-checksum-smoke-0-c19.rs
 // rustc:
 // c19 49c1fa10c2ec037d ok
-// ra-jit:
+// blaze:
 // c19 0342fed9db0d2dfd ok
 mod c19 {
     use super::*;

@@ -1,5 +1,5 @@
 //! tests/ui/parser/macro/statement-boundaries.rs: a macro called with braces ends a statement,
-//! and does not end what a match arm gives, where `|` after it is an operator. ra-jit ended the
+//! and does not end what a match arm gives, where `|` after it is an operator. blaze ended the
 //! arm there and read `| Mark` as the pattern of an arm that was not written.
 
 macro_rules! unit {

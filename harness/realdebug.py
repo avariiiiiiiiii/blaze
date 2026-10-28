@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """realdebug.py: what a debugger, a panic, perf and addr2line are told by a program
-`cargo ra-jit` built of a real project, against the cargo build of the same source.
+`blaze` built of a real project, against the cargo build of the same source.
 
     realdebug.py [PROJECT...] [--keep]
 
-Each project is cloned as cargo_ra_jit.py has it, and copied. A panic that an environment
+Each project is cloned as blaze_cli.py has it, and copied. A panic that an environment
 variable asks for is written into the copy, cargo builds it into `target-ref`, and
-`cargo ra-jit` builds it cold, waits for the daemon, and builds it again after a comment is
+`blaze` builds it cold, waits for the daemon, and builds it again after a comment is
 added, so that the program looked at is the one the daemon linked. Then, in the dev profile:
-  gdb       stops at each place, in a function of ra-jit's; the arguments and locals cargo's
+  gdb       stops at each place, in a function of blaze's; the arguments and locals cargo's
             build names there are named, with the same values where they are plain ones
   panic     the frames of the workspace's files are those of the cargo build, by file:line
   perf      `perf record --call-graph dwarf`, then `perf report` names the symbols and
-            `perf script` the lines of the frames in ra-jit's functions
-  addr2line every function of ra-jit's has a name and a line at its first address
-  dwarfdump `llvm-dwarfdump --verify` has nothing to say of ra-jit's units
+            `perf script` the lines of the frames in blaze's functions
+  addr2line every function of blaze's has a name and a line at its first address
+  dwarfdump `llvm-dwarfdump --verify` has nothing to say of blaze's units
 """
 import os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request, http.client
 
-import cargo_ra_jit
-from cargo_ra_jit import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
+import blaze_cli
+from blaze_cli import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
 from debuginfo import DWARFDUMP, LLVM, OPTIMIZED_OUT, Tally, compare, own_ranges, panics, units, unit_of
 
 PANIC = 'if std::env::var_os("REALDEBUG_PANIC").is_some() { panic!("asked for"); }'
@@ -153,8 +153,8 @@ def debugger(tally, what, reference, binary, ws, spec):
             tally.say(said, "no code" if empty else "NOT STOPPED", "the optimizer left the line none" if empty else "")
             continue
         producer = unit_of(binary, ours["at"]) if ours["at"] is not None else "nothing"
-        if not producer.startswith("ra-jit"):
-            tally.say(said, "NOT RA_JIT'S", f"the code is of {producer}")
+        if not producer.startswith("blaze"):
+            tally.say(said, "NOT BLAZE'S", f"the code is of {producer}")
             continue
         # What rustc has an `async` body resumed with is of no name the source has.
         names = [name for name in theirs["values"] if name != "_task_context"]
@@ -181,13 +181,13 @@ def backtrace(tally, what, reference, binary, ws, spec):
 
 def profiler(tally, what, binary, ws, spec):
     perf = shutil.which("perf")
-    data = os.path.join(tempfile.mkdtemp(prefix="ra-jit-realdebug-perf-"), "perf.data")
+    data = os.path.join(tempfile.mkdtemp(prefix="blaze-realdebug-perf-"), "perf.data")
     if perf:
         driven([perf, "record", "-o", data, "-F", "2000", "--call-graph", "dwarf,32768", binary, *spec.get("run", [])],
                ws, dict(os.environ), spec.get("serves"), times=300)
     if not perf or not os.path.exists(data):
         return tally.say(f"{what}: perf", "not run", "no perf here, or it may not sample: see kernel.perf_event_paranoid")
-    # A function is ra-jit's when a unit of ra-jit's has its first address.
+    # A function is blaze's when a unit of blaze's has its first address.
     starts = {start for start, _ in own_ranges(binary)}
     table = subprocess.run(["nm", "--defined-only", binary], capture_output=True, text=True, errors="replace").stdout
     mine = {name for at, name in re.findall(r"^([0-9a-f]+) \w (\S+)$", table, re.M) if int(at, 16) in starts}
@@ -202,8 +202,8 @@ def profiler(tally, what, binary, ws, spec):
     ours = [row for row in rows if row in mine]
     verdict = "NO SAMPLES" if not frames or not ours else "NO LINE" if lost else "NO SYMBOL" if unnamed else "named"
     tally.say(f"{what}: perf record, report and script", verdict,
-              f"report: {len(rows)} symbols of the program, {len(ours)} of ra-jit's functions, {len(unnamed)} without a name; "
-              f"script: {len(frames)} frames in ra-jit's functions, {len(lost)} without a line" + (f": {lost[0][:60]}" if lost else ""))
+              f"report: {len(rows)} symbols of the program, {len(ours)} of blaze's functions, {len(unnamed)} without a name; "
+              f"script: {len(frames)} frames in blaze's functions, {len(lost)} without a line" + (f": {lost[0][:60]}" if lost else ""))
 
 
 def addr2line(tally, what, binary):
@@ -215,28 +215,28 @@ def addr2line(tally, what, binary):
     unlined = [at for at, (_, line) in zip(starts, pairs) if not re.search(r"\.rs:\d+", line)]
     verdict = "NOT ASKED" if len(pairs) != len(starts) or not starts else "NO NAME" if unnamed else "NO LINE" if unlined else "resolved"
     tally.say(f"{what}: addr2line at each function", verdict,
-              f"{len(starts)} functions of ra-jit's, {len(unnamed)} without a name, {len(unlined)} without a line"
+              f"{len(starts)} functions of blaze's, {len(unnamed)} without a name, {len(unlined)} without a line"
               + (f": {(unnamed + unlined)[0]:#x}" if unnamed or unlined else ""))
 
 
 def verify(tally, what, binary):
-    """`llvm-dwarfdump --verify`, for the units of ra-jit's: rustc's own have functions the linker
+    """`llvm-dwarfdump --verify`, for the units of blaze's: rustc's own have functions the linker
     left out, which it finds to overlap, in the cargo build as well."""
     said = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True, errors="replace").stdout
     heads = units(binary)
-    count = sum(bool(re.search(r'DW_AT_producer\s+\("ra-jit ', unit)) for unit in heads)
+    count = sum(bool(re.search(r'DW_AT_producer\s+\("blaze ', unit)) for unit in heads)
     spans = []
     listed = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", "--recurse-depth=0", binary],
                             capture_output=True, text=True, errors="replace").stdout
     for unit in re.finditer(r"^(0x[0-9a-f]+): Compile Unit: length = (0x[0-9a-f]+).*?(?=^0x[0-9a-f]+: Compile Unit|\Z)", listed, re.S | re.M):
-        if re.search(r'DW_AT_producer\s+\("ra-jit ', unit.group(0)):
+        if re.search(r'DW_AT_producer\s+\("blaze ', unit.group(0)):
             spans.append((int(unit.group(1), 16), int(unit.group(1), 16) + int(unit.group(2), 16)))
     errors = [it for it in re.split(r"^error: ", said, flags=re.M)[1:] if "occurred" not in it.splitlines()[0] and not it.startswith("Aggregated")]
     ours = [it for it in errors
             if any(low <= int(at, 16) < high for at in re.findall(r"^(0x[0-9a-f]+): DW_TAG", it, re.M)[:2] for low, high in spans)
             or not re.search(r"^0x[0-9a-f]+: DW_TAG", it, re.M)]
     tally.say(f"{what}: llvm-dwarfdump --verify", "INVALID" if ours else "sound" if count else "NO UNIT",
-              f"{count} units of ra-jit's with {len(ours)} errors, {len(errors) - len(ours)} in rustc's units"
+              f"{count} units of blaze's with {len(ours)} errors, {len(errors) - len(ours)} in rustc's units"
               + (f": {ours[0].splitlines()[0][:70]}" if ours else ""))
 
 
@@ -271,7 +271,7 @@ def project(tally, name, work):
 
 def main():
     names = [a for a in sys.argv[1:] if not a.startswith("--")] or list(CHECKS)
-    work = tempfile.mkdtemp(prefix="ra-jit-realdebug-")
+    work = tempfile.mkdtemp(prefix="blaze-realdebug-")
     tally = Tally()
     try:
         for name in names:

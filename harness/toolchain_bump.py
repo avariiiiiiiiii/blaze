@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""toolchain_bump.py: move ra-jit to a newer Rust nightly. ra-jit supports one toolchain, the
+"""toolchain_bump.py: move blaze to a newer Rust nightly. blaze supports one toolchain, the
 dated nightly in harness/toolchain; everything that mirrors that rustc moves with it.
 
     toolchain_bump.py                  the newest nightly that has every component blaze needs
     toolchain_bump.py --date 2026-11-02
-    toolchain_bump.py --checks         after a bump, in an ix VM: build ra-jit and run the
-                                       checks that prove ra-jit and the nightly agree
+    toolchain_bump.py --checks         after a bump, in an ix VM: build blaze and run the
+                                       checks that prove blaze and the nightly agree
 
 A bump, in order (each step names itself when it fails, and stops there):
 
@@ -16,7 +16,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     the nightly's `rustc -V` and its rust-lang/rust commit);
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
-    the new commit with ra-jit's changes to them at the old commit carried over (a three-way
+    the new commit with blaze's changes to them at the old commit carried over (a three-way
     apply; a conflict stops the bump and names the files);
  4. moves the pins written down elsewhere: the old toolchain name, rustc version line and
     commit in install.sh and vendor/proc-macro-srv (RUSTC_VERSION_STRING, the manifest's
@@ -39,10 +39,10 @@ import ci
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PIN = os.path.join(HERE, "toolchain")
-PINS = os.path.join(ROOT, "crates/ra-jit/src/cargo/toolchain/pins.txt")
+PINS = os.path.join(ROOT, "crates/blaze-engine/src/cargo/toolchain/pins.txt")
 DIST = "https://static.rust-lang.org/dist"
 RUST = "https://github.com/rust-lang/rust"
-CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "ra-jit-bump")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "blaze-bump")
 HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
          "x86_64-pc-windows-msvc"]
 COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools-preview", "rustfmt-preview",
@@ -53,7 +53,7 @@ MENTIONS = ["install.sh", "vendor/proc-macro-srv/Cargo.toml",
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
 # in them can be what something was ported from.
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
-# vendor/proc-macro-srv's manifest and lock file are ra-jit's, written from upstream's (their
+# vendor/proc-macro-srv's manifest and lock file are blaze's, written from upstream's (their
 # header says how) and carried as they are; its crates are upstream's (`server_dirs`).
 ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
 
@@ -199,10 +199,10 @@ def without_dev_dependencies(root):
 
 
 def prune(new_root, base, ours):
-    """Removes from the server at the new commit what ra-jit leaves out: each file ra-jit deleted
-    from upstream at the old commit, and each file upstream added under a directory ra-jit deleted
-    (new tests in a `test_data` ra-jit does not carry). A file upstream added is kept when the
-    nearest directory above it that upstream had at the old commit is still in ra-jit's copy."""
+    """Removes from the server at the new commit what blaze leaves out: each file blaze deleted
+    from upstream at the old commit, and each file upstream added under a directory blaze deleted
+    (new tests in a `test_data` blaze does not carry). A file upstream added is kept when the
+    nearest directory above it that upstream had at the old commit is still in blaze's copy."""
     base_dirs = {os.path.dirname(f) for f in base} | {""}
     base_dirs |= {d for f in base_dirs for d in ancestors(f)}
     ours_dirs = {os.path.dirname(f) for f in ours} | {""}
@@ -233,9 +233,9 @@ async def vendor(old, new):
     server = os.path.join(ROOT, "vendor/proc-macro-srv")
     dirs = server_dirs()
     paths = [ABI[1], *dirs.values()]
-    with tempfile.TemporaryDirectory(prefix="ra-jit-bump-") as work:
-        # ra-jit's changes to the server: upstream at the old commit against vendor/, as a patch
-        # of the files both have and those ra-jit added. What ra-jit deleted is carried by `prune`.
+    with tempfile.TemporaryDirectory(prefix="blaze-bump-") as work:
+        # blaze's changes to the server: upstream at the old commit against vendor/, as a patch
+        # of the files both have and those blaze added. What blaze deleted is carried by `prune`.
         repo = await checkout(old, paths)
         for ours, theirs in dirs.items():
             shutil.copytree(os.path.join(repo, theirs), os.path.join(work, "base", ours), symlinks=True)
@@ -252,11 +252,11 @@ async def vendor(old, new):
         if diff.returncode not in (0, 1):
             raise Failed(f"vendor: diffing vendor/proc-macro-srv with upstream at {old[:9]} exited "
                          f"{diff.returncode}: {err.decode()[-2000:]}")
-        # Paths are a/base/... and b/ours/... (b/base/... for a file ra-jit deleted).
+        # Paths are a/base/... and b/ours/... (b/base/... for a file blaze deleted).
         patch = re.sub(rb"(?m)(^diff --git | |^--- |^\+\+\+ )([ab])/(?:base|ours)/", rb"\1\2/", patch)
         repo = await checkout(new, paths)
         replace_tree(os.path.join(repo, ABI[1]), os.path.join(ROOT, ABI[0]))
-        with tempfile.TemporaryDirectory(prefix="ra-jit-bump-new-") as fresh:
+        with tempfile.TemporaryDirectory(prefix="blaze-bump-new-") as fresh:
             for ours, theirs in dirs.items():
                 shutil.copytree(os.path.join(repo, theirs), os.path.join(fresh, ours), symlinks=True)
             without_dev_dependencies(fresh)
@@ -265,7 +265,7 @@ async def vendor(old, new):
                 replace_tree(os.path.join(fresh, ours), os.path.join(server, ours))
         if not patch.strip():
             return
-        patch_file = os.path.join(work, "ra-jit.patch")
+        patch_file = os.path.join(work, "blaze.patch")
         open(patch_file, "wb").write(patch)
         # A three-way apply needs the old blobs in this repository, which upstream's are not:
         # apply with rejects, so what applies does and each hunk that does not is a .rej file.
@@ -277,7 +277,7 @@ async def vendor(old, new):
             os.makedirs(CACHE, exist_ok=True)
             kept = os.path.join(CACHE, f"proc-macro-srv-{old[:9]}-{new[:9]}.patch")
             shutil.copy(patch_file, kept)
-            raise Failed("vendor: ra-jit's changes to vendor/proc-macro-srv did not all apply at "
+            raise Failed("vendor: blaze's changes to vendor/proc-macro-srv did not all apply at "
                          f"{new[:9]}; resolve the *.rej files under vendor/proc-macro-srv "
                          f"(the whole patch is {kept}), then finish the bump's later steps "
                          f"(move_mentions, flake, rustup) by hand. git apply said:\n{err.decode()[-3000:]}")
@@ -318,7 +318,7 @@ async def bump(date):
     date, channel = await pick(date)
     name = f"nightly-{date}"
     if name == old[0]:
-        print(f"ra-jit is already on {name}")
+        print(f"blaze is already on {name}")
         return
     print(f"moving {old[0]} ({old[1]}) to {name} ({channel['pkg']['rustc']['version']})")
     open(PIN, "w").write(name + "\n")
@@ -336,10 +336,10 @@ async def bump(date):
                                   "-c", "rust-src", "-c", "llvm-tools", "-c", "rustfmt", "-c", "clippy",
                                   bound=1200))
     print(f"""
-ra-jit is pinned to {name} ({new[1]}). Left to do:
+blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`
-    (with that host's release build of ra-jit), then commit crates/ra-jit/src/answers/rustc.json;
-  - `cargo build -p ra-jit --release` and fix what the new rustc_abi and std ask for;
+    (with that host's release build of blaze), then commit crates/blaze-engine/src/answers/rustc.json;
+  - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
   - `python3 harness/toolchain_bump.py --checks` in an ix VM, under Cranelift and under LLVM
     (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);
   - the full tier (uitest.py, libsuite.py, borrowck_ui.py) re-measured at the new commit;
@@ -347,11 +347,11 @@ ra-jit is pinned to {name} ({new[1]}). Left to do:
 
 
 async def checks():
-    """Builds ra-jit and runs what proves it agrees with the pinned nightly, in parallel."""
+    """Builds blaze and runs what proves it agrees with the pinned nightly, in parallel."""
     name = open(PIN).read().strip()
     env = dict(os.environ, RUSTUP_TOOLCHAIN=name)
-    await run("build", "cargo", "build", "-p", "ra-jit", "--release", env=env, bound=3600)
-    env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/ra-jit"))
+    await run("build", "cargo", "build", "-p", "blaze-engine", "--release", env=env, bound=3600)
+    env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/blaze-engine"))
     harness = [
         ["toolchain_pins.py"],
         ["answers.py"],
@@ -374,7 +374,7 @@ async def checks():
             group.create_task(one(argv))
     if failed:
         raise Failed("checks:\n\n" + "\n\n".join(failed))
-    print(f"ra-jit agrees with {name} on every check")
+    print(f"blaze agrees with {name} on every check")
 
 
 def main():

@@ -1,4 +1,4 @@
-//! A small binary with the dependency shapes of dioxus-cli that ra-jit finds hard: each function
+//! A small binary with the dependency shapes of dioxus-cli that blaze finds hard: each function
 //! here mirrors one in `dx` that was left to rustc.
 use std::{convert::Infallible, path::PathBuf};
 
@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
     println!("operators {:?}", operators(WASM)?);
     println!("css {}", minify_css("a { color: #ff0000; margin: 0px 0px 0px 0px }\n\nb{}")?);
 
-    let dir = std::env::temp_dir().join("ra-jit-rung");
+    let dir = std::env::temp_dir().join("blaze-rung");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("hello.txt"), "served")?;
     let router = axum::Router::new().fallback_service(serve_dir(dir, true));

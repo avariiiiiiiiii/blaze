@@ -8,7 +8,7 @@ with the pinned nightly's cargo, using the same daemon across edits and selectio
 """
 import json, os, shutil, subprocess, tempfile
 
-from check_json import RA_JIT, env
+from check_json import BLAZE, env
 
 PACKAGE = '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n'
 
@@ -21,7 +21,7 @@ def write(at, path, text):
 
 
 def verdict(at, home, blaze, flags):
-    command = ["cargo", *(["blaze"] if blaze else []), "check", "--message-format=json", *flags]
+    command = [*(["blaze"] if blaze else ["cargo"]), "check", "--message-format=json", *flags]
     done = subprocess.run(command, cwd=at, env=env(home), capture_output=True, text=True, timeout=600)
     errors = set()
     for line in done.stdout.splitlines():
@@ -116,7 +116,7 @@ def main():
             compare(at, home, f"registry dev-dependency {flags}", flags, 0)
         passed = True
     finally:
-        subprocess.run([RA_JIT, "stop"], env=env(home), capture_output=True)
+        subprocess.run([BLAZE, "stop"], env=env(home), capture_output=True)
         if passed:
             shutil.rmtree(work)
         else:

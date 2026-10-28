@@ -824,7 +824,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "percent-encoding",
- "ra-jit-store",
+ "blaze-store",
  "rustc-hash 2.1.2",
  "semver",
  "serde",
@@ -2099,7 +2099,7 @@ dependencies = [
  "intern",
  "itertools 0.15.0",
  "la-arena",
- "ra-ap-rustc_type_ir",
+ "rustc_type_ir",
  "rustc-hash 2.1.2",
  "salsa",
  "serde_json",
@@ -2135,7 +2135,7 @@ dependencies = [
  "intern",
  "itertools 0.15.0",
  "la-arena",
- "ra-ap-rustc_abi",
+ "rustc_abi",
  "ra-ap-rustc_parse_format",
  "rustc-hash 2.1.2",
  "rustc_apfloat",
@@ -2196,10 +2196,10 @@ dependencies = [
  "la-arena",
  "macros",
  "project-model",
- "ra-ap-rustc_abi",
+ "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_pattern_analysis",
- "ra-ap-rustc_type_ir",
+ "rustc_type_ir",
  "rustc-hash 2.1.2",
  "rustc_apfloat",
  "salsa",
@@ -2233,11 +2233,11 @@ dependencies = [
  "la-arena",
  "macros",
  "oorandom",
- "ra-ap-rustc_abi",
+ "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
- "ra-ap-rustc_next_trait_solver",
- "ra-ap-rustc_type_ir",
+ "rustc_next_trait_solver",
+ "rustc_type_ir",
  "rustc-hash 2.1.2",
  "rustc_apfloat",
  "salsa",
@@ -2266,7 +2266,7 @@ dependencies = [
  "hir-ty-wfcheck",
  "la-arena",
  "ra-ap-rustc_ast_ir",
- "ra-ap-rustc_type_ir",
+ "rustc_type_ir",
  "rustc-hash 2.1.2",
  "salsa",
  "smallvec",
@@ -2293,12 +2293,12 @@ dependencies = [
  "la-arena",
  "object 0.37.3",
  "postcard",
- "ra-ap-rustc_abi",
+ "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
- "ra-ap-rustc_type_ir",
- "ra-jit-fuzz",
- "ra-jit-store",
+ "rustc_type_ir",
+ "blaze-fuzz",
+ "blaze-store",
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rustc-stable-hash",
@@ -2321,7 +2321,7 @@ version = "0.0.0"
 dependencies = [
  "hir-def",
  "hir-ty",
- "ra-ap-rustc_type_ir",
+ "rustc_type_ir",
  "rustc-hash 2.1.2",
  "salsa",
 ]
@@ -3674,7 +3674,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "ra-ap-rustc_abi"
+name = "rustc_abi"
 version = "0.166.0"
 dependencies = [
  "bitflags 2.12.1",
@@ -3730,12 +3730,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-ap-rustc_next_trait_solver"
+name = "rustc_next_trait_solver"
 version = "0.166.0"
 dependencies = [
  "derive-where",
  "ra-ap-rustc_index",
- "ra-ap-rustc_type_ir",
+ "rustc_type_ir",
  "ra-ap-rustc_type_ir_macros",
  "tracing",
 ]
@@ -3764,7 +3764,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-ap-rustc_type_ir"
+name = "rustc_type_ir"
 version = "0.166.0"
 dependencies = [
  "arrayvec",
@@ -3772,7 +3772,7 @@ dependencies = [
  "derive-where",
  "ena",
  "indexmap",
- "ra-ap-rustc_abi",
+ "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
  "ra-ap-rustc_type_ir_macros",
@@ -3795,7 +3795,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-jit"
+name = "blaze-engine"
 version = "0.20261027.0"
 dependencies = [
  "anyhow",
@@ -3850,11 +3850,11 @@ dependencies = [
  "proc-macro-api",
  "project-model",
  "pulldown-cmark",
- "ra-jit-cache",
- "ra-jit-expand",
- "ra-jit-live",
- "ra-jit-macro-wasm",
- "ra-jit-store",
+ "blaze-cache",
+ "blaze-expand",
+ "blaze-live",
+ "blaze-macro-wasm",
+ "blaze-store",
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rustls",
@@ -3892,29 +3892,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-jit-bench"
+name = "blaze-bench"
 version = "0.20261027.0"
 dependencies = [
  "hir-ty-codegen",
- "ra-jit-store",
+ "blaze-store",
  "tango-bench",
 ]
 
 [[package]]
-name = "ra-jit-cache"
+name = "blaze-cache"
 version = "0.1.0"
 dependencies = [
  "postcard",
- "ra-jit-cache-macros",
+ "blaze-cache-macros",
  "serde",
 ]
 
 [[package]]
-name = "ra-jit-cache-macros"
+name = "blaze-cache-macros"
 version = "0.1.0"
 
 [[package]]
-name = "ra-jit-expand"
+name = "blaze-expand"
 version = "0.20261027.0"
 dependencies = [
  "base-db",
@@ -3923,7 +3923,7 @@ dependencies = [
  "paths",
  "postcard",
  "proc-macro-api",
- "ra-jit-store",
+ "blaze-store",
  "rustc-hash 2.1.2",
  "sha2 0.10.9",
  "span",
@@ -3931,15 +3931,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-jit-fuzz"
+name = "blaze-fuzz"
 version = "0.20261027.0"
 
 [[package]]
-name = "ra-jit-live"
+name = "blaze-live"
 version = "0.1.0"
 
 [[package]]
-name = "ra-jit-macro-wasm"
+name = "blaze-macro-wasm"
 version = "0.20261027.0"
 dependencies = [
  "base-db",
@@ -3949,7 +3949,7 @@ dependencies = [
  "paths",
  "proc-macro-api",
  "ra-ap-rustc_lexer",
- "ra-jit-store",
+ "blaze-store",
  "rustc-hash 2.1.2",
  "salsa",
  "sha2 0.10.9",
@@ -3959,13 +3959,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-jit-store"
+name = "blaze-store"
 version = "0.20261027.0"
 dependencies = [
  "crc32fast",
  "libc",
  "memmap2",
- "ra-jit-fuzz",
+ "blaze-fuzz",
  "rustc-hash 2.1.2",
  "sha2 0.10.9",
  "windows-sys 0.61.2",
@@ -4093,7 +4093,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rowan"
+name = "syntax-tree"
 version = "0.17.0"
 dependencies = [
  "countme",
@@ -4692,7 +4692,7 @@ dependencies = [
  "parser",
  "ra-ap-rustc_lexer",
  "rayon",
- "rowan",
+ "syntax-tree",
  "rustc-hash 2.1.2",
  "rustc-literal-escaper",
  "rustc_apfloat",

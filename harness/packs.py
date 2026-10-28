@@ -1,4 +1,4 @@
-"""packs.py: the sealed packs of crates/ra-jit-store, read and written as the store lays them out.
+"""packs.py: the sealed packs of crates/blaze-store, read and written as the store lays them out.
 
 A sealed pack of format 3 is the magic, the count of blocks and the count of entries, 12 bytes
 for each block (its length in the file, its length unpacked, and 0 when it is stored as it is or
@@ -9,7 +9,7 @@ rest of the file.
 import struct, subprocess, zlib
 
 FORMAT = 3
-MAGIC = b"rajitpk" + bytes([FORMAT])
+MAGIC = b"blazepk" + bytes([FORMAT])
 BLOCK_HEADER, ENTRY = 12, 48
 
 

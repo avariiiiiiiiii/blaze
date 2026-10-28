@@ -1,5 +1,5 @@
 //! A reference a constant holds to a field of an over-aligned value is as aligned as the
-//! value, since the field is at its start. ra-jit did not keep the alignment of the memory a
+//! value, since the field is at its start. blaze did not keep the alignment of the memory a
 //! constant points to and aligned all of it to 16, which is less than was asked for here.
 
 #[repr(align(64))]

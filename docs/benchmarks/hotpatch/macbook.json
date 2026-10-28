@@ -64,7 +64,7 @@
    ],
    "build_median_ms": null
   },
-  "ra-jit": {
+  "blaze": {
    "median_ms": 468.6,
    "p90_ms": 527.3,
    "min_ms": 409.79,

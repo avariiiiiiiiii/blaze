@@ -1,7 +1,7 @@
 //! tests/ui/fmt/format-args-capture.rs: `panic!("{foo}")` is a format string from the 2021
 //! edition on, and before it the string itself. The edition is that of where the `panic!` is
 //! written, or of the macro that wrote it; a macro of the standard library (`assert!`) stands
-//! for where it is called. ra-jit asked the edition of the innermost macro, so a 2015 crate
+//! for where it is called. blaze asked the edition of the innermost macro, so a 2015 crate
 //! was left to rustc looking for a variable named in the braces.
 
 use std::panic::catch_unwind;

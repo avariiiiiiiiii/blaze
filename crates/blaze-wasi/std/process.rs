@@ -1,6 +1,6 @@
 //! blaze's `std::process` for build scripts compiled for wasm32-wasip1 (crates/blaze-wasi). It
-//! stands for `library/std/src/sys/process/unsupported.rs` in the standard library ra-jit
-//! compiles for such a script (`ra-jit --run-tool`), and nowhere else: a program built for wasip1
+//! stands for `library/std/src/sys/process/unsupported.rs` in the standard library blaze
+//! compiles for such a script (`blaze --run-tool`), and nowhere else: a program built for wasip1
 //! keeps the toolchain's file, whose commands are unsupported, as rustc's has.
 //!
 //! A command runs on the host through the import `blaze.run_tool`, which runs only the tools the

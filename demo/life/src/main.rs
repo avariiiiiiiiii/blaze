@@ -1,4 +1,4 @@
-// Conway's Game of Life under ra-jit. Edit this file while it
+// Conway's Game of Life under blaze. Edit this file while it
 // runs: the daemon recompiles only the function you touched,
 // and the next frame uses it, with the grid intact.
 //

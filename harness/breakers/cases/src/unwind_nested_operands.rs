@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-S1-1-c22.rs`): the order of drops when
 //! an operand panics inside an aggregate that is itself an operand of another, as in
 //! `(Noisy(27), Duo { a: Noisy(39), b: panics() })`. The operands are dropped in the reverse
-//! of the order they were made, the inner one's first. ra-jit moved the operands of each
+//! of the order they were made, the inner one's first. blaze moved the operands of each
 //! aggregate behind the temporaries when it was done with it, the outer after the inner,
 //! which put the outer one's operands last and had them dropped first. The other parts are
 //! panics in a destructor and in other shapes of operand, which were right.

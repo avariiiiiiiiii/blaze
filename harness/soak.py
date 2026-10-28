@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""soak.py: one daemon, asked by `cargo ra-jit` and by the direct client, for hours.
+"""soak.py: one daemon, asked by `blaze` and by the direct client, for hours.
 
     soak.py [--seed N] [--steps N] [--hours H] [--work DIR] [--resume DIR]
             [--projects a,b,...] [--worktrees N] [--sample RATE] [--stop] [--quiet-daemon]
@@ -19,9 +19,9 @@ worktrees. Every step is drawn from the seed and the number of the step alone:
   burst      dozens of clients at once, over every worktree
   cancel     clients interrupted or killed in the middle of a request
   kill       the daemon or one of its workers killed, alone or under a burst
-  collect    `ra-jit cache gc` and `ra-jit cache verify` under a burst
-After a step, the worktrees it touched are built by `cargo ra-jit` (run, test or build, with
-or without the feature) or by `ra-jit sync` to the worker's own socket, and at the sampled
+  collect    `blaze-engine cache gc` and `blaze-engine cache verify` under a burst
+After a step, the worktrees it touched are built by `blaze` (run, test or build, with
+or without the feature) or by `blaze sync` to the worker's own socket, and at the sampled
 rate by plain cargo into a target directory of its own: what the program prints and how it
 ends, or the result of every test, has to be the same. A difference is asked for again
 before it counts, and one that goes away is counted as flaky.
@@ -36,15 +36,15 @@ import argparse, collections, concurrent.futures, glob, json, os, random, re, sh
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import cargo_ra_jit
-from cargo_ra_jit import RA_JIT, PROJECTS, base_env, how_built, program_output, test_results, difference, fetch
+import blaze_cli
+from blaze_cli import BLAZE, PROJECTS, base_env, how_built, program_output, test_results, difference, fetch
 
 BEGIN, END = "// soak:begin", "// soak:end"
 MODEL = "soak-model.json"
 REQUEST_SECS = 1800
 ODD = ("link failed", "did not answer", "worker ended", "panicked")
 WARM_SECS = 600
-GIT = ["git", "-c", "user.name=ra-jit", "-c", "user.email=ra-jit@localhost", "-c", "advice.detachedHead=false", "-c", "commit.gpgsign=false"]
+GIT = ["git", "-c", "user.name=blaze", "-c", "user.email=blaze@localhost", "-c", "advice.detachedHead=false", "-c", "commit.gpgsign=false"]
 
 # Each project: where it is built, the package the feature and the dependency are added to,
 # and its sites, each a file and the line of a function after which the soak's call goes.
@@ -424,7 +424,7 @@ class Soak:
         return dict(self.env, CARGO_TARGET_DIR=tree.path("target-ref"), CARGO_INCREMENTAL="0")
 
     def command(self, tree, kind, feature):
-        """The arguments after `cargo [ra-jit]` and the variables of a request of `kind`."""
+        """The arguments after `cargo [blaze]` and the variables of a request of `kind`."""
         spec, real = tree.spec, PROJECTS.get(tree.project, tree.spec)
         build = list(real.get("build", [])) + (["--features", "soak"] if feature else [])
         if kind == "test":
@@ -451,7 +451,7 @@ class Soak:
         if not ours:
             shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
         began = time.time()
-        child = subprocess.Popen(["cargo", *(["ra-jit"] if ours else []), *argv], cwd=tree.root, env=dict(base, **env),
+        child = subprocess.Popen([*(["blaze"] if ours else ["cargo"]), *argv], cwd=tree.root, env=dict(base, **env),
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
         cancelled = None
         try:
@@ -465,7 +465,7 @@ class Soak:
         except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
             child.communicate()
-            raise Failure(f"`cargo {'ra-jit ' if ours else ''}{' '.join(argv)}` in {tree.root} did not end in {REQUEST_SECS}s")
+            raise Failure(f"`cargo {'blaze ' if ours else ''}{' '.join(argv)}` in {tree.root} did not end in {REQUEST_SECS}s")
         finally:
             # What a killed client leaves running would hold the checkout's lock.
             try:
@@ -487,7 +487,7 @@ class Soak:
 
     def status(self, tree=None):
         tree = tree or self.trees()[0]
-        return subprocess.run(["cargo", "ra-jit", "status"], cwd=tree.root, env=self.env, capture_output=True, text=True, timeout=120).stdout
+        return subprocess.run(["blaze", "status"], cwd=tree.root, env=self.env, capture_output=True, text=True, timeout=120).stdout
 
     def wait_warm(self, tree):
         began = time.time()
@@ -522,11 +522,11 @@ class Soak:
                 return
             first = first if attempt else (mine, other, wrong)
             mine = None
-        raise Failure(f"`cargo ra-jit {' '.join(argv)}` in {tree.root} ({how_built(first[0].stderr)}): {first[2]}",
-                      {"ra-jit.txt": first[0].stdout + first[0].stderr, "cargo.txt": first[1].stdout + first[1].stderr})
+        raise Failure(f"`blaze {' '.join(argv)}` in {tree.root} ({how_built(first[0].stderr)}): {first[2]}",
+                      {"blaze.txt": first[0].stdout + first[0].stderr, "cargo.txt": first[1].stdout + first[1].stderr})
 
     def direct(self, tree):
-        """Asks the worker that holds `tree` for its program by `ra-jit sync`, runs it, and
+        """Asks the worker that holds `tree` for its program by `blaze sync`, runs it, and
         compares with what cargo's prints. Nothing when no worker has it loaded."""
         root = os.path.realpath(tree.root)
         for path in glob.glob(os.path.join(self.home, "states", "*.json")):
@@ -557,7 +557,7 @@ class Soak:
 
     def direct_sync(self, tree, checkout, socket):
         plan = checkout["programs"][0]
-        argv = [RA_JIT, "sync", socket, "--project", os.path.join(checkout["root"], checkout["config"]["project"]).rstrip("/")]
+        argv = [BLAZE, "sync", socket, "--project", os.path.join(checkout["root"], checkout["config"]["project"]).rstrip("/")]
         for krate in plan["crates"]:
             argv += ["--crate", os.path.relpath(krate, checkout["root"]) if os.path.isabs(krate) else krate]
         argv += ["--out", plan["object"], "--patch", plan["patch"], "--link-cmd", plan["link_cmd"], "--splice", plan["binary"]]
@@ -577,7 +577,7 @@ class Soak:
         wrong = difference(program_output(mine), program_output(other))
         self.state["compared"] += 1
         if wrong:
-            raise Failure(f"`ra-jit sync` of {tree.root}: {wrong}", {"ra-jit.txt": mine.stdout + mine.stderr, "cargo.txt": other.stdout + other.stderr})
+            raise Failure(f"`blaze sync` of {tree.root}: {wrong}", {"blaze.txt": mine.stdout + mine.stderr, "cargo.txt": other.stdout + other.stderr})
         return said
 
     def verify(self, tree, rng):
@@ -779,7 +779,7 @@ class Soak:
             pass
 
     def cache(self, *args):
-        return subprocess.run([RA_JIT, "cache", *args], env=self.env, capture_output=True, text=True, timeout=REQUEST_SECS)
+        return subprocess.run([BLAZE, "cache", *args], env=self.env, capture_output=True, text=True, timeout=REQUEST_SECS)
 
     def step_collect(self, rng):
         said = self.step_edit(rng)
@@ -792,7 +792,7 @@ class Soak:
         verified = self.cache("verify")
         for ran in [*collected, verified]:
             if ran.returncode:
-                raise Failure(f"`ra-jit cache {' '.join(ran.args[2:])}` ended with {ran.returncode}", {"cache.txt": ran.stdout + ran.stderr})
+                raise Failure(f"`blaze-engine cache {' '.join(ran.args[2:])}` ended with {ran.returncode}", {"cache.txt": ran.stdout + ran.stderr})
         return said
 
     STEPS = [("edit", 48), ("lock", 2), ("macros", 6), ("git", 12), ("worktree", 4), ("burst", 8), ("cancel", 8), ("kill", 4), ("collect", 4)]
@@ -865,8 +865,8 @@ class Soak:
         self.keep_logs(where)
         for tree in self.touched:
             # What the daemon linked of the tree that differs.
-            # Between links the daemon keeps it packed, as `ra-jit.o.zst`.
-            for at, built in enumerate(glob.glob(os.path.join(tree.root, "target", "ra-jit", "*", "programs", "*", "ra-jit.o*"))):
+            # Between links the daemon keeps it packed, as `blaze.o.zst`.
+            for at, built in enumerate(glob.glob(os.path.join(tree.root, "target", "blaze", "*", "programs", "*", "blaze.o*"))):
                 kept = f"{self.name(tree).replace('/', '-')}-{at}-{os.path.basename(os.path.dirname(built))}.o"
                 shutil.copy(built, os.path.join(where, kept + (".zst" if built.endswith(".zst") else "")))
             diff = tree.git("diff", "HEAD", check=False).stdout if os.path.isdir(tree.root) else ""
@@ -987,7 +987,7 @@ def report(work):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="a soak of one ra-jit daemon")
+    parser = argparse.ArgumentParser(description="a soak of one blaze-engine daemon")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--steps", type=int, default=10**9)
     parser.add_argument("--hours", type=float, default=10**6)
@@ -1012,19 +1012,19 @@ def main():
         args.seed, args.projects = kept["seed"], sorted(kept["projects"])
     else:
         args.seed = args.seed if args.seed is not None else random.SystemRandom().randrange(10**9)
-        args.work = os.path.realpath(args.work or tempfile.mkdtemp(prefix="ra-jit-soak-"))
+        args.work = os.path.realpath(args.work or tempfile.mkdtemp(prefix="blaze-soak-"))
         os.makedirs(args.work, exist_ok=True)
     print(f"seed {args.seed}, {backend()}, in {args.work}", flush=True)
     soak = Soak(args)
-    if not shutil.which("cargo-ra-jit", path=soak.env["PATH"].split(os.pathsep)[0]):
-        sys.exit("no cargo-ra-jit beside the ra-jit of BLAZE_BIN")
+    if not shutil.which("blaze", path=soak.env["PATH"].split(os.pathsep)[0]):
+        sys.exit("no blaze beside the blaze of BLAZE_BIN")
     if args.resume:
         for tree in soak.trees():
             tree.write(tree.model())
     try:
         return soak.run()
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=args.work, env=soak.env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=args.work, env=soak.env, capture_output=True, timeout=120)
 
 
 if __name__ == "__main__":

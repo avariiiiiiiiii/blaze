@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Tiering end to end (macOS on AArch64, ra-jit built with `--features llvm`): a program that
+"""Tiering end to end (macOS on AArch64, blaze built with `--features llvm`): a program that
 takes edits runs under the daemon, which samples it and compiles its hot functions again with
 LLVM, swapping them in as patches while it runs (docs/tiers.md).
 
-usage: tiers.py          (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: tiers.py          (BLAZE_BIN names the blaze built; blaze and blaze-rustc
                           are found next to it)
 
 A copy of demo/lifebench (the Game of Life on a large grid, run flat out) is built by cargo,
@@ -60,7 +60,7 @@ async def run(step: str, cmd: list[str], cwd: Path, env: dict[str, str]) -> str:
 
 
 async def build(step: str, cwd: Path, env: dict[str, str]) -> str:
-    return await run(step, ["cargo-ra-jit", "ra-jit", "build", "--locked"], cwd, env)
+    return await run(step, ["blaze", "build", "--locked"], cwd, env)
 
 
 async def serve(project: Path, env: dict[str, str]) -> None:
@@ -139,12 +139,12 @@ def same_as_cargo(step: str, ours: list[str], cargo: list[str]) -> None:
 
 
 def live_dir(binary: Path) -> Path | None:
-    """The directory ra-jit-live keeps for the executable, named after its LC_UUID."""
+    """The directory blaze-live keeps for the executable, named after its LC_UUID."""
     data = binary.read_bytes()
     at = data.find(b"\x1b\x00\x00\x00\x18\x00\x00\x00")  # LC_UUID, 24 bytes
     if at < 0:
         return None
-    return Path.home() / ".cache" / "ra-jit" / "live" / data[at + 8 : at + 24].hex()
+    return Path.home() / ".cache" / "blaze" / "live" / data[at + 8 : at + 24].hex()
 
 
 async def main() -> None:
@@ -152,7 +152,7 @@ async def main() -> None:
     # Short: a worker's socket is in the daemon's home, and macOS takes 104 bytes of path.
     work = Path(tempfile.mkdtemp(prefix="rjt-", dir="/tmp" if Path("/tmp").is_dir() else None))
     try:
-        shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
+        shutil.copytree(ROOT / "crates" / "blaze-live", work / "crates" / "blaze-live")
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
         base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=PIN)
@@ -229,7 +229,7 @@ async def main() -> None:
         for home in ("home-tiered", "home-off"):
             stop = dict(os.environ, BLAZE_HOME=str(work / home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
             try:
-                proc = await asyncio.create_subprocess_exec("cargo-ra-jit", "ra-jit", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                proc = await asyncio.create_subprocess_exec("blaze", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 await asyncio.wait_for(proc.wait(), 30)
             except (OSError, TimeoutError):
                 pass

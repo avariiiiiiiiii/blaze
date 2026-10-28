@@ -10,7 +10,7 @@ import errno, os, re, shlex, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 TOML = """[package]
 name = "sinc"
@@ -58,24 +58,24 @@ STEPS = [
 
 def follow(files, steps):
     """Edits a crate called `sinc` a step at a time under a daemon, against cargo."""
-    ws = tempfile.mkdtemp(prefix="ra-jit-includes-")
+    ws = tempfile.mkdtemp(prefix="blaze-includes-")
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", TOML), *files):
         open(os.path.join(ws, path), "w").write(text)
-    work = tempfile.mkdtemp(prefix="ra-jit-includes-out-")
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = tempfile.mkdtemp(prefix="blaze-includes-out-")
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     reference = os.path.join(work, "reference")
     fx = Fixture(ws, ["sinc"], ["-p", "sinc"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sinc.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
-    link = linkline.with_output(linkline.ahead(link, [patch, obj], RA_JIT), binary)
+    link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     # Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full.
     splice = ["--binary", binary]
     ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols]
     out = open(log_path, "a")
-    daemon = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
+    daemon = subprocess.Popen([BLAZE, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -83,12 +83,12 @@ def follow(files, steps):
     # A daemon whose first build took code of the checkout from the store (BLAZE_CACHE) builds
     # again by itself before anything else (#12), and a request waits for that build: what it
     # compiles is no step's.
-    subprocess.run([RA_JIT, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
+    subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
 
     def run(path):
         # After a full link the daemon writes the debug info in place, and Linux runs no
         # program while its file is open for writing ("text file busy"): what is given the
-        # program waits, as `cargo ra-jit run` does.
+        # program waits, as `blaze run` does.
         deadline = time.monotonic() + 120
         while True:
             try:
@@ -120,7 +120,7 @@ def follow(files, steps):
             open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
         time.sleep(0.02)
         began = time.time()
-        reply = subprocess.run([RA_JIT, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
+        reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
         took = (time.time() - began) * 1000
         reply = (reply.stdout + reply.stderr).strip()
         cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,

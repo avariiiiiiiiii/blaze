@@ -6,9 +6,9 @@ version = 4
 name = "livetypes"
 version = "0.1.0"
 dependencies = [
- "ra-jit-live",
+ "blaze-live",
 ]
 
 [[package]]
-name = "ra-jit-live"
+name = "blaze-live"
 version = "0.1.0"

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Live edits end to end (macOS on AArch64, Linux and Windows on x86-64): edit a function of a running
-program, and the running program must run the new code, applied by ra-jit-live from the
+program, and the running program must run the new code, applied by blaze-live from the
 daemon's patch.
 
-usage: live_e2e.py          (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: live_e2e.py          (BLAZE_BIN names the blaze built; blaze and blaze-rustc
                              are found next to it)
        LIVE_PROGRAM=live-alloc live_e2e.py
                             the same steps on harness/live-alloc, the program on the nightly's
                             `allocator_api` (a bump arena through `Vec<T, A>` and `Box<T, A>`)
 
-A copy of harness/live (a program that polls ra-jit-live and prints `answer()`) is built by the
+A copy of harness/live (a program that polls blaze-live and prints `answer()`) is built by the
 daemon until the daemon serves the build, edited once (the first edit after a daemon starts
 writes the whole object again), started, and edited again LIVE_EDITS times (default 5). Each
 edit has to arrive as a patch the program applies: `outcome: edit N applied` and the new answer
@@ -49,7 +49,7 @@ class StepError(Exception):
 
 
 async def build(step: str, cwd: Path, env: dict[str, str]) -> str:
-    cmd = ["cargo-ra-jit", "ra-jit", "build", "--locked"]
+    cmd = ["blaze", "build", "--locked"]
     try:
         async with asyncio.timeout(BUILD_TIMEOUT):
             proc = await asyncio.create_subprocess_exec(
@@ -65,14 +65,14 @@ async def build(step: str, cwd: Path, env: dict[str, str]) -> str:
     return text
 
 
-# What `cargo ra-jit` says when the toolchain is one the daemon never compiles for, which no
-# wait changes: another release than ra-jit's, or one without the standard library's source.
+# What `blaze` says when the toolchain is one the daemon never compiles for, which no
+# wait changes: another release than blaze's, or one without the standard library's source.
 OTHER_TOOLCHAIN = ("compiles for", "rust-src")
 
 
 async def serving(project: Path, env: dict[str, str]) -> None:
     """Builds until the daemon serves one. Until the daemon has loaded the workspace a build is
-    cargo's, which `cargo ra-jit` says why of; one it served says `[blaze]`."""
+    cargo's, which `blaze` says why of; one it served says `[blaze]`."""
     why = []
     for _ in range(120):
         said = await build("wait for the daemon", project, env)
@@ -148,10 +148,10 @@ async def start(executable: Path, cwd: Path, env: dict[str, str], step: str, ans
 async def main() -> None:
     own_home()
     bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
-    work = Path(tempfile.mkdtemp(prefix="ra-jit-live-e2e-"))
+    work = Path(tempfile.mkdtemp(prefix="blaze-live-e2e-"))
     started: list[Running] = []
     try:
-        shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
+        shutil.copytree(ROOT / "crates" / "blaze-live", work / "crates" / "blaze-live")
         shutil.copytree(HERE / PROGRAM, work / "harness" / "live", ignore=shutil.ignore_patterns("target"))
         project = work / "harness" / "live"
         source = project / "src" / "main.rs"
@@ -188,7 +188,7 @@ async def main() -> None:
                 raise StepError(f"patch {new - 2} applied: the program did not take the patch: {applied}")
             await probe.wait_for(f"new code of edit {new - 2} runs", f"answer {new}", since)
         chain = " -> ".join(str(it) for it in range(1, last + 1))
-        print(f"live edits: answer {chain} in a running program, each applied by ra-jit-live")
+        print(f"live edits: answer {chain} in a running program, each applied by blaze-live")
 
         # Another program, built and edited while this one runs, has its edits on disk.
         shutil.copytree(HERE / PROGRAM, work / "harness" / "other", ignore=shutil.ignore_patterns("target"))
@@ -234,7 +234,7 @@ async def main() -> None:
 
 def own_home() -> None:
     """Gives this run a daemon of its own when BLAZE_HOME names none: the default home
-    (XDG_RUNTIME_DIR/ra-jit) is one daemon and socket for every harness and lane of the user,
+    (XDG_RUNTIME_DIR/blaze) is one daemon and socket for every harness and lane of the user,
     and a run that talks to another's daemon tests that daemon's binary and state, not its own."""
     if os.environ.get("BLAZE_HOME"):
         return
@@ -244,8 +244,8 @@ def own_home() -> None:
 
     def stop() -> None:
         # The daemon of this home alone, which nothing else talks to; its logs stay for a failure.
-        cargo_ra_jit = Path(os.environ["BLAZE_BIN"]).resolve().parent / "cargo-ra-jit"
-        subprocess.run([str(cargo_ra_jit), "ra-jit", "stop"], env=dict(os.environ, BLAZE_HOME=home),
+        blaze_cli = Path(os.environ["BLAZE_BIN"]).resolve().parent / "blaze"
+        subprocess.run([str(blaze_cli), "blaze", "stop"], env=dict(os.environ, BLAZE_HOME=home),
                        capture_output=True, timeout=120)
 
     atexit.register(stop)
@@ -256,8 +256,8 @@ def daemon_home() -> Path:
     if os.environ.get("BLAZE_HOME"):
         return Path(os.environ["BLAZE_HOME"])
     if os.environ.get("XDG_RUNTIME_DIR"):
-        return Path(os.environ["XDG_RUNTIME_DIR"]) / "ra-jit"
-    return Path.home() / ".cache" / "ra-jit"
+        return Path(os.environ["XDG_RUNTIME_DIR"]) / "blaze"
+    return Path.home() / ".cache" / "blaze"
 
 
 def show_daemon_log(lines: int = 80) -> None:

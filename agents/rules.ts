@@ -24,29 +24,29 @@ type Rule = {
 
 const header = `# blaze
 
-How to build, test and change ra-jit, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
+How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
 
 export const rules = [
 	{
 		id: "no-rustc",
-		info: "ra-jit never runs rustc. It compiles everything itself: no function, crate, standard library, build script, proc macro, check, test, doctest or link step is handed to rustc, rustdoc or a cargo that runs them, and there is no \"fall back to cargo\" path. Each place that still does is a bug with a `no-rustc` issue, to be removed, never extended or added to.",
+		info: "blaze never runs rustc. It compiles everything itself: no function, crate, standard library, build script, proc macro, check, test, doctest or link step is handed to rustc, rustdoc or a cargo that runs them, and there is no \"fall back to cargo\" path. Each place that still does is a bug with a `no-rustc` issue, to be removed, never extended or added to.",
 		link: "docs/no-rustc.md",
 	},
 	{
 		id: "blaze-builds-blaze",
-		info: "Build and test blaze with blaze, locally and in CI: `cargo blaze build`, `cargo blaze test`, never `cargo build`/`cargo test` with rustc, and never sccache. Blaze's own store (local, and the shared remote CI fills) is the one cache. Where blaze can't yet build or test itself, that is the bug to fix, not a reason to call rustc; rustc stays only in the release build until blaze builds that too.",
+		info: "Build and test blaze with blaze, locally and in CI: `blaze build`, `blaze test`, never `cargo build`/`cargo test` with rustc, and never sccache. Blaze's own store (local, and the shared remote CI fills) is the one cache. Where blaze can't yet build or test itself, that is the bug to fix, not a reason to call rustc; rustc stays only in the release build until blaze builds that too.",
 		reason: "\"never use sccache never use rustc\" and \"we should make sure we get blaze to fully build itself! basically blaze sucks until then\" (Andrew, 2026-10-26).",
 		link: "docs/contributing.md",
 	},
 	{
 		id: "no-fallback",
-		info: "No fallback, ever; fail fast with a clear error. When ra-jit can't do something (an unsupported construct, a refused patch, a missing TypeId, a static it can't place), it stops with an error that names what and where, at the point it is first seen. It never quietly takes another path: not cargo or rustc, not rustc's copy of a function or static, not a whole build instead of a patch to hide a refusal, not a slower backend or an older cached result. New code adds no fallback. A change that touches an existing one turns it into an error in the same change, and where that would break a harness, fixes the bug behind it instead.",
+		info: "No fallback, ever; fail fast with a clear error. When blaze can't do something (an unsupported construct, a refused patch, a missing TypeId, a static it can't place), it stops with an error that names what and where, at the point it is first seen. It never quietly takes another path: not cargo or rustc, not rustc's copy of a function or static, not a whole build instead of a patch to hide a refusal, not a slower backend or an older cached result. New code adds no fallback. A change that touches an existing one turns it into an error in the same change, and where that would break a harness, fixes the bug behind it instead.",
 		reason: "\"No fallback EVER, no rustc, prefer quick error so bug can be fixed\" (Andrew, 2026-10-26). A silent fallback hides the bug and turns it into wrong output (#386, #392); an error gets it fixed.",
 	},
 	{
 		id: "superset-of-rust",
-		info: "Own the whole stack, and stay a superset of Rust. Move step by step toward owning every layer from source to running code (front end, std, codegen, linking, loading), never by narrowing what ra-jit accepts: every program the pinned nightly's rustc builds (`harness/toolchain`) must build and behave the same under ra-jit, with the real std, C dependencies, build scripts and proc macros. What ra-jit adds (live edits, tiers) comes on top. The one allowed difference is sandboxing: build scripts and proc macros run sandboxed (#147). One that needs more than the sandbox allows is the only exception, and is made to work rather than refused where possible.",
-		reason: "Owning every layer is what makes ra-jit fast. Sandboxing has been on by default since 2026-10-26 (https://github.com/indexable-inc/blaze/issues/147).",
+		info: "Own the whole stack, and stay a superset of Rust. Move step by step toward owning every layer from source to running code (front end, std, codegen, linking, loading), never by narrowing what blaze accepts: every program the pinned nightly's rustc builds (`harness/toolchain`) must build and behave the same under blaze, with the real std, C dependencies, build scripts and proc macros. What blaze adds (live edits, tiers) comes on top. The one allowed difference is sandboxing: build scripts and proc macros run sandboxed (#147). One that needs more than the sandbox allows is the only exception, and is made to work rather than refused where possible.",
+		reason: "Owning every layer is what makes blaze fast. Sandboxing has been on by default since 2026-10-26 (https://github.com/indexable-inc/blaze/issues/147).",
 		link: "docs/no-rustc.md",
 	},
 	{
@@ -57,14 +57,14 @@ export const rules = [
 	},
 	{
 		id: "sandbox-everything",
-		info: "Every build script and proc macro runs in a sandbox, by default, on every platform: every build script, cargo's runs and the daemon's, runs in one through `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in it (`macro_sandbox.rs`). Sandboxed tests are an experiment a workspace opts into (`experimental = [\"sandboxed-tests\"]` under the root manifest's `[workspace.metadata.blaze]`, or a package's `tests = true` under `[package.metadata.blaze.sandbox]`): there `cargo ra-jit test` runs each test executable in one sandbox (Linux namespaces and seccomp, macOS Seatbelt and the interposer) under `all` and `affected` alike, and elsewhere tests run as cargo runs them, every time, never kept as passed. Where a sandbox is due and none can be made it stops, rather than run outside. The only ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`, `unsandboxed-tests`, `build-script = false`), the root manifest's `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`) and `BLAZE_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by default; tests do until the experiment ends.",
+		info: "Every build script and proc macro runs in a sandbox, by default, on every platform: every build script, cargo's runs and the daemon's, runs in one through `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in it (`macro_sandbox.rs`). Sandboxed tests are an experiment a workspace opts into (`experimental = [\"sandboxed-tests\"]` under the root manifest's `[workspace.metadata.blaze]`, or a package's `tests = true` under `[package.metadata.blaze.sandbox]`): there `blaze test` runs each test executable in one sandbox (Linux namespaces and seccomp, macOS Seatbelt and the interposer) under `all` and `affected` alike, and elsewhere tests run as cargo runs them, every time, never kept as passed. Where a sandbox is due and none can be made it stops, rather than run outside. The only ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`, `unsandboxed-tests`, `build-script = false`), the root manifest's `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`) and `BLAZE_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by default; tests do until the experiment ends.",
 		reason: "\"Everything should by default be in sandbox and yea it should have sandbox support macos\" (Andrew, 2026-10-26). Sandboxed tests became an opt-in experiment on 2026-10-27 (Andrew).",
 		link: "docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox",
 	},
 	{
 		id: "best-long-term-design",
 		info: "Pick the best long-term design, not the least work: own the layer, rewrite it or port rustc's rule properly, rather than do the least work or what a small team could maintain. Spend the effort on proving it right (differential tests against rustc, fuzzing, real crates).",
-		reason: "Agents write most of ra-jit, so the amount of code a design takes is not what limits it; what stays expensive is proving it right.",
+		reason: "Agents write most of blaze, so the amount of code a design takes is not what limits it; what stays expensive is proving it right.",
 		link: "docs/contributing.md#rules-for-code",
 	},
 	{

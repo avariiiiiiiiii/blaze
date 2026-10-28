@@ -31,7 +31,7 @@ small table of a few projects on one platform (PICK) between `<!-- benchpick:sta
 `<!-- bench:start -->` and `<!-- bench:end -->`.
 A result of `bench.py --runtime` (harness/runbench.py's numbers) writes docs/benchmarks.md's
 runtime table instead, between `<!-- runbench:start -->` and `<!-- runbench:end -->`: how fast each
-benchmark's program runs built by ra-jit's LLVM against `cargo build --release`, and the
+benchmark's program runs built by blaze's LLVM against `cargo build --release`, and the
 geometric mean. It is stored in docs/benchmarks/runtime-<platform>.json, and differs when a
 median of any build moved by more than noise, a benchmark is new or gone, or the stored run is
 older than `--max-age`. A build that failed, or whose program did not do what the release build's
@@ -43,7 +43,7 @@ results are its own result's with those of each project measured on its own fold
 (`stored_all`), and a footnote under each table names the machine, commit and date of each such
 project. docs/benchmarks.md has every number of each, under its platform.
 A result in which a program said something else than cargo's (`wrong`) is refused: exit 2,
-nothing written. A test suite that ended otherwise under `cargo ra-jit test` is not refused: the
+nothing written. A test suite that ended otherwise under `blaze test` is not refused: the
 tests table says how, and the workflow fails after writing. `--check` writes nothing and exits 1
 when it would have written. `--memory`, from before there were platforms, is the same as no flag:
 a platform's memory is its result's.
@@ -51,7 +51,7 @@ a platform's memory is its result's.
 Every summary table comes with its chart (benchcharts.py), written to
 docs/benchmarks/charts/ by the same call that writes the table: the edit speed-ups with the
 build table, memory and disk with the memory table, the runtime ratios with the runtime table,
-each ra-jit against cargo with a bar per platform and each platform's geometric mean. `--render` writes every table and chart again from the stored results, and
+each blaze against cargo with a bar per platform and each platform's geometric mean. `--render` writes every table and chart again from the stored results, and
 `--charts` the charts alone.
 
 The last line says `changed` or `unchanged`, and so does `changed=true|false` in
@@ -267,7 +267,7 @@ def who(result):
 
 
 def machines(results, extra=lambda r: "", said=False):
-    """A line per platform: its machine, the ra-jit it measured and when, or that it has not
+    """A line per platform: its machine, the blaze it measured and when, or that it has not
     been measured; then a line for each project measured on its own, with its machines (and what
     it is, when `said`)."""
     lines = []
@@ -333,7 +333,7 @@ def edit_cell(phase):
 
 
 def edit_speedups(results, backend):
-    """(project, {platform: cargo's time ÷ ra-jit's for each kind of edit}), the edits chart's rows."""
+    """(project, {platform: cargo's time ÷ blaze's for each kind of edit}), the edits chart's rows."""
     rows = []
     for key in keys_of(results, backend):
         by = {}
@@ -380,7 +380,7 @@ def memory_backend(results):
 def memory_chart(results, backend):
     rows = []
     for key in keys_of(results, backend):
-        by = {p: (m["cargo"]["peak_mb"], m["ra-jit"]["peak_mb"]) for p, r in results.items()
+        by = {p: (m["cargo"]["peak_mb"], m["blaze"]["peak_mb"]) for p, r in results.items()
               if key in r["results"] and (m := edit_memory(r["results"][key]))}
         if by:
             rows.append((label_of(results, key), by))
@@ -388,7 +388,7 @@ def memory_chart(results, backend):
 
 
 def on_disk(measured):
-    """(cargo's target directory, ra-jit's target directory, store and home) in MB, once a
+    """(cargo's target directory, blaze's target directory, store and home) in MB, once a
     project's edits are done, or None."""
     disk = measured.get("disk_mb") or {}
     ours = sum(disk.get(k) or 0 for k in ("target", "store", "home"))
@@ -407,7 +407,7 @@ def disk_chart(results, backend):
 
 def pick_section(results, backend="cranelift"):
     """The README's small table: an edit to one function of each project of PICK on PICK_ON."""
-    lines = [PICK_START, f"| Edit one function, then build ({PICK_ON}) | `cargo build` | `cargo blaze build` |", "|---|---:|---:|"]
+    lines = [PICK_START, f"| Edit one function, then build ({PICK_ON}) | `cargo build` | `blaze build` |", "|---|---:|---:|"]
     measured = (results.get(PICK_ON) or {"results": {}})["results"]
     for key in keys_of(results, backend):
         name = key.split("/")[0]
@@ -434,7 +434,7 @@ def summary_section(results):
     lines = [SUM_START]
     if summary := edits_chart(results, backend):
         lines += [benchcharts.picture("edits", f"How much faster an edit builds under blaze than under cargo, by platform: {summary}"), ""]
-    lines += ["Edit, then build, on real projects at pinned commits: incremental `cargo build` → `cargo blaze build`, both "
+    lines += ["Edit, then build, on real projects at pinned commits: incremental `cargo build` → `blaze build`, both "
               "warm, same linker, Cranelift, the median of each run's edits. Each platform is a machine of its "
               "own: compare numbers within a platform, not across.", ""]
     fell_back = False
@@ -494,11 +494,11 @@ def memory_section(results):
         lines += [benchcharts.picture("disk", f"What a project's build keeps on disk, blaze against cargo, by platform: {summary}"), ""]
     lines += [f"Memory and disk, {BACKEND_NAMES[backend]}, from the same runs as the build table. Peak: the most every process "
               "doing the work held at once, cargo → blaze. For blaze that is the daemon, its workers and what they run, and "
-              "`cargo blaze build` with any cargo it ran; for plain cargo, cargo itself, rustc, build scripts and the linker. "
+              "`blaze build` with any cargo it ran; for plain cargo, cargo itself, rustc, build scripts and the linker. "
               "How it is measured: [docs/benchmarks.md](docs/benchmarks.md#memory-and-disk).", "",
               "Peak while an edit to one function builds, cargo → blaze:", "",
               "| Project | " + " | ".join(NAMES) + " |", "|---|" + "---:|" * len(NAMES)]
-    pair = lambda m: f"{megabytes(m['cargo']['peak_mb'])} → **{megabytes(m['ra-jit']['peak_mb'])}**" if m else "-"
+    pair = lambda m: f"{megabytes(m['cargo']['peak_mb'])} → **{megabytes(m['blaze']['peak_mb'])}**" if m else "-"
     keys = [k for k in keys_of(measured, backend) if any(k in r["results"] and edit_memory(r["results"][k]) for r in measured.values())]
     for key in keys:
         cells = [pair(edit_memory(measured[p]["results"][key])) if p in measured and key in measured[p]["results"] else "-" for p in NAMES]
@@ -535,7 +535,7 @@ def memory_tables(result, keys, backend, name=""):
              "process, median of the runs. Largest process: the peak of the one process that held the most, as the kernel "
              "kept it: `wait4`'s for the command's tree, and each process's peak sampled (on macOS the kernel's peak footprint "
              "of each, counting for the daemon only a peak it passed during the step). blaze is the daemon, its workers and "
-             "what they run, and the `cargo blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts "
+             "what they run, and the `blaze build` with any cargo it ran; cargo is cargo itself, rustc, build scripts "
              "and the linker. Daemon after: what the daemon and its workers hold once the step is over ([how](#memory-and-disk)).", "",
              "| Project | Step | cargo, peak | blaze, peak | cargo, largest process | blaze, largest process | Daemon after |",
              "|---|---|---:|---:|---:|---:|---:|"]
@@ -546,8 +546,8 @@ def memory_tables(result, keys, backend, name=""):
             if not m:
                 continue
             step = "Cold, until the daemon is ready" if label == "cold" else EDITS[label]
-            lines.append(f"| {project_name(key, measured)} | {step} | {megabytes(m['cargo']['peak_mb'])} | {megabytes(m['ra-jit']['peak_mb'])} | "
-                         f"{megabytes(m['cargo']['largest_mb'])} | {megabytes(m['ra-jit']['largest_mb'])} | {megabytes(m['ra-jit'].get('resident_mb'))} |")
+            lines.append(f"| {project_name(key, measured)} | {step} | {megabytes(m['cargo']['peak_mb'])} | {megabytes(m['blaze']['peak_mb'])} | "
+                         f"{megabytes(m['cargo']['largest_mb'])} | {megabytes(m['blaze']['largest_mb'])} | {megabytes(m['blaze'].get('resident_mb'))} |")
     lines += ["", "The daemon between builds, and what each side keeps on disk once the edits are done (each block once, [how](#memory-and-disk)). "
               "After the first build: once the step after the cold build (nothing changed) is done; growth is from then to the end, "
               "over every edit made and taken back. Warm store: the cold start of another checkout with the store the first one filled.", "",
@@ -569,7 +569,7 @@ def memory_tables(result, keys, backend, name=""):
 
 
 def setups_table(result, keys, backend, name=""):
-    """The same steps built the fastest ways there are besides ra-jit, for the projects that had them."""
+    """The same steps built the fastest ways there are besides blaze, for the projects that had them."""
     keys = [k for k in keys if any(p.get("setups") for p in result["results"][k]["phases"].values())]
     if not keys:
         return []
@@ -591,14 +591,14 @@ def setups_table(result, keys, backend, name=""):
             if not phase or not phase.get("setups"):
                 continue
             ours = phase["wall_s"] if label != "cold" else phase.get("wall_s")
-            times = {"cargo": phase["cargo_s"], "ra-jit": ours}
+            times = {"cargo": phase["cargo_s"], "blaze": ours}
             times.update({n: phase["setups"].get(n, {}).get("median_s") for n in names})
             # `cargo check` builds nothing to run, so it is not what the fastest is chosen from.
             fastest = min((v, n) for n, v in times.items() if v is not None and n != "check")[1]
             cell = lambda n: ("failed" if (phase["setups"].get(n) or {}).get("failed") else "-") if times[n] is None else (
                 f"**{seconds(times[n])}**" if n == fastest else seconds(times[n]))
             step = "Cold, until the daemon is ready" if label == "cold" else EDITS[label]
-            lines.append(f"| {project_name(key, measured)} | {step} | {cell('cargo')} | " + " | ".join(cell(n) for n in names) + f" | {cell('ra-jit')} |")
+            lines.append(f"| {project_name(key, measured)} | {step} | {cell('cargo')} | " + " | ".join(cell(n) for n in names) + f" | {cell('blaze')} |")
     failures = sorted({f"{project_name(k, result['results'][k])}, {SETUPS[n]}: {s['failed']}" for k in keys
                        for p in result["results"][k]["phases"].values() for n, s in (p.get("setups") or {}).items() if s.get("failed")})
     if failures:
@@ -607,9 +607,9 @@ def setups_table(result, keys, backend, name=""):
 
 
 def said_otherwise(difference):
-    """How a test suite ended otherwise under ra-jit, for a table cell."""
+    """How a test suite ended otherwise under blaze, for a table cell."""
     if found := re.fullmatch(r"(-?\d+) for (-?\d+)", difference or ""):
-        return f"`cargo blaze test` exited {found[1]}, `cargo test` {found[2]}"
+        return f"`blaze test` exited {found[1]}, `cargo test` {found[2]}"
     return (difference or "").replace("|", "\\|")[:120]
 
 
@@ -618,9 +618,9 @@ def tests_table(result, keys, backend, name=""):
     if not keys:
         return []
     lines = ["", f"#### Test suites, {BACKEND_NAMES[backend]}{', ' + name if name else ''}", "",
-             "`cargo blaze test` and `cargo test` of the same tests, median of three: after the edit of a widely used function "
+             "`blaze test` and `cargo test` of the same tests, median of three: after the edit of a widely used function "
              "(the file named), and again with nothing changed. Each includes running the tests. First runs: the three untimed "
-             "runs of `cargo blaze test` before them (the first is handed to cargo, the daemon builds the test targets at the "
+             "runs of `blaze test` before them (the first is handed to cargo, the daemon builds the test targets at the "
              "second). Every test has to end the same way under both, every time.", "",
              "| Project | Command | Tests | Same outcome | Edited | Edit, then test: cargo | blaze | | Built | Nothing changed: cargo | blaze | First runs of blaze |",
              "|---|---|---:|---|---|---:|---:|---:|---|---:|---:|---|"]
@@ -647,7 +647,7 @@ def runtime_wrong(result):
             for bench in info.get("differs", []):
                 wrong.append(f"{bench} {build}: the program did not do what cargo's release build did")
         for bench, timed in program.get("benches", {}).items():
-            for build in ("release", "ra-jit"):
+            for build in ("release", "blaze-engine"):
                 if build not in timed:
                     wrong.append(f"{bench} {build}: not timed")
     return wrong
@@ -711,7 +711,7 @@ def differences(stored, result, noise, max_age_h):
                     why.append(f"{key} {label} {field}: {before} -> {after}")
             if (old.get("built") == "daemon") != (phase.get("built") == "daemon"):
                 why.append(f"{key} {label}: built by {old.get('built')} -> {phase.get('built')}")
-            for side in ("ra-jit", "cargo"):
+            for side in ("blaze", "cargo"):
                 before, after = ((p.get("memory") or {}).get(side, {}).get("peak_mb") for p in (old, phase))
                 if (before is None) != (after is None):
                     why.append(f"{key} {label}: {side} memory {'measured' if after is not None else 'no longer measured'}")
@@ -782,10 +782,10 @@ def platform_doc(name, result, stored):
         lines += ["", f"#### Cold, {BACKEND_NAMES[backend]}, {name}", "",
                   "From an empty target directory, crates already downloaded, " + ("one run." if cold_runs == 1 else
                   f"median of {cold_runs} runs, each from nothing.") + " The empty store fetches the standard library as a "
-                  "release's first build does. `cargo blaze build` is cargo's own build (the daemon is "
+                  "release's first build does. `blaze build` is cargo's own build (the daemon is "
                   "not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. "
                   "Warm store: the same in another checkout of the same commit, with the store the first one filled.", "",
-                  "| Project | `cargo build` | `cargo blaze build` | Daemon ready, empty store | Daemon ready, warm store | "
+                  "| Project | `cargo build` | `blaze build` | Daemon ready, empty store | Daemon ready, warm store | "
                   "Functions compiled | Daemon memory | Store |",
                   "|---|---:|---:|---:|---:|---:|---:|---:|"]
         for key in keys:
@@ -813,7 +813,7 @@ def platform_doc(name, result, stored):
                 cell = lambda r: f"{seconds(r['median_s'])} ({seconds(r['min_s'])} to {seconds(r['max_s'])})" + (
                     f"; {megabytes(r['peak_mb'])}, {r['size_mb']} MB" if r.get("peak_mb") is not None else "")
                 command = " ".join(run["command"]).replace("{library}", "<the toolchain's library source>").replace("|", "\\|")
-                lines.append(f"| {project_name(key, result['results'][key])} | `{command}` | {cell(run['ra-jit'])} | "
+                lines.append(f"| {project_name(key, result['results'][key])} | `{command}` | {cell(run['blaze'])} | "
                              f"{cell(run['cargo debug'])} | {cell(run['cargo release'])} |")
         lines.append("")
     return lines
@@ -824,19 +824,19 @@ ROUGH = 1.5
 
 def rough(row):
     """Whether a benchmark's runs varied too much to read its ratio closely: the slowest run of
-    release or of ra-jit took more than ROUGH times its fastest."""
-    return any(max(runs) > ROUGH * min(runs) for b in ("release", "ra-jit") if (runs := (row.get(b) or {}).get("runs")) and min(runs) > 0)
+    release or of blaze took more than ROUGH times its fastest."""
+    return any(max(runs) > ROUGH * min(runs) for b in ("release", "blaze-engine") if (runs := (row.get(b) or {}).get("runs")) and min(runs) > 0)
 
 
 def ratio_cell(row):
-    return ("≈" if rough(row) else "") + times(row["ra-jit"]["ratio"])
+    return ("≈" if rough(row) else "") + times(row["blaze"]["ratio"])
 
 
 ROUGH_NOTE = f"≈: that benchmark's runs varied by more than {ROUGH:g}× from fastest to slowest on that machine; read it as rough."
 
 
 def runtime_best(measured):
-    """Of a runbench.py result's ra-jit builds, the one whose geometric mean is lowest: (its
+    """Of a runbench.py result's blaze builds, the one whose geometric mean is lowest: (its
     ratio of each benchmark, the geometric mean, how it was built), or None."""
     ours = [b for b in measured["builds"] if b not in ("release", "checked")]
     ratios = lambda b: {bench: row[b]["ratio"] for p in measured["programs"].values() for bench, row in p["benches"].items() if b in row}
@@ -882,18 +882,18 @@ def runtime_tables(result):
     sized = []
     for name, program in measured["programs"].items():
         for bench, row in program["benches"].items():
-            lines.append(f"| {bench} | {seconds(row['release']['median_s'])} | **{seconds(row['ra-jit']['median_s'])}** | "
+            lines.append(f"| {bench} | {seconds(row['release']['median_s'])} | **{seconds(row['blaze']['median_s'])}** | "
                          f"{ratio_cell(row)} |" + ((f" {times(row['checked']['ratio'])} |" if "checked" in row else " - |") if checked else "") +
-                         f" {mem(row, 'release')} → {mem(row, 'ra-jit')} |")
+                         f" {mem(row, 'release')} → {mem(row, 'blaze')} |")
         info = program["builds"]
-        if info.get("release", {}).get("size_mb") is not None and info.get("ra-jit", {}).get("size_mb") is not None:
-            sized.append(f"| {name} | {seconds(info['release']['build_s'])} → {seconds(info['ra-jit']['build_s'])} | "
-                         f"{info['release']['size_mb']} MB → {info['ra-jit']['size_mb']} MB | "
-                         f"{megabytes(info['release'].get('build_peak_mb'))} → {megabytes(info['ra-jit'].get('build_peak_mb'))} | "
-                         f"{megabytes(info['release'].get('build_largest_mb'))} → {megabytes(info['ra-jit'].get('build_largest_mb'))} |")
+        if info.get("release", {}).get("size_mb") is not None and info.get("blaze", {}).get("size_mb") is not None:
+            sized.append(f"| {name} | {seconds(info['release']['build_s'])} → {seconds(info['blaze']['build_s'])} | "
+                         f"{info['release']['size_mb']} MB → {info['blaze']['size_mb']} MB | "
+                         f"{megabytes(info['release'].get('build_peak_mb'))} → {megabytes(info['blaze'].get('build_peak_mb'))} | "
+                         f"{megabytes(info['release'].get('build_largest_mb'))} → {megabytes(info['blaze'].get('build_largest_mb'))} |")
     geomean = measured.get("geomean") or {}
-    if geomean.get("ra-jit"):
-        lines.append(f"| **All benchmarks (geometric mean)** | | | **{times(geomean['ra-jit'])}** |" +
+    if geomean.get("blaze"):
+        lines.append(f"| **All benchmarks (geometric mean)** | | | **{times(geomean['blaze'])}** |" +
                      (f" {times(geomean['checked'])} |" if checked and geomean.get("checked") else (" |" if checked else "")) + " |")
     if sized:
         lines += ["", "What each program takes, release → blaze: its build from cold (for blaze, cargo running the build "
@@ -909,8 +909,8 @@ def rounds(result):
 
 
 def runtime_section(results):
-    """docs/benchmarks.md's table of how fast what ra-jit's LLVM builds runs, against cargo's release
-    build: ra-jit's time ÷ release's of each benchmark on each platform, then by platform the
+    """docs/benchmarks.md's table of how fast what blaze's LLVM builds runs, against cargo's release
+    build: blaze's time ÷ release's of each benchmark on each platform, then by platform the
     times, memory and builds."""
     lines = [RUN_START]
     if summary := runtime_chart(results):
@@ -926,10 +926,10 @@ def runtime_section(results):
         for p in NAMES:
             row = next((pr["benches"][bench] for pr in (results[p]["runbench"]["programs"].values() if p in results else [])
                         if bench in pr["benches"]), None)
-            cells.append(ratio_cell(row) if row and "ra-jit" in row else "-")
-            noisy = noisy or bool(row and "ra-jit" in row and rough(row))
+            cells.append(ratio_cell(row) if row and "blaze" in row else "-")
+            noisy = noisy or bool(row and "blaze" in row and rough(row))
         lines.append(f"| {bench} | " + " | ".join(cells) + " |")
-    means = [f"**{times(g)}**" if p in results and (g := (results[p]["runbench"].get("geomean") or {}).get("ra-jit")) else "-" for p in NAMES]
+    means = [f"**{times(g)}**" if p in results and (g := (results[p]["runbench"].get("geomean") or {}).get("blaze")) else "-" for p in NAMES]
     lines += [f"| **All benchmarks (geometric mean)** | " + " | ".join(means) + " |", "", *([ROUGH_NOTE, ""] if noisy else []),
               *machines(results, lambda r: f", each benchmark run {rounds(r)} times" if rounds(r) else ""), "",
               "<details><summary>Times, memory and builds, by platform</summary>"]

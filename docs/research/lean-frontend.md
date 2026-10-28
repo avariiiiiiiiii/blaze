@@ -1,14 +1,14 @@
 # A lean frontend for compiling: where the time and memory go
 
-2026-10-24, for [#236](https://github.com/indexable-inc/ra-jit/issues/236) (a strict, lean
-frontend: lossless trees and error tolerance off the codegen path), beside [#40](https://github.com/indexable-inc/ra-jit/issues/40)
-(frozen dependencies), [#41](https://github.com/indexable-inc/ra-jit/issues/41) (the warm
-manifest), [#188](https://github.com/indexable-inc/ra-jit/issues/188),
-[#216](https://github.com/indexable-inc/ra-jit/issues/216) and
-[#11](https://github.com/indexable-inc/ra-jit/issues/11). The question: rust-analyzer was built
+2026-10-24, for [#236](https://github.com/indexable-inc/blaze/issues/236) (a strict, lean
+frontend: lossless trees and error tolerance off the codegen path), beside [#40](https://github.com/indexable-inc/blaze/issues/40)
+(frozen dependencies), [#41](https://github.com/indexable-inc/blaze/issues/41) (the warm
+manifest), [#188](https://github.com/indexable-inc/blaze/issues/188),
+[#216](https://github.com/indexable-inc/blaze/issues/216) and
+[#11](https://github.com/indexable-inc/blaze/issues/11). The question: rust-analyzer was built
 for an editor (a lossless tree per file, inference that tolerates any error, salsa recording
 every read so any edit can be answered incrementally); which of that does a compiler pay for,
-and how much? Measured on dev-aws-8 (AMD EPYC 9R14, 192 vCPU, 369 GB, Linux), ra-jit at
+and how much? Measured on dev-aws-8 (AMD EPYC 9R14, 192 vCPU, 369 GB, Linux), blaze at
 `c48ca3f800` and, for the listing change, `07217080d0`; release builds, Cranelift, nushell 0.108.0
 (`bench.py`'s pin), the worker pinned to 16 cores (`taskset -c 120-135`) and builds on others.
 Each claim is **read** (measured, or read in a source), **reported** (someone says so) or
@@ -46,14 +46,14 @@ Each claim is **read** (measured, or read in a source), **reported** (someone sa
 ## How it was measured
 
 - `harness/leanprof.py PROJECT --work W` runs a project's first hour as phases and writes when
-  each began and ended (monotonic clock): `cold` (`cargo ra-jit build` from nothing until
+  each began and ended (monotonic clock): `cold` (`blaze build` from nothing until
   ready), `base` (the own base the daemon builds once idle), each edit of `--edits` made and
   undone `--rounds` times, then `warm` (the daemon stopped and started on the same store) and
   `warm base`. `--no-warm` stops after the edits (**read**).
 - `perf record -k CLOCK_MONOTONIC -g -F 199` of the whole run, with frame pointers, cut by
   `harness/cpufold.py --phases W/phases.json`: per phase, the share of samples with a kind of
   work on the stack, the kind of the innermost frame, and for samples revalidating memos, the
-  query whose memo was verified, the query that asked and the ra-jit function that asked
+  query whose memo was verified, the query that asked and the blaze function that asked
   (**read**).
 - A build with counters in salsa 0.28.5 (not committed: a patched copy of salsa and a dump at
   each request) gave per revision the deep verifications by durability and query, edges walked
@@ -152,7 +152,7 @@ The worker's heap after the base build, jemalloc's sampled bytes given to the ho
 | holder | MB | share |
 |---|---|---|
 | salsa's records (edges, revisions) | 1,307 | 22.6% |
-| ra-jit's own (vfs, symbol table, splice) | 988 | 17.1% |
+| blaze's own (vfs, symbol table, splice) | 988 | 17.1% |
 | inference and traits | 639 | 11.0% |
 | codegen and monomorphization | 617 | 10.7% |
 | macro expansion (trees, arguments, span maps) | 443 | 7.7% |
@@ -201,7 +201,7 @@ Salsa's own count of its metadata is 898 MB (**read**).
    (**unverified**: no prototype).
 3. **Take the diagnostics pass off a body edit's critical path** (35 to 76 ms of about 300):
    split one file's diagnostics across cores by definition, and leave out the definitions the
-   edit did not change, whose diagnostics are memoized. `cargo ra-jit check` keeps the
+   edit did not change, whose diagnostics are memoized. `blaze check` keeps the
    tolerant path whole: what it reports must stay rustc's (#222) (**unverified**).
 4. **Interned arguments that are never collected**: 7% of a signature edit and 39 MB, from a
    one-line change in a pinned fork of salsa-macro-rules, once it is shown that no argument
@@ -221,7 +221,7 @@ work done again that rustc keeps in `.rmeta`; not doing it again is #40 (frozen 
 
 ## Slice 1: crates listed on every core
 
-[#239](https://github.com/indexable-inc/ra-jit/pull/239). `build` listed each crate it builds (its functions, what it exports) one after another, though
+[#239](https://github.com/indexable-inc/blaze/pull/239). `build` listed each crate it builds (its functions, what it exports) one after another, though
 `Listed::of_all` lists crates one to a core and was used only for linked crates. It now lists
 them all first with `of_all`, which skips crates already listed. What is listed is the same.
 
@@ -334,7 +334,7 @@ body's closures in parallel (**read** for the cycles).
 interns its arguments as a tuple, which salsa keeps for 3 revisions after it was last asked for and
 then may collect and reuse. Each call of it records the tuple's read, an edge, and its LRU. A tuple
 can be kept for good only if nothing in it is collected (a value it holds, freed and its slot
-reused, would make the tuple name another value). What salsa collects in ra-jit (**read**, by
+reused, would make the tuple name another value). What salsa collects in blaze (**read**, by
 search of every `#[salsa::interned]` and `#[salsa::tracked]` struct): the tracked structs
 `ModuleIdLt`, `BlockIdLt`, `Modules`, `ModuleScope` and `DefMapPair` (hir-def), and the interned
 `InternedFileId` (ide-db) and `InternedSourceRootId` (base-db). Every other interned type,
@@ -344,7 +344,7 @@ and clauses are `intern` crate values, reference counted and never collected (th
 `gc` is only called by the proc-macro server's copy); `Crate` is a salsa input. So no blanket
 change: `ModuleScope::name` and many others take a `ModuleId` or a tracked struct. salsa-macros
 now takes `revisions` on a tracked function, for its interned arguments, and four hot ones of
-ra-jit's own whose arguments hold none of the collected types keep theirs for good: `row_place`,
+blaze's own whose arguments hold none of the collected types keep theirs for good: `row_place`,
 `source_place`, `compiled_instance` and `instance_serial` (#253). Two more of the fork's, whose
 arguments qualify too, were measured with them: `layout_of_ty_query` and
 `TraitImpls::in_crate_and_deps_for_trait_and_self_ty`. They stay as they were, as CI builds the

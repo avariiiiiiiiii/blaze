@@ -1,6 +1,6 @@
 # How the release binaries are built
 
-Branch `build-profile`, from main at 40ddac92ab, 2026-10-21. The question was whether ra-jit is
+Branch `build-profile`, from main at 40ddac92ab, 2026-10-21. The question was whether blaze is
 built the fastest way it can be for the daemon's edit loop and its cold start: the allocator,
 the Cargo profile, and profile-guided optimization (PGO). What a release ships now: the `dist`
 profile (`release` with thin LTO), optimized with a profile of its own work, built by
@@ -10,7 +10,7 @@ nushell, the same peak memory.
 
 ## How it was measured
 
-`harness/abbench.py` (new) runs builds of ra-jit against each other on `bench.py`'s edits of a
+`harness/abbench.py` (new) runs builds of blaze against each other on `bench.py`'s edits of a
 real project, in rounds whose order rotates, each build with its own copy of the project, home
 and store; a turn starts a daemon from nothing (the cold start: cargo's first build and the
 wait until the daemon is ready), makes every edit three times and takes it back. Every number
@@ -92,9 +92,9 @@ build of the profile they optimize, as `build_release.py` does, and got both. On
 and C's builds, cycles), thin LTO took 4-7% fewer cycles to cold-start nushell and PGO 6%
 (the one interval clear of zero); edit cycles moved within the noise (-3% to +6%).
 
-Build time of ra-jit (`cargo build -p ra-jit`, Linux, 32 cores):
+Build time of blaze (`cargo build -p blaze-engine`, Linux, 32 cores):
 
-| profile | from clean | after a one-line change in `crates/ra-jit` |
+| profile | from clean | after a one-line change in `crates/blaze-engine` |
 |---|---|---|
 | release | 73 s | 18 s |
 | thin LTO, 16 codegen units (`dist`) | 83 s | 46 s |
@@ -121,7 +121,7 @@ minutes.
 
 What it took:
 
-- A killed process writes no counters. `cargo ra-jit stop` kills the workers, so
+- A killed process writes no counters. `blaze stop` kills the workers, so
   `--train` ends a turn by killing the daemon, after which each worker sees its input close
   and exits by itself; each process writes its own file (`LLVM_PROFILE_FILE=%p`), and the
   merge waits until no instrumented process is left. With one shared file, a spare still
@@ -130,7 +130,7 @@ What it took:
   its daemon died (below), so the training waited 120 s per project for nothing and got a
   quarter of the counts: 13 against 57 billion.
 - On macOS the `cc` crate passes `-Cprofile-generate` on to Apple clang, whose profile format
-  is not rustc's LLVM's, and the instrumented ra-jit crashed at start
+  is not rustc's LLVM's, and the instrumented blaze crashed at start
   (rust-lang/rust#163640): the C code (mimalloc, ring) is built with
   `-fno-profile-generate`/`-fno-profile-use`. GCC on Linux accepts the same flags.
 
@@ -147,7 +147,7 @@ Branch `one-build`, from main at 22b1267233, 2026-10-21. Until then the flake an
 | a release's binaries | `build_release.py --target T --strict`: `dist` with the profile `pgo/profiles.json` pins for T |
 | `nix run`, `nix profile install`, `nix build .#daemon` (and `.#dist`, `.#blaze`, the demo) | the same script inside the derivation, the same profile fetched by its sha256 |
 | from a checkout | the same script |
-| `cargo install --locked --profile dist ra-jit` | `dist` without PGO |
+| `cargo install --locked --profile dist blaze` | `dist` without PGO |
 
 **One profile for every build.** A build has to be reproducible from the commit alone, so the
 profile can no longer be trained inside the release job: the `pgo` workflow trains it, one
@@ -164,7 +164,7 @@ of JSON.
 
 **A profile finds a function by its symbol.** Read on Linux x86-64 with `nm` and
 `llvm-profdata show --all-functions`: every symbol of a Rust crate carries the crate's hash
-(`Cscx9Nkki9Or4_6ra_jit`), and cargo derives that hash from the whole graph of the build:
+(`Cscx9Nkki9Or4_6blaze`), and cargo derives that hash from the whole graph of the build:
 each crate's name, version, source and features, the profile (incremental or not included),
 the toolchain, and a wrapper of rustc around the workspace's crates (not RUSTFLAGS, and not
 the absolute path: the runner's build and the dev host's have the same hashes). A build whose graph differs finds next to
@@ -177,23 +177,23 @@ comparing the binaries' symbols, crate by crate:
   local crate (read from `cargo build -v` in and out of the sandbox: the command lines differ
   in the wrapper, the linker and the `-C metadata` values; the unit graphs are the same). The
   flake's `dist` now sets `auditable = false`, and the script clears `RUSTC_WRAPPER` and
-  `RUSTC_WORKSPACE_WRAPPER`, which `ra-jit enable` would otherwise have set for anyone
+  `RUSTC_WORKSPACE_WRAPPER`, which `blaze enable` would otherwise have set for anyone
   building from a checkout.
 - The dev host's shell sets `CARGO_INCREMENTAL=1`, which turns incremental on for the
   workspace's crates and changes their hashes: run from that shell, the build at 9c15d7035b
   (the first pin the workflow committed to main) was refused by `--strict`, and passed with
   the variable unset. The script sets `CARGO_INCREMENTAL=0`, `dist`'s own setting.
 - `cargo install` from a checkout gets other hashes again, with or without `--target`, and
-  one from crates.io builds other packages altogether (`ra-jit-hir` for `hir`, the registry
+  one from crates.io builds other packages altogether (`blaze-hir` for `hir`, the registry
   for the path), so no profile trained from the repository applies to it. Handing it the
   profile (`--config build.rustflags=['-Cprofile-use=…']`, which it does pass to rustc) builds
-  a ra-jit whose workspace crates have hashes the profile does not have, and LLVM warns of
+  a blaze whose workspace crates have hashes the profile does not have, and LLVM warns of
   nothing.
 - Any change to Cargo.lock, a manifest or the toolchain changes the hash of every crate above
   it, the workspace's included.
 
-So each pin records the hash its profile has for ra-jit (`crate`), the script reads the
-hash of the ra-jit it built from the binary's symbols and warns when they differ, a release
+So each pin records the hash its profile has for blaze (`crate`), the script reads the
+hash of the blaze it built from the binary's symbols and warns when they differ, a release
 (`--strict`) refuses to be built that way, and the `pgo` workflow runs by itself on a push to
 main that touches Cargo.lock, a manifest or `harness/toolchain`.
 
@@ -207,7 +207,7 @@ after a one-line edit to `main.rs`, 1,622 at d906695d51, 23 commits and 6,700 li
 profile has about 187,000 functions.
 
 **`cargo install` and PGO.** Cargo reads profiles from the root manifest only, and an
-installed crate is its own root, so the published `ra-jit` manifest now carries `release` and
+installed crate is its own root, so the published `blaze` manifest now carries `release` and
 `dist` (`publish_crates.py`) and `--profile dist` works from crates.io. Compiler flags are
 another matter: `[profile.*] rustflags` is the unstable `profile-rustflags` feature (stable
 cargo 1.99.0 refuses the manifest: "requires a nightly version of Cargo"), a build script's
@@ -219,7 +219,7 @@ slower and edits 3% slower than the release's binaries, and the README says so.
 **`release` stays as it is.** The harnesses, the gate and CI build `release` after every
 change, and `cargo install --profile dist` reaches the shipped profile without making
 `release` slower to rebuild (18 s against 46 s after a one-line change), so nothing that
-works on ra-jit pays for thin LTO, and nothing that ships goes without it.
+works on blaze pays for thin LTO, and nothing that ships goes without it.
 
 **Not byte for byte.** The recipe, the Rust toolchain, the crates and the profile are the
 same; the C compiler and the linker are not (Ubuntu 22.04's on the runner, nixpkgs' in the
@@ -228,23 +228,23 @@ flake), so the C code (mimalloc, ring) and the layout differ.
 **Found on the way.** The release workflow of the previous section installed the toolchain
 without `rust-src`, so the training daemon would have refused every project and the first
 tagged release would have failed; the `pgo` workflow installs it. The README's `nix profile
-install github:indexable-inc/ra-jit#ra-jit` named a package the flake did not have;
-`packages.ra-jit` is now the daemon. And the archive and the flake's `dist` copied three named
-binaries, missing `ra-jit-rustc-first`, which `cargo ra-jit` runs in a workspace's first build;
-`build_release.py --out` copies every binary cargo reports for ra-jit, so neither keeps a list.
+install github:indexable-inc/blaze#blaze` named a package the flake did not have;
+`packages.blaze` is now the daemon. And the archive and the flake's `dist` copied three named
+binaries, missing `blaze-rustc-first`, which `blaze` runs in a workspace's first build;
+`build_release.py --out` copies every binary cargo reports for blaze, so neither keeps a list.
 
 **Verified** (2026-10-21, `RUST_BACKTRACE` unset). The profiles pinned were trained by the
 `pgo` workflow (run 39640967658, from a throwaway branch: a dispatch needs the workflow on
 main) at code identical to 22b1267233. Linux x86-64 (dev-aws-5): `build_release.py --strict`
 downloads the pinned profile, checks it and builds; `nix build .#dist .#daemon` builds the
-same in 82 s, with the same crate hashes and the same number of symbols of ra-jit (11,236),
+same in 82 s, with the same crate hashes and the same number of symbols of blaze (11,236),
 of `hir_ty` (25,845) and of `serde_json` (1,357), and 7 KB less code; both have all four
-binaries. Under the nix-built ra-jit, `difftest.py corpus --layouts --mixed 8` matches;
-`cargo test --release -p ra-jit` passes (117). With `RUSTC_WORKSPACE_WRAPPER` set the script
+binaries. Under the nix-built blaze, `difftest.py corpus --layouts --mixed 8` matches;
+`cargo test --release -p blaze-engine` passes (117). With `RUSTC_WORKSPACE_WRAPPER` set the script
 builds the same crates. macOS AArch64: `build_release.py --strict` builds (392 s on the loaded
 Mac) and the corpus with `--mixed 8` matches under its binary; `nix build .#dist .#daemon`
 builds with the same crate hashes and all four binaries (1,208 s). `cargo install
---profile dist --path crates/ra-jit` builds and installs all four binaries (Linux). Not run:
+--profile dist --path crates/blaze-engine` builds and installs all four binaries (Linux). Not run:
 the release and pgo workflows on main (the pin job's push to main is untested), Linux AArch64
 beyond the training, the LLVM backend.
 
@@ -267,17 +267,17 @@ standard input until it closes. `lines()` holds the `StdinLock` for the whole lo
 read waited for a lock its own thread held, forever. A daemon that crashed or was killed
 left such a worker running with its memory (2 GB on fd) and its socket, and the next daemon's
 first build fell back to cargo ("another daemon serves"). Fixed in its own commit.
-`cargo_ra_jit.py`'s daemon checks (run alone, macOS): without the fix "the workers of the
+`blaze_cli.py`'s daemon checks (run alone, macOS): without the fix "the workers of the
 killed daemon are gone" and the two checks after it fail, with it they hold. The checks of
 that part that fail with and without it: 16 clients at once running the same program while
 the daemon splices it (on macOS one of them sticks in `_dyld_start` or is killed, signal 9),
-and the three checks of a client of another build of ra-jit replacing the daemon.
+and the three checks of a client of another build of blaze replacing the daemon.
 
 ## Verified
 
 macOS, the `dist` build with the fix, `RUST_BACKTRACE` unset: `difftest.py corpus --layouts
 --mixed 8` and `mixfutures --mixed 16 --layouts` match, `growth.py` and `movedlines.py` pass,
-`cargo test --release -p ra-jit` passes, `cargo test --release -p hir-ide` fails the 18 tests
+`cargo test --release -p blaze-engine` passes, `cargo test --release -p hir-ide` fails the 18 tests
 it fails on main and no other. `build_release.py` ran through on Linux x86-64 (57 billion
 counts, 319 s) and on macOS AArch64 (64 billion counts, 512 s on the loaded Mac), and the
 corpus with `--mixed 8` matches under the macOS binary it made. Not run: Linux AArch64,

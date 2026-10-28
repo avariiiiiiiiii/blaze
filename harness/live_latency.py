@@ -2,9 +2,9 @@
 """Save-to-running latency of live edits (macOS on AArch64, Windows on x86-64), step by step.
 
 usage: live_latency.py [--program probe|life|bevy|egui] [cargo|socket|burst|replay|restart ...]
-       (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are found next to it)
+       (BLAZE_BIN names the blaze built; blaze and blaze-rustc are found next to it)
 
-The program is harness/live (`probe`, the default: a few functions and ra-jit-live), the Game
+The program is harness/live (`probe`, the default: a few functions and blaze-live), the Game
 of Life demo (`life`: demo/life with eframe, a 38 MB debug executable, run without its window
 with BLAZE_LIFE_HEADLESS=1), a bevy app (`bevy`: harness/live-bevy, a simulation of ships,
 rocks and shots on bevy's ECS with generic systems, without a window, one 600-line file, 21 MB)
@@ -13,7 +13,7 @@ every frame without a window, generic widgets, one 580-line file). Each applies 
 arrives, as the demo's window does. It is built and started as live_e2e.py does, then takes
 LATENCY_EDITS edits (default 10) in each mode named:
 
-  cargo   the file is written and `cargo ra-jit build` asks the daemon for the build, as the
+  cargo   the file is written and `blaze build` asks the daemon for the build, as the
           demo's launcher did on each save (its 200 ms mtime poll, 100 ms on average, comes
           on top and is not in these numbers)
   socket  the text goes straight to the daemon (`edit` line on its socket, what the demo's
@@ -38,21 +38,21 @@ LATENCY_EDITS edits (default 10) in each mode named:
           executable, so a newer one has the older's code too). A program told to restart,
           or one whose executable the daemon linked again (`ok object=`: it takes no more
           patches, and is not always told), is started again as a launcher would: `cargo
-          ra-jit build` once an answer says the text on disk builds, then the executable to
+          blaze build` once an answer says the text on disk builds, then the executable to
           its answer; the keys up to the one built are then timed to that. Whether a key that
           was typed over before it was sent compiles is asked of the daemon after the round,
-          off the clock; an error that is ra-jit's (`` `main` is not compiled by ra-jit``)
+          off the clock; an error that is blaze's (`` `main` is not compiled by blaze``)
           and not a diagnostic counts as compiling, and is counted as refused; `no program
           built has <file>` says nothing of the text, which is asked again after the round
           and left out if the daemon still has no program. Every answer goes to the JSON,
           under counts
   restart a session of the program's edits one at a time, mostly bodies and a few changes of
           a type: the edits answered with a restart, and for each the time from the edit to
-          the program started again running it (`cargo ra-jit build`, then the executable to
+          the program started again running it (`blaze build`, then the executable to
           its first answer) against plain incremental `cargo build` of the same source and the
           start of what it built (`cargo run`), in a target directory of its own. An edit the
           daemon refuses though it compiles (bevy's `main`, left to rustc) is restarted the
-          same way, as a launcher would, and counted as refused. A `cargo ra-jit build` that
+          same way, as a launcher would, and counted as refused. A `blaze build` that
           fails is written down as the restart's outcome, cargo's time is still taken, and
           the session ends there
 
@@ -294,7 +294,7 @@ class Program:
 
 
 def copy_program(name: str, work: Path) -> Program:
-    shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
+    shutil.copytree(ROOT / "crates" / "blaze-live", work / "crates" / "blaze-live")
     ignore = shutil.ignore_patterns("target")
     match name:
         case "probe":
@@ -707,8 +707,8 @@ def keystrokes(text: str, ops: list[Op], rng: random.Random) -> Iterator[tuple[s
 
 def builds(answer: str) -> bool | None:
     """Whether the daemon's answer to an edit says its text compiles: `error: ` is an error in
-    the source, as rustc writes it, and says it does not; one that is ra-jit's own (`cargo: `,
-    a function it does not compile, such as `` `main` is not compiled by ra-jit: unsupported:
+    the source, as rustc writes it, and says it does not; one that is blaze's own (`cargo: `,
+    a function it does not compile, such as `` `main` is not compiled by blaze: unsupported:
     ...``, or `failed: `) says nothing against the text, which rustc would build. `no program
     built has <file>` says nothing of the text either way (None): the daemon did not build
     it."""
@@ -730,7 +730,7 @@ def outcome_lines(log: list[str]) -> tuple[list[tuple[int, int]], list[int]]:
 
 async def relaunch(program: Program, live: list[Launched], binary: Path, env: dict[str, str], answered: asyncio.Event | None = None, last: Callable[[], tuple[int, str] | None] = lambda: None) -> tuple[int, int]:
     """Starts the program again, as a launcher that restarts it when told to does: `cargo
-    ra-jit build` of what is on disk, once that builds, then the executable to its answer.
+    blaze build` of what is on disk, once that builds, then the executable to its answer.
     `last` says what was answered last (the key and the answer); a build is tried after an
     answer that is not an error, else after the next; with no answer in 30 s (the typing is
     over) the build's error is the round's. Says the key built and when the build started."""
@@ -740,7 +740,7 @@ async def relaunch(program: Program, live: list[Launched], binary: Path, env: di
         if said is None or (said[1].startswith("ok") and "superseded" not in said[1]):
             key, started = said[0] if said else -1, now_us()
             try:
-                await build("restart: cargo ra-jit build", program.project, env)
+                await build("restart: blaze build", program.project, env)
                 break
             except StepError as error:
                 failed = error
@@ -936,7 +936,7 @@ async def replay(program: Program, live: list[Launched], binary: Path, env: dict
             continue
         counts["keys that compile"] += 1
         if text in refused:
-            counts["keys that compile and ra-jit refused"] += 1
+            counts["keys that compile and blaze refused"] += 1
         later = [(ran[i], sent[i][1], "patch") for i in range(len(sent)) if sent[i][0] >= key and i in ran]
         later += [(it["running"], it["started"], "restart") for it in restarts if it["key"] >= key]
         if not later:
@@ -992,7 +992,7 @@ async def session(program: Program, live: list[Launched], env: dict[str, str], p
         if row["outcome"] in ("restart", "refused"):
             built = now_us()
             try:
-                await build(f"restart {nth}: cargo ra-jit build", program.project, env)
+                await build(f"restart {nth}: blaze build", program.project, env)
             except StepError as error:
                 # The daemon cannot build the source at all: what cargo takes for it is still
                 # timed, and the session ends, since every edit after it builds on it.
@@ -1076,7 +1076,7 @@ async def main(program_name: str, modes: list[str]) -> None:
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(line_buffering=True)
     bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
-    work = Path(tempfile.mkdtemp(prefix="ra-jit-live-latency-"))
+    work = Path(tempfile.mkdtemp(prefix="blaze-live-latency-"))
     target = Path(os.environ.get("LATENCY_TARGET_DIR") or work / "target").resolve()
     meta = metadata(program_name)
     print(f"{meta['host']}")
@@ -1147,7 +1147,7 @@ async def main(program_name: str, modes: list[str]) -> None:
                         if part := [row for row in rows if row["by"] == how]:
                             tables.append(summarize(f"{program.name}, replay: the keys run by a {how}", part, ["total", "queued"]))
                     if restarts:
-                        tables.append(summarize(f"{program.name}, replay: each restart, `cargo ra-jit build` to the program running", [{"total": it["total"]} for it in restarts], ["total"]))
+                        tables.append(summarize(f"{program.name}, replay: each restart, `blaze build` to the program running", [{"total": it["total"]} for it in restarts], ["total"]))
                     by_script = collections.defaultdict(list)
                     for row in rows:
                         by_script[row["script"]].append(row["total"])

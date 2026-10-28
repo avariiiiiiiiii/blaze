@@ -5,7 +5,7 @@
 // panic: panicked at src/main.rs:345:37:
 // index out of bounds: the len is 3 but the index is 17764076402644541682
 // c1 0000000000000000 ok
-// ra-jit:
+// blaze:
 // panic: panicked at src/main.rs:345:24:
 // index out of bounds: the len is 3 but the index is 17764076402644541682
 // c1 0000000000000000 ok

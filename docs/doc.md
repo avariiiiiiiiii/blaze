@@ -1,14 +1,14 @@
-# `cargo blaze doc`
+# `blaze doc`
 
-`cargo blaze doc` (and `blaze doc`) writes the HTML documentation of the packages asked for and
+`blaze doc` (and `blaze doc`) writes the HTML documentation of the packages asked for and
 of what they depend on, as `cargo doc` does, with no rustdoc: blaze writes every page from
 rust-analyzer's HIR (`crates/blaze-doc`). The pages are not rustdoc's byte for byte; they hold
 what rustdoc's hold, look much like them, and work the same way (search, sidebar, themes,
 source pages).
 
 ```sh
-cargo blaze doc --open            # the package and its dependencies, then open its page
-cargo blaze doc --no-deps -p foo  # one package, nothing it depends on
+blaze doc --open            # the package and its dependencies, then open its page
+blaze doc --no-deps -p foo  # one package, nothing it depends on
 ```
 
 ## What it writes
@@ -82,8 +82,8 @@ crate sees (`hashbrown`'s `Equivalent` on `gix_diff::blob::Algorithm`, from `ima
 
 ### The load is one-shot, in the command's process
 
-`cargo blaze doc` loads the workspace in its own process, as the daemon's checker loads it
-(`crate::load` in `crates/ra-jit`, from `crates/ra-jit/src/cargo/own/doc.rs`), writes the pages
+`blaze doc` loads the workspace in its own process, as the daemon's checker loads it
+(`crate::load` in `crates/blaze-engine`, from `crates/blaze-engine/src/cargo/own/doc.rs`), writes the pages
 and exits. It does not ask the daemon: a database for documentation needs every dependency's
 items and bodies' signatures, with `cfg(doc)` set, and a daemon would hold that only for `doc`
 to read once; the one-shot load needs no daemon running and leaves nothing behind.
@@ -122,13 +122,13 @@ Both go when the load stops needing them ([no-rustc.md](no-rustc.md)).
 
 ## How complete it is
 
-`harness/docdiff.py <workspace>` runs the pinned nightly's `cargo doc` and `cargo blaze doc` with
+`harness/docdiff.py <workspace>` runs the pinned nightly's `cargo doc` and `blaze doc` with
 the same flags and compares, for each crate both documented: the item pages, the members and
 impls anchored on pages both have (`method.new`, `impl-Debug-for-Foo`), the intra-doc links
 rustdoc resolved (by their titles), and the `unresolved link` warnings. On the bench apps (each
 with its dependencies; 2026-10-26, dev-aws-8, blaze at 69cbce21f5):
 
-| App | Pages | Members and impls | Resolved links | Warnings rustdoc gives, blaze gives too | `cargo doc` | `cargo blaze doc` |
+| App | Pages | Members and impls | Resolved links | Warnings rustdoc gives, blaze gives too | `cargo doc` | `blaze doc` |
 |---|---|---|---|---|---|---|
 | fd | 12785 of 12787 (100.0%) | 91972 of 92078 (99.9%) | 13340 of 13420 (99.4%) | 1 of 1 | 27.4 s | 7.7 s |
 | ripgrep | 8037 of 8042 (99.9%) | 58477 of 58705 (99.6%) | 6527 of 6588 (99.1%) | 0 of 0 | 5.6 s | 5.9 s |
@@ -136,7 +136,7 @@ with its dependencies; 2026-10-26, dev-aws-8, blaze at 69cbce21f5):
 | helix | 28164 of 28476 (98.9%) | 376345 of 380019 (99.0%) | 54300 of 55013 (98.7%) | 0 of 0 | 149.2 s | 19.0 s |
 | biome | 41563 of 42003 (99.0%) | 1770723 of 1784684 (99.2%) | 218253 of 222469 (98.1%) | 22 of 22, and 3 more | 1028.0 s | 92.5 s |
 
-`cargo doc` starts from an empty target directory; `cargo blaze doc` with its build scripts
+`cargo doc` starts from an empty target directory; `blaze doc` with its build scripts
 already run (the first load also runs them through cargo: fd's first run took 56.6 s, nearly
 all of it that). fd's 7.6 s, at an earlier commit, was 0.75 s of load, 6.3 s of model and
 0.06 s of writing. helix ran with `HELIX_DISABLE_AUTO_GRAMMAR_BUILD=1` on both sides (its
@@ -169,7 +169,7 @@ What blaze still misses or adds, and why:
 
 ## Not done
 
-- Doctests are `cargo blaze test --doc`'s, not this command's.
+- Doctests are `blaze test --doc`'s, not this command's.
 - `--message-format` is refused; `--examples`, `--tests` and `--benches` are not read.
 - No settings page and no `help.html`; the theme follows the system's. Links into the
   standard library point at doc.rust-lang.org's nightly docs, as rustdoc's do with no local

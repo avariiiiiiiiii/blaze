@@ -5,7 +5,7 @@ usage: invalidation.py [crate[,crate...]] [--only TEXT] [--perf DIR] [--check] [
 
 `--only` keeps the scenarios whose name contains TEXT, plus one per entry of BODIES. `--perf`
 records the daemon with `perf` during each edit, into DIR/<n>.data. `--check` compares the object
-the daemon wrote after each edit with the one a new ra-jit process writes from the same source.
+the daemon wrote after each edit with the one a new blaze process writes from the same source.
 `--cargo` has the daemon link the program after each build, times `cargo build` on the same edit
 in a target directory of its own, and compares what the two programs print.
 
@@ -19,13 +19,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["BLAZE_STATS"] = "1"
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs
+from difftest import Fixture, BLAZE, sysroot_rlibs
 from editbench import millis
 
 V = os.path.join(HERE, "vendor")
 A, S = os.path.join(V, "regex-automata/src"), os.path.join(V, "regex-syntax/src")
 B = os.path.join(HERE, "bench2/src")
-BODY = "let _ra_jit_edit = 1u32;"
+BODY = "let _blaze_edit = 1u32;"
 # Edited files are read and written byte for byte: one of them is not text.
 RAW = {"encoding": "latin-1", "newline": ""}
 
@@ -53,7 +53,7 @@ def substitute(path, old, new):
 
 BODIES = [(f"{A}/util/look.rs", 291), (f"{A}/util/sparse_set.rs", 151), (f"{A}/nfa/thompson/builder.rs", 149),
           (f"{A}/meta/strategy.rs", 383), (f"{A}/nfa/thompson/pikevm.rs", 165)]
-NEW_FN = "\n/// Added by the harness.\npub fn ra_jit_new_item(x: u32) -> u32 { x + 1 }\n"
+NEW_FN = "\n/// Added by the harness.\npub fn blaze_new_item(x: u32) -> u32 { x + 1 }\n"
 SCENARIOS = {
     "comment appended to one file": [insert_after(f"{A}/util/look.rs", 10**9, "// edit")],
     "blank line at top of one file": [top(f"{A}/nfa/thompson/builder.rs")],
@@ -76,7 +76,7 @@ SCENARIOS = {
     "upstream crate: new pub fn, called from the binary": [
         insert_after(f"{S}/hir/mod.rs", 10**9, NEW_FN),
         substitute(f"{B}/main.rs", "    let re = Regex::new(",
-                   '    println!("{}", regex_syntax::hir::ra_jit_new_item(41));\n    let re = Regex::new(')],
+                   '    println!("{}", regex_syntax::hir::blaze_new_item(41));\n    let re = Regex::new(')],
     "generic fn with a closure removed, its one call written out": [
         substitute(f"{B}/main.rs", "        show(m.range(), &hay[m.range()]);\n",
                    '        println!("{:?} {}", m.range(), &hay[m.range()]);\n'),
@@ -141,10 +141,10 @@ def main():
     link, cargo_env, cargo_bin = [], None, None
     if a.cargo:
         args = list(fx.link_args)
-        patch = os.path.join(fx.work, "ra-jit.patch.o")
-        objects = [patch] * a.patch + [os.path.join(fx.work, "ra-jit.o")]
-        args = linkline.ahead(args, objects, RA_JIT)
-        fx.binary = args[args.index("-o") + 1] = os.path.join(fx.work, "bin-ra-jit")
+        patch = os.path.join(fx.work, "blaze.patch.o")
+        objects = [patch] * a.patch + [os.path.join(fx.work, "blaze.o")]
+        args = linkline.ahead(args, objects, BLAZE)
+        fx.binary = args[args.index("-o") + 1] = os.path.join(fx.work, "bin-blaze")
         link = ["--link-cmd", shlex.join(args)] + ["--patch", patch] * a.patch
         # cargo as it comes: incremental, and none of the flags the harness builds with.
         cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTFLAGS", "CARGO_INCREMENTAL")}
@@ -163,9 +163,9 @@ def main():
     log_path = os.path.join(fx.work, "daemon.log")
     log_out = open(log_path, "a")
     log = open(log_path)
-    obj = os.path.join(fx.work, "ra-jit.o")
+    obj = os.path.join(fx.work, "blaze.o")
     mismatches = 0
-    daemon = subprocess.Popen([RA_JIT, ws, *crates, "--out", obj, "--watch", *link, *symbols],
+    daemon = subprocess.Popen([BLAZE, ws, *crates, "--out", obj, "--watch", *link, *symbols],
                               stderr=log_out, stdout=log_out)
 
     def wait(pattern, seen):
@@ -241,13 +241,13 @@ def main():
                 row["same"] = (ours.returncode, ours.stdout) == (theirs.returncode, theirs.stdout)
                 mismatches += not row["same"]
                 if not row["same"]:
-                    for who, run in (("ra-jit", ours), ("cargo", theirs)):
+                    for who, run in (("blaze", ours), ("cargo", theirs)):
                         print(f"  {who}: exit {run.returncode}\n" + run.stdout.decode(errors="replace")[-400:], flush=True)
             rows.append(row)
             print(row, flush=True)
             if a.check:
                 scratch = os.path.join(fx.work, "scratch.o")
-                subprocess.run([RA_JIT, ws, *crates, "--out", scratch, *symbols],
+                subprocess.run([BLAZE, ws, *crates, "--out", scratch, *symbols],
                                check=True, capture_output=True)
                 same = open(scratch, "rb").read() == open(obj, "rb").read()
                 print("  from scratch:", "same object" if same else "DIFFERENT OBJECT", flush=True)

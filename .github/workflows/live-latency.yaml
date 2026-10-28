@@ -52,7 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: live-debug
-      - run: cargo build --release -p ra-jit
+      - run: cargo build --release -p blaze-engine
       - name: time edits of a running program
         env:
           LATENCY_EDITS: ${{ inputs.edits || '10' }}
@@ -61,11 +61,11 @@ jobs:
           LATENCY_JSON: ${{ runner.temp }}/latency.json
           BLAZE_BENCH_MACHINE: GitHub macos-15 runner
           BLAZE_IDLE_SECS: "0"
-        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'socket burst replay' }}
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'socket burst replay' }}
       - name: what the workers said
         if: always()
         run: |
-          for log in "$HOME"/.cache/ra-jit/workers/*/log "$HOME"/.cache/ra-jit/spares/*/log; do
+          for log in "$HOME"/.cache/blaze/workers/*/log "$HOME"/.cache/blaze/spares/*/log; do
             [ -f "$log" ] || continue
             echo "::group::$log (filtered)"
             grep -E "request:|timeline-us|apply-us|splice|steps:|asked:|edit-to-binary|link:|live:|panicked|error" "$log" | cut -c1-400 | tail -300 || true
@@ -77,9 +77,9 @@ jobs:
           name: latency-${{ matrix.program }}
           path: |
             ${{ runner.temp }}/latency.json
-            ~/.cache/ra-jit/daemon.log
-            ~/.cache/ra-jit/workers/*/log
-            ~/.cache/ra-jit/spares/*/log
+            ~/.cache/blaze/daemon.log
+            ~/.cache/blaze/workers/*/log
+            ~/.cache/blaze/spares/*/log
           if-no-files-found: warn
 
   history:
@@ -95,7 +95,7 @@ jobs:
         with:
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v8
         with:
           pattern: latency-*

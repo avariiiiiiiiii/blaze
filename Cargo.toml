@@ -1,9 +1,9 @@
 [workspace]
 members = ["crates/*"]
-# `ra-jit-wasm` turns on a feature of `hir-ty-codegen` that swaps the code generator's output, which
+# `blaze-wasm` turns on a feature of `hir-ty-codegen` that swaps the code generator's output, which
 # must not be unified into a build of the native crates.
 exclude = [
-    "crates/ra-jit-wasm",
+    "crates/blaze-wasm",
     "demo",
     "harness",
     "vendor/proc-macro-srv",
@@ -34,7 +34,7 @@ debug = 1
 
 [profile.dev.package]
 # These speed up local tests.
-rowan.opt-level = 3
+syntax-tree.opt-level = 3
 rustc-hash.opt-level = 3
 smol_str.opt-level = 3
 text-size.opt-level = 3
@@ -53,7 +53,7 @@ debug = 2
 
 # The binaries a release ships, built with PGO by .github/scripts/build_release.py
 # (docs/reports/RELEASE-BUILD.md). Thin LTO takes 4-5% off an edit's work in the daemon but
-# makes a rebuild of ra-jit after a one-line change 2.5 times longer, so `release`, which the
+# makes a rebuild of blaze after a one-line change 2.5 times longer, so `release`, which the
 # harnesses and CI build after every change, goes without.
 [profile.dist]
 inherits = "release"
@@ -81,9 +81,9 @@ hir-ty = { path = "crates/hir-ty", version = "0.0.0" }
 hir-ty-borrowck = { path = "crates/hir-ty-borrowck", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
-ra-jit-expand = { path = "crates/ra-jit-expand" }
-ra-jit-macro-wasm = { path = "crates/ra-jit-macro-wasm" }
-ra-jit-store = { path = "crates/ra-jit-store" }
+blaze-expand = { path = "crates/blaze-expand" }
+blaze-macro-wasm = { path = "crates/blaze-macro-wasm" }
+blaze-store = { path = "crates/blaze-store" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-lints = { path = "crates/blaze-lints" }
@@ -93,7 +93,7 @@ blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-tree = { path = "crates/blaze-tree" }
-ra-jit-fuzz = { path = "crates/ra-jit-fuzz" }
+blaze-fuzz = { path = "crates/blaze-fuzz" }
 hir-ide = { path = "crates/hir-ide", version = "0.0.0" }
 ide-db = { path = "crates/ide-db", version = "0.0.0" }
 ide-diagnostics = { path = "crates/ide-diagnostics", version = "0.0.0" }
@@ -122,12 +122,12 @@ ra-ap-rustc_lexer = { version = "0.166", default-features = false }
 ra-ap-rustc_parse_format = { version = "0.166", default-features = false }
 ra-ap-rustc_index = { version = "0.166", default-features = false }
 # rustc's layout code, from the tag of the stable in `harness/toolchain`.
-ra-ap-rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
+rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }
 # The trait solver, with fixes of rustc's backported.
-ra-ap-rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
-ra-ap-rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver", version = "0.0.0", default-features = false }
+rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
+rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver", version = "0.0.0", default-features = false }
 
 # rust-analyzer's libraries, from crates.io
 line-index = { version = "0.1.2" }
@@ -149,7 +149,7 @@ nohash-hasher = "0.2.0"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.9.6", default-features = false }
 rayon = "1.10.0"
-rowan = { path = "crates/rowan", version = "0.0.0" }
+syntax-tree = { path = "crates/syntax-tree", version = "0.0.0" }
 # Ideally we'd not enable the macros feature but unfortunately the `tracked` attribute does not work
 # on impls without it
 salsa = { version = "0.28.5", default-features = false, features = [

@@ -1,4 +1,4 @@
-//! Proc-macro libraries that list their macros in a static, as ra-jit links them (`--shared`),
+//! Proc-macro libraries that list their macros in a static, as blaze links them (`--shared`),
 //! which the toolchain's server does not read: a caller that names a server reading that list
 //! has such libraries expanded by it, and the others by the toolchain's.
 

@@ -88,11 +88,11 @@ The `tests-ui/` files: `nll/polonius/nll-problem-case-3-issue-21906.rs` (+ its `
 
 ## rust-analyzer/ (the borrowck rust-analyzer removed)
 
-Source: `git show ed03b37400^:crates/<path>` in the ra-jit repository. Commit
+Source: `git show ed03b37400^:crates/<path>` in the blaze repository. Commit
 `ed03b3740084da2cb9fc847d0dd7cdf4c97106e3` ("Remove borrowck", Chayim Refael Friedman, parent
 `6817dd3094`) is rust-analyzer's own commit from
 [rust-lang/rust-analyzer#23043](https://github.com/rust-lang/rust-analyzer/pull/23043) ("anti-feat:
-Remove borrowck"), reachable in ra-jit's history through the `vendor/rust-analyzer/` subtree, so its
+Remove borrowck"), reachable in blaze's history through the `vendor/rust-analyzer/` subtree, so its
 paths are `crates/...`. Upstream equivalent, assuming the subtree kept upstream's hashes (not
 checked): `https://github.com/rust-lang/rust-analyzer/blob/6817dd3094203c8bc4911f5799baf897623003de/crates/<path>`.
 Licence: MIT OR Apache-2.0.

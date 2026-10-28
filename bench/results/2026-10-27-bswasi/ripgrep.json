@@ -29,8 +29,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.100",
       "error": null,
       "ms": 3084,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -41,8 +41,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.100",
       "error": null,
       "ms": 8,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/anyhow/4980ba706e2460f7/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -104,8 +104,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.177",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/libc/d2572e8e1ccc8a1f/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/libc/d2572e8e1ccc8a1f/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/libc/d2572e8e1ccc8a1f/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/libc/d2572e8e1ccc8a1f/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -268,8 +268,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.101",
       "error": null,
       "ms": 16,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      },
@@ -286,8 +286,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.101",
       "error": null,
       "ms": 3268,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/proc-macro2/47fb60210eef6815/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -326,8 +326,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.41",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/quote/f3a3a983c61acf2f/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/quote/f3a3a983c61acf2f/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/quote/f3a3a983c61acf2f/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/quote/f3a3a983c61acf2f/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -408,8 +408,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228",
       "error": null,
       "ms": 9,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/serde/743dc653536db2e0/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/serde/743dc653536db2e0/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/serde/743dc653536db2e0/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/serde/743dc653536db2e0/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }
@@ -446,8 +446,8 @@
       "cwd": "/root/bsw/work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.228",
       "error": null,
       "ms": 17,
-      "program": "/root/bsw/work/target/ripgrep/debug/build/serde_core/2bcf76970f22a137/ra-jit-rustc/rustc",
-      "ran": "/root/bsw/work/target/ripgrep/debug/build/serde_core/2bcf76970f22a137/ra-jit-rustc/rustc",
+      "program": "/root/bsw/work/target/ripgrep/debug/build/serde_core/2bcf76970f22a137/blaze-rustc/rustc",
+      "ran": "/root/bsw/work/target/ripgrep/debug/build/serde_core/2bcf76970f22a137/blaze-rustc/rustc",
       "refused": null,
       "status": 0
      }

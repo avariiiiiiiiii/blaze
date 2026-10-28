@@ -1,6 +1,6 @@
 # The borrow checker's time on the bench apps, before and after drop liveness is found as rustc's dropck finds it
 
-Made by `harness/borrowck_speed.py --jobs 1` (one `ra-jit borrowck --project DIR --timings`
+Made by `harness/borrowck_speed.py --jobs 1` (one `blaze-engine borrowck --project DIR --timings`
 per app, see docs/borrowck.md "Speed"), in an arm64 ix VM (32 vCPUs, 32 GiB), inside
 `nix develop`. `before.*` is main d93d0958; `after.*` is main d93d0958 with what dropping a
 type uses found over the strongly connected components of the types it drops, an ADT's part a

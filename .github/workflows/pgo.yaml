@@ -1,6 +1,6 @@
 name: pgo
 
-# Trains the profiles ra-jit is optimized with (PGO), each on the runner its release binary is
+# Trains the profiles blaze is optimized with (PGO), each on the runner its release binary is
 # built on, and pins them: the files go to the `pgo-profiles` release under names that carry
 # their sha256, and a commit to main writes those names and hashes into pgo/profiles.json, which
 # the release workflow and the flake build with (.github/scripts/build_release.py).
@@ -36,7 +36,7 @@ jobs:
   train:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # The instrumented build of ra-jit and the training.
+    # The instrumented build of blaze and the training.
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -50,7 +50,7 @@ jobs:
       # llvm-tools: llvm-profdata, which merges what the instrumented build counted; rust-src:
       # the daemon being trained reads the standard library from it.
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component llvm-tools,rust-src && rustup default "$tc"
-      # lld links the instrumented AArch64 ra-jit, whose code is past a direct call's reach for GNU ld
+      # lld links the instrumented AArch64 blaze, whose code is past a direct call's reach for GNU ld
       # (build_release.py, `train`).
       - if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update -q && sudo apt-get install -yq lld && ld.lld --version
@@ -80,7 +80,7 @@ jobs:
           fetch-depth: 0
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v8
         with:
           pattern: pgo-*
@@ -91,7 +91,7 @@ jobs:
         run: |
           gh release view pgo-profiles --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
             gh release create pgo-profiles --repo "$GITHUB_REPOSITORY" --prerelease --title "PGO profiles" \
-              --notes "The profiles ra-jit's builds are optimized with, one file per toolchain, target and content (pgo/profiles.json pins them by sha256). Not a release of ra-jit."
+              --notes "The profiles blaze's builds are optimized with, one file per toolchain, target and content (pgo/profiles.json pins them by sha256). Not a release of blaze."
           gh release upload pgo-profiles --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP"/pgo/*/*.profdata --clobber
       - name: Pin
         run: |

@@ -1,8 +1,8 @@
 //! Found by the fuzzer (`fuzz/found/differs-panic-location-s1-1-c14.rs`): the column a panic
 //! is reported at. rustc's span of an expression in parentheses starts at the parenthesis, so
-//! an overflow in `(a + b) * c` is at the `(`; ra-jit reported the `a`. An index that is built
+//! an overflow in `(a + b) * c` is at the `(`; blaze reported the `a`. An index that is built
 //! in (an array or a slice by a `usize`) is reported from where the indexed expression
-//! starts, and only one through `Index` (a `Vec`, a range) from its bracket; ra-jit reported
+//! starts, and only one through `Index` (a `Vec`, a range) from its bracket; blaze reported
 //! the bracket for both. Parentheses a macro puts around what it was passed are not part of
 //! the span, and a method call is reported from its name whatever is around it.
 

@@ -40,12 +40,12 @@ field for the repository).
 
 `1.99.0_encoder_should_encode_mir.rs`: excerpt, lines 1095 to 1135 of
 `https://raw.githubusercontent.com/rust-lang/rust/1.99.0/compiler/rustc_metadata/src/rmeta/encoder.rs`
-(tag `1.99.0` = `daa8d75bc715f77869fa06d80b6ea1a3fe52d38e`, the toolchain ra-jit pins). MIT OR
+(tag `1.99.0` = `daa8d75bc715f77869fa06d80b6ea1a3fe52d38e`, the toolchain blaze pins). MIT OR
 Apache-2.0.
 
 ## salsa/
 
-From the crates.io release `salsa-0.28.5` in cargo's registry cache, the version in ra-jit's
+From the crates.io release `salsa-0.28.5` in cargo's registry cache, the version in blaze's
 `Cargo.lock`. MIT OR Apache-2.0.
 
 | file | what |

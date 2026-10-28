@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""wasmsections.py: the custom sections of a wasm object ra-jit writes are rustc's.
+"""wasmsections.py: the custom sections of a wasm object blaze writes are rustc's.
 
 A `#[link_section]` static is a custom section of the module on wasm, which wasm-bindgen and
-the like read. Builds `harness/wasmsections` with rustc and with ra-jit for each wasm target
+the like read. Builds `harness/wasmsections` with rustc and with blaze for each wasm target
 and compares the custom sections of the two objects, leaving out the linker's own and those of
 tools.
 
 usage: wasmsections.py [target ...]   (default: wasm32-unknown-unknown wasm32-wasip1)
 """
 import os, subprocess, sys, tempfile
-from difftest import RA_JIT
+from difftest import BLAZE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "wasmsections")
@@ -53,15 +53,15 @@ def sysroot_rlibs(target):
 
 
 def check(target, work):
-    theirs, ours = os.path.join(work, f"{target}.rustc.o"), os.path.join(work, f"{target}.ra-jit.o")
+    theirs, ours = os.path.join(work, f"{target}.rustc.o"), os.path.join(work, f"{target}.blaze.o")
     subprocess.run(["rustc", "--edition", "2024", "--crate-type", "lib", "--crate-name", "wasmsections",
                     "--emit", f"obj={theirs}", "--target", target, os.path.join(FIXTURE, "src/lib.rs")],
                    check=True)
     symbols = [x for rlib in sysroot_rlibs(target) for x in ("--symbols", rlib)]
-    run = subprocess.run([RA_JIT, FIXTURE, "--crate", "wasmsections", "--out", ours, "--target", target, *symbols],
+    run = subprocess.run([BLAZE, FIXTURE, "--crate", "wasmsections", "--out", ours, "--target", target, *symbols],
                          capture_output=True, text=True)
     if run.returncode != 0:
-        print(f"{target}: ra-jit failed\n{run.stderr[-3000:]}")
+        print(f"{target}: blaze failed\n{run.stderr[-3000:]}")
         return False
     want, got = custom_sections(theirs), custom_sections(ours)
     if want == got:
@@ -70,7 +70,7 @@ def check(target, work):
     print(f"{target}: DIFFERENT")
     for name in sorted(set(want) | set(got)):
         if want.get(name) != got.get(name):
-            print(f"  {name}: rustc {want.get(name)!r}, ra-jit {got.get(name)!r}")
+            print(f"  {name}: rustc {want.get(name)!r}, blaze {got.get(name)!r}")
     return False
 
 

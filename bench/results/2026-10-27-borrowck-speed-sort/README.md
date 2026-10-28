@@ -1,6 +1,6 @@
 # The borrow checker's time on the bench apps, before and after the order drop live locals are walked in is found once per local
 
-Made by `harness/borrowck_speed.py --jobs 1` (one `ra-jit borrowck --project DIR --timings`
+Made by `harness/borrowck_speed.py --jobs 1` (one `blaze-engine borrowck --project DIR --timings`
 per app, see docs/borrowck.md "Speed"), in an arm64 ix VM (32 vCPUs, 32 GiB), inside
 `nix develop`. `before.*` is main 7cd0efbb; `after.*` is main 7cd0efbb with the key drop live
 locals are sorted by, the first point a walk meets each at, found once per local

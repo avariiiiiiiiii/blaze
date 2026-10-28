@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""storeshared.py: several daemons and `ra-jit cache` commands on one store at once.
+"""storeshared.py: several daemons and `blaze-engine cache` commands on one store at once.
 
 Every daemon has a checkout of its own and all of them have the same store. They are edited
 and asked for their programs at the same time, with states of the workspace that the others
@@ -8,7 +8,7 @@ seal packs side by side and read each other's.
 
 First with room for everything: afterwards a daemon that has compiled nothing has to find
 nearly all of its code in what the others sealed. Then with a store that is far too small,
-while `ra-jit cache gc` evicts and merges in a loop and `ra-jit cache verify` reads the store
+while `blaze-engine cache gc` evicts and merges in a loop and `blaze-engine cache verify` reads the store
 in a loop: every program has to print what cargo's does, and verify must never find a pack
 that is not what was written.
 
@@ -93,7 +93,7 @@ def found(daemon):
 
 def main():
     start = time.time()
-    work = scratch("ra-jit-storeshared-")
+    work = scratch("blaze-storeshared-")
     store = os.path.join(work, "store")
     checkouts = [Checkout(work, f"checkout{n}") for n in range(DAEMONS + 1)]
     # cargo's builds of every state, before anything runs at once.

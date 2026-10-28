@@ -1,5 +1,5 @@
 //! rapidhash and brotli-decompressor test their command line tools, which cargo builds for
-//! the tests and names in `CARGO_BIN_EXE_<name>`. ra-jit did not know the variable, and ran a
+//! the tests and names in `CARGO_BIN_EXE_<name>`. blaze did not know the variable, and ran a
 //! program named for the lack of it.
 
 use std::process::Command;

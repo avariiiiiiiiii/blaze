@@ -1,7 +1,7 @@
 //! Found by the fuzzer: what `assert!` says when it fails. The message is the condition as
 //! rustc's pretty printer writes it back, which breaks a condition longer than a line over
-//! several lines and indents them. ra-jit writes the condition on one line. Open: it needs
-//! rustc's printer (`rustc_ast_pretty`), which is not a crate ra_jit can depend on.
+//! several lines and indents them. blaze writes the condition on one line. Open: it needs
+//! rustc's printer (`rustc_ast_pretty`), which is not a crate blaze can depend on.
 
 use std::hint::black_box;
 use std::panic::{AssertUnwindSafe, catch_unwind};

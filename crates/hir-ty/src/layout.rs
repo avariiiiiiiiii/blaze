@@ -86,7 +86,7 @@ pub enum LayoutError {
     NotImplemented,
     RecursiveTypeWithoutIndirection,
     /// A scalable vector in a struct, enum, tuple, array or closure: rustc lays it out at the
-    /// least vector length, which ra-jit's code does not keep it at.
+    /// least vector length, which blaze's code does not keep it at.
     ScalableVectorField,
     TargetLayoutNotAvailable,
     Unknown,

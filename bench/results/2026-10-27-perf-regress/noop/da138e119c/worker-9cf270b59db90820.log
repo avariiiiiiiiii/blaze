@@ -11,7 +11,7 @@ stats: 7529 of 31233 functions compiled, 23704 reused
 phases: compile 132.1ms, resolve 200.4ms, define 215.6ms, fallback 5.1ms, object 378.0ms, 1 rounds
 link: 217.6ms (exit status: 0; not spliced: no executable to add to)
 watching 135 files
-tier: off (BLAZE_TIER=off, ra-jit built without `--features llvm`, or not macOS on AArch64)
+tier: off (BLAZE_TIER=off, blaze built without `--features llvm`, or not macOS on AArch64)
 request: sync at_us=1793146857158522
 request: sync at_us=1793146857185658
 request: sync at_us=1793146858008367

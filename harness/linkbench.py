@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """linkbench.py ARGS LINKERS WHAT [N]: times variations of one link line, run without the compiler driver.
 
-ARGS holds the linker's arguments one per line, with ra-jit's `*.patch.o` right before its whole object
+ARGS holds the linker's arguments one per line, with blaze's `*.patch.o` right before its whole object
 (recorded by putting a script that writes its arguments in place of `ld` under `cc -B`).
 LINKERS is `name=/path/to/ld,...`. WHAT is one of:
 

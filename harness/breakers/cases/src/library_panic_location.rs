@@ -1,6 +1,6 @@
 //! tests/ui/iterators/iter-sum-overflow-debug.rs: a panic in code of the standard library
 //! that is compiled into the crate, as `Iterator::sum` is, names the file where the sources
-//! are installed. ra-jit named it `/rustc/<commit>/..`, which is where the library was built
+//! are installed. blaze named it `/rustc/<commit>/..`, which is where the library was built
 //! and what only the code inside the built library says.
 
 use std::panic::catch_unwind;

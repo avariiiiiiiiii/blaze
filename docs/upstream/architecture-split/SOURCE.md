@@ -7,7 +7,7 @@ became `_`.
 ## rustc-1.99.0/ (how rustc splits the compiler into crates)
 
 Source: `https://raw.githubusercontent.com/rust-lang/rust/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/<path>`,
-the 1.99.0 release, the toolchain ra-jit pins. Licence: MIT OR Apache-2.0. Verbatim.
+the 1.99.0 release, the toolchain blaze pins. Licence: MIT OR Apache-2.0. Verbatim.
 
 | file | `<path>` |
 |---|---|
@@ -35,8 +35,8 @@ rust-analyzer's architecture document is not copied here: it is in the tree, at
 
 ## measured/ (produced here, not fetched)
 
-From a scratch bare repository with blobless fetches of `indexable-inc/rust-analyzer` `ra-jit`
-(at `c0dabc5588`), `rust-lang/rust-analyzer` `master` (at `ea09c7b724`, 2026-10-21) and ra-jit
+From a scratch bare repository with blobless fetches of `indexable-inc/rust-analyzer` `blaze`
+(at `c0dabc5588`), `rust-lang/rust-analyzer` `master` (at `ea09c7b724`, 2026-10-21) and blaze
 `main` (at `22b1267233`). The merge base of the fork and upstream is `0b21bd6596` (2026-10-20),
 the upstream commit the 2026-10-20 merge took.
 
@@ -44,5 +44,5 @@ the upstream commit the 2026-10-20 merge took.
 |---|---|
 | `vendor-numstat.txt` | `git diff --numstat 0b21bd6596 <main>:vendor/rust-analyzer` |
 | `vendor-new-files.txt` | the same with `--diff-filter=A --name-only` |
-| `upstream-churn.txt` | for each file of `vendor-numstat.txt` that upstream has: `git rev-list --count --no-merges --since=2026-04-21 <upstream master> -- <file>`, then ra-jit's added and removed lines |
-| `rebuild-times.txt` | on the M5 Max (18 cores) under the load of other lanes (the load averages are in each line): for each file, twice, append a comment line, `/usr/bin/time -p cargo build --release -p ra-jit` with Rust 1.99.0, restore the file, rebuild. `cpu` is user plus system seconds, `crates` the ones cargo compiled. `before` is `main` at `5f26408566`; `after` is the `codegen-crate` branch before it was rebased over step 4, so the borrow checker was still a module of `hir-ty` in both; `after-step3` is the `store-crate` branch on `main` after steps 2 and 4 |
+| `upstream-churn.txt` | for each file of `vendor-numstat.txt` that upstream has: `git rev-list --count --no-merges --since=2026-04-21 <upstream master> -- <file>`, then blaze's added and removed lines |
+| `rebuild-times.txt` | on the M5 Max (18 cores) under the load of other lanes (the load averages are in each line): for each file, twice, append a comment line, `/usr/bin/time -p cargo build --release -p blaze-engine` with Rust 1.99.0, restore the file, rebuild. `cpu` is user plus system seconds, `crates` the ones cargo compiled. `before` is `main` at `5f26408566`; `after` is the `codegen-crate` branch before it was rebased over step 4, so the borrow checker was still a module of `hir-ty` in both; `after-step3` is the `store-crate` branch on `main` after steps 2 and 4 |

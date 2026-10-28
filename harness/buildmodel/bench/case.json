@@ -10,7 +10,7 @@
     "speed"
   ],
   "verb": "bench",
-  "ra-jit": [
+  "blaze": [
     "--dev-deps",
     "--profile",
     "bench"

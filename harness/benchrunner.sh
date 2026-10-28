@@ -14,7 +14,7 @@
 # the platform (the machine's own, checked) and the name of the machine for the results
 # (BLAZE_BENCH_MACHINE). One argument is the name, on linux-x86-64, as before there were
 # platforms. Installs the runner in ~/actions-runner and runs it at boot: on Linux from a user
-# systemd unit, ra-jit-bench-runner.service, that lingers; on macOS as the runner's own launchd
+# systemd unit, blaze-bench-runner.service, that lingers; on macOS as the runner's own launchd
 # service (svc.sh), which needs the user logged in, and the Mac kept from sleeping.
 # Needs curl, tar and Nix with flakes; on NixOS the runner's own binaries run through nix-ld.
 # Run again to re-register (--replace keeps the name). Then add the platform to the repository
@@ -57,9 +57,9 @@ if [ "$(uname -s)" = Darwin ]; then
   exit 0
 fi
 mkdir -p "$HOME/.config/systemd/user"
-cat > "$HOME/.config/systemd/user/ra-jit-bench-runner.service" <<EOF
+cat > "$HOME/.config/systemd/user/blaze-bench-runner.service" <<EOF
 [Unit]
-Description=GitHub Actions runner for ra-jit benchmarks ($label)
+Description=GitHub Actions runner for blaze benchmarks ($label)
 After=network-online.target
 
 [Service]
@@ -74,6 +74,6 @@ RestartSec=10
 WantedBy=default.target
 EOF
 systemctl --user daemon-reload
-systemctl --user enable --now ra-jit-bench-runner.service
+systemctl --user enable --now blaze-bench-runner.service
 loginctl enable-linger "$USER" 2>/dev/null || sudo loginctl enable-linger "$USER"
-systemctl --user --no-pager status ra-jit-bench-runner.service | head -5
+systemctl --user --no-pager status blaze-bench-runner.service | head -5

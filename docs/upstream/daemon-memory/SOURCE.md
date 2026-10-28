@@ -1,7 +1,7 @@
 # docs/upstream/daemon-memory: what was read, from where, when
 
 Read on **2026-10-21** for [docs/research/daemon-memory.md](../../research/daemon-memory.md).
-Excerpts of salsa 0.28.5, the version ra-jit's `Cargo.toml` pins, as cargo unpacked it from
+Excerpts of salsa 0.28.5, the version blaze's `Cargo.toml` pins, as cargo unpacked it from
 crates.io (`~/.cargo/registry/src/index.crates.io-*/salsa-0.28.5`). Licence: MIT OR
 Apache-2.0. Verbatim; each file name says the upstream file and its lines, with `/` as `_` and
 `.txt` added so no Rust tool reads them.
@@ -14,7 +14,7 @@ Apache-2.0. Verbatim; each file name says the upstream file and its lines, with 
 | `salsa-0.28.5_src_function_execute.rs-364-396.rs.txt` | `previous_iteration`: such a memo without a value is taken for a cycle head that panicked, and `Cancelled::PropagatedPanic` is thrown |
 | `salsa-0.28.5_src_function_execute.rs-510-562.rs.txt` | `PoisonProvisionalIfPanicking`: the memo a panic leaves has a `fixpoint_initial` origin, which an evicted memo does not |
 
-Written here on **2026-10-22** for [#57](https://github.com/indexable-inc/ra-jit/issues/57), not
+Written here on **2026-10-22** for [#57](https://github.com/indexable-inc/blaze/issues/57), not
 fetched:
 
 | file | what it is |

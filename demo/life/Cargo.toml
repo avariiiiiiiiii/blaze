@@ -7,8 +7,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-ra-jit-live = { path = "../../crates/ra-jit-live" }
+blaze-live = { path = "../../crates/blaze-live" }
 eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
 
-# Not part of the ra-jit workspace: it has its own lock and its own unit graph.
+# Not part of the blaze workspace: it has its own lock and its own unit graph.
 [workspace]

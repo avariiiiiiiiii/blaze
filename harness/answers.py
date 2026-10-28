@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""answers.py: ra-jit answers rustc's questions (`-vV`, `--print cfg`, cargo's probe of file
+"""answers.py: blaze answers rustc's questions (`-vV`, `--print cfg`, cargo's probe of file
 names, `target-spec-json` and the rest) without running rustc, byte for byte as the pinned
-rustc answers them. This compares the two on every target ra-jit has the answers of, under the
+rustc answers them. This compares the two on every target blaze has the answers of, under the
 arguments and variables cargo and rust-analyzer ask with (docs/no-rustc.md, step B).
 
-    answers.py           compare ra-jit's answers with rustc's; a difference fails
-    answers.py --write   write what rustc answers into ra-jit's data, after a toolchain bump
+    answers.py           compare blaze's answers with rustc's; a difference fails
+    answers.py --write   write what rustc answers into blaze's data, after a toolchain bump
 
-ra-jit's answers are crates/ra-jit/src/answers/rustc.json, of the toolchain in harness/toolchain.
+blaze's answers are crates/blaze-engine/src/answers/rustc.json, of the toolchain in harness/toolchain.
 Another toolchain is asked once per question and its answers are kept, as before. The target specs
 depend on the host rustc was built for (x86-64 Linux's links with its own lld): --write keeps
 those of the other hosts and writes this host's, so it is run on each host CI has (Linux
@@ -19,9 +19,9 @@ import norustc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-DATA = os.path.join(ROOT, "crates/ra-jit/src/answers", "rustc.json")
+DATA = os.path.join(ROOT, "crates/blaze-engine/src/answers", "rustc.json")
 TARGETS = [
     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin",
@@ -29,7 +29,7 @@ TARGETS = [
     "wasm32-unknown-unknown", "wasm32-wasip1", "wasm32-wasip2",
 ]
 CRATE_TYPES = ["bin", "lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"]
-# What changes the cfgs rustc prints beyond the target's own; ra-jit adds these itself.
+# What changes the cfgs rustc prints beyond the target's own; blaze adds these itself.
 GIVEN = ("debug_assertions", "overflow_checks", "ub_checks", "panic=")
 PROBE = ["-", "--crate-name", "___", "--print=file-names", "--crate-type", "bin", "--crate-type", "rlib",
          "--crate-type", "dylib", "--crate-type", "cdylib", "--crate-type", "staticlib",
@@ -78,7 +78,7 @@ def features_of(rust, t, base):
     """What `-C target-cpu` and `-C target-feature` do to a target's `target_feature` cfgs, on the
     nightly: each CPU's, by the index of the set it has; each feature rustc names (+f, without a
     warning) and each feature only LLVM names (for `target-cpu=native`'s host features), by those
-    it turns on beside the target's own. A CPU or feature rustc warns of is left out: ra-jit refuses it."""
+    it turns on beside the target's own. A CPU or feature rustc warns of is left out: blaze refuses it."""
     nightly = {"RUSTC_BOOTSTRAP": "1"}
     listed = ask([rust, "--print", "target-features", *t], nightly)[1]
     rustcs, llvms, section = [], [], None
@@ -248,11 +248,11 @@ def features_asked(rust):
 def check():
     rust = rustc()
     if not os.path.exists(DATA):
-        print(f"ra-jit has no answers of rustc {TOOLCHAIN}: answers.py --write writes them")
+        print(f"blaze has no answers of rustc {TOOLCHAIN}: answers.py --write writes them")
         sys.exit(1)
     data = json.load(open(DATA))
     host = next(line.split(": ", 1)[1] for line in said(rust, ["-vV"]).splitlines() if line.startswith("host: "))
-    home = tempfile.mkdtemp(prefix="ra-jit-answers-")
+    home = tempfile.mkdtemp(prefix="blaze-answers-")
     wrong, answered, unknown = [], 0, {}
 
     def compared(question):
@@ -265,11 +265,11 @@ def check():
             if host not in data["targets"].get(target, {}).get("target_spec_json", {}):
                 # rustc is asked, once per toolchain.
                 return "unknown", target, want[1]
-        got = ask([RA_JIT, "rustc-wrapper", rust, *args],
+        got = ask([BLAZE, "rustc-wrapper", rust, *args],
                   {**variables, "BLAZE_HOME": home, "BLAZE_ANSWERS": "own"}, stdin)
         return "asked", (args, variables, want[1], got), got[:2] == want[:2]
 
-    work = tempfile.mkdtemp(prefix="ra-jit-answers-", dir="/tmp" if sys.platform == "darwin" else None)
+    work = tempfile.mkdtemp(prefix="blaze-answers-", dir="/tmp" if sys.platform == "darwin" else None)
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
         results = list(pool.map(compared, questions(work)))
     shutil.rmtree(work, ignore_errors=True)
@@ -283,10 +283,10 @@ def check():
         if not result[2]:
             wrong.append(result[1])
     for args, variables, want, (code, out, err) in wrong:
-        print(f"DIFFERS: {' '.join(args)} {variables or ''}: exit {code}\n  rustc:  {want!r}\n  ra-jit: {out!r} {err.strip()}")
-    print(f"{answered - len(wrong)} of {answered} questions answered by ra-jit as rustc {TOOLCHAIN} answers them")
+        print(f"DIFFERS: {' '.join(args)} {variables or ''}: exit {code}\n  rustc:  {want!r}\n  blaze: {out!r} {err.strip()}")
+    print(f"{answered - len(wrong)} of {answered} questions answered by blaze as rustc {TOOLCHAIN} answers them")
     if unknown:
-        print(f"ra-jit has not the target specs of rustc on {host}, which rustc is asked for; "
+        print(f"blaze has not the target specs of rustc on {host}, which rustc is asked for; "
               f"answers.py --write on this host adds them:\n{json.dumps(unknown)}")
     if wrong:
         sys.exit(1)

@@ -1,11 +1,11 @@
-"""linkline.py: a link line with ra-jit's objects ahead of what rustc built of the same crates.
+"""linkline.py: a link line with blaze's objects ahead of what rustc built of the same crates.
 
-Both define the same names, and ra-jit's have to be the ones that stay. An ELF linker keeps the
+Both define the same names, and blaze's have to be the ones that stay. An ELF linker keeps the
 first definition when told to, and so does a linker of the `link.exe` kind. Apple's linker has no flag for it, so there rustc's objects and
-archives are replaced by copies whose definitions are weak (`ra-jit weaken`): a weak definition
+archives are replaced by copies whose definitions are weak (`blaze-engine weaken`): a weak definition
 gives way to one that is not, and to a weak one before it on the line. On ELF they are replaced
-by the copies the daemon links (`ra-jit weaken --shared`), whose statics private to an object
-ra-jit's code can refer to.
+by the copies the daemon links (`blaze-engine weaken --shared`), whose statics private to an object
+blaze's code can refer to.
 """
 import os, shlex, subprocess, sys
 
@@ -53,7 +53,7 @@ def wasm(link):
 
 
 def allowing_duplicates(wasm):
-    """What an ELF or wasm link line gets after ra-jit's objects. A wasm module that edits are
+    """What an ELF or wasm link line gets after blaze's objects. A wasm module that edits are
     spliced into has to keep its symbol table, as it names nothing but its exports otherwise,
     and keeps what nothing calls yet, as an edit may. `BLAZE_LINK_ARGS` is what it gets
     instead of those."""
@@ -62,7 +62,7 @@ def allowing_duplicates(wasm):
     return [allow, *shlex.split(os.environ.get("BLAZE_LINK_ARGS", spliced))]
 
 
-def ahead(link, objects, ra_jit):
+def ahead(link, objects, blaze):
     """`link` with `objects` before rustc's, and the linker told that the first definition stays."""
     link = list(link)
     first = first_of_rustc(link)
@@ -75,9 +75,9 @@ def ahead(link, objects, ra_jit):
     # The library of the toolchain defines nothing a workspace crate does.
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
     theirs = [i for i, a in enumerate(link) if a.endswith(THEIRS) and not a.startswith(sysroot)]
-    # On ELF, copies whose statics private to an object are ones ra-jit's code can refer to,
-    # as the daemon links them (`weaken::shared`); ra-jit takes rustc's copy to be linkable.
-    weaken = [ra_jit, "weaken"] if MACHO else [ra_jit, "weaken", "--shared"]
+    # On ELF, copies whose statics private to an object are ones blaze's code can refer to,
+    # as the daemon links them (`weaken::shared`); blaze takes rustc's copy to be linkable.
+    weaken = [blaze, "weaken"] if MACHO else [blaze, "weaken", "--shared"]
     copies = subprocess.check_output([*weaken, *(link[i] for i in theirs)], text=True).splitlines()
     for i, copy in zip(theirs, copies):
         link[i] = copy

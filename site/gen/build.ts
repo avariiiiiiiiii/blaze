@@ -40,7 +40,7 @@ import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
-import { ANIMALS, sprite } from './animals';
+import { ANIMALS, ROBOT, sprite, symbolId } from './animals';
 import { benchScript } from './bench';
 import { glyphSvg } from './glyphs';
 import { highlight } from './highlight';
@@ -263,14 +263,14 @@ function ortFiles(): { mjs: string; parts: string[] } {
 /**
  * The anonymous readers' animals (gen/animals.ts) as one sprite, dist/animals/<hash>.svg, named by its content so a
  * browser may keep it; what the client gets as `BLAZE_ANIMALS` (client/lib/presence.ts): the sprite's path under the
- * base and the names, in order.
+ * base, the names, in order, and the robot's symbol (a bot's face).
  */
-function animalSprite(): { sprite: string; names: string[] } {
+function animalSprite(): { sprite: string; names: string[]; robot: string } {
 	const svg = sprite();
 	const name = `animals/${createHash('sha256').update(svg).digest('hex').slice(0, 16)}.svg`;
 	rmSync(path.join(dist, 'animals'), { recursive: true, force: true });
 	write(path.join(dist, name), svg);
-	return { sprite: name, names: ANIMALS.map((a) => a.name) };
+	return { sprite: name, names: ANIMALS.map((a) => a.name), robot: symbolId(ROBOT.name) };
 }
 
 function write(file: string, data: string | Uint8Array) {

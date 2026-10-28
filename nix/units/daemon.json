@@ -683,7 +683,7 @@
      "tango-bench"
     ],
     "name": "blaze-bench",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -695,7 +695,7 @@
      "serde_json"
     ],
     "name": "blaze-build-script",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -787,7 +787,7 @@
      "zstd"
     ],
     "name": "blaze-cargo",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -810,7 +810,7 @@
      "vfs"
     ],
     "name": "blaze-doc",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -875,7 +875,7 @@
      "zstd"
     ],
     "name": "blaze-engine",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -892,7 +892,7 @@
      "tt"
     ],
     "name": "blaze-expand",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -917,18 +917,18 @@
      "unicode-width 0.1.14"
     ],
     "name": "blaze-fmt",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "name": "blaze-fuzz",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
      "libc"
     ],
     "name": "blaze-in-place",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -948,7 +948,7 @@
      "toml"
     ],
     "name": "blaze-lints",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "name": "blaze-live",
@@ -971,7 +971,7 @@
      "wasmtime"
     ],
     "name": "blaze-macro-wasm",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -993,7 +993,7 @@
      "url"
     ],
     "name": "blaze-manifest",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1011,7 +1011,7 @@
      "url"
     ],
     "name": "blaze-metadata",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1022,7 +1022,7 @@
      "toml_edit"
     ],
     "name": "blaze-new",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1031,7 +1031,7 @@
      "serde"
     ],
     "name": "blaze-protocol",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1061,7 +1061,7 @@
      "url"
     ],
     "name": "blaze-registry",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1079,7 +1079,7 @@
      "url"
     ],
     "name": "blaze-resolve",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1091,7 +1091,7 @@
      "url"
     ],
     "name": "blaze-source",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1108,7 +1108,7 @@
      "wasmparser 0.236.1"
     ],
     "name": "blaze-splice",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1122,7 +1122,7 @@
      "zstd"
     ],
     "name": "blaze-store",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1133,14 +1133,14 @@
      "rustc-hash 2.1.2"
     ],
     "name": "blaze-tree",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
      "blaze-protocol"
     ],
     "name": "blaze-ui",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1154,7 +1154,7 @@
      "serde_json"
     ],
     "name": "blaze-units",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -1163,7 +1163,7 @@
      "wasmtime-wasi"
     ],
     "name": "blaze-wasi",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "checksum": "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71",
@@ -2577,7 +2577,7 @@
      "wasm-encoder 0.244.0"
     ],
     "name": "hir-ty-codegen",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    {
     "dependencies": [
@@ -7085,7 +7085,7 @@
     "license": "MIT OR Apache-2.0",
     "repository": "https://github.com/indexable-inc/blaze",
     "rust-version": "1.101",
-    "version": "0.20261028.1"
+    "version": "0.20261028.2"
    },
    "resolver": "2"
   }
@@ -7890,7 +7890,7 @@
    },
    "version": "2.1.0"
   },
-  "blaze-bench@0.20261028.1": {
+  "blaze-bench@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "Microbenchmarks of blaze's hot paths, run by tango in pairs: a change against its base",
    "homepage": "",
@@ -7905,9 +7905,9 @@
     "dir": "crates/blaze-bench",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-build-script@0.20261028.1": {
+  "blaze-build-script@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "Build scripts run as cargo runs them: the environment cargo 1.99 gives a script, what it prints read as cargo reads it, and who receives what",
    "homepage": "",
@@ -7922,7 +7922,7 @@
     "dir": "crates/blaze-build-script",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
   "blaze-cache-macros@0.1.0": {
    "authors": "Indexable, Inc.",
@@ -7958,7 +7958,7 @@
    },
    "version": "0.1.0"
   },
-  "blaze-cargo@0.20261028.1": {
+  "blaze-cargo@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze's cargo: the commands, the daemon and its client, plans, the sandbox and the remote store",
    "homepage": "https://ix.dev/blaze",
@@ -7973,9 +7973,9 @@
     "dir": "crates/blaze-cargo",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-doc@0.20261028.1": {
+  "blaze-doc@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "HTML documentation of a workspace and its dependencies, written by blaze from rust-analyzer's HIR, with no rustdoc",
    "homepage": "",
@@ -7990,9 +7990,9 @@
     "dir": "crates/blaze-doc",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-engine@0.20261028.1": {
+  "blaze-engine@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze: cargo build, test and run from a daemon that keeps your workspace compiled, with live edits",
    "homepage": "https://ix.dev/blaze",
@@ -8007,9 +8007,9 @@
     "dir": "crates/blaze-engine",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-expand@0.20261028.1": {
+  "blaze-expand@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze's proc-macro expansions kept in the store, so that a daemon that loads a workspace again expands no macro it expanded before",
    "homepage": "",
@@ -8024,9 +8024,9 @@
     "dir": "crates/blaze-expand",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-fmt@0.20261028.1": {
+  "blaze-fmt@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "rustfmt owned by blaze: rustfmt's formatting over rust-analyzer's syntax trees, with no rustc crates",
    "homepage": "",
@@ -8041,9 +8041,9 @@
     "dir": "crates/blaze-fmt",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-fuzz@0.20261028.1": {
+  "blaze-fuzz@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "Changed and made-up inputs for the tests of what reads the store, and how much memory a read asks for",
    "homepage": "",
@@ -8058,9 +8058,9 @@
     "dir": "crates/blaze-fuzz",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-in-place@0.20261028.1": {
+  "blaze-in-place@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "Waiting for and copying an executable blaze splices edits into in place",
    "homepage": "https://ix.dev/blaze",
@@ -8075,9 +8075,9 @@
     "dir": "crates/blaze-in-place",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-lints@0.20261028.1": {
+  "blaze-lints@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "clippy's lints, owned by blaze: computed from rust-analyzer's analysis, with clippy's names, levels, groups, configuration and messages",
    "homepage": "",
@@ -8092,7 +8092,7 @@
     "dir": "crates/blaze-lints",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
   "blaze-live@0.1.0": {
    "authors": "Indexable, Inc.",
@@ -8111,7 +8111,7 @@
    },
    "version": "0.1.0"
   },
-  "blaze-macro-wasm@0.20261028.1": {
+  "blaze-macro-wasm@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "Proc macros compiled to WebAssembly and run by blaze under Wasmtime, as dtolnay's watt runs them: the `proc_macro` that stands in for the standard library's there, and the host it asks",
    "homepage": "",
@@ -8126,9 +8126,9 @@
     "dir": "crates/blaze-macro-wasm",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-manifest@0.20261028.1": {
+  "blaze-manifest@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "Cargo.toml and .cargo/config.toml read as the pinned nightly's cargo reads them",
    "homepage": "",
@@ -8143,9 +8143,9 @@
     "dir": "crates/blaze-manifest",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-metadata@0.20261028.1": {
+  "blaze-metadata@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "cargo metadata with its resolve, made by blaze: the workspace read by blaze-manifest, the lock file's packages fetched by blaze-registry, resolved by blaze-resolve",
    "homepage": "",
@@ -8160,9 +8160,9 @@
     "dir": "crates/blaze-metadata",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-new@0.20261028.1": {
+  "blaze-new@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "cargo new and cargo init, made by blaze: the package's manifest, source, ignore file and repository written as cargo writes them",
    "homepage": "",
@@ -8177,9 +8177,9 @@
     "dir": "crates/blaze-new",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-protocol@0.20261028.1": {
+  "blaze-protocol@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze's wire protocol between the daemon and its clients: length-prefixed frames of deterministic CBOR (RFC 8949 4.2.1)",
    "homepage": "",
@@ -8194,9 +8194,9 @@
     "dir": "crates/blaze-protocol",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-registry@0.20261028.1": {
+  "blaze-registry@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze's reading of registries and fetching of sources as cargo 1.99 does them, into cargo's directories and blaze's store, with no cargo",
    "homepage": "",
@@ -8211,9 +8211,9 @@
     "dir": "crates/blaze-registry",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-resolve@0.20261028.1": {
+  "blaze-resolve@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "cargo's resolver, owned by blaze: the package model, Cargo.lock, version selection and feature unification",
    "homepage": "",
@@ -8228,9 +8228,9 @@
     "dir": "crates/blaze-resolve",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-source@0.20261028.1": {
+  "blaze-source@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "where a package comes from, as cargo 1.99 names it: SourceId and the names of the directories cargo keeps a source in, with no I/O",
    "homepage": "",
@@ -8245,9 +8245,9 @@
     "dir": "crates/blaze-source",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-splice@0.20261028.1": {
+  "blaze-splice@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze's splice: an edit's functions written into the executable of the last link, ELF, Mach-O, PE and wasm",
    "homepage": "https://ix.dev/blaze",
@@ -8262,9 +8262,9 @@
     "dir": "crates/blaze-splice",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-store@0.20261028.1": {
+  "blaze-store@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze's disk store: values kept by the hash of what they were made from, in packs a directory or a bucket can share",
    "homepage": "",
@@ -8279,9 +8279,9 @@
     "dir": "crates/blaze-store",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-tree@0.20261028.1": {
+  "blaze-tree@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "cargo tree, made by blaze: cargo's graph of packages and features, built on blaze-resolve's resolve and printed as cargo prints it",
    "homepage": "",
@@ -8296,9 +8296,9 @@
     "dir": "crates/blaze-tree",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-ui@0.20261028.1": {
+  "blaze-ui@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "How blaze shows a build: its records from the daemon rendered live on a terminal, as lines elsewhere, and summed up",
    "homepage": "",
@@ -8313,9 +8313,9 @@
     "dir": "crates/blaze-ui",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-units@0.20261028.1": {
+  "blaze-units@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "cargo's unit graph made by blaze: the units a build compiles and runs, with their features, profiles and edges, computed from blaze-resolve's resolve and blaze-manifest's workspace with no I/O",
    "homepage": "",
@@ -8330,9 +8330,9 @@
     "dir": "crates/blaze-units",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
-  "blaze-wasi@0.20261028.1": {
+  "blaze-wasi@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "Build scripts compiled for wasm32-wasip1 and run under Wasmtime: blaze's std::process for them, the run-tool import they call, and the runner",
    "homepage": "",
@@ -8347,7 +8347,7 @@
     "dir": "crates/blaze-wasi",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
   "block-buffer@0.10.4": {
    "authors": "RustCrypto Developers",
@@ -10440,7 +10440,7 @@
    },
    "version": "0.0.0"
   },
-  "hir-ty-codegen@0.20261028.1": {
+  "hir-ty-codegen@0.20261028.2": {
    "authors": "blaze contributors",
    "description": "blaze's code generator: rust-analyzer's MIR to machine code through Cranelift, LLVM or wasm",
    "homepage": "",
@@ -10455,7 +10455,7 @@
     "dir": "crates/hir-ty-codegen",
     "kind": "path"
    },
-   "version": "0.20261028.1"
+   "version": "0.20261028.2"
   },
   "hir-ty-wfcheck@0.0.0": {
    "authors": "blaze contributors",
@@ -16751,10 +16751,10 @@
  "systems": {
   "aarch64-darwin": {
    "roots": [
-    "blaze-engine@0.20261028.1 lib blaze_engine build",
-    "blaze-engine@0.20261028.1 bin blaze build",
-    "blaze-engine@0.20261028.1 bin blaze-engine build",
-    "blaze-engine@0.20261028.1 bin blaze-rustc build"
+    "blaze-engine@0.20261028.2 lib blaze_engine build",
+    "blaze-engine@0.20261028.2 bin blaze build",
+    "blaze-engine@0.20261028.2 bin blaze-engine build",
+    "blaze-engine@0.20261028.2 bin blaze-rustc build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -18894,7 +18894,7 @@
      "src": "src/lib.rs",
      "target": "bitmaps"
     },
-    "blaze-build-script@0.20261028.1 lib blaze_build_script build": {
+    "blaze-build-script@0.20261028.2 lib blaze_build_script build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -18926,7 +18926,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-build-script@0.20261028.1",
+     "pkg": "blaze-build-script@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -18992,14 +18992,14 @@
      "src": "src/lib.rs",
      "target": "blaze"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -19012,12 +19012,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -19028,7 +19028,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -19041,7 +19041,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 lib blaze_cargo build": {
+    "blaze-cargo@0.20261028.2 lib blaze_cargo build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -19070,7 +19070,7 @@
       },
       {
        "name": "blaze_build_script",
-       "unit": "blaze-build-script@0.20261028.1 lib blaze_build_script build"
+       "unit": "blaze-build-script@0.20261028.2 lib blaze_build_script build"
       },
       {
        "name": "fn_cache",
@@ -19078,19 +19078,19 @@
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_fmt",
-       "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
+       "unit": "blaze-fmt@0.20261028.2 lib blaze_fmt build"
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -19098,43 +19098,43 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_new",
-       "unit": "blaze-new@0.20261028.1 lib blaze_new build"
+       "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_tree",
-       "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+       "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_platform",
@@ -19170,7 +19170,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "http_body_util",
@@ -19329,7 +19329,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -19342,7 +19342,7 @@
      "src": "src/lib.rs",
      "target": "blaze_cargo"
     },
-    "blaze-doc@0.20261028.1 lib blaze_doc build": {
+    "blaze-doc@0.20261028.2 lib blaze_doc build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -19414,7 +19414,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-doc@0.20261028.1",
+     "pkg": "blaze-doc@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -19427,7 +19427,7 @@
      "src": "src/lib.rs",
      "target": "blaze_doc"
     },
-    "blaze-engine@0.20261028.1 bin blaze build": {
+    "blaze-engine@0.20261028.2 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -19436,27 +19436,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -19464,19 +19464,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -19508,7 +19508,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -19655,7 +19655,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -19668,7 +19668,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "blaze-engine@0.20261028.1 bin blaze-engine build": {
+    "blaze-engine@0.20261028.2 bin blaze-engine build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -19677,27 +19677,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -19705,19 +19705,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -19749,7 +19749,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -19896,7 +19896,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -19909,7 +19909,7 @@
      "src": "src/main.rs",
      "target": "blaze-engine"
     },
-    "blaze-engine@0.20261028.1 bin blaze-rustc build": {
+    "blaze-engine@0.20261028.2 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -19918,27 +19918,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -19946,19 +19946,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -19990,7 +19990,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -20137,7 +20137,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20150,14 +20150,14 @@
      "src": "src/bin/blaze-rustc.rs",
      "target": "blaze-rustc"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20170,19 +20170,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20195,7 +20195,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 lib blaze_engine build": {
+    "blaze-engine@0.20261028.2 lib blaze_engine build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20204,23 +20204,23 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -20228,19 +20228,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -20272,7 +20272,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -20419,7 +20419,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20432,7 +20432,7 @@
      "src": "src/lib.rs",
      "target": "blaze_engine"
     },
-    "blaze-expand@0.20261028.1 lib blaze_expand build": {
+    "blaze-expand@0.20261028.2 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20441,7 +20441,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -20484,7 +20484,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-expand@0.20261028.1",
+     "pkg": "blaze-expand@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20497,7 +20497,7 @@
      "src": "src/lib.rs",
      "target": "blaze_expand"
     },
-    "blaze-fmt@0.20261028.1 lib blaze_fmt build": {
+    "blaze-fmt@0.20261028.2 lib blaze_fmt build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20510,7 +20510,7 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "diff",
@@ -20581,7 +20581,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-fmt@0.20261028.1",
+     "pkg": "blaze-fmt@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20594,7 +20594,7 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
-    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+    "blaze-in-place@0.20261028.2 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20606,7 +20606,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-in-place@0.20261028.1",
+     "pkg": "blaze-in-place@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20619,7 +20619,7 @@
      "src": "src/lib.rs",
      "target": "blaze_in_place"
     },
-    "blaze-lints@0.20261028.1 lib blaze_lints build": {
+    "blaze-lints@0.20261028.2 lib blaze_lints build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20675,7 +20675,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-lints@0.20261028.1",
+     "pkg": "blaze-lints@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20708,7 +20708,7 @@
      "src": "src/lib.rs",
      "target": "blaze_live"
     },
-    "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build": {
+    "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20717,7 +20717,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -20768,7 +20768,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-macro-wasm@0.20261028.1",
+     "pkg": "blaze-macro-wasm@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20781,7 +20781,7 @@
      "src": "src/lib.rs",
      "target": "blaze_macro_wasm"
     },
-    "blaze-manifest@0.20261028.1 lib blaze_manifest build": {
+    "blaze-manifest@0.20261028.2 lib blaze_manifest build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20849,7 +20849,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-manifest@0.20261028.1",
+     "pkg": "blaze-manifest@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20862,7 +20862,7 @@
      "src": "src/lib.rs",
      "target": "blaze_manifest"
     },
-    "blaze-metadata@0.20261028.1 lib blaze_metadata build": {
+    "blaze-metadata@0.20261028.2 lib blaze_metadata build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20871,19 +20871,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "cargo_util_schemas",
@@ -20918,7 +20918,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-metadata@0.20261028.1",
+     "pkg": "blaze-metadata@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20931,7 +20931,7 @@
      "src": "src/lib.rs",
      "target": "blaze_metadata"
     },
-    "blaze-new@0.20261028.1 lib blaze_new build": {
+    "blaze-new@0.20261028.2 lib blaze_new build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20959,7 +20959,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-new@0.20261028.1",
+     "pkg": "blaze-new@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -20972,7 +20972,7 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
-    "blaze-registry@0.20261028.1 lib blaze_registry build": {
+    "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -20981,19 +20981,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cargo_platform",
@@ -21076,7 +21076,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-registry@0.20261028.1",
+     "pkg": "blaze-registry@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21089,7 +21089,7 @@
      "src": "src/lib.rs",
      "target": "blaze_registry"
     },
-    "blaze-resolve@0.20261028.1 lib blaze_resolve build": {
+    "blaze-resolve@0.20261028.2 lib blaze_resolve build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -21098,7 +21098,7 @@
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "cargo_platform",
@@ -21141,7 +21141,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-resolve@0.20261028.1",
+     "pkg": "blaze-resolve@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21154,7 +21154,7 @@
      "src": "src/lib.rs",
      "target": "blaze_resolve"
     },
-    "blaze-source@0.20261028.1 lib blaze_source build": {
+    "blaze-source@0.20261028.2 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -21186,7 +21186,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-source@0.20261028.1",
+     "pkg": "blaze-source@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21199,7 +21199,7 @@
      "src": "src/lib.rs",
      "target": "blaze_source"
     },
-    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+    "blaze-splice@0.20261028.2 lib blaze_splice build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -21208,7 +21208,7 @@
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_live",
@@ -21251,7 +21251,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-splice@0.20261028.1",
+     "pkg": "blaze-splice@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21264,7 +21264,7 @@
      "src": "src/lib.rs",
      "target": "blaze_splice"
     },
-    "blaze-store@0.20261028.1 lib blaze_store build": {
+    "blaze-store@0.20261028.2 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -21296,7 +21296,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-store@0.20261028.1",
+     "pkg": "blaze-store@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21309,7 +21309,7 @@
      "src": "src/lib.rs",
      "target": "blaze_store"
     },
-    "blaze-tree@0.20261028.1 lib blaze_tree build": {
+    "blaze-tree@0.20261028.2 lib blaze_tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -21318,15 +21318,15 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "rustc_hash",
@@ -21337,7 +21337,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-tree@0.20261028.1",
+     "pkg": "blaze-tree@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21350,7 +21350,7 @@
      "src": "src/lib.rs",
      "target": "blaze_tree"
     },
-    "blaze-units@0.20261028.1 lib blaze_units build": {
+    "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -21359,11 +21359,11 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "cargo_util_schemas",
@@ -21390,7 +21390,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-units@0.20261028.1",
+     "pkg": "blaze-units@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21403,14 +21403,14 @@
      "src": "src/lib.rs",
      "target": "blaze_units"
     },
-    "blaze-wasi@0.20261028.1 lib blaze_wasi build": {
+    "blaze-wasi@0.20261028.2 lib blaze_wasi build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-wasi@0.20261028.1",
+     "pkg": "blaze-wasi@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -25554,14 +25554,14 @@
      "src": "src/lib.rs",
      "target": "hir_ty_borrowck"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -25574,19 +25574,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -25599,7 +25599,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build": {
+    "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -25608,7 +25608,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cfg",
@@ -25644,7 +25644,7 @@
       },
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "hir_ty",
@@ -25747,7 +25747,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -37724,10 +37724,10 @@
   },
   "aarch64-linux": {
    "roots": [
-    "blaze-engine@0.20261028.1 lib blaze_engine build",
-    "blaze-engine@0.20261028.1 bin blaze build",
-    "blaze-engine@0.20261028.1 bin blaze-engine build",
-    "blaze-engine@0.20261028.1 bin blaze-rustc build"
+    "blaze-engine@0.20261028.2 lib blaze_engine build",
+    "blaze-engine@0.20261028.2 bin blaze build",
+    "blaze-engine@0.20261028.2 bin blaze-engine build",
+    "blaze-engine@0.20261028.2 bin blaze-rustc build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -39867,7 +39867,7 @@
      "src": "src/lib.rs",
      "target": "bitmaps"
     },
-    "blaze-build-script@0.20261028.1 lib blaze_build_script build": {
+    "blaze-build-script@0.20261028.2 lib blaze_build_script build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -39899,7 +39899,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-build-script@0.20261028.1",
+     "pkg": "blaze-build-script@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -39965,14 +39965,14 @@
      "src": "src/lib.rs",
      "target": "blaze"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -39985,12 +39985,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -40001,7 +40001,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -40014,7 +40014,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 lib blaze_cargo build": {
+    "blaze-cargo@0.20261028.2 lib blaze_cargo build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -40043,7 +40043,7 @@
       },
       {
        "name": "blaze_build_script",
-       "unit": "blaze-build-script@0.20261028.1 lib blaze_build_script build"
+       "unit": "blaze-build-script@0.20261028.2 lib blaze_build_script build"
       },
       {
        "name": "fn_cache",
@@ -40051,19 +40051,19 @@
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_fmt",
-       "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
+       "unit": "blaze-fmt@0.20261028.2 lib blaze_fmt build"
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -40071,43 +40071,43 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_new",
-       "unit": "blaze-new@0.20261028.1 lib blaze_new build"
+       "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_tree",
-       "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+       "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_platform",
@@ -40143,7 +40143,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "http_body_util",
@@ -40302,7 +40302,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -40315,7 +40315,7 @@
      "src": "src/lib.rs",
      "target": "blaze_cargo"
     },
-    "blaze-doc@0.20261028.1 lib blaze_doc build": {
+    "blaze-doc@0.20261028.2 lib blaze_doc build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -40387,7 +40387,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-doc@0.20261028.1",
+     "pkg": "blaze-doc@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -40400,7 +40400,7 @@
      "src": "src/lib.rs",
      "target": "blaze_doc"
     },
-    "blaze-engine@0.20261028.1 bin blaze build": {
+    "blaze-engine@0.20261028.2 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -40409,27 +40409,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -40437,19 +40437,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -40481,7 +40481,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -40628,7 +40628,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -40641,7 +40641,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "blaze-engine@0.20261028.1 bin blaze-engine build": {
+    "blaze-engine@0.20261028.2 bin blaze-engine build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -40650,27 +40650,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -40678,19 +40678,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -40722,7 +40722,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -40869,7 +40869,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -40882,7 +40882,7 @@
      "src": "src/main.rs",
      "target": "blaze-engine"
     },
-    "blaze-engine@0.20261028.1 bin blaze-rustc build": {
+    "blaze-engine@0.20261028.2 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -40891,27 +40891,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -40919,19 +40919,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -40963,7 +40963,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -41110,7 +41110,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41123,14 +41123,14 @@
      "src": "src/bin/blaze-rustc.rs",
      "target": "blaze-rustc"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41143,19 +41143,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41168,7 +41168,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 lib blaze_engine build": {
+    "blaze-engine@0.20261028.2 lib blaze_engine build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41177,23 +41177,23 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -41201,19 +41201,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -41245,7 +41245,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -41392,7 +41392,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41405,7 +41405,7 @@
      "src": "src/lib.rs",
      "target": "blaze_engine"
     },
-    "blaze-expand@0.20261028.1 lib blaze_expand build": {
+    "blaze-expand@0.20261028.2 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41414,7 +41414,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -41457,7 +41457,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-expand@0.20261028.1",
+     "pkg": "blaze-expand@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41470,7 +41470,7 @@
      "src": "src/lib.rs",
      "target": "blaze_expand"
     },
-    "blaze-fmt@0.20261028.1 lib blaze_fmt build": {
+    "blaze-fmt@0.20261028.2 lib blaze_fmt build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41483,7 +41483,7 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "diff",
@@ -41554,7 +41554,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-fmt@0.20261028.1",
+     "pkg": "blaze-fmt@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41567,7 +41567,7 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
-    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+    "blaze-in-place@0.20261028.2 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41579,7 +41579,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-in-place@0.20261028.1",
+     "pkg": "blaze-in-place@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41592,7 +41592,7 @@
      "src": "src/lib.rs",
      "target": "blaze_in_place"
     },
-    "blaze-lints@0.20261028.1 lib blaze_lints build": {
+    "blaze-lints@0.20261028.2 lib blaze_lints build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41648,7 +41648,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-lints@0.20261028.1",
+     "pkg": "blaze-lints@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41681,7 +41681,7 @@
      "src": "src/lib.rs",
      "target": "blaze_live"
     },
-    "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build": {
+    "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41690,7 +41690,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -41741,7 +41741,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-macro-wasm@0.20261028.1",
+     "pkg": "blaze-macro-wasm@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41754,7 +41754,7 @@
      "src": "src/lib.rs",
      "target": "blaze_macro_wasm"
     },
-    "blaze-manifest@0.20261028.1 lib blaze_manifest build": {
+    "blaze-manifest@0.20261028.2 lib blaze_manifest build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41822,7 +41822,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-manifest@0.20261028.1",
+     "pkg": "blaze-manifest@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41835,7 +41835,7 @@
      "src": "src/lib.rs",
      "target": "blaze_manifest"
     },
-    "blaze-metadata@0.20261028.1 lib blaze_metadata build": {
+    "blaze-metadata@0.20261028.2 lib blaze_metadata build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41844,19 +41844,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "cargo_util_schemas",
@@ -41891,7 +41891,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-metadata@0.20261028.1",
+     "pkg": "blaze-metadata@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41904,7 +41904,7 @@
      "src": "src/lib.rs",
      "target": "blaze_metadata"
     },
-    "blaze-new@0.20261028.1 lib blaze_new build": {
+    "blaze-new@0.20261028.2 lib blaze_new build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41932,7 +41932,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-new@0.20261028.1",
+     "pkg": "blaze-new@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -41945,7 +41945,7 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
-    "blaze-registry@0.20261028.1 lib blaze_registry build": {
+    "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -41954,19 +41954,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cargo_platform",
@@ -42049,7 +42049,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-registry@0.20261028.1",
+     "pkg": "blaze-registry@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -42062,7 +42062,7 @@
      "src": "src/lib.rs",
      "target": "blaze_registry"
     },
-    "blaze-resolve@0.20261028.1 lib blaze_resolve build": {
+    "blaze-resolve@0.20261028.2 lib blaze_resolve build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -42071,7 +42071,7 @@
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "cargo_platform",
@@ -42114,7 +42114,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-resolve@0.20261028.1",
+     "pkg": "blaze-resolve@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -42127,7 +42127,7 @@
      "src": "src/lib.rs",
      "target": "blaze_resolve"
     },
-    "blaze-source@0.20261028.1 lib blaze_source build": {
+    "blaze-source@0.20261028.2 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -42159,7 +42159,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-source@0.20261028.1",
+     "pkg": "blaze-source@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -42172,7 +42172,7 @@
      "src": "src/lib.rs",
      "target": "blaze_source"
     },
-    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+    "blaze-splice@0.20261028.2 lib blaze_splice build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -42181,7 +42181,7 @@
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_live",
@@ -42224,7 +42224,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-splice@0.20261028.1",
+     "pkg": "blaze-splice@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -42237,7 +42237,7 @@
      "src": "src/lib.rs",
      "target": "blaze_splice"
     },
-    "blaze-store@0.20261028.1 lib blaze_store build": {
+    "blaze-store@0.20261028.2 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -42269,7 +42269,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-store@0.20261028.1",
+     "pkg": "blaze-store@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -42282,7 +42282,7 @@
      "src": "src/lib.rs",
      "target": "blaze_store"
     },
-    "blaze-tree@0.20261028.1 lib blaze_tree build": {
+    "blaze-tree@0.20261028.2 lib blaze_tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -42291,15 +42291,15 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "rustc_hash",
@@ -42310,7 +42310,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-tree@0.20261028.1",
+     "pkg": "blaze-tree@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -42323,7 +42323,7 @@
      "src": "src/lib.rs",
      "target": "blaze_tree"
     },
-    "blaze-units@0.20261028.1 lib blaze_units build": {
+    "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -42332,11 +42332,11 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "cargo_util_schemas",
@@ -42363,7 +42363,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-units@0.20261028.1",
+     "pkg": "blaze-units@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -42376,14 +42376,14 @@
      "src": "src/lib.rs",
      "target": "blaze_units"
     },
-    "blaze-wasi@0.20261028.1 lib blaze_wasi build": {
+    "blaze-wasi@0.20261028.2 lib blaze_wasi build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-wasi@0.20261028.1",
+     "pkg": "blaze-wasi@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -46427,14 +46427,14 @@
      "src": "src/lib.rs",
      "target": "hir_ty_borrowck"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -46447,19 +46447,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -46472,7 +46472,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build": {
+    "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -46481,7 +46481,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cfg",
@@ -46517,7 +46517,7 @@
       },
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "hir_ty",
@@ -46620,7 +46620,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -58570,10 +58570,10 @@
   },
   "x86_64-darwin": {
    "roots": [
-    "blaze-engine@0.20261028.1 lib blaze_engine build",
-    "blaze-engine@0.20261028.1 bin blaze build",
-    "blaze-engine@0.20261028.1 bin blaze-engine build",
-    "blaze-engine@0.20261028.1 bin blaze-rustc build"
+    "blaze-engine@0.20261028.2 lib blaze_engine build",
+    "blaze-engine@0.20261028.2 bin blaze build",
+    "blaze-engine@0.20261028.2 bin blaze-engine build",
+    "blaze-engine@0.20261028.2 bin blaze-rustc build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -60713,7 +60713,7 @@
      "src": "src/lib.rs",
      "target": "bitmaps"
     },
-    "blaze-build-script@0.20261028.1 lib blaze_build_script build": {
+    "blaze-build-script@0.20261028.2 lib blaze_build_script build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -60745,7 +60745,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-build-script@0.20261028.1",
+     "pkg": "blaze-build-script@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -60811,14 +60811,14 @@
      "src": "src/lib.rs",
      "target": "blaze"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -60831,12 +60831,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -60847,7 +60847,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -60860,7 +60860,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 lib blaze_cargo build": {
+    "blaze-cargo@0.20261028.2 lib blaze_cargo build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -60889,7 +60889,7 @@
       },
       {
        "name": "blaze_build_script",
-       "unit": "blaze-build-script@0.20261028.1 lib blaze_build_script build"
+       "unit": "blaze-build-script@0.20261028.2 lib blaze_build_script build"
       },
       {
        "name": "fn_cache",
@@ -60897,19 +60897,19 @@
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_fmt",
-       "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
+       "unit": "blaze-fmt@0.20261028.2 lib blaze_fmt build"
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -60917,43 +60917,43 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_new",
-       "unit": "blaze-new@0.20261028.1 lib blaze_new build"
+       "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_tree",
-       "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+       "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_platform",
@@ -60989,7 +60989,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "http_body_util",
@@ -61148,7 +61148,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -61161,7 +61161,7 @@
      "src": "src/lib.rs",
      "target": "blaze_cargo"
     },
-    "blaze-doc@0.20261028.1 lib blaze_doc build": {
+    "blaze-doc@0.20261028.2 lib blaze_doc build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -61233,7 +61233,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-doc@0.20261028.1",
+     "pkg": "blaze-doc@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -61246,7 +61246,7 @@
      "src": "src/lib.rs",
      "target": "blaze_doc"
     },
-    "blaze-engine@0.20261028.1 bin blaze build": {
+    "blaze-engine@0.20261028.2 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -61255,27 +61255,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -61283,19 +61283,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -61327,7 +61327,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -61474,7 +61474,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -61487,7 +61487,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "blaze-engine@0.20261028.1 bin blaze-engine build": {
+    "blaze-engine@0.20261028.2 bin blaze-engine build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -61496,27 +61496,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -61524,19 +61524,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -61568,7 +61568,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -61715,7 +61715,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -61728,7 +61728,7 @@
      "src": "src/main.rs",
      "target": "blaze-engine"
     },
-    "blaze-engine@0.20261028.1 bin blaze-rustc build": {
+    "blaze-engine@0.20261028.2 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -61737,27 +61737,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -61765,19 +61765,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -61809,7 +61809,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -61956,7 +61956,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -61969,14 +61969,14 @@
      "src": "src/bin/blaze-rustc.rs",
      "target": "blaze-rustc"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -61989,19 +61989,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62014,7 +62014,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 lib blaze_engine build": {
+    "blaze-engine@0.20261028.2 lib blaze_engine build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62023,23 +62023,23 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -62047,19 +62047,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -62091,7 +62091,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -62238,7 +62238,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62251,7 +62251,7 @@
      "src": "src/lib.rs",
      "target": "blaze_engine"
     },
-    "blaze-expand@0.20261028.1 lib blaze_expand build": {
+    "blaze-expand@0.20261028.2 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62260,7 +62260,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -62303,7 +62303,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-expand@0.20261028.1",
+     "pkg": "blaze-expand@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62316,7 +62316,7 @@
      "src": "src/lib.rs",
      "target": "blaze_expand"
     },
-    "blaze-fmt@0.20261028.1 lib blaze_fmt build": {
+    "blaze-fmt@0.20261028.2 lib blaze_fmt build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62329,7 +62329,7 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "diff",
@@ -62400,7 +62400,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-fmt@0.20261028.1",
+     "pkg": "blaze-fmt@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62413,7 +62413,7 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
-    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+    "blaze-in-place@0.20261028.2 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62425,7 +62425,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-in-place@0.20261028.1",
+     "pkg": "blaze-in-place@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62438,7 +62438,7 @@
      "src": "src/lib.rs",
      "target": "blaze_in_place"
     },
-    "blaze-lints@0.20261028.1 lib blaze_lints build": {
+    "blaze-lints@0.20261028.2 lib blaze_lints build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62494,7 +62494,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-lints@0.20261028.1",
+     "pkg": "blaze-lints@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62527,7 +62527,7 @@
      "src": "src/lib.rs",
      "target": "blaze_live"
     },
-    "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build": {
+    "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62536,7 +62536,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -62587,7 +62587,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-macro-wasm@0.20261028.1",
+     "pkg": "blaze-macro-wasm@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62600,7 +62600,7 @@
      "src": "src/lib.rs",
      "target": "blaze_macro_wasm"
     },
-    "blaze-manifest@0.20261028.1 lib blaze_manifest build": {
+    "blaze-manifest@0.20261028.2 lib blaze_manifest build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62668,7 +62668,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-manifest@0.20261028.1",
+     "pkg": "blaze-manifest@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62681,7 +62681,7 @@
      "src": "src/lib.rs",
      "target": "blaze_manifest"
     },
-    "blaze-metadata@0.20261028.1 lib blaze_metadata build": {
+    "blaze-metadata@0.20261028.2 lib blaze_metadata build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62690,19 +62690,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "cargo_util_schemas",
@@ -62737,7 +62737,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-metadata@0.20261028.1",
+     "pkg": "blaze-metadata@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62750,7 +62750,7 @@
      "src": "src/lib.rs",
      "target": "blaze_metadata"
     },
-    "blaze-new@0.20261028.1 lib blaze_new build": {
+    "blaze-new@0.20261028.2 lib blaze_new build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62778,7 +62778,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-new@0.20261028.1",
+     "pkg": "blaze-new@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62791,7 +62791,7 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
-    "blaze-registry@0.20261028.1 lib blaze_registry build": {
+    "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62800,19 +62800,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cargo_platform",
@@ -62895,7 +62895,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-registry@0.20261028.1",
+     "pkg": "blaze-registry@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62908,7 +62908,7 @@
      "src": "src/lib.rs",
      "target": "blaze_registry"
     },
-    "blaze-resolve@0.20261028.1 lib blaze_resolve build": {
+    "blaze-resolve@0.20261028.2 lib blaze_resolve build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -62917,7 +62917,7 @@
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "cargo_platform",
@@ -62960,7 +62960,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-resolve@0.20261028.1",
+     "pkg": "blaze-resolve@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62973,7 +62973,7 @@
      "src": "src/lib.rs",
      "target": "blaze_resolve"
     },
-    "blaze-source@0.20261028.1 lib blaze_source build": {
+    "blaze-source@0.20261028.2 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -63005,7 +63005,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-source@0.20261028.1",
+     "pkg": "blaze-source@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -63018,7 +63018,7 @@
      "src": "src/lib.rs",
      "target": "blaze_source"
     },
-    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+    "blaze-splice@0.20261028.2 lib blaze_splice build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -63027,7 +63027,7 @@
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_live",
@@ -63070,7 +63070,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-splice@0.20261028.1",
+     "pkg": "blaze-splice@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -63083,7 +63083,7 @@
      "src": "src/lib.rs",
      "target": "blaze_splice"
     },
-    "blaze-store@0.20261028.1 lib blaze_store build": {
+    "blaze-store@0.20261028.2 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -63115,7 +63115,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-store@0.20261028.1",
+     "pkg": "blaze-store@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -63128,7 +63128,7 @@
      "src": "src/lib.rs",
      "target": "blaze_store"
     },
-    "blaze-tree@0.20261028.1 lib blaze_tree build": {
+    "blaze-tree@0.20261028.2 lib blaze_tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -63137,15 +63137,15 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "rustc_hash",
@@ -63156,7 +63156,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-tree@0.20261028.1",
+     "pkg": "blaze-tree@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -63169,7 +63169,7 @@
      "src": "src/lib.rs",
      "target": "blaze_tree"
     },
-    "blaze-units@0.20261028.1 lib blaze_units build": {
+    "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -63178,11 +63178,11 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "cargo_util_schemas",
@@ -63209,7 +63209,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-units@0.20261028.1",
+     "pkg": "blaze-units@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -63222,14 +63222,14 @@
      "src": "src/lib.rs",
      "target": "blaze_units"
     },
-    "blaze-wasi@0.20261028.1 lib blaze_wasi build": {
+    "blaze-wasi@0.20261028.2 lib blaze_wasi build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-wasi@0.20261028.1",
+     "pkg": "blaze-wasi@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -67404,14 +67404,14 @@
      "src": "src/lib.rs",
      "target": "hir_ty_borrowck"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -67424,19 +67424,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -67449,7 +67449,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build": {
+    "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -67458,7 +67458,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cfg",
@@ -67494,7 +67494,7 @@
       },
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "hir_ty",
@@ -67597,7 +67597,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -79570,10 +79570,10 @@
   },
   "x86_64-linux": {
    "roots": [
-    "blaze-engine@0.20261028.1 lib blaze_engine build",
-    "blaze-engine@0.20261028.1 bin blaze build",
-    "blaze-engine@0.20261028.1 bin blaze-engine build",
-    "blaze-engine@0.20261028.1 bin blaze-rustc build"
+    "blaze-engine@0.20261028.2 lib blaze_engine build",
+    "blaze-engine@0.20261028.2 bin blaze build",
+    "blaze-engine@0.20261028.2 bin blaze-engine build",
+    "blaze-engine@0.20261028.2 bin blaze-rustc build"
    ],
    "units": {
     "adler2@2.0.1 lib adler2 build": {
@@ -81713,7 +81713,7 @@
      "src": "src/lib.rs",
      "target": "bitmaps"
     },
-    "blaze-build-script@0.20261028.1 lib blaze_build_script build": {
+    "blaze-build-script@0.20261028.2 lib blaze_build_script build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -81745,7 +81745,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-build-script@0.20261028.1",
+     "pkg": "blaze-build-script@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -81811,14 +81811,14 @@
      "src": "src/lib.rs",
      "target": "blaze"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -81831,12 +81831,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -81847,7 +81847,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -81860,7 +81860,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-cargo@0.20261028.1 lib blaze_cargo build": {
+    "blaze-cargo@0.20261028.2 lib blaze_cargo build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -81889,7 +81889,7 @@
       },
       {
        "name": "blaze_build_script",
-       "unit": "blaze-build-script@0.20261028.1 lib blaze_build_script build"
+       "unit": "blaze-build-script@0.20261028.2 lib blaze_build_script build"
       },
       {
        "name": "fn_cache",
@@ -81897,19 +81897,19 @@
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-cargo@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-cargo@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_fmt",
-       "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
+       "unit": "blaze-fmt@0.20261028.2 lib blaze_fmt build"
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -81917,43 +81917,43 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_new",
-       "unit": "blaze-new@0.20261028.1 lib blaze_new build"
+       "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_tree",
-       "unit": "blaze-tree@0.20261028.1 lib blaze_tree build"
+       "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_platform",
@@ -81989,7 +81989,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "http_body_util",
@@ -82148,7 +82148,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-cargo@0.20261028.1",
+     "pkg": "blaze-cargo@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -82161,7 +82161,7 @@
      "src": "src/lib.rs",
      "target": "blaze_cargo"
     },
-    "blaze-doc@0.20261028.1 lib blaze_doc build": {
+    "blaze-doc@0.20261028.2 lib blaze_doc build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -82233,7 +82233,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-doc@0.20261028.1",
+     "pkg": "blaze-doc@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -82246,7 +82246,7 @@
      "src": "src/lib.rs",
      "target": "blaze_doc"
     },
-    "blaze-engine@0.20261028.1 bin blaze build": {
+    "blaze-engine@0.20261028.2 bin blaze build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -82255,27 +82255,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -82283,19 +82283,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -82327,7 +82327,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -82474,7 +82474,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -82487,7 +82487,7 @@
      "src": "src/bin/blaze.rs",
      "target": "blaze"
     },
-    "blaze-engine@0.20261028.1 bin blaze-engine build": {
+    "blaze-engine@0.20261028.2 bin blaze-engine build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -82496,27 +82496,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -82524,19 +82524,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -82568,7 +82568,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -82715,7 +82715,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -82728,7 +82728,7 @@
      "src": "src/main.rs",
      "target": "blaze-engine"
     },
-    "blaze-engine@0.20261028.1 bin blaze-rustc build": {
+    "blaze-engine@0.20261028.2 bin blaze-rustc build": {
      "crate_type": "bin",
      "deps": [
       {
@@ -82737,27 +82737,27 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_engine",
-       "unit": "blaze-engine@0.20261028.1 lib blaze_engine build"
+       "unit": "blaze-engine@0.20261028.2 lib blaze_engine build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -82765,19 +82765,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -82809,7 +82809,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -82956,7 +82956,7 @@
      "features": [],
      "kind": "bin",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -82969,14 +82969,14 @@
      "src": "src/bin/blaze-rustc.rs",
      "target": "blaze-rustc"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build build host": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -82989,19 +82989,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build build host"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83014,7 +83014,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-engine@0.20261028.1 lib blaze_engine build": {
+    "blaze-engine@0.20261028.2 lib blaze_engine build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83023,23 +83023,23 @@
       },
       {
        "name": "blaze_cargo",
-       "unit": "blaze-cargo@0.20261028.1 lib blaze_cargo build"
+       "unit": "blaze-cargo@0.20261028.2 lib blaze_cargo build"
       },
       {
        "name": "blaze_doc",
-       "unit": "blaze-doc@0.20261028.1 lib blaze_doc build"
+       "unit": "blaze-doc@0.20261028.2 lib blaze_doc build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-engine@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "blaze-engine@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "blaze_expand",
-       "unit": "blaze-expand@0.20261028.1 lib blaze_expand build"
+       "unit": "blaze-expand@0.20261028.2 lib blaze_expand build"
       },
       {
        "name": "blaze_lints",
-       "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
+       "unit": "blaze-lints@0.20261028.2 lib blaze_lints build"
       },
       {
        "name": "blaze_live",
@@ -83047,19 +83047,19 @@
       },
       {
        "name": "blaze_macro_wasm",
-       "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
+       "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
        "name": "blaze_splice",
-       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+       "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "blaze_wasi",
-       "unit": "blaze-wasi@0.20261028.1 lib blaze_wasi build"
+       "unit": "blaze-wasi@0.20261028.2 lib blaze_wasi build"
       },
       {
        "name": "cargo_metadata",
@@ -83091,7 +83091,7 @@
       },
       {
        "name": "hir_ty_codegen",
-       "unit": "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build"
+       "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
       },
       {
        "name": "hir_ty",
@@ -83238,7 +83238,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-engine@0.20261028.1",
+     "pkg": "blaze-engine@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83251,7 +83251,7 @@
      "src": "src/lib.rs",
      "target": "blaze_engine"
     },
-    "blaze-expand@0.20261028.1 lib blaze_expand build": {
+    "blaze-expand@0.20261028.2 lib blaze_expand build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83260,7 +83260,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -83303,7 +83303,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-expand@0.20261028.1",
+     "pkg": "blaze-expand@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83316,7 +83316,7 @@
      "src": "src/lib.rs",
      "target": "blaze_expand"
     },
-    "blaze-fmt@0.20261028.1 lib blaze_fmt build": {
+    "blaze-fmt@0.20261028.2 lib blaze_fmt build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83329,7 +83329,7 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "diff",
@@ -83400,7 +83400,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-fmt@0.20261028.1",
+     "pkg": "blaze-fmt@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83413,7 +83413,7 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
-    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+    "blaze-in-place@0.20261028.2 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83425,7 +83425,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-in-place@0.20261028.1",
+     "pkg": "blaze-in-place@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83438,7 +83438,7 @@
      "src": "src/lib.rs",
      "target": "blaze_in_place"
     },
-    "blaze-lints@0.20261028.1 lib blaze_lints build": {
+    "blaze-lints@0.20261028.2 lib blaze_lints build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83494,7 +83494,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-lints@0.20261028.1",
+     "pkg": "blaze-lints@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83527,7 +83527,7 @@
      "src": "src/lib.rs",
      "target": "blaze_live"
     },
-    "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build": {
+    "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83536,7 +83536,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "hir_expand",
@@ -83587,7 +83587,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-macro-wasm@0.20261028.1",
+     "pkg": "blaze-macro-wasm@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83600,7 +83600,7 @@
      "src": "src/lib.rs",
      "target": "blaze_macro_wasm"
     },
-    "blaze-manifest@0.20261028.1 lib blaze_manifest build": {
+    "blaze-manifest@0.20261028.2 lib blaze_manifest build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83668,7 +83668,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-manifest@0.20261028.1",
+     "pkg": "blaze-manifest@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83681,7 +83681,7 @@
      "src": "src/lib.rs",
      "target": "blaze_manifest"
     },
-    "blaze-metadata@0.20261028.1 lib blaze_metadata build": {
+    "blaze-metadata@0.20261028.2 lib blaze_metadata build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83690,19 +83690,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_registry",
-       "unit": "blaze-registry@0.20261028.1 lib blaze_registry build"
+       "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_units",
-       "unit": "blaze-units@0.20261028.1 lib blaze_units build"
+       "unit": "blaze-units@0.20261028.2 lib blaze_units build"
       },
       {
        "name": "cargo_util_schemas",
@@ -83737,7 +83737,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-metadata@0.20261028.1",
+     "pkg": "blaze-metadata@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83750,7 +83750,7 @@
      "src": "src/lib.rs",
      "target": "blaze_metadata"
     },
-    "blaze-new@0.20261028.1 lib blaze_new build": {
+    "blaze-new@0.20261028.2 lib blaze_new build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83778,7 +83778,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-new@0.20261028.1",
+     "pkg": "blaze-new@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83791,7 +83791,7 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
-    "blaze-registry@0.20261028.1 lib blaze_registry build": {
+    "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83800,19 +83800,19 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cargo_platform",
@@ -83895,7 +83895,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-registry@0.20261028.1",
+     "pkg": "blaze-registry@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83908,7 +83908,7 @@
      "src": "src/lib.rs",
      "target": "blaze_registry"
     },
-    "blaze-resolve@0.20261028.1 lib blaze_resolve build": {
+    "blaze-resolve@0.20261028.2 lib blaze_resolve build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -83917,7 +83917,7 @@
       },
       {
        "name": "blaze_source",
-       "unit": "blaze-source@0.20261028.1 lib blaze_source build"
+       "unit": "blaze-source@0.20261028.2 lib blaze_source build"
       },
       {
        "name": "cargo_platform",
@@ -83960,7 +83960,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-resolve@0.20261028.1",
+     "pkg": "blaze-resolve@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83973,7 +83973,7 @@
      "src": "src/lib.rs",
      "target": "blaze_resolve"
     },
-    "blaze-source@0.20261028.1 lib blaze_source build": {
+    "blaze-source@0.20261028.2 lib blaze_source build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -84005,7 +84005,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-source@0.20261028.1",
+     "pkg": "blaze-source@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -84018,7 +84018,7 @@
      "src": "src/lib.rs",
      "target": "blaze_source"
     },
-    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+    "blaze-splice@0.20261028.2 lib blaze_splice build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -84027,7 +84027,7 @@
       },
       {
        "name": "blaze_in_place",
-       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+       "unit": "blaze-in-place@0.20261028.2 lib blaze_in_place build"
       },
       {
        "name": "blaze_live",
@@ -84070,7 +84070,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-splice@0.20261028.1",
+     "pkg": "blaze-splice@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -84083,7 +84083,7 @@
      "src": "src/lib.rs",
      "target": "blaze_splice"
     },
-    "blaze-store@0.20261028.1 lib blaze_store build": {
+    "blaze-store@0.20261028.2 lib blaze_store build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -84115,7 +84115,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-store@0.20261028.1",
+     "pkg": "blaze-store@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -84128,7 +84128,7 @@
      "src": "src/lib.rs",
      "target": "blaze_store"
     },
-    "blaze-tree@0.20261028.1 lib blaze_tree build": {
+    "blaze-tree@0.20261028.2 lib blaze_tree build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -84137,15 +84137,15 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_metadata",
-       "unit": "blaze-metadata@0.20261028.1 lib blaze_metadata build"
+       "unit": "blaze-metadata@0.20261028.2 lib blaze_metadata build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "rustc_hash",
@@ -84156,7 +84156,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-tree@0.20261028.1",
+     "pkg": "blaze-tree@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -84169,7 +84169,7 @@
      "src": "src/lib.rs",
      "target": "blaze_tree"
     },
-    "blaze-units@0.20261028.1 lib blaze_units build": {
+    "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -84178,11 +84178,11 @@
       },
       {
        "name": "blaze_manifest",
-       "unit": "blaze-manifest@0.20261028.1 lib blaze_manifest build"
+       "unit": "blaze-manifest@0.20261028.2 lib blaze_manifest build"
       },
       {
        "name": "blaze_resolve",
-       "unit": "blaze-resolve@0.20261028.1 lib blaze_resolve build"
+       "unit": "blaze-resolve@0.20261028.2 lib blaze_resolve build"
       },
       {
        "name": "cargo_util_schemas",
@@ -84209,7 +84209,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-units@0.20261028.1",
+     "pkg": "blaze-units@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -84222,14 +84222,14 @@
      "src": "src/lib.rs",
      "target": "blaze_units"
     },
-    "blaze-wasi@0.20261028.1 lib blaze_wasi build": {
+    "blaze-wasi@0.20261028.2 lib blaze_wasi build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-wasi@0.20261028.1",
+     "pkg": "blaze-wasi@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -88304,14 +88304,14 @@
      "src": "src/lib.rs",
      "target": "hir_ty_borrowck"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -88324,19 +88324,19 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build": {
+    "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build build host"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build build host"
       }
      ],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -88349,7 +88349,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "hir-ty-codegen@0.20261028.1 lib hir_ty_codegen build": {
+    "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -88358,7 +88358,7 @@
       },
       {
        "name": "blaze_store",
-       "unit": "blaze-store@0.20261028.1 lib blaze_store build"
+       "unit": "blaze-store@0.20261028.2 lib blaze_store build"
       },
       {
        "name": "cfg",
@@ -88394,7 +88394,7 @@
       },
       {
        "name": "build_script_build",
-       "unit": "hir-ty-codegen@0.20261028.1 custom-build build-script-build run-custom-build"
+       "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
        "name": "hir_ty",
@@ -88497,7 +88497,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "hir-ty-codegen@0.20261028.1",
+     "pkg": "hir-ty-codegen@0.20261028.2",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,

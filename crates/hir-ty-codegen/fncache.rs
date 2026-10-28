@@ -401,7 +401,10 @@ impl Below {
     const FORMAT: &str = "below 2";
 
     /// What is below the sealed node of `key`, as this process or the store has it.
-    fn known(store: Option<&super::store::Store>, key: &[u8; super::store::KEY]) -> Option<Arc<Below>> {
+    fn known(
+        store: Option<&super::store::Store>,
+        key: &[u8; super::store::KEY],
+    ) -> Option<Arc<Below>> {
         if let Some(it) = KNOWN.lock().unwrap().get(key) {
             return Some(it.clone());
         }
@@ -411,7 +414,11 @@ impl Below {
     }
 
     /// Keeps what is below the sealed node of `key`, for this process and in the store.
-    fn keep(store: Option<&super::store::Store>, key: &[u8; super::store::KEY], below: &Arc<Below>) {
+    fn keep(
+        store: Option<&super::store::Store>,
+        key: &[u8; super::store::KEY],
+        below: &Arc<Below>,
+    ) {
         if let Some(store) = store {
             store.insert(key, below.write().as_bytes());
         }

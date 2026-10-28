@@ -12,8 +12,7 @@
 //! of an `async` block or a coroutine, whose code is not gone through, makes it none.
 
 use hir_def::{
-    AdtId, AssocItemId, DefWithBodyId, HasModule, ItemContainerId, Lookup, ModuleDefId,
-    StaticId,
+    AdtId, AssocItemId, DefWithBodyId, HasModule, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body,
     hir::{ClosureKind, Expr},
     item_scope::ItemScope,
@@ -49,7 +48,9 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
     {
         return Some("mutable or not an AtomicPtr");
     }
-    let ItemContainerId::ModuleId(module) = id.lookup(db).container else { return Some("not declared in a block") };
+    let ItemContainerId::ModuleId(module) = id.lookup(db).container else {
+        return Some("not declared in a block");
+    };
     let Some(block) = module.block(db) else { return Some("not of a module's block") };
     // A block in a block is in the same body: a body with a macro call has a block of its own.
     // SAFETY: the module is used in this call alone, as hir-def's own search for a block's body.
@@ -63,7 +64,9 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
     else {
         return Some("no body has its block");
     };
-    let Ok(init) = db.mir_body(InferBodyId::DefWithBodyId(id.into())) else { return Some("its initializer has no MIR") };
+    let Ok(init) = db.mir_body(InferBodyId::DefWithBodyId(id.into())) else {
+        return Some("its initializer has no MIR");
+    };
     if !made_of_fn(db, init, return_slot(), &mut FxHashSet::default()) {
         if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
             eprintln!("fn-cache: {:#?}", init.basic_blocks);
@@ -87,7 +90,9 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
                 bodies.extend(found.into_iter().filter(|&it| seen.insert(it)));
             }
         }
-        let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(at)) else { return Some("a body that can name it has no MIR") };
+        let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(at)) else {
+            return Some("a body that can name it has no MIR");
+        };
         let mut mir = vec![body];
         while let Some(body) = mir.pop() {
             if !only_dispatches(db, body, id) {
@@ -97,7 +102,9 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
                 return Some("a body uses it otherwise");
             }
             for &closure in &body.closures {
-                let Ok(it) = db.mir_body_for_closure(closure) else { return Some("a closure that can name it has no MIR") };
+                let Ok(it) = db.mir_body_for_closure(closure) else {
+                    return Some("a closure that can name it has no MIR");
+                };
                 mir.push(it);
             }
         }

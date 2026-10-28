@@ -833,8 +833,10 @@ What was decided, and why:
   function, its closures and the items in its blocks) only loads it or stores a function's
   address in it, never one handed in as an argument or returned by a call. Otherwise it is
   `global-state`, and the `transmute` of what is loaded from it `indirect`. On ripgrep this
-  took most of its tests from running every time to kept (numbers in
-  `bench/results/2026-10-28-hermetic-tests/`).
+  took the tests kept from 191 of 1144 to 363.
+- What blaze made of a test is kept beside its program (`tests-reach`), with the build of blaze
+  that made it (`tests-reach-by`). Another build of blaze tells tests by its own rules, so it
+  walks every test program again the first time it builds it.
 - A test the sandbox records (a workspace that opts into sandboxed tests) that blocks only by
   `fs`, `env`, `net` or `process` is kept with what it read, as before. One that blocks by any
   other kind runs every time, sandboxed or not.

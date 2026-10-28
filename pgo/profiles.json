@@ -1,27 +1,27 @@
 {
-  "toolchain": "nightly-2026-10-25",
+  "toolchain": "nightly-2026-10-27",
   "release": "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles",
   "targets": {
     "aarch64-apple-darwin": {
-      "name": "ra-jit-nightly-2026-10-25-aarch64-apple-darwin-330cc94780a0501f.profdata",
-      "sha256": "330cc94780a0501f39541352edf320f01433b02a1f6062ef1628f1544bc3a921",
-      "commit": "c5edbe0b991dd28a1ff4a7e5d766ba8bff52df72",
-      "count": 312195438668,
-      "crate": "5oGHd5g6Po0"
+      "name": "ra-jit-nightly-2026-10-27-aarch64-apple-darwin-467615cb2650f1d8.profdata",
+      "sha256": "467615cb2650f1d870ef186ea00d642831a9427dfa0d2d697f9478426b0536c0",
+      "commit": "ee93aea43395dfbde55a22fc110d754c47b091ce",
+      "count": 344787441332,
+      "crate": "ig4RhlaaUxk"
     },
     "aarch64-unknown-linux-gnu": {
-      "name": "ra-jit-nightly-2026-10-25-aarch64-unknown-linux-gnu-7404a97ad3160c94.profdata",
-      "sha256": "7404a97ad3160c943d0249e670b4855b1e5e951642aa549b946ceacdd986a71a",
-      "commit": "c5edbe0b991dd28a1ff4a7e5d766ba8bff52df72",
-      "count": 197850293923,
-      "crate": "5LwxgLi7Lpf"
+      "name": "ra-jit-nightly-2026-10-27-aarch64-unknown-linux-gnu-16b4b66e1878feb6.profdata",
+      "sha256": "16b4b66e1878feb6dd76b0ed493094883834d4d36ef93c98877cad2a3e57f76f",
+      "commit": "ee93aea43395dfbde55a22fc110d754c47b091ce",
+      "count": 362212574903,
+      "crate": "6ebLE1JHKa3"
     },
     "x86_64-unknown-linux-gnu": {
-      "name": "ra-jit-nightly-2026-10-25-x86_64-unknown-linux-gnu-dd887f392027a3c1.profdata",
-      "sha256": "dd887f392027a3c11e4bd65fdcaa12427688ce6ff2dcacba51d0ac936eb6938b",
-      "commit": "c5edbe0b991dd28a1ff4a7e5d766ba8bff52df72",
-      "count": 194109447622,
-      "crate": "h7S4ieHQVTi"
+      "name": "ra-jit-nightly-2026-10-27-x86_64-unknown-linux-gnu-85d970ad5cd93d47.profdata",
+      "sha256": "85d970ad5cd93d47ee30ecde08c52ad62d794fc70e4394c0f343dc10ed34b14f",
+      "commit": "ee93aea43395dfbde55a22fc110d754c47b091ce",
+      "count": 346791701103,
+      "crate": "gToedOsxlsF"
     }
   }
 }

@@ -3,10 +3,13 @@ name: release
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/release_notes.py) builds blaze for
 # Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS, and the
 # tag's CHANGELOG.md section as the notes. The release is a prerelease, the canary channel's,
-# until promote.yaml makes it stable (docs/release.md). The tag must match the workspace version. A tag
-# pushed by hand starts it; the release train's tags start it by dispatch on the tag (pgo.yaml's
-# pin job, .github/scripts/train_release.py), since a tag the workflow's own token makes starts
-# no workflow. A manual run on a branch builds and checks the same archives without releasing.
+# until promote.yaml makes it stable (docs/release.md). A tag on a `release:` commit
+# (train_release.py) is the workspace version, and its notes are CHANGELOG.md's section; a
+# canary's tag (canary.yaml) is on a commit of main as it is, and the build stamps the tag's
+# version into its own checkout (.github/scripts/canary.py stamp). A tag pushed by hand starts
+# it; the trains' and canary.yaml's tags start it by dispatch on the tag, since a tag the
+# workflow's own token makes starts no workflow. A manual run on a branch builds and checks the
+# same archives without releasing.
 on:
   push:
     tags: ["v*"]
@@ -32,10 +35,17 @@ jobs:
       version: ${{ steps.notes.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      # On a tag: the tag is the workspace version and CHANGELOG.md has its section.
+        with:
+          fetch-depth: 0
+      # On a tag: CHANGELOG.md's section of a release commit's version, or a canary's notes.
       # By hand: the workspace version needs a section.
       - id: notes
-        run: python3 -I .github/scripts/release_notes.py --tag "${{ github.ref_type == 'tag' && github.ref_name || '' }}" --out "$RUNNER_TEMP/notes.md"
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            python3 -I .github/scripts/canary.py stamp "{\"tag\": \"$GITHUB_REF_NAME\", \"notes\": \"$RUNNER_TEMP/notes.md\"}"
+          else
+            python3 -I .github/scripts/release_notes.py --tag "" --out "$RUNNER_TEMP/notes.md"
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: notes
@@ -69,6 +79,9 @@ jobs:
       # `Standard library` below; crates/blaze-engine/src/shipped.rs).
       - if: github.ref_type == 'tag'
         run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+      # A canary's tag is on a commit whose workspace version is the last release commit's.
+      - if: github.ref_type == 'tag'
+        run: python3 -I .github/scripts/canary.py stamp "{\"tag\": \"$GITHUB_REF_NAME\"}"
       # No build cache: release binaries come from a clean build. With the `llvm` feature, so
       # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
       # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a

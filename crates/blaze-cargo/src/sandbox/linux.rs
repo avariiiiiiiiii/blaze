@@ -320,8 +320,11 @@ fn run_as(
     // empty `/tmp`.
     let scratch = match unshared {
         Some(_) => {
-            let dir = std::env::temp_dir()
-                .join(format!("blaze-sandbox-tmp-{}-{}", std::process::id(), unique()));
+            let dir = std::env::temp_dir().join(format!(
+                "blaze-sandbox-tmp-{}-{}",
+                std::process::id(),
+                unique()
+            ));
             std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
             Some(dir)
         }

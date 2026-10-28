@@ -214,6 +214,9 @@ pub(crate) enum Asked {
     },
     /// `lock` and its arguments: what build scripts download, pinned (`fetches.rs`).
     Lock(Vec<String>),
+    /// `pin` and its arguments: this blaze's version written into the workspace's manifest,
+    /// so that the `blaze` anyone runs there runs this release (`versions.rs`).
+    Pin(Vec<String>),
     Help,
     Version,
 }
@@ -285,6 +288,7 @@ impl Asked {
             ("disable", _) => Asked::Disable,
             ("toolchain", _) => Asked::Toolchain { path: rest.iter().any(|it| it == "--path") },
             ("lock", _) => Asked::Lock(rest.to_vec()),
+            ("pin", _) => Asked::Pin(rest.to_vec()),
             _ => Asked::Own(args),
         }
     }

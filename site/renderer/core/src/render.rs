@@ -891,8 +891,7 @@ pub fn render(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let doc_attr =
-        if talk { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
+    let doc_attr = if talk { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
     let say_intro = if audio.is_some() {
         format!(" data-say=\"{}\"", crate::spoken::INTRO)
     } else {

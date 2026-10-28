@@ -241,12 +241,12 @@ def train(target, out):
     work = Path(tempfile.mkdtemp(prefix="rjpgo-", dir="/tmp"))
     raw = work / "raw"
     raw.mkdir()
-    # On AArch64 a direct call reaches 128 MiB, and the instrumented ra-jit is larger: its calls
-    # to the value-profiling runtime (`__llvm_profile_instrument_memop`, `_target`) do not link
-    # (R_AARCH64_CALL26 truncated). Counters are inline, so only value profiling is left out.
+    # On AArch64 a direct call reaches 128 MiB, and the instrumented ra-jit's code is larger. GNU ld
+    # then fails its calls into libgcc and the profiling runtime (R_AARCH64_CALL26 truncated);
+    # lld puts a range-extension thunk in front of them (pgo.yaml installs it on that runner).
     rustflags = f"-Cprofile-generate={raw}"
     if target.startswith("aarch64-unknown-linux"):
-        rustflags += " -Cllvm-args=-disable-vp"
+        rustflags += " -Clink-arg=-fuse-ld=lld"
     built, _ = build(target, ROOT / "target" / "pgo-instrumented", rustflags, "-fno-profile-generate")
     binaries, crate = built[0].parent, crate_hash(built)
 

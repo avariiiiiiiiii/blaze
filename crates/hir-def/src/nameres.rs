@@ -52,6 +52,7 @@ pub mod attr_resolution;
 mod collector;
 pub mod diagnostics;
 pub mod frozen;
+pub use hir_expand::proc_macro::may_have_session_macros;
 mod mod_resolution;
 mod path_resolution;
 pub mod proc_macro;
@@ -206,6 +207,9 @@ pub struct DefMap {
     // FIXME: Figure out a better way for the IDE layer to resolve these?
     derive_helpers_in_scope:
         FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>,
+
+    /// Whether collecting declarations ran a macro with compilation-local state.
+    pub session_macros: bool,
 
     /// The diagnostics that need to be emitted for this crate.
     diagnostics: Vec<DefDiagnostic>,
@@ -570,6 +574,7 @@ impl DefMap {
             prelude: None,
             macro_use_prelude: FxHashMap::default(),
             derive_helpers_in_scope: FxHashMap::default(),
+            session_macros: false,
             diagnostics: Vec::new(),
             data: crate_data,
         }
@@ -586,6 +591,7 @@ impl DefMap {
             krate: _,
             prelude: _,
             data: _,
+            session_macros: _,
         } = self;
 
         macro_use_prelude.shrink_to_fit();

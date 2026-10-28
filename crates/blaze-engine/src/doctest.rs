@@ -1092,6 +1092,7 @@ fn add_crates(
     }
     let all: Vec<base_db::Crate> = base_db::all_crates(db).iter().copied().chain(crates).collect();
     base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
+    crate::prepare_macro_sessions(db);
     added
 }
 
@@ -1241,6 +1242,7 @@ pub(crate) fn run_all(
         });
         // The examples of the next library are crates of the same names.
         base_db::set_all_crates_with_durability(db, crates, Durability::MEDIUM);
+        crate::prepare_macro_sessions(db);
         match ran {
             Ok(code) => code,
             Err(why) => recorded.refused(&format!("{why:#}")),
@@ -1265,8 +1267,10 @@ fn run(
     let library: ide_db::base_db::Crate = krate.into();
     let cfg = library.cfg_options(db).clone();
     document(db, krate);
+    crate::prepare_macro_sessions(db);
     let (tests, left_out) = hir::attach_db(db, || tests(db, asked, krate));
     library.set_cfg_options(db).to(cfg);
+    crate::prepare_macro_sessions(db);
     let built_from = built_from(db, library);
     let (plans, unit) = plan(db, building, asked, krate, &tests, target);
     let db: &RootDatabase = db;

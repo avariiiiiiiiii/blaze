@@ -9,8 +9,7 @@
 //! ```
 //!
 //! What it prints, a line each, in milliseconds: the module's compile by Cranelift, its first
-//! expansion (a fresh instance, as every expansion is) and the median of `--runs` more; with
-//! `--store`, the first expansion, kept, and the median of finding it kept; with `--native`,
+//! expansion in a crate session and the median of `--runs` more; with `--native`,
 //! the server's start and load of the library, its first expansion and the median of more.
 
 use std::{
@@ -120,8 +119,7 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(), String> {
         mixed_site: call_site,
     };
 
-    // What the store keeps of the machine code is of this build, which no toolchain is
-    // linked against here: the expansions are kept apart from it, of no build.
+    // Compiled machine code belongs to this build; expansion outputs are not cached.
     blaze_store::compiles_against("blaze-engine proc-macro-wasm");
     let code = args.store.as_deref().map(blaze_store::Store::open_at).transpose();
     let code = code.map_err(|e| e.to_string())?;
@@ -136,34 +134,18 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(), String> {
         format!("the module has no macro {}: it has {names:?}", args.name)
     })?;
     let listed = &macros[index];
-    let first = wasm.expand(index as u32, listed, None, &call, None);
+    let mut session = wasm.session(&env).map_err(|e| format!("{e:?}"))?;
+    let first = session.expand(index as u32, listed, None, &call);
     let output = first.output.map_err(|e| format!("{e:?}"))?;
     println!("wasm first: {}", ms(first.took));
-    let runs = (0..args.runs).map(|_| wasm.expand(index as u32, listed, None, &call, None).took);
-    println!("wasm warm: {}", ms(median(runs.collect())));
-    let wasm_text = output.to_string();
-
-    if let Some(dir) = &args.store {
-        let store = blaze_store::Store::open_at(dir).map_err(|e| e.to_string())?;
-        let kept = wasm.expand(index as u32, listed, None, &call, Some(&store));
-        println!("wasm kept: {} (found {})", ms(kept.took), kept.found);
-        store.flush();
-        drop(store);
-        let store = blaze_store::Store::open_at(dir).map_err(|e| e.to_string())?;
-        let mut found = Vec::new();
-        for _ in 0..args.runs.max(1) {
-            let ran = wasm.expand(index as u32, listed, None, &call, Some(&store));
-            let same = ran.output.as_ref().is_ok_and(|it| it.to_string() == wasm_text);
-            if !ran.found || !same {
-                println!("wasm found: not (found {}, same {same})", ran.found);
-                break;
-            }
-            found.push(ran.took);
-        }
-        if found.len() == args.runs.max(1) {
-            println!("wasm found: {}", ms(median(found)));
-        }
+    let mut runs = Vec::new();
+    for _ in 0..args.runs {
+        let ran = session.expand(index as u32, listed, None, &call);
+        ran.output.map_err(|e| format!("{e:?}"))?;
+        runs.push(ran.took);
     }
+    println!("wasm warm: {}", ms(median(runs)));
+    let wasm_text = output.to_string();
 
     if let (Some(native), Some(server)) = (&args.native, &args.server) {
         let start = Instant::now();

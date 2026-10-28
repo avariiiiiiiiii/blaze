@@ -106,7 +106,7 @@ fn key_of(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"blaze frozen def map 6");
+    field(b"blaze frozen def map 7");
     field(source.as_bytes());
     field(format!("{:?} {:?} {:?}", data.edition, data.target_kind, data.crate_attrs).as_bytes());
     let mut cfgs: Vec<String> =
@@ -209,10 +209,16 @@ impl Part {
     }
 
     fn encode(self, db: &ide_db::RootDatabase, krate: Crate) -> Result<Vec<u8>, String> {
-        hir::attach_db(db, || match self {
-            Part::DefMap => hir_frozen::encode(db, krate),
-            Part::Impls => impls_frozen::encode(db, krate),
-            Part::LangItems => hir_frozen::encode_lang_items(db, krate),
+        hir::attach_db(db, || {
+            // Artifacts cannot restore the guest state of this crate's declarations.
+            if hir::crate_def_map(db, krate).session_macros {
+                return Err("compilation-local macro state".to_owned());
+            }
+            match self {
+                Part::DefMap => hir_frozen::encode(db, krate),
+                Part::Impls => impls_frozen::encode(db, krate),
+                Part::LangItems => hir_frozen::encode_lang_items(db, krate),
+            }
         })
     }
 
@@ -258,6 +264,7 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
         }
         part.set(db, maps);
     }
+    crate::prepare_macro_sessions(db);
     served
 }
 

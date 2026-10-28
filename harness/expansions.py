@@ -140,6 +140,8 @@ def counts(log):
 
 
 def main():
+    # This harness verifies the native server's output cache, not WASM sessions.
+    os.environ["BLAZE_PROC_MACRO_WASM"] = "0"
     work, store = scratch("blaze-expansions-"), scratch("blaze-expansions-store-")
     ws = os.path.join(work, "app")
     os.makedirs(os.path.join(ws, "src"))

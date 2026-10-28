@@ -625,18 +625,20 @@ A module sees only what cargo documents for a proc macro:
   the environment of the shell or the daemon.
 - A clock that reads 0 and random bytes that are the same on every run.
 
-Each expansion is kept in the store. Its first key is what the module was built of (two
-builds of one source are not the same bytes), the macro, its input and the variables. Its
-second key adds the file reads the host recorded: each path, relative to the package, and
-what that file held. A later expansion is found only while each of those reads holds the
-same as before; the format is `cargo/keyed.rs`'s. The expansion's own keys hold no absolute
-path and no host triple. But what a module was built of names the checkout's paths, so for
-now only the same checkout finds it. An expansion that asked the compiler about a span (its
-source text, file, line or a join) is not kept. A module's machine code is kept too, for
-the machine that compiled it: a new process loads it in about 3 ms rather than compiling it
-again (4 to 11 s for the corpus's macros). The list of a module's macros is kept in a
-`.macros` file beside it, so a load compiles nothing; a module is compiled, or loaded from
-the store, when one of its macros first expands.
+Each calling crate gets its own module instance for a database revision. Its macros share
+guest statics, stored tokens, source locations and open package files. Every new database
+revision starts a fresh session, including a client request without source changes. Before cached bodies are checked, its declarations expand
+again in collection order, including unchanged registration attributes. A trap fails that
+session until the next revision.
+
+Expansion outputs are not cached: finding an earlier output would skip the macro's state
+changes. The compiled module's machine code remains cached for the host that compiled it.
+Frozen declaration, impl and language-item artifacts are disabled for crates whose
+declarations call these macros: those artifacts do not contain the macro's state. Depending
+on a macro crate alone does not disable frozen artifacts or force declaration expansion.
+Actual callers repeat declaration expansion every revision; compiled function caching remains enabled.
+The list of a module's macros is kept in a `.macros` file beside it; a load compiles nothing
+until a macro first expands.
 
 A proc macro that can't be built or loaded as a module fails the load, naming it:
 

@@ -16,8 +16,9 @@
 
 use std::{
     cell::RefCell,
-    error, fmt,
+    error,
     ffi::CStr,
+    fmt,
     iter::FromIterator,
     ops::{Bound, Range, RangeBounds},
     path::PathBuf,
@@ -697,7 +698,12 @@ macro_rules! unsuffixed_int_literals {
 
 impl Literal {
     fn new(kind: LitKind, value: &str, suffix: Option<&str>) -> Literal {
-        Literal { kind, symbol: value.into(), suffix: suffix.map(Into::into), span: Span::call_site() }
+        Literal {
+            kind,
+            symbol: value.into(),
+            suffix: suffix.map(Into::into),
+            span: Span::call_site(),
+        }
     }
 
     suffixed_int_literals! {
@@ -1314,6 +1320,7 @@ pub mod __blaze {
     pub fn expand1(f: fn(TokenStream) -> TokenStream, ptr: *const u8, len: usize) {
         hook();
         give(f(input(ptr, len)));
+        ROOM.with(|room| room.borrow_mut().clear());
     }
 
     /// An attribute.
@@ -1326,6 +1333,7 @@ pub mod __blaze {
     ) {
         hook();
         give(f(input(attr, attr_len), input(ptr, len)));
+        ROOM.with(|room| room.borrow_mut().clear());
     }
 
     /// The list of macros, a line each: kind (0 derive, 1 attribute, 2 function-like), name

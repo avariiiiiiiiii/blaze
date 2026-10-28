@@ -1366,11 +1366,12 @@ lint the example denies; and every error code it is marked with has to be among 
 rustdoc checks (`compile_fail,E0499` passes on the borrow checker's E0499). Where blaze's
 checker is weaker than rustc's it can't tell, and the example fails with the reason and is
 counted in the `doctests:` line ("marked `compile_fail` that blaze can't tell fail as
-marked"), never passed on a guess: an error it does not find (`E0277`, a bound not met, among
-many; the codes outside `SURE` and `BORROWCK`), a body MIR lowering does not support and the
-borrow checker skipped, the borrow checker turned off, or only errors rust-analyzer finds where
-rustc need not (a syntax error, or any error whose code is in neither list). Before, any error passed
-the example and the codes were not checked.
+marked"), never passed on a guess: only errors whose code is in neither list, which rust-analyzer
+reports where rustc need not (`E0277`, a bound not met, is one: rust-analyzer reports it, and
+`blaze check` does not trust it; a syntax error is another), no error at all (a code it does
+not check yet, a body MIR lowering does not support and the borrow checker skipped, the borrow
+checker turned off), or errors without every code marked. Before, any error passed the example
+and the codes were not checked.
 
 **M. Remove the wrapper and the fallback.** ([#93](https://github.com/indexable-inc/blaze/issues/93)) Plain cargo after `blaze enable` names blaze as
 `build.rustc`; blaze answers cargo's questions (B) and writes for each unit the files cargo

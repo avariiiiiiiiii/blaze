@@ -853,8 +853,9 @@ An example marked `compile_fail` passes when blaze's front end finds an error in
 rustc gives too: one of the errors `blaze check` is as sure of as rustc
 (`SURE` in `lib.rs`), the borrow checker's, or a lint the example denies, and, as rustdoc
 checks, every error code it is marked with (`compile_fail,E0499`). blaze's checker is weaker
-than rustc's here: it finds fewer errors (trait bounds not met, `E0277`, among them), finds
-some rustc does not, and skips bodies MIR lowering does not support. Where it can't tell, the
+than rustc's here: it reports errors it is not sure rustc gives (a trait bound not met,
+`E0277`, is not in `SURE`), misses others, and the borrow checker skips bodies MIR lowering does
+not support. Where it can't tell, the
 example fails with the reason and is counted in the `doctests:` line as one blaze can't tell
 fails as marked; it never passes on a guess.
 

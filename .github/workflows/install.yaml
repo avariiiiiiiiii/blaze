@@ -2,7 +2,8 @@ name: install
 
 # install.sh, run as a user runs it, on each platform it installs on: from the newest release
 # (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
-# `blaze` in a new project. And this commit's build, installed in a Debian
+# `blaze` in a new project; then each channel and pin form (`--channel`, BLAZE_CHANNEL,
+# `--version stable|canary|V`) against the release GitHub says it is. And this commit's build, installed in a Debian
 # container with no Rust at all, which runs `blaze run` in a project written by hand. On a
 # change to the script, on each release once it is published, weekly (a release's assets or
 # GitHub's redirects can change under it) and by hand. Not a check the merge queue requires.
@@ -83,6 +84,36 @@ jobs:
           if sh install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
           cat out.txt
           grep -F "there is no blaze release 0.0.0-none" out.txt
+      # The channels (docs/release.md), each against the release GitHub's API says it is:
+      # stable is the latest release, canary the newest dated one, prerelease or not. Without
+      # the toolchain: what is checked is which release came.
+      - name: channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          stable=$(gh release view -R "$BLAZE_REPO" --json tagName -q .tagName)
+          canary=$(gh release list -R "$BLAZE_REPO" --limit 100 --json tagName -q '.[].tagName' |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
+          echo "stable $stable, canary v$canary"
+          # installs VERSION SAID COMMAND...: the command installs VERSION and says SAID.
+          installs() {
+            version="$1"; said="$2"; shift 2
+            env -u BLAZE_VERSION "$@" > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -Fx "$said is installed." out.txt
+            blaze --version | tee /dev/stderr | grep -F "blaze $version " > /dev/null
+          }
+          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain
+          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain --channel stable
+          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain --version stable
+          installs "$canary" "blaze $canary (canary)" sh install.sh --no-toolchain --channel canary
+          installs "$canary" "blaze $canary (canary)" env BLAZE_CHANNEL=canary sh install.sh --no-toolchain
+          installs "$canary" "blaze $canary (canary)" sh install.sh --no-toolchain --version canary
+          # A version is that release, whatever the channel.
+          installs "${stable#v}" "blaze ${stable#v}" sh install.sh --no-toolchain --channel canary --version "$stable"
+          if sh install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
+          grep -F "blaze has no channel nightly." out.txt
 
   # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
   # the glibc a release asks for, with blaze's proc-macro server beside blaze. The profile may

@@ -108,13 +108,23 @@ AGENTS.md).
     waiting survives a tool that kills it; `land.py --wait` picks it up again. Never push to main or
     merge into it by hand. See
     [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
-13. **clean-up-lane**: Delete what a lane made when it is done: its worktree, target directory and ix
+13. **own-prs-to-merge**: Get pull requests in; don't hand them back. Any agent may take any open pull
+    request (a lane's, a contributor's, a draft) to merged: merge main, resolve conflicts (an
+    append-only file like CHANGELOG.md keeps both sides), fix its gate, finish a draft, mark it
+    ready, turn on auto-merge. Close one only when it is wrong or unwanted, saying why; skip one
+    whose author asked to be left alone. Tell the owning lane what you changed. Issues too: fix one
+    rather than route it to an owner.
+    Why: Andrew, 2026-10-28: "u can work on drafts and get them completed, dont care about draft state;
+    u can control and fix issues instead of sending back to owner, u should resolve ideally", and
+    "be agentic wrt prs". Tonight's crate splits left every open pull request conflicting; routing
+    each back to its lane left them all waiting.
+14. **clean-up-lane**: Delete what a lane made when it is done: its worktree, target directory and ix
     VM, and its merged branch.
-14. **credit-people**: Credit people. A commit or pull request built on someone's suggestion, diagnosis,
+15. **credit-people**: Credit people. A commit or pull request built on someone's suggestion, diagnosis,
     workaround or patch from an issue, review or discussion gets a `Co-authored-by: Name
     <id+login@users.noreply.github.com>` trailer for each of them, and names where it came from. See
     [docs/contributing.md#credit](docs/contributing.md#credit).
-15. **narration-is-a-script**: The site's narration is a podcast script, not the article read aloud.
+16. **narration-is-a-script**: The site's narration is a podcast script, not the article read aloud.
     Each page in `site/content/` has its own spoken version, written for the ear: an `Intro`, one
     `Say` per top-level Section or Issue (a `Say` on a container replaces its whole subtree; a long
     section splits into `Say`s on its sub-blocks, the rest `Silent`) and an `Outro`. Talk to the
@@ -124,7 +134,7 @@ AGENTS.md).
     accurate to the article: a change to a page changes its script in the same commit.
     Pronunciations go in `site/audio/lexicon.toml`, which never touches text inside `[ ]`. See
     [site/audio/README.md](site/audio/README.md).
-16. **scripts-take-typed-input**: A script (Python in `.github/scripts/`, `harness/`, `bench/`,
+17. **scripts-take-typed-input**: A script (Python in `.github/scripts/`, `harness/`, `bench/`,
     `scripts/`, `nix/`) takes one typed input, not a set of flags: a single JSON value, given as a
     path to a file, `-` for standard input, or inline as the one argument. It parses that into a
     typed structure (a frozen `dataclass` with `Literal` and exact types, every field named, unknown

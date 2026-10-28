@@ -234,6 +234,12 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-head { margin: 0 4px 6px; color: var(--ink-3); }
 .tl-list li.tl-head { border: 0; }
 .tl-list .face, .tl-list .flag, .tl-list .tag { flex: none; }
+.tl-av { position: relative; flex: none; display: inline-grid; }
+.tl-av .face { width: 22px; height: 22px; }
+.tl-av .dot { position: absolute; right: -2px; bottom: -2px; width: 9px; height: 9px; border-radius: 50%; background: var(--bg-3); box-shadow: inset 0 0 0 1.5px var(--ink-4), 0 0 0 2px var(--bg-3); }
+.tl-av .dot.on { background: var(--ok); box-shadow: 0 0 0 2px var(--bg-3); }
+.tl-list .more { margin-left: 6px; color: var(--ink-4); cursor: default; }
+.tl-list .for { flex: none; min-width: 26px; color: var(--ink-4); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
 .faces { display: inline-flex; align-items: center; }
 .faces .face + .face { margin-left: -6px; }
 .face { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: var(--bg-4); box-shadow: 0 0 0 2px var(--bg); transition: opacity 0.2s; }
@@ -272,6 +278,41 @@ main .discussion { scroll-margin-top: 64px; }
 .chat-online { flex: 1; color: var(--ink-3); font-size: 12.5px; }
 .chat-x { width: 28px; height: 28px; border: 0; border-radius: 8px; background: none; color: var(--ink-3); font-size: 20px; line-height: 1; cursor: pointer; }
 .chat-x:hover { background: var(--s-tint); color: var(--ink-1); }
+.chat-x svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.chat-x { display: grid; place-items: center; padding: 0; }
+.chat-mute.on { color: var(--ink-1); }
+/* Full screen: over the whole content pane, beside the sidebar (the frame's grid, above). */
+body.chat-full .chat { left: calc(var(--side-w) + 4px); width: auto; box-shadow: inset 0 0 0 1px var(--line-2); }
+body.chat-full .chat > .resizer { display: none; }
+body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typing { width: 100%; max-width: 860px; margin-inline: auto; }
+@media (max-width: 800px) { .chat-full { display: none; } }
+/* Translated messages (client/lib/translate.ts): a quiet line under the text. */
+.chat-tr { margin: 2px 0 0 28px; color: var(--ink-4); font-size: 11.5px; }
+.chat-tr button { padding: 0; border: 0; background: none; color: var(--ink-3); font: inherit; cursor: pointer; }
+.chat-tr button:hover { color: var(--ink-1); text-decoration: underline; }
+.chat-tr.pending { animation: tr-pulse 1.6s ease-in-out infinite; }
+@keyframes tr-pulse { 50% { opacity: 0.55; } }
+/* Who is writing, between the list and the composer. */
+.chat-typing { display: flex; align-items: center; gap: 7px; min-height: 22px; padding: 0 16px 4px; color: var(--ink-3); font-size: 12px; }
+.chat-typing[hidden] { display: none; }
+.chat-typing-faces { display: inline-flex; }
+.chat-typing-faces .face { width: 18px; height: 18px; }
+.chat-typing-faces .face + .face { margin-left: -5px; }
+.dots { display: inline-flex; gap: 3px; align-items: center; }
+.dots i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: dot 1.2s ease-in-out infinite; }
+.dots i:nth-child(2) { animation-delay: 0.15s; }
+.dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes dot { 0%, 60%, 100% { opacity: 0.3; transform: none; } 30% { opacity: 1; transform: translateY(-2px); } }
+/* Pop-ups for messages while the chat is shut, at the bottom right. */
+.chat-toasts { position: fixed; z-index: 46; right: clamp(8px, 1vw, 14px); bottom: 14px; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 24px)); pointer-events: none; }
+.chat-toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 0; border-radius: 14px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 12px 32px rgb(0 0 0 / 0.3); color: var(--ink-2); font: inherit; font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; pointer-events: auto; animation: toast-in 0.2s ease-out; }
+.chat-toast:hover { background: var(--bg-4); }
+.chat-toast .face { width: 26px; height: 26px; }
+.chat-toast-words { min-width: 0; }
+.chat-toast-words b { display: block; color: var(--ink-1); font-weight: 500; }
+.chat-toast-words span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.chat-toast.out { opacity: 0; transform: translateY(6px); transition: opacity 0.25s, transform 0.25s; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
 .chat-list { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 8px 0 10px; }
 .chat-msg { position: relative; padding: 6px 36px 2px 16px; }
 .chat-msg.grouped { padding-top: 0; }
@@ -324,4 +365,5 @@ main .discussion { scroll-margin-top: 64px; }
 .say-bubble.out { opacity: 0; transform: translateY(-4px); transition: opacity 0.3s, transform 0.3s; }
 @keyframes say-in { from { opacity: 0; transform: scale(0.9) translateX(-6px); } }
 .face.talking { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--ok); }
-@media (prefers-reduced-motion: reduce) { .say-bubble { animation: none; } }
+.say-bubble.typing { padding: 9px 11px; color: var(--ink-3); }
+@media (prefers-reduced-motion: reduce) { .say-bubble, .chat-toast, .dots i, .chat-tr.pending { animation: none; } }

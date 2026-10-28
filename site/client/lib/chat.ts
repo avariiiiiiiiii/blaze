@@ -8,9 +8,13 @@
  * admins anyone's. While the panel is shut the top line's Chat button counts what came in. It starts open where the
  * page makes room for it (a wide screen) until the reader closes it; that choice is kept per browser (localStorage),
  * wrapped like every storage access here because storage can refuse.
+ *
+ * Someone else's message in another language gets translated where the computer can do it (client/lib/translate.ts),
+ * marked as translated with a way back to the original. Who is writing shows under the list, with their faces.
  */
 
 import { CHAT, handle } from './resize';
+import * as tr from './translate';
 
 type Who = { key: string; login: string | null; avatar: string | null };
 type You = Who & { signIn: boolean; admin?: boolean };
@@ -19,14 +23,24 @@ type Msg = { id: number; key: string; login: string; avatar: string | null; text
 const OPEN_KEY = 'blaze.chat.open';
 const GROUP_MS = 5 * 60_000;
 const MAX = 500;
+/** How many of the history's latest messages get translated when the chat loads. */
+const TRANSLATE_HISTORY = 30;
+/** How long a typing indicator lasts without another word from its writer (they repeat every 2 s). */
+const TYPING_MS = 4500;
+const TYPING_SEND_MS = 2000;
 
 let send: (m: object) => void = () => {};
 let you: You | null = null;
 let base = '/';
 let face: (w: Who) => HTMLElement = () => document.createElement('span');
-let speak: (key: string, login: string, text: string) => void = () => {};
+let speak: (key: string, login: string, text: string | null) => void = () => {};
 let messages: Msg[] = [];
 let unread = 0;
+/** Translations by message id: being made, made, or not to be made. */
+type Tr = { s: 'pending'; from: string } | { s: 'done'; from: string; text: string; original: boolean } | { s: 'none' };
+const translations = new Map<number, Tr>();
+/** Who is writing now, by key, until when. */
+const typing = new Map<string, { who: Who; until: number; timer: ReturnType<typeof setTimeout> }>();
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''): HTMLElementTagNameMap[K] {
 	const e = document.createElement(tag);
@@ -45,15 +59,36 @@ const close = el('button', 'chat-x');
 close.type = 'button';
 close.setAttribute('aria-label', 'Close the chat');
 close.textContent = '×';
-head.append(title, online, close);
+/** Line icons for the head's buttons (16px, stroked in currentColor). */
+function icon(d: string): SVGSVGElement {
+	const ns = 'http://www.w3.org/2000/svg';
+	const svg = document.createElementNS(ns, 'svg');
+	svg.setAttribute('viewBox', '0 0 16 16');
+	svg.setAttribute('aria-hidden', 'true');
+	const p = document.createElementNS(ns, 'path');
+	p.setAttribute('d', d);
+	svg.append(p);
+	return svg;
+}
+const BELL = 'M4 11V7a4 4 0 0 1 8 0v4l1 1.5H3L4 11ZM6.5 14h3';
+const BELL_OFF = 'M4 11V7a4 4 0 0 1 6.6-3M12 7v4l1 1.5H5M6.5 14h3M2.5 2.5l11 11';
+const GROW = 'M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9';
+const SHRINK = 'M13.5 6.5h-4v-4M2.5 9.5h4v4M9.5 6.5 14 2M6.5 9.5 2 14';
+const mute = el('button', 'chat-x chat-mute');
+mute.type = 'button';
+const full = el('button', 'chat-x chat-full');
+full.type = 'button';
+head.append(title, online, mute, full, close);
 const list = el('div', 'chat-list');
 list.setAttribute('role', 'log');
 list.setAttribute('aria-live', 'polite');
 const jump = el('button', 'chat-jump', 'New messages');
 jump.type = 'button';
 jump.hidden = true;
+const typingRow = el('div', 'chat-typing');
+typingRow.setAttribute('aria-live', 'polite');
 const foot = el('div', 'chat-foot');
-panel.append(handle(CHAT), head, list, jump, foot);
+panel.append(handle(CHAT), head, list, jump, typingRow, foot);
 
 /** The top line's Chat button (client/lib/presence.ts places it). */
 export const button = el('button', 'tl-btn tl-chat');
@@ -63,6 +98,67 @@ panel.id = 'chat';
 const badge = el('span', 'tl-badge');
 badge.hidden = true;
 button.append(el('span', 'tl-chat-icon'), el('span', 'tl-label', 'Chat'), badge);
+
+const MUTE_KEY = 'blaze.chat.mute';
+function muted(): boolean {
+	try {
+		return localStorage.getItem(MUTE_KEY) === '1';
+	} catch {
+		return false;
+	}
+}
+function drawMute(): void {
+	const m = muted();
+	mute.replaceChildren(icon(m ? BELL_OFF : BELL));
+	mute.classList.toggle('on', m);
+	mute.title = m ? 'Muted: no pop-ups while the chat is shut' : 'Mute pop-ups while the chat is shut';
+	mute.setAttribute('aria-label', mute.title);
+	mute.setAttribute('aria-pressed', String(m));
+}
+function setMuted(m: boolean): void {
+	try {
+		if (m) localStorage.setItem(MUTE_KEY, '1');
+		else localStorage.removeItem(MUTE_KEY);
+	} catch {
+		// Storage refused: the choice lasts this page.
+	}
+	drawMute();
+	if (m) for (const t of toasts.children) t.remove();
+}
+
+/** Full screen: the chat over the whole content pane, the sidebar still beside it. Esc or the button again leaves. */
+function setFull(on: boolean): void {
+	document.body.classList.toggle('chat-full', on);
+	full.replaceChildren(icon(on ? SHRINK : GROW));
+	full.title = on ? 'Leave full screen' : 'Full screen';
+	full.setAttribute('aria-label', full.title);
+	full.setAttribute('aria-pressed', String(on));
+	if (on) toBottom();
+}
+
+/** Pop-ups for messages that come while the chat is shut (not muted): the newest three, each a few seconds. */
+const toasts = el('div', 'chat-toasts');
+toasts.setAttribute('aria-live', 'polite');
+const TOAST_MS = 5000;
+function toast(m: Msg): void {
+	if (muted() || !panel.hidden) return;
+	const t = el('button', 'chat-toast');
+	t.type = 'button';
+	const words = el('span', 'chat-toast-words');
+	words.append(el('b', '', m.login), el('span', '', m.text));
+	t.append(face(m), words);
+	t.title = 'Open the chat';
+	t.addEventListener('click', () => {
+		setOpen(true);
+		t.remove();
+	});
+	toasts.prepend(t);
+	while (toasts.children.length > 3) toasts.lastElementChild?.remove();
+	setTimeout(() => {
+		t.classList.add('out');
+		setTimeout(() => t.remove(), 250);
+	}, TOAST_MS);
+}
 
 /** Open on load: as the reader last left it, else open where the page makes room (styles/shell.css, 1280px). */
 function stored(): boolean {
@@ -84,7 +180,9 @@ function setOpen(open: boolean): void {
 	} catch {
 		// Storage refused: the panel just won't reopen on the next load.
 	}
+	if (!open) setFull(false);
 	if (open) {
+		for (const t of toasts.children) t.remove();
 		unread = 0;
 		drawBadge();
 		toBottom();
@@ -131,6 +229,104 @@ function body(text: string): HTMLElement {
 	return p;
 }
 
+/** A message's text, translated when it has been (unless flipped back), and the line that says so. */
+function text(m: Msg): HTMLElement[] {
+	const t = translations.get(m.id);
+	if (!t || t.s === 'none') return [body(m.text)];
+	const note = el('p', 'chat-tr');
+	if (t.s === 'pending') {
+		note.classList.add('pending');
+		note.append(pendingText(t.from));
+		return [body(m.text), note];
+	}
+	const flip = el('button', '', t.original ? 'Show translation' : 'Show original');
+	flip.type = 'button';
+	flip.addEventListener('click', () => {
+		translations.set(m.id, { ...t, original: !t.original });
+		redraw(m);
+	});
+	const label = el('span', '', `Translated from ${tr.languageName(t.from)}`);
+	label.title = 'Translated on this computer by HY-MT1.5 (Tencent). It can be wrong.';
+	note.append(label, ' · ', flip);
+	return [body(t.original ? m.text : t.text), note];
+}
+
+let trState: tr.State = { s: 'idle' };
+function pendingText(from: string): Node {
+	const f = document.createDocumentFragment();
+	const lang = tr.languageName(from);
+	if (trState.s === 'loading') {
+		const pct = trState.total ? ` ${Math.floor((trState.loaded / trState.total) * 100)}% of ${(trState.total / 1e9).toFixed(1)} GB` : '';
+		f.append(`Getting the translator, once:${pct} · `);
+		const no = el('button', '', 'Stop');
+		no.type = 'button';
+		no.title = 'Stop the download and do not translate on this computer';
+		no.addEventListener('click', () => tr.stop());
+		f.append(no);
+	} else f.append(`Translating from ${lang}…`);
+	return f;
+}
+
+/** Swaps a drawn message's text for what it is now. */
+function redraw(m: Msg): void {
+	const row = list.querySelector<HTMLElement>(`.chat-msg[data-id="${m.id}"]`);
+	if (!row) return;
+	for (const old of row.querySelectorAll('.chat-text, .chat-tr')) old.remove();
+	const del = row.querySelector('.chat-del');
+	const stick = nearBottom();
+	for (const n of text(m)) row.insertBefore(n, del);
+	if (stick) toBottom();
+}
+
+/** Translates `m` when it is someone else's, in another language, and this computer can. */
+async function translateOne(m: Msg): Promise<void> {
+	if (m.key === you?.key || translations.has(m.id)) return;
+	translations.set(m.id, { s: 'none' });
+	const from = await tr.needs(m.text);
+	if (!from) return;
+	translations.set(m.id, { s: 'pending', from });
+	redraw(m);
+	const out = await tr.translate(m.text);
+	translations.set(m.id, out && out !== m.text ? { s: 'done', from, text: out, original: false } : { s: 'none' });
+	redraw(m);
+}
+
+function drawTyping(): void {
+	const now = Date.now();
+	const who = [...typing.values()].filter((t) => t.until > now).map((t) => t.who);
+	typingRow.replaceChildren();
+	typingRow.hidden = who.length === 0;
+	if (!who.length) return;
+	const faces = el('span', 'chat-typing-faces');
+	for (const w of who.slice(0, 3)) faces.append(face(w));
+	const names = who.map((w) => w.login ?? 'someone');
+	const line = names.length === 1 ? `${names[0]} is typing` : names.length === 2 ? `${names[0]} and ${names[1]} are typing` : `${names.length} people are typing`;
+	const dots = el('span', 'dots');
+	dots.append(el('i'), el('i'), el('i'));
+	typingRow.append(faces, el('span', '', line), dots);
+}
+
+function typed(w: Who): void {
+	if (w.key === you?.key) return;
+	const old = typing.get(w.key);
+	if (old) clearTimeout(old.timer);
+	const timer = setTimeout(() => {
+		typing.delete(w.key);
+		drawTyping();
+	}, TYPING_MS);
+	typing.set(w.key, { who: w, until: Date.now() + TYPING_MS, timer });
+	drawTyping();
+	if (w.login) speak(w.key, w.login, null);
+}
+
+function stoppedTyping(key: string): void {
+	const t = typing.get(key);
+	if (!t) return;
+	clearTimeout(t.timer);
+	typing.delete(key);
+	drawTyping();
+}
+
 function item(m: Msg, prev: Msg | undefined): HTMLElement {
 	const grouped = prev && prev.key === m.key && Date.parse(m.at) - Date.parse(prev.at) < GROUP_MS;
 	const row = el('div', grouped ? 'chat-msg grouped' : 'chat-msg');
@@ -146,7 +342,7 @@ function item(m: Msg, prev: Msg | undefined): HTMLElement {
 		who.append(face(m), name, t);
 		row.append(who);
 	}
-	row.append(body(m.text));
+	row.append(...text(m));
 	if (you && (you.key === m.key || you.admin)) {
 		const del = el('button', 'chat-del', '×');
 		del.type = 'button';
@@ -189,7 +385,14 @@ function drawFoot(): void {
 			ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
 			go.disabled = !ta.value.trim();
 		};
-		ta.addEventListener('input', grow);
+		let sentTyping = 0;
+		ta.addEventListener('input', () => {
+			grow();
+			if (ta.value.trim() && Date.now() - sentTyping > TYPING_SEND_MS) {
+				sentTyping = Date.now();
+				send({ t: 'typing' });
+			}
+		});
 		ta.addEventListener('keydown', (e) => {
 			if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
 				e.preventDefault();
@@ -201,6 +404,7 @@ function drawFoot(): void {
 			const text = ta.value.trim();
 			if (!text) return;
 			send({ t: 'say', text });
+			sentTyping = 0;
 			ta.value = '';
 			grow();
 			err.hidden = true;
@@ -232,21 +436,34 @@ export function setup(opts: {
 	send: (m: object) => void;
 	base: string;
 	face: (w: Who) => HTMLElement;
-	speak: (key: string, login: string, text: string) => void;
+	speak: (key: string, login: string, text: string | null) => void;
 }): void {
 	send = opts.send;
 	speak = opts.speak;
 	base = opts.base;
 	face = opts.face;
-	document.body.append(panel);
-	button.addEventListener('click', () => setOpen(panel.hidden));
+	document.body.append(panel, toasts);
+	drawMute();
+	setFull(false);
+	mute.addEventListener('click', () => setMuted(!muted()));
+	full.addEventListener('click', () => setFull(!document.body.classList.contains('chat-full')));
+	typingRow.hidden = true;
+	tr.setup(base);
+	tr.watch((s) => {
+		trState = s;
+		if (s.s === 'failed' || (s.s === 'idle' && tr.off())) for (const [id, t] of translations) if (t.s === 'pending') translations.set(id, { s: 'none' });
+		for (const m of messages) if (translations.get(m.id)?.s !== 'done') redraw(m);
+	});
+	button.addEventListener('click', () => setOpen(!document.body.classList.contains('chat-open')));
 	close.addEventListener('click', () => setOpen(false));
 	jump.addEventListener('click', toBottom);
 	list.addEventListener('scroll', () => {
 		if (nearBottom()) jump.hidden = true;
 	});
 	document.addEventListener('keydown', (e) => {
-		if (e.key === 'Escape' && !panel.hidden && panel.contains(document.activeElement)) setOpen(false);
+		if (e.key !== 'Escape' || panel.hidden) return;
+		if (document.body.classList.contains('chat-full')) setFull(false);
+		else if (panel.contains(document.activeElement)) setOpen(false);
 	});
 	drawList();
 	drawFoot();
@@ -269,20 +486,29 @@ export function message(m: { t?: unknown }): boolean {
 		const ms = (m as { messages?: unknown }).messages;
 		messages = Array.isArray(ms) ? (ms as Msg[]) : [];
 		drawList();
+		for (const x of messages.slice(-TRANSLATE_HISTORY).reverse()) void translateOne(x);
 	} else if (m.t === 'msg') {
 		const msg = (m as { m: Msg }).m;
 		const stick = nearBottom();
+		stoppedTyping(msg.key);
 		if (msg.key !== you?.key) speak(msg.key, msg.login, msg.text);
 		messages.push(msg);
 		if (messages.length > 200) messages.shift();
 		list.querySelector('.chat-empty')?.remove();
 		list.append(item(msg, messages[messages.length - 2]));
+		void translateOne(msg);
 		if (panel.hidden) {
-			if (msg.key !== you?.key) unread++;
+			if (msg.key !== you?.key) {
+				unread++;
+				toast(msg);
+			}
 			drawBadge();
 			toBottom();
 		} else if (stick || msg.key === you?.key) toBottom();
 		else jump.hidden = false;
+	} else if (m.t === 'typing') {
+		const w = m as { key?: unknown; login?: unknown; avatar?: unknown };
+		if (typeof w.key === 'string') typed({ key: w.key, login: typeof w.login === 'string' ? w.login : null, avatar: typeof w.avatar === 'string' ? w.avatar : null });
 	} else if (m.t === 'unsay') {
 		const id = (m as { id: number }).id;
 		messages = messages.filter((x) => x.id !== id);

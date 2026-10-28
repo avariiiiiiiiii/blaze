@@ -23,7 +23,7 @@ import * as chat from './chat';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; since?: number; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -195,6 +195,14 @@ function flag(cc: string): HTMLElement {
 	return f;
 }
 
+/** How long since `t`, short: now, 5m, 2h, 3d. */
+function ago(t: number): string {
+	const m = Math.floor((Date.now() - t) / 60_000);
+	return m < 1 ? 'now' : m < 60 ? `${m}m` : m < 1440 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d`;
+}
+// The times in an open list keep up on their own.
+setInterval(() => drawList(), 30_000);
+
 function drawList(): void {
 	if (list.hidden) return;
 	list.replaceChildren(el('p', 'tl-head', total === 1 ? 'Only you, right now' : `${total} on the site`));
@@ -206,16 +214,34 @@ function drawList(): void {
 			who.href = `https://github.com/${encodeURIComponent(p.login!)}`;
 			who.rel = 'nofollow noopener';
 		}
-		li.append(face(p, p.pages.length > 0 && p.pages.every((x) => x.away)), who);
+		// The dot: green while a tab of theirs is in front of them, hollow while every one is in the background.
+		const active = p.pages.some((x) => !x.away);
+		const av = el('span', 'tl-av');
+		const dot = el('span', active ? 'dot on' : 'dot');
+		dot.title = active ? 'Here now' : 'Tab in the background';
+		av.append(face(p, !active), dot);
+		li.append(av, who);
 		if (p.country) li.append(flag(p.country));
 		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
+		// The page in front of them, the rest of their tabs as +N (named in its tooltip).
 		const where = el('span', 'where');
-		for (const pg of p.pages) {
-			const a = el('a', pg.away ? 'away' : '', titleOf(pg.path));
-			a.href = href(pg.path);
+		const [front, ...rest] = p.pages;
+		if (front) {
+			const a = el('a', front.away ? 'away' : '', titleOf(front.path));
+			a.href = href(front.path);
 			where.append(a);
 		}
+		if (rest.length) {
+			const more = el('span', 'more', `+${rest.length}`);
+			more.title = rest.map((x) => titleOf(x.path)).join(', ');
+			where.append(more);
+		}
 		li.append(where);
+		if (p.since) {
+			const t = el('span', 'for', ago(p.since));
+			t.title = `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+			li.append(t);
+		}
 		ul.append(li);
 	}
 	if (people.length < total) ul.append(el('li', 'tl-head', `and ${total - people.length} more`));
@@ -290,10 +316,13 @@ function drawSide(): void {
 }
 
 const SAY_MS = 6000;
+const TYPING_BUBBLE_MS = 3000;
 const bubbles = new Map<string, HTMLElement>();
 
 /** A bubble with `text` out of `key`'s face on the sidebar row of the page they are on, if it is in view. */
-function speak(key: string, login: string, text: string): void {
+function speak(key: string, login: string, text: string | null): void {
+	// Typing dots never cover something said that is still showing.
+	if (text === null && bubbles.get(key)?.classList.contains('said')) return;
 	bubbles.get(key)?.remove();
 	const p = people.find((x) => x.key === key);
 	// The page they are looking at first, then any other tab of theirs.
@@ -306,9 +335,13 @@ function speak(key: string, login: string, text: string): void {
 	at ??= document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
 	const r = at?.getBoundingClientRect();
 	if (!at || !r || r.width === 0 || r.bottom < 0 || r.top > innerHeight) return;
-	const b = el('div', 'say-bubble');
+	const b = el('div', text === null ? 'say-bubble typing' : 'say-bubble said');
 	b.setAttribute('aria-hidden', 'true');
-	b.append(el('b', '', login), el('span', '', text));
+	if (text === null) {
+		const dots = el('span', 'dots');
+		dots.append(el('i'), el('i'), el('i'));
+		b.append(dots);
+	} else b.append(el('b', '', login), el('span', '', text));
 	b.style.left = `${Math.round(r.right + 10)}px`;
 	b.style.top = `${Math.round(r.top + r.height / 2 - 14)}px`;
 	document.body.append(b);
@@ -321,7 +354,7 @@ function speak(key: string, login: string, text: string): void {
 			b.remove();
 			if (bubbles.get(key) === b) bubbles.delete(key);
 		}, 300);
-	}, SAY_MS);
+	}, text === null ? TYPING_BUBBLE_MS : SAY_MS);
 }
 // The sidebar scrolling or the page swapping moves the faces from under a bubble: let it go.
 for (const t of ['scroll', LEAVE] as const) addEventListener(t, () => {

@@ -15,9 +15,11 @@
  *                     {t: "comments", doc}                      a comment on that doc was posted or deleted
  *                     {t: "chat", messages: [Msg]}              the chat's last CHAT_SHOWN messages, once, on connect
  *                     {t: "msg", m: Msg} / {t: "unsay", id}     a chat message said, or taken back
+ *                     {t: "typing", key, login, avatar}           someone signed in is writing (at most every TYPING_MS)
  *                     {t: "error", text}                        why the tab's last chat message was refused
  *   client -> server  {t: "at", path, away}                       the page the tab shows (a site path) and whether
  *                                                                  it is hidden; unknown paths count as no page
+ *                     {t: "typing"}                            chat: the reader is writing a message
  *                     {t: "say", text} / {t: "unsay", id}       chat: signed-in readers only; taking back is for
  *                                                                  the author or a COMMENT_ADMINS id
  *
@@ -45,13 +47,16 @@ const CHAT_KEPT = 500;
 const RATE_SHORT = 5;
 const RATE_LONG = 120;
 const MAX_PEOPLE = 300;
+const TYPING_MS = 2000;
+/** A reload or a dropped connection shorter than this keeps someone's time on the site. */
+const RETURN_MS = 120_000;
 
 type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean };
 type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string };
 /** Kept on each socket (`serializeAttachment`), so it survives hibernation. */
-type Tab = Who & { path: string | null; away: boolean; country: string | null; seen?: number };
+type Tab = Who & { path: string | null; away: boolean; country: string | null; seen?: number; since?: number };
 /** `country` is Cloudflare's two-letter guess from the IP (`request.cf.country`), shown as a flag; null when unknown or Tor. */
-type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; since: number; pages: { path: string; away: boolean }[] };
 
 /** The worker side of GET /api/presence. */
 export async function handlePresence(request: Request, env: Env): Promise<Response> {
@@ -89,6 +94,10 @@ export class Presence extends DurableObject<Env> {
 	private salt: { day: string; key: CryptoKey } | null = null;
 	/** Each talker's recent message times (ms), for the rate limit. Lost on hibernation, which only forgives. */
 	private said = new Map<string, number[]>();
+	/** When each person last said they were typing (not kept: a lost one only drops an indicator). */
+	private typed = new Map<string, number>();
+	/** When each person came, and when their last tab went (null while one is open). Lost on hibernation; then a tab's own `since` stands. */
+	private arrived = new Map<string, { at: number; gone: number | null }>();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -112,7 +121,11 @@ export class Presence extends DurableObject<Env> {
 
 		const { 0: client, 1: server } = new WebSocketPair();
 		this.ctx.acceptWebSocket(server, [who.key]);
-		const tab: Tab = { ...who, path: null, away: false, country: request.headers.get('x-presence-country') || null };
+		const now = Date.now();
+		const before = this.arrived.get(who.key);
+		const since = before && (before.gone === null || now - before.gone < RETURN_MS) ? before.at : now;
+		this.arrived.set(who.key, { at: since, gone: null });
+		const tab: Tab = { ...who, path: null, away: false, since, country: request.headers.get('x-presence-country') || null };
 		server.serializeAttachment(tab);
 		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, admin: !!who.admin, signIn: request.headers.get('x-presence-signin') === '1' }));
 		server.send(this.snapshot());
@@ -129,6 +142,12 @@ export class Presence extends DurableObject<Env> {
 			return ws.close(1003, 'Not JSON.');
 		}
 		const tab = ws.deserializeAttachment() as Tab;
+		if (m.t === 'typing') {
+			const now = Date.now();
+			if (!tab.login || now - (this.typed.get(tab.key) ?? 0) < TYPING_MS) return;
+			this.typed.set(tab.key, now);
+			return this.broadcast(JSON.stringify({ t: 'typing', key: tab.key, login: tab.login, avatar: tab.avatar }));
+		}
 		if (m.t === 'say') return this.say(ws, tab, m.text);
 		if (m.t === 'unsay') return this.unsay(ws, tab, m.id);
 		if (m.t !== 'at') return;
@@ -162,6 +181,7 @@ export class Presence extends DurableObject<Env> {
 		if (times.filter((t) => now - t < 15_000).length >= RATE_SHORT || times.length >= RATE_LONG) return refuse('Slow down a little.');
 		times.push(now);
 		this.said.set(tab.key, times);
+		this.typed.delete(tab.key);
 		const at = new Date(now).toISOString();
 		const row = this.ctx.storage.sql
 			.exec<{ id: number }>('INSERT INTO chat (key, login, avatar, text, at) VALUES (?, ?, ?, ?, ?) RETURNING id', tab.key, tab.login, tab.avatar, text, at)
@@ -218,9 +238,10 @@ export class Presence extends DurableObject<Env> {
 			if (!tab) continue;
 			let p = people.get(tab.key);
 			if (!p) {
-				p = { key: tab.key, login: tab.login, avatar: tab.avatar, country: tab.country ?? null, pages: [] };
+				p = { key: tab.key, login: tab.login, avatar: tab.avatar, country: tab.country ?? null, since: tab.since ?? Date.now(), pages: [] };
 				people.set(tab.key, p);
 			}
+			if (tab.since && tab.since < p.since) p.since = tab.since;
 			if (!tab.path) continue;
 			const same = p.pages.find((x) => x.path === tab.path && x.away === tab.away);
 			if (same) seen.set(same, Math.max(seen.get(same) ?? 0, tab.seen ?? 0));
@@ -229,6 +250,12 @@ export class Presence extends DurableObject<Env> {
 				p.pages.push(pg);
 				seen.set(pg, tab.seen ?? 0);
 			}
+		}
+		const now = Date.now();
+		for (const [key, a] of this.arrived) {
+			if (people.has(key)) a.gone = null;
+			else if (a.gone === null) a.gone = now;
+			else if (now - a.gone > RETURN_MS) this.arrived.delete(key);
 		}
 		// Each person's pages, the one in front of them first: in view before hidden, then the latest moved to.
 		for (const p of people.values()) p.pages.sort((a, b) => Number(a.away) - Number(b.away) || (seen.get(b) ?? 0) - (seen.get(a) ?? 0));

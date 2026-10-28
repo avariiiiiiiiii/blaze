@@ -39,16 +39,39 @@ published as a full release and counts as stable.
 
 ## Cutting a canary
 
-`release-cut.yaml` (by hand, on main) or the release train's `release` job commits
-`release: v0.YYYYMMDD.N` and tags it; `release.yaml` builds the archives on the tag for macOS
-(Apple silicon) and Linux (x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS`
-and the tag's CHANGELOG.md section as its notes. PGO is off for now (#870): the release is built
-with `--no-pgo`.
+Every green main is a canary, cheaply. `canary.yaml` runs when the merge gate's run on a push to
+main ends green (and hourly, and by hand): `.github/scripts/canary.py cut` tags main's HEAD
+`v0.YYYYMMDD.N` through the API and dispatches `release.yaml` on the tag, when
+
+- HEAD's `ci` check is green and HEAD has no release tag yet,
+- something besides the docs (`docs/`, `site/`, `agents/`, `*.md`) and the bots' own commits
+  changed since the newest release,
+- no `release.yaml` or `release-cut.yaml` is running, and the newest release is at least 30
+  minutes old (`-f min-minutes=N` by hand). A green main inside that window is cut by the next
+  green push or the hourly run.
+
+No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
+that passed the gate as it is. release.yaml stamps the tag's version into its own checkout
+(Cargo.toml's workspace version and the workspace's entries of Cargo.lock, `canary.py stamp`),
+so `blaze --version` and the archives' names are the tag's, and writes the notes: CHANGELOG.md's
+[Unreleased] and the title of each change merged since the previous release. Main's Cargo.toml
+keeps the version of the last release commit.
+
+`release-cut.yaml` (by hand, on main) or the release train's `release` job still cuts a release
+the old way: it commits `release: v0.YYYYMMDD.N` (the version, a CHANGELOG.md section, Cargo.lock,
+nix/units) and tags it, and that release's notes are its CHANGELOG.md section. Both count every
+tag, so they never take the same number.
+
+Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
+(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS`. PGO is off for now (#870):
+the release is built with `--no-pgo`.
 
 ## Promotion to stable
 
 `release.yaml` starts `promote.yaml` once it has published the prerelease (by dispatch: a release
-the workflow's own token publishes starts no `release:` workflow). It runs, against the
+the workflow's own token publishes starts no `release:` workflow). One gate runs at a time; a
+newer canary's run replaces one still waiting, so the gate always takes the newest canary when it
+is free, and a canary it never took stays a canary. It runs, against the
 published archives, installed with `install.sh --version <v>` as a user installs them, on macOS
 (Apple silicon) and Linux (x86-64 and ARM64):
 

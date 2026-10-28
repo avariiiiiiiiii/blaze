@@ -56,8 +56,9 @@ const TARGET_SELECTION: &[&str] = &[
 const DEV_TARGETS: &[&str] =
     &["--examples", "--example", "--tests", "--test", "--benches", "--bench", "--all-targets"];
 
-/// The flags of `cargo test` that are about running and not about building.
-const RUNNING: &[&str] = &["--no-run", "--no-fail-fast"];
+/// The flags of `cargo test` that are about running and not about building, and blaze's
+/// `--why` and `--json`, which say why each test runs or not instead of running them.
+const RUNNING: &[&str] = &["--no-run", "--no-fail-fast", "--why", "--json"];
 
 /// The flags that change only what cargo prints, with `--color`'s value: the build is the
 /// same.
@@ -264,6 +265,10 @@ pub(crate) struct Flags {
     pub(crate) verbose: bool,
     pub(crate) no_run: bool,
     pub(crate) no_fail_fast: bool,
+    /// `blaze test --why`: say of each test whether it is hermetic and why not, and run none.
+    pub(crate) why: bool,
+    /// With `--why`, the tests' lines of `tests.ndjson` on stdout instead of a table.
+    pub(crate) json: bool,
     pub(crate) doc: bool,
     /// Whether a flag picks targets, so that `cargo test` runs no doc tests.
     pub(crate) selects_targets: bool,
@@ -530,6 +535,8 @@ impl Flags {
             "-v" | "-vv" | "--verbose" => self.verbose = true,
             "--no-run" => self.no_run = true,
             "--no-fail-fast" => self.no_fail_fast = true,
+            "--why" => self.why = true,
+            "--json" => self.json = true,
             "--doc" => self.doc = true,
             _ => {}
         }
@@ -649,6 +656,9 @@ mod tests {
             (&["filter".to_owned()][..], &["--nocapture".to_owned()][..])
         );
         assert!(test.flags.no_fail_fast && test.flags.no_run);
+        let why = build("test", "--why --json -p a");
+        assert!(why.flags.why && why.flags.json);
+        assert_eq!(why.build_args, ["-p", "a"]);
     }
 
     #[test]

@@ -105,7 +105,7 @@ pub use debuginfo::Sidecar;
 mod f16_f128;
 mod float_pair;
 mod fncache;
-pub use fncache::{AlwaysRun, Reach, tests_reach};
+pub use fncache::{Call, Found, Kind as ReachKind, Reach, tests_reach};
 mod fragment;
 mod home;
 mod later;

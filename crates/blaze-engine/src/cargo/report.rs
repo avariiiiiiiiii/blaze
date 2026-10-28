@@ -1,0 +1,479 @@
+//! What `blaze test` writes of each test it was asked to run, for people and programs to tell
+//! what is slow to test and why: `target/blaze/tests.ndjson`, a [`Line`] a test, appended as
+//! each test executable finishes and written again at the end sorted by package, target and
+//! name, so two runs diff line by line; and `target/blaze/tests.summary.json`, the counts and
+//! what makes the most tests not hermetic ([`Summary`]). `blaze test --why` runs no test and
+//! prints a table of the same, `--why --json` the lines. docs/cargo.md has the schema.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write as _,
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    affected::{Cached, Planned},
+    plan::{Call, Reason},
+    state::{Kind, Program},
+};
+
+/// The version of the schema of [`Line`] and [`Summary`], their `v`.
+pub(crate) const SCHEMA: u32 = 1;
+
+/// How many of each ranking [`Summary`] keeps.
+const TOP: usize = 50;
+
+/// A test, as a line of `tests.ndjson`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Line {
+    pub(crate) v: u32,
+    pub(crate) package: String,
+    /// `lib`, or the kind and name of the target: `bin:rg`, `test:integration`.
+    pub(crate) target: String,
+    /// libtest's name of it.
+    pub(crate) name: String,
+    /// Whether its end is a function of its code alone, so that a pass is kept by its code.
+    pub(crate) hermetic: bool,
+    /// `hit`: it passed as it is now and was not run; `miss`: it ran, and a pass is kept;
+    /// `never`: it runs every time.
+    pub(crate) cached: String,
+    /// `passed`, `failed`, `cached` (not run for a pass kept), `unknown` (its executable
+    /// ended without saying) or `not-run` (`--why`).
+    pub(crate) result: String,
+    /// It passed and failed under one key, and runs every time.
+    pub(crate) flaky: bool,
+    /// What makes it not hermetic, a kind once each, by the fewest calls.
+    pub(crate) reasons: Vec<Reason>,
+    /// What it reaches that a pass does not stand for but only makes a flaky test flaky:
+    /// the clock, randomness, threads.
+    pub(crate) nondeterministic: Vec<Reason>,
+}
+
+impl Line {
+    fn order(&self) -> (&str, &str, &str) {
+        (&self.package, &self.target, &self.name)
+    }
+}
+
+/// How a test executable's run ended, for its [`Line`]s.
+pub(crate) struct Ended<'a> {
+    /// `--why`: nothing ran.
+    pub(crate) planned_only: bool,
+    /// The tests it was asked to run, all of them when `None`.
+    pub(crate) ran: Option<&'a [String]>,
+    pub(crate) failed: bool,
+    /// The tests that failed, when that is known.
+    pub(crate) failures: Option<&'a [String]>,
+    pub(crate) verifying: bool,
+    /// The tests found flaky.
+    pub(crate) flaky: &'a BTreeSet<String>,
+}
+
+/// The target `program` is, as a [`Line`] names it.
+pub(crate) fn target_of(program: &Program) -> String {
+    let kind = match program.kind {
+        Kind::Lib => return "lib".to_owned(),
+        Kind::Bin => "bin",
+        Kind::Example => "example",
+        Kind::Test => "test",
+        Kind::Bench => "bench",
+    };
+    format!("{kind}:{}", program.name)
+}
+
+/// The lines of the tests of `program`, as `planned` and how its run `ended` say.
+pub(crate) fn lines_of(program: &Program, planned: &[Planned], ended: &Ended<'_>) -> Vec<Line> {
+    let target = target_of(program);
+    let failures: Option<BTreeSet<&str>> =
+        ended.failures.map(|it| it.iter().map(String::as_str).collect());
+    let ran: Option<BTreeSet<&str>> = ended.ran.map(|it| it.iter().map(String::as_str).collect());
+    let mut lines: Vec<Line> = planned
+        .iter()
+        .map(|test| {
+            let name = test.name.as_str();
+            let result = match () {
+                _ if ended.planned_only => "not-run",
+                _ if test.cached == Cached::Hit && !ended.verifying => "cached",
+                _ if ran.as_ref().is_some_and(|it| !it.contains(name)) => "not-run",
+                _ if !ended.failed => "passed",
+                _ => match &failures {
+                    Some(failed) if failed.contains(name) => "failed",
+                    Some(_) => "passed",
+                    None => "unknown",
+                },
+            };
+            let (reasons, nondeterministic) =
+                test.reasons.iter().cloned().partition(|it: &Reason| it.blocks());
+            Line {
+                v: SCHEMA,
+                package: program.package.clone(),
+                target: target.clone(),
+                name: test.name.clone(),
+                hermetic: test.hermetic,
+                cached: test.cached.name().to_owned(),
+                result: result.to_owned(),
+                flaky: ended.flaky.contains(name),
+                reasons,
+                nondeterministic,
+            }
+        })
+        .collect();
+    lines.sort_by(|a, b| a.order().cmp(&b.order()));
+    lines
+}
+
+/// `tests.ndjson` as it is written: what `blaze test` ran so far.
+pub(crate) struct Report {
+    dir: PathBuf,
+    lines: Vec<Line>,
+    file: Option<std::fs::File>,
+}
+
+impl Report {
+    /// The report of this command, in `target`, the target directory: `tests.ndjson` starts
+    /// empty.
+    pub(crate) fn new(target: &Path) -> Report {
+        let dir = target.join("blaze");
+        let file = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::File::create(dir.join("tests.ndjson")))
+            .ok();
+        Report { dir, lines: Vec::new(), file }
+    }
+
+    /// Adds the lines of a test executable that finished.
+    pub(crate) fn add(&mut self, lines: Vec<Line>) {
+        if let Some(file) = &mut self.file {
+            let text: String = lines.iter().map(ndjson).collect();
+            _ = file.write_all(text.as_bytes());
+        }
+        self.lines.extend(lines);
+    }
+
+    /// Writes `tests.ndjson` again, sorted, and `tests.summary.json`; the lines and the summary.
+    pub(crate) fn finish(mut self) -> (Vec<Line>, Summary) {
+        self.lines.sort_by(|a, b| a.order().cmp(&b.order()));
+        let summary = Summary::of(&self.lines);
+        let text: String = self.lines.iter().map(ndjson).collect();
+        write_whole(&self.dir.join("tests.ndjson"), text.as_bytes());
+        if let Ok(json) = serde_json::to_string_pretty(&summary) {
+            write_whole(&self.dir.join("tests.summary.json"), format!("{json}\n").as_bytes());
+        }
+        (self.lines, summary)
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+fn write_whole(file: &Path, bytes: &[u8]) {
+    let writing = file.with_extension("writing");
+    if std::fs::write(&writing, bytes).and_then(|()| std::fs::rename(&writing, file)).is_err() {
+        _ = std::fs::remove_file(&writing);
+    }
+}
+
+/// A line of `tests.ndjson`, with its newline.
+pub(crate) fn ndjson(line: &Line) -> String {
+    serde_json::to_string(line).map(|it| it + "\n").unwrap_or_default()
+}
+
+/// What `tests.summary.json` holds: how many tests are hermetic and kept, and what makes the
+/// most tests not hermetic, the place to start to make a repository's tests faster.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Summary {
+    pub(crate) v: u32,
+    pub(crate) tests: usize,
+    pub(crate) hermetic: usize,
+    pub(crate) not_hermetic: usize,
+    /// How many tests are of each `cached`: `hit`, `miss`, `never`.
+    pub(crate) cached: BTreeMap<String, usize>,
+    /// How many tests are of each `result`.
+    pub(crate) results: BTreeMap<String, usize>,
+    /// How many tests each kind makes not hermetic.
+    pub(crate) by_kind: BTreeMap<String, usize>,
+    /// What makes the most tests not hermetic, by kind and what, the most first.
+    pub(crate) top_reasons: Vec<TopReason>,
+    /// The functions of the workspace the most tests reach it through: the last of the
+    /// workspace on the way to a reason, the most first.
+    pub(crate) top_helpers: Vec<TopHelper>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TopReason {
+    pub(crate) kind: String,
+    pub(crate) what: String,
+    /// How many tests it makes not hermetic.
+    pub(crate) tests: usize,
+    /// The first of them, by package, target and name.
+    pub(crate) example: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TopHelper {
+    #[serde(rename = "fn")]
+    pub(crate) name: String,
+    /// Where it calls on to the reason.
+    pub(crate) file: Option<String>,
+    pub(crate) line: Option<u32>,
+    pub(crate) col: Option<u32>,
+    /// The kinds of reason reached through it.
+    pub(crate) kinds: Vec<String>,
+    /// How many tests reach a reason through it.
+    pub(crate) tests: usize,
+    /// How many of those reach every reason that makes them not hermetic through it: they
+    /// are hermetic once it no longer reaches any.
+    pub(crate) only_through_it: usize,
+}
+
+impl Summary {
+    pub(crate) fn of(lines: &[Line]) -> Summary {
+        let count = |it: &mut BTreeMap<String, usize>, key: &str| {
+            *it.entry(key.to_owned()).or_default() += 1;
+        };
+        let (mut cached, mut results, mut by_kind) =
+            (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let mut reasons: BTreeMap<(String, String), (usize, String)> = BTreeMap::new();
+        let mut helpers: BTreeMap<(String, Option<String>), (TopHelper, BTreeSet<String>)> =
+            BTreeMap::new();
+        for line in lines {
+            count(&mut cached, &line.cached);
+            count(&mut results, &line.result);
+            let test = format!("{} {} {}", line.package, line.target, line.name);
+            let mut through = BTreeSet::new();
+            for reason in &line.reasons {
+                count(&mut by_kind, &reason.kind);
+                let entry = reasons
+                    .entry((reason.kind.clone(), reason.what.clone()))
+                    .or_insert_with(|| (0, test.clone()));
+                entry.0 += 1;
+                if test < entry.1 {
+                    entry.1 = test.clone();
+                }
+                let helper = helper(&reason.chain);
+                through.insert(helper.map(|it| (it.name.clone(), at(it))));
+                let Some(call) = helper else { continue };
+                let (_, kinds) =
+                    helpers.entry((call.name.clone(), at(call))).or_insert_with(|| {
+                        let top = TopHelper {
+                            name: call.name.clone(),
+                            file: call.file.clone(),
+                            line: call.line,
+                            col: call.col,
+                            kinds: Vec::new(),
+                            tests: 0,
+                            only_through_it: 0,
+                        };
+                        (top, BTreeSet::new())
+                    });
+                kinds.insert(reason.kind.clone());
+            }
+            let only = through.len() == 1;
+            for key in through.into_iter().flatten() {
+                if let Some((top, _)) = helpers.get_mut(&key) {
+                    top.tests += 1;
+                    top.only_through_it += usize::from(only);
+                }
+            }
+        }
+        let mut top_reasons: Vec<TopReason> = reasons
+            .into_iter()
+            .map(|((kind, what), (tests, example))| TopReason { kind, what, tests, example })
+            .collect();
+        top_reasons.sort_by(|a, b| {
+            b.tests.cmp(&a.tests).then_with(|| (&a.kind, &a.what).cmp(&(&b.kind, &b.what)))
+        });
+        top_reasons.truncate(TOP);
+        let mut top_helpers: Vec<TopHelper> = helpers
+            .into_values()
+            .map(|(mut top, kinds)| {
+                top.kinds = kinds.into_iter().collect();
+                top
+            })
+            .collect();
+        top_helpers.sort_by(|a, b| {
+            (b.only_through_it, b.tests)
+                .cmp(&(a.only_through_it, a.tests))
+                .then_with(|| (&a.name, &a.file, a.line).cmp(&(&b.name, &b.file, b.line)))
+        });
+        top_helpers.truncate(TOP);
+        let hermetic = lines.iter().filter(|it| it.hermetic).count();
+        Summary {
+            v: SCHEMA,
+            tests: lines.len(),
+            hermetic,
+            not_hermetic: lines.len() - hermetic,
+            cached,
+            results,
+            by_kind,
+            top_reasons,
+            top_helpers,
+        }
+    }
+}
+
+/// The last call on `chain` made by code of the workspace, whose file is told relative to it.
+fn helper(chain: &[Call]) -> Option<&Call> {
+    chain.iter().rev().find(|it| it.file.as_deref().is_some_and(|file| !file.starts_with('/')))
+}
+
+fn at(call: &Call) -> Option<String> {
+    let file = call.file.as_deref()?;
+    Some(format!("{file}:{}:{}", call.line.unwrap_or(0), call.col.unwrap_or(0)))
+}
+
+/// `blaze test --why`'s table of `lines` and `summary`, with where the files are.
+pub(crate) fn table(lines: &[Line], summary: &Summary, dir: &Path) -> String {
+    let mut out = String::new();
+    let percent = match summary.tests {
+        0 => 100.0,
+        tests => summary.hermetic as f64 * 100.0 / tests as f64,
+    };
+    let of = |key: &str| summary.cached.get(key).copied().unwrap_or(0);
+    out.push_str(&format!(
+        "{} of {} tests are hermetic ({percent:.0}%): {} passed as they are now, {} to run and \
+         keep, {} run every time\n",
+        summary.hermetic,
+        summary.tests,
+        of("hit"),
+        of("miss"),
+        of("never"),
+    ));
+    if !summary.top_reasons.is_empty() {
+        out.push_str("\nWhat makes the most tests not hermetic:\n");
+        out.push_str(&format!("  {:>6}  {:<12}  {}\n", "tests", "kind", "what"));
+        for it in summary.top_reasons.iter().take(20) {
+            out.push_str(&format!("  {:>6}  {:<12}  {}\n", it.tests, it.kind, it.what));
+        }
+    }
+    if !summary.top_helpers.is_empty() {
+        out.push_str(
+            "\nThe functions of the workspace they are reached through (a test is hermetic \
+             once all it reaches through them is gone):\n",
+        );
+        out.push_str(&format!("  {:>6}  {:>6}  {}\n", "tests", "only", "function"));
+        for it in summary.top_helpers.iter().take(20) {
+            let place =
+                it.file.as_deref().map(|file| format!(" ({file}:{})", it.line.unwrap_or(0)));
+            out.push_str(&format!(
+                "  {:>6}  {:>6}  {}{} [{}]\n",
+                it.tests,
+                it.only_through_it,
+                it.name,
+                place.unwrap_or_default(),
+                it.kinds.join(", ")
+            ));
+        }
+    }
+    let not: Vec<&Line> = lines.iter().filter(|it| !it.hermetic).collect();
+    if !not.is_empty() {
+        out.push_str(&format!("\nNot hermetic ({}):\n", not.len()));
+        for line in not {
+            let why: Vec<String> = line
+                .reasons
+                .iter()
+                .map(|it| {
+                    let chain: Vec<&str> = it.chain.iter().map(|it| it.name.as_str()).collect();
+                    format!("{} `{}` by {}", it.kind, it.what, chain.join(" -> "))
+                })
+                .collect();
+            out.push_str(&format!(
+                "  {} {} {}: {}\n",
+                line.package,
+                line.target,
+                line.name,
+                why.join("; ")
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "\nEvery test: {}; the counts: {}\n",
+        dir.join("tests.ndjson").display(),
+        dir.join("tests.summary.json").display()
+    ));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reason(kind: &str, what: &str, chain: &[(&str, Option<&str>)]) -> Reason {
+        Reason {
+            kind: kind.to_owned(),
+            what: what.to_owned(),
+            why: format!("it reaches `{what}`"),
+            chain: chain.iter().map(|(name, at)| Call::new((*name).to_owned(), *at)).collect(),
+        }
+    }
+
+    fn line(name: &str, reasons: Vec<Reason>) -> Line {
+        let (reasons, nondeterministic): (Vec<_>, Vec<_>) =
+            reasons.into_iter().partition(|it| it.blocks());
+        Line {
+            v: SCHEMA,
+            package: "p".to_owned(),
+            target: "lib".to_owned(),
+            name: name.to_owned(),
+            hermetic: reasons.is_empty(),
+            cached: if reasons.is_empty() { "hit" } else { "never" }.to_owned(),
+            result: if reasons.is_empty() { "cached" } else { "passed" }.to_owned(),
+            flaky: false,
+            reasons,
+            nondeterministic,
+        }
+    }
+
+    #[test]
+    fn a_call_is_read_from_where_it_is() {
+        let call = Call::new("f".to_owned(), Some("src/lib.rs:3:9"));
+        assert_eq!(
+            (call.file.as_deref(), call.line, call.col),
+            (Some("src/lib.rs"), Some(3), Some(9))
+        );
+        let call = Call::new("f".to_owned(), None);
+        assert_eq!((call.file, call.line, call.col), (None, None, None));
+    }
+
+    #[test]
+    fn the_summary_ranks_what_makes_the_most_tests_not_hermetic() {
+        let fixture = [("tests::fixture", Some("src/tests.rs:4:5")), ("std::fs::read", None)];
+        let lines = vec![
+            line("tests::a", vec![reason("fs", "open", &[("tests::a", Some("src/tests.rs:9:1"))])]),
+            line("tests::b", vec![reason("fs", "open", &fixture)]),
+            line(
+                "tests::c",
+                vec![reason("fs", "open", &fixture), reason("env", "getenv", &fixture)],
+            ),
+            line("tests::d", vec![reason("random", "RandomState::new", &[])]),
+            line("tests::e", vec![]),
+        ];
+        let summary = Summary::of(&lines);
+        assert_eq!((summary.tests, summary.hermetic, summary.not_hermetic), (5, 2, 3));
+        assert_eq!(summary.by_kind.get("fs"), Some(&3));
+        assert_eq!(summary.by_kind.get("random"), None);
+        assert_eq!(summary.top_reasons[0].what, "open");
+        assert_eq!(summary.top_reasons[0].tests, 3);
+        assert_eq!(summary.top_reasons[0].example, "p lib tests::a");
+        let first = &summary.top_helpers[0];
+        assert_eq!(first.name, "tests::fixture");
+        assert_eq!((first.tests, first.only_through_it), (2, 2));
+        assert_eq!(first.kinds, ["env", "fs"]);
+        // Sorted, the same lines give the same summary in any order.
+        let mut shuffled = lines.clone();
+        shuffled.reverse();
+        assert_eq!(Summary::of(&shuffled), summary);
+    }
+
+    #[test]
+    fn a_line_reads_back_as_it_was_written() {
+        let written =
+            line("tests::a", vec![reason("fs", "open", &[("tests::a", Some("src/a.rs:1:2"))])]);
+        let text = ndjson(&written);
+        assert!(text.starts_with("{\"v\":1,") && text.ends_with("}\n"));
+        assert!(text.contains("\"fn\":\"tests::a\""));
+        assert_eq!(serde_json::from_str::<Line>(text.trim_end()).unwrap(), written);
+    }
+}

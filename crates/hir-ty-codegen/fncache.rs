@@ -37,7 +37,9 @@ use cranelift_codegen::ir::{InstBuilder, Value, types};
 use cranelift_module::ModuleRelocTarget;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
-    signatures::{FunctionSignature, StaticSignature, StructSignature, TraitSignature},
+    signatures::{
+        FunctionSignature, StaticFlags, StaticSignature, StructSignature, TraitSignature,
+    },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
@@ -174,11 +176,11 @@ pub(super) fn cache_code(
 
 /// For each of `roots`, the functions a test harness runs, a hash of the code of the function
 /// and of everything it reaches, as [`cache_code`] hashes a cached body, for a test to be run
-/// again only once that changed. `Err` says why what the test does is not all in its code, and
-/// by what calls: it reaches what blaze can't compile, and is run every time. A test that
-/// reaches the world outside the program (files, the environment, processes, the network) has
-/// its hash and [`Reach::outside`] says how: what it read there is the rest of what it is,
-/// which a sandbox that records it can tell.
+/// again only once that changed, and the first of each [`Kind`] of what makes its end depend
+/// on more than that code, by the fewest calls ([`Reach::found`]): what blaze can't compile,
+/// the world outside the program (files, the environment, processes, the network), foreign
+/// code, assembly, a function pointer made from data, a static other tests can change, and
+/// the clock, randomness and threads, which only make a test flaky.
 ///
 /// The nodes are hashed once for all the roots; each root then hashes, in the order it finds
 /// them, every node it reaches with where the node's edges go in that order, so that a hash
@@ -187,13 +189,13 @@ pub(super) fn cache_code(
 /// A function of crates outside the checkout, instantiated with their types, is hashed by its
 /// stable name and not gone into: the name stands for its code and for all it reaches, as it
 /// does for the store's compiled functions ([`super::cached`]). What a test's hash says of
-/// what is below it, that it reaches what can't be compiled or the world outside, is kept in
-/// the store by the name, so that a daemon with the store compiles none of it.
+/// what is below it, what it reaches of each kind, is kept in the store by the name, so that
+/// a daemon with the store compiles none of it.
 pub fn tests_reach(
     db: &dyn HirDatabase,
     symbols: &dyn SymbolResolver,
     roots: &[FunctionId],
-) -> Vec<std::result::Result<Reach, AlwaysRun>> {
+) -> Vec<Reach> {
     let header = (
         FORMAT,
         "tests by stable names",
@@ -231,70 +233,49 @@ pub fn tests_reach(
         sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
     walked.sort_unstable_by(|a, b| b.cmp(a));
     for at in walked {
-        let below = below_of(db, &walk, &sealed, at);
+        let below = below_of(&walk, &sealed, at);
         if let Some(store) = store {
             store.insert(&sealed[&at].key, below.write().as_bytes());
         }
         sealed.get_mut(&at).unwrap().below = Some(below);
     }
     let mut local: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut order: Vec<u32> = Vec::new();
-    // Where in `order` the node that first reached each one is.
-    let mut from: Vec<u32> = Vec::new();
+    let mut way = Way::default();
     starts
         .into_iter()
         .map(|start| {
             local.clear();
-            order.clear();
-            from.clear();
+            way.clear(start);
             local.insert(start, 0);
-            order.push(start);
-            from.push(0);
-            let mut outside_at = None;
+            let mut found = Vec::new();
             let mut at = 0;
-            while let Some(&node) = order.get(at) {
-                let seen = &walk.nodes[node as usize].node;
+            while let Some(&node) = way.order.get(at) {
                 if let Some(Sealed { below: Some(below), .. }) = sealed.get(&node) {
-                    let path = |rest: &[String]| {
-                        let mut path = path_to(db, &walk, &order, &from, at);
-                        path.extend(rest.iter().skip(1).cloned());
-                        path
-                    };
-                    if let Some((why, rest)) = &below.uncompiled {
-                        return Err(AlwaysRun { why: why.clone(), path: path(rest) });
-                    }
-                    if outside_at.is_none()
-                        && let Some((why, rest)) = &below.outside
-                    {
-                        outside_at = Some((why.clone(), path(rest)));
+                    for it in &below.found {
+                        if !found.iter().any(|seen: &Found| seen.kind == it.kind) {
+                            let path = joined(walk.path_to(&way, at), &it.path);
+                            found.push(Found { path, ..it.clone() });
+                        }
                     }
                     at += 1;
                     continue;
                 }
-                if walk.uncompiled.contains(&node) {
-                    let why =
-                        format!("it reaches {}, which blaze can't compile", describe(db, seen));
-                    return Err(AlwaysRun { why, path: path_to(db, &walk, &order, &from, at) });
-                }
-                if outside_at.is_none()
-                    && let Node::Leaf(name, _) = seen
-                    && let Some(what) = outside(name)
-                {
-                    let path = path_to(db, &walk, &order, &from, at);
-                    outside_at = Some((format!("it reaches `{name}`, which {what}"), path));
+                for (kind, what, why) in walk.reasons(node) {
+                    if !found.iter().any(|seen| seen.kind == kind) {
+                        found.push(Found { kind, what, why, path: walk.path_to(&way, at) });
+                    }
                 }
                 for edge in &walk.nodes[node as usize].edges {
                     if let std::collections::hash_map::Entry::Vacant(it) = local.entry(edge.to) {
-                        it.insert(order.len() as u32);
-                        order.push(edge.to);
-                        from.push(at as u32);
+                        it.insert(way.order.len() as u32);
+                        way.push(edge.to, at, edge.site);
                     }
                 }
                 at += 1;
             }
             let mut hasher = rustc_stable_hash::StableSipHasher128::new();
             header.hash(&mut hasher);
-            for &node in &order {
+            for &node in &way.order {
                 walk.segments[node as usize].hash(&mut hasher);
                 let edges = match sealed.contains_key(&node) {
                     true => &[][..],
@@ -306,10 +287,44 @@ pub fn tests_reach(
                 }
             }
             let type_id::Fingerprint(low, high) = hasher.finish();
-            let outside = outside_at.map(|(why, path)| AlwaysRun { why, path });
-            Ok(Reach { hash: u128::from(low) | u128::from(high) << 64, outside })
+            found.sort_by_key(|it| it.kind);
+            Reach { hash: u128::from(low) | u128::from(high) << 64, found }
         })
         .collect()
+}
+
+/// The nodes a walk from one node found, in the order found, each with where in `order` the
+/// node that first reached it is and by what.
+#[derive(Default)]
+struct Way {
+    order: Vec<u32>,
+    from: Vec<u32>,
+    via: Vec<Site>,
+}
+
+impl Way {
+    fn clear(&mut self, start: u32) {
+        self.order.clear();
+        self.from.clear();
+        self.via.clear();
+        self.push(start, 0, Site::None);
+    }
+
+    fn push(&mut self, node: u32, from: usize, via: Site) {
+        self.order.push(node);
+        self.from.push(from as u32);
+        self.via.push(via);
+    }
+}
+
+/// The calls to a sealed node, then those `rest` has below it: the sealed node calls the next
+/// where `rest`'s first, itself, says.
+fn joined(mut path: Vec<Call>, rest: &[Call]) -> Vec<Call> {
+    if let (Some(last), Some(first)) = (path.last_mut(), rest.first()) {
+        last.at = first.at.clone();
+    }
+    path.extend(rest.iter().skip(1).cloned());
+    path
 }
 
 /// A node [`tests_reach`] takes whole by its stable name.
@@ -320,27 +335,34 @@ struct Sealed {
     below: Option<Below>,
 }
 
-/// What a test's hash says of what a node reaches, the node itself too: the first of what
-/// can't be compiled and the first way to the world outside, each with why and the calls to
-/// it from the node.
+/// What a test's hash says of what a node reaches, the node itself too: the first of each
+/// [`Kind`], with the calls to it from the node.
 #[derive(Default)]
 struct Below {
-    uncompiled: Option<(String, Vec<String>)>,
-    outside: Option<(String, Vec<String>)>,
+    found: Vec<Found>,
 }
 
 impl Below {
-    const FORMAT: &str = "below 1";
+    const FORMAT: &str = "below 2";
 
-    /// A line for each that is there: `u` or `o`, why, and each call, all after tabs.
+    /// A line for each found: its kind, what, why and each call, all after tabs; where a
+    /// call calls the next follows its name after a `\x1f`.
     fn write(&self) -> String {
+        let field = |it: &str| it.replace(['\t', '\n', '\x1f'], " ");
         let mut out = format!("{}\n", Self::FORMAT);
-        for (kind, it) in [("u", &self.uncompiled), ("o", &self.outside)] {
-            let Some((why, path)) = it else { continue };
-            out.push_str(kind);
-            for field in std::iter::once(why).chain(path) {
+        for it in &self.found {
+            out.push_str(it.kind.name());
+            for text in [&it.what, &it.why] {
                 out.push('\t');
-                out.push_str(&field.replace(['\t', '\n'], " "));
+                out.push_str(&field(text));
+            }
+            for call in &it.path {
+                out.push('\t');
+                out.push_str(&field(&call.name));
+                if let Some(at) = &call.at {
+                    out.push('\x1f');
+                    out.push_str(&field(at));
+                }
             }
             out.push('\n');
         }
@@ -356,13 +378,16 @@ impl Below {
         let mut below = Below::default();
         for line in lines {
             let mut fields = line.split('\t');
-            let slot = match fields.next()? {
-                "u" => &mut below.uncompiled,
-                "o" => &mut below.outside,
-                _ => return None,
-            };
+            let kind = Kind::from_name(fields.next()?)?;
+            let what = fields.next()?.to_owned();
             let why = fields.next()?.to_owned();
-            *slot = Some((why, fields.map(str::to_owned).collect()));
+            let path = fields
+                .map(|it| match it.split_once('\x1f') {
+                    Some((name, at)) => Call { name: name.to_owned(), at: Some(at.to_owned()) },
+                    None => Call { name: it.to_owned(), at: None },
+                })
+                .collect();
+            below.found.push(Found { kind, what, why, path });
         }
         Some(below)
     }
@@ -392,107 +417,87 @@ fn sealed_name(
 
 fn below_key(header: &impl std::fmt::Debug, name: &str) -> [u8; super::store::KEY] {
     use sha2::Digest;
-    sha2::Sha256::digest(format!("tests reach below\n{header:?}\n{name}").as_bytes()).into()
+    sha2::Sha256::digest(
+        format!("tests reach below\n{}\n{header:?}\n{name}", Below::FORMAT).as_bytes(),
+    )
+    .into()
 }
 
 /// What `start`, a sealed node gone into, reaches, as [`Below`] has it: a sealed node below it
 /// that has what is below it is not gone into again.
-fn below_of(
-    db: &dyn HirDatabase,
-    walk: &Walk<'_>,
-    sealed: &FxHashMap<u32, Sealed>,
-    start: u32,
-) -> Below {
+fn below_of(walk: &Walk<'_>, sealed: &FxHashMap<u32, Sealed>, start: u32) -> Below {
     let mut below = Below::default();
-    let (mut order, mut from) = (vec![start], vec![0u32]);
+    let mut way = Way::default();
+    way.clear(start);
     let mut seen = FxHashSet::from_iter([start]);
     let mut at = 0;
-    while let Some(&node) = order.get(at) {
-        let path = |rest: &[String]| {
-            let mut path = path_to(db, walk, &order, &from, at);
-            path.extend(rest.iter().skip(1).cloned());
-            path
-        };
+    while let Some(&node) = way.order.get(at) {
         let known = sealed.get(&node).and_then(|it| it.below.as_ref()).filter(|_| node != start);
         match known {
             Some(inner) => {
-                if below.uncompiled.is_none()
-                    && let Some((why, rest)) = &inner.uncompiled
-                {
-                    below.uncompiled = Some((why.clone(), path(rest)));
-                }
-                if below.outside.is_none()
-                    && let Some((why, rest)) = &inner.outside
-                {
-                    below.outside = Some((why.clone(), path(rest)));
+                for it in &inner.found {
+                    if !below.found.iter().any(|seen| seen.kind == it.kind) {
+                        let path = joined(walk.path_to(&way, at), &it.path);
+                        below.found.push(Found { path, ..it.clone() });
+                    }
                 }
             }
             None => {
-                let seen_node = &walk.nodes[node as usize].node;
-                if below.uncompiled.is_none() && walk.uncompiled.contains(&node) {
-                    let why = format!(
-                        "it reaches {}, which blaze can't compile",
-                        describe(db, seen_node)
-                    );
-                    below.uncompiled = Some((why, path(&[])));
-                }
-                if below.outside.is_none()
-                    && let Node::Leaf(name, _) = seen_node
-                    && let Some(what) = outside(name)
-                {
-                    below.outside = Some((format!("it reaches `{name}`, which {what}"), path(&[])));
+                for (kind, what, why) in walk.reasons(node) {
+                    if !below.found.iter().any(|seen| seen.kind == kind) {
+                        below.found.push(Found { kind, what, why, path: walk.path_to(&way, at) });
+                    }
                 }
                 for edge in &walk.nodes[node as usize].edges {
                     if seen.insert(edge.to) {
-                        order.push(edge.to);
-                        from.push(at as u32);
+                        way.push(edge.to, at, edge.site);
                     }
                 }
             }
         }
-        if below.uncompiled.is_some() && below.outside.is_some() {
+        if below.found.len() == Kind::ALL.len() {
             break;
         }
         at += 1;
     }
+    below.found.sort_by_key(|it| it.kind);
     below
 }
 
-/// The fewest calls from the root of `order` to its node at `at`, each by its name without
-/// the types it is instantiated with.
-fn path_to(
-    db: &dyn HirDatabase,
-    walk: &Walk<'_>,
-    order: &[u32],
-    from: &[u32],
-    at: usize,
-) -> Vec<String> {
-    let mut path = vec![at];
-    while path.last().is_some_and(|&it| it != 0) {
-        path.push(from[path[path.len() - 1]] as usize);
-    }
-    path.iter()
-        .rev()
-        .map(|&it| {
-            without_arguments(describe(db, &walk.nodes[order[it] as usize].node).trim_matches('`'))
-        })
-        .collect()
-}
-
-/// What [`tests_reach`] says of a test whose code it could hash.
+/// What [`tests_reach`] says of a test.
 pub struct Reach {
+    /// Of its code and all it reaches; of what it reaches that can't be compiled, by name.
     pub hash: u128,
-    /// How the test reaches the world outside the program, the first way found, when it does.
-    pub outside: Option<AlwaysRun>,
+    /// The first of each [`Kind`] it reaches, by the fewest calls, in the order of the kinds.
+    pub found: Vec<Found>,
 }
 
-/// Why a test [`tests_reach`] hashes is run every time.
-pub struct AlwaysRun {
+impl Reach {
+    /// Whether its end is a function of its code alone: nothing it reaches [`Kind::blocks`].
+    pub fn hermetic(&self) -> bool {
+        self.found.iter().all(|it| !it.kind.blocks())
+    }
+}
+
+/// A way a test's end depends on more than its code.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Found {
+    pub kind: Kind,
+    /// What it reaches, by name: a symbol, a static, a function.
+    pub what: String,
     /// What it reaches, and what that does.
     pub why: String,
-    /// The fewest calls that take the test to it: the test, what it calls and so on, each by
-    /// its name without the types it is instantiated with.
-    pub path: Vec<String>,
+    /// The fewest calls that take the test to it: the test, what it calls and so on.
+    pub path: Vec<Call>,
+}
+
+/// A function on the way from a test to what it reaches.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Call {
+    /// Its name without the types it is instantiated with.
+    pub name: String,
+    /// Where it calls the next one, `file:line:column`, when that is told.
+    pub at: Option<String>,
 }
 
 /// `name` with each list of generic arguments after a `::` left out, as `…`.
@@ -517,13 +522,65 @@ fn without_arguments(name: &str) -> String {
 }
 
 /// What a foreign function or static a test reaches does that the test's code does not
-/// decide, by its symbol: `None` for what gives the same for the same input, as far as a test
-/// can tell. Time, randomness, threads and locks are left out: a test that turns on them is
-/// flaky whether it runs again or not.
-fn outside(symbol: &str) -> Option<&'static str> {
+/// decide, by its symbol, and of which [`Kind`]: `None` for what gives the same for the same
+/// input, as far as a test can tell. Locks are left out: a test that turns on how its threads
+/// are scheduled is flaky whether it runs again or not.
+fn outside(symbol: &str) -> Option<(Kind, &'static str)> {
     let name = symbol.trim_start_matches('_');
     let name = name.split('$').next().unwrap_or(name);
     let name = name.strip_suffix("64").unwrap_or(name);
+    let kind = match name {
+        "clock_gettime"
+        | "gettimeofday"
+        | "time"
+        | "mach_absolute_time"
+        | "mach_continuous_time"
+        | "QueryPerformanceCounter"
+        | "GetSystemTimePreciseAsFileTime"
+        | "GetSystemTimeAsFileTime" => return Some((Kind::Clock, "reads the clock")),
+        "getrandom"
+        | "getentropy"
+        | "arc4random"
+        | "arc4random_buf"
+        | "CCRandomGenerateBytes"
+        | "SecRandomCopyBytes"
+        | "BCryptGenRandom"
+        | "ProcessPrng"
+        | "RtlGenRandom" => {
+            return Some((Kind::Random, "draws randomness"));
+        }
+        "pthread_create" | "CreateThread" => return Some((Kind::Thread, "starts a thread")),
+        "exit" | "Exit" | "ExitProcess" => {
+            return Some((Kind::Process, "ends the process, and the other tests with it"));
+        }
+        "getenv"
+        | "secure_getenv"
+        | "environ"
+        | "NSGetEnviron"
+        | "GetEnvironmentVariableW"
+        | "GetEnvironmentStringsW"
+        | "setenv"
+        | "unsetenv"
+        | "putenv"
+        | "SetEnvironmentVariableW" => Kind::Env,
+        "execve" | "execvp" | "execvpe" | "posix_spawn" | "posix_spawnp" | "fork" | "vfork"
+        | "clone3" | "system" | "popen" | "CreateProcessW" => Kind::Process,
+        "socket" | "connect" | "bind" | "accept" | "accept4" | "getaddrinfo" | "WSASocketW" => {
+            Kind::Net
+        }
+        _ => Kind::Fs,
+    };
+    let what = match kind {
+        Kind::Env => "reads or sets the environment",
+        Kind::Process => "starts processes",
+        Kind::Net => "uses the network",
+        _ => file_call(name)?,
+    };
+    Some((kind, what))
+}
+
+/// What a foreign function of files does, by its name without `_` and `64`.
+fn file_call(name: &str) -> Option<&'static str> {
     Some(match name {
         "open"
         | "openat"
@@ -555,19 +612,71 @@ fn outside(symbol: &str) -> Option<&'static str> {
         | "CreateFileW"
         | "FindFirstFileW"
         | "GetFileAttributesExW" => "reads or writes files",
-        "getenv"
-        | "secure_getenv"
-        | "environ"
-        | "NSGetEnviron"
-        | "GetEnvironmentVariableW"
-        | "GetEnvironmentStringsW" => "reads the environment",
-        "execve" | "execvp" | "execvpe" | "posix_spawn" | "posix_spawnp" | "fork" | "vfork"
-        | "clone3" | "system" | "popen" | "CreateProcessW" => "starts processes",
-        "socket" | "connect" | "bind" | "accept" | "accept4" | "getaddrinfo" | "WSASocketW" => {
-            "uses the network"
-        }
         _ => return None,
     })
+}
+
+/// What makes a test's end depend on more than its code, by kind, as `tests.ndjson` names
+/// it. A test that reaches one that [`Kind::blocks`] is not hermetic.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Kind {
+    Fs,
+    Env,
+    Net,
+    Process,
+    Clock,
+    Random,
+    Thread,
+    Ffi,
+    Asm,
+    Indirect,
+    Uncompiled,
+    GlobalState,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 12] = [
+        Kind::Fs,
+        Kind::Env,
+        Kind::Net,
+        Kind::Process,
+        Kind::Clock,
+        Kind::Random,
+        Kind::Thread,
+        Kind::Ffi,
+        Kind::Asm,
+        Kind::Indirect,
+        Kind::Uncompiled,
+        Kind::GlobalState,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Fs => "fs",
+            Kind::Env => "env",
+            Kind::Net => "net",
+            Kind::Process => "process",
+            Kind::Clock => "clock",
+            Kind::Random => "random",
+            Kind::Thread => "thread",
+            Kind::Ffi => "ffi",
+            Kind::Asm => "asm",
+            Kind::Indirect => "indirect",
+            Kind::Uncompiled => "uncompiled",
+            Kind::GlobalState => "global-state",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|it| it.name() == name)
+    }
+
+    /// Whether a test that reaches it is not hermetic, and runs every time. The clock,
+    /// randomness and threads don't: a test whose pass turns on them is flaky, run again or
+    /// not, so they are told (`nondeterministic`) and its pass is kept by its code.
+    pub fn blocks(self) -> bool {
+        !matches!(self, Kind::Clock | Kind::Random | Kind::Thread)
+    }
 }
 
 /// The name of the function whose body `closure` is, as a backtrace has it.
@@ -602,7 +711,7 @@ enum Node {
 }
 
 /// What a node refers to the next by, to find where that is written.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Site {
     Func(FunctionId),
     Static(StaticId),
@@ -656,6 +765,11 @@ struct Walk<'db> {
     tests: bool,
     /// The nodes blaze can't compile, whose code tells nothing of what they do.
     uncompiled: FxHashSet<u32>,
+    /// For [`tests_reach`], what each node is that makes a test's end depend on more than its
+    /// code: of which kind, what by name, and why.
+    kinds: FxHashMap<u32, (Kind, String, String)>,
+    /// Where a node refers to the next by a site, as [`Walk::site_location`] found it.
+    locations: std::cell::RefCell<FxHashMap<(u32, Site), Option<String>>>,
     /// An argument holds a reference count, which what reads one gives and the key does not
     /// tell: two arguments can share a value or not.
     counted: bool,
@@ -680,6 +794,8 @@ impl<'db> Walk<'db> {
             segments: Vec::new(),
             tests: false,
             uncompiled: FxHashSet::default(),
+            kinds: FxHashMap::default(),
+            locations: Default::default(),
             counted,
             library: FxHashMap::default(),
         }
@@ -741,7 +857,9 @@ impl<'db> Walk<'db> {
             // A seed is randomness, which is no more outside a test than the time is. A
             // backtrace is shown, not a result: what it reads of the environment and the
             // working directory changes what a failure prints.
-            if makes_seed(db, func) || of_backtrace(db, func) {
+            // The stack a thread is started with is sized by `RUST_MIN_STACK`, which a test
+            // can't tell but by running out of it.
+            if makes_seed(db, func) || of_backtrace(db, func) || sizes_stack(db, func) {
                 return (Node::Leaf(name(), None), site, false);
             }
             // What a test reaches is all that decides how it ends, so only the toolchain's
@@ -906,6 +1024,11 @@ impl<'db> Walk<'db> {
                             let why = format!("reads {}, which can change", describe(db, node));
                             self.nodes[at as usize].why = Why::of_user(why);
                         }
+                        if self.tests
+                            && let Some(reason) = self.static_reason(*id, compiled.writable)
+                        {
+                            self.kinds.entry(at).or_insert(reason);
+                        }
                         (&compiled.blob, compiled.writable).hash(&mut hasher);
                         let own = self.is_own(at);
                         self.requests(at, &mut hasher, &compiled.requests, own);
@@ -990,6 +1113,12 @@ impl<'db> Walk<'db> {
                     if own && self.nodes[at as usize].why.is_none() {
                         self.nodes[at as usize].why = Why::own("has assembly in it");
                     }
+                    if self.tests && !self.in_toolchain(at) {
+                        let what = describe(db, &self.nodes[at as usize].node);
+                        let why = format!("it reaches {what}, which has assembly in it");
+                        let what = without_arguments(what.trim_matches('`'));
+                        self.kinds.entry(at).or_insert((Kind::Asm, what, why));
+                    }
                 }
                 FuncTarget::Instance(instance, env) => {
                     let (node, site, codec) = self.function(at, instance, env);
@@ -997,6 +1126,8 @@ impl<'db> Walk<'db> {
                     3u8.hash(hasher);
                     if !self.tests {
                         to.hash(hasher);
+                    } else if let Some(reason) = self.called_reason(instance) {
+                        self.kinds.entry(to).or_insert(reason);
                     }
                 }
             }
@@ -1032,6 +1163,10 @@ impl<'db> Walk<'db> {
                     2u8.hash(hasher);
                     if !self.tests {
                         to.hash(hasher);
+                    } else if foreign_static(db, *id).is_some()
+                        && let Some(reason) = self.static_reason(*id, false)
+                    {
+                        self.kinds.entry(to).or_insert(reason);
                     }
                 }
                 // Where code is written, which the hash leaves out.
@@ -1073,7 +1208,11 @@ impl<'db> Walk<'db> {
         owner: InferBodyId<'db>,
         closure: Option<InternedClosureId<'db>>,
     ) {
-        if self.tests || !self.is_own(at) || self.nodes[at as usize].why.is_some() {
+        let looked = match self.tests {
+            true => !self.in_toolchain(at),
+            false => self.is_own(at) && self.nodes[at as usize].why.is_none(),
+        };
+        if !looked {
             return;
         }
         let db = self.db;
@@ -1082,10 +1221,146 @@ impl<'db> Walk<'db> {
             None => db.mir_body(owner),
         };
         let Ok(body) = body else { return };
+        if self.tests {
+            if let Some(span) = fn_from_data(db, body) {
+                let place =
+                    location(db, body, span).map(|it| format!(", at {it}")).unwrap_or_default();
+                let what = describe(db, &self.nodes[at as usize].node);
+                let why = format!(
+                    "it reaches {what}, which calls a function pointer made of data (a \
+                     `transmute`){place}"
+                );
+                let what = without_arguments(what.trim_matches('`'));
+                self.kinds.entry(at).or_insert((Kind::Indirect, what, why));
+            }
+            return;
+        }
         if let Some((why, span)) = raw_use(body) {
             let place = location(db, body, span);
             self.nodes[at as usize].why = Some(Why { text: why.to_owned(), of_user: false, place });
         }
+    }
+
+    /// What node `at` is that makes a test's end depend on more than its code, for
+    /// [`tests_reach`]: of which kind, what by name, and why.
+    fn reasons(&self, at: u32) -> Vec<(Kind, String, String)> {
+        let mut reasons = Vec::new();
+        if let Some(it) = self.kinds.get(&at) {
+            reasons.push(it.clone());
+        }
+        if self.uncompiled.contains(&at) {
+            let what = describe(self.db, &self.nodes[at as usize].node);
+            let why = format!("it reaches {what}, which blaze can't compile");
+            reasons.push((Kind::Uncompiled, what.trim_matches('`').to_owned(), why));
+        }
+        reasons
+    }
+
+    /// The fewest calls from the root of `way` to its node at `at`, each by its name without
+    /// the types it is instantiated with, and where it calls the next.
+    fn path_to(&self, way: &Way, at: usize) -> Vec<Call> {
+        let mut path = vec![at];
+        while path.last().is_some_and(|&it| it != 0) {
+            path.push(way.from[path[path.len() - 1]] as usize);
+        }
+        path.reverse();
+        (0..path.len())
+            .map(|i| {
+                let node = way.order[path[i]];
+                let name = describe(self.db, &self.nodes[node as usize].node);
+                let at = path.get(i + 1).and_then(|&next| {
+                    let site = way.via[next];
+                    let mut locations = self.locations.borrow_mut();
+                    locations
+                        .entry((node, site))
+                        .or_insert_with(|| self.site_location(node, site))
+                        .clone()
+                });
+                Call { name: without_arguments(name.trim_matches('`')), at }
+            })
+            .collect()
+    }
+
+    /// Whether the node is code of the toolchain (std, core, alloc and the crates they are
+    /// built of), whose foreign calls and assembly are told only where they are known.
+    fn in_toolchain(&self, at: u32) -> bool {
+        let db = self.db;
+        let krate = match &self.nodes[at as usize].node {
+            Node::Root(func) => func.krate(db),
+            Node::Instance(instance, _) => match instance.def {
+                InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => func.krate(db),
+                InstanceDef::Closure(id) => {
+                    InternedClosureId::from_id(id).loc(db).owner.module(db).krate(db)
+                }
+                InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                    InternedCoroutineId::from_id(id).loc(db).owner.module(db).krate(db)
+                }
+                _ => return true,
+            },
+            Node::Static(id) => id.krate(db),
+            Node::Leaf(..) => return true,
+        };
+        krate.data(db).origin.is_lang()
+    }
+
+    /// What a call a test reaches makes its end depend on, by kind, for [`tests_reach`]: a
+    /// foreign function the test's code does not decide, or a seed.
+    fn called_reason(&self, instance: &Instance) -> Option<(Kind, String, String)> {
+        let db = self.db;
+        let InstanceDef::Fn(func) = instance.def else { return None };
+        if let Some(symbol) = link_name(db, func) {
+            if let Some((kind, what)) = outside(&symbol) {
+                let why = format!("it reaches `{symbol}`, which {what}");
+                return Some((kind, symbol, why));
+            }
+            if pure_foreign(&symbol) || func.krate(db).data(db).origin.is_lang() {
+                return None;
+            }
+            let why =
+                format!("it calls the foreign function `{symbol}`, whose code blaze can't see");
+            return Some((Kind::Ffi, symbol, why));
+        }
+        if makes_seed(db, func) {
+            let name = function_name(db, func, instance.args.as_ref());
+            let why = format!("it reaches `{name}`, which makes a random seed (a `HashMap`'s)");
+            return Some((Kind::Random, name, why));
+        }
+        None
+    }
+
+    /// What a static a test reaches makes its end depend on, by kind: a foreign static, or one
+    /// of a crate outside the toolchain that other tests in the process can change.
+    fn static_reason(&self, id: StaticId, writable: bool) -> Option<(Kind, String, String)> {
+        let db = self.db;
+        let toolchain = id.krate(db).data(db).origin.is_lang();
+        if let Some(symbol) = foreign_static(db, id) {
+            if let Some((kind, what)) = outside(&symbol) {
+                return Some((
+                    kind,
+                    symbol.clone(),
+                    format!("it reaches `{symbol}`, which {what}"),
+                ));
+            }
+            if toolchain || symbol.starts_with("__rust_") {
+                return None;
+            }
+            let why =
+                format!("it reads the foreign static `{symbol}`, which foreign code can change");
+            return Some((Kind::Ffi, symbol, why));
+        }
+        let mutable = StaticSignature::of(db, id).flags.contains(StaticFlags::MUTABLE);
+        if toolchain
+            || !writable
+            || is_thread_local(db, id)
+            || !(mutable || shared(db, db.type_for_static(id).skip_binder()))
+        {
+            return None;
+        }
+        let name = static_name(db, id);
+        let why = format!(
+            "it uses the static `{name}`, which can change, and other tests of the process with it"
+        );
+        Some((Kind::GlobalState, name, why))
     }
 
     /// Why what `from` reaches is not pure, by the shortest way to the first that is not:
@@ -1415,6 +1690,52 @@ fn of_backtrace(db: &dyn HirDatabase, func: FunctionId) -> bool {
     }
     let ItemContainerId::ImplId(id) = func.lookup(db).container else { return false };
     is_std_struct(db, db.impl_self_ty(id).skip_binder(), "Backtrace")
+}
+
+/// Whether a static of `ty` that can change is state other tests of the process can change:
+/// all but a cell set once (`LazyLock`, `OnceLock`, once_cell's and lazy_static's), which code
+/// the test reaches sets to what that code gives, unless it holds a lock, a cell or an atomic.
+fn shared<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> bool {
+    const ONCE: &[&str] = &["LazyLock", "OnceLock", "LazyCell", "OnceCell", "Lazy", "Once"];
+    const CHANGES: &[&str] =
+        &["Mutex", "RwLock", "ReentrantMutex", "RefCell", "Cell", "UnsafeCell", "SyncUnsafeCell"];
+    let struct_name = |ty: Ty<'db>| {
+        let TyKind::Adt(def, args) = ty.kind() else { return None };
+        let AdtId::StructId(id) = def.def_id() else { return None };
+        Some((StructSignature::of(db, id).name.as_str().to_owned(), args))
+    };
+    let Some((name, args)) = struct_name(ty) else { return true };
+    if !ONCE.contains(&name.as_str()) {
+        return true;
+    }
+    let Some(inner) = args.iter().find_map(|it| it.ty()) else { return false };
+    struct_name(inner)
+        .is_some_and(|(name, _)| CHANGES.contains(&name.as_str()) || name.starts_with("Atomic"))
+}
+
+/// Where `body` makes a function pointer of data, with a `transmute`: what it calls through
+/// it is no function the code reached names, and can be any.
+fn fn_from_data(db: &dyn HirDatabase, body: &MirBody<'_>) -> Option<MirSpan> {
+    for (_, block) in body.basic_blocks.iter() {
+        let Some(terminator) = &block.terminator else { continue };
+        let TerminatorKind::Call { func, destination, .. } = &terminator.kind else { continue };
+        let Some((callee, _)) = fn_item(func) else { continue };
+        let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
+        if FunctionSignature::is_intrinsic(db, callee)
+            && matches!(name.as_str(), "transmute" | "transmute_unchecked")
+            && destination.projection.as_slice().is_empty()
+            && matches!(body.locals[destination.local].ty.as_ref().kind(), TyKind::FnPtr(..))
+        {
+            return Some(terminator.span);
+        }
+    }
+    None
+}
+
+/// Whether `func` is std's `min_stack`, which reads `RUST_MIN_STACK` for a thread's stack.
+fn sizes_stack(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std))
+        && FunctionSignature::of(db, func).name.as_str() == "min_stack"
 }
 
 fn is_std_struct(db: &dyn HirDatabase, ty: Ty<'_>, name: &str) -> bool {
@@ -1969,23 +2290,72 @@ mod tests {
 
     #[test]
     fn what_is_below_a_sealed_node_reads_back_as_it_was_written() {
-        let path = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+        let call = |name: &str, at: Option<&str>| Call {
+            name: name.to_owned(),
+            at: at.map(str::to_owned),
+        };
+        let found = |kind, what: &str, why: &str, path| Found {
+            kind,
+            what: what.to_owned(),
+            why: why.to_owned(),
+            path,
+        };
         let below = Below {
-            uncompiled: None,
-            outside: Some((
-                "it reaches `open`, which reads or writes files".to_owned(),
-                path(&["std::fs::read", "std::fs::File::open", "open"]),
-            )),
+            found: vec![
+                found(
+                    Kind::Fs,
+                    "open",
+                    "it reaches `open`, which reads or writes files",
+                    vec![
+                        call("std::fs::read", Some("library/std/src/fs.rs:300:5")),
+                        call("std::fs::File::open", None),
+                        call("open", None),
+                    ],
+                ),
+                found(
+                    Kind::GlobalState,
+                    "c::N",
+                    "it uses the static `c::N`",
+                    vec![call("f", None)],
+                ),
+            ],
         };
         let read = Below::read(below.write().as_bytes()).unwrap();
-        assert_eq!(read.uncompiled, None);
-        assert_eq!(read.outside, below.outside);
+        assert_eq!(read.found, below.found);
         let nothing = Below::read(Below::default().write().as_bytes()).unwrap();
-        assert!(nothing.uncompiled.is_none() && nothing.outside.is_none());
+        assert!(nothing.found.is_empty());
         // A tab in what is said would start a call of its own.
-        let tabbed = Below { uncompiled: Some(("a\tb".to_owned(), path(&["f"]))), outside: None };
+        let tabbed = Below {
+            found: vec![found(Kind::Uncompiled, "f", "a\tb", vec![call("f", Some("x\ty"))])],
+        };
         let read = Below::read(tabbed.write().as_bytes()).unwrap();
-        assert_eq!(read.uncompiled, Some(("a b".to_owned(), path(&["f"]))));
-        assert!(Below::read(b"below 0\n").is_none());
+        assert_eq!(read.found[0].why, "a b");
+        assert_eq!(read.found[0].path, vec![call("f", Some("x y"))]);
+        assert!(Below::read(b"below 1\n").is_none());
+    }
+
+    #[test]
+    fn every_kind_has_a_name_it_is_read_back_by() {
+        for kind in Kind::ALL {
+            assert_eq!(Kind::from_name(kind.name()), Some(kind));
+        }
+        let flaky: Vec<Kind> = Kind::ALL.into_iter().filter(|it| !it.blocks()).collect();
+        assert_eq!(flaky, [Kind::Clock, Kind::Random, Kind::Thread]);
+    }
+
+    #[test]
+    fn foreign_symbols_are_told_by_kind() {
+        let kind = |symbol| outside(symbol).map(|(kind, _)| kind);
+        assert_eq!(kind("open64"), Some(Kind::Fs));
+        assert_eq!(kind("statx"), Some(Kind::Fs));
+        assert_eq!(kind("getenv"), Some(Kind::Env));
+        assert_eq!(kind("posix_spawnp"), Some(Kind::Process));
+        assert_eq!(kind("_exit"), Some(Kind::Process));
+        assert_eq!(kind("connect"), Some(Kind::Net));
+        assert_eq!(kind("clock_gettime"), Some(Kind::Clock));
+        assert_eq!(kind("getrandom"), Some(Kind::Random));
+        assert_eq!(kind("pthread_create"), Some(Kind::Thread));
+        assert_eq!(kind("write"), None);
+        assert_eq!(kind("memcpy"), None);
     }
 }

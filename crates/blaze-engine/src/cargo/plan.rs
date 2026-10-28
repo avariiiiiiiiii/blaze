@@ -250,13 +250,72 @@ pub(crate) const TESTS: &str = "tests.harness";
 /// tests an edit reaches, for the daemon to write [`REACH`] at each build of it.
 pub(crate) const REACH_WANTED: &str = "tests-reach-wanted";
 
-/// What the daemon wrote of each test of the program at its last build, one a line: a hash of
-/// what decides how the test ends, a tab and libtest's name of it; or `-`, the name, a tab,
-/// why the test is run every time and, when calls lead to that, a tab and the calls from the
-/// test, joined by ` -> `; or `*`, a tab and why every test is. A test that reaches the world
-/// outside the program has `~` before its hash, then why and the calls as `-` has them: what
-/// it read there, which a sandbox records, decides the rest. Written whole, or not there.
+/// What the daemon wrote of each test of the program at its last build: [`REACH_FORMAT`], then
+/// one test a line, a hash of what decides how the test ends, a tab, libtest's name of it, a
+/// tab and what it reaches that its code does not decide, a JSON list of [`Reason`]s. The
+/// hash of a test that is not hermetic has a mark before it: `~` when all that makes it so is
+/// the world outside the program, which a sandbox records, and `!` otherwise. Or `-`, the
+/// name, a tab and why the test runs every time, with no hash (a benchmark); or `*`, a tab and
+/// why every test is. Written whole, or not there.
 pub(crate) const REACH: &str = "tests-reach";
+
+/// The first line of [`REACH`], which changes with what it holds.
+pub(crate) const REACH_FORMAT: &str = "tests-reach 2";
+
+/// Whether a sandbox that records what a test reads makes what a reason of `kind` reaches part
+/// of the test's key: files, the environment, other processes and the network.
+pub(crate) fn recorded_by_a_sandbox(kind: &str) -> bool {
+    matches!(kind, "fs" | "env" | "net" | "process")
+}
+
+/// What a test reaches that its code does not decide, as [`REACH`] and `tests.ndjson` have it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Reason {
+    /// `fs`, `env`, `net`, `process`, `clock`, `random`, `thread`, `ffi`, `asm`, `indirect`,
+    /// `uncompiled` or `global-state`.
+    pub(crate) kind: String,
+    /// What, by name: a symbol, a static, a function.
+    pub(crate) what: String,
+    /// What it reaches and what that does, said.
+    pub(crate) why: String,
+    /// The fewest calls from the test to it.
+    pub(crate) chain: Vec<Call>,
+}
+
+impl Reason {
+    /// Whether it makes a test that reaches it not hermetic, to run every time: all but the
+    /// clock, randomness and threads, which make a test flaky at worst.
+    pub(crate) fn blocks(&self) -> bool {
+        !matches!(self.kind.as_str(), "clock" | "random" | "thread")
+    }
+}
+
+/// A function on the way from a test to what it reaches, and where it calls the next one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Call {
+    #[serde(rename = "fn")]
+    pub(crate) name: String,
+    pub(crate) file: Option<String>,
+    pub(crate) line: Option<u32>,
+    pub(crate) col: Option<u32>,
+}
+
+impl Call {
+    /// The call `name` makes at `at`, `file:line:column`.
+    pub(crate) fn new(name: String, at: Option<&str>) -> Call {
+        let parsed = at.and_then(|at| {
+            let (rest, col) = at.rsplit_once(':')?;
+            let (file, line) = rest.rsplit_once(':')?;
+            Some((file.to_owned(), line.parse().ok()?, col.parse().ok()?))
+        });
+        match parsed {
+            Some((file, line, col)) => {
+                Call { name, file: Some(file), line: Some(line), col: Some(col) }
+            }
+            None => Call { name, file: at.map(str::to_owned), line: None, col: None },
+        }
+    }
+}
 
 /// Why the tests of `unit` are only right as rustc built them under rustc's harness, if they
 /// are. rustc's harness, where it stays in a test executable, calls the tests and their

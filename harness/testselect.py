@@ -31,11 +31,11 @@ file runs again only when the file changed, `-v` says which file, a test that wr
 package changes nothing of it outside its run, a test that writes outside fails and the command
 says what the sandbox denied it and how to take it out, a test its package takes out of the
 sandbox (`unsandboxed-tests`) runs outside and writes there, every time, with
-`BLAZE_SANDBOX=off` every test runs every time, `BLAZE_TESTS=verify` runs the tests kept as
-passed and says they passed again, a store pushed to a remote and pulled into an empty one
-skips every test that passed, and so does the store under a fresh target and daemon, as on a CI
-runner. A package that has not opted in runs every test under `affected`, and is told what to add
-to its manifest.
+`BLAZE_SANDBOX=off` the hermetic tests are still skipped and the one that reads a file runs every
+time, `BLAZE_TESTS=verify` runs the tests kept as passed and says they passed again, a store
+pushed to a remote and pulled into an empty one skips every test that passed, and so does the
+store under a fresh target and daemon, as on a CI runner. A package that has not opted in keeps
+the passes of its hermetic tests all the same, and runs its bench every time.
 
 Python 3, stdlib only.
 """
@@ -236,8 +236,8 @@ STEPS = [
 ]
 if SANDBOXED:
     STEPS += [
-        # Outside the sandbox no test is hermetic, and every test runs every time.
-        ("outside the sandbox", [], "affected -v BLAZE_SANDBOX=off", ALL | {"tests::added", "it_added"}, True),
+        # Outside the sandbox a hermetic test is kept all the same; the one that reads a file runs.
+        ("outside the sandbox", [], "affected -v BLAZE_SANDBOX=off", {FILE}, True),
         ("the file a test reads edited", [("data.txt", "tsel", "tsel tsel")], "affected -v", {FILE}, True),
         ("nothing edited after the file", [], "affected", set(), True),
         ("a test that writes into the package", [
@@ -267,7 +267,7 @@ SAYS = {} if SANDBOXED else {
     "why a test runs every time": [
         r"Always tests::reads_a_file: it reaches `\w+`, which reads or writes files, by "
         r"tsel::tests::reads_a_file -> std::fs::read_to_string::<…> -> .* -> \w+$",
-        r"Skipped \d+ tests, unchanged since the last pass; 1 test run every time \(said above\);",
+        r"Cached \d+ tests from .*; 1 test run every time \(said above\);",
     ],
 }
 
@@ -288,8 +288,8 @@ KEPT_FROM = re.escape(kept_from())
 if SANDBOXED:
     SAYS = {
         "outside the sandbox": [
-            r"Always tests::reads_a_file: it runs outside the sandbox: `BLAZE_SANDBOX=off`$",
-            r"\d+ tests outside the sandbox, run every time and never kept: ",
+            r"Always tests::reads_a_file: it reaches `\w+`, which reads or writes files, by ",
+            r"; 1 test run every time \(said above\);",
         ],
         "the file a test reads edited": [
             r"Sandboxed tests::reads_a_file: it read `[^`]*/data\.txt`, which changed$",
@@ -303,7 +303,7 @@ if SANDBOXED:
         "every pass kept verified": [r"Verified the passes kept: (\d+) of \1 tests passed again$"],
         "passes pulled from a remote": [
             rf"Cached \d+ tests from {KEPT_FROM}",
-            r"1 test outside the sandbox, run every time and never kept: " + re.escape(OUTSIDE_TEST),
+            r"; 1 test run every time \(`blaze test --why` says why\);",
         ],
         "a fresh target and daemon with the store": [
             rf"Cached \d+ tests from {KEPT_FROM}",
@@ -377,18 +377,13 @@ def benched(root, env):
         return "NOT SERVED BY THE DAEMON"
     if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
         return f"ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
-    if not SANDBOXED:
-        return "ok"
-    # It has not opted into sandboxed tests: nothing is kept, and the note says how to opt in.
-    code, said = test(ws, env, "affected")
-    ran = {name for name, _ in RAN.findall(said)}
-    note = (r"note: no test is sandboxed, so none is kept as passed and every test runs: .*"
-            r'`experimental = \["sandboxed-tests"\]` under `\[workspace\.metadata\.blaze\]` in '
-            r"\S*/benched/Cargo\.toml$")
-    if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
-        return f"NOT OPTED IN, ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
-    if not re.search(note, said, re.M):
-        return f"NOT OPTED IN, DID NOT SAY {note}"
+    # It has not opted into sandboxed tests: its hermetic tests are kept all the same, once they
+    # passed under `affected`, and the bench runs every time.
+    for want in ({"tests::added", "tests::adds", "tests::bench_add"}, {"tests::bench_add"}):
+        code, said = test(ws, env, "affected")
+        ran = {name for name, _ in RAN.findall(said)}
+        if ran != want or code != 0:
+            return f"NOT OPTED IN, ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
     return "ok"
 
 

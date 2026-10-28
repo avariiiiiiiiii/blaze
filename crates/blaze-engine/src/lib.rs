@@ -3905,7 +3905,7 @@ fn reach_of_tests(
         functions.iter().copied().filter(|&it| hir::Function::from(it).is_test(db)).collect();
     // `cargo test` runs a `#[bench]` once as a test.
     let benches = functions.iter().map(|&it| hir::Function::from(it)).filter(|it| it.is_bench(db));
-    let mut text = String::new();
+    let mut text = format!("{}\n", cargo::plan::REACH_FORMAT);
     for bench in benches {
         let Some(name) = test_harness::name(db, krate, bench) else { continue };
         text.push_str(&format!("-\t{name}\tit is a benchmark\n"));
@@ -3913,28 +3913,37 @@ fn reach_of_tests(
     for (&id, reach) in tests.iter().zip(hir_ty_codegen::tests_reach(db, resolver, &tests)) {
         let function = hir::Function::from(id);
         let Some(name) = test_harness::name(db, krate, function) else { continue };
-        let field = |it: &str| it.replace(['\t', '\n'], " ");
-        let why = |it: &hir_ty_codegen::AlwaysRun| {
-            let path: Vec<String> = it.path.iter().map(|it| field(it)).collect();
-            format!("{}\t{}", field(&it.why), path.join(" -> "))
+        let attrs = function.source(db).map(|it| {
+            let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+            attrs.collect::<Vec<_>>().join("\n")
+        });
+        let identity = format!("{:032x}\n{}", reach.hash, attrs.unwrap_or_default());
+        let identity = sha2::Sha256::digest(identity.as_bytes());
+        let hex: String = identity.iter().map(|it| format!("{it:02x}")).collect();
+        let blocking = reach.found.iter().filter(|it| it.kind.blocks());
+        let recorded =
+            blocking.clone().all(|it| cargo::plan::recorded_by_a_sandbox(it.kind.name()));
+        let mark = match (reach.hermetic(), recorded) {
+            (true, _) => "",
+            (false, true) => "~",
+            (false, false) => "!",
         };
-        let line = match reach {
-            Ok(reach) => {
-                let attrs = function.source(db).map(|it| {
-                    let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
-                    attrs.collect::<Vec<_>>().join("\n")
-                });
-                let identity = format!("{:032x}\n{}", reach.hash, attrs.unwrap_or_default());
-                let identity = sha2::Sha256::digest(identity.as_bytes());
-                let hex: String = identity.iter().map(|it| format!("{it:02x}")).collect();
-                match &reach.outside {
-                    None => format!("{hex}\t{name}\n"),
-                    Some(outside) => format!("~{hex}\t{name}\t{}\n", why(outside)),
-                }
-            }
-            Err(always) => format!("-\t{name}\t{}\n", why(&always)),
-        };
-        text.push_str(&line);
+        let found: Vec<cargo::plan::Reason> = reach
+            .found
+            .iter()
+            .map(|it| cargo::plan::Reason {
+                kind: it.kind.name().to_owned(),
+                what: it.what.clone(),
+                why: it.why.clone(),
+                chain: it
+                    .path
+                    .iter()
+                    .map(|call| cargo::plan::Call::new(call.name.clone(), call.at.as_deref()))
+                    .collect(),
+            })
+            .collect();
+        let found = serde_json::to_string(&found).unwrap_or_else(|_| "[]".to_owned());
+        text.push_str(&format!("{mark}{hex}\t{name}\t{found}\n"));
     }
     text
 }

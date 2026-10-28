@@ -1,11 +1,13 @@
-//! `BLAZE_TESTS=affected`: `blaze test` runs, of each program of tests the daemon
-//! built, the tests that have not passed with what they are a function of as it is now, and
-//! says how many passed before and where ([`results`]). The daemon writes beside the program a
-//! hash of each test's code with all it reaches ([`plan::REACH`]). A test that reaches the
-//! world outside its code runs in the sandbox every test runs in, which records what it read,
-//! and that is part of its key too ([`results::Results::find`]); outside the sandbox
-//! (`BLAZE_SANDBOX=off`, or a test its package takes out of it) it runs every time, as does a
-//! test that reaches code blaze can't compile. Unset, or `all`, runs every test, as cargo does.
+//! `blaze test` runs, of each program of tests the daemon built, the tests that have not
+//! passed with what they are a function of as it is now, and says how many passed before and
+//! where ([`results`]). The daemon writes beside the program a hash of each test's code with
+//! all it reaches, and what it reaches that its code does not decide ([`plan::REACH`]). A
+//! hermetic test, one that reaches nothing outside the program and nothing blaze can't see
+//! into, is kept by that hash alone. A test that reaches the world outside its code runs
+//! every time, unless the workspace opts into sandboxed tests: the sandbox records what it
+//! read, and that is part of its key too ([`results::Results::find`]). One that reaches what
+//! nothing records (foreign code, assembly, a static other tests change, code blaze can't
+//! compile) runs every time. `BLAZE_TESTS=all` runs every test, as cargo does.
 //!
 //! `BLAZE_TESTS=verify` picks the same, runs every test anyway and says of each that had a
 //! pass whether it passed again: one that failed is flaky, or its key misses something it is a
@@ -31,9 +33,9 @@ pub(crate) const VAR: &str = "BLAZE_TESTS";
 const NAMES_AT_MOST: usize = 64 << 10;
 
 /// Whether this command runs only the tests that have not passed as they are now, or checks
-/// that those that did pass again ([`verifying`]).
+/// that those that did pass again ([`verifying`]): unless `BLAZE_TESTS=all`.
 pub(crate) fn on() -> bool {
-    std::env::var(VAR).is_ok_and(|it| it == "affected" || it == "verify")
+    std::env::var(VAR).map_or(true, |it| it != "all")
 }
 
 /// Whether this command runs every test and checks that those that passed before pass again.
@@ -81,6 +83,8 @@ pub(crate) enum Pick {
         /// where they passed.
         flaky: Vec<(String, String)>,
         keys: Keys,
+        /// Every test of the program, in the order the daemon wrote them.
+        planned: Vec<Planned>,
     },
 }
 
@@ -90,8 +94,37 @@ pub(crate) struct Always {
     pub(crate) why: String,
     /// The calls that take the test to what it reaches, from the test on, joined by ` -> `.
     pub(crate) path: Option<String>,
-    /// Whether it runs outside the sandbox, taken out by its package or the command.
-    pub(crate) outside: bool,
+}
+
+/// What is known of a test of a program before it runs, for `tests.ndjson`.
+pub(crate) struct Planned {
+    pub(crate) name: String,
+    /// Whether its end is a function of its code alone.
+    pub(crate) hermetic: bool,
+    /// What it reaches that its code does not decide, all kinds.
+    pub(crate) reasons: Vec<plan::Reason>,
+    pub(crate) cached: Cached,
+}
+
+/// Whether a test's pass is kept, as `tests.ndjson` has it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cached {
+    /// It passed under its key as it is now, and is not run (but under [`verifying`]).
+    Hit,
+    /// It has a key and no pass under it: it runs, and a pass is kept.
+    Miss,
+    /// It runs every time and is never kept.
+    Never,
+}
+
+impl Cached {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Cached::Hit => "hit",
+            Cached::Miss => "miss",
+            Cached::Never => "never",
+        }
+    }
 }
 
 /// The first key of each test of a program that may be kept, and whether it reaches the world
@@ -154,9 +187,10 @@ impl Keys {
 /// Which tests of `test` this command runs. `results` are the store's, `None` when there is
 /// none; `run` stands for what the command builds and runs the tests with; `sandbox` is what
 /// stands for the environment of a sandboxed test ([`super::sandboxed::identity_of`]) when the
-/// tests run sandboxed, and why they run outside otherwise: a test outside is not hermetic,
-/// and runs every time, as do those of `outside`, which the manifest `manifest` takes out.
-#[allow(clippy::too_many_arguments)]
+/// tests run sandboxed, and why they run outside otherwise. A hermetic test is kept by its code
+/// wherever it runs; one that reaches the world outside its code is kept with what it read in
+/// the sandbox, and runs every time outside it, as those of `outside`, which its package takes
+/// out, do.
 pub(crate) fn pick(
     asked: &Invocation,
     state: &State,
@@ -165,53 +199,80 @@ pub(crate) fn pick(
     run: &str,
     sandbox: Result<&str, &str>,
     outside: &BTreeSet<String>,
-    manifest: &Path,
 ) -> Pick {
     if !on() || !asked.positional.is_empty() || !plain(&asked.trailing) {
         return Pick::Asked;
     }
     let Some(dir) = state.plan_dir(test) else { return Pick::Asked };
     let Ok(reach) = std::fs::read_to_string(dir.join(plan::REACH)) else { return Pick::Asked };
+    let mut lines = reach.lines();
+    // One of an older blaze, written before the program was built again.
+    if lines.next() != Some(plan::REACH_FORMAT) {
+        return Pick::Asked;
+    }
     let programs = programs_run_by(state, test);
     let mut results = results;
     let (mut names, mut keys, mut always, mut reaching) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new());
-    let (mut cached, mut flaky, mut total) = (BTreeMap::new(), Vec::new(), 0);
-    for line in reach.lines() {
-        let mut parts = line.split('\t');
+    let (mut cached, mut flaky, mut total, mut planned) =
+        (BTreeMap::new(), Vec::new(), 0, Vec::new());
+    for line in lines {
+        let mut parts = line.splitn(3, '\t');
         let (Some(hash), Some(name)) = (parts.next(), parts.next()) else { continue };
         if hash == "*" {
             return Pick::Asked;
         }
         total += 1;
-        let reaches = hash.strip_prefix('~');
-        let outside_why = match sandbox {
-            Err(why) => Some(format!("it runs outside the sandbox: {why}")),
-            Ok(_) if outside.contains(name) => {
-                Some(format!("its package takes it out of the sandbox ({})", manifest.display()))
-            }
-            Ok(_) => None,
-        };
-        if let Some(why) = outside_why {
-            names.push(name.to_owned());
-            always.push(Always { name: name.to_owned(), why, path: None, outside: true });
-            continue;
-        }
+        let rest = parts.next().unwrap_or_default();
         if hash == "-" {
             names.push(name.to_owned());
-            let why = parts.next().unwrap_or_default().to_owned();
-            let path = parts.next().map(str::to_owned);
-            always.push(Always { name: name.to_owned(), why, path, outside: false });
+            always.push(Always { name: name.to_owned(), why: rest.to_owned(), path: None });
+            let reason = plan::Reason {
+                kind: "benchmark".to_owned(),
+                what: name.to_owned(),
+                why: rest.to_owned(),
+                chain: Vec::new(),
+            };
+            let reasons = vec![reason];
+            let name = name.to_owned();
+            planned.push(Planned { name, hermetic: false, reasons, cached: Cached::Never });
             continue;
         }
-        let identity = match (reaches, sandbox) {
-            (Some(hash), Ok(env)) => format!("~{hash}{programs}{env}{run}"),
+        let reasons: Vec<plan::Reason> = serde_json::from_str(rest).unwrap_or_default();
+        let (mark, hash) = match hash.as_bytes().first() {
+            Some(b'~' | b'!') => (&hash[..1], &hash[1..]),
+            _ => ("", hash),
+        };
+        let hermetic = mark.is_empty();
+        let sandboxed = sandbox.ok().filter(|_| !outside.contains(name));
+        let reads = mark == "~" && sandboxed.is_some();
+        if !hermetic && !reads {
+            let first = reasons.iter().find(|it| it.blocks());
+            let why = first.map_or_else(
+                || "it reaches what its code does not decide".to_owned(),
+                |it| it.why.clone(),
+            );
+            let path = first.map(|it| {
+                it.chain.iter().map(|call| call.name.as_str()).collect::<Vec<_>>().join(" -> ")
+            });
+            names.push(name.to_owned());
+            always.push(Always { name: name.to_owned(), why, path });
+            let name = name.to_owned();
+            planned.push(Planned { name, hermetic, reasons, cached: Cached::Never });
+            continue;
+        }
+        let identity = match (reads, sandboxed) {
+            (true, Some(env)) => format!("~{hash}{programs}{env}{run}"),
             _ => format!("{hash}{programs}{run}"),
         };
         let first = Results::first(&identity, name);
-        keys.insert(name.to_owned(), (first, reaches.is_some()));
-        let found =
-            results.as_mut().map_or(Found::Missing(None), |it| it.find(&first, reaches.is_some()));
+        keys.insert(name.to_owned(), (first, reads));
+        let found = results.as_mut().map_or(Found::Missing(None), |it| it.find(&first, reads));
+        let kept = match &found {
+            Found::Passed { .. } => Cached::Hit,
+            _ => Cached::Miss,
+        };
+        planned.push(Planned { name: name.to_owned(), hermetic, reasons, cached: kept });
         match found {
             Found::Passed { from } => {
                 cached.insert(name.to_owned(), from);
@@ -219,7 +280,7 @@ pub(crate) fn pick(
             }
             Found::Flaky { from } => flaky.push((name.to_owned(), from)),
             Found::Missing(why) => {
-                if let (Some(why), true) = (why, reaches.is_some()) {
+                if let (Some(why), true) = (why, reads) {
                     reaching.push((name.to_owned(), why));
                     names.push(name.to_owned());
                     continue;
@@ -227,7 +288,7 @@ pub(crate) fn pick(
             }
         }
         names.push(name.to_owned());
-        if reaches.is_some() {
+        if reads {
             reaching.push((
                 name.to_owned(),
                 "it has not passed with what it read as it is now".to_owned(),
@@ -245,7 +306,7 @@ pub(crate) fn pick(
     }
     let long = names.iter().map(|it| it.len() + 1).sum::<usize>() > NAMES_AT_MOST;
     let names = (names.len() != total && !long).then_some(names);
-    Pick::Some { names, total, always, reaching, cached, flaky, keys: Keys(keys) }
+    Pick::Some { names, total, always, reaching, cached, flaky, keys: Keys(keys), planned }
 }
 
 /// What stands for what the command `asked` builds and runs its tests with, beside each test's

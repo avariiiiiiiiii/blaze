@@ -184,7 +184,7 @@ main.wide { max-width: none; }
 
 /* Moving between pages. The client router (client/nav.ts) swaps the page column without a load, inside a
    same-document view transition: the sidebar and the phone bar are their own layers and stay put, and only the page
-   column cross-fades, quickly. The few navigations it leaves to the browser (a fallback, /updates with Turnstile) are
+   column cross-fades, quickly. The few navigations it leaves to the browser (a fallback) are
    the same cross-fade as a cross-document view transition (Chrome and Edge 126+, Safari 18.2+; elsewhere a plain
    load). Neither runs under prefers-reduced-motion (nav.ts skips its transition). */
 @view-transition { navigation: auto; }

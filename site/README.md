@@ -38,7 +38,7 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `(InGroup, nav.x)`; `renderer/core/src/side.rs` draws the sidebar, crumb, pager and outline from them, in the ix
   docs' layout.
 - `client/`: browser scripts (the sidebar's folds, drawer, search over `dist/search.json` and outline in `side.ts`;
-  comment enhancements, the signup form, the charts' tooltips, copy buttons). `nav.ts` is the client router: a click on a link to
+  comment enhancements, the course and its player, the charts' tooltips, copy buttons). `nav.ts` is the client router: a click on a link to
   another page fetches it (fetched ahead on hover) and swaps only the page column, the head's tags and the sidebar's
   open row, without a load, as the ix docs move between pages; anything unexpected falls back to a plain load. Each
   page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
@@ -136,7 +136,7 @@ To look at the page with other data, point `BENCH_HISTORY` at a directory of `.j
 
 `worker/index.ts` is the Worker entry (plain `export default { fetch }`). `assets.run_worker_first` is `true`, so
 every request reaches the worker: `base.ts` `enter` redirects other hosts, strips the base (`/blaze`) from the path and
-the worker routes the site path (`/api/*`, `/auth/*`, `/updates`, `/audio/*`, discussable pages); anything else goes
+the worker routes the site path (`/api/*`, `/auth/*`, `/audio/*`, discussable pages); anything else goes
 to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out without the base). A missing page gets
 `dist/404.html`. Since every response comes from the worker, a `_headers` file would not apply: `http.ts`
 `assetHeaders` sets the CSP, nosniff and referrer policy on assets.
@@ -206,7 +206,6 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   the feed and a button meanwhile, then says "Site updated". Drafts (the feed's input and whether it was open, and
   comments), an edit in progress, scroll positions and the narration's place go through sessionStorage and come back; a reload that still gets the old
   assets doesn't retry for a minute.
-- `updates.ts`: the `/updates` form.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.
 
 The worker imports `.gen/` (written by the build), so build before `wrangler dev` or `deploy` (both run the build
@@ -219,8 +218,7 @@ bunx wrangler dev --var GITHUB_CLIENT_ID:<dev app id>     # secrets for dev go i
 bunx tsc --noEmit -p tsconfig.json                         # type-checks worker/ only
 ```
 
-Secrets (`wrangler secret put`, or `.dev.vars` locally; `.dev.vars*` is gitignored): `GITHUB_CLIENT_SECRET`,
-`TURNSTILE_SECRET_KEY`.
+Secrets (`wrangler secret put`, or `.dev.vars` locally; `.dev.vars*` is gitignored): `GITHUB_CLIENT_SECRET`.
 
 The cookies are `__Secure-` cookies, so they are `Secure`. `wrangler dev` serves plain http://localhost by default:
 Safari drops every `Secure` cookie on http://localhost, so sign-in can lose its cookie there. For local sign-in run
@@ -246,8 +244,7 @@ Caching: an anonymous request is served from the Cache API under
 `CF_VERSION` binding's (`version_metadata`), new on every deploy, so a change of code or vars moves every key;
 `wrangler dev` gives a random id per session. The version is memoised for 2 s per isolate. A request with a valid session is rendered for that reader and
 sent `private, no-store`; it never reads or writes the cache, and the only code that writes it renders with no viewer.
-Anonymous pages go to the browser as `no-cache, Vary: cookie`. Worker-served HTML carries a CSP (`script-src 'self'`;
-`/updates` also allows Turnstile); the `x-render` header says how it was served (`hit`, `miss`, `anonymous`, `private`).
+Anonymous pages go to the browser as `no-cache, Vary: cookie`. Worker-served HTML carries a CSP (`script-src 'self'`); the `x-render` header says how it was served (`hit`, `miss`, `anonymous`, `private`).
 
 Pages tagged `Discussable` take comments, per block or on the page as a whole (block `_page`). The build lists them
 (from the renderer, `site_discussable`) in `.gen/discussable.json` (doc -> title and each block's id and first 280 chars of text); the worker accepts only
@@ -293,40 +290,13 @@ npx wrangler d1 execute ra-jit-updates --remote --command \
   "select c.id, c.doc, c.block, u.login, c.body, c.created_at from comments c join users u on u.id = c.user_id where c.deleted_at is null order by c.id desc"
 ```
 
-## Signups (`/updates`)
+## Signups (retired)
 
-`worker/updates.ts`. GET serves `dist/updates.html` with the Turnstile widget (when `TURNSTILE_SITE_KEY` is set) and
-the visitor's Referer filled in through HTMLRewriter. POST with `Accept: application/json` (`client/updates.ts`)
-answers `{ok: true}` or `{error}`; a plain form post (no JS) gets the page back with the error shown, or the thank-you
-note. Cross-site posts are refused (403).
-
-One row per email in `signups` (email lowercased; a repeat signup updates `company` and `why`, keeps the first-touch
-metadata). Metadata: `request.cf` country, region, city, asn, asOrganization, timezone; user-agent; referer (the page
-before `/updates`); accept-language; `src` and `utm_*` from the `/updates` URL (the README button uses `?src=readme`).
-No IPs are stored. Rate limit: 3 signups per email and 60 overall per minute (429), logged in `signup_attempts` by
-the same statement that checks the limit. Only posts with a valid email that passed Turnstile are logged, so failed
-checks cannot fill the global cap. A form post over 64 KiB is refused (413).
-
-Turnstile: set `TURNSTILE_SITE_KEY` in `wrangler.jsonc` `vars` and the secret with `wrangler secret put`. With no
-secret, verification is skipped; with no site key, the widget is not shown (dev).
-
-### One-time setup
-
-```
-npx wrangler d1 create ra-jit-updates      # paste the printed database_id into wrangler.jsonc (TODO there)
-npx wrangler d1 migrations apply ra-jit-updates --remote
-npx wrangler secret put TURNSTILE_SECRET_KEY
-bun gen/build.ts && npx wrangler deploy
-```
-
-Local dev: `npx wrangler d1 migrations apply ra-jit-updates --local`.
-
-### Reading signups
+`/updates` was a signup form; it is now What's new, the course's changelog (`content/updates.flecs`). The D1 tables it
+wrote, `signups` and `signup_attempts` (`migrations/0001_signups.sql`), are kept with their rows; nothing writes them
+now. The database is `ra-jit-updates`, which also holds the comments:
 
 ```
 npx wrangler d1 execute ra-jit-updates --remote --command \
   "select email, company, why, src, country, city, as_organization, created_at from signups order by created_at desc"
-npx wrangler d1 execute ra-jit-updates --remote --command "select count(*) from signups"
 ```
-
-Add `--json` for machine-readable output.

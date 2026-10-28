@@ -136,8 +136,8 @@ const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css
 type Baked = SnapshotInput['bakes'];
 
 /**
- * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and each lesson's
- * glyph (gen/glyphs.ts, set as the lesson page's `Baked {html}`). By entity path.
+ * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and each lesson's and
+ * update's glyph (gen/glyphs.ts, set as the page's `Baked {html}`). By entity path.
  */
 function bake(all: Map<string, Node>): Baked {
 	const baked: Baked = {};
@@ -150,7 +150,7 @@ function bake(all: Map<string, Node>): Baked {
 		}
 		const cmd = n.values.get('Command');
 		if (cmd) (baked[n.path] ??= {}).highlighted = highlight(prose(String(cmd.text ?? '')), 'bash');
-		const lesson = n.values.get('Lesson');
+		const lesson = n.values.get('Lesson') ?? n.values.get('Update');
 		if (lesson) {
 			try {
 				(baked[n.path] ??= {}).baked = glyphSvg(String(lesson.glyph ?? ''));

@@ -30,7 +30,7 @@ use uds_windows::UnixStream;
 use super::{plan::Plan, units::stamp_of};
 use blaze_protocol::{
     Message,
-    events::{Event, Record},
+    events::{Event, Record, Subscribe},
 };
 
 use crate::socket::{self, Asked, NotServed, Served, private_dir, private_file};
@@ -171,6 +171,12 @@ pub(crate) enum Request {
     Lint(Ahead, String),
     Status,
     Stop,
+    /// The records of the builds `subscribe` names: those of before, and with `follow` each
+    /// one after as it comes ([`Watched`]).
+    Watch {
+        subscribe: Subscribe,
+        follow: bool,
+    },
 }
 
 impl Request {
@@ -217,6 +223,9 @@ pub(crate) enum Reply {
     },
     Status(Status),
     Stopping,
+    /// The records of a [`Request::Watch`] that does not follow; one that does was sent them
+    /// as they came.
+    Watched(Vec<Record>),
 }
 
 /// Why the worker did not build a program.
@@ -1063,6 +1072,78 @@ struct Daemon {
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
     asked: Mutex<Instant>,
+    watched: Mutex<Watched>,
+}
+
+/// The records of the builds under way and of the last of each workspace, for the commands
+/// that watch them: `blaze watch` follows every build, `blaze status` shows the one of its
+/// workspace.
+#[derive(Default)]
+struct Watched {
+    /// The number of the last build that began.
+    builds: u64,
+    watching: Vec<Watching>,
+    watchers: Vec<Watcher>,
+}
+
+struct Watching {
+    build: u64,
+    root: PathBuf,
+    records: Vec<Record>,
+    done: bool,
+}
+
+/// A command that is sent the records of the builds of the workspace at `root`, or of every
+/// one.
+struct Watcher {
+    root: Option<PathBuf>,
+    to: std::sync::mpsc::Sender<Record>,
+}
+
+/// How many workspaces' last builds the daemon keeps the records of.
+const WATCHED: usize = 16;
+
+impl Watched {
+    fn began(&mut self, root: &Path) -> u64 {
+        self.builds += 1;
+        self.watching.retain(|it| !(it.done && it.root == root));
+        let done = self.watching.iter().filter(|it| it.done).count();
+        if let Some(oldest) = self.watching.iter().position(|it| it.done)
+            && done >= WATCHED
+        {
+            self.watching.remove(oldest);
+        }
+        let watching = Watching {
+            build: self.builds,
+            root: root.to_owned(),
+            records: Vec::new(),
+            done: false,
+        };
+        self.watching.push(watching);
+        self.builds
+    }
+
+    fn record(&mut self, build: u64, record: &Record) {
+        let Some(watching) = self.watching.iter_mut().find(|it| it.build == build) else { return };
+        watching.records.push(record.clone());
+        let done = matches!(record.event, Event::Finished { .. });
+        watching.done |= done;
+        let root = &watching.root;
+        // One that went away is told nothing more, and one of a workspace whose build is
+        // done is done too.
+        self.watchers.retain(|watcher| {
+            let ours = watcher.root.as_ref().is_none_or(|it| it == root);
+            !ours || watcher.to.send(record.clone()).is_ok() && !(done && watcher.root.is_some())
+        });
+    }
+
+    /// The build under way in the workspace `at` is in, or else its last.
+    fn of(&self, at: &Path) -> Option<&Watching> {
+        let of = |done: bool| {
+            self.watching.iter().rev().find(|it| it.done == done && at.starts_with(&it.root))
+        };
+        of(false).or_else(|| of(true))
+    }
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -1153,6 +1234,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
+        watched: Mutex::default(),
     });
     // A build starts the daemon, and is given this one.
     daemon.spare();
@@ -1183,6 +1265,14 @@ pub(crate) fn serve() -> anyhow::Result<()> {
 /// said since.
 const RELAYED: Duration = Duration::from_millis(100);
 
+/// The process whose records a command is handed, the root of the workspace it builds, and
+/// what the command is.
+struct Followed {
+    dir: PathBuf,
+    root: PathBuf,
+    command: &'static str,
+}
+
 /// What the daemon sends a client in answer to a request: the records of the build it waits
 /// for as they come, then the reply.
 #[derive(Serialize, Deserialize, Debug)]
@@ -1198,16 +1288,19 @@ pub(crate) enum Answer {
 fn relaying(
     stream: &UnixStream,
     id: u64,
-    dir: &Path,
-    command: &str,
+    followed: &Followed,
+    watched: &Mutex<Watched>,
     answering: impl FnOnce() -> Reply,
 ) -> Reply {
+    let Followed { dir, root, command } = followed;
     let began_ns = blaze_protocol::follow::now_ns();
     let build = std::sync::Mutex::new(blaze_ui::Build::default());
+    let number = lock(watched).began(root);
     let gone = AtomicBool::new(false);
     let send = |event: Event, at_ns: u64| {
         let record = Record { at_ns: at_ns.saturating_sub(began_ns), event };
         lock(&build).apply(&record);
+        lock(watched).record(number, &record);
         // A command that went away is handed nothing more; its answer goes nowhere too.
         if !gone.load(Relaxed)
             && blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Record(record)))
@@ -1226,8 +1319,10 @@ fn relaying(
             }
         }
     };
-    let root = dir.to_owned();
-    send(Event::Began { build: id, command: command.to_owned(), root }, began_ns);
+    send(
+        Event::Began { build: number, command: (*command).to_owned(), root: root.clone() },
+        began_ns,
+    );
     let (answered, told) = std::sync::mpsc::channel::<()>();
     let relay = &relay;
     let reply = std::thread::scope(|scope| {
@@ -1303,11 +1398,14 @@ impl Daemon {
         let read = Instant::now();
         let mut reply = match envelope {
             Some(envelope) if envelope.version == self.version => {
-                match self.followed_in(&envelope.request) {
-                    Some((dir, command)) => {
-                        relaying(stream, id, &dir, command, || self.handle(envelope.request))
+                match (self.followed_in(&envelope.request), envelope.request) {
+                    (_, Request::Watch { subscribe, follow }) => {
+                        self.watch(stream, id, &subscribe, follow)
                     }
-                    None => self.handle(envelope.request),
+                    (Some(followed), request) => {
+                        relaying(stream, id, &followed, &self.watched, || self.handle(request))
+                    }
+                    (None, request) => self.handle(request),
                 }
             }
             _ => Reply::Restart { version: self.version.clone() },
@@ -1355,22 +1453,61 @@ impl Daemon {
         }
     }
 
-    /// The directory of the process that answers `request`, whose records the command that
-    /// asks is handed ([`blaze_protocol::follow`]), and what the request is: a build, which
-    /// may load the workspace first, and a check, which can take long.
-    fn followed_in(&self, request: &Request) -> Option<(PathBuf, &'static str)> {
-        match request {
+    /// The process that answers `request`, whose records the command that asks is handed
+    /// ([`blaze_protocol::follow`]): a build, which may load the workspace first, and a
+    /// check, which can take long.
+    fn followed_in(&self, request: &Request) -> Option<Followed> {
+        let (dir, root, command) = match request {
             Request::Build(checkout) => {
-                Some((self.home.join("workers").join(checkout.config.id()), "build"))
+                (self.home.join("workers").join(checkout.config.id()), &checkout.root, "build")
             }
             Request::Check(ahead) => {
-                Some((self.home.join("checkers").join(ahead.config.id()), "check"))
+                (self.home.join("checkers").join(ahead.config.id()), &ahead.root, "check")
             }
             Request::Lint(ahead, _) => {
-                Some((self.home.join("checkers").join(ahead.config.id()), "clippy"))
+                (self.home.join("checkers").join(ahead.config.id()), &ahead.root, "clippy")
             }
-            Request::Warm(_) | Request::Status | Request::Stop => None,
+            Request::Warm(_) | Request::Status | Request::Stop | Request::Watch { .. } => {
+                return None;
+            }
+        };
+        Some(Followed { dir, root: root.clone(), command })
+    }
+
+    /// Answers a [`Request::Watch`]: the records of before, and with `follow` each one after
+    /// as it comes, until the build of a workspace is done or the command goes away.
+    fn watch(&self, stream: &UnixStream, id: u64, subscribe: &Subscribe, follow: bool) -> Reply {
+        let mut watched = lock(&self.watched);
+        let (root, before) = match subscribe {
+            Subscribe::Build { root } => {
+                let Some(watching) = watched.of(root) else { return Reply::Watched(Vec::new()) };
+                let done = watching.done;
+                let watching_root = watching.root.clone();
+                let records = watching.records.clone();
+                if done || !follow {
+                    return Reply::Watched(records);
+                }
+                (Some(watching_root), records)
+            }
+            Subscribe::All => {
+                let under_way = watched.watching.iter().filter(|it| !it.done);
+                (None, under_way.flat_map(|it| it.records.clone()).collect())
+            }
+        };
+        if !follow {
+            return Reply::Watched(before);
         }
+        let (to, told) = std::sync::mpsc::channel();
+        watched.watchers.push(Watcher { root, to });
+        drop(watched);
+        for record in before.into_iter().chain(told) {
+            let sent =
+                blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Record(record)));
+            if sent.is_err() {
+                break;
+            }
+        }
+        Reply::Watched(Vec::new())
     }
 
     fn handle(&self, request: Request) -> Reply {
@@ -1400,6 +1537,7 @@ impl Daemon {
                     .collect(),
             }),
             Request::Stop => Reply::Stopping,
+            Request::Watch { .. } => Reply::Watched(Vec::new()),
         }
     }
 
@@ -1796,6 +1934,36 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_watcher_is_handed_the_builds_it_watches_and_a_workspace_keeps_its_last() {
+        let began =
+            |root: &str| Event::Began { build: 0, command: "build".into(), root: root.into() };
+        let finished = Event::Finished { ok: true, summary: Default::default() };
+        let record = |event: Event| Record { at_ns: 0, event };
+        let mut watched = Watched::default();
+        let first = watched.began(Path::new("/w/a"));
+        watched.record(first, &record(began("/w/a")));
+        let (to, every) = std::sync::mpsc::channel();
+        watched.watchers.push(Watcher { root: None, to });
+        let (to, of_a) = std::sync::mpsc::channel();
+        watched.watchers.push(Watcher { root: Some("/w/a".into()), to });
+        let other = watched.began(Path::new("/w/b"));
+        watched.record(other, &record(began("/w/b")));
+        watched.record(first, &record(finished.clone()));
+        assert_eq!(every.try_iter().count(), 2, "every build's records");
+        assert_eq!(of_a.try_iter().count(), 1, "only a's");
+        assert_eq!(watched.watchers.len(), 1, "a's watcher is done when a's build is");
+        let of = watched.of(Path::new("/w/a/src")).unwrap();
+        assert!(
+            of.done && of.records.len() == 2,
+            "the last build of the workspace of a directory in it"
+        );
+        let again = watched.began(Path::new("/w/a"));
+        watched.record(again, &record(began("/w/a")));
+        assert!(!watched.of(Path::new("/w/a")).unwrap().done, "the one under way before the last");
+        assert_eq!(watched.watching.len(), 2, "a's last is dropped once another begins");
+    }
 
     #[test]
     fn the_workers_asked_longest_ago_are_stopped_for_the_rest_to_fit() {

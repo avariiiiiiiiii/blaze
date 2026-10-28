@@ -98,6 +98,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Status => status()?,
         Asked::Stop => stop()?,
         Asked::Why(args) => why::command(&args)?,
+        Asked::Watch => watch()?,
         Asked::Enable => switch::enable()?,
         Asked::Disable => switch::disable()?,
         Asked::Toolchain { path } => match toolchain::settle() {
@@ -143,6 +144,7 @@ usage: blaze <command> [cargo's flags]    (or blaze <command>)
   status             whether blaze is enabled, what the daemon has loaded, what fell back
   stop               ends the daemon; the next build starts one
   why [fn|crate]     what the last build compiled again and why
+  watch              every build the daemon does, as it does it
   enable, disable    plain `cargo build|run|test|check` through blaze, and back
   toolchain          blaze's own toolchain, which it builds every project with, downloaded once
                      if it has none (`--path`: its directory)
@@ -493,6 +495,48 @@ fn store_status() -> String {
     format!("store: {} MB, {most} (`blaze cache gc` collects it), {}", held >> 20, dir.display())
 }
 
+/// The build under way in the workspace of the current directory, or its last, as cargo's
+/// lines: what `blaze status` says of it.
+fn build_here() -> anyhow::Result<String> {
+    let here = std::env::current_dir()?;
+    let root = dunce::canonicalize(&here).unwrap_or(here);
+    let subscribe = blaze_protocol::events::Subscribe::Build { root };
+    let request = Request::Watch { subscribe, follow: false };
+    let Ok(Some(Reply::Watched(records))) = client::ask(request, Start::Never) else {
+        return Ok(String::new());
+    };
+    let Some(first) = records.first() else { return Ok(String::new()) };
+    let blaze_protocol::events::Event::Began { command, root, .. } = &first.event else {
+        return Ok(String::new());
+    };
+    let finished =
+        records.iter().any(|it| matches!(it.event, blaze_protocol::events::Event::Finished { .. }));
+    let when = if finished { "last" } else { "under way" };
+    let mut said = format!("  {command} of {} ({when}):\n", root.display());
+    let mut plain = blaze_ui::Plain::new(false);
+    for record in &records {
+        said.push_str(&plain.record(record));
+    }
+    Ok(said)
+}
+
+/// `blaze watch`: every build the daemon does, shown as it does it, until interrupted.
+fn watch() -> anyhow::Result<i32> {
+    say::watching();
+    let subscribe = blaze_protocol::events::Subscribe::All;
+    match client::ask(Request::Watch { subscribe, follow: true }, Start::Never)? {
+        Some(Reply::Watched(_)) => Ok(0),
+        Some(Reply::Restart { version }) => {
+            eprintln!("error: the daemon is another build of blaze, version {version}");
+            Ok(FAILED)
+        }
+        _ => {
+            eprintln!("error: {}", client::why_none());
+            Ok(FAILED)
+        }
+    }
+}
+
 /// `blaze status`: the daemon, its workers, the store, and how the builds of each
 /// checkout went.
 fn status() -> anyhow::Result<i32> {
@@ -527,6 +571,7 @@ fn status() -> anyhow::Result<i32> {
                     let _ = writeln!(said, "    {}: {warmth}", root.display());
                 }
             }
+            said.push_str(&build_here()?);
         }
         Some(Reply::Restart { version }) => {
             let _ = writeln!(

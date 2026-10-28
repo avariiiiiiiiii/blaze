@@ -20,12 +20,21 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   (src/main.rs edited), draw, tick (uses what changed); 0.21s`); off a terminal cargo-like
   lines. `-q` shows none.
 - `blaze why [fn|crate]` says what the last build rebuilt and why.
+- The built-in `gca!` macro of the pinned nightly (generic const arguments,
+  `#![feature(gca_min_const_items)]`) expands to its expression, as rustc evaluates it (#862).
+  A constant using it was refused ("this built-in macro is not implemented").
 - `--events json|cbor` writes the build's events to stdout, one record a line or frame.
 - `variant_count` in a constant evaluates, as rustc's does: an enum's variants, 1 for a
   struct or union, 0 for any other type (#862). A function using it was refused.
 
 ### Changed
 
+- Wasm proc macros expand in a session per calling crate only when they keep state (#908).
+  The guest's allocator counts live bytes, and an expansion that leaves some behind marks its
+  module stateful in the store. A module none of whose expansions did (serde_derive,
+  thiserror and most derives) goes back to a fresh instance per expansion: its expansions are
+  kept, and crates that call it are frozen again. A module not seen yet expands in a session
+  until a build has run it.
 - `blaze test` keeps a hermetic test's pass by its code, with no opt-in (#836): a test whose
   reachable code reaches no file, environment variable, socket, other process, foreign code,
   inline assembly, unbounded indirect call, writable shared static or code blaze can't compile
@@ -49,6 +58,9 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   confined with Landlock and the seccomp supervisor instead: writes only to `OUT_DIR` and a
   `TMPDIR` of its own, no network, signals only to its own processes, reads recorded as before
   (docs/cargo.md says what it does not hide). Sandboxed tests still need user namespaces.
+- A constant, static or discriminant whose own arithmetic overflows fails to evaluate, as
+  rustc's does, in a crate built without `-C overflow-checks` too (`--release`); it was given
+  the wrapped value (#862). A `const fn`'s arithmetic still follows the crate.
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
 - Native proc macros receive real source positions, text and file paths through the bidirectional server protocol; a server that cannot enable source spans is refused (#823).
 - `unchecked_add`, `unchecked_sub`, `unchecked_mul`, `unchecked_shl`, `unchecked_shr`,

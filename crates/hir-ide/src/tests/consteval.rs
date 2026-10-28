@@ -148,6 +148,21 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
 }
 
 #[test]
+fn generic_const_argument_macro() {
+    check_number(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! gca {}
+const fn add1(n: usize) -> usize { n + 1 }
+const fn len<const N: usize>(_: [u8; N]) -> usize { N }
+const ADD: usize = gca!(add1(2));
+const GOAL: usize = gca!({ ADD * 10 }) + len([0u8; gca!(ADD)]);
+"#,
+        33,
+    );
+}
+
+#[test]
 fn add() {
     check_number(r#"const GOAL: usize = 2 + 2;"#, 4);
     check_number(r#"const GOAL: i32 = -2 + --5;"#, 3);
@@ -165,6 +180,21 @@ fn bit_op() {
         e == ConstEvalError::MirEvalError(MirEvalError::Panic("Overflow in Shl".to_owned()))
     });
     check_number(r#"const GOAL: i32 = 100000000i32 << 11"#, (100000000i32 << 11) as i128);
+}
+
+#[test]
+fn overflow_in_a_constant() {
+    // The test crate has no `-C overflow-checks`: a constant's own arithmetic is checked
+    // regardless, and a `const fn`'s wraps, as rustc evaluates both.
+    let overflow = |op: &str| {
+        let op = format!("Overflow in {op}");
+        move |e: ConstEvalError<'_>| e == ConstEvalError::MirEvalError(MirEvalError::Panic(op))
+    };
+    check_fail(r#"const GOAL: u8 = { let x = 255u8; x + 1 };"#, overflow("Add"));
+    check_fail(r#"const GOAL: i8 = { let x = -128i8; -x };"#, overflow("Neg"));
+    check_fail(r#"const GOAL: u32 = { let x = 1u32; x << 32 };"#, overflow("Shl"));
+    check_fail(r#"const GOAL: u8 = { let x = 0u8; x - 1 };"#, overflow("Sub"));
+    check_number(r#"const fn add(a: u8, b: u8) -> u8 { a + b } const GOAL: u8 = add(255, 1);"#, 0);
 }
 
 #[test]

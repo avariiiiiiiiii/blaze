@@ -62,6 +62,18 @@ struct Target {
 }
 
 impl Target {
+    /// The spec rustc on `host` prints: its own, or on a host not recorded (Windows) the one
+    /// every recorded host prints. A spec the hosts differ on (x86-64 Linux's, whose own rustc
+    /// links with its lld) is the build's, so not known for another host.
+    fn spec_on(&self, host: &str) -> Option<&str> {
+        if let Some(spec) = self.target_spec_json.get(host) {
+            return Some(spec);
+        }
+        let mut specs = self.target_spec_json.values();
+        let spec = specs.next()?;
+        specs.all(|it| it == spec).then_some(spec)
+    }
+
     /// The `target_feature`s of `cpu` with `features` turned on (`true`) and off in order,
     /// starting from `have`, the target's own; `None` for a CPU or feature rustc warns of or
     /// does not have.
@@ -521,7 +533,7 @@ pub fn answer(
             // are read to link: an Apple target's spec names no deployment target
             // (`"llvm-target": "arm64-apple-macosx"`).
             "target-spec-json" if given.unstable_options && nightly => {
-                out += target.target_spec_json.get(toolchain.host)?;
+                out += target.spec_on(toolchain.host)?;
             }
             _ => return None,
         }
@@ -592,5 +604,15 @@ mod tests {
         assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
         let apple = spec("aarch64-apple-darwin", true).expect("an Apple spec under SDKROOT");
         assert_eq!(Some(apple), spec("aarch64-apple-darwin", false));
+    }
+
+    #[test]
+    fn a_spec_the_hosts_agree_on_is_answered_on_any_host() {
+        let release = &releases()[0];
+        let wasm = &release.targets["wasm32-wasip1"];
+        let windows = wasm.spec_on("x86_64-pc-windows-msvc").expect("wasm32-wasip1's spec");
+        assert_eq!(Some(windows), wasm.spec_on("aarch64-apple-darwin"));
+        let linux = &release.targets["x86_64-unknown-linux-gnu"];
+        assert_eq!(linux.spec_on("x86_64-pc-windows-msvc"), None);
     }
 }

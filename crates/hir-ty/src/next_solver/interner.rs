@@ -19,8 +19,8 @@ use hir_def::{
     hir::{ClosureKind as HirClosureKind, CoroutineKind as HirCoroutineKind, ExprId, PatId},
     lang_item::LangItems,
     signatures::{
-        EnumFlags, EnumSignature, FnFlags, FunctionSignature, ImplFlags, ImplSignature,
-        StructFlags, StructSignature, TraitFlags, TraitSignature, UnionSignature,
+        EnumFlags, EnumSignature, ImplFlags, ImplSignature, StructFlags, StructSignature,
+        TraitFlags, TraitSignature, UnionSignature,
     },
 };
 use rustc_abi::ExternAbi;
@@ -688,7 +688,9 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
     }
 
     fn destructor(self, interner: DbInterner<'db>) -> Option<AdtDestructorKind> {
-        crate::drop::destructor(interner.db, self.def_id()).map(|_| AdtDestructorKind::NotConst)
+        crate::effects::destructor_is_const(interner.db, self.def_id()).map(|is_const| {
+            if is_const { AdtDestructorKind::Const } else { AdtDestructorKind::NotConst }
+        })
     }
 
     fn field_representing_type_info(
@@ -1436,15 +1438,35 @@ impl<'db> Interner for DbInterner<'db> {
         bounds.map_bound(|it| it.iter().copied())
     }
 
-    #[expect(unreachable_code)]
     fn const_conditions(
         self,
-        _def_id: Self::DefId,
+        def_id: Self::DefId,
     ) -> EarlyBinder<
         Self,
         impl IntoIterator<Item = rustc_type_ir::Binder<Self, rustc_type_ir::TraitRef<Self>>>,
     > {
-        EarlyBinder::bind([unimplemented!()])
+        let db = self.db();
+        let of = |def: GenericDefId| {
+            crate::effects::effect_trait_refs(
+                crate::lower::const_conditions(db, def).skip_binder().iter().copied(),
+            )
+            .collect()
+        };
+        EarlyBinder::bind(match def_id {
+            SolverDefId::FunctionId(it) => of(it.into()),
+            SolverDefId::ImplId(it) => of(it.into()),
+            SolverDefId::TraitId(it) => of(it.into()),
+            SolverDefId::TypeAliasId(it) => of(it.into()),
+            SolverDefId::InternedClosureId(closure)
+                if crate::effects::closure_is_const(db, closure) =>
+            {
+                of(closure.loc(db).owner.generic_def(db))
+            }
+            SolverDefId::BuiltinDeriveImplId(it) => {
+                crate::effects::builtin_derive_const_conditions(db, it)
+            }
+            _ => Vec::new(),
+        })
     }
 
     fn has_target_features(self, _def_id: Self::FunctionId) -> bool {
@@ -2092,25 +2114,32 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn explicit_implied_const_bounds(
         self,
-        _def_id: Self::DefId,
+        def_id: Self::DefId,
     ) -> EarlyBinder<
         Self,
         impl IntoIterator<Item = rustc_type_ir::Binder<Self, rustc_type_ir::TraitRef<Self>>>,
     > {
-        // FIXME(next-solver)
-        EarlyBinder::bind([])
+        // A trait's `[const]` supertraits. FIXME: an associated type's `[const]` item bounds.
+        let SolverDefId::TraitId(trait_) = def_id else { return EarlyBinder::bind(Vec::new()) };
+        let conditions = crate::lower::const_conditions(self.db(), trait_.into()).skip_binder();
+        EarlyBinder::bind(
+            crate::effects::effect_trait_refs(conditions.iter().copied())
+                .filter(|it| {
+                    it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())
+                })
+                .collect(),
+        )
     }
 
     fn fn_is_const(self, id: Self::FunctionId) -> bool {
-        let id = match id.0 {
-            CallableDefId::FunctionId(id) => id,
-            _ => return false,
-        };
-        FunctionSignature::of(self.db(), id).flags.contains(FnFlags::CONST)
+        match id.0 {
+            CallableDefId::FunctionId(id) => crate::effects::fn_is_const(self.db(), id),
+            CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => true,
+        }
     }
 
-    fn impl_is_const(self, _def_id: Self::ImplId) -> bool {
-        false
+    fn impl_is_const(self, def_id: Self::ImplId) -> bool {
+        crate::effects::impl_is_const(self.db(), def_id)
     }
 
     fn opt_alias_variances(
@@ -2253,9 +2282,8 @@ impl<'db> Interner for DbInterner<'db> {
         }
     }
 
-    fn closure_is_const(self, _def_id: Self::ClosureId) -> bool {
-        // FIXME
-        false
+    fn closure_is_const(self, def_id: Self::ClosureId) -> bool {
+        crate::effects::closure_is_const(self.db(), def_id.0)
     }
 
     fn item_name(self, _item_index: Self::DefId) -> Self::Symbol {

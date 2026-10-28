@@ -46,6 +46,7 @@ jobs:
       os: ubuntu-24.04
       tier: full
       borrowck: true
+      consteval: true
       pinned-ui: true
       blaze-cli: true
       bench: true

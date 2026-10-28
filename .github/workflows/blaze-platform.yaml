@@ -165,13 +165,11 @@ jobs:
           project: ${{ steps.blaze.outputs.project }}
           token: ${{ secrets.BLAZE_CACHE_TOKEN }}
           sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
-      # What follows is for the harnesses of the `fast` and `full` tiers, which run this build;
-      # the merge gate's and main's tiers run none.
-      #
       # blaze's proc-macro server beside blaze, as a release has it: a load into blaze's own
       # target directory has blaze link every proc macro for that server, and fails without
       # one ("blaze did not build the proc macro", docs/no-rustc.md, J). Not on Windows, whose
-      # release blaze does not build yet.
+      # release blaze does not build yet. Only for the harnesses of the `fast` and `full` tiers:
+      # the smoke corpus of every tier is std alone, with no proc macros.
       - name: blaze's proc-macro server
         if: runner.os != 'Windows' && (inputs.tier == 'fast' || inputs.tier == 'full')
         run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/blaze-engine
@@ -179,14 +177,12 @@ jobs:
       # and `cargo clippy` to the blaze beside it, and fails without one; a load finds
       # blaze-proc-macro-srv beside blaze). A tar keeps them executable.
       - name: Pack
-        if: inputs.tier == 'fast' || inputs.tier == 'full'
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
           server=$([ -f blaze-proc-macro-srv ] && echo blaze-proc-macro-srv || true)
           tar -cf blaze.tar blaze-engine$exe blaze$exe blaze-rustc$exe $server
-      - if: inputs.tier == 'fast' || inputs.tier == 'full'
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: blaze-${{ inputs.platform }}
           path: target/release/blaze.tar

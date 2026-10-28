@@ -50,7 +50,11 @@ OPEN_BLAZE = {
         "a_socket_let_go_of_is_free_while_processes_start", "one_connection_too_many_is_closed",
         "one_process_serves_a_socket", "the_directory_and_the_socket_are_the_users_alone",
     ]),
-    # https://github.com/indexable-inc/blaze/issues/893
+}
+# Pass or fail on a blaze run, by the runner's load: neither is an error.
+UNSURE_BLAZE = {
+    # A 64 MiB part has 5 s to be answered: in time on linux x64, not on arm64
+    # (https://github.com/indexable-inc/blaze/issues/893).
     "blaze_cargo::remote::gateway::tests::what_is_over_a_put_goes_up_in_parts_checked_whole",
 }
 
@@ -100,7 +104,8 @@ def main():
     seen, failed = set(), set()
     status, any_failed = run(command, ROOT, env, seen, failed)
     sys.stdout.flush()
-    new, fixed, gone = sorted(failed - open_), sorted(open_ & seen - failed), sorted(open_ - seen)
+    unsure = set() if plain else UNSURE_BLAZE
+    new, fixed, gone = sorted(failed - open_ - unsure), sorted(open_ & seen - failed), sorted(open_ - seen)
     print(f"\n{len(seen)} tests, {len(failed)} failed, {len(open_ & failed)} of them known (OPEN in harness/unittests.py)")
     for name in new:
         print(f"::error::{name} fails, and is not in OPEN in harness/unittests.py")

@@ -38,7 +38,10 @@ use hir_def::{
     },
     hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
-    signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
+    signatures::{
+        ConstSignature, FunctionSignature, StaticFlags, StaticSignature, StructFlags,
+        StructSignature,
+    },
     src::HasSource,
 };
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
@@ -52,13 +55,13 @@ use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
 use salsa::plumbing::{AsId, FromId};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{AstNode, SyntaxNode, TextRange, TextSize};
 use triomphe::Arc;
 
 use hir_def::lang_item::LangItems;
 use hir_ty::{
     InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, PointerCast,
-    consteval::try_const_usize,
+    consteval::{ConstEvalError, try_const_usize},
     db::HirDatabase,
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, destructor, has_drop_glue},
@@ -84,11 +87,12 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, FrameStorage, LocalId, MirBody,
-    MirOptLevel, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue,
-    StatementKind, StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
+    MirEvalError, MirOptLevel, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
+    Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp, interpret_mir,
     location::{
         ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
-        location_of, written_call, written_range,
+        location_of, reported_range, source_location_in_file, source_range, track_caller,
+        written_call, written_range,
     },
     monomorphized, monomorphized_promoted_mir_body_query,
     overflow::{body_written_checked, crate_checks_overflow},
@@ -2842,15 +2846,39 @@ pub struct Recompiled {
 }
 
 /// The functions of the source compiled since the last call, the first 64 of them, and how
-/// many there were in all.
+/// many there were in all. Salsa also runs [`compiled_root`] of a function an edit took away,
+/// to verify what read it before the edit: that one is not of the source, and has no name in it.
 pub fn take_recompiled(db: &dyn HirDatabase) -> (Vec<Recompiled>, usize) {
     let (funcs, all) = std::mem::take(&mut *RECOMPILED.lock().unwrap_or_else(|e| e.into_inner()));
-    let named = funcs.into_iter().map(|func| Recompiled {
-        name: FunctionSignature::of(db, func).name.as_str().to_owned(),
-        krate: fncache::crate_name(db, func.krate(db)),
-        file: func.lookup(db).id.file_id.original_file(db).file_id(db),
-    });
-    (named.collect(), all)
+    let kept = funcs.len();
+    let named: Vec<_> = funcs
+        .into_iter()
+        .filter(|&func| {
+            let id = func.lookup(db).id;
+            in_source(db, InFile::new(id.file_id, id.value.erase()))
+        })
+        .map(|func| Recompiled {
+            name: FunctionSignature::of(db, func).name.as_str().to_owned(),
+            krate: fncache::crate_name(db, func.krate(db)),
+            file: func.lookup(db).id.file_id.original_file(db).file_id(db),
+        })
+        .collect();
+    let gone = kept - named.len();
+    (named, all - gone)
+}
+
+/// Whether the item `id` is in the source as it is now, and so is every macro call it was
+/// expanded from and the macro's definition. The map of an expansion is made by expanding
+/// it, which looks for its call: a call the source no longer has is checked before.
+fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
+    if let Some(call) = id.file_id.macro_file() {
+        let loc = call.loc(db);
+        let called = InFile::new(loc.kind.file_id(), loc.kind.erased_ast_id());
+        if !in_source(db, called) || !in_source(db, loc.def.kind.erased_ast_id()) {
+            return false;
+        }
+    }
+    id.file_id.ast_id_map(db).try_get_erased(id.value).is_some()
 }
 
 /// The code of a non-generic function.
@@ -4259,16 +4287,46 @@ fn describe_scopes(
     of_binding
 }
 
-/// File, line and column of a place in a body, as rustc reports them, found from where the
-/// body is in its file: [`places::source_location`] finds them from the body alone.
-#[salsa::tracked]
-fn source_location_in_file<'db>(
-    db: &'db dyn HirDatabase,
-    owner: DefWithBodyId,
-    span: MirSpan,
-) -> Option<(base_db::FileId, u32, u32)> {
-    let (file_id, range) = source_range(db, owner, span)?;
-    location_of(db, file_id, range)
+/// The error the build stops with when the evaluation of `of`, or of a constant it reads, ran
+/// past its budget (`const-eval` under `[workspace.metadata.blaze]`): what it ran out of, where,
+/// and the setting that raises it. `None` for any other error.
+fn over_budget(
+    db: &dyn HirDatabase,
+    of: GeneralConstId<'_>,
+    e: &ConstEvalError<'_>,
+) -> Option<CodegenError> {
+    let name = |of: GeneralConstId<'_>| match of {
+        GeneralConstId::ConstId(id) => {
+            ConstSignature::of(db, id).name.as_ref().map(|it| format!("`{}`", it.as_str()))
+        }
+        GeneralConstId::StaticId(id) => {
+            Some(format!("`{}`", StaticSignature::of(db, id).name.as_str()))
+        }
+        GeneralConstId::AnonConstId(_) => None,
+    };
+    let mut what = name(of).unwrap_or_else(|| "a constant expression".to_owned());
+    let ConstEvalError::MirEvalError(e) = e else { return None };
+    let mut e: &MirEvalError<'_> = e;
+    let (spent, at) = loop {
+        match e {
+            MirEvalError::InFunction(inner, _) => e = &**inner,
+            MirEvalError::ConstEvalError(inner, error) => {
+                let ConstEvalError::MirEvalError(inner_error) = &**error else { return None };
+                what = format!("`{inner}`");
+                e = inner_error;
+            }
+            MirEvalError::OverBudget { spent, at } => break (*spent, *at),
+            _ => return None,
+        }
+    };
+    let at = at
+        .and_then(|(owner, span)| fncache::location(db, owner, span))
+        .map(|it| format!(" at {it}"))
+        .unwrap_or_default();
+    Some(CodegenError::Refused(format!(
+        "const eval of {what} {spent}{at} (raise {} under `[workspace.metadata.blaze]`)",
+        spent.setting()
+    )))
 }
 
 /// File, line and column of a place in a body for a debugger, as rustc gives code its lines.
@@ -4322,86 +4380,6 @@ fn written_place(
         }
     }
     line_and_column(db, hir_expand::resolve_span(db, kept))
-}
-
-/// The file a place in a body is written in, which may be what a macro expands to, and
-/// where in it rustc has the place begin.
-fn source_range<'db>(
-    db: &'db dyn HirDatabase,
-    owner: DefWithBodyId,
-    span: MirSpan,
-) -> Option<(HirFileId, TextRange)> {
-    let source_map = &Body::with_source_map(db, owner).1;
-    let source = match span {
-        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
-        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
-        // ends where the body does.
-        MirSpan::ExprEnd(expr) => {
-            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
-                (Ok(written), _) => written,
-                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
-                    source_map.expr_syntax(*tail).ok()?
-                }
-                (Err(_), _) => return None,
-            }
-        }
-        MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
-        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
-    };
-    if let MirSpan::ExprEnd(_) = span {
-        // The brace that closes a block, which is where rustc has a scope left.
-        let range = source.value.syntax_node_ptr().text_range();
-        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
-        return Some((source.file_id, TextRange::new(last?, range.end())));
-    }
-    let range = match span {
-        MirSpan::ExprId(expr) => {
-            let root = source.file_id.parse_or_expand(db);
-            let node = source.value.syntax_node_ptr().to_node(&root);
-            reported_range(db, owner, expr, source.file_id, &node)?
-        }
-        _ => source.value.syntax_node_ptr().text_range(),
-    };
-    Some((source.file_id, range))
-}
-
-/// The part of an expression that rustc's span of it covers where it panics: a method call
-/// from the method's name on, an index through `Index` from its bracket on, and any other
-/// expression together with the parentheses it is written in.
-fn reported_range(
-    db: &dyn HirDatabase,
-    owner: DefWithBodyId,
-    expr: ExprId,
-    file_id: HirFileId,
-    node: &SyntaxNode,
-) -> Option<TextRange> {
-    let end = node.text_range().end();
-    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
-        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
-    }
-    if let Some(written) = ast::IndexExpr::cast(node.clone())
-        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
-        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
-    {
-        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
-    }
-    Some(parenthesized(db, file_id, node))
-}
-
-/// The range of an expression with the parentheses around it. rustc's span of an expression
-/// includes them when both are written in one place, and not when a macro put the
-/// parentheses around what it was passed.
-fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
-    let passed_in = |range: TextRange| {
-        file_id.macro_file().is_none()
-            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
-    };
-    let inner = passed_in(node.text_range());
-    node.ancestors()
-        .skip(1)
-        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
-        .last()
-        .map_or(node.text_range(), |it| it.text_range())
 }
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
@@ -8125,24 +8103,6 @@ pub(crate) fn erase_regions<'db>(
     erased
 }
 
-/// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
-/// impl inherits the attribute from the trait's declaration.
-fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    let has =
-        |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
-    if has(func) {
-        return true;
-    }
-    let ItemContainerId::ImplId(impl_id) = func.lookup(db).container else {
-        return false;
-    };
-    let Some(trait_ref) = db.impl_trait(impl_id) else {
-        return false;
-    };
-    let name = &FunctionSignature::of(db, func).name;
-    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
-}
-
 /// The integer an address is on the target.
 fn ptr() -> Type {
     Target::current().pointer()
@@ -10731,9 +10691,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
         }
-        let allocation = db
-            .const_eval_static(id)
-            .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
+        let allocation = db.const_eval_static(id).map_err(|e| {
+            over_budget(db, GeneralConstId::StaticId(id), &e)
+                .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
+        })?;
         // Nothing can be written to a static of no size.
         let writable = !allocation.memory.is_empty()
             && (flags.contains(StaticFlags::MUTABLE)
@@ -10874,7 +10835,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn eval_const(&mut self, unevaluated: UnevaluatedConst<'db>) -> Result<Allocation<'db>> {
         let db = self.cg.db;
         let UnevaluatedConst { def, args } = unevaluated;
-        let frontend = |e| CodegenError::Frontend(format!("const eval: {e:?}"));
+        let frontend = |e: ConstEvalError<'db>| {
+            over_budget(db, def.0, &e)
+                .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
+        };
         match def.0 {
             GeneralConstId::ConstId(id) => {
                 let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);

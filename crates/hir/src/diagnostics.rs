@@ -134,6 +134,8 @@ diagnostics![AnyDiagnostic<'db> ->
     BorrowckError,
     BorrowckSkipped,
     BreakOutsideOfLoop,
+    ConstCheckError,
+    ConstImpure,
     CannotBeDereferenced<'db>,
     UnaryOperatorCannotBeApplied<'db>,
     BinaryOperatorCannotBeApplied<'db>,
@@ -416,6 +418,22 @@ pub struct BorrowckError {
     /// The span is the brace that closes `node`, where rustc has a scope end.
     pub at_end: bool,
     pub code: &'static str,
+    pub message: String,
+}
+
+/// An error of rustc's const checker: what a `const fn`, a `const` or a `static` may not do.
+#[derive(Debug)]
+pub struct ConstCheckError {
+    pub node: InFile<SyntaxNodePtr>,
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// A `const fn` whose result at run time depends on more than its arguments: "const fn reads
+/// or writes mutable state: `CALLS` is `AtomicU64`, which is not `Freeze`".
+#[derive(Debug)]
+pub struct ConstImpure {
+    pub node: InFile<SyntaxNodePtr>,
     pub message: String,
 }
 
@@ -1476,6 +1494,29 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 }
                 .into(),
             );
+        }
+        let const_check = &hir_ide::mir::const_check::const_check(self.db, def).diagnostics;
+        for diagnostic in const_check {
+            let Some(node) = node_of(diagnostic.span) else { continue };
+            self.acc.push(
+                ConstCheckError {
+                    node,
+                    code: diagnostic.code,
+                    message: diagnostic.message.clone(),
+                }
+                .into(),
+            );
+        }
+        if let DefWithBodyId::FunctionId(func) = def
+            && const_check.is_empty()
+            && hir_ide::mir::const_check::const_context(self.db, def)
+                == Some(hir_ide::mir::const_check::ConstContext::ConstFn)
+            && let Some(impure) = hir_ide::mir::purity::const_purity(self.db, func)
+            && impure.told
+            && let Some(node) = node_of(impure.span)
+        {
+            let message = format!("const fn {}", impure.said());
+            self.acc.push(ConstImpure { node, message }.into());
         }
         if let Some(reason) = &result.skipped
             && std::env::var_os("BLAZE_BORROWCK_SKIPPED").is_some()

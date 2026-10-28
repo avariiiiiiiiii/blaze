@@ -3,7 +3,7 @@
 use std::{borrow::Cow, fmt, ops, str::from_utf8};
 
 use anyhow::Context;
-use base_db::{Env, TargetKind};
+use base_db::{ConstEvalBudget, Env, TargetKind};
 use cargo_metadata::{CargoOpt, MetadataCommand, PackageId};
 use la_arena::{Arena, Idx};
 use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
@@ -397,6 +397,32 @@ fn convert_target_kind(kinds: &[cargo_metadata::TargetKind]) -> TargetKind {
         };
     }
     TargetKind::Other
+}
+
+/// The budget `const-eval` under `[workspace.metadata.blaze]` sets ([`ConstEvalBudget`]), from
+/// the workspace's `metadata` as `cargo metadata` prints it: the default for what it leaves
+/// out, and an error naming the key for anything that is not a positive integer of a known key.
+pub(crate) fn const_eval_budget(metadata: &serde_json::Value) -> anyhow::Result<ConstEvalBudget> {
+    let mut budget = ConstEvalBudget::default();
+    let Some(table) = metadata.get("blaze").and_then(|it| it.get(ConstEvalBudget::KEY)) else {
+        return Ok(budget);
+    };
+    let key = ConstEvalBudget::KEY;
+    let table = table.as_object().with_context(|| {
+        format!("`{key}` is a table: `{key} = {{ steps = N, memory = BYTES }}`")
+    })?;
+    for (name, value) in table {
+        let slot = match name.as_str() {
+            "steps" => &mut budget.steps,
+            "memory" => &mut budget.memory,
+            _ => anyhow::bail!("`{key}.{name}` is not a setting (known: `steps`, `memory`)"),
+        };
+        *slot = value
+            .as_u64()
+            .filter(|it| *it > 0)
+            .with_context(|| format!("`{key}.{name}` is a positive integer, not `{value}`"))?;
+    }
+    Ok(budget)
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]

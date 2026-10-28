@@ -2648,6 +2648,8 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeBound {
                 match modifier {
                     TraitBoundModifier::None => (),
                     TraitBoundModifier::Maybe => write!(f, "?")?,
+                    TraitBoundModifier::Const => write!(f, "const ")?,
+                    TraitBoundModifier::MaybeConst => write!(f, "[const] ")?,
                 }
                 store[path].hir_fmt(f, owner, store)
             }

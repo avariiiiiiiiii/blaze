@@ -255,8 +255,9 @@ asked for. `/run` starts empty too, but for the links at its top (NixOS's `PATH`
 `/run/current-system`), and so does the Nix daemon's socket directory: a network namespace
 hides abstract sockets but not the machine's Unix sockets (the Docker, D-Bus, systemd, Nix
 daemon and agents' sockets of `/run` and `/run/user/$UID`), which would let a test have a daemon
-outside do what it may not. It needs namespaces a user can make; Ubuntu's AppArmor stops them
-unless `kernel.apparmor_restrict_unprivileged_userns` is 0, which the error says. A filter is
+outside do what it may not. Its overlays need namespaces a user can make; Ubuntu's AppArmor
+stops them unless `kernel.apparmor_restrict_unprivileged_userns` is 0, which the error says
+(a build script, which has no overlays, is confined with Landlock there instead). A filter is
 installed on every run. It refuses `TIOCSTI` and `TIOCLINUX` (`EPERM`); `io_uring_setup`
 (`ENOSYS`, as a kernel built without it answers and as Docker's default profile refuses it:
 seccomp never sees an `io_uring` operation, so a ring would read, write and connect past the
@@ -425,18 +426,27 @@ run does, and a proc-macro server does not start and the load says why: nothing 
 outside instead, nor goes to cargo or rustc. Windows has no sandbox yet, so there a build with
 build scripts or proc macros needs `BLAZE_SANDBOX=off`.
 
-In a container the sandbox's user namespace may be refused: Docker's default seccomp profile
-refuses `unshare(CLONE_NEWUSER)` to a process without `CAP_SYS_ADMIN`, so in a plain `docker
-run` every build script and proc macro fails with
-`a user namespace (unshare): Operation not permitted`
-([#420](https://github.com/indexable-inc/blaze/issues/420)). Where the process can tell it is
-in a container (`/.dockerenv`, `/run/.containerenv`, the `container` variable, or
-`/proc/1/cgroup` naming docker, kubepods, containerd, libpod or lxc), the error says so and
-names the ways on: run the container with `--security-opt seccomp=unconfined` (or a seccomp
-profile that allows user namespaces; on Kubernetes `securityContext.seccompProfile.type:
-Unconfined`), which keeps the sandbox, or set `BLAZE_SANDBOX=off`, which runs build scripts,
-proc macros and tests outside it, as cargo does. blaze does not make a weaker sandbox there on
-its own.
+Where a user may not make a user namespace, a build script's sandbox is confined with Landlock
+instead (Linux 5.13 on). Ubuntu 23.10 on keeps users from them through AppArmor
+(`kernel.apparmor_restrict_unprivileged_userns=1`: `/proc/self/setgroups: Permission
+denied`), and Docker's default seccomp profile refuses `unshare(CLONE_NEWUSER)` to a process
+without `CAP_SYS_ADMIN` ([#420](https://github.com/indexable-inc/blaze/issues/420)). What a
+build script is promised holds the same: it writes only its `OUT_DIR` (and the per-user cache
+on macOS), reaches no network, sees exactly the environment cargo gave it, and what it read is
+recorded. Landlock refuses every write outside the writable directories, a `TMPDIR` of the
+run's own and the terminal and null devices, and every TCP `bind` and `connect`; the seccomp
+supervisor refuses every address a call names that is not a Unix socket of the sandbox's own
+(the loopback and the abstract sockets are the machine's there) and every signal to a process
+that is not the sandbox's; the sandbox's first process reaps what the program leaves and kills
+it as the program ends. What namespaces hide and this does not: the machine's `/tmp`, `/run`
+and processes are seen (read-only), and SysV IPC and a file's mode, owner and times are not
+refused. A sandboxed test's overlays need a mount namespace, so a workspace that opted into
+sandboxed tests still needs user namespaces: where they can't be made, its tests fail saying
+so, with the ways on (`sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, an
+AppArmor profile that allows `userns` for blaze; in a container `--security-opt
+seccomp=unconfined`, or on Kubernetes `securityContext.seccompProfile.type: Unconfined`) or
+`BLAZE_SANDBOX=off`, which runs them outside, as cargo does. Where neither namespaces nor
+Landlock can be had, a build script fails the same way, naming both.
 
 A sandbox can be given a view (`sandbox::View`, the spec's `view`) in place of the machine,
 which is what a build script is to see under the Nix model (Andrew, 2026-10-27): its declared
@@ -625,18 +635,20 @@ A module sees only what cargo documents for a proc macro:
   the environment of the shell or the daemon.
 - A clock that reads 0 and random bytes that are the same on every run.
 
-Each expansion is kept in the store. Its first key is what the module was built of (two
-builds of one source are not the same bytes), the macro, its input and the variables. Its
-second key adds the file reads the host recorded: each path, relative to the package, and
-what that file held. A later expansion is found only while each of those reads holds the
-same as before; the format is `cargo/keyed.rs`'s. The expansion's own keys hold no absolute
-path and no host triple. But what a module was built of names the checkout's paths, so for
-now only the same checkout finds it. An expansion that asked the compiler about a span (its
-source text, file, line or a join) is not kept. A module's machine code is kept too, for
-the machine that compiled it: a new process loads it in about 3 ms rather than compiling it
-again (4 to 11 s for the corpus's macros). The list of a module's macros is kept in a
-`.macros` file beside it, so a load compiles nothing; a module is compiled, or loaded from
-the store, when one of its macros first expands.
+Each calling crate gets its own module instance for a database revision. Its macros share
+guest statics, stored tokens, source locations and open package files. Every new database
+revision starts a fresh session, including a client request without source changes. Before cached bodies are checked, its declarations expand
+again in collection order, including unchanged registration attributes. A trap fails that
+session until the next revision.
+
+Expansion outputs are not cached: finding an earlier output would skip the macro's state
+changes. The compiled module's machine code remains cached for the host that compiled it.
+Frozen declaration, impl and language-item artifacts are disabled for crates whose
+declarations call these macros: those artifacts do not contain the macro's state. Depending
+on a macro crate alone does not disable frozen artifacts or force declaration expansion.
+Actual callers repeat declaration expansion every revision; compiled function caching remains enabled.
+The list of a module's macros is kept in a `.macros` file beside it; a load compiles nothing
+until a macro first expands.
 
 A proc macro that can't be built or loaded as a module fails the load, naming it:
 
@@ -1101,6 +1113,22 @@ then run as a pinned version is. When the pointer can't be read (offline), the r
 when last read runs, with a line saying so; with none read before, it is an error. A pin to a
 version stays on that release, whose bytes never change: promotion from canary to stable flips
 the same release.
+
+## How far a constant's evaluation may go
+
+Every evaluation of a constant, static, array length or other compile-time code has a budget
+of steps (basic blocks run, as rustc counts them) and of memory (its stack and heap together),
+1 000 000 000 steps and 1 GiB unless the workspace's root `Cargo.toml` says otherwise:
+
+    [workspace.metadata.blaze]
+    const-eval = { steps = 4_000_000_000, memory = 4_294_967_296 }
+
+An evaluation that reaches either stops the build with what it ran out of, where it was and
+the setting to raise, as in ``const eval of `TABLE` exceeded 1000000000 steps at
+src/lib.rs:12:9 (raise `const-eval.steps` under `[workspace.metadata.blaze]`)``. rustc's own
+limit is its `long_running_const_eval` lint, an error at 2 000 000 steps unless the lint is
+allowed (then it only warns, and runs on); the default here is 500 times that, so the budget
+ends a loop that never would rather than refusing code rustc takes.
 
 ## Environment variables
 

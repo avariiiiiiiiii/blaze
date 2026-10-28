@@ -34,6 +34,10 @@ struct Recorder {
 }
 
 impl ProcMacroExpander for Recorder {
+    fn requires_session(&self) -> bool {
+        self.inner.requires_session()
+    }
+
     fn expand(
         &self,
         db: &dyn SourceDatabase,
@@ -55,19 +59,34 @@ impl ProcMacroExpander for Recorder {
             mixed_site,
             current_dir,
         );
-        let call = Call {
-            krate: self.krate.clone(),
-            name: self.name.clone(),
-            input: subtree.to_string(),
-            attr: attrs.map(ToString::to_string),
-        };
-        let recorded = match &output {
-            Ok(output) => Ok(output.to_string()),
-            Err(ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why)) => {
-                Err(why.clone())
-            }
-        };
-        self.expansions.lock().unwrap_or_else(|it| it.into_inner()).insert(call, recorded);
+        self.record(subtree, attrs, &output);
+        output
+    }
+
+    fn expand_in(
+        &self,
+        db: &dyn SourceDatabase,
+        calling_crate: ide_db::base_db::Crate,
+        subtree: &tt::TopSubtree,
+        attrs: Option<&tt::TopSubtree>,
+        env: &Env,
+        def_site: Span,
+        call_site: Span,
+        mixed_site: Span,
+        current_dir: String,
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        let output = self.inner.expand_in(
+            db,
+            calling_crate,
+            subtree,
+            attrs,
+            env,
+            def_site,
+            call_site,
+            mixed_site,
+            current_dir,
+        );
+        self.record(subtree, attrs, &output);
         output
     }
 
@@ -75,6 +94,29 @@ impl ProcMacroExpander for Recorder {
         (other as &dyn std::any::Any)
             .downcast_ref::<Self>()
             .is_some_and(|other| self.name == other.name && self.inner.eq_dyn(&*other.inner))
+    }
+}
+
+impl Recorder {
+    fn record(
+        &self,
+        subtree: &tt::TopSubtree,
+        attrs: Option<&tt::TopSubtree>,
+        output: &Result<tt::TopSubtree, ProcMacroExpansionError>,
+    ) {
+        let call = Call {
+            krate: self.krate.clone(),
+            name: self.name.clone(),
+            input: subtree.to_string(),
+            attr: attrs.map(ToString::to_string),
+        };
+        let recorded = match output {
+            Ok(output) => Ok(output.to_string()),
+            Err(ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why)) => {
+                Err(why.clone())
+            }
+        };
+        self.expansions.lock().unwrap_or_else(|it| it.into_inner()).insert(call, recorded);
     }
 }
 

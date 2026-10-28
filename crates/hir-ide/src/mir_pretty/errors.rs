@@ -134,44 +134,8 @@ impl MirEvalError<'_> {
                         writeln!(f, "In {closure:?}")?;
                     }
                 }
-                let (source_map, self_param_syntax) = match *def {
-                    InferBodyId::DefWithBodyId(def) => {
-                        let body = &Body::with_source_map(db, def).1;
-                        (&**body, body.self_param_syntax())
-                    }
-                    InferBodyId::AnonConstId(def) => {
-                        let store = ExpressionStore::with_source_map(db, def.loc(db).owner).1;
-                        (store, None)
-                    }
-                };
-                let span: InFile<SyntaxNodePtr> = match *span {
-                    MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => match source_map.expr_syntax(e) {
-                        Ok(s) => s.map(|it| it.into()),
-                        Err(_) => continue,
-                    },
-                    MirSpan::PatId(p) => match source_map.pat_syntax(p) {
-                        Ok(s) => s.map(|it| it.syntax_node_ptr()),
-                        Err(_) => continue,
-                    },
-                    MirSpan::BindingId(b) => {
-                        match source_map
-                            .patterns_for_binding(b)
-                            .iter()
-                            .find_map(|p| source_map.pat_syntax(*p).ok())
-                        {
-                            Some(s) => s.map(|it| it.syntax_node_ptr()),
-                            None => continue,
-                        }
-                    }
-                    MirSpan::SelfParam => match self_param_syntax {
-                        Some(s) => s.map(|it| it.syntax_node_ptr()),
-                        None => continue,
-                    },
-                    MirSpan::Unknown => continue,
-                };
-                let file_id = span.file_id.original_file(db);
-                let text_range = span.value.text_range();
-                writeln!(f, "{}", span_formatter(file_id.file_id(db), text_range))?;
+                let Some((file_id, range)) = source_range(db, *def, *span) else { continue };
+                writeln!(f, "{}", span_formatter(file_id, range))?;
             }
         }
         match err {
@@ -221,6 +185,15 @@ impl MirEvalError<'_> {
                     display_target,
                 )?;
             }
+            MirEvalError::OverBudget { spent, at } => {
+                write!(f, "const eval {spent}")?;
+                if let Some((owner, span)) = at
+                    && let Some((file_id, range)) = source_range(db, *owner, *span)
+                {
+                    write!(f, " at {}", span_formatter(file_id, range))?;
+                }
+                writeln!(f, " (raise {} under `[workspace.metadata.blaze]`)", spent.setting())?;
+            }
             MirEvalError::UndefinedBehavior(_)
             | MirEvalError::TargetDataLayoutNotAvailable(_)
             | MirEvalError::Panic(_)
@@ -228,7 +201,6 @@ impl MirEvalError<'_> {
             | MirEvalError::TypeIsUnsized(_, _)
             | MirEvalError::NotSupported(_)
             | MirEvalError::InvalidConst
-            | MirEvalError::ExecutionLimitExceeded
             | MirEvalError::StackOverflow
             | MirEvalError::CoerceUnsizedError(_)
             | MirEvalError::InternalError(_)
@@ -247,6 +219,37 @@ impl MirEvalError<'_> {
             _ => None,
         }
     }
+}
+
+/// The file and range of `span` in the body of `def`.
+fn source_range(
+    db: &dyn HirDatabase,
+    def: InferBodyId<'_>,
+    span: MirSpan,
+) -> Option<(FileId, TextRange)> {
+    let (source_map, self_param_syntax) = match def {
+        InferBodyId::DefWithBodyId(def) => {
+            let body = &Body::with_source_map(db, def).1;
+            (&**body, body.self_param_syntax())
+        }
+        InferBodyId::AnonConstId(def) => {
+            (ExpressionStore::with_source_map(db, def.loc(db).owner).1, None)
+        }
+    };
+    let span: InFile<SyntaxNodePtr> = match span {
+        MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => {
+            source_map.expr_syntax(e).ok()?.map(|it| it.into())
+        }
+        MirSpan::PatId(p) => source_map.pat_syntax(p).ok()?.map(|it| it.syntax_node_ptr()),
+        MirSpan::BindingId(b) => source_map
+            .patterns_for_binding(b)
+            .iter()
+            .find_map(|p| source_map.pat_syntax(*p).ok())?
+            .map(|it| it.syntax_node_ptr()),
+        MirSpan::SelfParam => self_param_syntax?.map(|it| it.syntax_node_ptr()),
+        MirSpan::Unknown => return None,
+    };
+    Some((span.file_id.original_file(db).file_id(db), span.value.text_range()))
 }
 
 #[extension(pub trait ConstEvalErrorPretty)]

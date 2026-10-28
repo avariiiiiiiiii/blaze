@@ -509,6 +509,38 @@ pub struct CrateWorkspaceData {
     pub target: Result<target::TargetData, target::TargetLoadError>,
     /// Toolchain version used to compile the crate.
     pub toolchain: Option<Version>,
+    /// How far the evaluation of one constant of the workspace may go.
+    pub const_eval: ConstEvalBudget,
+}
+
+/// What one evaluation of a constant, static or other compile-time code may spend before it
+/// stops with an error: `const-eval` under `[workspace.metadata.blaze]` in the root manifest.
+///
+/// ```toml
+/// [workspace.metadata.blaze]
+/// const-eval = { steps = 4_000_000_000, memory = 2_147_483_648 }
+/// ```
+///
+/// rustc's evaluation has no limit of its own past its `long_running_const_eval` lint (at 2
+/// million steps, allowed away by `#[allow]`), so the default is far beyond what code rustc
+/// takes without that `#[allow]` ever spends: it is there to end a loop that never would.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct ConstEvalBudget {
+    /// Basic blocks run, as rustc counts the terminators it evaluates.
+    pub steps: u64,
+    /// Bytes of the evaluation's stack and heap together.
+    pub memory: u64,
+}
+
+impl ConstEvalBudget {
+    /// The key of the table under `[workspace.metadata.blaze]`.
+    pub const KEY: &str = "const-eval";
+}
+
+impl Default for ConstEvalBudget {
+    fn default() -> Self {
+        ConstEvalBudget { steps: 1_000_000_000, memory: 1 << 30 }
+    }
 }
 
 impl CrateWorkspaceData {

@@ -203,4 +203,6 @@ cases![
     self_projection_enum_pat,
     rpit_recursive_method,
     attr_on_prefix_expr,
+    type_id_lifetime_constant,
+    caller_through_track_caller,
 ];

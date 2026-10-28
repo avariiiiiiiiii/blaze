@@ -20,8 +20,10 @@ struct Number(value: i32)               // an RFC's number
 struct Nav(label: string, order: i32)   // a page's row in the sidebar: its label, top to bottom by order in its section
 struct Link(label: string, href: string, order: i32) // a sidebar row that goes elsewhere (a child of a section)
 // The sidebar (nav.flecs; renderer core side.rs): its sections are the children of `nav`, each with a Group and an
-// Icon. A page joins one with Nav, Icon and (InGroup, nav.<section>); its RFCs are its row's kids.
+// Icon. A page joins one with Nav, Icon and (InGroup, nav.<section>); its RFCs are its row's kids, and the lessons of
+// a Course on it follow its row.
 struct Group(title: string, order: i32) // a sidebar section, top to bottom by order
+FoldOnPhone {}                          // a sidebar section that starts folded in the phone drawer
 struct Icon(name: string)               // a row's or section's icon: a key of renderer/core/src/icons.rs
 // The logo, set on `site`: animated pixel-fire WebP, the dark file on a dark page, the light one on a light page.
 // The still files are its first frame, which the sidebar shows until the pointer is on it.
@@ -59,6 +61,23 @@ Ol { (With, flecs.core.OrderedChildren) }
 Table { (With, flecs.core.OrderedChildren) }
 Tr { (With, flecs.core.OrderedChildren) }
 
+// The course (the home page's map; renderer core render.rs, client/learn.ts). A lesson is a page under site.learn
+// (/learn/<slug>) with Lesson; its
+// children are Steps, one idea per screen. Without JS the steps are stacked and each question shows its answer in a
+// fold; client/learn.ts turns the page into one step at a time and keeps the reader's progress in localStorage.
+struct Lesson(order: i32, line: string) // a lesson page: its place on the course map, and what it teaches in one line
+struct Step(title: string)              // one screen of a lesson: a short paragraph, maybe a diagram, maybe a question
+struct Quiz(prompt: string)             // a question: its children are Choices, exactly one of them Right
+struct Choice(text: string, why: string) // an answer, and the one line the reader sees once they pick it
+Right {}                                // the Choice that is right
+struct Figure(piece: string, label: string) // a diagram the reader can touch (client/lib/diagrams.ts draws `piece`); label says what it shows
+// A question answered by tapping parts of a diagram: `right` is the names of the parts to pick, comma separated (the
+// piece's node ids), `hint` what a wrong pick is told, `why` the explanation once it is right.
+struct Tap(prompt: string, piece: string, right: string, hint: string, why: string)
+Course {}                               // the course map: the Lesson pages under its (Lessons, page), or under this page, by order
+Step { (With, flecs.core.OrderedChildren) }
+Quiz { (With, flecs.core.OrderedChildren) }
+
 // Things the TS layer builds itself, placed like any block.
 RfcIndex {}                             // the list of RFCs (children of site.rfcs)
 References {}                           // every reference the page cites, in order of first use
@@ -89,6 +108,7 @@ Resolved {}
 Cites {}                                // (Cites, ref): a block leans on that reference
 DependsOn {}                            // (DependsOn, page): read that page first
 InGroup { Exclusive }                   // (InGroup, nav.<section>): the page's sidebar row is in that section
+Lessons { Exclusive }                   // (Lessons, page) on a Course: the lessons it maps are that page's
 
 // Page kinds.
 Discussable {}                          // signed-in readers comment on each block

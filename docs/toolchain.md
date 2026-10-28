@@ -58,8 +58,10 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
 1. On the branch `toolchain/bump` (the open bump's with main merged in, or a new one from main),
    `harness/toolchain_bump.py` pins the newest nightly whose manifest has every component blaze
    needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
-   `crates/rustc_abi` and the proc-macro server from rust-lang/rust at the new commit, and
-   moves the pin in `install.sh`, the server's manifest, `Cargo.toml` and the flake.
+   `crates/rustc_abi` and the proc-macro server from rust-lang/rust at the new commit, merges
+   the new nightly's standard library into `library/` ([The standard
+   library](#the-standard-library-library)), and moves the pin in `install.sh`, the server's
+   manifest, `Cargo.toml` and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
    `answers/rustc.json`.
@@ -94,13 +96,42 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    - **no verdict** (GitHub's API failing past its retries, a bug in the script): the same
      issue says so, with `gh workflow run toolchain-bump.yaml -f train=<run id>`, which counts
      and decides again with main's scripts.
-5. A step before the pull request that fails (a vendoring conflict, no usable nightly in two
-   weeks, a conflict merging main into the bump) opens or comments on the same issue with what
+5. A step before the pull request that fails (a vendoring conflict, a conflict merging the
+   standard library, no usable nightly in two weeks, a conflict merging main into the bump) opens or comments on the same issue with what
    failed, and so does a bump open for a day without merging. Nothing is skipped quietly.
 
 Fixes for what a nightly breaks (layouts, the ABI, std's source, intrinsics, borrow-check
 verdicts) are pushed to `toolchain/bump`. The next day's run merges main into it and moves it to
 that day's nightly from there, so they are kept, and the train runs again.
+
+## The standard library: library/
+
+The source of the standard library blaze compiles is in the repository, at `library/`, so
+that blaze can change it (Andrew, 2026-10-28: "make a ./library and just make it current
+nightly rustc, and use that, so we use our own Rust source, which allows us to change it in
+the future"). It is the Rust project's at the commit of blaze's nightly, as that nightly's
+`rust-src` has it: `library/` of rust-lang/rust with the `backtrace` submodule, byte for
+byte, and the third-party crates of `library/Cargo.lock` (hashbrown, libc, compiler_builtins'
+deps, addr2line, gimli, object, ...) vendored in `library/vendor` with the
+`library/.cargo/config.toml` that reads them from there. They are vendored rather than fetched
+from crates.io so that a cold build needs no network beyond blaze's store, and so that their
+paths, which panics and `file!()` show, are the ones `rust-src` gives. Until blaze reads it
+from here (the next step of #402), it compiles the nightly's `rust-src`, whose files these are.
+
+- `library/UPSTREAM` says which: the commit, the nightly and the sha256 of its `rust-src`,
+  read from the nightly's channel manifest (`harness/library.py import` wrote it).
+- It is not a member of blaze's workspace: no fmt, clippy or test of blaze's reads it, and
+  `.gitattributes` keeps upstream's bytes.
+- `python3 harness/library.py check '{}'` holds it to upstream: every file is the nightly's,
+  byte for byte, but those `library/PATCHES.md` names.
+- The daily bump moves it with the pin as a merge (`harness/library.py merge`): upstream's
+  changes from the old nightly to the new one are applied three-way, so blaze's own changes
+  are kept. A conflict stops the bump, names the files and opens the bump's issue.
+
+To change the standard library, edit it under `library/` and say what and why in
+`library/PATCHES.md` in the same commit, naming each file in backticks as
+`` `library/<path>` ``. There are no changes yet: with `library/` unpatched, blaze must behave
+exactly as with the nightly's own `rust-src`.
 
 ## How far behind it gets, and how long a bump takes
 

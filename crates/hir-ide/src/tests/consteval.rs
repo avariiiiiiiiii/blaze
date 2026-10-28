@@ -22,9 +22,10 @@ use crate::{
 
 use crate::{
     consteval::ConstEvalError,
-    mir::{MirEvalError, MirLowerError},
+    mir::{Budget, MirEvalError, MirLowerError},
 };
 
+mod const_traits;
 mod intrinsics;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
@@ -147,6 +148,21 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
 }
 
 #[test]
+fn generic_const_argument_macro() {
+    check_number(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! gca {}
+const fn add1(n: usize) -> usize { n + 1 }
+const fn len<const N: usize>(_: [u8; N]) -> usize { N }
+const ADD: usize = gca!(add1(2));
+const GOAL: usize = gca!({ ADD * 10 }) + len([0u8; gca!(ADD)]);
+"#,
+        33,
+    );
+}
+
+#[test]
 fn add() {
     check_number(r#"const GOAL: usize = 2 + 2;"#, 4);
     check_number(r#"const GOAL: i32 = -2 + --5;"#, 3);
@@ -164,6 +180,21 @@ fn bit_op() {
         e == ConstEvalError::MirEvalError(MirEvalError::Panic("Overflow in Shl".to_owned()))
     });
     check_number(r#"const GOAL: i32 = 100000000i32 << 11"#, (100000000i32 << 11) as i128);
+}
+
+#[test]
+fn overflow_in_a_constant() {
+    // The test crate has no `-C overflow-checks`: a constant's own arithmetic is checked
+    // regardless, and a `const fn`'s wraps, as rustc evaluates both.
+    let overflow = |op: &str| {
+        let op = format!("Overflow in {op}");
+        move |e: ConstEvalError<'_>| e == ConstEvalError::MirEvalError(MirEvalError::Panic(op))
+    };
+    check_fail(r#"const GOAL: u8 = { let x = 255u8; x + 1 };"#, overflow("Add"));
+    check_fail(r#"const GOAL: i8 = { let x = -128i8; -x };"#, overflow("Neg"));
+    check_fail(r#"const GOAL: u32 = { let x = 1u32; x << 32 };"#, overflow("Shl"));
+    check_fail(r#"const GOAL: u8 = { let x = 0u8; x - 1 };"#, overflow("Sub"));
+    check_number(r#"const fn add(a: u8, b: u8) -> u8 { a + b } const GOAL: u8 = add(255, 1);"#, 0);
 }
 
 #[test]
@@ -2500,6 +2531,43 @@ fn static_read_through_another() {
 }
 
 #[test]
+fn static_written_by_a_static() {
+    let modifying = |e: ConstEvalError<'_>| {
+        if let ConstEvalError::MirEvalError(MirEvalError::ConstEvalError(_, inner)) = e
+            && let ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(it)) =
+                simplify(*inner)
+        {
+            it.starts_with("modifying the initial value of static")
+        } else {
+            false
+        }
+    };
+    check_fail(
+        r#"
+    static mut A: u32 = 0;
+    static B: u32 = unsafe { A = 1; 2 };
+    const GOAL: u32 = B;
+    "#,
+        modifying,
+    );
+    check_fail(
+        r#"
+    static mut C: u32 = unsafe { C = 1; 0 };
+    const GOAL: u32 = unsafe { C };
+    "#,
+        modifying,
+    );
+    check_number(
+        r#"
+    static mut D: u32 = 4;
+    static E: u32 = { let mut x = unsafe { D }; x += 1; x };
+    const GOAL: u32 = E;
+    "#,
+        5,
+    );
+}
+
+#[test]
 fn extern_weak_statics() {
     check_number(
         r#"
@@ -3102,7 +3170,15 @@ fn exec_limits() {
         r#"
     const GOAL: usize = loop {};
     "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::ExecutionLimitExceeded),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Steps(10_000_000),
+                    at: Some(_),
+                })
+            )
+        },
     );
     check_fail(
         r#"
@@ -3111,7 +3187,15 @@ fn exec_limits() {
     }
     const GOAL: i32 = f(0);
     "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::ExecutionLimitExceeded),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Steps(10_000_000),
+                    at: Some(_),
+                })
+            )
+        },
     );
     // Reasonable code should still work
     check_number(
@@ -3149,9 +3233,13 @@ fn memory_limit() {
         };
         "#,
         |e| {
-            e == ConstEvalError::MirEvalError(MirEvalError::Panic(
-                "Memory allocation of 30000000000 bytes failed".to_owned(),
-            ))
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Memory(1_073_741_824),
+                    at: Some(_),
+                })
+            )
         },
     );
 }

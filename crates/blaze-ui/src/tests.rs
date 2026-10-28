@@ -142,6 +142,27 @@ fn a_fresh_build_says_nothing_of_its_own() {
     assert!(!drawn.contains("Fresh"), "{drawn:?}");
 }
 
+/// A failed build's last line says why to who watches it; the command that asked for it says
+/// the errors in full and cargo's `could not compile` after, so it has no line of its own,
+/// as cargo has one line of failure.
+#[test]
+fn a_failure_is_said_once_to_the_command_that_asked() {
+    let error = "error[E0308]: expected u32, found &'static str".to_owned();
+    let summary = Summary { took_ns: 40 * MS, error: Some(error), ..Summary::default() };
+    let records = [
+        at(0, Event::Began { build: 1, command: "build".into(), root: "/w/anim".into() }),
+        at(40 * MS, Event::Finished { ok: false, summary }),
+    ];
+    let mut watched = Plain::new(false);
+    let said: String = records.iter().map(|it| watched.record(it)).collect();
+    assert_eq!(said, "error: error[E0308]: expected u32, found &'static str (after 0.04s)\n");
+    let mut asked = Plain::new(false).errors_said();
+    assert_eq!(records.iter().map(|it| asked.record(it)).collect::<String>(), "");
+    let mut live = Live::new(80, false).errors_said();
+    let drawn: String = records.iter().map(|it| live.record(it, 40 * MS)).collect();
+    assert!(!drawn.contains("error"), "{drawn:?}");
+}
+
 /// On a terminal: the region is redrawn in place, each of its lines fits the width, each
 /// redraw clears exactly what was drawn, and at the end the summary is all that is left
 /// of it.

@@ -10,6 +10,7 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Added
 
+- Git-index registries can be resolved and fetched, including offline use of Cargo's index and archive caches; failed index updates are reported instead of using an old tree (#316).
 - A build shows what it does while it does it. The daemon and its workers speak deterministic
   CBOR frames (RFC 8949 §4.2.1) instead of JSON lines, and a worker publishes the build as
   events: each step (loading the workspace, resolving names, compiling, checking, linking),
@@ -19,10 +20,21 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   (src/main.rs edited), draw, tick (uses what changed); 0.21s`); off a terminal cargo-like
   lines. `-q` shows none.
 - `blaze why [fn|crate]` says what the last build rebuilt and why.
+- The built-in `gca!` macro of the pinned nightly (generic const arguments,
+  `#![feature(gca_min_const_items)]`) expands to its expression, as rustc evaluates it (#862).
+  A constant using it was refused ("this built-in macro is not implemented").
 - `--events json|cbor` writes the build's events to stdout, one record a line or frame.
+- `variant_count` in a constant evaluates, as rustc's does: an enum's variants, 1 for a
+  struct or union, 0 for any other type (#862). A function using it was refused.
 
 ### Changed
 
+- Wasm proc macros expand in a session per calling crate only when they keep state (#908).
+  The guest's allocator counts live bytes, and an expansion that leaves some behind marks its
+  module stateful in the store. A module none of whose expansions did (serde_derive,
+  thiserror and most derives) goes back to a fresh instance per expansion: its expansions are
+  kept, and crates that call it are frozen again. A module not seen yet expands in a session
+  until a build has run it.
 - `blaze test` keeps a hermetic test's pass by its code, with no opt-in (#836): a test whose
   reachable code reaches no file, environment variable, socket, other process, foreign code,
   inline assembly, unbounded indirect call, writable shared static or code blaze can't compile
@@ -37,6 +49,32 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   `-O2`, and 0 and 1 (`dev`, `test`) stay on Cranelift. `BLAZE_BACKEND` and `BLAZE_OPT` still
   choose. A dev build and a release build of one project keep separate workers. A blaze built
   without its `llvm` feature refuses a profile that asks for LLVM instead of using Cranelift.
+
+### Fixed
+
+- Build scripts run on a stock Ubuntu 23.10 or later, where AppArmor keeps a user from making a
+  user namespace: every crate with a build script failed with `the sandbox could not be made:
+  /proc/self/setgroups: Permission denied`. Where no user namespace can be made, the sandbox is
+  confined with Landlock and the seccomp supervisor instead: writes only to `OUT_DIR` and a
+  `TMPDIR` of its own, no network, signals only to its own processes, reads recorded as before
+  (docs/cargo.md says what it does not hide). Sandboxed tests still need user namespaces.
+- A constant, static or discriminant whose own arithmetic overflows fails to evaluate, as
+  rustc's does, in a crate built without `-C overflow-checks` too (`--release`); it was given
+  the wrapped value (#862). A `const fn`'s arithmetic still follows the crate.
+- Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
+- Native proc macros receive real source positions, text and file paths through the bidirectional server protocol; a server that cannot enable source spans is refused (#823).
+- `unchecked_add`, `unchecked_sub`, `unchecked_mul`, `unchecked_shl`, `unchecked_shr`,
+  `unchecked_div`, `unchecked_rem` and `exact_div` in a constant fail to evaluate, as rustc's
+  do, where the operation is undefined: an overflow, a shift past the width, a division by
+  zero or of the least value by -1, and an `exact_div` with a remainder (#862). Some gave a
+  wrong value instead: `unchecked_div(-128i8, -1)`, and `exact_div` with a remainder.
+- A static whose initializer writes to a static, another or itself, fails to evaluate, as rustc's
+  does (#862). It was evaluated as if the write had not been made.
+- Invalid built-in derives now fail `blaze check` and `blaze build`, including `Default` on an enum without a default variant and derives on unsupported item shapes (#751).
+- `Location::caller()` in a constant is evaluated, as rustc does: the place of the first call up
+  the stack that does not track its caller, under the file name the build uses (#862). A function
+  with such a constant was refused. docs/support.md no longer lists it, nor `%` on floats or
+  `type_id` of a type with lifetimes in a constant, which already matched rustc.
 
 ## [0.20261028.2] - 2026-10-28
 

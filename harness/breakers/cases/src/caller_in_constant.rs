@@ -1,7 +1,7 @@
 //! library/coretests panic/location.rs: `Location::caller()` in a constant is where the
 //! constant calls it. blaze evaluated it to where `caller` asks, inside `core`, under a file
-//! name rustc does not use. What rustc names the file is not known where a constant is
-//! evaluated, so a function with such a constant is left to rustc.
+//! name rustc does not use, and then refused it: the evaluator did not know what rustc names
+//! the file. It is the name the build gives it, as for `file!()`.
 
 use std::panic::Location;
 

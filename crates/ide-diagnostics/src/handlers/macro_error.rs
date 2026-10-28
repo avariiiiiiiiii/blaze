@@ -15,7 +15,13 @@ pub(crate) fn macro_error(ctx: &DiagnosticsContext<'_, '_>, d: &hir::MacroError)
     // Use more accurate position if available.
     let display_range = ctx.sema.diagnostics_display_range_for_range(d.range);
     Diagnostic::new(
-        DiagnosticCode::Ra(d.kind, if d.error { Severity::Error } else { Severity::WeakWarning }),
+        match d.kind {
+            "E0665" => DiagnosticCode::RustcHardError("E0665"),
+            kind => DiagnosticCode::Ra(
+                kind,
+                if d.error { Severity::Error } else { Severity::WeakWarning },
+            ),
+        },
         d.message.clone(),
         display_range,
     )

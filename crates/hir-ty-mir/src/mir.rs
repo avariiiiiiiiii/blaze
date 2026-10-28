@@ -15,6 +15,7 @@ pub(crate) use hir_ty::{
     next_solver::{GenericArgs, Ty},
 };
 
+pub mod const_check;
 mod eval;
 pub mod location;
 mod lower;
@@ -22,6 +23,7 @@ mod monomorphization;
 mod optimize;
 pub mod overflow;
 mod pretty;
+pub mod purity;
 mod storage;
 mod transform;
 pub mod type_name;

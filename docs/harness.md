@@ -15,6 +15,12 @@ report the dev targets' errors. Each target flag must pick what cargo's does: `-
 example or bench, `--test NAME` the one test, `--lib` no unit tests, and a member only
 depended on its library alone.
 
+`nativespans.py`: A native proc macro asks for a span's source text, line, column, byte range and file; edits and a daemon restart must agree with Cargo, under native and wasm expansion (#823).
+
+`gitindex.py`: A local git-index registry fetches two packages with Cargo-equal paths, source trees, archives and index cache bytes; each tool then reads the other's cache offline (#316).
+
+`deriveerrors.py`: Unused invalid built-in derives fail check and build as Cargo's do; a valid edit and a daemon restart preserve the verdict (#751).
+
 ## Running them
 
 You need Python 3, the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`) with
@@ -130,6 +136,7 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 | `backends.py` | One program compiled by each code producer: counts, time per function, and what LLVM left to Cranelift |
 | `lints_ui.py <rust checkout>` | The lints rust-analyzer finds at the level a source denies them, against rustc's UI tests that `deny` or `forbid` one: for each lint, the errors (lint and line) blaze reports that rustc does too (right), that rustc does not (wrong) and that only rustc reports (missed). A lint blaze fails builds with (`DENIED` in main.rs) has none wrong; one in a macro's expansion is not counted, as it fails no build. It scores against the pinned nightly's rustc; `--toolchain nightly-YYYY-MM-DD` against another. `lints_ui.py harness/lints_probes` scores the units written for the lints with few UI tests, one for each place a lint applies. `--deny LINT` scores one lint on every UI test, each read with `#![deny(LINT)]` first, for a lint few tests deny (`unused_mut`) |
 | `borrowck_ui.py <rust checkout>` | The borrow checker ([borrowck.md](borrowck.md)) against rustc's borrow-check UI tests: each unit passes when blaze reports the errors (code and line) the pinned nightly rustc reports, under Polonius and NLL. `--min-pass N` fails below N Polonius passes; a panic, or an error on a unit rustc accepts, fails it too |
+| `consteval_ui.py CONFIG` | The const evaluator against rustc's `tests/ui/consts` and `tests/ui/const-generics` at the pinned nightly's commit. Each revision of a test is a unit: blaze evaluates its free constants and statics and the constants of its inherent impls (`blaze-engine consteval`), and the unit passes when the ones that fail are the ones rustc's `error[E0080]`s name (none, for a pass test). The run-pass tests also go through `uitest.py`. Units rustc's verdict cannot be compared with (an auxiliary crate, a `-Z` flag, another error, a generic or anonymous constant) are counted out of scope with a reason. Writes `summary.md`, with every difference by kind, and `units.json` to `out`. `min_evaluation` and `min_run_pass` are the floors the train holds; a panic fails it too. Results: `bench/results/*-consteval/` |
 | `check_apps.py [name ...]` | `blaze check` against `cargo check` on the applications of `apps/apps.json` (cloned and prepared as `borrowck_apps.py` does) and the corpus: both run `check --workspace --all-targets --message-format=json`, into target directories and daemon homes of their own, and the errors and warnings of the workspace's files are compared by file, line and code or lint. An error only blaze reports (invented: it fails a build rustc accepts) or only rustc does (missed) fails it; missed warnings are counted, as the checker writes errors only. Needs `blaze-proc-macro-srv` beside blaze (`.github/scripts/build_release.py --server-beside`); a cargo job compiles a build script with blaze in 1 to 2.5 GB, so a 16 GB VM takes `CARGO_BUILD_JOBS=4` |
 | `scoreboard.py` | Runs the targets in `targets.json` and fails when behaviour differs or coverage drops below the committed `scoreboard.json` |
 | `mirparity.py <workspace> --crate <name> [--level N] [--rustc-level 1\|2]` | blaze's MIR (`blaze-engine mir`, at `BLAZE_MIR_OPT` level N) against rustc's `-Zunpretty=mir`, function by function: the share that match in shape, statement counts, statements and types, and the most frequent differences. Not a gate: the numbers are in [research/mir-gap.md](research/mir-gap.md) |
@@ -200,7 +207,7 @@ writes them again.
 | `storeshared.py` | Several daemons and `blaze-engine cache` commands on one store at once |
 | `storebuilds.py` | A store one build of blaze wrote serves another build of the same sources: the store keys by what blaze was built from, not by the bytes of its executable ([#105](https://github.com/indexable-inc/blaze/issues/105)). Linux and macOS |
 | `deepnames.py` | Closures nested 20 deep keep the store under 64 MB, and a second daemon finds their entries again: a type spelled out longer than 1 KB is named by its hash (issue #29) |
-| `expansions.py` | A second daemon on one store finds every derive and attribute expansion the first kept, and after an edit, with `BLAZE_PROC_MACRO_CACHE=check`, none expands otherwise than it was kept (issue #38) |
+| `expansions.py` | Uses the native proc-macro server. A second daemon on one store finds every derive and attribute expansion the first kept, and after an edit, with `BLAZE_PROC_MACRO_CACHE=check`, none expands otherwise than it was kept (issue #38) |
 | `remote.py`, `s3fake.py` | A store shared by two machines through an S3 service, with the transfer broken, objects spoiled and manifests forged |
 | `packs.py` | Not a check: the sealed pack's layout ([cache.md](cache.md)) read and written, for `remote.py`, `storeguards.py` and `bench.py` |
 | `deps.py` | cargo's builds of registry crates pushed and pulled. Builds offline from cargo's registry cache, so it does not run on a clean CI machine |

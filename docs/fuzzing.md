@@ -68,6 +68,14 @@ unwinding (`fuzz/scenes.py`). It does not generate threads, macros of its own, S
 intrinsics, or any I/O other than the checksum lines. Programs are a single crate and use
 only `std`.
 
+Every case also has a few `const fn`s (`fuzz/constfn.py`), each with a constant that calls
+it. `run` starts by calling each one again on the same arguments through `black_box`, and
+both results go into the checksum. blaze's build agrees with cargo's only when blaze's
+interpreter, which evaluates the constant, and its compiled code agree with rustc. A body
+uses what a `const fn` may use without a feature: integer and float arithmetic (float `%`
+too), `as`, `while` and `loop`, `match`, arrays, `&mut` to its locals, calls to the const
+fns before it, and a const generic length. A NaN goes into the checksum as one value.
+
 ## What counts as a finding
 
 - A case whose line differs from cargo's: the checksum, the panic location, the panic

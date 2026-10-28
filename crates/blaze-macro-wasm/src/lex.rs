@@ -1,19 +1,14 @@
 //! Text a macro asks to be tokens of (`str::parse::<TokenStream>`, `Literal::from_str`),
 //! lexed by the host as rust-analyzer's proc-macro server lexes it
-//! (`proc-macro-srv/src/token_stream.rs`), each token at a span of `call_site`'s anchor and
-//! context over its range of the text.
+//! (`proc-macro-srv/src/token_stream.rs`). Parsed tokens use the current call-site span,
+//! as rustc does; offsets into the parsed string are not offsets into the source file.
 
 use intern::Symbol;
 use ra_ap_rustc_lexer::{self as lexer, DocStyle, LiteralKind, TokenKind};
-use span::{Span, TextRange, TextSize};
+use span::Span;
 use tt::{DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing};
 
 use crate::wire::Tree;
-
-fn ranged(span: Span, range: std::ops::Range<usize>) -> Span {
-    let range = TextRange::new(TextSize::new(range.start as u32), TextSize::new(range.end as u32));
-    Span { range, ..span }
-}
 
 fn punct_char(kind: TokenKind) -> Option<char> {
     Some(match kind {
@@ -98,19 +93,12 @@ fn literal(text: &str, span: Span, kind: LiteralKind, suffix_start: u32) -> tt::
 }
 
 /// A doc comment as the attribute it stands for.
-fn doc(
-    stream: &mut Vec<Tree>,
-    text: &str,
-    style: DocStyle,
-    span: Span,
-    range: std::ops::Range<usize>,
-) {
+fn doc(stream: &mut Vec<Tree>, text: &str, style: DocStyle, span: Span) {
     stream.push(punct('#', false, span));
     if style == DocStyle::Inner {
         stream.push(punct('!', false, span));
     }
-    let value =
-        tt::Literal::new(&text.escape_debug().to_string(), ranged(span, range), LitKind::Str, "");
+    let value = tt::Literal::new(&text.escape_debug().to_string(), span, LitKind::Str, "");
     stream.push(Tree::Group {
         kind: DelimiterKind::Bracket,
         open: span,
@@ -126,8 +114,7 @@ fn doc(
 
 /// The tokens of `s`, or why it is none.
 pub(crate) fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
-    let mut groups: Vec<(DelimiterKind, std::ops::Range<usize>, Vec<Tree>)> =
-        vec![(DelimiterKind::Invisible, 0..0, vec![])];
+    let mut groups: Vec<(DelimiterKind, Vec<Tree>)> = vec![(DelimiterKind::Invisible, vec![])];
     let mut offset = 0;
     let mut tokens = lexer::tokenize(s, lexer::FrontmatterAllowed::No).peekable();
     while let Some(token) = tokens.next() {
@@ -141,7 +128,7 @@ pub(crate) fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
             _ => None,
         };
         if let Some(kind) = opens {
-            groups.push((kind, range, vec![]));
+            groups.push((kind, vec![]));
             continue;
         }
         let closes = match token.kind {
@@ -158,29 +145,23 @@ pub(crate) fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
                     Some(_) => format!("Expected '{char}'"),
                 });
             }
-            let (kind, open_range, trees) = groups.pop().unwrap();
-            let group = Tree::Group {
-                kind,
-                open: ranged(span, open_range.clone()),
-                close: ranged(span, range.clone()),
-                entire: ranged(span, open_range.start..range.end),
-                trees,
-            };
-            groups.last_mut().ok_or("Unbalanced delimiters")?.2.push(group);
+            let (kind, trees) = groups.pop().unwrap();
+            let group = Tree::Group { kind, open: span, close: span, entire: span, trees };
+            groups.last_mut().ok_or("Unbalanced delimiters")?.1.push(group);
             continue;
         }
-        let stream = &mut groups.last_mut().ok_or("Unbalanced delimiters")?.2;
+        let stream = &mut groups.last_mut().ok_or("Unbalanced delimiters")?.1;
         let text = &s[range.clone()];
         match token.kind {
             TokenKind::LineComment { doc_style: None }
             | TokenKind::BlockComment { doc_style: None, .. }
             | TokenKind::Whitespace => {}
             TokenKind::LineComment { doc_style: Some(style) } => {
-                doc(stream, &s[range.start + 3..range.end], style, span, range)
+                doc(stream, &s[range.start + 3..range.end], style, span)
             }
             TokenKind::BlockComment { doc_style: Some(style), terminated } => {
                 let end = if terminated { range.end - 2 } else { range.end };
-                doc(stream, &s[range.start + 3..end], style, span, range)
+                doc(stream, &s[range.start + 3..end], style, span)
             }
             TokenKind::Unknown => return Err(format!("Unknown token: `{text}`")),
             TokenKind::UnknownPrefix => return Err(format!("Unknown prefix: `{text}`")),
@@ -190,18 +171,16 @@ pub(crate) fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
             TokenKind::InvalidIdent => return Err(format!("Invalid identifier: `{text}`")),
             TokenKind::GuardedStrPrefix => {
                 let bytes = s.as_bytes();
-                let first = range.start..range.start + 1;
-                stream.push(punct(bytes[range.start] as char, true, ranged(span, first)));
-                let second = range.start + 1..range.end;
-                stream.push(punct(bytes[range.start + 1] as char, joint, ranged(span, second)));
+                stream.push(punct(bytes[range.start] as char, true, span));
+                stream.push(punct(bytes[range.start + 1] as char, joint, span));
             }
-            TokenKind::Ident => stream.push(ident(text, ranged(span, range), IdentIsRaw::No)),
+            TokenKind::Ident => stream.push(ident(text, span, IdentIsRaw::No)),
             TokenKind::RawIdent => {
                 let range = range.start + 2..range.end;
-                stream.push(ident(&s[range.clone()], ranged(span, range), IdentIsRaw::Yes))
+                stream.push(ident(&s[range.clone()], span, IdentIsRaw::Yes))
             }
             TokenKind::Literal { kind, suffix_start } => {
-                let it = literal(text, ranged(span, range), kind, suffix_start);
+                let it = literal(text, span, kind, suffix_start);
                 stream.push(Tree::Leaf(Leaf::Literal(it)))
             }
             TokenKind::RawLifetime | TokenKind::Lifetime { .. } => {
@@ -210,24 +189,23 @@ pub(crate) fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
                 }
                 let skip = if token.kind == TokenKind::RawLifetime { 3 } else { 1 };
                 let range = range.start + skip..range.end;
-                let quote = range.start..range.start + 1;
-                stream.push(punct('\'', true, ranged(span, quote)));
+                stream.push(punct('\'', true, span));
                 let is_raw = if token.kind == TokenKind::RawLifetime {
                     IdentIsRaw::Yes
                 } else {
                     IdentIsRaw::No
                 };
-                stream.push(ident(&s[range.clone()], ranged(span, range), is_raw))
+                stream.push(ident(&s[range.clone()], span, is_raw))
             }
             TokenKind::Eof => break,
             kind => match punct_char(kind) {
-                Some(char) => stream.push(punct(char, joint, ranged(span, range))),
+                Some(char) => stream.push(punct(char, joint, span)),
                 None => return Err(format!("Unknown token: `{text}`")),
             },
         }
     }
     match (groups.pop(), groups.is_empty()) {
-        (Some((DelimiterKind::Invisible, _, trees)), true) => Ok(trees),
+        (Some((DelimiterKind::Invisible, trees)), true) => Ok(trees),
         _ => Err("Mismatched token groups".to_owned()),
     }
 }

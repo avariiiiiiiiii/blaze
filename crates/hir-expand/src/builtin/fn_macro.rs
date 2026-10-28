@@ -126,6 +126,7 @@ register_builtin! {
     (format_args_nl, FormatArgsNl) => format_args_nl_expand,
     (quote, Quote) => quote_expand,
     (pattern_type, PatternType) => pattern_type_expand,
+    (gca, Gca) => gca_expand,
 }
 
 register_builtin! {
@@ -1105,6 +1106,18 @@ fn unescape_str(s: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(s)
     }
+}
+
+/// `gca!(expr)`, a generic const argument: the expression, which is what rustc evaluates it to.
+fn gca_expand(
+    _db: &dyn SourceDatabase,
+    _arg_id: MacroCallId,
+    tt: &tt::TopSubtree,
+    _call_site: Span,
+) -> ExpandResult<tt::TopSubtree> {
+    let mut tt = tt.clone();
+    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
+    ExpandResult::ok(tt)
 }
 
 fn pattern_type_expand(

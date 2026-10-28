@@ -7,6 +7,7 @@ pub(crate) mod wrapper;
 
 mod affected;
 mod ancestor;
+mod backend;
 pub(crate) mod cli;
 mod client;
 #[cfg(unix)]
@@ -64,8 +65,8 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     if let Ok(home) = daemon::home() {
         crate::renamed::say_old_dirs(&home);
     }
-    if let Asked::Build(_) = asked
-        && let Err(why) = toolchain::settle(true)
+    if let Asked::Build(asked) = &asked
+        && let Err(why) = toolchain::settle(true).and_then(|_| backend::follow_profile(asked))
     {
         say::error(&why);
         std::process::exit(FAILED);

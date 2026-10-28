@@ -949,8 +949,8 @@ build a command line is, so changing one starts from a cargo build again.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `BLAZE_BACKEND` | `cranelift` or `llvm`. `llvm` needs a blaze built with `--features llvm` | `cranelift` |
-| `BLAZE_OPT` | LLVM optimisation level, 0 to 3. Functions are still compiled one at a time | 2 |
+| `BLAZE_BACKEND` | `cranelift` or `llvm`, whatever the profile asks for. `llvm` needs a blaze built with `--features llvm`, as the released ones are | the profile's ([below](#backends)) |
+| `BLAZE_OPT` | LLVM optimisation level, 0 to 3, whatever the profile's `opt-level`. Functions are still compiled one at a time | the profile's; 2 with `BLAZE_BACKEND=llvm` set |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast` | `optimized`; `fast` at level 0 |
 | `BLAZE_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `BLAZE_SPLICE` | `0` links in full after every edit instead of splicing | splice |
@@ -987,6 +987,37 @@ The disk store is on by default and shared by every daemon and checkout of the u
 daemon reads `BLAZE_CACHE` once, when it starts: a daemon started by a shell without the
 variable keeps the default store whatever later shells have set, so run `blaze stop`
 before changing it.
+
+## Backends
+
+A build compiles with the backend its profile's `opt-level` asks for, as cargo resolves the
+profile: the `[profile]` tables of the root manifest, the configuration's and `--config`'s over
+them, `CARGO_PROFILE_<NAME>_OPT_LEVEL`, and `inherits`. A custom profile that inherits
+`release` is built as `release` is, unless it sets its own `opt-level`.
+
+| `opt-level` | Backend | Profiles that have it by default |
+|---|---|---|
+| `0` | Cranelift | `dev`, `test` |
+| `1` | Cranelift: rustc's `-O1` has no LLVM pipeline blaze runs to match it | |
+| `2` | LLVM at `-O2` (`BLAZE_OPT=2`) | |
+| `3` | LLVM at `-O3` (`BLAZE_OPT=3`) | `release`, `bench` |
+| `s`, `z` | LLVM at `-O2`: blaze's LLVM has no pipeline for size yet, so the code is not smaller than at `-O2` | |
+
+`BLAZE_BACKEND` set is the backend whatever the profile (`BLAZE_BACKEND=cranelift blaze build
+--release` builds a release with Cranelift), and `BLAZE_OPT` set is LLVM's level. The level
+belongs to the build as a whole, the root profile's: a `[profile.release.package.<name>]`
+`opt-level` changes nothing. A blaze built without `--features llvm` refuses a profile that
+asks for LLVM, saying so, rather than building it with Cranelift. The released binaries have
+the feature on every target.
+
+The backend and its level are part of a worker's environment, so a dev and a release build of
+one project are kept by two workers, and neither evicts the other's state. The store keys each
+function's code by the backend and level that compiled it as well: code Cranelift compiled is
+never given to a build with LLVM, nor `-O2`'s to `-O3`'s.
+
+A build with LLVM takes longer than one with Cranelift. A first build takes the most longer,
+because LLVM compiles every function then
+([#807](https://github.com/indexable-inc/blaze/issues/807)).
 
 ## Known problems
 

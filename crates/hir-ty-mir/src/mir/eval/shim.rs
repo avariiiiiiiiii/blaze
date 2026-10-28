@@ -1457,6 +1457,20 @@ impl<'db> Evaluator<'db> {
                     "`unreachable` intrinsic executed".to_owned(),
                 ));
             }
+            "compare_bytes" => {
+                // `<[u8]>::cmp` and `memcmp` in `core`: rustc's evaluation gives the order as
+                // -1, 0 or 1, where at run time only the sign is promised.
+                let [left, right, bytes] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "compare_bytes args are not provided".into(),
+                    ));
+                };
+                let left = Address::from_bytes(left.get(self)?)?;
+                let right = Address::from_bytes(right.get(self)?)?;
+                let bytes = from_bytes!(usize, bytes.get(self)?);
+                let order = self.read_memory(left, bytes)?.cmp(self.read_memory(right, bytes)?);
+                destination.write_from_bytes(self, &(order as i32).to_le_bytes())
+            }
             "const_allocate" => {
                 let [size, align] = args else {
                     return Err(MirEvalError::InternalError(

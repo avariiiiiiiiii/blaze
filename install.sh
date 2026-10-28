@@ -162,9 +162,10 @@ else
     releases="https://github.com/$REPO/releases"
 
     # The release: the one asked for; else canary's, the newest dated release, prerelease or
-    # not, from the release feed (which needs no API token and has no rate limit); else
-    # stable's, GitHub's latest, which is never a prerelease, or the nightly build before the
-    # first.
+    # not; else stable's, GitHub's latest, which is never a prerelease, or the nightly build
+    # before the first. The release feed needs no API token and has no rate limit, but lists
+    # tags too, which have no release until release.yaml has built it: canary's is the newest
+    # whose checksums are there.
     if [ -n "$VERSION" ]; then
         tag="v${VERSION#v}"
         [ "$VERSION" = nightly ] && tag=nightly
@@ -173,10 +174,17 @@ else
             fail "the list of blaze's releases could not be read; is the network up?" \
                 "$(cat "$tmp/error")
 $releases.atom"
-        tag=$(grep -o 'releases/tag/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' "$tmp/releases.atom" |
-            sed 's/^releases\/tag\/v//; s/"$//' | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
+        grep -o 'releases/tag/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' "$tmp/releases.atom" |
+            sed 's/^releases\/tag\/v//; s/"$//' | sort -t . -k 1,1nr -k 2,2nr -k 3,3nr > "$tmp/candidates" || true
+        tag=""
+        while read -r candidate; do
+            if fetch "$releases/download/v$candidate/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
+                tag="v$candidate"
+                break
+            fi
+            step "v$candidate has no release yet"
+        done < "$tmp/candidates"
         [ -n "$tag" ] || fail "blaze has no canary release yet." "Releases: $releases"
-        tag="v$tag"
     else
         latest=$(landing "$releases/latest" 2>/dev/null || true)
         case "$latest" in

@@ -149,7 +149,7 @@ From [docs/machines](https://ix.dev/docs/machines), [docs/snapshots](https://ix.
   ([architecture.md](architecture.md), **read**). It can hold several checkouts (`--also`), but
   per Andrew the runner never uses that: a daemon holds one branch, and branches are forks.
 - **The first build.** cargo's and rustc's unless `BLAZE_RUSTC_BASE=0`, which has the daemon
-  build the base itself (`main.rs`, **read**; `harness/warmstart.py` uses it). The seed always
+  build the base itself (`lib.rs`, **read**; `harness/warmstart.py` uses it). The seed always
   sets it.
 - **Per checkout today.** `tests-reach` and `tests-passed` live beside each test program in the
   target directory (`cargo/affected.rs`, **read**). Affected selection runs everything when cargo

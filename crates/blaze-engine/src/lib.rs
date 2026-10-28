@@ -8104,7 +8104,8 @@ pub(crate) fn version() -> String {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+/// The program `blaze-engine`, whose `src/main.rs` is only this.
+pub fn main() -> anyhow::Result<()> {
     // Before anything that could start a thread: the sandbox forks.
     if std::env::args_os().nth(1).is_some_and(|it| it == sandbox::COMMAND) {
         sandbox::command(std::env::args_os().skip(2));

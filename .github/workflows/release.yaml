@@ -75,7 +75,9 @@ jobs:
       # since the pgo workflow last ran). The blaze it built then builds blaze's
       # proc-macro server (`--server`), which the archive has beside it: the server that
       # expands with the proc-macro libraries blaze links, so no user's machine builds it.
-      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --strict --server
+      # PGO is off for now (pgo.yaml runs by hand only): releases ship the plain `dist` build, so a
+      # fix reaches users minutes after release-cut. To turn it back on, `--strict` instead of `--no-pgo`.
+      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --no-pgo --server
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
       - name: Archive

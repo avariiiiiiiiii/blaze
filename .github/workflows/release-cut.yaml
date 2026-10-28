@@ -1,7 +1,7 @@
 # Cuts a release of main by hand while the train runs by hand only (train.yaml): the train's
 # release job alone, without waiting for a green train. `train_release.py prepare --push` makes
-# the commit `release: v0.YYYYMMDD.N` and dispatches pgo.yaml, whose pin job tags it, which runs
-# release.yaml. Run it on a main whose merge gate (`ci`) is green:
+# the commit `release: v0.YYYYMMDD.N`, tags it and dispatches release.yaml (PGO is off for now,
+# so nothing waits on pgo.yaml). Run it on a main whose merge gate (`ci`) is green:
 #
 #     gh workflow run release-cut.yaml
 name: release cut

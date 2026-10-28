@@ -4,7 +4,7 @@
  * platform-independent build outputs (`uv run --script renderer/build.py`, or fetched with renderer/fetch.py).
  *
  * 1. Runs content/*.flecs under Flecs (flecs/flecs-doc.wasm, gen/tree.ts) to bake what the renderer leaves to TS:
- *    highlighted code (highlight.js), by entity path; and to write the scripts the content asks for: a BenchHistory
+ *    highlighted code (highlight.js) and lessons' glyphs (gen/glyphs.ts), by entity path; and to write the scripts the content asks for: a BenchHistory
  *    names a directory of benchmark history, which gen/bench/ turns into charts under it, as Flecs script.
  * 2. site-snapshot.wasm runs the same scripts, then the generated ones, with the baked HTML set, and returns the
  *    snapshot.
@@ -42,6 +42,7 @@ import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
 import { ANIMALS, sprite } from './animals';
 import { benchScript } from './bench';
+import { glyphSvg } from './glyphs';
 import { highlight } from './highlight';
 import { dedent, load, prose, type Node } from './tree';
 
@@ -134,7 +135,10 @@ const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css
 
 type Baked = SnapshotInput['bakes'];
 
-/** What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`). By entity path. */
+/**
+ * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and each lesson's
+ * glyph (gen/glyphs.ts, set as the lesson page's `Baked {html}`). By entity path.
+ */
 function bake(all: Map<string, Node>): Baked {
 	const baked: Baked = {};
 	for (const n of all.values()) {
@@ -146,6 +150,14 @@ function bake(all: Map<string, Node>): Baked {
 		}
 		const cmd = n.values.get('Command');
 		if (cmd) (baked[n.path] ??= {}).highlighted = highlight(prose(String(cmd.text ?? '')), 'bash');
+		const lesson = n.values.get('Lesson');
+		if (lesson) {
+			try {
+				(baked[n.path] ??= {}).baked = glyphSvg(String(lesson.glyph ?? ''));
+			} catch (e) {
+				throw new Error(`${n.path}: ${(e as Error).message}`);
+			}
+		}
 	}
 	return baked;
 }

@@ -84,13 +84,14 @@ instance and makes a new one on the next request.
 
 `site-snapshot.wasm`: `snap_new`, `snap_alloc`, `snap_free`, `snap_build(h, input, len)` (0 with the snapshot, or 1 with
 the error), `snap_output_ptr`, `snap_output_len`, `snap_drop`. The input is JSON
-`{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, audio?}}}`, the scripts in run order (`schema.flecs`,
+`{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?, audio?}}}`, the scripts in run order (`schema.flecs`,
 `refs.flecs`, then the rest by path, then the ones the build generated, such as the benchmark charts).
 
-## Highlighting stays in TS, embedded as-is; charts are content
+## Highlighting and glyphs stay in TS, embedded as-is; charts are content
 
-`gen/build.ts` pre-renders highlighted code (highlight.js), by entity path, and the snapshot step sets that HTML on the
-entities as `Highlighted {html}` (Code, Command). The core embeds it unchanged, so the core has no highlighter.
+`gen/build.ts` pre-renders highlighted code (highlight.js) and each lesson's glyph (gen/glyphs.ts), by entity path,
+and the snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (a
+lesson page). The core embeds it unchanged, so the core has no highlighter.
 
 Charts are elements like any other (`BarChart`, `LineChart`, `Charts`, `Picker` in `content/schema.flecs`), drawn by
 `core/src/chart.rs` as inline SVG with a table of their numbers. The benchmark page's are written by the build from the
@@ -123,7 +124,7 @@ The fixtures stay: `serve` seeds its store from `fixtures/comments.json`.
 ## Flecs, and what is left
 
 The core never touches Flecs; only `core/src/scripts.rs` does, behind the `scripts` feature, through flecs-snapshot's
-`World`: `run` for the content scripts and for `bake.flecs` (which only defines `Highlighted` and `Audio`),
+`World`: `run` for the content scripts and for `bake.flecs` (which only defines `Highlighted`, `Baked` and `Audio`),
 `set` for the baked HTML (checked against each component's layout), and `roots` for the root list (sorted bytewise).
 The `world_*` C exports are behind flecs-snapshot's `ffi` feature, which the renderer leaves off, so they are not in
 `site-snapshot.wasm`. `snapshot.rs` reads documents strictly, as flecs-snapshot's own reader does: an unknown key in

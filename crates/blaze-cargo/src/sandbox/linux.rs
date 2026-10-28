@@ -424,9 +424,9 @@ fn run_in(
         return Err(os("socketpair"));
     }
     let recorded = program.is_some() && spec.record.is_some();
-    let confined = scratch.is_some();
+    let confining = scratch.is_some();
     let filter =
-        program.map(|_| filter_program(recorded, spec.record_reads, confined, sockets[1]));
+        program.map(|_| filter_program(recorded, spec.record_reads, confining, sockets[1]));
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     // Before the fork, so that no signal ends this process before it passes them on; the
     // sandbox's processes that run no program keep the handlers, and pass nothing on.
@@ -475,7 +475,7 @@ fn run_in(
         None => OWN.to_vec(),
     };
     let mut recorder = Recorder::new(spec, &own);
-    let around = match (&spec.view, confined) {
+    let around = match (&spec.view, confining) {
         (Some(_), _) => Around::View,
         (None, true) => Around::Confined(first),
         (None, false) => Around::Namespaces,

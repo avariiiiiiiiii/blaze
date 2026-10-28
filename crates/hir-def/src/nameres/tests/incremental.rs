@@ -85,7 +85,11 @@ pub const BAZ: u32 = 0;
                     )
                     .unwrap(),
                 ),
-                Arc::new(CrateWorkspaceData { target: Err("".into()), toolchain: None }),
+                Arc::new(CrateWorkspaceData {
+                    target: Err("".into()),
+                    toolchain: None,
+                    const_eval: Default::default(),
+                }),
             )
         };
         let a = add_crate("a", 0);

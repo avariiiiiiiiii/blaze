@@ -35,11 +35,11 @@ mod handlers {
     pub(crate) mod binary_operator_cannot_be_applied;
     pub(crate) mod borrowck;
     pub(crate) mod break_outside_of_loop;
-    pub(crate) mod const_check;
     pub(crate) mod cannot_be_dereferenced;
     pub(crate) mod cannot_implicitly_deref_trait_object;
     pub(crate) mod cannot_index_into;
     pub(crate) mod closure_kind_mismatch;
+    pub(crate) mod const_check;
     pub(crate) mod duplicate_field;
     pub(crate) mod elided_lifetimes_in_path;
     pub(crate) mod expected_array_or_slice_pat;

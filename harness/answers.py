@@ -266,7 +266,7 @@ def check():
                 # rustc is asked, once per toolchain.
                 return "unknown", target, want[1]
         got = ask([BLAZE, "rustc-wrapper", rust, *args],
-                  {**variables, "BLAZE_HOME": home, "BLAZE_ANSWERS": "own"}, stdin)
+                  {**variables, "BLAZE_HOME": home}, stdin)
         return "asked", (args, variables, want[1], got), got[:2] == want[:2]
 
     work = tempfile.mkdtemp(prefix="blaze-answers-", dir="/tmp" if sys.platform == "darwin" else None)

@@ -70,8 +70,6 @@ def main():
                RUSTUP_TOOLCHAIN="nr-pin",
                BLAZE_HOME=home, BLAZE_CACHE=store, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
                BLAZE_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
-    if base == "bun":
-        env["BLAZE_OTHER_TOOLCHAIN"] = "1"
     # A release ships the standard library its builds start from (crates/blaze-engine/src/shipped.rs):
     # made here by the blaze under test as the release workflow makes it, from the toolchain
     # the builds use, and fetched by the first build. NR_STD=build has the builds make it.

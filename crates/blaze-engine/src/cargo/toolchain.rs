@@ -1,30 +1,23 @@
-//! blaze's own toolchain, the Rust `blaze` builds with whatever toolchain the project
-//! names: `blaze-2026-10-25` ([`name`]), today the Rust nightly of that date (docs/toolchain.md).
-//! It is blaze's, not the project's: the base blaze replaces piece by piece (docs/no-rustc.md),
-//! moved on blaze's schedule with the corpus as the gate. blaze lays out types, names symbols and links as that nightly does, so cargo,
-//! rustc and the daemon all run under it. blaze supports the latest nightly only, pinned by date
-//! in `harness/toolchain` (`harness/toolchain_bump.py` moves it): a project pinned to a stable
-//! release or an older nightly builds with it, since Rust builds today what an older release
-//! built; one that needs what the pinned nightly lacks fails with rustc's error and a line saying
-//! which toolchain built it, and never goes to cargo for it ([#269]).
+//! blaze's own toolchain, the Rust `blaze` builds with: `blaze-2026-10-25` ([`name`]), today
+//! the Rust nightly of that date (docs/toolchain.md). The language and standard library are the
+//! ones this blaze ships, and nothing else picks them: blaze ignores `RUSTC`,
+//! `RUSTUP_TOOLCHAIN`, rustup's settings and the project's `rust-toolchain` files, and never
+//! runs or asks a rustc to learn anything (docs/no-rustc.md). A project that needs another
+//! Rust pins another blaze (`[workspace.metadata.blaze] version`).
 //!
-//! The release comes from, in order: what `RUSTC` names, or the rustc cargo would run when it
-//! is that release; rustup's copy of it; blaze's own copy (`own.rs`), downloaded the first
-//! time none of those has it.
-//!
-//! [#269]: https://github.com/indexable-inc/blaze/issues/269
+//! The files of the release (its cargo, the source of its standard library, the standard
+//! library of each target) are found on disk with nothing run: rustup's copy of the release
+//! when it has one with `rust-src`, else blaze's own copy (`own.rs`), downloaded the first time
+//! neither is there.
 
 mod own;
 
 pub(crate) use own::home;
 
 use std::{
-    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
-
-use super::state::rustc_says;
 
 /// The toolchain blaze compiles, as rustup names it: `nightly-2026-10-25`.
 pub(crate) const OURS: &str = include_str!("../../../../harness/toolchain");
@@ -52,14 +45,14 @@ pub(crate) fn ours_commit() -> &'static str {
     own::commit()
 }
 
-/// The project's own toolchain, as a failure names it, when blaze builds with its release in
-/// its place.
-static IN_PLACE_OF: OnceLock<(String, &'static str)> = OnceLock::new();
+/// The host's tuple, as the Rust project names its builds: what blaze answers `rustc -vV`'s
+/// `host:` with. `None` on a host blaze ships no toolchain for.
+pub(crate) fn host() -> Option<&'static str> {
+    own::host()
+}
 
-/// Where the Rust a command builds with came from.
+/// Where the files of blaze's release are.
 pub(crate) enum Chosen {
-    /// The rustc `RUSTC` names or cargo would run, at its sysroot.
-    Given(PathBuf),
     Rustup(PathBuf),
     Own(PathBuf),
 }
@@ -68,7 +61,7 @@ impl Chosen {
     /// Where the toolchain is: its sysroot.
     pub(crate) fn dir(&self) -> &Path {
         match self {
-            Chosen::Given(dir) | Chosen::Rustup(dir) | Chosen::Own(dir) => dir,
+            Chosen::Rustup(dir) | Chosen::Own(dir) => dir,
         }
     }
 }
@@ -78,7 +71,6 @@ impl std::fmt::Display for Chosen {
         let (name, ours) = (name(), OURS.trim());
         let dir = self.dir().display();
         match self {
-            Chosen::Given(_) => write!(f, "{name}, blaze's toolchain (Rust {ours}), at {dir}"),
             Chosen::Rustup(_) => {
                 write!(f, "{name}, blaze's toolchain (Rust {ours}), rustup's copy at {dir}")
             }
@@ -87,86 +79,83 @@ impl std::fmt::Display for Chosen {
     }
 }
 
-/// Has the cargo, rustc and daemon of this command be blaze's release. A rustc that is that
-/// release is used as it is; rustup's copy is named in `RUSTUP_TOOLCHAIN`, which rustup's
-/// proxies take over a toolchain file or an override, with its cargo in `CARGO`; blaze's own
-/// is named in `CARGO`, `RUSTC` and `RUSTDOC` and is first on `PATH`, for the processes this one
-/// starts and not the user's shell. A `build` in a project whose toolchain is another says so,
-/// once in that project; `blaze toolchain` and blaze's own answers say nothing of a project.
-/// `Err` is why the command can't be built, said for the user to act on. Before any thread
-/// starts: it sets the environment.
-pub(crate) fn settle(build: bool) -> Result<Chosen, String> {
+/// The files of blaze's release, found with nothing run: rustup's copy with the source of the
+/// standard library, else blaze's own when it is whole. `None` when neither is there.
+pub(crate) fn found() -> Option<Chosen> {
+    if let Some(dir) = FOUND.get() {
+        return Some(chosen_at(dir.clone()));
+    }
     let ours = OURS.trim();
-    let other = super::state::other_toolchain_allowed();
-    let rustc = super::state::rustc_path();
-    let version = version_of(&rustc);
-    let shown = version.as_deref().unwrap_or("of no release it says");
-    if other {
-        let sysroot = sysroot_of(&rustc);
-        with_library(&sysroot, shown)?;
-        return Ok(Chosen::Given(sysroot));
-    }
-    let named = super::state::rustc_named().is_some();
-    if version.as_deref() == Some(ours_says()) {
-        let sysroot = sysroot_of(&rustc);
-        match with_library(&sysroot, ours) {
-            Ok(()) => {
-                rustup_named(&sysroot);
-                return Ok(Chosen::Given(sysroot));
+    let chosen = match rustup_home().and_then(|home| installed(&home, ours)) {
+        Some(dir) if with_library(&dir, ours).is_ok() => Chosen::Rustup(dir),
+        _ => {
+            let release = own::Release::ours()?;
+            let dir = release.dir()?;
+            if !own::complete(&release, &dir) {
+                return None;
             }
-            // What `RUSTC` names is used or refused; a rustc on the path without the library
-            // leaves the release to rustup or blaze.
-            Err(why) if named => return Err(why),
-            Err(_) => {}
+            Chosen::Own(dir)
         }
-    } else if named {
-        return Err(format!(
-            "`RUSTC` names rustc {shown}, and blaze builds with Rust {ours}, the release it \
-             compiles: without `RUSTC` it builds with {ours} (`BLAZE_OTHER_TOOLCHAIN=1` builds \
-             with {shown} anyway, laying its types out as {ours} does)"
-        ));
-    }
-    if let Some(version) = version.filter(|it| it != ours_says()) {
-        if build {
-            note_once(&version, named_by());
-        }
-        let _ = IN_PLACE_OF.set((version, named_by()));
-    }
-    let rustup = rustup_home().and_then(|home| installed(&home, ours));
-    if let Some(dir) = rustup.filter(|dir| with_library(dir, ours).is_ok()) {
-        let name = dir.file_name().map_or_else(|| OsString::from(ours), OsStr::to_owned);
-        let cargo = dir.join("bin").join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
-        // SAFETY: before any thread is started.
-        unsafe {
-            std::env::set_var("RUSTUP_TOOLCHAIN", name);
-            std::env::set_var("CARGO", cargo);
-        }
-        return Ok(Chosen::Rustup(dir));
-    }
-    let Some(release) = own::Release::ours() else {
-        return Err(format!(
-            "blaze builds with Rust {ours}, which is not installed, and the Rust project \
-             publishes no copy of it for this machine that blaze knows: install Rust {ours} with \
-             its `rust-src` and put it first on `PATH`"
-        ));
     };
-    let Some(dir) = release.dir() else {
-        return Err(format!(
-            "blaze builds with Rust {ours} and keeps it in .blaze in your home directory, and \
-             there is no home directory: `BLAZE_HOME` names where to keep it"
-        ));
-    };
-    if !own::complete(&release, &dir) {
-        own::fetch(&release, &dir)?;
-    }
-    use_own(&dir);
-    Ok(Chosen::Own(dir))
+    let _ = FOUND.set(chosen.dir().to_owned());
+    Some(chosen)
 }
 
-/// Has every process this one starts run blaze's own toolchain at `dir`: cargo and the daemon
-/// from it, and a rustc, rustdoc or cargo a build script finds on the path, or reaches through a
+/// Where [`found`] found blaze's release, or was told it is ([`known_at`]).
+static FOUND: OnceLock<PathBuf> = OnceLock::new();
+
+/// Tells this process where blaze's release is, as the blaze that started it found it: a
+/// build script's sandbox may not see where rustup and blaze keep toolchains.
+pub(crate) fn known_at(sysroot: PathBuf) {
+    let _ = FOUND.set(sysroot);
+}
+
+fn chosen_at(dir: PathBuf) -> Chosen {
+    let own = own::Release::ours().and_then(|it| it.dir());
+    if own.as_deref() == Some(&*dir) { Chosen::Own(dir) } else { Chosen::Rustup(dir) }
+}
+
+/// The sysroot of blaze's release: what blaze answers `rustc --print sysroot` with.
+pub(crate) fn sysroot() -> Option<PathBuf> {
+    found().map(|it| it.dir().to_owned())
+}
+
+/// Has the cargo, rustc and daemon of this command be blaze's release, downloading blaze's
+/// own copy of it when there is none ([`found`]). They are named in `CARGO`, `RUSTC`, `RUSTDOC`
+/// and `RUSTUP_TOOLCHAIN` and are first on `PATH`, for the processes this one starts and not
+/// the user's shell, whatever the user set them to or a toolchain file names. `Err` is why
+/// the command can't be built, said for the user to act on. Before any thread starts: it sets
+/// the environment.
+pub(crate) fn settle() -> Result<Chosen, String> {
+    let ours = OURS.trim();
+    let chosen = match found() {
+        Some(chosen) => chosen,
+        None => {
+            let Some(release) = own::Release::ours() else {
+                return Err(format!(
+                    "blaze builds with Rust {ours}, and the Rust project publishes no copy of it \
+                     for this machine that blaze knows"
+                ));
+            };
+            let Some(dir) = release.dir() else {
+                return Err(format!(
+                    "blaze builds with Rust {ours} and keeps it in .blaze in your home \
+                     directory, and there is no home directory: `BLAZE_HOME` names where to \
+                     keep it"
+                ));
+            };
+            own::fetch(&release, &dir)?;
+            Chosen::Own(dir)
+        }
+    };
+    use_toolchain(chosen.dir());
+    Ok(chosen)
+}
+
+/// Has every process this one starts run blaze's release at `dir`: cargo and the daemon from
+/// it, and a rustc, rustdoc or cargo a build script finds on the path, or reaches through a
 /// rustup proxy, from it too.
-fn use_own(dir: &Path) {
+fn use_toolchain(dir: &Path) {
     let bin = dir.join("bin");
     let exe = |name: &str| bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let path = std::env::var_os("PATH");
@@ -177,87 +166,11 @@ fn use_own(dir: &Path) {
         std::env::set_var("RUSTC", exe("rustc"));
         std::env::set_var("RUSTDOC", exe("rustdoc"));
         std::env::set_var("RUSTUP_TOOLCHAIN", dir);
+        std::env::remove_var("RUSTUP_TOOLCHAIN_SOURCE");
         if let Ok(path) = std::env::join_paths(path) {
             std::env::set_var("PATH", path);
         }
     }
-}
-
-/// Names rustup's toolchain at `sysroot` one way however it was named (`nightly-2026-10-25`,
-/// `nightly-2026-10-25-<host>`, a path), since the name is part of which build this is.
-fn rustup_named(sysroot: &Path) {
-    let home = rustup_home().and_then(|it| dunce::canonicalize(it.join("toolchains")).ok());
-    let dir = dunce::canonicalize(sysroot).ok();
-    let name = dir.filter(|dir| home.is_some_and(|home| dir.parent() == Some(&*home)));
-    if std::env::var_os("RUSTUP_TOOLCHAIN").is_some()
-        && let Some(name) = name.as_ref().and_then(|it| it.file_name())
-    {
-        // SAFETY: before any thread is started.
-        unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", name) };
-    }
-}
-
-/// Says, once for each project directory and toolchain it names, that blaze builds with its
-/// own toolchain and not that one: a note, not an error, and nothing is switched. The marker is
-/// in `~/.blaze/noted`; with no home directory it is said every time.
-fn note_once(version: &str, named: &str) {
-    use sha2::Digest as _;
-    let here = std::env::current_dir().unwrap_or_default();
-    let mut hash = sha2::Sha256::new();
-    hash.update(here.as_os_str().as_encoded_bytes());
-    hash.update([0]);
-    hash.update(version);
-    hash.update([0]);
-    hash.update(name());
-    let key = crate::content::hex(&hash.finalize()[..12]);
-    let marker = own::home().map(|home| home.join("noted").join(key));
-    if marker.as_ref().is_some_and(|it| it.exists()) {
-        return;
-    }
-    super::say::note(&format!(
-        "blaze builds with its own toolchain, {}, not rustc {version}, {named}. blaze is its own \
-         Rust toolchain whatever the project pins (docs/toolchain.md); the project's toolchain \
-         and its CI stay the final word",
-        name()
-    ));
-    if let Some(marker) = marker
-        && let Some(dir) = marker.parent()
-        && std::fs::create_dir_all(dir).is_ok()
-    {
-        let _ = std::fs::write(marker, version);
-    }
-}
-
-/// What a build that failed says after its errors: which toolchain built it, when it was not
-/// the project's own, since the failure may be what one has and the other has not. It may as
-/// well be blaze's own error (its checker reporting what rustc accepts), which only rustc of
-/// blaze's release tells apart, so the note names that rather than blame the difference.
-pub(crate) fn failed_note() -> Option<String> {
-    let (version, named) = IN_PLACE_OF.get()?;
-    let ours = OURS.trim();
-    Some(format!(
-        "blaze built this with its own toolchain, {} (Rust {ours}), not {version}, {named}; an \
-         error {version} would not give may come from that difference, or be blaze's own if \
-         `cargo +{ours} check` gives none either",
-        name(),
-    ))
-}
-
-pub(crate) fn note_failed() {
-    if let Some(note) = failed_note() {
-        super::say::note(&note);
-    }
-}
-
-/// What `rustc` says it is after `rustc `, as `1.101.0-nightly (12433c307 2026-10-24)`: the
-/// whole line, since every nightly of a release has the same number.
-fn version_of(rustc: &OsStr) -> Option<String> {
-    let said = rustc_says(rustc, &["--version"])?;
-    said.lines().next()?.trim().strip_prefix("rustc ").map(str::to_owned)
-}
-
-fn sysroot_of(rustc: &OsStr) -> PathBuf {
-    PathBuf::from(rustc_says(rustc, &["--print=sysroot"]).unwrap_or_default())
 }
 
 /// The `rust-lld` that rustc links MSVC programs with when a target says so, as the
@@ -265,27 +178,11 @@ fn sysroot_of(rustc: &OsStr) -> PathBuf {
 pub(crate) fn rust_lld() -> PathBuf {
     let host = hir_ty_codegen::Target::host();
     let lld = format!("rust-lld{}", std::env::consts::EXE_SUFFIX);
-    sysroot_of(&super::state::rustc_path()).join("lib/rustlib").join(host).join("bin").join(lld)
+    sysroot().unwrap_or_default().join("lib/rustlib").join(host).join("bin").join(lld)
 }
 
-/// What chose the project's toolchain, as rustup tells the programs its proxies start.
-fn named_by() -> &'static str {
-    match std::env::var("RUSTUP_TOOLCHAIN_SOURCE").as_deref() {
-        Ok("toolchain-file") => "which the project's rust-toolchain file names",
-        Ok("path-override" | "override") => "which `rustup override` names for the project",
-        Ok("cli") => "which `+toolchain` names",
-        Ok("env") => "which `RUSTUP_TOOLCHAIN` names",
-        Ok("default") => "rustup's default toolchain",
-        _ => "the toolchain cargo was started with",
-    }
-}
-
-/// The sysroot of rustup's copy of blaze's release, the one [`settle`] picks when rustup has it,
-/// found without running anything.
-pub(crate) fn rustup_ours() -> Option<PathBuf> {
-    rustup_home().and_then(|home| installed(&home, OURS.trim()))
-}
-
+/// Where rustup keeps its toolchains, which is only where to look for a copy of blaze's
+/// release: what rustup would pick is not asked.
 fn rustup_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("RUSTUP_HOME") {
         return Some(PathBuf::from(home));

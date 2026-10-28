@@ -4,7 +4,6 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::{OsStr, OsString},
     fs::OpenOptions,
     io::{BufReader, Write as _},
     path::{Path, PathBuf},
@@ -446,9 +445,6 @@ impl Built {
             }
         }
         let status = cargo.wait()?;
-        if !status.success() {
-            super::toolchain::note_failed();
-        }
         Ok(if status.success() { Ok(built) } else { Err(status.code().unwrap_or(101)) })
     }
 }
@@ -1049,29 +1045,6 @@ pub(crate) fn cargo_path() -> PathBuf {
     std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from)
 }
 
-/// The rustc cargo builds with: the one it is told, else the one beside the cargo that ran
-/// this command, which is the toolchain's and not the rustup proxy on the path that would
-/// pick it again.
-pub(super) fn rustc_path() -> OsString {
-    if let Some(rustc) = rustc_named() {
-        return rustc;
-    }
-    let rustc = format!("rustc{}", std::env::consts::EXE_SUFFIX);
-    let beside = std::env::var_os("CARGO").map(|it| PathBuf::from(it).with_file_name(rustc));
-    beside.filter(|it| it.is_file()).map_or_else(|| "rustc".into(), PathBuf::into_os_string)
-}
-
-/// The rustc `RUSTC` names, when it names one.
-pub(super) fn rustc_named() -> Option<OsString> {
-    std::env::var_os("RUSTC")
-}
-
-/// What `rustc` prints when given `args` (`--version`, `--print=sysroot`), when it starts.
-pub(super) fn rustc_says(rustc: &OsStr, args: &[&str]) -> Option<String> {
-    let output = crate::answers::answer(Command::new(rustc).args(args), &[]).ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
 pub(super) fn metadata(asked: &Invocation) -> Metadata {
     super::metadata::no_deps(asked.flags.manifest_path.as_deref(), &asked.flags.config)
 }
@@ -1125,37 +1098,15 @@ fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBu
     nearest.map(Path::to_owned).ok_or("no Cargo.toml here".to_owned())
 }
 
-/// Why the toolchain cargo builds with is not one blaze compiles for, when it is not: it
-/// is another release than the one blaze has the layouts of, or the source of its standard
-/// library, which the daemon compiles from, is not installed. `blaze` has made it
-/// blaze's (`toolchain::settle`); plain cargo after `blaze enable` builds with the project's.
-///
-/// `BLAZE_OTHER_TOOLCHAIN=1` takes another toolchain anyway, for a project pinned to a
-/// nightly near ours: the layouts, symbol names, ABI and `TypeId`s are still the pinned
-/// nightly's, and nothing checks that the other rustc agrees with them.
+/// Why blaze's release can't be built with, when it can't: its files are not installed.
+/// Nothing is run to tell, and which toolchain the project names does not matter.
 fn other_toolchain() -> Option<String> {
-    let rustc = rustc_path();
-    let said = |flag: &str| rustc_says(&rustc, &[flag]);
-    let version = said("--version")?;
-    let version = version.lines().next().unwrap_or_default().trim();
-    let version = version.strip_prefix("rustc ").unwrap_or(version);
-    let ours = super::toolchain::OURS.trim();
-    if version != super::toolchain::ours_says() && !other_toolchain_allowed() {
-        return Some(format!(
-            "rustc {version} is not the {ours} blaze compiles, and plain cargo builds with the \
-             project's toolchain; `blaze` builds with {ours}"
-        ));
-    }
-    let library = Path::new(&said("--print=sysroot")?).join("lib/rustlib/src/rust/library");
-    (!library.exists()).then(|| {
-        "the toolchain has no source of the standard library, \
-         `rustup component add rust-src` installs it"
-            .to_owned()
+    super::toolchain::found().is_none().then(|| {
+        format!(
+            "blaze builds with Rust {}, which is not installed: `blaze toolchain` installs it",
+            super::toolchain::OURS.trim()
+        )
     })
-}
-
-pub(super) fn other_toolchain_allowed() -> bool {
-    std::env::var_os("BLAZE_OTHER_TOOLCHAIN").is_some_and(|it| it == "1")
 }
 
 /// What the checkouts of one repository share: the repository's own directory, which is
@@ -1190,11 +1141,8 @@ const LIBRARY_PATH: &str = if cfg!(windows) {
 /// Where the toolchain cargo builds with has the libraries of the host, `libstd` as a
 /// dynamic library among them. `None` when rustc does not say.
 pub(super) fn sysroot_libraries() -> Option<PathBuf> {
-    let rustc = rustc_path();
-    let output =
-        crate::answers::answer(Command::new(rustc).arg("--print=target-libdir"), &[]).ok()?;
-    let said = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (output.status.success() && !said.is_empty()).then(|| PathBuf::from(said))
+    let said = crate::answers::ours_said(&["--print=target-libdir"]).ok()?;
+    (!said.is_empty()).then(|| PathBuf::from(said))
 }
 
 /// Where cargo has the dynamic linker look when it runs `executable`: the dependencies of
@@ -1473,11 +1421,7 @@ pub(crate) fn turned_down(said: &crate::errors::Said, package: &str, target: &st
     if !notes.is_empty() {
         notes.push('\n');
     }
-    let toolchain =
-        super::toolchain::failed_note().map_or(String::new(), |it| format!("\nnote: {it}"));
-    format!(
-        "{said}\n\n{notes}error: could not compile `{package}` ({target}) due to {errors}{toolchain}"
-    )
+    format!("{said}\n\n{notes}error: could not compile `{package}` ({target}) due to {errors}")
 }
 
 #[cfg(test)]

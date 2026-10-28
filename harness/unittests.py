@@ -17,6 +17,7 @@ CRATES = [
     "hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
     "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics",
 ]
+CRATES += ["proc-macro-api"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {

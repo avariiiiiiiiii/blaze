@@ -153,7 +153,16 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
 - `presence.ts`: `/api/presence`, a WebSocket to the `Presence` Durable Object (one, named `site`, hibernating), which
   knows who is on which page. Signed-in readers are their GitHub login; anonymous ones get a key that is an HMAC of
   their IP and user agent under a random key the object makes each UTC day and deletes the next, so a name lasts a day
-  and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line:
+  and no IP is kept. Crawlers and other automation are welcome (nothing is blocked or challenged, and nothing in
+  `robots.txt` or the headers turns them away) but show as what they are: `worker/bots.ts` decides at the upgrade,
+  in the worker, from Cloudflare's `request.cf.verifiedBotCategory` (a verified bot's category), `request.cf.botManagement`
+  (`verifiedBot`, a score under 30: real only with Enterprise Bot Management; ix.dev is on the Free plan, where it
+  holds fixed dummy values that never count) and the user agent (well-known crawlers by name, anything calling itself
+  a bot, crawler or spider, HTTP libraries, and headless browsers: HeadlessChrome, so a Playwright test that wants a
+  person sets a user agent without it). A bot is named for the crawler ("Googlebot", else "A crawler") and drawn as
+  the sprite's robot (`ROBOT` in `gen/animals.ts`), listed under "Crawlers" in the who-is-here list, left out of
+  "N online", and gets no join or leave line; the object refuses it pointers, live lines, typing and chat. A
+  signed-in reader is never a bot. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line:
   Chat (opens the feed's history and input, as T does), the faces on this page (click for everyone and where), and the
   reader's GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
   On the page itself (`client/lib/cursors.ts`) the others there show as live pointers (desktop only; "Hide cursors"

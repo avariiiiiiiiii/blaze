@@ -148,6 +148,21 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
 }
 
 #[test]
+fn generic_const_argument_macro() {
+    check_number(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! gca {}
+const fn add1(n: usize) -> usize { n + 1 }
+const fn len<const N: usize>(_: [u8; N]) -> usize { N }
+const ADD: usize = gca!(add1(2));
+const GOAL: usize = gca!({ ADD * 10 }) + len([0u8; gca!(ADD)]);
+"#,
+        33,
+    );
+}
+
+#[test]
 fn add() {
     check_number(r#"const GOAL: usize = 2 + 2;"#, 4);
     check_number(r#"const GOAL: i32 = -2 + --5;"#, 3);

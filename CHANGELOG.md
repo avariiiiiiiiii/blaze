@@ -20,6 +20,9 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   (src/main.rs edited), draw, tick (uses what changed); 0.21s`); off a terminal cargo-like
   lines. `-q` shows none.
 - `blaze why [fn|crate]` says what the last build rebuilt and why.
+- The built-in `gca!` macro of the pinned nightly (generic const arguments,
+  `#![feature(gca_min_const_items)]`) expands to its expression, as rustc evaluates it (#862).
+  A constant using it was refused ("this built-in macro is not implemented").
 - `--events json|cbor` writes the build's events to stdout, one record a line or frame.
 - `variant_count` in a constant evaluates, as rustc's does: an enum's variants, 1 for a
   struct or union, 0 for any other type (#862). A function using it was refused.

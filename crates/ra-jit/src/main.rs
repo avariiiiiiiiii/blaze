@@ -4289,11 +4289,18 @@ fn start_from_rustc(
     }
     std::fs::write(patch, &empty)?;
     // Another name for it at once, for a client to install: the copy a splice writes is
-    // made while the daemon waits for the first edit.
-    let _ = std::fs::remove_file(binary);
-    if std::fs::hard_link(rustcs, binary).is_err() {
-        std::fs::copy(rustcs, binary)?;
+    // made while the daemon waits for the first edit. Renamed into place, so that a client
+    // never finds no file there.
+    let mut new = binary.as_os_str().to_owned();
+    new.push(format!(".{}.new", std::process::id()));
+    let new = PathBuf::from(new);
+    let _ = std::fs::remove_file(&new);
+    if std::fs::hard_link(rustcs, &new).is_err() {
+        std::fs::copy(rustcs, &new)?;
     }
+    std::fs::rename(&new, binary)?;
+    // A rename onto another name of the same file leaves both names.
+    let _ = std::fs::remove_file(&new);
     let linked = Linked::read_rustcs(binary.to_owned(), patch, &args.out);
     lock(&LINKED).insert(binary.to_owned(), Executable::Linked(linked));
     lock(&RUSTC_LINKED).insert(binary.to_owned());
@@ -5942,10 +5949,10 @@ fn link(
     let reached = cargo::plan::reached_only(cmd);
     let cmd = match reached.as_deref() {
         Some(reached) if lock(&REACHED_ONLY).contains(cmd) => {
-            run_link(reached, start, &declined)?;
+            run_link(reached, splice, start, &declined)?;
             reached
         }
-        _ => match (run_link(cmd, start, &declined), reached.as_deref()) {
+        _ => match (run_link(cmd, splice, start, &declined), reached.as_deref()) {
             (Err(why), Some(reached))
                 if why
                     .downcast_ref::<LinkFailed>()
@@ -5953,7 +5960,7 @@ fn link(
             {
                 lock(&REACHED_ONLY).insert(cmd.to_owned());
                 let again = "; again without the code nothing reaches, as rustc's line has it: some of it uses what nothing defines";
-                run_link(reached, Instant::now(), again)?;
+                run_link(reached, splice, Instant::now(), again)?;
                 reached
             }
             (linked, _) => {
@@ -5967,7 +5974,7 @@ fn link(
     {
         cargo::plan::write_headerpad(binary, pad)?;
         let again = format!("; again with -Wl,-headerpad,{pad:#x}, for the splices to fit");
-        run_link(cmd, Instant::now(), &again)?;
+        run_link(cmd, splice, Instant::now(), &again)?;
     }
     drop(reading);
     if let (Some(binary), Some(patch), true) = (splice, patch, relinked) {
@@ -6009,9 +6016,25 @@ fn packs_whole(args: &Args) -> bool {
 }
 
 /// Runs the link command `cmd` and says how long it took since `start` and how it ended, with
-/// `note` after.
-fn run_link(cmd: &str, start: Instant, note: &str) -> anyhow::Result<()> {
-    let linked = shell(cmd).output()?;
+/// `note` after. The executable `binary` it writes is linked under a directory of its own
+/// beside it and renamed into place: lld moves the file there aside as it starts to write, and
+/// GNU ld removes it, so a client that installs the last build's while another client's
+/// request links it again would find none.
+fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> anyhow::Result<()> {
+    let aside = binary.and_then(|binary| Some((binary, linked_aside(cmd, binary)?)));
+    let line = aside.as_ref().map_or(cmd, |(_, (line, _))| line);
+    let linked = shell(line).output();
+    let placed = match (&aside, &linked) {
+        (Some((binary, (_, at))), Ok(linked)) if linked.status.success() => {
+            std::fs::rename(at, binary)
+                .with_context(|| format!("putting the executable linked at {}", binary.display()))
+        }
+        _ => Ok(()),
+    };
+    if let Some(dir) = aside.as_ref().and_then(|(_, (_, at))| at.parent()) {
+        _ = std::fs::remove_dir_all(dir);
+    }
+    let linked = linked?;
     let status = linked.status;
     let said = String::from_utf8_lossy(&linked.stderr).into_owned();
     eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
@@ -6019,7 +6042,29 @@ fn run_link(cmd: &str, start: Instant, note: &str) -> anyhow::Result<()> {
     if !status.success() {
         return Err(LinkFailed { status, said }.into());
     }
-    Ok(())
+    placed
+}
+
+/// The link line `cmd` with the executable it names after `-o`, `binary`, written in a
+/// directory of its own beside it under the same name (which Apple's linker signs it by), and
+/// where that is. `None` when the line names `binary` otherwise, or not once.
+fn linked_aside(cmd: &str, binary: &Path) -> Option<(String, PathBuf)> {
+    if cfg!(windows) {
+        return None;
+    }
+    let mut args = shlex::split(cmd)?;
+    let named = binary.to_str()?;
+    let mut found = args.windows(2).enumerate().filter(|(_, it)| it[0] == "-o" && it[1] == named);
+    let at = found.next().filter(|_| found.next().is_none())?.0;
+    let mut dir = binary.as_os_str().to_owned();
+    dir.push(format!(".linking.{}", std::process::id()));
+    let dir = PathBuf::from(dir);
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).ok()?;
+    let aside = dir.join(binary.file_name()?);
+    args[at + 1] = aside.to_str()?.to_owned();
+    let line = shlex::try_join(args.iter().map(String::as_str)).ok()?;
+    Some((line, aside))
 }
 
 /// The link commands whose executables are linked without the code nothing reaches
@@ -11458,6 +11503,27 @@ mod tests {
             crate_place(inside, Some(Path::new("app/src/main.rs")), None),
             "app/src/main.rs"
         );
+    }
+
+    /// A link writes the executable beside its place under the same name, for it to be renamed
+    /// there: a client that reads it meanwhile finds the last one, never none.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_writes_the_executable_aside_under_its_name() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-aside-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("my app");
+        let line = format!("cc -B/x -fuse-ld=lld a.o -o '{}' -lc", binary.display());
+        let (aside, at) = linked_aside(&line, &binary).unwrap();
+        assert_eq!(at.file_name(), binary.file_name());
+        assert_eq!(at.parent().unwrap().parent(), Some(&*dir));
+        assert!(at.parent().unwrap().is_dir());
+        let args = shlex::split(&aside).unwrap();
+        assert_eq!(args[args.len() - 3..], ["-o", at.to_str().unwrap(), "-lc"]);
+        assert!(linked_aside("cc a.o -o elsewhere", &binary).is_none());
+        let twice = format!("{line} -o '{}'", binary.display());
+        assert!(linked_aside(&twice, &binary).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An rlib whose `lib.rmeta` is `metadata`, as an archive of one member.

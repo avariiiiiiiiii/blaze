@@ -3812,7 +3812,10 @@ fn reach_of_tests(
         let Some(name) = test_harness::name(db, krate, bench) else { continue };
         text.push_str(&format!("-\t{name}\tit is a benchmark\n"));
     }
-    for (&id, reach) in tests.iter().zip(hir_ty_codegen::tests_reach(db, resolver, &tests)) {
+    let started = Instant::now();
+    let reaches = hir_ty_codegen::tests_reach(db, resolver, &tests);
+    let walked = started.elapsed();
+    for (&id, reach) in tests.iter().zip(reaches) {
         let function = hir::Function::from(id);
         let Some(name) = test_harness::name(db, krate, function) else { continue };
         let attrs = function.source(db).map(|it| {
@@ -3849,6 +3852,13 @@ fn reach_of_tests(
             serde_json::to_string(it).unwrap_or_else(|_| "[]".to_owned())
         };
         text.push_str(&format!("{mark}{hex}\t{name}\t{}\t{}\n", json(&blocking), json(&others)));
+    }
+    if std::env::var_os("BLAZE_STATS").is_some() {
+        eprintln!(
+            "tests-reach-text-us: walk={} all={}",
+            walked.as_micros(),
+            started.elapsed().as_micros()
+        );
     }
     text
 }

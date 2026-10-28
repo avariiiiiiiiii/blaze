@@ -206,7 +206,10 @@ pub fn tests_reach(
         super::target::Target::current().triple(),
         super::store::toolchain(),
     );
+    let started = std::time::Instant::now();
+    let mut took = Vec::new();
     let names = super::stable::StableNames::new(db, symbols, FxHashSet::default(), true);
+    took.push(("names", started.elapsed()));
     let store = super::store::Store::global();
     let mut walk = Walk::new(db, false);
     walk.tests = true;
@@ -232,6 +235,7 @@ pub fn tests_reach(
         walk.segments.push(u128::from(low) | u128::from(high) << 64);
         sealed.insert(at, Sealed { key, below });
     }
+    took.push(("nodes", started.elapsed()));
     // One found later is mostly below one found earlier, and is then taken whole by it.
     let mut walked: Vec<u32> =
         sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
@@ -243,9 +247,10 @@ pub fn tests_reach(
         }
         sealed.get_mut(&at).unwrap().below = Some(below);
     }
+    took.push(("below", started.elapsed()));
     let mut local: FxHashMap<u32, u32> = FxHashMap::default();
     let mut way = Way::default();
-    starts
+    let reach = starts
         .into_iter()
         .map(|start| {
             local.clear();
@@ -294,7 +299,20 @@ pub fn tests_reach(
             found.sort_by_key(|it| it.kind);
             Reach { hash: u128::from(low) | u128::from(high) << 64, found }
         })
-        .collect()
+        .collect();
+    took.push(("roots", started.elapsed()));
+    if std::env::var_os("BLAZE_STATS").is_some() {
+        let steps: Vec<String> =
+            took.iter().map(|(name, at)| format!("{name}={}", at.as_micros())).collect();
+        eprintln!(
+            "tests-reach-steps-us: {} ({} roots, {} nodes, {} sealed)",
+            steps.join(" "),
+            roots.len(),
+            walk.nodes.len(),
+            sealed.len()
+        );
+    }
+    reach
 }
 
 /// The nodes a walk from one node found, in the order found, each with where in `order` the

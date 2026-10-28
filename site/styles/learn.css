@@ -343,7 +343,7 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 .doc .course a:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 4px; }
 
 /* Mastery: one cell per question, grouped by lesson. Solid: right the first time; mid: right later; faint: not yet. */
-.mastery { margin: 26px 0 0; padding: 16px 18px; border-radius: 16px; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line); }
+.mastery { margin: 26px 0; padding: 16px 18px; border-radius: 16px; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line); }
 .m-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; }
 .m-t { color: var(--ink-1); font-size: 14px; font-weight: 600; }
 .m-n { color: var(--ink-3); font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }

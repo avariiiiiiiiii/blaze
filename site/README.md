@@ -149,9 +149,12 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   page's discussion with its comment count, the faces on this page (click for everyone and where), and the reader's
   GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
   On the page itself (`client/lib/cursors.ts`) the others there show as live pointers (desktop only; "Hide cursors"
-  in the who-is-here list turns them off) and as bands on a rail at the right edge where each is reading (click a
-  face to go there). Positions are anchors in the text (a block index and a fraction of it, x a fraction of `main`'s
-  width), so different window sizes line up; the object passes them only to the other tabs on the same page, rate
+  in the who-is-here list turns them off) and as faces on a rail at the right edge where each one's pointer is in the
+  article (click a face to go there). A pointer is sent as what it is on (`client/lib/anchor.ts`): in the
+  article a block and the character in it, elsewhere a region (the sidebar, the top line, the chat, "On this page") and
+  the link, chat message or button in it, with fractions of that thing's box; so it lands on the same thing whatever
+  each reader's window and layout, and a reader without that thing on screen (sidebar shut, chat closed) doesn't draw
+  it; the object passes them only to the other tabs on the same page, rate
   limited per person, and never stores them.
   Everything passing shows in one overlay feed at the bottom left of the page, like Minecraft's chat
   (`client/lib/feed.ts`): chat messages, who joined ("Merry Tiger joined on Charter") and who left (someone off the

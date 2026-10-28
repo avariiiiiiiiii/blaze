@@ -711,7 +711,13 @@ impl<'a> Driver<'a> {
             },
             dep_info: deps.join(format!("{stem}.d")),
         };
-        let compiled = self.compile(&crates, &made, &deps.join(&stem));
+        let mut compiled = self.compile(&crates, &made, &deps.join(&stem));
+        // Compiled for this host from here, beside the other units, rather than in the load,
+        // which loads one module after another.
+        if wasm && compiled.is_ok() {
+            compiled = ra_jit_macro_wasm::prepare_soon(&made.exe, own_script::store())
+                .map_err(anyhow::Error::msg);
+        }
         if let (true, Err(why)) = (wasm, &compiled) {
             let root: &Path = self.cargo.workspace_root().as_ref();
             anyhow::bail!(super::own_macro::refusal(&name, &format!("{why:#}"), root));

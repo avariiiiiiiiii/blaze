@@ -199,4 +199,5 @@ cases![
     const_float_min_max,
     guard_nested_guard,
     self_projection_enum_pat,
+    rpit_recursive_method,
 ];

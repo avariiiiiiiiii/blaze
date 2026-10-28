@@ -280,6 +280,19 @@ class Step:
         self.name, self.argv = name, argv
 
 
+def plain_cargo(env):
+    """The cargo blaze is compared with, and its environment: the user's, else, on a machine
+    with no Rust, the one blaze downloaded, with its toolchain first on PATH so that it finds
+    its rustc."""
+    users = shutil.which("cargo", path=env["PATH"])
+    if users:
+        return users, env
+    own = sorted(glob.glob(os.path.join(env["HOME"], ".blaze", "toolchains", "*", "bin", "cargo")))
+    if not own:
+        return None, env
+    return own[-1], {**env, "PATH": os.path.dirname(own[-1]) + os.pathsep + env["PATH"]}
+
+
 def fetch(spec, into, env):
     os.makedirs(into)
     if "files" in spec:
@@ -289,9 +302,9 @@ def fetch(spec, into, env):
                 f.write(text)
         # A project someone has worked on has its lock file; `newdeps` is one that has none yet.
         has_deps = any(re.search(r"\[dependencies\]\n\S", text) for text in spec["files"].values())
-        cargo = shutil.which("cargo", path=env["PATH"])
+        cargo, cargo_env = plain_cargo(env)
         if has_deps and cargo and not spec.get("unlocked"):
-            subprocess.run([cargo, "generate-lockfile", "--quiet"], cwd=into, env=env, check=True)
+            subprocess.run([cargo, "generate-lockfile", "--quiet"], cwd=into, env=cargo_env, check=True)
         return
     cache = os.path.join(tempfile.gettempdir(), "experience-src", spec["rev"])
     if not os.path.isdir(cache):
@@ -346,9 +359,8 @@ def flow(name, spec, work, env):
         return s
 
     def cargo(step, *args):
-        # With no cargo of the user's, the one blaze downloaded is the one to compare with.
-        own = sorted(glob.glob(os.path.join(env["HOME"], ".blaze", "toolchains", "*", "bin", "cargo")))
-        return Step(step, [users_cargo or (own[-1] if own else "cargo"), *args], cargo_dir, env)
+        plain, plain_env = plain_cargo(env)
+        return Step(step, [plain or "cargo", *args], cargo_dir, plain_env)
 
     def run_python(root, profile_dir):
         lib = os.path.join(root, "target", profile_dir, "libpyext.dylib" if sys.platform == "darwin" else "libpyext.so")

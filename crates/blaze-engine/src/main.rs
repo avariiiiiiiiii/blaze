@@ -9342,8 +9342,7 @@ fn run_holding(
                 eprint!("cold: ");
                 report(&cold);
             }
-            for said in [blaze_expand::report(), blaze_macro_wasm::report()].into_iter().flatten()
-            {
+            for said in [blaze_expand::report(), blaze_macro_wasm::report()].into_iter().flatten() {
                 eprintln!("{said}");
             }
             if let Some(why) = cold.refused_reached(&args) {

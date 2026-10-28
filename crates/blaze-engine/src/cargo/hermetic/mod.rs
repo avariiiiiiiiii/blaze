@@ -765,8 +765,7 @@ mod tests {
 
     #[test]
     fn a_view_hides_the_target_directory_and_git_but_what_is_bound_in_them() {
-        let root =
-            std::env::temp_dir().join(format!("blaze-hermetic-view-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("blaze-hermetic-view-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&root);
         let package = root.join("ws");
         let out_dir = package.join("target/debug/build/ws-1/out");

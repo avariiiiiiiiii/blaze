@@ -45,11 +45,11 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use futures_util::{StreamExt, stream};
 use blaze_store::{
     FORMAT as STORE_FORMAT, StoreDir, limit_for, name_file_whole, pack_format, pack_keys,
     parse_size, write_file_whole,
 };
+use futures_util::{StreamExt, stream};
 use rustc_hash::FxHashMap;
 use tokio::{io::AsyncSeekExt, runtime::Runtime};
 use url::Url;

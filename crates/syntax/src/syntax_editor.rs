@@ -12,8 +12,8 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use syntax_tree::TextRange;
 use rustc_hash::FxHashMap;
+use syntax_tree::TextRange;
 
 use crate::{
     AstNode, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, T,

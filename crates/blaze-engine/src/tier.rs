@@ -20,8 +20,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use hir_ty_codegen::tier::{Branches, Level};
 use blaze_live::format::{self, Profile, Sample, TierEvent, TierFunction, Tiers};
+use hir_ty_codegen::tier::{Branches, Level};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::lock;
@@ -229,8 +229,7 @@ fn shown(symbol: &str) -> String {
         let path = path.rsplit_once('.').filter(|it| hex(it.1)).map_or(path, |it| it.0);
         return path.replace(&format!("[{id}]"), "");
     }
-    let own =
-        ["blaze::", "blaze::", "blaze.patch::"].iter().find_map(|it| symbol.strip_prefix(it));
+    let own = ["blaze::", "blaze::", "blaze.patch::"].iter().find_map(|it| symbol.strip_prefix(it));
     if let Some(own) = own {
         let numbered = |it: &(&str, &str)| {
             let number = it.1.strip_prefix('n').unwrap_or(it.1);

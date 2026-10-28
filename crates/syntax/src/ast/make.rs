@@ -16,8 +16,8 @@ mod quote;
 use either::Either;
 use itertools::Itertools;
 use parser::{Edition, T};
-use syntax_tree::NodeOrToken;
 use stdx::{format_to, format_to_acc, never};
+use syntax_tree::NodeOrToken;
 
 use crate::{
     AstNode, SourceFile, SyntaxKind, SyntaxToken,

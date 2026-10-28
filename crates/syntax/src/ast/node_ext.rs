@@ -7,8 +7,8 @@ use std::{fmt, iter::successors};
 
 use itertools::Itertools;
 use parser::SyntaxKind;
-use syntax_tree::TextSize;
 use smallvec::{SmallVec, smallvec};
+use syntax_tree::TextSize;
 
 use crate::{
     NodeOrToken, SmolStr, SyntaxElement, SyntaxElementChildren, SyntaxToken, T,

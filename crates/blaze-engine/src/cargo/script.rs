@@ -1188,8 +1188,7 @@ mod tests {
 
     #[test]
     fn a_run_in_another_checkout_has_its_key_and_what_it_left_names_that_checkout() {
-        let root =
-            std::env::temp_dir().join(format!("blaze-script-places-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("blaze-script-places-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let real = root.join("script");
         std::fs::create_dir_all(&root).unwrap();

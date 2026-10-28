@@ -4,9 +4,9 @@
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 
-extern crate rustc_abi;
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
+extern crate rustc_abi;
 extern crate rustc_type_ir;
 
 pub mod diagnostics;

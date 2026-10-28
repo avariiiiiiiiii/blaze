@@ -54,8 +54,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         Some(out) => Some(std::io::BufWriter::new(std::fs::File::create(out)?)),
         None => None,
     };
-    let dir =
-        std::env::temp_dir().join(format!("blaze-borrowck-{}-{edition}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("blaze-borrowck-{}-{edition}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         dir.join("Cargo.toml"),

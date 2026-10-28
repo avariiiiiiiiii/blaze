@@ -11,9 +11,9 @@
 // For details, see the zulip discussion below:
 // https://rust-lang.zulipchat.com/#narrow/channel/185405-t-compiler.2Frust-analyzer/topic/relying.20on.20in-tree.20.60rustc_type_ir.60.2F.60rustc_next_trait_solver.60/with/541055689
 
-extern crate rustc_abi;
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate ra_ap_rustc_index as rustc_index;
+extern crate rustc_abi;
 extern crate rustc_next_trait_solver;
 extern crate rustc_type_ir;
 

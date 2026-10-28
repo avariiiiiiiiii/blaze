@@ -363,8 +363,7 @@ mod windows_tests {
 
     #[test]
     fn the_directory_and_the_socket_are_the_users_alone() {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-socket-private-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blaze-socket-private-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         private_dir(&dir).unwrap();
         private_dir(&dir).unwrap();

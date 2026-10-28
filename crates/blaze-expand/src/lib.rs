@@ -42,13 +42,13 @@ use std::{
 };
 
 use base_db::{Env, SourceDatabase};
+use blaze_store::{KEY, Store};
 use hir_expand::proc_macro::{ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
 use paths::{AbsPath, AbsPathBuf};
 use proc_macro_api::{
     legacy_protocol::msg::{FlatTree, SpanDataIndexMap},
     version::CURRENT_API_VERSION,
 };
-use blaze_store::{KEY, Store};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use span::{Span, SpanAnchor, SyntaxContext, TextRange};

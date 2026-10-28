@@ -3,9 +3,9 @@
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
-extern crate rustc_abi;
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate ra_ap_rustc_index as rustc_index;
+extern crate rustc_abi;
 extern crate rustc_type_ir;
 
 use std::{borrow::Cow, fmt, sync::LazyLock};

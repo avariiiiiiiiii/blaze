@@ -146,9 +146,8 @@ fn expand(item: TokenStream) -> Result<TokenStream, Failed> {
     wrapper.extend(returned_ty);
     wrapper.extend([group(Delimiter::Brace, inner)]);
     wrapper.extend(code(";"));
-    wrapper.extend(code(
-        "let __blaze_code = ::blaze::__private::__blaze_cache_code(&__blaze_body);",
-    ));
+    wrapper
+        .extend(code("let __blaze_code = ::blaze::__private::__blaze_cache_code(&__blaze_body);"));
     let mut key_args = code("&__blaze_code, &");
     key_args.extend([group(Delimiter::Parenthesis, borrowed)]);
     wrapper.extend(code("let __blaze_key = ::blaze::__private::key"));
@@ -227,10 +226,7 @@ fn parse_params(stream: TokenStream) -> Result<Vec<Param>, Failed> {
                 name.clone()
             }
             _ => {
-                return Err((
-                    span,
-                    "#[blaze::cache] takes parameters written `name: Type`".into(),
-                ));
+                return Err((span, "#[blaze::cache] takes parameters written `name: Type`".into()));
             }
         };
         let colon = colon.expect("a pattern before a colon");

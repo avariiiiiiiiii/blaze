@@ -596,7 +596,7 @@ pub struct Wasm {
     path: PathBuf,
     digest: [u8; 32],
     /// What its expansions are kept under: what it was built of, when the file beside it says
-    /// (`crates/blaze-engine/src/cargo/own_script.rs`, `MADE_OF`), since two builds of the same
+    /// (`crates/blaze-cargo/src/cargo/own_script.rs`, `MADE_OF`), since two builds of the same
     /// source are not the same bytes; its digest otherwise.
     identity: [u8; 32],
     pre: InstancePre<State>,
@@ -1549,6 +1549,20 @@ mod tests {
         let bytes = writer.out;
         let trees = Reader::new(&bytes, &spans).stream().unwrap();
         assert_eq!(wire::top_subtree(trees, span(3, 9)).to_string(), top.to_string());
+    }
+
+    #[test]
+    fn a_negative_number_comes_out_as_a_minus_and_a_number() {
+        let number = |text: &str, kind: tt::LitKind, suffix: &str| {
+            Tree::Leaf(tt::Leaf::Literal(tt::Literal::new(text, span(0, 0), kind, suffix)))
+        };
+        let trees = vec![
+            number("-1", tt::LitKind::Integer, "i8"),
+            number("-1.5", tt::LitKind::Float, ""),
+            number("2", tt::LitKind::Integer, ""),
+        ];
+        let want = tokens("-1i8 -1.5 2", span(0, 0)).unwrap();
+        assert_eq!(wire::top_subtree(trees, span(0, 0)).to_string(), want.to_string());
     }
 
     #[test]

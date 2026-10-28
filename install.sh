@@ -3,15 +3,19 @@
 # without Rust:
 #
 #   curl -fsSL https://ix.dev/blaze | sh
-#   curl -fsSL https://ix.dev/blaze | sh -s -- --version 0.2.0
+#   curl -fsSL https://ix.dev/blaze | sh -s -- --channel canary
+#   curl -fsSL https://ix.dev/blaze | sh -s -- --version 0.20261028.0
 #
 # It downloads the release built for this machine (macOS on Apple silicon, Linux on x86-64 or
 # ARM64), checks it against the checksums published with it, puts `blaze` and the programs
 # it runs in ${CARGO_HOME:-~/.cargo}/bin, and has blaze download the Rust it builds
 # with, once (125 to 160 MB; none when rustup already has it). It never asks anything. Running it
-# again installs the newest release over the one there.
+# again installs the newest release of the channel over the one there.
 #
-#   --version V        install release V (or BLAZE_VERSION=V) instead of the newest
+#   --channel C        stable (the default: releases that passed the heavy tests) or canary (the
+#                      newest release, a prerelease until it is promoted); or BLAZE_CHANNEL=C.
+#                      docs/release.md says what each is.
+#   --version V        install release V (or BLAZE_VERSION=V), whatever the channel
 #   --no-toolchain     download Rust at the first build instead (BLAZE_NO_TOOLCHAIN=1)
 #   --verbose          say each step
 #   --yes, -y          accepted; nothing is asked anyway
@@ -25,6 +29,7 @@ REPO="${BLAZE_REPO:-indexable-inc/blaze}"
 # harness/toolchain; harness/toolchain_bump.py writes it
 TOOLCHAIN="nightly-2026-10-27"
 VERSION="${BLAZE_VERSION:-}"
+CHANNEL="${BLAZE_CHANNEL:-}"
 NO_TOOLCHAIN="${BLAZE_NO_TOOLCHAIN:-}"
 ARCHIVE="${BLAZE_ARCHIVE:-}"
 VERBOSE=""
@@ -46,6 +51,12 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         --version=*) VERSION="${1#--version=}"; shift ;;
+        --channel)
+            [ $# -gt 1 ] || fail "--channel needs a channel: stable or canary"
+            CHANNEL="$2"
+            shift 2
+            ;;
+        --channel=*) CHANNEL="${1#--channel=}"; shift ;;
         --no-toolchain) NO_TOOLCHAIN=1; shift ;;
         --verbose | -v) VERBOSE=1; shift ;;
         --yes | -y) shift ;;
@@ -53,9 +64,17 @@ while [ $# -gt 0 ]; do
             sed -n '2,/^$/s/^# \{0,1\}//p' "$0" 2>/dev/null || say "See https://ix.dev/blaze"
             exit 0
             ;;
-        *) fail "this installer has no option $1" "It takes --version V, --no-toolchain, --verbose and --yes." ;;
+        *) fail "this installer has no option $1" "It takes --channel C, --version V, --no-toolchain, --verbose and --yes." ;;
     esac
 done
+
+# A workspace pins blaze with a version or a channel's name, and so does --version.
+case "$VERSION" in stable | canary) CHANNEL="$VERSION"; VERSION="" ;; esac
+case "$CHANNEL" in
+    "" | stable) CHANNEL=stable ;;
+    canary) ;;
+    *) fail "blaze has no channel $CHANNEL." "The channels are stable (the default) and canary." ;;
+esac
 
 # ---------------------------------------------------------------------------------------------
 # Which build this machine takes
@@ -142,10 +161,30 @@ if [ -n "$ARCHIVE" ]; then
 else
     releases="https://github.com/$REPO/releases"
 
-    # The release: the one asked for, else the newest, else the nightly build before the first.
+    # The release: the one asked for; else canary's, the newest dated release, prerelease or
+    # not; else stable's, GitHub's latest, which is never a prerelease, or the nightly build
+    # before the first. The release feed needs no API token and has no rate limit, but lists
+    # tags too, which have no release until release.yaml has built it: canary's is the newest
+    # whose checksums are there.
     if [ -n "$VERSION" ]; then
         tag="v${VERSION#v}"
         [ "$VERSION" = nightly ] && tag=nightly
+    elif [ "$CHANNEL" = canary ]; then
+        fetch "$releases.atom" "$tmp/releases.atom" 2>"$tmp/error" ||
+            fail "the list of blaze's releases could not be read; is the network up?" \
+                "$(cat "$tmp/error")
+$releases.atom"
+        grep -o 'releases/tag/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' "$tmp/releases.atom" |
+            sed 's/^releases\/tag\/v//; s/"$//' | sort -t . -k 1,1nr -k 2,2nr -k 3,3nr > "$tmp/candidates" || true
+        tag=""
+        while read -r candidate; do
+            if fetch "$releases/download/v$candidate/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
+                tag="v$candidate"
+                break
+            fi
+            step "v$candidate has no release yet"
+        done < "$tmp/candidates"
+        [ -n "$tag" ] || fail "blaze has no canary release yet." "Releases: $releases"
     else
         latest=$(landing "$releases/latest" 2>/dev/null || true)
         case "$latest" in
@@ -153,7 +192,7 @@ else
             *) tag=nightly ;;
         esac
     fi
-    step "release $tag of $REPO"
+    step "release $tag of $REPO ($CHANNEL)"
 
     if ! fetch "$releases/download/$tag/SHA256SUMS" "$tmp/SHA256SUMS" 2>"$tmp/error"; then
         if [ -n "$VERSION" ]; then
@@ -170,6 +209,7 @@ $releases/download/$tag/SHA256SUMS"
     want=$(awk -v n="$asset" '$2 == n || $2 == "*" n { print $1; exit }' "$tmp/SHA256SUMS")
 
     if [ "$tag" = nightly ]; then shown="the nightly build"; else shown="blaze ${tag#v}"; fi
+    if [ -z "$VERSION" ] && [ "$CHANNEL" = canary ]; then shown="$shown (canary)"; fi
     say "Installing $shown for $machine..."
     step "downloading $asset"
     fetch "$releases/download/$tag/$asset" "$tmp/$asset" 2>"$tmp/error" ||
@@ -203,14 +243,13 @@ bin="$cargo_home/bin"
 mkdir -p "$bin" 2>"$tmp/error" || fail "blaze's folder could not be made." "$(cat "$tmp/error")"
 
 # A blaze from before its rename (#270) left its programs here under their old names. When it was
-# enabled, cargo's configuration names its wrapper: it is disabled with its own program, and this
-# blaze is enabled in its place once installed.
-enable_again=""
+# enabled, cargo's configuration names its wrapper: it is disabled with its own program. Plain
+# cargo builds through no blaze since; `blaze` takes back what a later `blaze enable` wrote.
 old_enabled="$cargo_home/ra-jit-enabled.json" # rename: old name
 old_engine="$bin/ra-jit" # rename: old name
 if [ -f "$old_enabled" ] && [ -x "$old_engine" ]; then
-    step "disabling the blaze from before its rename, to enable this one in its place"
-    "$old_engine" disable >/dev/null 2>&1 && enable_again=1
+    step "disabling the blaze from before its rename: plain cargo no longer builds through blaze"
+    "$old_engine" disable >/dev/null 2>&1 || true
 fi
 # `cargo blaze` (before it `cargo ra-jit`) is now `blaze`: the program cargo ran for it goes. # rename: old name
 old_launcher=""
@@ -247,13 +286,6 @@ for program in "$unpacked"/*; do
         put "$program" "$(basename "$program")"
     fi
 done
-if [ -n "$enable_again" ]; then
-    "$bin/blaze" enable >/dev/null 2>"$tmp/error" ||
-        fail "blaze is installed, but plain cargo could not be switched to it as it was to the blaze before." \
-            "$(cat "$tmp/error")
-Run: blaze enable"
-    step "plain cargo goes through blaze, as it did before"
-fi
 
 # ---------------------------------------------------------------------------------------------
 # The Rust blaze builds with
@@ -302,7 +334,7 @@ say ""
 case "$tag" in
     "") say "blaze is installed." ;;
     nightly) say "blaze (nightly build) is installed." ;;
-    *) say "blaze ${tag#v} is installed." ;;
+    *) say "$shown is installed." ;;
 esac
 if [ -n "$linker_note" ]; then say ""; say "$linker_note"; fi
 if [ -n "$path_note" ]; then say ""; say "$path_note"; fi

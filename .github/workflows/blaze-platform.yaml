@@ -48,6 +48,10 @@ on:
         description: harness/wasm32.py, programs built for wasm32 and run under wasmtime against cargo's
         type: boolean
         default: false
+      smoke:
+        description: the std cases of the smoke corpus (harness/smoke.py), in every tier
+        type: boolean
+        default: false
 
 env:
   CARGO_INCREMENTAL: 0
@@ -340,6 +344,33 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           cd harness
           BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 uitest.py "$RUNNER_TEMP/rust" --tests ui-pinned.txt --jobs 4 --work "$RUNNER_TEMP/ui"
+
+  # The std cases of the smoke corpus (docs/release.md): small programs with no dependencies
+  # that `blaze run` must print the expected output of and `blaze test` must pass, dev and
+  # --release, as a user runs them. The merge gate's; the whole corpus, against a release's
+  # archives, is what a canary passes to become stable (promote.yaml).
+  smoke:
+    name: smoke (std)
+    if: inputs.smoke
+    needs: build
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # With Nix: the build's programs ask for the dev shell's glibc, from the Nix store.
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release
+      - run: tar -xf blaze.tar
+        working-directory: target/release
+      - name: smoke corpus (std)
+        run: |
+          BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
+            "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
 
   # `blaze` in place of cargo on projects at pinned commits, and the flags, the daemon's
   # life and plain cargo after `blaze enable`. Incremental compilation is left to the profile,

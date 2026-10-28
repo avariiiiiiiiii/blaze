@@ -12,12 +12,12 @@ name: pgo
 # that many functions changed since the profile was trained, and before a release after large
 # changes to the code. The release train runs it on each release commit it makes, and the pin
 # job then tags the release.
+# PGO is off for now: releases build with `--no-pgo` (release.yaml) and are tagged by release-cut
+# itself, so this runs by hand only. To turn it back on, restore the push trigger:
+#   push: { branches: [main], paths: [Cargo.lock, "**/Cargo.toml", harness/toolchain,
+#           .github/scripts/build_release.py, crates/hir-ty-codegen/llvm.json] }
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    # build_release.py and llvm.json: the recipe's features and the LLVM it links.
-    paths: [Cargo.lock, "**/Cargo.toml", harness/toolchain, .github/scripts/build_release.py, crates/hir-ty-codegen/llvm.json]
 
 # A push replaces the run of the push before it, never a run by hand: the release train's
 # dispatch on a release commit (train_release.py) must finish, or its tag never comes.

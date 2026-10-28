@@ -108,6 +108,7 @@ jobs:
       tier: ${{ needs.changes.outputs.tier }}
       borrowck: true
       pinned-ui: true
+      smoke: true
 
   # On a push to main alone: their caches, for the train's runs and the next push's.
   linux-arm64:

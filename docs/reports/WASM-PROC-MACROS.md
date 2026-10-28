@@ -20,6 +20,13 @@ otherwise.
 - blaze (`--target wasm32-wasip1 --crate proc_macro --shared`) links the macro crate and
   everything it uses into a WASI reactor that exports `blaze_proc_macro_list` and
   `blaze_proc_macro_expand`. No rustc-built code is in it.
+- rustc builds a proc macro for the host, so crates that link `proc_macro` (the macro crate,
+  and those whose root has `extern crate proc_macro`, such as syn, synstructure and
+  proc-macro2) are told no `target_os = "wasi"` and no `target_family = "wasm"`
+  (`own_macro::host_side_cfg`). synstructure and syn 1 leave out `proc_macro` on wasm32 with
+  `target_os = "wasi"`, and synstructure its `decl_derive!` with it: a module had none of the
+  derives declared that way, hir-ty's `TypeVisitable` and ICU's `Yokeable` among them (#828).
+  Every other crate is told the target: libc, getrandom and wasi pick the WASI library by it.
 - The host (`src/lib.rs`, `src/wasi.rs`) compiles the module with Cranelift where blaze builds
   it (`cargo/compile_time.rs`, `cargo/own_macro.rs`), with no unit waiting: the module carries its list of macros in a custom section
   (`blaze_proc_macros`), written to the `.macros` file beside it at once, stamped with the

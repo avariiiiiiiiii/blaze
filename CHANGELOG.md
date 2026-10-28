@@ -10,6 +10,50 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Changed
 
+- Release profiles build with LLVM at the profile's level (#831): `opt-level` 2 and 3
+  (`release`, `bench`, a profile that inherits them) build at `-O2` and `-O3`, `s` and `z` at
+  `-O2`, and 0 and 1 (`dev`, `test`) stay on Cranelift. `BLAZE_BACKEND` and `BLAZE_OPT` still
+  choose. A dev build and a release build of one project keep separate workers. A blaze built
+  without its `llvm` feature refuses a profile that asks for LLVM instead of using Cranelift.
+
+### Removed
+
+- `blaze enable` and `blaze disable`, and plain cargo building through blaze (#93, no-rustc.md's
+  step M): `blaze` is the only way in. A plain `cargo build` is cargo's and rustc's alone. On a
+  machine where `enable` was run, the next `blaze` takes `build.rustc-workspace-wrapper` out of
+  cargo's `config.toml` (the file as it was before, when nobody edited it since), puts back the
+  `cargo fmt` and `cargo clippy` its links replaced, and says so in one line.
+  `BLAZE_RUSTC_BASE` is gone with it: the first edits no longer patch an executable rustc
+  linked, which only that mode still had. `blaze-rustc` stays, as the wrapper of a load into
+  cargo's target directory.
+
+## [0.20261028.1] - 2026-10-28
+
+### Fixed
+
+- A program that spawns a thread or makes a `HashMap` builds with the standard library a
+  release ships (#840, #224). Its build was refused with "writable static `MIN` (or
+  `__RUST_STD_INTERNAL_VAL`) without a rustc symbol": a static declared in a body of std
+  (`thread::min_stack`'s `MIN`, each `thread_local!`'s, `RandomState::new`'s `KEYS`) is named
+  after where it is written, and the name had the path of std's sources on the machine that
+  built the unit (CI's runner, `/Users/runner/.rustup/...`), so a program built anywhere else
+  asked for names the unit does not define. The place now names a file of the standard library
+  from `library/` on, and one cargo fetched under `/cargo`, the same on every machine, and the
+  program links to the unit's one copy of each static. The unit's store key changes, so it is
+  built or fetched once again. `harness/stdstatics.py` makes the unit from std's sources in
+  another directory and runs the three programs, dev and `--release`.
+
+### Merged
+
+- std statics in bodies: name their place by a path every machine shares (#840) (#857)
+- experience.py flags the names blaze no longer has, not every mention of blaze (#869)
+- nix/units: blaze-protocol and blaze-ui (main's unit-graph check, stale since #855/#856) (#871)
+- agents: scripts take one typed JSON input, not flags (#874)
+
+## [0.20261028.0] - 2026-10-28
+
+### Changed
+
 - `cargo blaze` is gone: run `blaze` (same subcommands and flags). The program `cargo-blaze`,
   and `cargo-ra-jit` before it, are no longer built or shipped; install.sh removes the one it
   finds and says so in one line.
@@ -37,6 +81,28 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   `RA_JIT_<NAME>`, is no longer read; blaze stops when one is set, with a line for each:
   `RA_JIT_CACHE was renamed BLAZE_CACHE`. The programs blaze builds read `BLAZE_FN_CACHE*`
   and `BLAZE_TIER` alone too.
+
+### Merged
+
+- a build keeps its plan while what it was made of is unchanged, not resolving the workspace on every no-op (#814)
+- BLAZE_REMOTE never holds up a build; lazy packs waited for 250 ms at most; gateway connects within 2 s (#815)
+- nix: the flake's default is blaze, so nix profile install github:indexable-inc/blaze installs it (#816)
+- release: notes under GitHub's limit, publish_crates fixes, crates.io off until the rename (#819)
+- release: notes longer than a GitHub release allows keep the entries that fit and link CHANGELOG.md (#820)
+- install: the check reads what `blaze toolchain` says now (#821)
+- one workspace: vendor/rust-analyzer's crates are root members with one Cargo.lock, the fork's unused crates and fork sync removed (#818)
+- settings are BLAZE_* alone; RA_JIT_* stops blaze, naming the new name (#270) (#817)
+- build(deps): bump actions/setup-python from 6 to 7 in the actions group (#822)
+- wasm proc macros: a kept expansion loads no module, expansions that ask a span's line/text/file kept with their answers, counters per edit (#824)
+- site: redesign in the ix docs layout: sidebar, animated fire logo, a home page around four goals with drawings, install and usage pages, client-side page swaps (#825)
+- publish_crates.py: a version-string dependency and the toolchain's include_str! in toolchain.rs (crates.io job of v0.20261027.0) (#826)
+- move the front end's crates (from vendor/rust-analyzer), rowan and rustc_abi into crates/ (#829)
+- an Apple link writes again the headerpad file a clean took (#721 on macOS) (#835)
+- blaze builds wasmtime again: System V vectors in XMM registers, negative float literal patterns (#834)
+- a checkout's git asks DNS for nothing (#838)
+- harness: cargo_ra_jit lays out every side as stable cargo (fd/ripgrep/just tests found their program, train #61) (#845)
+- ra-jit is blaze everywhere; blaze is the only command; forks renamed (#270) (#832)
+- COFF statics keep a section each, so the PE splice reads their size (splices.py 59 on Windows LLVM) (#846)
 
 ## [0.20261027.0] - 2026-10-27
 
@@ -2665,6 +2731,8 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261027.0...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.1...HEAD
+[0.20261028.1]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.1
+[0.20261028.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.0
 [0.20261027.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261027.0
 [0.1.0]: https://github.com/indexable-inc/ra-jit/releases/tag/v0.1.0

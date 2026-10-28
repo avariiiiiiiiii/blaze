@@ -11,8 +11,8 @@ std has on AArch64, then has no frame at all, and a panic aborts, cargo's build 
 program is built with `blaze build` until the daemon serves the build, then edited a
 few times: every edit after the first (which writes the whole object again) has to be
 spliced, print what the source says, and have the unwinder find the frame of the edited
-function where its symbol now is (`_Unwind_Find_FDE`). The daemon is run with
-`BLAZE_RUSTC_BASE=0`, as headerpad.py is, and built for macOS 14, as nix's shell builds.
+function where its symbol now is (`_Unwind_Find_FDE`). It is built for macOS 14, as nix's
+shell builds.
 
 Python 3, stdlib only.
 """
@@ -137,7 +137,7 @@ def main():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
-               BLAZE_RUSTC_BASE="0", MACOSX_DEPLOYMENT_TARGET="14.0")
+               MACOSX_DEPLOYMENT_TARGET="14.0")
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "ncu"), os.path.join(ws, "src", "main.rs")

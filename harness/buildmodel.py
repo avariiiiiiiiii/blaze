@@ -400,10 +400,11 @@ class Case:
             if not said.startswith("ok"):
                 return said
             # Another client's answer may be linking over the file: taken once it holds still.
-            mine = f"{binary}.client{n}"
-            for _ in range(200):
-                shutil.copy(binary, mine)
+            for attempt in range(200):
+                # A file of its own each time: an earlier copy may still be held by a child.
+                mine = f"{binary}.client{n}.{attempt}"
                 try:
+                    shutil.copy(binary, mine)
                     ran = self.behaviour(mine, env)
                 except OSError as busy:
                     # Another thread's child, forked while the copy was open, holds it for a moment.
@@ -433,8 +434,9 @@ class Case:
     def doctests(self, env):
         """`cargo test --doc` with rustdoc, and `blaze test --doc`."""
         def tested(target_dir, blaze=False):
-            command = [*(["blaze"] if blaze else ["cargo"]), "test", "--doc"]
             path = os.path.dirname(BLAZE) + os.pathsep + env.get("PATH", os.environ["PATH"])
+            # Windows looks a program up in this process's PATH, not the child's.
+            command = [shutil.which("blaze", path=path) or "blaze" if blaze else "cargo", "test", "--doc"]
             run = subprocess.run([*command, *self.select[:2], *self.cargo_args, "--", *self.spec.get("args", [])],
                                  cwd=self.ws, capture_output=True, text=True, timeout=900,
                                  env={**env, "PATH": path, "CARGO_TARGET_DIR": os.path.join(self.ws, target_dir)})

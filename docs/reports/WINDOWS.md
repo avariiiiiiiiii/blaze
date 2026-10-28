@@ -50,7 +50,7 @@ What changed, by area:
 
 ## The PE splice
 
-`crates/blaze-engine/src/splice/pe.rs`. The contract is the ELF one: `Baseline::read` and `Addition`
+`crates/blaze-splice/src/pe.rs`. The contract is the ELF one: `Baseline::read` and `Addition`
 are shared, and the format is chosen by what the executable is.
 
 - Symbols. A PE has no symbol table and `link.exe` cannot write one, so names come from the

@@ -7,6 +7,10 @@ the final word on whether the code builds.
 
 Andrew, 2026-10-26, answering "blaze uses its pinned nightly even when the project pins stable":
 "you should use YOUR OWN NIGHTLY that you control since you are trying to replace rustc".
+Andrew, 2026-10-28 03:30Z: zero Rust toolchain pinning. blaze uses the language and std its own
+binary ships, ignores rust-toolchain, rust-toolchain.toml, rustup's settings and
+`RUSTUP_TOOLCHAIN`, and never runs or asks rustc, not even with rustup installed. Projects pin
+the blaze version instead.
 
 ## Why one toolchain, and why blaze's
 
@@ -28,13 +32,20 @@ the standard library is part of a compiler.
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, `rust-std` (the host's, and `wasm32-wasip1`'s,
   which proc macros are built for) and `rust-src`, unchanged, from
   static.rust-lang.org, each checked against the sha256 compiled into blaze
-  (`crates/blaze-engine/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
+  (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
   when rustup already has it with `rust-src` (the same bytes). The installer downloads it once;
   `blaze toolchain --path` prints its directory.
 - **Who uses it:** cargo, rustc and the daemon that blaze starts (`CARGO`, `RUSTC`, `RUSTDOC`,
-  `PATH` for its own processes). The user's `cargo`, `rustc` and pins are untouched.
+  `RUSTUP_TOOLCHAIN`, `PATH` for its own processes), whatever they were set to. The user's
+  `cargo`, `rustc` and pins are untouched, and blaze reads none of them.
+- **What rustc says:** blaze answers every question asked of rustc (`--version`, `-vV`,
+  `--print cfg|sysroot|target-libdir|target-spec-json|...`) itself, for this release, whoever
+  asks: cargo through blaze's wrapper, rust-analyzer in process, a build script through blaze's
+  rustc stand-in, which also checks the probes build scripts compile (`autocfg`, `rustversion`,
+  `version_check`, `anyhow`'s and `thiserror`'s). No rustc is run to find any of it
+  ([no-rustc.md](no-rustc.md), step B).
 - **Bumps:** every day, to the newest nightly, by a workflow, with the merge gate and the
   release train as the gate ([The daily bump](#the-daily-bump)).
 
@@ -117,15 +128,16 @@ Measured 2026-10-27, on the first bump the workflow made.
 
 ## What it means for a project
 
-- A project that pins another toolchain (a stable release, an older nightly) builds with
-  blaze's. blaze says so once per project and pin, as a note, not an error, and switches
-  nothing:
-  `note: blaze builds with its own toolchain, blaze-2026-10-27, not rustc 1.99.0 (...), which
-  the project's rust-toolchain file names. ...`
+- A project that pins another toolchain (a stable release, an older nightly, in a
+  rust-toolchain file, `rustup override` or `RUSTUP_TOOLCHAIN`) builds with blaze's. The pin is
+  not read: blaze runs nothing to learn what it names. Under `-v`, a rust-toolchain file blaze
+  passes over gets one line: `blaze: <file> is ignored: blaze builds with its own Rust, ...`.
+- `edition` applies as cargo applies it. A workspace member whose `rust-version` is newer than
+  blaze's Rust is one error naming both versions and saying to update blaze (and pin it);
+  `--ignore-rust-version` builds it anyway, as with cargo.
 - Rust keeps building old code, so stable code builds; `#![feature(...)]` code builds too.
 - Code blaze's toolchain cannot build (a nightly feature it removed, a library item newer than
-  it, `rust-version` above 1.101) fails with rustc's error and a note that blaze built it with
-  its own toolchain, not the project's.
+  it) fails with blaze's error. A project that needs another Rust pins another blaze.
 - Keep `cargo build`/`cargo test` with the project's toolchain in CI. blaze is for the edit
   loop; the project's toolchain decides.
 

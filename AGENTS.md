@@ -45,11 +45,14 @@ AGENTS.md).
    release train on the bump's branch (docs/toolchain.md, "The daily bump"), and a bump that is not
    green is an open issue, not a skipped day. It is the language and std definition blaze matches
    while rustc is still in the tree, not a rustc blaze maintains; every rustc use left is removed on
-   the way to none. Users keep their own toolchain and CI as the final word: blaze says so rather
-   than switching toolchains. See [docs/no-rustc.md](docs/no-rustc.md).
+   the way to none. blaze ignores rust-toolchain files, rustup's settings, `RUSTUP_TOOLCHAIN` and
+   `RUSTC`, and never runs or asks rustc to learn anything: projects pin the blaze version
+   (`[workspace.metadata.blaze] version`), not Rust's. Users keep their own toolchain and CI as the
+   final word. See [docs/no-rustc.md](docs/no-rustc.md).
    Why: "You should use your own nightly that you control since you are trying to replace rustc"
    (Andrew, 2026-10-26). "blaze should be the latest-nightly equivalent" (Andrew, 2026-10-27, #404).
-   We are moving off rustc entirely ("no rustc", Andrew).
+   We are moving off rustc entirely ("no rustc", Andrew). "ZERO Rust toolchain pinning" (Andrew,
+   2026-10-28).
 6. **sandbox-everything**: Every build script and proc macro runs in a sandbox, by default, on every
    platform: every build script, cargo's runs and the daemon's, runs in one through
    `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in
@@ -121,3 +124,17 @@ AGENTS.md).
     accurate to the article: a change to a page changes its script in the same commit.
     Pronunciations go in `site/audio/lexicon.toml`, which never touches text inside `[ ]`. See
     [site/audio/README.md](site/audio/README.md).
+16. **scripts-take-typed-input**: A script (Python in `.github/scripts/`, `harness/`, `bench/`,
+    `scripts/`, `nix/`) takes one typed input, not a set of flags: a single JSON value, given as a
+    path to a file, `-` for standard input, or inline as the one argument. It parses that into a
+    typed structure (a frozen `dataclass` with `Literal` and exact types, every field named, unknown
+    fields refused) and fails naming the field that is wrong. At most a positional subcommand may
+    come before it. No `argparse` flag sets, no environment variables as hidden parameters (an
+    environment variable is only for what the environment is, like a token). A workflow writes the
+    JSON inline (`python3 x.py '{"target": "...", "pgo": false}'`). An existing script moves to this
+    when it is next changed.
+    Why: Andrew, 2026-10-28: "for parser things it should be typed like json instead of cli args, json
+    through a file or stdin or a single value". Flags drift (build_release.py grew --strict,
+    --no-pgo, --server, --server-beside, ...), are untyped, and an agent or a workflow has to guess
+    their combinations; one JSON value is checkable, diffable and the same from a workflow, a person
+    or another script.

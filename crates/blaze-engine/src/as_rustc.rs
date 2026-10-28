@@ -17,6 +17,8 @@
 //! (`autocfg` removes the `.ll` it asked for, `anyhow` the whole directory, `rustix` never
 //! reads its file), so they are empty, and the dep-info names the probe's source.
 
+pub(crate) use blaze_cargo::as_rustc::{NAME, TOOLCHAIN};
+
 use std::{
     ffi::{OsStr, OsString},
     io::{Read as _, Write as _},
@@ -24,13 +26,6 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-
-/// The variable that names, to this, the toolchain's rustc: what cargo gave the script as
-/// `RUSTC`.
-pub(crate) const TOOLCHAIN: &str = "BLAZE_SCRIPT_RUSTC";
-
-/// The name blaze is started under to be this.
-pub(crate) const NAME: &str = "rustc";
 
 /// Whether this process was started as `rustc`, which is to be this.
 pub(crate) fn is_me() -> bool {
@@ -56,22 +51,20 @@ pub(crate) fn command() -> ! {
 
 fn run(args: &[OsString]) -> anyhow::Result<i32> {
     let rustc = std::env::var_os(TOOLCHAIN)
-        .with_context(|| format!("`{TOOLCHAIN}` does not name the toolchain's rustc"))?;
-    // A question blaze has no answer of is not asked of rustc, and the cargo the load asks
-    // of the standard library asks of the toolchain's rustc, through blaze's wrapper, not of
-    // this.
+        .with_context(|| format!("`{TOOLCHAIN}` does not name blaze's rustc"))?;
+    let sysroot = Path::new(&rustc).parent().and_then(Path::parent);
+    let sysroot = sysroot.with_context(|| format!("`{TOOLCHAIN}` names no toolchain's rustc"))?;
+    crate::cargo::toolchain::known_at(sysroot.to_owned());
+    // The cargo the load asks of the standard library asks blaze's wrapper, not this.
     // SAFETY: nothing else runs yet in this process.
-    unsafe {
-        std::env::set_var("BLAZE_ANSWERS", "own");
-        std::env::set_var("RUSTC", &rustc);
-    }
+    unsafe { std::env::set_var("RUSTC", &rustc) };
     let mut stdin = Vec::new();
     if args.iter().any(|it| it == "-") {
         std::io::stdin().read_to_end(&mut stdin).context("reading standard input")?;
     }
     if crate::answers::is_question(args) {
-        let answer = crate::answers::own_answer_of(&rustc, args, &stdin)
-            .context("blaze has no answer of its own to this question")?;
+        let answer =
+            crate::answers::ours(args, &stdin).context("blaze has no answer to this question")?;
         std::io::stdout().write_all(&answer)?;
         return Ok(0);
     }
@@ -81,7 +74,7 @@ fn run(args: &[OsString]) -> anyhow::Result<i32> {
         .collect::<Option<_>>()
         .context("an argument that is not text")?;
     let probe = Probe::of(&args)?;
-    probe.answer(&rustc, &stdin)
+    probe.answer(sysroot, &stdin)
 }
 
 /// What a script asked rustc to check: one crate, by itself.
@@ -203,23 +196,19 @@ impl<'a> Probe<'a> {
         }
     }
 
-    /// Checks the crate with the toolchain of `rustc`, its source on `stdin` when that is
+    /// Checks the crate with blaze's release at `sysroot`, its source on `stdin` when that is
     /// the input: what rustc would end with, the files asked for written when it compiles.
-    fn answer(&self, rustc: &OsStr, stdin: &[u8]) -> anyhow::Result<i32> {
+    fn answer(&self, sysroot: &Path, stdin: &[u8]) -> anyhow::Result<i32> {
         let name = self.name()?;
         // The cfgs the crate is checked with are those rustc would print for the same flags,
         // which blaze answers or does not.
         let mut asked: Vec<OsString> = self.cfg_flags.iter().map(OsString::from).collect();
         asked.extend(["--print", "cfg"].map(OsString::from));
-        crate::answers::own_answer_of(rustc, &asked, &[])
+        crate::answers::ours(&asked, &[])
             .context("blaze can't tell the cfgs rustc would check the crate with")?;
         let cfg_args: Vec<String> = self.cfg_flags.iter().map(|it| (*it).to_owned()).collect();
         let cfg = crate::cargo::own_script::cfg_of(&cfg_args);
         let target = self.cfg_flags.windows(2).find(|it| it[0] == "--target").map(|it| it[1]);
-        let rustc =
-            crate::answers::toolchain_rustc_of(rustc).context("its toolchain is not known")?;
-        let sysroot =
-            rustc.parent().and_then(Path::parent).context("its toolchain is not known")?;
         let dir = Scratch::new()?;
         let root = match self.input.context("no input")? {
             "-" => {

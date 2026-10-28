@@ -201,4 +201,5 @@ cases![
     guard_nested_guard,
     self_projection_enum_pat,
     rpit_recursive_method,
+    attr_on_prefix_expr,
 ];

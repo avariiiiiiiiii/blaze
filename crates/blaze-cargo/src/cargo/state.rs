@@ -5,24 +5,19 @@
 use std::{
     collections::BTreeMap,
     fs::OpenOptions,
-    io::{BufReader, Write as _},
+    io::Write as _,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 use anyhow::Context as _;
-use cargo_metadata::{Artifact, BuildScript, Message, Metadata, Package, TargetKind};
-use rustc_hash::FxHashSet;
+use cargo_metadata::{BuildScript, Metadata, Package};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    cli::{Invocation, Subcommand, worker_env},
+    cli::{Invocation, worker_env},
     daemon::{self, Checkout, WorkerConfig},
-    package,
-    plan::Plan,
-    script, switch,
-    units::{self, Record, stamp_now, stamp_of},
-    wrapper,
+    home, package, script,
+    units::{stamp_now, stamp_of},
 };
 
 /// The state of one build of a checkout: one command with one set of flags.
@@ -150,18 +145,6 @@ pub enum Kind {
     Bench,
 }
 
-impl Kind {
-    fn of(kinds: &[TargetKind]) -> Kind {
-        match kinds.first() {
-            Some(TargetKind::Bin) => Kind::Bin,
-            Some(TargetKind::Example) => Kind::Example,
-            Some(TargetKind::Test) => Kind::Test,
-            Some(TargetKind::Bench) => Kind::Bench,
-            _ => Kind::Lib,
-        }
-    }
-}
-
 /// Something cargo acts on that is not source the daemon compiles. When one does not hold
 /// the build is cargo's.
 #[derive(Serialize, Deserialize)]
@@ -280,22 +263,6 @@ impl Guard {
                 .then(|| format!("the environment variable {name} changed")),
         }
     }
-
-    fn files(what: &str, files: impl IntoIterator<Item = PathBuf>) -> Guard {
-        let files = files.into_iter().map(|it| {
-            let there = it.exists();
-            (it, there)
-        });
-        Guard::Files { what: what.to_owned(), files: files.collect() }
-    }
-
-    fn beside_tests(files: Vec<PathBuf>, cargo: Vec<PathBuf>) -> Guard {
-        let files = files.into_iter().map(|it| {
-            let was = written_at(&it).zip(without_tests(&it));
-            (it, was)
-        });
-        Guard::BesideTests { files: files.collect(), cargo }
-    }
 }
 
 /// A hash of the Rust source in `file` with every item marked `#[test]` or `#[cfg(test)]`
@@ -362,17 +329,6 @@ fn newer_in(dir: &Path, since: u128) -> Option<PathBuf> {
     None
 }
 
-/// What cargo said while it built.
-pub struct Built {
-    /// When cargo started.
-    started: u128,
-    artifacts: Vec<Artifact>,
-    scripts: Vec<BuildScript>,
-    /// What cargo said of each build script it ran and each proc macro it built, a line
-    /// each as it said it, a fresh one too.
-    said: Vec<String>,
-}
-
 /// What the checker of `blaze check` with the flags of `asked` loads: the workspace
 /// as a build of those flags has it, with the crates of every package of it. A flag that
 /// picks the tests checks them as `cargo check --tests` does, with `cfg(test)`.
@@ -409,51 +365,6 @@ pub fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
     Ok(daemon::Ahead { config, crates, root, targets: asked.target_flags() })
 }
 
-impl Built {
-    /// Runs cargo on what `asked` builds, with blaze as the wrapper of the workspace's
-    /// crates. Progress and diagnostics are cargo's own. `Err` is cargo's exit status when
-    /// it failed.
-    pub fn by_cargo(asked: &Invocation) -> anyhow::Result<Result<Built, i32>> {
-        let started = stamp_now();
-        let mut cargo = Command::new(cargo_path());
-        match asked.subcommand {
-            Subcommand::Build | Subcommand::Run | Subcommand::Check => cargo.arg("build"),
-            Subcommand::Test => cargo.args(["test", "--no-run"]),
-        };
-        cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
-        as_built(&mut cargo)?;
-        cargo.stdout(Stdio::piped());
-        let mut cargo = cargo.spawn().context("running cargo")?;
-        let said = cargo.stdout.take().context("cargo has no output")?;
-        let mut built =
-            Built { started, artifacts: Vec::new(), scripts: Vec::new(), said: Vec::new() };
-        for message in Message::parse_stream(BufReader::new(said)) {
-            let message = message?;
-            // The worker that loads the build reads what the scripts said and where the proc
-            // macros are from cargo's one build of them.
-            let scripted = match &message {
-                Message::BuildScriptExecuted(_) => true,
-                Message::CompilerArtifact(it) => it.target.is_proc_macro(),
-                _ => false,
-            };
-            if scripted {
-                built.said.push(serde_json::to_string(&message)?);
-            }
-            match message {
-                Message::CompilerArtifact(artifact) => built.artifacts.push(artifact),
-                Message::BuildScriptExecuted(script) => built.scripts.push(script),
-                // Whoever reads this may stop reading before its end.
-                Message::TextLine(line) => {
-                    let _ = writeln!(std::io::stdout(), "{line}");
-                }
-                _ => {}
-            }
-        }
-        let status = cargo.wait()?;
-        Ok(if status.success() { Ok(built) } else { Err(status.code().unwrap_or(101)) })
-    }
-}
-
 impl State {
     /// The file in the record of a unit that names the builds its program is in, a key a
     /// line.
@@ -487,40 +398,6 @@ impl State {
     pub fn of_unit(unit: &Path) -> Vec<String> {
         let keys = std::fs::read_to_string(unit.join(State::STATES)).unwrap_or_default();
         keys.lines().map(str::to_owned).collect()
-    }
-
-    /// Forgets the builds `keys`: rustc has linked a program of theirs again, and what
-    /// they kept of cargo's is not what cargo has now.
-    pub fn forget<'a>(keys: impl IntoIterator<Item = &'a String>) {
-        for key in keys {
-            for path in [State::path(key), State::kept_path(key)].into_iter().flatten() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    /// The program linked from the unit recorded in `unit`, the checkout it is asked for
-    /// in, and where it is among that checkout's programs. `Err` is why the daemon is not
-    /// asked for it.
-    pub fn asked_for(&self, unit: &Path) -> Result<(&Checkout, usize), String> {
-        let program = self.of_unit_dir(unit).ok_or("the build no longer has the program")?;
-        match (program.asked_as, &program.left_to_cargo) {
-            (Some((checkout, at)), _) => Ok((&self.checkouts[checkout], at)),
-            (None, why) => Err(why.clone().unwrap_or_default()),
-        }
-    }
-
-    fn of_unit_dir(&self, unit: &Path) -> Option<&Program> {
-        self.programs.iter().find(|it| it.unit.as_deref() == Some(unit))
-    }
-
-    /// Has `binary` be what cargo has of the program linked from the unit recorded in
-    /// `unit`: cargo was given it where it had rustc's, for the source as it is now.
-    pub fn cargo_has(&self, unit: &Path, binary: &Path) -> std::io::Result<()> {
-        match self.of_unit_dir(unit) {
-            Some(program) => place(binary, &program.cargos),
-            None => Ok(()),
-        }
     }
 
     pub fn write(&self) -> anyhow::Result<()> {
@@ -570,35 +447,10 @@ impl State {
         })
     }
 
-    /// Counts a build that went to cargo.
-    pub fn count_cargo(&mut self, reason: &str) {
-        *self.counts.cargo.entry(reason.to_owned()).or_default() += 1;
-    }
-
     /// The executables of the build `key` and the hard link kept to what rustc linked of
     /// each. A file of its own, in a shape that stays: it is read when the state can't be.
     fn kept_path(key: &str) -> anyhow::Result<PathBuf> {
         Ok(daemon::home()?.join("states").join(format!("{key}.kept.json")))
-    }
-
-    /// Puts the executables rustc linked back where cargo has them, for cargo to find what
-    /// it built. One whose link is gone is deleted, and cargo links it again.
-    pub fn give_back(key: &str) {
-        let kept = State::kept_path(key).ok().and_then(|it| std::fs::read(it).ok());
-        let kept: Vec<(PathBuf, PathBuf)> =
-            kept.and_then(|it| serde_json::from_slice(&it).ok()).unwrap_or_default();
-        let _held = build_locks(kept.iter().map(|(executable, _)| &**executable));
-        for (executable, cargos) in kept {
-            // Whatever goes wrong here, cargo finds a file that is not its own or none,
-            // and builds the program again.
-            let _ = if is_placed(&cargos, &executable) {
-                Ok(())
-            } else if cargos.is_file() {
-                place(&cargos, &executable)
-            } else {
-                std::fs::remove_file(&executable)
-            };
-        }
     }
 
     /// Has every program be where cargo has it: the daemon's executable of one it built,
@@ -695,193 +547,6 @@ impl State {
     pub fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
         self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
     }
-
-    /// The state after cargo built `asked` in `cwd`: what it built, what the daemon can
-    /// build of it, and what the next build has to check.
-    pub fn after(
-        asked: &Invocation,
-        cwd: &Path,
-        key: &str,
-        built: Built,
-        counts: Counts,
-    ) -> anyhow::Result<State> {
-        let metadata = metadata(asked);
-        // By its real path, as rustc's working directory and so the sources of the units
-        // are: a workspace reached through a link is the one it links to.
-        let root = metadata.workspace_root.as_std_path();
-        let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_owned());
-        let dir = metadata.target_directory.as_std_path().join("blaze").join(key);
-        let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
-        let artifacts: Vec<&Artifact> =
-            built.artifacts.iter().filter(|it| members.contains(&it.package_id)).collect();
-        let records = records_of(&artifacts)?;
-        let used = used_by(&artifacts, &records);
-
-        let mut state = State {
-            version: daemon::version(),
-            key: key.to_owned(),
-            root: root.clone(),
-            built_at: built.started,
-            profile: asked.profile().to_owned(),
-            programs: Vec::new(),
-            guards: Vec::new(),
-            checkouts: Vec::new(),
-            refusal: None,
-            doc_tests: false,
-            counts,
-            configured: configured_env(cwd),
-        };
-        let project = match project(asked, cwd, &metadata) {
-            Ok(project) => dunce::canonicalize(&project).unwrap_or(project),
-            Err(why) => {
-                state.refusal = Some(why);
-                root.clone()
-            }
-        };
-        if state.refusal.is_none() {
-            state.refusal = other_toolchain();
-        }
-        let env = match units::places_named(&used) {
-            Ok(env) => env,
-            Err(why) => {
-                state.refusal.get_or_insert(why);
-                BTreeMap::new()
-            }
-        };
-        let config = |unit_test: bool| WorkerConfig {
-            repository: repository(&root),
-            project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
-            cfg_test: unit_test,
-            selection: asked.selection(),
-            env: worker_env(),
-            command_env: BTreeMap::new(),
-            whole: false,
-        };
-        let sysroot_libraries = sysroot_libraries();
-        let scripts = match kept_said(&dir, &built.said) {
-            Ok(file) => Some(file),
-            Err(why) => {
-                eprintln!("blaze: what the build scripts said is not kept: {why}");
-                None
-            }
-        };
-        let checkout = |unit_test: bool| Checkout {
-            key: format!("{key}{}", if unit_test { "-unit" } else { "" }),
-            generation: 0,
-            kept: false,
-            built_at: built.started,
-            config: config(unit_test),
-            root: root.clone(),
-            programs: Vec::new(),
-            sources: Vec::new(),
-            env: env.clone(),
-            scripts: scripts.clone(),
-        };
-        let mut checkouts = [checkout(false), checkout(true)];
-        let executables = artifacts.iter().filter(|it| !it.target.is_custom_build());
-        for artifact in executables {
-            let Some(executable) = &artifact.executable else { continue };
-            let package = metadata.packages.iter().find(|it| it.id == artifact.package_id);
-            let package = package.context("cargo built a package it does not list")?;
-            let kind = Kind::of(&artifact.target.kind);
-            let test = artifact.profile.test;
-            let unit_test = test && !matches!(kind, Kind::Test | Kind::Bench);
-            let name = artifact.target.name.clone();
-            let unit = Record::of_artifact(&used, executable.as_std_path());
-            // Named as cargo names the unit, the same in every build of it.
-            let files = dir.join("programs").join(unit.map_or(&name, |it| &it.id));
-            std::fs::create_dir_all(&files)?;
-            let cargos = files.join("cargo");
-            place(executable.as_std_path(), &cargos)?;
-            let names = unit.map(|it| it.outputs()).unwrap_or_default().into_iter();
-            let names = names
-                .filter(|it| it != executable.as_std_path())
-                .filter(|it| same_file::is_same_file(it, executable).unwrap_or(false))
-                .collect();
-            let plan = match unit {
-                Some(unit) => Plan::of(unit, &used, &files, unit_test)?,
-                None => Err(format!(
-                    "cargo built `{name}` before blaze recorded what it is linked from; \
-                     `cargo clean -p {}` has it built again",
-                    package.name
-                )),
-            };
-            let (asked_as, left_to_cargo) = match plan {
-                Ok(plan) => {
-                    let checkout = &mut checkouts[usize::from(unit_test)];
-                    checkout.generation = checkout.generation.max(plan.stamp);
-                    checkout.programs.push(plan);
-                    (Some((usize::from(unit_test), checkout.programs.len() - 1)), None)
-                }
-                Err(why) => (None, Some(why)),
-            };
-            let compiled = reached_from(unit.into_iter().collect(), &used);
-            let inputs: FxHashSet<PathBuf> = compiled
-                .iter()
-                .flat_map(|it| it.inputs().files)
-                .filter(|it| !it.starts_with(metadata.target_directory.as_std_path()))
-                .collect();
-            let default_run =
-                kind == Kind::Bin && !test && package.default_run.as_ref() == Some(&name);
-            state.programs.push(Program {
-                default_run,
-                name,
-                kind,
-                package: package.name.to_string(),
-                test,
-                source: artifact.target.src_path.clone().into_std_path_buf(),
-                package_dir: package_dir(package),
-                executable: executable.clone().into_std_path_buf(),
-                names,
-                cargos,
-                unit: unit.and_then(|it| Some(Record::dir_for(&it.out_dir()?).join(&it.id))),
-                asked_as,
-                left_to_cargo,
-                inputs: inputs.into_iter().collect(),
-                env: run_env(package, &built.scripts)
-                    .into_iter()
-                    .chain(programs_named(kind, unit))
-                    .chain(library_path(executable.as_std_path(), sysroot_libraries.as_deref()))
-                    .collect(),
-            });
-        }
-        state
-            .programs
-            .sort_by(|a, b| (&a.package, a.kind, &a.name).cmp(&(&b.package, b.kind, &b.name)));
-        for checkout in &mut checkouts {
-            let sources = checkout.programs.iter().flat_map(|plan| {
-                let compiled = used.iter().filter(|it| plan.crates.contains(&it.source));
-                compiled.flat_map(|it| it.inputs().files)
-            });
-            // What a build script wrote is cargo's, written while it built.
-            let target_dir = metadata.target_directory.as_std_path();
-            let sources: FxHashSet<PathBuf> =
-                sources.filter(|it| !it.starts_with(target_dir)).collect();
-            checkout.sources = sources.into_iter().collect();
-        }
-        state.checkouts = checkouts.into_iter().collect();
-        // Cargo runs the doc tests of the packages it runs the tests of.
-        let tested: FxHashSet<_> =
-            artifacts.iter().filter(|it| it.profile.test).map(|it| &it.package_id).collect();
-        // A proc macro is a library with doc tests as much as any other.
-        let library = |it: &cargo_metadata::Target| {
-            it.is_lib() || it.is_rlib() || it.is_dylib() || it.is_proc_macro()
-        };
-        let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
-        state.doc_tests =
-            metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
-        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
-        let kept: Vec<PathBuf> = State::all()
-            .iter()
-            .chain([&state])
-            .flat_map(|it| it.checkouts.iter().flat_map(|it| &it.programs))
-            .flat_map(|it| it.copies.clone())
-            .collect();
-        for dir in record_dirs(&artifacts) {
-            units::collect_garbage(&dir, &kept)?;
-        }
-        Ok(state)
-    }
 }
 
 impl Program {
@@ -956,20 +621,6 @@ fn is_placed(from: &Path, to: &Path) -> bool {
         && written(&from) == written(&to)
 }
 
-/// Writes `said`, what cargo said of the build scripts and proc macros of a build, to the
-/// file `scripts` in `dir`, whole or not at all: a worker started after the build loads the
-/// workspace with it, and does not build the scripts and proc macros again in a target
-/// directory of its own to find out.
-fn kept_said(dir: &Path, said: &[String]) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let file = dir.join("scripts");
-    let mut new = file.as_os_str().to_owned();
-    new.push(format!(".{}.new", std::process::id()));
-    std::fs::write(&new, said.join("\n"))?;
-    std::fs::rename(&new, &file)?;
-    Ok(file)
-}
-
 /// The package of what a debugger reads of the executable at `binary`, linked from `object`
 /// and what rustc compiled, whose package is `rustcs`: written again when either is newer.
 fn packed(binary: &Path, object: &Path, rustcs: &Path) -> Result<PathBuf, String> {
@@ -1000,51 +651,6 @@ pub fn place(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Has `to` be a file of its own with what `from` has now, put there under another name and
-/// renamed over it: what was at `to` stays as it is for whoever runs it, and nothing written to
-/// `from` later reaches it. Plain cargo starts the program at `to` with no word to the daemon,
-/// which writes its own executable in place for the next start, and on Linux a program started
-/// while its file is open for writing is refused ("text file busy").
-pub fn place_copy(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut new = to.as_os_str().to_owned();
-    new.push(format!(".{}.new", std::process::id()));
-    let new = PathBuf::from(new);
-    let _ = std::fs::remove_file(&new);
-    crate::splice::copy_file(from, &new)
-        .and_then(|()| std::fs::rename(&new, to))
-        .inspect_err(|_| _ = std::fs::remove_file(&new))
-}
-
-/// Gives `command` the environment cargo built in, so that a cargo it runs, or is, has the
-/// same units: cargo keys the crates of the workspace by their wrapper, and one run
-/// without it builds each program again and puts its own where this build's is, under a
-/// program that is running.
-pub fn as_built(command: &mut Command) -> std::io::Result<()> {
-    command.env(switch::VARIABLE, switch::wrapper_path()?).env(wrapper::DRIVEN, "1");
-    // The project's own wrapper still runs rustc, from inside blaze's, as cargo finds it from
-    // the directory it runs in.
-    let dir =
-        command.get_current_dir().map_or_else(std::env::current_dir, |it| Ok(it.to_owned()))?;
-    match switch::project_wrapper(&dir) {
-        Some(theirs) => command.env(switch::CHAINED, theirs),
-        None => command.env_remove(switch::CHAINED),
-    };
-    every_crate(command)
-}
-
-/// Has cargo run the rustc of every crate through blaze's wrapper, for the build scripts of
-/// the packages outside the workspace (docs/no-rustc.md, step I), unless the user has a
-/// wrapper there. Cargo keys no unit by this wrapper, so the builds of plain cargo are still
-/// this one's.
-pub fn every_crate(command: &mut Command) -> std::io::Result<()> {
-    let dir =
-        command.get_current_dir().map_or_else(std::env::current_dir, |it| Ok(it.to_owned()))?;
-    if !switch::user_wraps(&dir) {
-        command.env("RUSTC_WRAPPER", switch::wrapper_path()?).env(wrapper::EVERY_CRATE, "1");
-    }
-    Ok(())
-}
-
 /// The cargo to run: the one that ran this command, or the one on the path.
 pub fn cargo_path() -> PathBuf {
     std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from)
@@ -1056,29 +662,6 @@ pub fn metadata(asked: &Invocation) -> Metadata {
 
 pub fn package_dir(package: &Package) -> PathBuf {
     package.manifest_path.parent().map(|it| it.as_std_path().to_owned()).unwrap_or_default()
-}
-
-/// The directories the records of what cargo just built are in.
-fn record_dirs(artifacts: &[&Artifact]) -> FxHashSet<PathBuf> {
-    let files = artifacts.iter().flat_map(|it| &it.filenames);
-    files.filter_map(|it| it.parent()).map(|it| Record::dir_for(it.as_std_path())).collect()
-}
-
-fn records_of(artifacts: &[&Artifact]) -> anyhow::Result<Vec<Record>> {
-    let mut records = Vec::new();
-    for dir in record_dirs(artifacts) {
-        records.extend(Record::all(&dir)?);
-    }
-    Ok(records)
-}
-
-/// The records of the units of this build: a directory has those of other builds too. Cargo
-/// names a program by its hard link to what rustc wrote or by its copy of it, so the files
-/// are told by what they are and not by their paths.
-fn used_by(artifacts: &[&Artifact], records: &[Record]) -> Vec<Record> {
-    let files = artifacts.iter().flat_map(|it| &it.filenames);
-    let is_built = |record: &&Record| files.clone().any(|it| record.wrote(it.as_std_path()));
-    records.iter().filter(is_built).cloned().collect()
 }
 
 /// The directory of the package the build is of, whose features the daemon loads the
@@ -1143,13 +726,6 @@ const LIBRARY_PATH: &str = if cfg!(windows) {
     "LD_LIBRARY_PATH"
 };
 
-/// Where the toolchain cargo builds with has the libraries of the host, `libstd` as a
-/// dynamic library among them. `None` when rustc does not say.
-pub fn sysroot_libraries() -> Option<PathBuf> {
-    let said = crate::answers::ours_said(&["--print=target-libdir"]).ok()?;
-    (!said.is_empty()).then(|| PathBuf::from(said))
-}
-
 /// Where cargo has the dynamic linker look when it runs `executable`: the dependencies of
 /// the profile, the profile's own directory, the toolchain's libraries, and then wherever
 /// it looked already. A test of a proc macro is linked with the toolchain's `libstd`. The
@@ -1176,22 +752,6 @@ pub fn library_path(executable: &Path, sysroot: Option<&Path>) -> Option<(String
     let dirs = deps.into_iter().chain([profile.to_owned()]).chain(sysroot.map(Path::to_owned));
     let joined = std::env::join_paths(dirs.chain(already)).ok()?;
     Some((LIBRARY_PATH.to_owned(), joined.into_string().ok()?))
-}
-
-/// The variables a cargo since rust-lang/cargo#16421 also sets when it runs an integration
-/// test or a benchmark: `CARGO_BIN_EXE_<name>` for each program of its package, as it gave
-/// them to rustc for the unit. A test that looks for a program by them at run time (assert_cmd's
-/// `cargo_bin`) finds none beside it in cargo's second layout, where the test is in its unit's
-/// own directory and not in the profile's.
-fn programs_named(kind: Kind, unit: Option<&Record>) -> Vec<(String, String)> {
-    if !matches!(kind, Kind::Test | Kind::Bench) {
-        return Vec::new();
-    }
-    let named = unit.into_iter().flat_map(|it| &it.env);
-    named
-        .filter(|(name, _)| name.starts_with("CARGO_BIN_EXE_"))
-        .map(|(n, v)| (n.clone(), v.clone()))
-        .collect()
 }
 
 /// The variables cargo sets for a program of `package` when it runs it.
@@ -1243,7 +803,7 @@ pub fn configured_env(cwd: &Path) -> Vec<Configured> {
     };
     let mut files: Vec<PathBuf> =
         cwd.ancestors().filter_map(|it| in_dir(&it.join(".cargo"))).collect();
-    let home = switch::cargo_home().and_then(|it| in_dir(&it));
+    let home = home::cargo_home().and_then(|it| in_dir(&it));
     if let Some(home) = home
         && !files.iter().any(|it| same_file::is_same_file(it, &home).unwrap_or(false))
     {
@@ -1277,140 +837,6 @@ pub fn configured_env(cwd: &Path) -> Vec<Configured> {
         }
     }
     env
-}
-
-/// Everything a change to which makes the next build cargo's.
-fn guards(
-    cwd: &Path,
-    metadata: &Metadata,
-    used: &[Record],
-    scripts: &[BuildScript],
-    checkouts: &[Checkout],
-) -> Vec<Guard> {
-    let root = metadata.workspace_root.as_std_path();
-    let manifests = metadata
-        .workspace_packages()
-        .into_iter()
-        .map(|it| it.manifest_path.clone().into_std_path_buf());
-    let mut guards = vec![
-        Guard::files("the manifest", manifests.chain([root.join("Cargo.toml")])),
-        Guard::AsLeft {
-            written: written_at(&root.join("Cargo.lock")),
-            file: root.join("Cargo.lock"),
-        },
-        Guard::files(
-            "cargo's configuration",
-            named_above(cwd, &switch::CONFIGS).chain(switch::home_configs()),
-        ),
-    ];
-    let in_build = runs_in_build(used);
-    // What a build script wrote to its `OUT_DIR` it wrote while cargo built, after the build
-    // began, and only cargo writes it again: when the script runs again, which its own guards
-    // are for.
-    let generated =
-        |file: &PathBuf| scripts.iter().any(|it| file.starts_with(it.out_dir.as_std_path()));
-    let mut read_at: std::collections::BTreeMap<PathBuf, Option<u128>> = Default::default();
-    for unit in &in_build {
-        let ran_at = unit.cargo_ran_at().map(stamp_of);
-        for file in unit.inputs().files.into_iter().filter(|it| !generated(it)) {
-            let at = read_at.entry(file).or_insert(ran_at);
-            *at = at.zip(ran_at).map(|(a, b)| a.min(b));
-        }
-    }
-    let files = read_at.into_iter().map(|(file, at)| (file.exists(), file, at));
-    let files = files.map(|(there, file, at)| (file, there, at)).collect();
-    guards.push(Guard::Read { what: "what runs during the build:".to_owned(), files });
-    // What cargo or a build script sets for rustc changes with the manifest or the script.
-    let set_for_rustc = |name: &str| {
-        name.starts_with("CARGO_")
-            || name == "OUT_DIR"
-            || scripts.iter().any(|it| it.env.iter().any(|(set, _)| set == name))
-    };
-    for unit in used {
-        let env = unit.inputs().env.into_iter().filter(|(name, _)| !set_for_rustc(name));
-        guards.extend(env.map(|(name, value)| Guard::Env { name, value }));
-    }
-    let members: FxHashSet<_> = metadata.workspace_members.iter().collect();
-    for script in scripts.iter().filter(|it| members.contains(&it.package_id)) {
-        let package = metadata.packages.iter().find(|it| it.id == script.package_id);
-        guards.extend(package.map(|it| rerun_guards(it, script)).into_iter().flatten());
-    }
-    let linked = checkouts.iter().flat_map(|it| &it.programs);
-    let mut linked: Vec<PathBuf> = linked.flat_map(|it| it.linked_as_built.clone()).collect();
-    linked.sort();
-    linked.dedup();
-    let built = used.iter().filter(|it| !it.is_test());
-    let built = built.filter(|it| it.inputs().files.iter().any(|file| linked.contains(file)));
-    let cargo = built.flat_map(Record::cargo_dep_info).collect();
-    guards.push(Guard::beside_tests(linked, cargo));
-    guards
-}
-
-/// The files named one of `names` in `dir` and in every directory above it, there or not.
-fn named_above<'a>(dir: &'a Path, names: &'a [&str]) -> impl Iterator<Item = PathBuf> + 'a {
-    dir.ancestors().flat_map(move |dir| names.iter().map(move |name| dir.join(name)))
-}
-
-/// The units that run during the build, and the libraries of the workspace they are built
-/// against, and the ones those are.
-fn runs_in_build(used: &[Record]) -> Vec<&Record> {
-    reached_from(used.iter().filter(|it| it.runs_in_build()).collect(), used)
-}
-
-/// `found` and the units among `used` they are built against, and the ones those are.
-fn reached_from<'a>(mut found: Vec<&'a Record>, used: &'a [Record]) -> Vec<&'a Record> {
-    let mut at = 0;
-    while let Some(unit) = found.get(at).copied() {
-        at += 1;
-        // A library is named by its metadata or by its rlib.
-        let externs: FxHashSet<PathBuf> = unit.externs().map(|it| it.with_extension("")).collect();
-        for other in used {
-            let named = other.outputs().iter().any(|it| externs.contains(&it.with_extension("")));
-            if named && !found.iter().any(|it| it.id == other.id) {
-                found.push(other);
-            }
-        }
-    }
-    found
-}
-
-/// What the build script of `package` said it reruns for. One that said nothing reruns for
-/// any change to the package. A variable is the user's to change, and then cargo builds; for
-/// a file the daemon runs the script again, when it knows how cargo ran it.
-fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
-    let dir = package_dir(package);
-    let what = format!("the build script of `{}` reruns for", package.name);
-    let said = script::printed(script.out_dir.as_std_path());
-    let said = said.and_then(|it| std::fs::read_to_string(it).ok()).unwrap_or_default();
-    let directive = |line: &str, name: &str| {
-        let rest = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"))?;
-        rest.strip_prefix(name)?.strip_prefix('=').map(str::to_owned)
-    };
-    let (mut files, mut variables) = (Vec::new(), Vec::new());
-    for line in said.lines() {
-        if let Some(path) = directive(line, "rerun-if-changed") {
-            let path = dir.join(path);
-            files.push(match path.is_dir() {
-                true => Guard::Tree { what: what.clone(), dir: path },
-                false => Guard::files(&what, [path]),
-            });
-        }
-        if let Some(name) = directive(line, "rerun-if-env-changed") {
-            let value = std::env::var(&name).ok();
-            variables.push(Guard::Env { name, value });
-        }
-    }
-    if files.is_empty() && variables.is_empty() {
-        let what = format!("the build script of `{}` reruns for any change,", package.name);
-        files.push(Guard::Tree { what, dir });
-    }
-    let out_dir = script.out_dir.clone().into_std_path_buf();
-    if script::can_rerun(&out_dir) {
-        let package = package.name.to_string();
-        files = vec![Guard::Script { package, out_dir, reruns_for: files, checked_at: 0 }];
-    }
-    files.extend(variables);
-    files
 }
 
 /// `said`, the errors the daemon found in the source of the target `target` (`bin "app"`,

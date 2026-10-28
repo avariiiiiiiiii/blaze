@@ -52,18 +52,11 @@ blaze has no watch mode of its own; any file watcher can run it. With
 watchexec -e rs -- blaze build
 ```
 
-## Make plain `cargo build` use blaze
+## Plain `cargo build`
 
-For editors, scripts and agents that run `cargo build` themselves:
-
-```sh
-blaze enable
-```
-
-From then on plain `cargo build`, `run`, `test` and `check` go through blaze, in every project of
-your user. It adds one setting to `~/.cargo/config.toml`, and `blaze disable` puts the file back
-as it was. Edits are slower this way than with `blaze`, and on some projects slower than plain
-cargo ([why](cargo.md#plain-cargo-switched-on-globally)).
+Plain cargo does not build through blaze: `blaze` is the only way in. Where an earlier blaze's
+`blaze enable` was run, the next `blaze` takes its setting out of `~/.cargo/config.toml` and
+says so in one line ([cargo.md](cargo.md#plain-cargo-switched-on-globally)).
 
 ## Change a running program
 
@@ -108,9 +101,7 @@ and comes with the next release. How it works, and how fast from a keystroke to 
   with rustc's error (see [install.md](install.md#what-you-need) and
   [support.md](support.md#toolchain)).
 - **Not everything builds yet.** Under `blaze`, the flags listed above and code blaze can't
-  compile yet fail the build with the reason; nothing goes to cargo. Plain cargo after
-  `blaze enable` still has rustc build what blaze does not, and `blaze status` counts
-  those builds. In the benchmark tables, `(c)` marks an edit that went to cargo when it was
+  compile yet fail the build with the reason; nothing goes to cargo. In the benchmark tables, `(c)` marks an edit that went to cargo when it was
   measured.
 - **Errors.** An edit with a type error fails to build, as it would under cargo. The borrow checker
   is new: 0.1.0 has none, so an edit with a borrow error builds and runs; the one on `main` finds

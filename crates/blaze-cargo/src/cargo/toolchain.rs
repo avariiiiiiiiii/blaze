@@ -218,14 +218,6 @@ fn newer_than_ours(major: u64, minor: u64, patch: u64) -> bool {
     (major, minor, patch) > (ours.major, ours.minor, ours.patch)
 }
 
-/// The `rust-lld` that rustc links MSVC programs with when a target says so, as the
-/// repository's `.cargo/config.toml` does: rustc finds it in the toolchain, not on the PATH.
-pub fn rust_lld() -> PathBuf {
-    let host = hir_ty_codegen::Target::host();
-    let lld = format!("rust-lld{}", std::env::consts::EXE_SUFFIX);
-    sysroot().unwrap_or_default().join("lib/rustlib").join(host).join("bin").join(lld)
-}
-
 /// Where rustup keeps its toolchains, which is only where to look for a copy of blaze's
 /// release: what rustup would pick is not asked.
 fn rustup_home() -> Option<PathBuf> {

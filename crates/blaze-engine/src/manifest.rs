@@ -165,7 +165,6 @@ fn crate_key(db: &RootDatabase, krate: Crate, keys: &mut FxHashMap<Crate, Option
 pub(crate) fn key(db: &RootDatabase, args: &Args, table_is_empty: bool) -> Option<Hash> {
     let eligible = table_is_empty
         && args.symbol_files.is_empty()
-        && args.rustc_binary.is_none()
         && args.report.is_none()
         && args.deny.is_none()
         && args.isolate.is_none()

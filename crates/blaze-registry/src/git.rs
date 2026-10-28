@@ -459,6 +459,39 @@ fn command(dir: &Path) -> Command {
     command
 }
 
+/// The git index at cargo's `registry/index/<name>/.git`, read without a checkout.
+pub(crate) fn registry_command(db: &Path) -> Command {
+    let mut command = command(db);
+    command
+        .env("GIT_DIR", db)
+        // Reading a partial index must not implicitly fetch missing objects offline.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env("GIT_COMMITTER_NAME", "blaze")
+        .env("GIT_COMMITTER_EMAIL", "blaze@localhost");
+    command
+}
+
+pub(crate) fn fetch_registry(context: &Context, url: &str, db: &Path) -> anyhow::Result<()> {
+    if !db.join("HEAD").exists() {
+        std::fs::create_dir_all(db)?;
+        run(registry_command(db).args(["init", "--quiet", "--template="]))?;
+    }
+    if matches!(
+        github_fast_path(context, db, url, &GitReference::DefaultBranch)?,
+        FastPath::UpToDate
+    ) {
+        return Ok(());
+    }
+    context
+        .net
+        .retry
+        .run(|| fetch_with_cli(db, url, &["+HEAD:refs/remotes/origin/HEAD".to_owned()], false))
+}
+
 /// `git` in a database: the user's configuration counts, for credentials and `insteadOf`.
 fn git(db: &Path, args: &[&str]) -> anyhow::Result<String> {
     run(command(db).env("GIT_DIR", db).args(args))

@@ -23,6 +23,7 @@ use crate::{
 /// Where a registry's index files come from.
 enum Files {
     Sparse(Box<SparseIndex>),
+    Git(crate::git_index::GitIndex),
     /// A `local-registry`: `index/` and the `.crate` files beside it, on disk.
     Local {
         root: PathBuf,
@@ -103,32 +104,28 @@ impl Drop for Reading<'_> {
 }
 
 impl Registry {
-    /// A remote registry. Only sparse ones are read so far: a git index is refused with a
-    /// reason.
+    /// A remote registry, whose index is sparse or git, sharing cargo's on-disk cache.
     pub fn remote(source: SourceId, context: Arc<Context>) -> anyhow::Result<Registry> {
-        if !source.is_sparse() {
-            bail!(
-                "{} is a git index, which blaze does not read yet; a sparse index \
-                 (`sparse+https://...`) of the same registry is read",
-                source.url()
-            );
-        }
         let name = source.registry_dir_name();
         let registry = context.cargo_home.join("registry");
         let index_dir = registry.join("index").join(&name);
-        let sparse = SparseIndex::new(
-            source,
-            index_dir.clone(),
-            context.http.clone(),
-            context.net.retry,
-            context.net.offline,
-            context.auth.clone(),
-        )?;
+        let files = if source.is_sparse() {
+            Files::Sparse(Box::new(SparseIndex::new(
+                source,
+                index_dir.clone(),
+                context.http.clone(),
+                context.net.retry,
+                context.net.offline,
+                context.auth.clone(),
+            )?))
+        } else {
+            Files::Git(crate::git_index::GitIndex::new(source, index_dir.clone(), context.clone()))
+        };
         Ok(Registry {
             src_dir: registry.join("src").join(&name),
             crate_dir: registry.join("cache").join(&name),
             cache_root: index_dir.join(".cache"),
-            files: Files::Sparse(Box::new(sparse)),
+            files,
             source,
             name,
             context,
@@ -179,14 +176,32 @@ impl Registry {
     pub(crate) fn sparse(&self) -> Option<&SparseIndex> {
         match &self.files {
             Files::Sparse(sparse) => Some(sparse),
-            Files::Local { .. } => None,
+            Files::Git(_) | Files::Local { .. } => None,
         }
+    }
+
+    pub(crate) fn download_token(&self) -> anyhow::Result<String> {
+        if let Some(sparse) = self.sparse() {
+            return sparse.token(false);
+        }
+        let auth = self.context.auth.as_deref().context(
+            "registry requires authentication, but no credential configuration was supplied",
+        )?;
+        let name = auth.name_of(&self.source)?;
+        auth.token(
+            crate::auth::Named { source: &self.source, name: name.as_deref() },
+            None,
+            crate::auth::Operation::Read,
+            &[],
+            true,
+        )
     }
 
     /// The registry's `config.json`; a local registry has none.
     pub fn config(&self) -> anyhow::Result<Option<RegistryConfig>> {
         match &self.files {
             Files::Sparse(sparse) => sparse.config(),
+            Files::Git(git) => git.config(),
             Files::Local { .. } => Ok(None),
         }
     }
@@ -196,6 +211,7 @@ impl Registry {
     pub fn config_is_cached(&self) -> bool {
         match &self.files {
             Files::Sparse(sparse) => sparse.config_is_cached(),
+            Files::Git(git) => git.config_is_cached(),
             Files::Local { .. } => true,
         }
     }
@@ -204,14 +220,17 @@ impl Registry {
     /// index; until then what is in the cache is used as it is.
     pub fn invalidate(&self) {
         self.read.lock().unwrap_or_else(PoisonError::into_inner).clear();
-        if let Files::Sparse(sparse) = &self.files {
-            sparse.invalidate();
+        match &self.files {
+            Files::Sparse(sparse) => sparse.invalidate(),
+            Files::Git(git) => git.invalidate(),
+            Files::Local { .. } => {}
         }
     }
 
     pub fn is_updated(&self) -> bool {
         match &self.files {
             Files::Sparse(sparse) => sparse.is_updated(),
+            Files::Git(git) => git.is_updated(),
             Files::Local { .. } => true,
         }
     }
@@ -265,10 +284,17 @@ impl Registry {
             Some((summaries, version)) => (Some(summaries), Some(version)),
             None => (None, None),
         };
+        let was_updated = self.is_updated();
         let response = match &self.files {
             Files::Sparse(sparse) => sparse.load(&relative, index_version.as_deref()).await?,
             Files::Local { root } => local_load(root, &relative)?,
+            Files::Git(git) => git.load(&relative, index_version.as_deref())?,
         };
+        // A missing git entry can update the entire tree, including entries already read.
+        // Keep this read, but ask for the others again from that snapshot next time.
+        if matches!(&self.files, Files::Git(_)) && !was_updated && self.is_updated() {
+            self.read.lock().unwrap_or_else(PoisonError::into_inner).retain(|it, _| it == name);
+        }
         match response {
             LoadResponse::CacheValid => {
                 cached.context("registry said cache valid when no cache exists")

@@ -4,8 +4,9 @@
 //! and create their impls based on lowered data, see crates/hir-ty/src/builtin_derive.rs.
 
 use base_db::SourceDatabase;
-use hir_expand::{InFile, builtin::BuiltinDeriveExpander, name::Name};
+use hir_expand::{AstId, InFile, builtin::BuiltinDeriveExpander, name::Name};
 use intern::{Symbol, sym};
+use syntax::ast;
 use tt::TextRange;
 
 use crate::{
@@ -161,8 +162,29 @@ pub(crate) fn with_derive_traits(
 }
 
 impl BuiltinDeriveImplLoc {
+    /// Whether the derive is listed in a `#[derive_const(..)]`, which makes the impl a
+    /// `const impl`.
+    pub fn is_const(&self, db: &dyn SourceDatabase) -> bool {
+        let (adt_ast_id, module) = self.adt_source(db);
+        let (_, meta) = self.derive_attr_id.find_attr_range(db, module.krate(db), adt_ast_id);
+        meta.path()
+            .and_then(|path| path.as_single_name_ref())
+            .is_some_and(|name| name.text() == "derive_const")
+    }
+
     pub fn source(&self, db: &dyn SourceDatabase) -> InFile<TextRange> {
-        let (adt_ast_id, module) = match self.adt {
+        let (adt_ast_id, module) = self.adt_source(db);
+        let derive_range = self.derive_attr_id.find_derive_range(
+            db,
+            module.krate(db),
+            adt_ast_id,
+            self.derive_index,
+        );
+        adt_ast_id.with_value(derive_range)
+    }
+
+    fn adt_source(&self, db: &dyn SourceDatabase) -> (AstId<ast::Adt>, crate::ModuleId) {
+        match self.adt {
             AdtId::StructId(adt) => {
                 let adt_loc = adt.loc(db);
                 (adt_loc.id.upcast(), adt_loc.container)
@@ -175,13 +197,6 @@ impl BuiltinDeriveImplLoc {
                 let adt_loc = adt.loc(db);
                 (adt_loc.id.upcast(), adt_loc.container)
             }
-        };
-        let derive_range = self.derive_attr_id.find_derive_range(
-            db,
-            module.krate(db),
-            adt_ast_id,
-            self.derive_index,
-        );
-        adt_ast_id.with_value(derive_range)
+        }
     }
 }

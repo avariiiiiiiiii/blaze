@@ -113,10 +113,19 @@ fn enable_builtin_derive_fast_path() -> bool {
 pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(not(test))]
+thread_local! {
+    /// [`EXPAND_BUILTIN_DERIVES`] for the def maps computed on this thread only, so a test that
+    /// evaluates a derived method does not change what tests on other threads see.
+    pub static EXPAND_BUILTIN_DERIVES_ON_THIS_THREAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 #[inline]
 #[cfg(not(test))]
 fn enable_builtin_derive_fast_path() -> bool {
-    !EXPAND_BUILTIN_DERIVES.load(std::sync::atomic::Ordering::Relaxed)
+    !(EXPAND_BUILTIN_DERIVES.load(std::sync::atomic::Ordering::Relaxed)
+        || EXPAND_BUILTIN_DERIVES_ON_THIS_THREAD.get())
 }
 
 const PREDEFINED_TOOLS: &[SmolStr] = &[

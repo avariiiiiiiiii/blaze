@@ -73,7 +73,7 @@ build scripts the build never ran, and `env!` of their variables failed. A lock 
 missing or that the manifests no longer agree with is written as cargo writes it (2026-10-26),
 a registry package it does not pin chosen from the registry's index as cargo chooses it
 (blaze-registry's `IndexRegistry`, #321). What it does not read yet goes to cargo's `cargo
-metadata` with the reason printed: `[replace]`, a registry with a git index, a git or vendored
+metadata` with the reason printed: `[replace]`, a git or vendored
 package the lock file does not pin.
 `BLAZE_OWN_RESOLVE=0` sends every load to cargo.
 
@@ -276,3 +276,11 @@ schema of blaze's own over `toml::Value`: what a table reads and every message i
 come from the same serde walk as cargo's, `Value<T>` keeps where each value was defined, and a
 type cargo reads (cargo-util-schemas' `TomlProfile`) reads here unchanged. `cargo config get`
 prints with the `toml_edit` (`=0.25.12`) and `shell-escape` (`=0.1.5`) cargo 1.99 prints with.
+
+Git-index registries are read from their fetched tree without a checkout (#316). Cargo and
+blaze share the blob-versioned index cache; old commit-versioned caches are accepted too.
+`python3 harness/fetchdiff.py --git-index-only` compares a local two-package registry with
+Cargo and then tests offline cache exchange. `harness/gitindex.py` runs the same fixture
+through the `blaze fetch` CLI. Crates.io with `registries.crates-io.protocol = "git"` uses
+the same index implementation; `fetchdiff.py --git-index` selects it for the full corpus.
+Fetching the whole public index is not part of the local fixture.

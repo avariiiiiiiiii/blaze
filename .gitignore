@@ -1,5 +1,9 @@
 target*/
 __pycache__/
+# The standard library is upstream's file for file (harness/library.py check), `target/` source
+# directories included.
+!/library/**
+/library/target/
 # Built: `crates/blaze-wasm/web/build.sh` and `build-site.sh`.
 /crates/blaze-wasm/web/pkg/
 /site/playground/blaze/

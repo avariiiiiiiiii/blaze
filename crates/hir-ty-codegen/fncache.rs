@@ -50,12 +50,13 @@ use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     mir::{
-        AggregateKind, CastKind, MirBody, MirSpan, Operand, OperandKind, ProjectionElem, Rvalue,
-        StatementKind, TerminatorKind,
+        AggregateKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
+        TerminatorKind,
     },
     next_solver::{DbInterner, GenericArgs, ParamEnv, Ty, TyKind},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
+use hir_ty_mir::mir::purity::{is_const_pure, operands, raw_use};
 
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
@@ -1232,8 +1233,9 @@ impl<'db> Walk<'db> {
         let Ok(body) = body else { return };
         if self.tests {
             if let Some(span) = fn_from_data(db, body) {
-                let place =
-                    location(db, body, span).map(|it| format!(", at {it}")).unwrap_or_default();
+                let place = location(db, body.owner, span)
+                    .map(|it| format!(", at {it}"))
+                    .unwrap_or_default();
                 let what = describe(db, &self.nodes[at as usize].node);
                 let why = format!(
                     "it reaches {what}, which calls a function pointer made of data (a \
@@ -1245,7 +1247,7 @@ impl<'db> Walk<'db> {
             return;
         }
         if let Some((why, span)) = raw_use(body) {
-            let place = location(db, body, span);
+            let place = location(db, body.owner, span);
             self.nodes[at as usize].why = Some(Why { text: why.to_owned(), of_user: false, place });
         }
     }
@@ -1399,6 +1401,13 @@ impl<'db> Walk<'db> {
             if let Some(why) = &self.nodes[at as usize].why {
                 return Some(self.told(at, &parent, why));
             }
+            // A `const fn` with no generic arguments that is const-pure reaches nothing that is
+            // not: what a generic one calls by a trait can be a non-const `impl` at run time.
+            if let Node::Root(func) = self.nodes[at as usize].node
+                && is_const_pure(self.db, func)
+            {
+                continue;
+            }
             for (i, edge) in self.nodes[at as usize].edges.iter().enumerate() {
                 if !edge.codec && seen.insert(edge.to) {
                     parent.insert(edge.to, (at, i));
@@ -1473,14 +1482,14 @@ impl<'db> Walk<'db> {
                 if let StatementKind::Assign(_, rvalue) = &statement.kind
                     && operands(rvalue).into_iter().any(refers)
                 {
-                    return location(db, body, statement.span);
+                    return location(db, body.owner, statement.span);
                 }
             }
             let Some(terminator) = &block.terminator else { continue };
             if let TerminatorKind::Call { func, args, .. } = &terminator.kind
                 && (refers(func) || args.iter().any(refers))
             {
-                return location(db, body, terminator.span);
+                return location(db, body.owner, terminator.span);
             }
         }
         None
@@ -1905,8 +1914,12 @@ fn describe(db: &dyn HirDatabase, node: &Node) -> String {
 }
 
 /// File, line and column of a place in a body, the file relative to the workspace.
-fn location(db: &dyn HirDatabase, body: &MirBody<'_>, span: MirSpan) -> Option<String> {
-    let InferBodyId::DefWithBodyId(owner) = body.owner else { return None };
+pub(super) fn location(
+    db: &dyn HirDatabase,
+    owner: InferBodyId<'_>,
+    span: MirSpan,
+) -> Option<String> {
+    let InferBodyId::DefWithBodyId(owner) = owner else { return None };
     let (file, line, column) = super::source_location(db, owner, span)?;
     let root = db.file_source_root(file).source_root_id(db);
     let root = db.source_root(root).source_root(db);
@@ -1917,57 +1930,6 @@ fn location(db: &dyn HirDatabase, body: &MirBody<'_>, span: MirSpan) -> Option<S
         .map(|it| it.trim_start_matches('/').to_owned())
         .unwrap_or(path);
     Some(format!("{path}:{line}:{column}"))
-}
-
-fn operands(rvalue: &Rvalue) -> Vec<&Operand> {
-    match rvalue {
-        Rvalue::Use(it)
-        | Rvalue::Repeat(it, _)
-        | Rvalue::Cast(_, it, _)
-        | Rvalue::UnaryOp(_, it) => {
-            vec![it]
-        }
-        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => vec![a, b],
-        Rvalue::Aggregate(_, it) => it.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The first use of a raw pointer in `body` that makes what it gives depend on more than
-/// its arguments: a dereference, or an address taken as a number.
-fn raw_use(body: &MirBody<'_>) -> Option<(&'static str, MirSpan)> {
-    let raw = |place: &hir_ty_mir::mir::StoredPlace| {
-        matches!(place.projection.as_slice().first(), Some(ProjectionElem::Deref))
-            && matches!(body.locals[place.local].ty.as_ref().kind(), TyKind::RawPtr(..))
-    };
-    let operand_raw = |operand: &Operand| match &operand.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => raw(place),
-        _ => false,
-    };
-    for (_, block) in body.basic_blocks.iter() {
-        for statement in &block.statements {
-            let StatementKind::Assign(place, rvalue) = &statement.kind else {
-                if let StatementKind::InlineAsm(_) = &statement.kind {
-                    return Some(("has assembly in it", statement.span));
-                }
-                continue;
-            };
-            if let Rvalue::Cast(CastKind::PointerExposeAddress, ..) = rvalue {
-                return Some(("takes an address as a number", statement.span));
-            }
-            let read = match rvalue {
-                Rvalue::Ref(_, it)
-                | Rvalue::Len(it)
-                | Rvalue::Discriminant(it)
-                | Rvalue::CopyForDeref(it) => raw(it),
-                _ => operands(rvalue).into_iter().any(operand_raw),
-            };
-            if raw(place) || read {
-                return Some(("dereferences a raw pointer", statement.span));
-            }
-        }
-    }
-    None
 }
 
 /// What `body`, of core or alloc, does itself that is not pure; else the bodies of core and

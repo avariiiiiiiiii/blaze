@@ -469,7 +469,7 @@ def main():
     if not os.path.exists(os.path.join(bin_dir, "blaze")):
         raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
     if SANDBOXED:
-        probe = subprocess.run([os.environ["BLAZE_BIN"], "sandbox", "--probe"], capture_output=True, text=True)
+        probe = subprocess.run([os.environ["BLAZE_BIN"], "sandbox", "--probe", "--overlays"], capture_output=True, text=True)
         if probe.returncode != 0:
             raise SystemExit(f"there is no sandbox for the tests here (`BLAZE_SANDBOX=off` tests without):\n"
                              f"{probe.stderr.strip()}")

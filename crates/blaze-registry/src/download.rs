@@ -193,7 +193,7 @@ impl Registry {
         let url =
             crate_url(&config.dl, &package.name, &package.version.to_string(), &package.checksum);
         let token = match config.auth_required {
-            true => Some(self.sparse().context("a registry with a config.json")?.token(false)?),
+            true => Some(self.download_token()?),
             false => None,
         };
         let headers: Vec<(&str, &str)> =

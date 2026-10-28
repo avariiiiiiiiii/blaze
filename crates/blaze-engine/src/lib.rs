@@ -14,6 +14,7 @@ use blaze_cargo::{
 mod as_rustc;
 mod borrowck;
 mod check;
+mod consteval;
 mod content;
 mod doc;
 mod doctest;
@@ -4877,6 +4878,7 @@ fn link_executable(
         Ok(exports)
     });
     let exports = exports.transpose()?;
+    blaze_macro_wasm::flush();
     let took = link::executable(
         db,
         &program,
@@ -6265,6 +6267,8 @@ const SURE: &[&str] = &[
     "E0560",
     "E0583",
     "E0599",
+    "E0665",
+    "builtin-derive-error",
     "unresolved-macro-call",
 ];
 
@@ -7830,6 +7834,9 @@ pub fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("borrowck") {
         return borrowck::command(std::env::args().skip(2));
     }
+    if std::env::args().nth(1).as_deref() == Some("consteval") {
+        return consteval::command(std::env::args().skip(2));
+    }
     if std::env::args().nth(1).as_deref() == Some("compile-time-deps") {
         return compile_time_deps(std::env::args().skip(2));
     }
@@ -8763,6 +8770,7 @@ fn run_holding(
     write_harnesses(&mut db, texts);
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
     frozen::store(&db, &served)?;
+    blaze_macro_wasm::flush();
     for said in [blaze_expand::report(), blaze_macro_wasm::report()].into_iter().flatten() {
         eprintln!("{said}");
     }

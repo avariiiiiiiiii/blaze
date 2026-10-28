@@ -162,6 +162,8 @@ struct StackFrame<'db> {
     destination: Option<BasicBlockId>,
     prev_stack_ptr: usize,
     span: (MirSpan, InferBodyId<'db>),
+    /// The function called, when it is not a closure or what an evaluation starts from.
+    callee: Option<FunctionId>,
 }
 
 #[derive(Clone)]
@@ -188,6 +190,8 @@ pub struct Evaluator<'db> {
     /// doesn't say how much memory it can reach, its allocation does.
     allocations: [Vec<Allocated>; 2],
     code_stack: Vec<StackFrame<'db>>,
+    /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
+    running: Option<(Option<FunctionId>, (MirSpan, InferBodyId<'db>))>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
     static_locations: FxHashMap<StaticId, Address>,
@@ -452,7 +456,7 @@ pub fn interpret_mir<'db>(
 impl<'db> Evaluator<'db> {
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
-        let interval = self.interpret_mir(body, None.into_iter())?;
+        let interval = self.interpret_mir(body, None.into_iter(), None)?;
         let bytes = interval.get(self)?;
         let mut memory_map =
             self.create_memory_map(bytes, ty, &Locals { ptr: ArenaMap::new(), body })?;
@@ -510,6 +514,7 @@ impl<'db> Evaluator<'db> {
             heap: vec![0],
             allocations: Default::default(),
             code_stack: vec![],
+            running: None,
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
             static_locations: Default::default(),
@@ -783,6 +788,7 @@ impl<'db> Evaluator<'db> {
         &mut self,
         body: &'db MirBody<'db>,
         args: impl Iterator<Item = IntervalOrOwned>,
+        called: Option<(FunctionId, MirSpan, InferBodyId<'db>)>,
     ) -> Result<'db, Interval> {
         if let Some(it) = self.stack_depth_limit.checked_sub(1) {
             self.stack_depth_limit = it;
@@ -793,13 +799,19 @@ impl<'db> Evaluator<'db> {
         let (mut locals, prev_stack_ptr) = self.create_locals_for_body(body, None)?;
         self.fill_locals_for_body(body, &mut locals, args)?;
         let prev_code_stack = mem::take(&mut self.code_stack);
-        let span = (MirSpan::Unknown, body.owner);
-        self.code_stack.push(StackFrame { locals, destination: None, prev_stack_ptr, span });
+        let prev_running = self.running;
+        let (callee, span) = match called {
+            Some((callee, span, caller)) => (Some(callee), (span, caller)),
+            None => (None, (MirSpan::Unknown, body.owner)),
+        };
+        let frame = StackFrame { locals, destination: None, prev_stack_ptr, span, callee };
+        self.code_stack.push(frame);
         'stack: loop {
             let Some(mut my_stack_frame) = self.code_stack.pop() else {
                 not_supported!("missing stack frame");
             };
             let frame_body = my_stack_frame.locals.body;
+            self.running = Some((my_stack_frame.callee, my_stack_frame.span));
             let e = (|| {
                 let locals = &mut my_stack_frame.locals;
                 let body = locals.body.clone();
@@ -927,6 +939,7 @@ impl<'db> Evaluator<'db> {
                         *at = Some((frame_body.owner, span));
                     }
                     let my_code_stack = mem::replace(&mut self.code_stack, prev_code_stack);
+                    self.running = prev_running;
                     let mut error_stack = vec![];
                     for frame in my_code_stack.into_iter().rev() {
                         if let Some(f) = frame.locals.body.owner.as_function() {
@@ -945,6 +958,7 @@ impl<'db> Evaluator<'db> {
             match my_stack_frame.destination {
                 None => {
                     self.code_stack = prev_code_stack;
+                    self.running = prev_running;
                     self.stack_depth_limit += 1;
                     return Ok(return_interval);
                 }
@@ -2224,7 +2238,7 @@ impl<'db> Evaluator<'db> {
             let name = GeneralConstId::AnonConstId(konst).name(self.db);
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
         })?;
-        let result = self.interpret_mir(body, iter::empty())?;
+        let result = self.interpret_mir(body, iter::empty(), None)?;
         let ty = body.locals[return_slot()].ty.as_ref();
         let align = self.size_align_of(ty, locals)?.map_or(1, |it| it.1);
         let addr = self.heap_allocate(result.size, align)?;
@@ -3230,7 +3244,7 @@ impl<'db> Evaluator<'db> {
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
         let interval = self
-            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned))
+            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned), None)
             .map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
@@ -3424,13 +3438,20 @@ impl<'db> Evaluator<'db> {
         target_bb: Option<BasicBlockId>,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         if let Some(target_bb) = target_bb {
+            let span = (span, locals.body.owner);
             let (mut locals, prev_stack_ptr) =
                 self.create_locals_for_body(mir_body, Some(destination))?;
             self.fill_locals_for_body(mir_body, &mut locals, arg_bytes.into_iter())?;
-            let span = (span, locals.body.owner);
-            Ok(Some(StackFrame { locals, destination: Some(target_bb), prev_stack_ptr, span }))
+            Ok(Some(StackFrame {
+                locals,
+                destination: Some(target_bb),
+                prev_stack_ptr,
+                span,
+                callee: Some(def),
+            }))
         } else {
-            let result = self.interpret_mir(mir_body, arg_bytes).map_err(|e| {
+            let called = Some((def, span, locals.body.owner));
+            let result = self.interpret_mir(mir_body, arg_bytes, called).map_err(|e| {
                 MirEvalError::InFunction(
                     Box::new(e),
                     vec![(Either::Left(def), span, locals.body.owner)],
@@ -3779,6 +3800,7 @@ pub fn render_const_using_debug_impl<'db>(
         db.runtime_mir_body(format_fn.into())
             .map_err(|e| MirEvalError::MirLowerError(format_fn, e))?,
         [IntervalOrOwned::Borrowed(Interval { addr: arguments, size: ptr_size * 2 })].into_iter(),
+        None,
     )?;
     let message_string = interval.get(&evaluator)?;
     let words = [

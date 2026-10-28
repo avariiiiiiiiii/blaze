@@ -12,6 +12,7 @@ use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use stdx::never;
 
 use crate::{
+    InferBodyId,
     drop::{DropGlue, has_drop_glue},
     mir::eval::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
@@ -19,6 +20,7 @@ use crate::{
         MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, TypeIdOf, VTableOfBytes, VariantId,
         from_bytes, not_supported, pad16, try_const_usize,
     },
+    mir::location::{source_location_in_file, source_path, track_caller},
     next_solver::Region,
 };
 
@@ -1484,9 +1486,9 @@ impl<'db> Evaluator<'db> {
             }
             "const_deallocate" => Ok(()),
             "caller_location" => {
-                // A constant holds what rustc would name the file, which is known to whoever
-                // builds the program and not here.
-                not_supported!("the caller's location in a constant")
+                let site = self.caller_site(locals, span)?;
+                let location = self.location_of(site, locals)?;
+                destination.write_from_bytes(self, &location.to_bytes())
             }
             "box_new" => {
                 let ty = generic_args.type_at(0);
@@ -1716,6 +1718,78 @@ impl<'db> Evaluator<'db> {
             _ => erased,
         });
         Ok(ty.fold_with(&mut Anonymized(interner)))
+    }
+
+    /// Where `caller_location` asked at `span` of the body being run is: as rustc passes each
+    /// `#[track_caller]` function the place it is called from, the call of the innermost
+    /// function up the stack that does not track its caller.
+    fn caller_site(
+        &self,
+        locals: &Locals<'db>,
+        span: MirSpan,
+    ) -> Result<'db, (MirSpan, InferBodyId<'db>)> {
+        let tracks =
+            |callee: Option<FunctionId>| callee.is_some_and(|it| track_caller(self.db, it));
+        let frames = self.running.into_iter();
+        let mut frames = frames.chain(self.code_stack.iter().rev().map(|it| (it.callee, it.span)));
+        let mut site = (span, locals.body.owner);
+        loop {
+            let Some((callee, call)) = frames.next() else {
+                // The frames above are of an evaluation this one was started from.
+                if tracks(site.1.as_function()) {
+                    not_supported!("the caller's location past a call the evaluator nests");
+                }
+                return Ok(site);
+            };
+            if !tracks(callee) {
+                return Ok(site);
+            }
+            if call.0 == MirSpan::Unknown {
+                not_supported!("the caller's location of a call with no place");
+            }
+            site = call;
+        }
+    }
+
+    /// A `&'static Location<'static>` of `span` in `owner`, under the name the build gives its
+    /// file, which rustc's `Location::file` says.
+    fn location_of(
+        &mut self,
+        (span, owner): (MirSpan, InferBodyId<'db>),
+        locals: &Locals<'db>,
+    ) -> Result<'db, Address> {
+        let InferBodyId::DefWithBodyId(body) = owner else {
+            not_supported!("the caller's location in an anonymous constant");
+        };
+        let Some((file, line, col)) = *source_location_in_file(self.db, body, span) else {
+            not_supported!("the caller's location: no place for {span:?}");
+        };
+        let Some(name) = source_path(self.db, file) else {
+            not_supported!("the caller's location: the build did not name its file");
+        };
+        let Some(id) = self.lang_items().PanicLocation else {
+            not_supported!("no `Location` in core");
+        };
+        // The name is followed by a NUL that its length leaves out (`Location::file_as_c_str`).
+        let addr = self.heap_allocate(name.len() + 1, 1)?;
+        self.write_memory(addr, name.as_bytes())?;
+        self.write_memory(addr.offset(name.len()), &[0])?;
+        let args = GenericArgs::new_from_slice(&[Region::new_erased(self.interner()).into()]);
+        let (size, layout, tag) = self.layout_of_variant(id.into(), args, locals)?;
+        let fields = id.fields(self.db).fields().iter().map(|(_, field)| {
+            Ok(IntervalOrOwned::Owned(match field.name.as_str() {
+                "filename" | "file" => [addr.to_bytes(), super::word_bytes(name.len())].concat(),
+                "line" => line.to_le_bytes().into(),
+                "col" => col.to_le_bytes().into(),
+                "_filename" => Vec::new(),
+                other => not_supported!("a field `{other}` of `Location`"),
+            }))
+        });
+        let fields = fields.collect::<Result<'db, Vec<_>>>()?;
+        let bytes = self.construct_with_layout(size, &layout, tag, fields.into_iter())?;
+        let location = self.heap_allocate(size, layout.align.abi.bytes() as usize)?;
+        self.write_memory(location, &bytes)?;
+        Ok(location)
     }
 
     /// `text` as a `&'static str` in `destination`.

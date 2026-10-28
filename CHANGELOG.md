@@ -50,6 +50,10 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
 - Native proc macros receive real source positions, text and file paths through the bidirectional server protocol; a server that cannot enable source spans is refused (#823).
 - Invalid built-in derives now fail `blaze check` and `blaze build`, including `Default` on an enum without a default variant and derives on unsupported item shapes (#751).
+- `Location::caller()` in a constant is evaluated, as rustc does: the place of the first call up
+  the stack that does not track its caller, under the file name the build uses (#862). A function
+  with such a constant was refused. docs/support.md no longer lists it, nor `%` on floats or
+  `type_id` of a type with lifetimes in a constant, which already matched rustc.
 
 ## [0.20261028.2] - 2026-10-28
 

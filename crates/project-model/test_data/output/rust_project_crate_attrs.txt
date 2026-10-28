@@ -51,6 +51,10 @@
                 "test has no target data",
             ),
             toolchain: None,
+            const_eval: ConstEvalBudget {
+                steps: 1000000000,
+                memory: 1073741824,
+            },
         },
     },
 }

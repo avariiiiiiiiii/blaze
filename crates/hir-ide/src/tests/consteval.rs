@@ -22,7 +22,7 @@ use crate::{
 
 use crate::{
     consteval::ConstEvalError,
-    mir::{MirEvalError, MirLowerError},
+    mir::{Budget, MirEvalError, MirLowerError},
 };
 
 mod intrinsics;
@@ -3102,7 +3102,15 @@ fn exec_limits() {
         r#"
     const GOAL: usize = loop {};
     "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::ExecutionLimitExceeded),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Steps(10_000_000),
+                    at: Some(_),
+                })
+            )
+        },
     );
     check_fail(
         r#"
@@ -3111,7 +3119,15 @@ fn exec_limits() {
     }
     const GOAL: i32 = f(0);
     "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::ExecutionLimitExceeded),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Steps(10_000_000),
+                    at: Some(_),
+                })
+            )
+        },
     );
     // Reasonable code should still work
     check_number(
@@ -3149,9 +3165,13 @@ fn memory_limit() {
         };
         "#,
         |e| {
-            e == ConstEvalError::MirEvalError(MirEvalError::Panic(
-                "Memory allocation of 30000000000 bytes failed".to_owned(),
-            ))
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Memory(1_073_741_824),
+                    at: Some(_),
+                })
+            )
         },
     );
 }

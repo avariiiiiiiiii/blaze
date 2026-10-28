@@ -392,9 +392,17 @@ impl<'a> Driver<'a> {
         let wake = Condvar::new();
         let workers =
             std::thread::available_parallelism().map_or(1, |it| it.get()).div_ceil(4).max(4);
+        let slots = workers.min(tasks.len().max(1));
+        let counting = crate::events::Counting::new(
+            blaze_protocol::events::Step::BuildScripts,
+            tasks.len(),
+            slots,
+        );
+        let counting = &counting;
         std::thread::scope(|scope| {
-            for _ in 0..workers.min(tasks.len().max(1)) {
-                scope.spawn(|| {
+            for slot in 0..slots {
+                let (state, wake, tasks, then) = (&state, &wake, &tasks, &then);
+                scope.spawn(move || {
                     loop {
                         let mut held = lock(&state);
                         let at = loop {
@@ -410,7 +418,9 @@ impl<'a> Driver<'a> {
                         };
                         held.busy += 1;
                         drop(held);
+                        counting.on(slot, || self.shown(tasks[at].0));
                         let result = self.step(tasks[at].0);
+                        counting.done(slot);
                         let mut held = lock(&state);
                         held.busy -= 1;
                         held.done += 1;
@@ -443,6 +453,19 @@ impl<'a> Driver<'a> {
             tasks.len()
         );
         Ok(())
+    }
+
+    /// A step as the build's progress names it: `serde (build script)`.
+    fn shown(&self, task: Task) -> String {
+        let (at, what) = match task {
+            Task::Script(at) => (at, "compiling its build script"),
+            Task::Run(at) => (at, "running its build script"),
+            Task::Macro(at) => (at, "linking the proc macro"),
+        };
+        let name = self
+            .package(at)
+            .map_or_else(|_| self.unit(at).target.name.clone(), |it| it.name.clone());
+        format!("{name}, {what}")
     }
 
     fn step(&self, task: Task) -> anyhow::Result<()> {

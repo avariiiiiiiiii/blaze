@@ -241,8 +241,11 @@ impl Shown {
         match self.held.take() {
             Some(_) => {
                 let finished = live.build().finished.as_ref();
-                let last = finished.and_then(|it| blaze_ui::last_line(it, colored(), asked()));
-                eprint!("{}", last.map(|it| it + "\n").unwrap_or_default());
+                let last = finished.map(|it| blaze_ui::last_lines(it, colored(), asked()));
+                eprint!(
+                    "{}",
+                    last.unwrap_or_default().iter().map(|it| format!("{it}\n")).collect::<String>()
+                );
             }
             None => eprint!("{out}"),
         }

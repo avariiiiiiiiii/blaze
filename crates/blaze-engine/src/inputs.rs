@@ -292,7 +292,9 @@ impl Scripts {
             let value = env.map_or_else(|| was.clone(), |env| env.get(name));
             config.extra_env.insert(name.clone(), value);
         }
-        let said = self.workspace.run_build_scripts(&config, &|_| {})?;
+        let said = crate::events::within(crate::events::Step::BuildScripts, None, || {
+            self.workspace.run_build_scripts(&config, &|_| {})
+        })?;
         if let Some(error) = said.error() {
             anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));
         }

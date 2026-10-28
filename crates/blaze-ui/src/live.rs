@@ -2,10 +2,13 @@
 
 use blaze_protocol::events::{CrateState, Record};
 
-use crate::{Build, CYAN, Change, DIM, GREEN, last_line, paint, staying, took};
+use crate::{Build, CYAN, Change, DIM, GREEN, last_lines, paint, staying, took};
 
 /// The most crates the region lists by name; the rest under way are counted.
 const SHOWN: usize = 6;
+
+/// The most lines of the tree of crates ([`Live::tree`]).
+const TREE: usize = 10;
 
 /// Clears the region and draws it again as records come and time passes. What it returns is
 /// written to the terminal as it is.
@@ -65,7 +68,9 @@ impl Live {
             out.push('\n');
         }
         let finished = self.build.finished.as_ref();
-        if let Some(last) = finished.and_then(|it| last_line(it, self.color, self.errors_said)) {
+        for last in
+            finished.map(|it| last_lines(it, self.color, self.errors_said)).unwrap_or_default()
+        {
             out.push_str(&last);
             out.push('\n');
         }
@@ -105,7 +110,8 @@ impl Live {
         let since = |began: u64| took(now_ns.saturating_sub(began));
         let mut totals = Vec::new();
         let crates = build.crates.len();
-        if crates > 0 {
+        // With a graph, the tree's last line counts the crates.
+        if crates > 0 && build.graph.is_empty() {
             let done = build.crates.iter().filter(|it| it.ended_ns.is_some()).count();
             totals.push(format!("{done}/{crates} crates"));
         }
@@ -113,17 +119,29 @@ impl Live {
         if fns.total > 0 {
             totals.push(format!("{}/{} fns", fns.done, fns.total));
         }
-        let (word, what) = match build.running().last() {
+        // Between one step's end and the next one's start, the step that ended.
+        let step = build.running().last().or_else(|| build.steps.last());
+        let (word, what) = match step {
             Some(step) => (step.step.word(), format!("{} {}", step.what(), since(step.began_ns))),
-            None if build.steps.is_empty() => ("Waiting", format!("for the daemon {}", since(0))),
-            None => ("Finishing", since(0)),
+            None => ("Waiting", format!("for the daemon {}", since(0))),
         };
         let mut what = what;
+        // The step's own count says more than the totals: what it is doing now.
+        if let Some(count) = step.and_then(|it| it.count()) {
+            totals.insert(0, count);
+        }
+        if let Some(longest) = step.and_then(|it| it.progress.as_ref()?.longest.as_deref()) {
+            totals.push(format!("longest {longest}"));
+        }
         for total in &totals {
             what.push_str(" \u{b7} ");
             what.push_str(total);
         }
         let mut lines = vec![self.fit(GREEN, &format!("{word:>12}"), &what)];
+        if !build.graph.is_empty() {
+            lines.extend(self.tree(now_ns));
+            return lines;
+        }
         let mut running: Vec<_> =
             build.crates.iter().filter(|it| it.state == CrateState::Running).collect();
         // The longest under way first: what the build waits on.
@@ -153,6 +171,128 @@ impl Live {
             let done = format!("{built} built, {up_to_date} up to date");
             lines.push(self.fit(DIM, &format!("{:>12}", ""), &done));
         }
+        lines
+    }
+
+    /// The crates under way as a tree, from the program down what it waits for: each crate
+    /// being resolved, checked or compiled with what it did so far and for how long, under
+    /// the crates waiting for it; what is done is left out, and counted in the last line with
+    /// the longest chain so far.
+    ///
+    /// ```text
+    ///             anim waiting
+    ///             ├─ wgpu  compiling 1201 fns  4.10s
+    ///             └─ winit  resolving  0.80s
+    ///             98 done (40 up to date) · 2 under way · 21 waiting · longest chain 41.2s: anim ← wgpu
+    /// ```
+    fn tree(&self, now_ns: u64) -> Vec<String> {
+        let build = &self.build;
+        let graph = &build.graph;
+        let krate = |node: usize| &build.crates[graph[node].row];
+        let busy = |node: usize| krate(node).is_busy();
+        // Whether the node or something it waits for is under way; the graph lists each
+        // node after what it waits for.
+        let mut under_way = vec![false; graph.len()];
+        let mut waited_for = vec![false; graph.len()];
+        for (at, node) in graph.iter().enumerate() {
+            under_way[at] = busy(at) || node.deps.iter().any(|&dep| under_way[dep]);
+            for &dep in &node.deps {
+                waited_for[dep] = true;
+            }
+        }
+        let mut lines = Vec::new();
+        // By row: the nodes of a crate are one line.
+        let mut shown = vec![false; build.crates.len()];
+        // Depth first from each node nothing waits for, the branch busy longest first.
+        // A root has no glyph; `indent` is what the lines of its children start with.
+        let mut stack: Vec<(usize, String, Option<bool>)> = (0..graph.len())
+            .rev()
+            .filter(|&at| !waited_for[at] && under_way[at])
+            .map(|at| (at, String::new(), None))
+            .collect();
+        while let Some((node, indent, last)) = stack.pop() {
+            let row = graph[node].row;
+            if shown[row] {
+                continue;
+            }
+            if lines.len() == TREE {
+                break;
+            }
+            shown[row] = true;
+            let glyph = match last {
+                None => "",
+                Some(true) => "\u{2514}\u{2500}",
+                Some(false) => "\u{251c}\u{2500}",
+            };
+            let it = krate(node);
+            let rest = match it.is_busy() {
+                true => {
+                    let fns = match (it.fns.total, it.fns.done) {
+                        (_, 0) => String::new(),
+                        (0, done) => format!(" {done} fns"),
+                        (total, done) => format!(" {done}/{total} fns"),
+                    };
+                    let since = took(now_ns.saturating_sub(it.since_ns));
+                    format!("{}  {}{fns}  {since}", it.name, it.word())
+                }
+                false => format!("{} waiting", it.name),
+            };
+            // A crate's branches start under its name.
+            let word = match last {
+                None => format!("{:12}", ""),
+                Some(_) => format!("{:13}{indent}{glyph}", ""),
+            };
+            lines.push(self.fit(CYAN, &word, &rest));
+            let mut deps: Vec<usize> = graph[node]
+                .deps
+                .iter()
+                .copied()
+                .filter(|&it| under_way[it] && !shown[graph[it].row])
+                .collect();
+            deps.sort_by_key(|&it| std::cmp::Reverse(krate(it).busy_ns(now_ns)));
+            // Deeper than this, a chain goes on at the same indent.
+            let indent = match last {
+                Some(last) if indent.chars().count() < 3 * 5 => {
+                    indent + if last { "   " } else { "\u{2502}  " }
+                }
+                _ => indent,
+            };
+            for (at, &dep) in deps.iter().enumerate().rev() {
+                stack.push((dep, indent.clone(), Some(at + 1 == deps.len())));
+            }
+        }
+        let mut rows: Vec<usize> = graph.iter().map(|it| it.row).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let hidden = rows.iter().filter(|&&it| build.crates[it].is_busy() && !shown[it]).count();
+        if hidden > 0 {
+            let more = format!("{hidden} more under way");
+            lines.push(self.fit(CYAN, &format!("{:12}", ""), &more));
+        }
+        let count = |state: fn(CrateState) -> bool| {
+            build.crates.iter().filter(|it| state(it.state)).count()
+        };
+        let done = count(CrateState::is_done);
+        let up_to_date = count(|it| it == CrateState::UpToDate);
+        let busy_now = count(|it| {
+            matches!(it, CrateState::Resolving | CrateState::Checking | CrateState::Running)
+        });
+        let waiting = build.crates.len() - done - busy_now;
+        let mut footer = format!("{done} done");
+        if up_to_date > 0 {
+            footer.push_str(&format!(" ({up_to_date} up to date)"));
+        }
+        footer.push_str(&format!(" \u{b7} {busy_now} under way \u{b7} {waiting} waiting"));
+        let (chain, chain_ns) = build.critical_path(now_ns);
+        if chain.len() > 1 && chain_ns > 0 {
+            let names: Vec<&str> = chain.iter().map(|&it| build.crates[it].name.as_str()).collect();
+            footer.push_str(&format!(
+                " \u{b7} longest chain {}: {}",
+                took(chain_ns),
+                names.join(" \u{2190} ")
+            ));
+        }
+        lines.push(self.fit(DIM, &format!("{:12}", ""), &footer));
         lines
     }
 

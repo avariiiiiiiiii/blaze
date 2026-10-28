@@ -595,7 +595,10 @@ fn standard_library_once(sysroot: &Path, store: &Path, dir: &Path) -> Result<(),
     key.field(keyed::toolchain(sysroot).as_bytes());
     let key: String = key.done()[..8].iter().map(|it| format!("{it:02x}")).collect();
     once(&store.join(format!("scripts-std-{key}")), || {
-        build_nothing(sysroot, dir, store, true).map(drop)
+        let of = Some("the standard library of build scripts");
+        crate::events::within(blaze_protocol::events::Step::Std, of, || {
+            build_nothing(sysroot, dir, store, true).map(drop)
+        })
     })
 }
 

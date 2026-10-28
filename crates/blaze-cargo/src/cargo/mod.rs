@@ -415,7 +415,7 @@ fn asking(checkout: &Checkout) -> Checkout {
 /// What the store of compiled code holds and may hold, and where it is.
 fn store_status() -> String {
     let Some(dir) = daemon::store() else {
-        return "store: none (BLAZE_CACHE says so)".to_owned();
+        return format!("store: none ({})", daemon::no_store());
     };
     let held = blaze_store::StoreDir::at(&dir).stats().map_or(0, |it| it.held());
     let most = match blaze_store::limit_for(&dir) {

@@ -3334,7 +3334,9 @@ fn workspace_at(
                     };
                     config = &own_config;
                 }
-                workspace.run_build_scripts(config, &|_| {})?
+                events::within(events::Step::BuildScripts, None, || {
+                    workspace.run_build_scripts(config, &|_| {})
+                })?
             }
         };
         // A crate whose script did not run is read without what it writes: thiserror's
@@ -3527,16 +3529,19 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: us
     // dependencies are not resolved resolves them itself, one after the other.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let helping = std::sync::atomic::AtomicUsize::new(0);
+    let counting = events::Counting::new(events::Step::Resolve, crates.len(), threads);
     std::thread::scope(|scope| {
-        for _ in 0..threads {
+        for slot in 0..threads {
             let db = db.clone();
-            let (next, helping) = (&next, &helping);
+            let (next, helping, counting) = (&next, &helping, &counting);
             scope.spawn(move || {
                 while let Some(&krate) =
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
                     let start = Instant::now();
                     let before = memory::live();
+                    counting.on(slot, || crate_shown(&db, krate));
+                    events::crate_is(krate, events::CrateState::Resolving);
                     hir::attach_db(&db, || {
                         _ = hir::crate_def_map(&db, krate);
                         let names = start.elapsed();
@@ -3572,10 +3577,24 @@ fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: us
                             );
                         }
                     });
+                    events::crate_is(krate, events::CrateState::Resolved);
+                    counting.done(slot);
                 }
             });
         }
     });
+}
+
+/// A crate as a person names it: its name, or `std` for the standard library's.
+fn crate_shown(db: &RootDatabase, krate: ide_db::base_db::Crate) -> String {
+    match krate.data(db).origin.is_lang() {
+        true => "std".to_owned(),
+        false => krate
+            .extra_data(db)
+            .display_name
+            .as_ref()
+            .map_or_else(|| "?".to_owned(), |it| it.to_string()),
+    }
 }
 
 /// Does what finding the impls of `krate` asks of each impl and each body that may hold one,
@@ -6333,15 +6352,21 @@ fn broken_in(
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let refuse_borrowck = std::env::var_os("BLAZE_BORROWCK_REFUSE").is_none_or(|it| it != "0");
+    // The check of one file is an edit's, over before anyone would look.
+    let counting = match edited.len() {
+        0 | 1 => events::Counting::none(),
+        files => events::Counting::new(events::Step::Check, files, threads.min(files)),
+    };
     let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
-                let (db, config, within) = (db.clone(), &config, &within);
+                let (db, config, within, counting) = (db.clone(), &config, &within, &counting);
                 scope.spawn(move || {
                     let files = edited.iter().skip(part).step_by(threads);
                     hir::attach_db(&db, || {
                         files
                             .flat_map(|&file| {
+                                counting.on(part, || shown(watched, file, root));
                                 // A library's files are its unit tests' too, with what is
                                 // under `cfg(test)`: each crate built of them says what it
                                 // finds, where rust-analyzer would ask the first.
@@ -6362,7 +6387,9 @@ fn broken_in(
                                 let each = each.into_iter().flat_map(move |within| {
                                     errors_of(db, config, file, within, rules)
                                 });
-                                each.collect::<Vec<_>>()
+                                let found = each.collect::<Vec<_>>();
+                                counting.done(part);
+                                found
                             })
                             .collect::<Vec<_>>()
                     })
@@ -8773,6 +8800,7 @@ fn run_holding(
     }
     events::at(events::Step::Resolve, None);
     let built = built_crates(&db, &args)?;
+    events::graph(&db, &built);
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
     // what named them is read again.
@@ -8792,6 +8820,7 @@ fn run_holding(
     let texts = harnesses(&db, [&args], None);
     write_harnesses(&mut db, texts);
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+    events::at(events::Step::Store, Some("the resolved names"));
     frozen::store(&db, &served)?;
     blaze_macro_wasm::flush();
     for said in [blaze_expand::report(), blaze_macro_wasm::report()].into_iter().flatten() {
@@ -8829,6 +8858,7 @@ fn run_holding(
     // Beside cargo the symbols were read as cargo wrote them, and are there a moment after
     // the names are resolved: a compile started now would hold up readiness past that.
     if !beside {
+        events::at(events::Step::Codegen, Some("ahead"));
         lower_until(&mut db, &args, &listed, cores(), true, &|| table.is_finished())?;
     }
     let (table, whole) =
@@ -8880,6 +8910,11 @@ fn run_holding(
         let mut edited: Vec<_> = paths.keys().copied().collect();
         edited.sort_unstable();
         let sources = Sources { paths };
+        let what = match edited.len() {
+            1 => "the edited file".to_owned(),
+            files => format!("{files} edited files"),
+        };
+        events::at(events::Step::Check, Some(&what));
         let broken = broken_in(&db, &edited, &sources, &args.checkout, None, !args.lints_capped);
         let why =
             hir::attach_db(&db, || refusal(&db, &edited, &sources, &args.checkout, broken, None));
@@ -8963,6 +8998,12 @@ fn run_holding(
         if let Some(why) = cold.refused_reached(&args) {
             bail!("{why}");
         }
+        if events::heard() {
+            events::built(&db, &shown_crate(&db, &args), &known.stats, None);
+            if !served {
+                events::cache(&known.stats);
+            }
+        }
         // No rustc checked the source of a build with nothing of rustc's: the worker
         // does, all of it the build compiles and the code nothing reaches too, as rustc
         // would. An error fails every build of the checkout until a source is written
@@ -9023,7 +9064,6 @@ fn run_holding(
         memory::report(&mut db, "build")?;
         report_stats(&known.stats);
         let named = shown_crate(&db, &args);
-        events::built(&db, &named, &known.stats, None);
         events::at(events::Step::Link, Some(&named));
         link(
             args.link_cmd.as_deref(),
@@ -9053,6 +9093,7 @@ fn run_holding(
             }
         }
         if let (Some(key), false) = (&manifest_key, served) {
+            events::at(events::Step::Store, Some("the manifest"));
             let start = Instant::now();
             let checked = match manifest_mode {
                 Some(manifest::Mode::Check) => manifest::check(&db, &args, key, &cold.wrote)
@@ -9086,6 +9127,7 @@ fn run_holding(
     // step once the pull is over, which its builds do not wait for.
     let once = args.socket.is_none() && !args.watch;
     if once && let Some(pulling) = pulling.take() {
+        events::at(events::Step::Remote, None);
         shared = pulled(pulling)?;
     }
     match (shared, pulling) {

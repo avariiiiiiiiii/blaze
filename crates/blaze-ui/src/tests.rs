@@ -1,4 +1,6 @@
-use blaze_protocol::events::{Cause, CrateState, Event, Fns, Record, Step, Summary};
+use blaze_protocol::events::{
+    Cache, Cause, CrateState, Event, Fns, NodeKind, NodeState, Record, Step, Summary,
+};
 
 use crate::{Live, Plain, summary_line, took};
 
@@ -73,8 +75,7 @@ fn edit() -> Vec<Record> {
                         ("draw".into(), callee()),
                         ("tick".into(), callee()),
                     ],
-                    more: 0,
-                    error: None,
+                    ..Summary::default()
                 },
             },
         ),
@@ -208,6 +209,147 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
     );
 }
 
+fn crate_is(name: &str, state: CrateState, done: u64) -> Event {
+    Event::Crate { name: name.into(), state, fns: Fns { total: 0, done, kept: 0 } }
+}
+
+fn node(id: u32, kind: NodeKind, name: &str, deps: &[u32]) -> Event {
+    Event::Node { id, kind, name: name.into(), deps: deps.to_vec() }
+}
+
+/// anim's graph, cut down: the standard library, libc, two crates that use it and anim.
+fn graph() -> Vec<Event> {
+    vec![
+        node(10, NodeKind::Std, "std", &[]),
+        node(11, NodeKind::Names, "libc", &[10]),
+        node(12, NodeKind::Names, "winit", &[10, 11]),
+        node(13, NodeKind::Names, "wgpu", &[10, 11]),
+        node(14, NodeKind::Names, "anim", &[12, 13]),
+    ]
+}
+
+fn graphed() -> Vec<Record> {
+    vec![
+        at(0, Event::Began { build: 1, command: "run".into(), root: "/w/anim".into() }),
+        at(0, Event::Started { step: Step::Resolve, of: None }),
+    ]
+    .into_iter()
+    .chain(graph().into_iter().map(|it| at(0, it)))
+    .chain([
+        at(100 * MS, crate_is("std", CrateState::Resolving, 0)),
+        at(S, crate_is("std", CrateState::Resolved, 0)),
+        at(S, crate_is("libc", CrateState::Resolving, 0)),
+        at(1500 * MS, crate_is("libc", CrateState::Resolved, 0)),
+        at(1500 * MS, crate_is("winit", CrateState::Resolving, 0)),
+        at(1500 * MS, crate_is("wgpu", CrateState::Resolving, 0)),
+        at(
+            2 * S,
+            Event::Progress {
+                step: Step::Resolve,
+                done: 2,
+                total: 5,
+                longest: Some("winit".into()),
+            },
+        ),
+    ])
+    .collect()
+}
+
+/// With the graph of its crates, the region is a tree: what is under way, below what waits
+/// for it, each with what it is doing and for how long; what is done or waits is counted in
+/// the last line, with the longest chain so far.
+#[test]
+fn the_region_is_a_tree_of_the_crates_under_way() {
+    let mut live = Live::new(120, false);
+    let mut drawn = String::new();
+    for record in graphed() {
+        drawn = live.record(&record, record.at_ns);
+    }
+    drawn = live.tick(3 * S);
+    let region: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    assert_eq!(
+        region,
+        [
+            "   Resolving names 3.00s \u{b7} 2/5 crates \u{b7} longest winit",
+            "             anim waiting",
+            "             \u{251c}\u{2500} winit  resolving  1.50s",
+            "             \u{2514}\u{2500} wgpu  resolving  1.50s",
+            "             0 done \u{b7} 2 under way \u{b7} 3 waiting \u{b7} longest chain 2.90s: anim \u{2190} \
+             wgpu \u{2190} libc \u{2190} std",
+        ]
+    );
+}
+
+/// The driver's nodes that are no crate's (docs/driver.md) are lines of their own, moved by
+/// their [`Event::Moved`]s: a build script compiling waits for nothing, its run for it.
+#[test]
+fn a_build_script_is_a_node_of_its_own() {
+    let mut live = Live::new(120, false);
+    let records = [
+        at(0, Event::Began { build: 1, command: "build".into(), root: "/w/rg".into() }),
+        at(0, Event::Started { step: Step::BuildScripts, of: None }),
+        at(0, node(0, NodeKind::Script, "anyhow", &[])),
+        at(0, node(1, NodeKind::ScriptRun, "anyhow", &[0])),
+        at(0, node(2, NodeKind::Macro, "serde_derive", &[])),
+        at(100 * MS, Event::Moved { id: 0, state: NodeState::Running }),
+        at(100 * MS, Event::Moved { id: 2, state: NodeState::Running }),
+        at(900 * MS, Event::Moved { id: 2, state: NodeState::Cached { remote: false } }),
+    ];
+    for record in &records {
+        live.record(record, record.at_ns);
+    }
+    let drawn = live.tick(2 * S);
+    let region: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    assert_eq!(
+        region,
+        [
+            "    Building build scripts and proc macros 2.00s",
+            "             anyhow build script  compiling  1.90s",
+            "             1 done (1 up to date) \u{b7} 1 under way \u{b7} 0 waiting",
+        ]
+    );
+}
+
+/// A build that took long ends saying why: its slowest steps, and what the store had and,
+/// of a cold one, why it had nothing.
+#[test]
+fn a_long_build_says_why_it_took_as_long_as_it_did() {
+    let mut build = crate::Build::default();
+    let steps = [
+        (Step::LoadWorkspace, None, 0, 10_700),
+        (Step::Resolve, None, 10_700, 13_100),
+        (Step::Codegen, Some("anim"), 13_100, 17_300),
+        (Step::Check, Some("14 files"), 17_300, 117_300),
+        (Step::Link, Some("anim"), 117_300, 117_400),
+    ];
+    for (step, of, began, ended) in steps {
+        let of: Option<String> = of.map(Into::into);
+        build.apply(&at(began * MS, Event::Started { step, of: of.clone() }));
+        build.apply(&at(ended * MS, Event::Ended { step, of }));
+    }
+    let cold = Some("cache keys changed since blaze 0.20261027.0 (fb82b09)".into());
+    build.apply(&at(
+        17 * S,
+        Event::Cache { cache: Cache { found: 0, fetched: 0, compiled: 77917, cold } },
+    ));
+    build.apply(&at(17 * S, crate_is("anim", CrateState::Built, 77917)));
+    let summary = build.summary(117_400 * MS, None);
+    let finished = crate::Finished { ok: true, summary, at_ns: 117_400 * MS };
+    let lines = crate::last_lines(&finished, false, true);
+    assert_eq!(
+        lines,
+        [
+            "    Compiled 77917 fns in 1 crate, 0 kept; 1m57s",
+            "        Took 1m57s: checking 14 files 1m40s, loading workspace 10.7s, compiling anim 4.20s",
+            "       Cache cold: cache keys changed since blaze 0.20261027.0 (fb82b09)",
+        ]
+    );
+    // A quick build says nothing more than it did.
+    let quick =
+        crate::Finished { summary: build.summary(400 * MS, None), at_ns: 400 * MS, ..finished };
+    assert_eq!(crate::last_lines(&quick, false, true).len(), 1);
+}
+
 /// The lines that stay are those before the region: the region is its header, the crates
 /// under way and the count of those done. A test of the renderer's own text, with no color.
 fn region_len(lines: &[&str]) -> usize {
@@ -217,7 +359,6 @@ fn region_len(lines: &[&str]) -> usize {
             || it.starts_with("   Resolving names ")
             || it.starts_with("     Linking anim ")
             || it.starts_with("     Waiting ")
-            || it.starts_with("   Finishing ")
     });
     header.map_or(0, |at| lines.len() - at)
 }

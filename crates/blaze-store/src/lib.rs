@@ -62,6 +62,8 @@ pub const KEY: usize = 32;
 pub const FORMAT: u32 = 3;
 const MAGIC: &[u8; 8] = b"blazepk\x03";
 const VERSION_FILE: &str = "version";
+/// The blaze that added to the store last ([`Store::last_writer`]).
+const WRITER_FILE: &str = "written-by";
 const LOCK_FILE: &str = "lock";
 /// The key, the length of the value and the checksum of the record.
 const HEADER: usize = KEY + 4 + 4;
@@ -1665,6 +1667,22 @@ impl Store {
     /// directory that cannot be used is said once, and the process compiles without one.
     pub fn global() -> Option<&'static Store> {
         Store::global_or(None)
+    }
+
+    /// The blaze that added to the store last, as [`Store::note_writer`] said it. Entries
+    /// are keyed by the program that compiled them ([`Identity`]): a build by another finds
+    /// none of that one's, which is why it is cold.
+    pub fn last_writer(&self) -> Option<String> {
+        let text = self.dir.read(WRITER_FILE).ok()?;
+        Some(String::from_utf8_lossy(&text).trim().to_owned()).filter(|it| !it.is_empty())
+    }
+
+    /// Says `who` added to the store last.
+    pub fn note_writer(&self, who: &str) -> io::Result<()> {
+        if self.last_writer().as_deref() == Some(who) {
+            return Ok(());
+        }
+        self.dir.write_whole(WRITER_FILE, format!("{who}\n").as_bytes())
     }
 
     /// The store of this process: the directory `BLAZE_CACHE` names, or `otherwise` when the

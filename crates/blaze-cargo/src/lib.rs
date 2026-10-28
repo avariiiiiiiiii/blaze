@@ -18,6 +18,7 @@ pub mod deps;
 pub mod doctest;
 pub mod engine;
 pub mod errors;
+pub mod events;
 pub mod link;
 pub mod live;
 pub mod memory;

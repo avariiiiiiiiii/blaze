@@ -43,7 +43,7 @@ PROJECTS = {
     "daemon": (".", ["-p", "blaze-engine"]),
     "life": ("demo/life", []),
 }
-UNITS_DIR = ROOT / "nix" / "units"
+UNITS_DIR = ROOT / "tools" / "nix" / "units"
 
 
 class StepError(Exception):

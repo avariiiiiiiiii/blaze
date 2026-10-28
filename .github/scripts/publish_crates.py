@@ -422,7 +422,9 @@ def staged_manifest(c: Crate, by_dir: dict[Path, Crate], stage: Path) -> dict[st
                 del table[key]
                 pruned.add(key)
                 continue
-            if isinstance(spec, dict) and spec.get("workspace"):
+            if isinstance(spec, str):
+                spec = {"version": spec}
+            if spec.get("workspace"):
                 continue  # the staged workspace's table names it
             dep = by_dir[d]
             new = {

@@ -19,7 +19,7 @@ use crate::{
 /// implements `Named` for it with `LEN`, that name's length. Its `String` is the three words
 /// the standard library's is, made with `const_allocate`, the nightly's const heap.
 const MACROS: &str = r#"
-//- minicore: sized, copy, transmute
+//- minicore: sized, copy, derive, transmute
 //- /macros.rs crate:proc-macro:macros
 #[rustc_intrinsic]
 const unsafe fn const_allocate(size: usize, align: usize) -> *mut u8;

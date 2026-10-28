@@ -45,7 +45,7 @@ commit of main whose `ci` check is green (main moves faster than its gate, so th
 HEAD itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N`
 through the API and dispatches `release.yaml` on the tag, when
 
-- something besides the docs (`docs/`, `site/`, `agents/`, `*.md`) and the bots' own commits
+- something besides the docs (`docs/`, `site/`, `tools/agents/`, `*.md`) and the bots' own commits
   changed from the newest release to that commit,
 - no `release-cut.yaml` is running and no `release.yaml` is building a release (a run on a
   branch is not one), and the newest release is at least 30
@@ -61,7 +61,7 @@ keeps the version of the last release commit.
 
 `release-cut.yaml` (by hand, on main) or the release train's `release` job still cuts a release
 the old way: it commits `release: v0.YYYYMMDD.N` (the version, a CHANGELOG.md section, Cargo.lock,
-nix/units) and tags it, and that release's notes are its CHANGELOG.md section. Both count every
+tools/nix/units) and tags it, and that release's notes are its CHANGELOG.md section. Both count every
 tag, so they never take the same number.
 
 Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux

@@ -522,6 +522,27 @@ fn wrapping_add() {
 }
 
 #[test]
+fn compare_bytes() {
+    check_number(
+        r#"
+        #[rustc_intrinsic]
+        pub const unsafe fn compare_bytes(left: *const u8, right: *const u8, bytes: usize) -> i32;
+
+        const GOAL: i32 = unsafe {
+            let a = [1u8, 2, 3, 4];
+            let b = [1u8, 2, 4, 0];
+            let lt = compare_bytes(&a as *const [u8; 4] as *const u8, &b as *const [u8; 4] as *const u8, 4);
+            let eq = compare_bytes(&a as *const [u8; 4] as *const u8, &b as *const [u8; 4] as *const u8, 2);
+            let gt = compare_bytes(&b as *const [u8; 4] as *const u8, &a as *const [u8; 4] as *const u8, 3);
+            let none = compare_bytes(&a as *const [u8; 4] as *const u8, &b as *const [u8; 4] as *const u8, 0);
+            (lt + 2) * 1000 + (eq + 2) * 100 + (gt + 2) * 10 + none + 2
+        };
+        "#,
+        1232,
+    );
+}
+
+#[test]
 fn ptr_offset_from() {
     check_number(
         r#"

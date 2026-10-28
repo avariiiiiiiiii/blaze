@@ -26,6 +26,7 @@ pub mod own_macro;
 pub mod own_script;
 pub mod package;
 pub mod plan;
+pub mod report;
 pub mod results;
 pub mod run;
 pub mod sandboxed;

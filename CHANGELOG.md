@@ -23,6 +23,15 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Changed
 
+- `blaze test` keeps a hermetic test's pass by its code, with no opt-in (#836): a test whose
+  reachable code reaches no file, environment variable, socket, other process, foreign code,
+  inline assembly, unbounded indirect call, writable shared static or code blaze can't compile
+  runs again only when that code changes. Every other test runs every time. Each test, whether
+  it is hermetic and why not (a kind, what it reaches and the fewest calls to it) is written to
+  `target/blaze/tests.ndjson`, with counts and the reasons that keep the most tests running in
+  `target/blaze/tests.summary.json`; `blaze test --why` prints them as a table, and
+  `--why --json` as the NDJSON lines. `BLAZE_TESTS=all` runs every test. Sandboxed tests stay an
+  experimental opt-in.
 - Release profiles build with LLVM at the profile's level (#831): `opt-level` 2 and 3
   (`release`, `bench`, a profile that inherits them) build at `-O2` and `-O3`, `s` and `z` at
   `-O2`, and 0 and 1 (`dev`, `test`) stay on Cranelift. `BLAZE_BACKEND` and `BLAZE_OPT` still

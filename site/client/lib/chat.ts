@@ -59,7 +59,26 @@ const close = el('button', 'chat-x');
 close.type = 'button';
 close.setAttribute('aria-label', 'Close the chat');
 close.textContent = '×';
-head.append(title, online, close);
+/** Line icons for the head's buttons (16px, stroked in currentColor). */
+function icon(d: string): SVGSVGElement {
+	const ns = 'http://www.w3.org/2000/svg';
+	const svg = document.createElementNS(ns, 'svg');
+	svg.setAttribute('viewBox', '0 0 16 16');
+	svg.setAttribute('aria-hidden', 'true');
+	const p = document.createElementNS(ns, 'path');
+	p.setAttribute('d', d);
+	svg.append(p);
+	return svg;
+}
+const BELL = 'M4 11V7a4 4 0 0 1 8 0v4l1 1.5H3L4 11ZM6.5 14h3';
+const BELL_OFF = 'M4 11V7a4 4 0 0 1 6.6-3M12 7v4l1 1.5H5M6.5 14h3M2.5 2.5l11 11';
+const GROW = 'M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9';
+const SHRINK = 'M13.5 6.5h-4v-4M2.5 9.5h4v4M9.5 6.5 14 2M6.5 9.5 2 14';
+const mute = el('button', 'chat-x chat-mute');
+mute.type = 'button';
+const full = el('button', 'chat-x chat-full');
+full.type = 'button';
+head.append(title, online, mute, full, close);
 const list = el('div', 'chat-list');
 list.setAttribute('role', 'log');
 list.setAttribute('aria-live', 'polite');
@@ -79,6 +98,67 @@ panel.id = 'chat';
 const badge = el('span', 'tl-badge');
 badge.hidden = true;
 button.append(el('span', 'tl-chat-icon'), el('span', 'tl-label', 'Chat'), badge);
+
+const MUTE_KEY = 'blaze.chat.mute';
+function muted(): boolean {
+	try {
+		return localStorage.getItem(MUTE_KEY) === '1';
+	} catch {
+		return false;
+	}
+}
+function drawMute(): void {
+	const m = muted();
+	mute.replaceChildren(icon(m ? BELL_OFF : BELL));
+	mute.classList.toggle('on', m);
+	mute.title = m ? 'Muted: no pop-ups while the chat is shut' : 'Mute pop-ups while the chat is shut';
+	mute.setAttribute('aria-label', mute.title);
+	mute.setAttribute('aria-pressed', String(m));
+}
+function setMuted(m: boolean): void {
+	try {
+		if (m) localStorage.setItem(MUTE_KEY, '1');
+		else localStorage.removeItem(MUTE_KEY);
+	} catch {
+		// Storage refused: the choice lasts this page.
+	}
+	drawMute();
+	if (m) for (const t of toasts.children) t.remove();
+}
+
+/** Full screen: the chat over the whole content pane, the sidebar still beside it. Esc or the button again leaves. */
+function setFull(on: boolean): void {
+	document.body.classList.toggle('chat-full', on);
+	full.replaceChildren(icon(on ? SHRINK : GROW));
+	full.title = on ? 'Leave full screen' : 'Full screen';
+	full.setAttribute('aria-label', full.title);
+	full.setAttribute('aria-pressed', String(on));
+	if (on) toBottom();
+}
+
+/** Pop-ups for messages that come while the chat is shut (not muted): the newest three, each a few seconds. */
+const toasts = el('div', 'chat-toasts');
+toasts.setAttribute('aria-live', 'polite');
+const TOAST_MS = 5000;
+function toast(m: Msg): void {
+	if (muted() || !panel.hidden) return;
+	const t = el('button', 'chat-toast');
+	t.type = 'button';
+	const words = el('span', 'chat-toast-words');
+	words.append(el('b', '', m.login), el('span', '', m.text));
+	t.append(face(m), words);
+	t.title = 'Open the chat';
+	t.addEventListener('click', () => {
+		setOpen(true);
+		t.remove();
+	});
+	toasts.prepend(t);
+	while (toasts.children.length > 3) toasts.lastElementChild?.remove();
+	setTimeout(() => {
+		t.classList.add('out');
+		setTimeout(() => t.remove(), 250);
+	}, TOAST_MS);
+}
 
 /** Open on load: as the reader last left it, else open where the page makes room (styles/shell.css, 1280px). */
 function stored(): boolean {
@@ -100,7 +180,9 @@ function setOpen(open: boolean): void {
 	} catch {
 		// Storage refused: the panel just won't reopen on the next load.
 	}
+	if (!open) setFull(false);
 	if (open) {
+		for (const t of toasts.children) t.remove();
 		unread = 0;
 		drawBadge();
 		toBottom();
@@ -360,7 +442,11 @@ export function setup(opts: {
 	speak = opts.speak;
 	base = opts.base;
 	face = opts.face;
-	document.body.append(panel);
+	document.body.append(panel, toasts);
+	drawMute();
+	setFull(false);
+	mute.addEventListener('click', () => setMuted(!muted()));
+	full.addEventListener('click', () => setFull(!document.body.classList.contains('chat-full')));
 	typingRow.hidden = true;
 	tr.setup(base);
 	tr.watch((s) => {
@@ -368,14 +454,16 @@ export function setup(opts: {
 		if (s.s === 'failed' || (s.s === 'idle' && tr.off())) for (const [id, t] of translations) if (t.s === 'pending') translations.set(id, { s: 'none' });
 		for (const m of messages) if (translations.get(m.id)?.s !== 'done') redraw(m);
 	});
-	button.addEventListener('click', () => setOpen(panel.hidden));
+	button.addEventListener('click', () => setOpen(!document.body.classList.contains('chat-open')));
 	close.addEventListener('click', () => setOpen(false));
 	jump.addEventListener('click', toBottom);
 	list.addEventListener('scroll', () => {
 		if (nearBottom()) jump.hidden = true;
 	});
 	document.addEventListener('keydown', (e) => {
-		if (e.key === 'Escape' && !panel.hidden && panel.contains(document.activeElement)) setOpen(false);
+		if (e.key !== 'Escape' || panel.hidden) return;
+		if (document.body.classList.contains('chat-full')) setFull(false);
+		else if (panel.contains(document.activeElement)) setOpen(false);
 	});
 	drawList();
 	drawFoot();
@@ -410,7 +498,10 @@ export function message(m: { t?: unknown }): boolean {
 		list.append(item(msg, messages[messages.length - 2]));
 		void translateOne(msg);
 		if (panel.hidden) {
-			if (msg.key !== you?.key) unread++;
+			if (msg.key !== you?.key) {
+				unread++;
+				toast(msg);
+			}
 			drawBadge();
 			toBottom();
 		} else if (stick || msg.key === you?.key) toBottom();

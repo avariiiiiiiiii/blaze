@@ -57,8 +57,8 @@ export type State =
 	| { s: 'ready' }
 	| { s: 'failed'; message: string };
 
-const base = (lang: string) => lang.toLowerCase().split(/[-_]/)[0];
-const target = base(navigator.language || 'en');
+const langOf = (lang: string) => lang.toLowerCase().split(/[-_]/)[0];
+const target = langOf(navigator.language || 'en');
 export const languageName = (code: string) => {
 	try {
 		return new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' }).of(code) ?? LANGS[code] ?? code;
@@ -126,7 +126,7 @@ async function detect(text: string): Promise<string | null> {
 	const d = await detector;
 	if (d) {
 		const [top] = await d.detect(plain);
-		if (top && top.confidence >= 0.6 && LANGS[base(top.detectedLanguage)]) return base(top.detectedLanguage);
+		if (top && top.confidence >= 0.6 && LANGS[langOf(top.detectedLanguage)]) return langOf(top.detectedLanguage);
 	}
 	for (const [re, lang] of SCRIPTS) if (re.test(plain)) return lang;
 	return null;

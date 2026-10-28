@@ -972,6 +972,15 @@
    },
    {
     "dependencies": [
+     "blaze-fuzz",
+     "rustc-hash 2.1.2",
+     "serde"
+    ],
+    "name": "blaze-protocol",
+    "version": "0.20261028.0"
+   },
+   {
+    "dependencies": [
      "anyhow",
      "blaze-manifest",
      "blaze-resolve",
@@ -1053,6 +1062,13 @@
      "rustc-hash 2.1.2"
     ],
     "name": "blaze-tree",
+    "version": "0.20261028.0"
+   },
+   {
+    "dependencies": [
+     "blaze-protocol"
+    ],
+    "name": "blaze-ui",
     "version": "0.20261028.0"
    },
    {
@@ -6592,6 +6608,9 @@
     "blaze-new": {
      "path": "crates/blaze-new"
     },
+    "blaze-protocol": {
+     "path": "crates/blaze-protocol"
+    },
     "blaze-source": {
      "path": "crates/blaze-source"
     },
@@ -6600,6 +6619,9 @@
     },
     "blaze-tree": {
      "path": "crates/blaze-tree"
+    },
+    "blaze-ui": {
+     "path": "crates/blaze-ui"
     },
     "blaze-units": {
      "path": "crates/blaze-units"
@@ -8052,6 +8074,23 @@
    },
    "version": "0.20261028.0"
   },
+  "blaze-protocol@0.20261028.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's wire protocol between the daemon and its clients: length-prefixed frames of deterministic CBOR (RFC 8949 4.2.1)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-protocol",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-protocol",
+    "kind": "path"
+   },
+   "version": "0.20261028.0"
+  },
   "blaze-registry@0.20261028.0": {
    "authors": "blaze contributors",
    "description": "blaze's reading of registries and fetching of sources as cargo 1.99 does them, into cargo's directories and blaze's store, with no cargo",
@@ -8133,6 +8172,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-tree",
+    "kind": "path"
+   },
+   "version": "0.20261028.0"
+  },
+  "blaze-ui@0.20261028.0": {
+   "authors": "blaze contributors",
+   "description": "How blaze shows a build: its records from the daemon rendered live on a terminal, as lines elsewhere, and summed up",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-ui",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-ui",
     "kind": "path"
    },
    "version": "0.20261028.0"

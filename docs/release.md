@@ -99,7 +99,7 @@ PATH for an installed release).
 - **projects** (real repositories at pinned commits): ripgrep, indexable-inc/anim, and blaze
   itself.
 - **apps** (large applications at pinned commits, with the system libraries each builds with
-  in its entry): cargo 0.92.0, zed v1.24.4 (a window it does not open: `--help`; its tests are
+  in its entry): cargo 0.92.0 (which says `cargo 1.91.0`), zed v1.24.4 (a window it does not open: `--help`; its tests are
   those of the crates below gpui, since the whole suite with both builds is longer than a
   hosted runner's six hours), servo v0.7.0 (`--version`; the tests of crates without a window
   or a GPU), and bun's Rust port (bun-v1.4.3, after `harness/bunprep.py` built its C and C++ in

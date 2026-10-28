@@ -40,7 +40,7 @@
       "rev": "ea2d97820c16195b0ca3fadb4319fe512c199a43",
       "apt": ["libssl-dev", "pkg-config"],
       "seconds": 7200,
-      "runs": [{ "select": ["-p", "cargo", "--bin", "cargo"], "args": ["--version"], "contains": "cargo 0.92.0" }],
+      "runs": [{ "select": ["-p", "cargo", "--bin", "cargo"], "args": ["--version"], "contains": "cargo 1.91.0 (ea2d97820" }],
       "test": ["-p", "cargo-util", "-p", "cargo-platform"]
     },
     "zed": {

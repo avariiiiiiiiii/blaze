@@ -228,9 +228,10 @@ tar -xzof "$tmp/$asset" -C "$tmp/unpacked" 2>"$tmp/error" ||
     fail "the downloaded archive could not be unpacked." "$(cat "$tmp/error")"
 # The archive's one folder, whatever the file is named.
 set -- "$tmp/unpacked"/*/
-[ $# -eq 1 ] && [ -d "$1" ] ||
+if [ $# -ne 1 ] || [ ! -d "$1" ]; then
     fail "$asset is not a blaze release's archive: it does not hold one folder of programs." \
         "Download blaze-<version>-$target.tar.gz from https://github.com/$REPO/releases and name it in BLAZE_ARCHIVE."
+fi
 unpacked="${1%/}"
 [ -x "$unpacked/blaze" ] || [ -x "$unpacked/ra-jit" ] || # rename: old name
     fail "$asset is not a blaze release's archive: it has no blaze in $(basename "$unpacked")." \

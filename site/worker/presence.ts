@@ -226,23 +226,15 @@ export class Presence extends DurableObject<Env> {
 		ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS chat (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, login TEXT NOT NULL, avatar TEXT,
 			text TEXT NOT NULL, at TEXT NOT NULL)`);
-		// Threads came later: a database from before them gets the column here (and has it already the next time).
-		try {
-			ctx.storage.sql.exec('ALTER TABLE chat ADD COLUMN parent INTEGER');
-		} catch {
-			// The column is there.
+		// Columns that came later (threads, then replies also sent to the chat, and edits): a database from before them
+		// gets them here. Only the missing ones are added, so a failing ALTER is a real error and stops here.
+		const have = new Set(ctx.storage.sql.exec<{ name: string }>('PRAGMA table_info(chat)').toArray().map((c) => c.name));
+		for (const [name, type] of [['parent', 'INTEGER'], ['broadcast', 'INTEGER'], ['edited_at', 'TEXT']]) {
+			if (!have.has(name)) ctx.storage.sql.exec(`ALTER TABLE chat ADD COLUMN ${name} ${type}`);
 		}
 		ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS chat_parent ON chat (parent)');
-		// Then replies also sent to the chat, and edits: the same way.
-		for (const col of ['broadcast INTEGER', 'edited_at TEXT']) {
-			try {
-				ctx.storage.sql.exec(`ALTER TABLE chat ADD COLUMN ${col}`);
-			} catch {
-				// The column is there.
-			}
-		}
 		// One row per person, reaction and message; `login` for the list of who reacted. A message's reactions go when it
-		// does (`sweep`).
+		// does (deleted with it in `say`'s prune and in `unsay`).
 		ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS reactions (
 			message_id INTEGER NOT NULL, key TEXT NOT NULL, kind TEXT NOT NULL, login TEXT NOT NULL,
 			PRIMARY KEY (message_id, key, kind))`);
@@ -481,8 +473,12 @@ export class Presence extends DurableObject<Env> {
 		// Replies are always newer than their message, so a reply pruned by id never leaves its message behind; the
 		// second half takes the replies of messages pruned, wherever they are, so no reply is left without one.
 		const cutoff = row.id - CHAT_KEPT;
+		this.ctx.storage.sql.exec(
+			'DELETE FROM reactions WHERE message_id <= ? OR message_id IN (SELECT id FROM chat WHERE parent <= ?)',
+			cutoff,
+			cutoff,
+		);
 		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id <= ? OR parent <= ?', cutoff, cutoff);
-		this.sweep();
 		if (parent !== null && parent <= cutoff) return refuse('That thread is too old for replies.');
 		const m: Msg = { id: row.id, key: tab.key, login: tab.login, avatar: tab.avatar, text, at, ...(parent !== null && { parent }), ...(broadcast && { broadcast: true as const, to }) };
 		this.broadcast(JSON.stringify({ t: 'msg', m }));
@@ -527,11 +523,6 @@ export class Presence extends DurableObject<Env> {
 			: this.ctx.storage.sql.exec('DELETE FROM reactions WHERE message_id = ? AND key = ? AND kind = ?', id, tab.key, kind);
 		if (!done.rowsWritten) return;
 		this.broadcast(JSON.stringify({ t: 'react', id, reactions: this.reactionsOf([id]).get(id) ?? [] }));
-	}
-
-	/** Drops the reactions of messages that are gone (taken back or pruned). Both tables are small. */
-	private sweep(): void {
-		this.ctx.storage.sql.exec('DELETE FROM reactions WHERE message_id NOT IN (SELECT id FROM chat)');
 	}
 
 	/** The reactions on `ids`, by message: kinds in the order they first came, and who, in the order they came. */
@@ -583,8 +574,8 @@ export class Presence extends DurableObject<Env> {
 		if (!row) return;
 		if (row.key !== tab.key && !tab.admin) return ws.send(JSON.stringify({ t: 'error', text: 'Not your message.' }));
 		// A top-level message takes its thread with it.
+		this.ctx.storage.sql.exec('DELETE FROM reactions WHERE message_id = ? OR message_id IN (SELECT id FROM chat WHERE parent = ?)', id, id);
 		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id = ? OR parent = ?', id, id);
-		this.sweep();
 		if (row.parent === null) return this.broadcast(JSON.stringify({ t: 'unsay', id }));
 		const s = this.summaries([row.parent]).get(row.parent) ?? { replies: 0, last: null, repliers: [] };
 		this.broadcast(JSON.stringify({ t: 'unsay', id, parent: row.parent, ...s }));

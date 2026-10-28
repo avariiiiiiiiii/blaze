@@ -804,7 +804,8 @@ function loadSeen(): boolean {
 		const o: unknown = JSON.parse(v);
 		if (o && typeof o === 'object') seen = o as Record<string, number>;
 	} catch {
-		// Storage refused, or a bad value: what this page has seen stands.
+		// Storage refused, or a bad value: as on a first run, so old replies don't all light up on every connect.
+		return false;
 	}
 	return true;
 }

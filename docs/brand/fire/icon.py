@@ -4,12 +4,15 @@
 # ///
 """icon.py: the square icon, the pixel "b" of the header (gen.py) on fire, for favicons and avatars.
 
-    uv run docs/brand/fire/icon.py   # writes docs/brand/blaze-icon-{dark,light}.svg and site/static/brand/'s copies
+    uv run docs/brand/fire/icon.py   # writes docs/brand/blaze-icon-{dark,light}.svg, PNGs of
+                                     # each at PNG_SIZES and favicon.ico, and site/static/brand/'s copies
 
 The letter, its shadow and the five fire colours are gen.py's; the flame is drawn by hand below, since the
 header's simulation makes shapeless blobs at 24 cells.
 """
 import os
+
+from PIL import Image, ImageDraw
 from gen import GLYPHS, THEMES
 # Flame cells: (x, y): heat 1 (deep red) .. 5 (white-hot), in a 24-cell square, b's stem at x=8.
 F = """
@@ -38,6 +41,8 @@ rows = [r.strip() for r in GLYPHS["b"].strip().splitlines()]
 solid = {(8 + DX + x, 10 + DY + y) for y, r in enumerate(rows) for x, c in enumerate(r) if c == "X"}
 shadow = {(x + 1, y + 1) for x, y in solid} - solid - set(flame)
 N, pad = 24, 1
+PNG_SIZES = [32, 180, 512, 1024]
+CELL = 80  # pixels per cell before scaling down to each PNG size
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
 OUTS = [os.path.join(ROOT, "docs", "brand"), os.path.join(ROOT, "site", "static", "brand")]
 for theme, bg in (("dark", "#0d1117"), ("light", "#ffffff")):
@@ -51,3 +56,20 @@ for theme, bg in (("dark", "#0d1117"), ("light", "#ffffff")):
     for out in OUTS:
         with open(os.path.join(out, f"blaze-icon-{theme}.svg"), "w") as f:
             f.write(svg)
+    # The same cells as pixels, for where SVG is not taken: square cells at CELL, the corners
+    # cut from a mask, then scaled down to each size.
+    big = Image.new("RGBA", (s * CELL, s * CELL), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(big)
+    draw.rectangle((0, 0, s * CELL, s * CELL), fill=bg)
+    for x, y, c in cells:
+        draw.rectangle(((x + pad) * CELL, (y + pad) * CELL, (x + pad + 1) * CELL - 1, (y + pad + 1) * CELL - 1), fill=c)
+    mask = Image.new("L", big.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, s * CELL - 1, s * CELL - 1), radius=round(s * 0.22 * CELL), fill=255)
+    big.putalpha(mask)
+    for size in PNG_SIZES:
+        img = big.resize((size, size), Image.LANCZOS)
+        for out in OUTS:
+            img.save(os.path.join(out, f"blaze-icon-{theme}-{size}.png"), optimize=True)
+    if theme == "dark":
+        for out in OUTS:
+            big.resize((256, 256), Image.LANCZOS).save(os.path.join(out, "favicon.ico"), sizes=[(16, 16), (32, 32), (48, 48)])

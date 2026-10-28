@@ -357,7 +357,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+      # With Nix: the build's programs ask for the dev shell's glibc, from the Nix store.
       - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}

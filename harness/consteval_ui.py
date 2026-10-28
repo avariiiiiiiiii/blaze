@@ -39,13 +39,13 @@ LINE = r"^//@ *(?:\[(?P<rev>[\w,-]+)\] *)?"
 DIRECTIVE = re.compile(LINE + r"(?P<name>[\w-]+)(?: *: *| +|$)(?P<value>.*)$", re.M)
 PASS = {"run-pass", "build-pass", "check-pass"}
 AUX = {"aux-build", "aux-crate", "proc-macro", "aux-bin", "aux-codegen-backend"}
-# Flags that do not change what a constant evaluates to.
+# Flags that do not change what a constant evaluates to. blaze's trait solver is the next one.
 INERT = re.compile(r"^(-[AWDF] ?\S*|--cap-lints(=| )\S+|-g|-C ?\S+|-O|--crate-type(=| )\S+|--check-cfg(=| )\S+"
                    r"|--error-format(=| )\S+|--diagnostic-width(=| )\S+|--crate-name(=| )\S+|--emit(=| )\S+"
                    r"|--remap-path-prefix(=| )\S+|--edition(=| )\S+|--cfg(=| )\S+|--test"
                    r"|-Z ?(ui-testing|deduplicate-diagnostics|track-diagnostics|treat-err-as-bug|"
                    r"verbose-internals|write-long-types-to-disk|mir-opt-level|validate-mir|"
-                   r"translate-remapped-path-to-local-path)(=\S+)?)$")
+                   r"translate-remapped-path-to-local-path|next-solver)(=\S+)?)$")
 ERROR = re.compile(r"^error(\[(?P<code>E\d{4})\])?: (?P<message>.*)$", re.M)
 FAILED = re.compile(r"evaluation of `(?P<name>[^`]+)` failed")
 # Errors that follow from one rustc already reported for the constant.
@@ -130,6 +130,7 @@ def units_of(test, path):
         if revision:
             unit.cfgs.append(revision)
         mine = [(n, v) for r, n, v in directives if r is None or revision in r.split(",")]
+        unit.cfgs += checks_of([f for n, v in mine if n == "compile-flags" for f in flags_of(v)])
         passes = False
         for name, value in mine:
             if name == "edition":
@@ -152,6 +153,25 @@ def units_of(test, path):
             unit.expected = expected_of(unit, path, passes)
         units.append(unit)
     return units
+
+
+def checks_of(flags):
+    """The cfgs of the checks rustc builds with: compiletest does not optimize, so debug
+    assertions and overflow checks are on unless the flags say otherwise."""
+    setting = lambda value: value.split("=", 1)[1].strip() in ("", "y", "yes", "on", "true") if "=" in value else True
+    debug = overflow = None
+    optimized = False
+    for flag in flags:
+        option = re.sub(r"^-C ?", "", flag) if flag.startswith("-C") else None
+        if flag == "-O" or option and option.startswith("opt-level") and option.split("=", 1)[-1].strip() not in ("0", ""):
+            optimized = True
+        elif option and option.startswith("debug-assertions"):
+            debug = setting(option)
+        elif option and option.startswith("overflow-checks"):
+            overflow = setting(option)
+    debug = not optimized if debug is None else debug
+    overflow = debug if overflow is None else overflow
+    return [name for name, on in (("debug_assertions", debug), ("overflow_checks", overflow)) if on]
 
 
 def flags_of(text):
@@ -233,8 +253,10 @@ def evaluate(binary, units, jobs, work):
 
 def kind_of_error(error):
     """What a failed evaluation of blaze is, without the parts that differ from item to item."""
-    error = re.sub(r"\b\d+\b", "N", error)
-    error = re.sub(r"Idx::<[^>]*>\(N\)|\w+Id\(N\)", "Id", error)
+    error = re.sub(r"WithStack \{ error: ", "", error)
+    error = re.sub(r", stack: \[.*", "", error, flags=re.S)
+    error = re.sub(r"-?\b\d+\b", "N", error)
+    error = re.sub(r"Idx::<[^>]*>\(N\)|\w+Id\(\w+\)", "Id", error)
     return error[:120]
 
 
@@ -248,7 +270,7 @@ def kind_of_rustc(test_path, revision, name):
             for i, m in enumerate(blocks):
                 end = blocks[i + 1].start() if i + 1 < len(blocks) else len(text)
                 if f"evaluation of `{name}` failed" in text[m.start():end]:
-                    words = re.sub(r"`[^`]*`", "`_`", m["message"]).split()
+                    words = re.sub(r"-?\b\d+\b", "N", re.sub(r"`[^`]*`", "`_`", m["message"])).split()
                     return " ".join(words[:6])
     return "?"
 
@@ -311,11 +333,14 @@ def summary(units, ran):
         for kind, detail in unit.differences:
             head = detail.split(": ", 1)[-1]
             kinds[(kind, head)] += 1
-            examples[(kind, head)].append(unit.label)
+            if unit.label not in examples[(kind, head)]:
+                examples[(kind, head)].append(unit.label)
     lines.append("## Differences of evaluation, largest class first\n")
-    lines.append("| units | kind | what | e.g. |\n|---|---|---|---|")
+    lines.append("An item is one constant or static; a unit, one revision of a test.\n")
+    lines.append("| items | units | kind | what | e.g. |\n|---|---|---|---|---|")
     for (kind, head), n in kinds.most_common():
-        lines.append(f"| {n} | {kind} | {head.replace('|', '/')} | {', '.join(examples[(kind, head)][:3])} |")
+        shown = examples[(kind, head)]
+        lines.append(f"| {n} | {len(shown)} | {kind} | {head.replace('|', '/')} | {', '.join(shown[:3])} |")
     if ran is not None:
         lines.append("\n## Differences of values (run-pass)\n")
         for r in ran:

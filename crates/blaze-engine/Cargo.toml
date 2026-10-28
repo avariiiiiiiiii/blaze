@@ -120,7 +120,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 heap-profile = ["tikv-jemallocator/profiling", "blaze-cargo/heap-profile"]
 
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
-llvm = ["hir-ty-codegen/llvm"]
+llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
 
 # Runs build scripts compiled for wasm32-wasip1 under Wasmtime when a workspace asks for it
 # (`BLAZE_BUILD_SCRIPTS=wasi`, docs/cargo.md "Build scripts under WASI"): an experiment.

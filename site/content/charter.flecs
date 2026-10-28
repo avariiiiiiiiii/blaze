@@ -4,9 +4,9 @@ site {
     Title: {"Charter"}
     Intro: {"[calm, warm] This is the blaze charter: the rulebook every RFC gets checked against."}
     Outro: {"[calm] So, five rules. Rust that builds keeps building. New things live in a new, unstable edition. Checkable beats short. Fast to build, fast to run, easy to change. And everything is decided in the open. [breath] Thanks for listening."}
-    Nav: {"Charter", 1}
+    Nav: {"Charter", 3}
     Icon: {"scroll"}
-    (InGroup, nav.design)
+    (InGroup, nav.reference)
     Description: {"What blaze holds to: Rust keeps working, new things are opt-in, and checkable code beats short code."}
 
     Lede lede("blaze is Rust, plus a place to try what Rust could become. These are the rules for both.") {

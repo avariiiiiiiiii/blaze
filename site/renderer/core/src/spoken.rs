@@ -7,13 +7,15 @@
 //! - a Section's title becomes a transition ("Next: Prior art."), an H3 its title, an Issue "Open question: ...", a
 //!   Goal its title and its line;
 //! - a Table is read row by row against its header ("Function in the main crate: cargo 1.76 seconds, ...");
-//! - an Img is its alt text ("On screen: ..."); an Art (an animated drawing) is not read: its label is for screen
-//!   readers, and the paragraphs beside it say the same in words;
+//! - an Img is its alt text ("On screen: ..."); an Art (an animated drawing) and a Figure (a lesson's diagram) are not
+//!   read: their label is for screen readers, and the paragraphs beside them say the same in words;
+//! - a lesson's Step is its title, then its blocks; a Quiz or Tap is "Question: " and its prompt (an author marks
+//!   question steps Silent); the course map reads each lesson's number and title;
 //! - Code and Command blocks are skipped, citations are never read, References, the signup form and the bench widget
 //!   are skipped, and the RFC index reads each RFC's number and title.
 //!
 //! An author overrides any block's line with `Say: {"..."}` (Drama 3 directions such as `[warm]` allowed). On a
-//! container (Section, Issue, Goal, Li, Ul, Ol) the `Say` stands for its whole subtree: its children are not read, so one
+//! container (Section, Issue, Goal, Step, Li, Ul, Ol) the `Say` stands for its whole subtree: its children are not read, so one
 //! authored line can tell a whole section. The `Silent` tag drops a block and everything under it. A page can carry
 //! `Intro` (said first; the default is its title, and for an RFC its number) and `Outro` (said last). Derived lines
 //! never carry a direction: brackets and angle brackets are taken out of them, so only an author's `Say` steers the
@@ -149,7 +151,7 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<(), String> {
         return Ok(());
     }
     let id = ctx.block_id(n);
-    let walk = ["Section", "Issue", "Goal", "Li"].iter().any(|c| e.has(c))
+    let walk = ["Section", "Issue", "Goal", "Li", "Step"].iter().any(|c| e.has(c))
         || e.has_tag("Ul")
         || e.has_tag("Ol");
     if let Some(say) = text_of(e, "Say") {
@@ -176,6 +178,18 @@ fn derive(n: Id, ctx: &mut Ctx) -> Result<Option<String>, String> {
         }
         return Ok(Some(items.join(" ")));
     }
+    if e.has_tag("Course") {
+        let source = ctx.s.world.course_source(n)?;
+        let mut items = Vec::new();
+        for (i, c) in ctx.s.world.lessons(source).into_iter().enumerate() {
+            items.push(format!(
+                "Lesson {}, {}.",
+                i + 1,
+                text_of(ctx.e(c), "Title").unwrap_or_default()
+            ));
+        }
+        return Ok(Some(items.join(" ")));
+    }
     if ["References", "SignupForm", "BenchHistory"].iter().any(|t| e.has_tag(t)) {
         return Ok(None);
     }
@@ -187,8 +201,18 @@ fn derive(n: Id, ctx: &mut Ctx) -> Result<Option<String>, String> {
     if let Some(t) = text_of(e, "H3") {
         return ctx.plain(&prose(&dedent(&t)), n).map(Some);
     }
-    if e.has("Code") || e.has("Command") {
+    if e.has("Code") || e.has("Command") || e.has("Figure") {
         return Ok(None);
+    }
+    // A question is read as its prompt; its choices are for the eye.
+    for comp in ["Quiz", "Tap"] {
+        if let Some(v) = e.value(comp) {
+            let prompt = ctx.plain(&prose(&js::string(v.get("prompt"))), n)?;
+            return Ok(Some(format!("Question: {prompt}")));
+        }
+    }
+    if let Some(v) = e.value("Step") {
+        return ctx.plain(&js::string(v.get("title")), n).map(Some);
     }
     if let Some(i) = e.value("Img") {
         let alt = js::string(i.get("alt"));

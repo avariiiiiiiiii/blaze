@@ -138,10 +138,14 @@ function with layout and calling convention already decided. Below it, a produce
 `Code`: bytes, the relocations in them, and how to unwind through them. Nothing after that
 can tell which producer made the code.
 
-- **Cranelift** is the default. It compiles the IR directly.
-- **LLVM** (`llvm.rs`, `llvm/lower.rs`, `llvm/emitted.rs`; behind the `llvm` cargo feature
-  and `BLAZE_BACKEND=llvm`) translates the Cranelift IR of the function into an LLVM module
-  holding that one function, optimises it at `BLAZE_OPT`, has LLVM write an object into
+- **Cranelift** compiles the IR directly. It is the backend of a profile with `opt-level` 0
+  or 1 (`dev`, `test`).
+- **LLVM** (`llvm.rs`, `llvm/lower.rs`, `llvm/emitted.rs`; behind the `llvm` cargo feature)
+  is the backend of a profile with `opt-level` 2, 3, `s` or `z` (`release`, `bench`), at the
+  profile's level (`s` and `z` at 2). The client reads the profile and starts the build's
+  worker with `BLAZE_BACKEND=llvm` and `BLAZE_OPT`, unless they are set already
+  (`cargo/backend.rs`, [cargo.md](cargo.md#backends)). It translates the Cranelift IR of
+  the function into an LLVM module holding that one function, optimises it at `BLAZE_OPT`, has LLVM write an object into
   memory, and reads the code, constants, relocations and unwind table back out of it.
   Functions are compiled alone at every level, so nothing is inlined across functions. A
   function LLVM has no lowering for is given to Cranelift, with the reason recorded.

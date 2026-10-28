@@ -294,7 +294,10 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
     if asked.flags.no_run {
         return Ok(0);
     }
-    let code = run::tests(asked, &state, &cwd, None)?;
+    let code = run::tests(asked, &state, &cwd, None, metadata.target_directory.as_std_path())?;
+    if asked.flags.why {
+        return Ok(code);
+    }
     let stopped = code != 0 && !asked.flags.no_fail_fast;
     // Cargo runs no doc tests when tests are picked by target or by name.
     let picked = asked.flags.selects_targets || !asked.positional.is_empty();

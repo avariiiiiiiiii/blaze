@@ -4,7 +4,7 @@ site {
     Title: {"Usage"}
     Nav: {"Usage", 2}
     Icon: {"terminal"}
-    (InGroup, nav.start)
+    (InGroup, nav.reference)
     Description: {"Using blaze day to day: cargo's commands, rebuild on save, plain cargo through blaze, live edits, and what works yet."}
     Intro: {"[warm] Using blaze, day to day. If you know cargo, you mostly know this already."}
     Outro: {"[warm] So: the same commands as cargo, with blaze in front, a daemon that keeps your project compiled, and a clear error whenever blaze can't do something yet. Thanks for listening."}

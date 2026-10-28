@@ -13,6 +13,7 @@ use super::{
     affected::{self, Pick},
     cli::Invocation,
     experimental,
+    report::{self, Report},
     results::Results,
     sandboxed, say,
     state::{Held, Kind, Program, State},
@@ -175,14 +176,17 @@ fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std
 /// Runs the test executables one after another, each in the directory of its package, and in
 /// a sandbox ([`sandboxed`]) when its workspace or package opts in and neither it nor the
 /// command takes it out, and stops at the first that fails unless told not to. The result is
-/// cargo's exit status. Under `BLAZE_TESTS=affected` each runs only the tests that have not
-/// passed with what they are a function of as it is now, as the store keeps them
-/// ([`results`]); `verify` runs those too and says whether they passed again ([`affected`]).
+/// cargo's exit status. Each runs only the tests that have not passed with what they are a
+/// function of as it is now, as the store keeps them ([`results`]), unless `BLAZE_TESTS=all`;
+/// `verify` runs those too and says whether they passed again ([`affected`]). What each test
+/// is and how it ended is written to `target/blaze/tests.ndjson` in `target`, the target
+/// directory ([`report`]); `--why` runs none and says why each would run or not.
 pub fn tests(
     asked: &Invocation,
     state: &State,
     cwd: &Path,
     mut held: Option<Held>,
+    target: &Path,
 ) -> anyhow::Result<i32> {
     let mut failed = Vec::new();
     let mut tally = Tally::default();
@@ -205,18 +209,8 @@ pub fn tests(
         ));
         return Ok(FAILED);
     }
-    let not_opted_in = opt_outs.values().find(|it| !it.all && !it.sandboxed());
-    if affected::on()
-        && sandboxing
-        && !opt_outs.values().any(sandboxed::OptOut::sandboxed)
-        && let Some(it) = not_opted_in
-    {
-        say::note(&format!(
-            "no test is sandboxed, so none is kept as passed and every test runs: sandboxed \
-             tests are an experiment a workspace opts into, with {}",
-            it.experiments.how_to(experimental::SANDBOXED_TESTS)
-        ));
-    }
+    let why_only = asked.flags.why;
+    let mut report = Report::new(target);
     let mut results = affected::on().then(Results::open).flatten();
     if affected::on() && results.is_none() {
         say::note(
@@ -258,23 +252,37 @@ pub fn tests(
         };
         let sandbox = identity.as_deref().ok_or(why_outside.as_str());
         let outside = if sandboxed_here { &opt_out.tests } else { &no_test };
-        let pick = affected::pick(
-            asked,
-            state,
-            test,
-            results.as_mut(),
-            &run,
-            sandbox,
-            outside,
-            &opt_out.manifest,
-        );
+        let pick = affected::pick(asked, state, test, results.as_mut(), &run, sandbox, outside);
+        let no_flaky = BTreeSet::new();
+        if why_only {
+            match &pick {
+                Pick::Some { planned, .. } => {
+                    report.add(report::lines_of(
+                        test,
+                        planned,
+                        &report_ended(true, None, false, None, &no_flaky),
+                    ));
+                }
+                Pick::Asked => say::note(&format!(
+                    "{running}: nothing is known of its tests, which run as asked (`{}=all`, \
+                     tests named, or harness flags other than those that only show the run)",
+                    affected::VAR
+                )),
+            }
+            continue;
+        }
         let mut picked = None;
-        if let Pick::Some { names, total, cached, .. } = &pick {
+        if let Pick::Some { names, total, cached, planned, .. } = &pick {
             for from in cached.values() {
                 *tally.cached.entry(from.clone()).or_default() += 1;
             }
             if let Some(names) = names {
                 if names.is_empty() {
+                    report.add(report::lines_of(
+                        test,
+                        planned,
+                        &report_ended(false, Some(names.as_slice()), false, None, &no_flaky),
+                    ));
                     let passed = format!("{}, passed before as they are now", counted(*total));
                     say::status(asked.flags.quiet, "Cached", &format!("{running}: {passed}"));
                     continue;
@@ -294,10 +302,7 @@ pub fn tests(
             for test in always {
                 let by = test.path.as_ref().map(|it| format!(", by {it}")).unwrap_or_default();
                 verbose("Always", &format!("{}: {}{by}", test.name, test.why));
-                match test.outside {
-                    true => tally.outside.push(test.name.clone()),
-                    false => tally.always += 1,
-                }
+                tally.always += 1;
             }
             for (name, why) in reaching {
                 verbose("Sandboxed", &format!("{name}: {why}"));
@@ -362,6 +367,7 @@ pub fn tests(
                 }
             }
         }
+        let mut found_flaky = BTreeSet::new();
         if let (Pick::Some { names, total, keys, cached, .. }, Some(results)) =
             (&pick, results.as_mut())
         {
@@ -382,6 +388,7 @@ pub fn tests(
                      the same, so it is never kept and runs every time"
                 ));
             }
+            found_flaky.extend(flaky);
             if affected::verifying() {
                 let failed: BTreeSet<&str> =
                     failures.iter().flatten().map(String::as_str).collect();
@@ -394,6 +401,20 @@ pub fn tests(
                 }
             }
         }
+        if let Pick::Some { names, planned, flaky, .. } = &pick {
+            found_flaky.extend(flaky.iter().map(|(name, _)| name.clone()));
+            report.add(report::lines_of(
+                test,
+                planned,
+                &report_ended(
+                    false,
+                    names.as_deref(),
+                    ended_badly,
+                    failures.as_deref(),
+                    &found_flaky,
+                ),
+            ));
+        }
         if ended_badly {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
@@ -403,6 +424,15 @@ pub fn tests(
     }
     if let Some(results) = &results {
         results.seal();
+    }
+    let dir = report.dir().to_owned();
+    let (lines, summary, text) = report.finish();
+    if why_only {
+        match asked.flags.json {
+            true => print!("{text}"),
+            false => print!("{}", report::table(&lines, &summary, &dir)),
+        }
+        return Ok(0);
     }
     tally.say(asked);
     match failed.as_slice() {
@@ -419,15 +449,24 @@ pub fn tests(
     }
 }
 
+/// How a test executable's run ended, for its lines of `tests.ndjson`.
+fn report_ended<'a>(
+    planned_only: bool,
+    ran: Option<&'a [String]>,
+    failed: bool,
+    failures: Option<&'a [String]>,
+    flaky: &'a BTreeSet<String>,
+) -> report::Ended<'a> {
+    report::Ended { planned_only, ran, failed, failures, verifying: affected::verifying(), flaky }
+}
+
 /// What a command's test executables came to, said at its end.
 #[derive(Default)]
 struct Tally {
     /// The tests not run for having passed as they are now, by where they passed.
     cached: BTreeMap<String, usize>,
-    /// The tests run every time: benchmarks and those that reach what blaze can't compile.
+    /// The tests run every time: benchmarks and those that are not hermetic.
     always: usize,
-    /// The tests run outside the sandbox, every time.
-    outside: Vec<String>,
     /// Under `verify`, the tests that passed again, those that failed, and those of a run
     /// that ended without saying how each did.
     verified: usize,
@@ -438,22 +477,11 @@ struct Tally {
 impl Tally {
     fn say(&self, asked: &Invocation) {
         let quiet = asked.flags.quiet;
-        let why = if asked.flags.verbose { "said above" } else { "`-v` says why" };
+        let why = if asked.flags.verbose { "said above" } else { "`blaze test --why` says why" };
         let all = format!("`{}=all` runs every test", affected::VAR);
         let mut rest = Vec::new();
         if self.always > 0 {
             rest.push(format!("{} run every time ({why})", counted(self.always)));
-        }
-        if !self.outside.is_empty() {
-            const SHOWN: usize = 5;
-            let mut names = self.outside[..self.outside.len().min(SHOWN)].join(", ");
-            if self.outside.len() > SHOWN {
-                names.push_str(&format!(" and {} more", self.outside.len() - SHOWN));
-            }
-            rest.push(format!(
-                "{} outside the sandbox, run every time and never kept: {names}",
-                counted(self.outside.len())
-            ));
         }
         let verifying = affected::verifying();
         if !self.cached.is_empty() && !verifying {

@@ -971,6 +971,7 @@ dependencies = [
  "proc-macro-api",
  "ra-ap-rustc_lexer",
  "rustc-hash 2.1.2",
+ "salsa",
  "sha2 0.10.9",
  "span",
  "tt",

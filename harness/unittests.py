@@ -50,6 +50,8 @@ OPEN_BLAZE = {
         "a_socket_let_go_of_is_free_while_processes_start", "one_connection_too_many_is_closed",
         "one_process_serves_a_socket", "the_directory_and_the_socket_are_the_users_alone",
     ]),
+    # https://github.com/indexable-inc/blaze/issues/960
+    "blaze_cargo::sandbox::linux::tests::a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing",
 }
 # Pass or fail on a blaze run, by the runner's load: neither is an error.
 UNSURE_BLAZE = {

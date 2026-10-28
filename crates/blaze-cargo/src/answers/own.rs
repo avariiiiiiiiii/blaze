@@ -335,19 +335,6 @@ fn arch(tuple: &str) -> &str {
 /// The variables rustc reads for any question, which blaze answers only when they are unset.
 const UNSET: [&str; 2] = ["RUSTC_OVERRIDE_VERSION_STRING", "RUST_TARGET_PATH"];
 
-/// The variables of Apple's SDK and deployment targets, which a shell of nixpkgs on macOS
-/// sets. rustc reads them to link and for an Apple target's spec, which says the deployment
-/// target; its version, cfgs, sysroot and file names, and every other target's spec, are the
-/// same with them, and are answered with them set.
-const APPLE: [&str; 6] = [
-    "SDKROOT",
-    "MACOSX_DEPLOYMENT_TARGET",
-    "IPHONEOS_DEPLOYMENT_TARGET",
-    "TVOS_DEPLOYMENT_TARGET",
-    "WATCHOS_DEPLOYMENT_TARGET",
-    "XROS_DEPLOYMENT_TARGET",
-];
-
 /// The cfgs rustc sets itself, which it refuses as `--cfg`, by name or by what it starts with.
 const BUILTIN_CFGS: [&str; 13] = [
     "debug_assertions",
@@ -530,11 +517,10 @@ pub fn answer(
                 cfgs.dedup();
                 cfgs.iter().for_each(|it| out += &format!("{it}\n"));
             }
-            "target-spec-json"
-                if given.unstable_options
-                    && nightly
-                    && (!tuple.contains("-apple-") || APPLE.iter().all(|it| var(it).is_none())) =>
-            {
+            // Apple's SDKROOT and *_DEPLOYMENT_TARGET, which a shell of nixpkgs on macOS sets,
+            // are read to link: an Apple target's spec names no deployment target
+            // (`"llvm-target": "arm64-apple-macosx"`).
+            "target-spec-json" if given.unstable_options && nightly => {
                 out += target.target_spec_json.get(toolchain.host)?;
             }
             _ => return None,
@@ -591,16 +577,20 @@ mod tests {
     }
 
     #[test]
-    fn a_spec_besides_apples_is_answered_in_a_shell_of_the_sdk() {
-        let spec = |target: &str| {
+    fn a_spec_is_answered_in_a_shell_of_the_sdk() {
+        let spec = |target: &str, sdk: bool| {
             let args =
                 ["-Z", "unstable-options", "--print", "target-spec-json", "--target", target];
             let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-            let sdk = |name: &str| (name == "SDKROOT").then(|| OsString::from("/sdk"));
-            answer(&args, &[], &sdk)
+            let var = |name: &str| {
+                (sdk && matches!(name, "SDKROOT" | "MACOSX_DEPLOYMENT_TARGET"))
+                    .then(|| OsString::from(if name == "SDKROOT" { "/sdk" } else { "14.0" }))
+            };
+            answer(&args, &[], &var)
         };
-        let wasm = spec("wasm32-wasip1").expect("wasm32-wasip1's spec under SDKROOT");
+        let wasm = spec("wasm32-wasip1", true).expect("wasm32-wasip1's spec under SDKROOT");
         assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
-        assert!(spec("aarch64-apple-darwin").is_none());
+        let apple = spec("aarch64-apple-darwin", true).expect("an Apple spec under SDKROOT");
+        assert_eq!(Some(apple), spec("aarch64-apple-darwin", false));
     }
 }

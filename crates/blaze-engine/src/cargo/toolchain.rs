@@ -173,6 +173,51 @@ fn use_toolchain(dir: &Path) {
     }
 }
 
+/// The `rust-toolchain` or `rust-toolchain.toml` nearest `dir`, which rustup would follow and
+/// blaze does not.
+pub(crate) fn toolchain_file(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .flat_map(|it| ["rust-toolchain", "rust-toolchain.toml"].map(|name| it.join(name)))
+        .find(|it| it.is_file())
+}
+
+/// Says, under `-v`, that the toolchain file nearest `dir` is not followed: one line, since
+/// nothing about the build depends on it.
+pub(crate) fn say_toolchain_file(dir: &Path, verbose: bool) {
+    if let Some(file) = toolchain_file(dir).filter(|_| verbose) {
+        eprintln!(
+            "blaze: {} is ignored: blaze builds with its own Rust, {} ({})",
+            file.display(),
+            ours_release(),
+            name()
+        );
+    }
+}
+
+/// Why this blaze can't build `packages`: the first whose `rust-version` is newer than the
+/// Rust blaze ships. A nightly counts as its release, as cargo counts it.
+pub(crate) fn too_new(packages: &[&cargo_metadata::Package]) -> Option<String> {
+    let package = packages.iter().find(|it| {
+        it.rust_version.as_ref().is_some_and(|it| newer_than_ours(it.major, it.minor, it.patch))
+    })?;
+    let needs = package.rust_version.as_ref()?;
+    Some(format!(
+        "`{}` needs Rust {needs} (its `rust-version`), and this blaze ({}) is Rust {}: update \
+         blaze to one with Rust {needs} or newer, and pin it in the workspace's `Cargo.toml` \
+         under `[workspace.metadata.blaze] version`",
+        package.name,
+        env!("CARGO_PKG_VERSION"),
+        ours_release()
+    ))
+}
+
+/// Whether Rust `major.minor.patch` is newer than blaze's release, its nightly counted as the
+/// release it leads to.
+fn newer_than_ours(major: u64, minor: u64, patch: u64) -> bool {
+    let ours = semver::Version::parse(ours_release()).expect("blaze's release is a version");
+    (major, minor, patch) > (ours.major, ours.minor, ours.patch)
+}
+
 /// The `rust-lld` that rustc links MSVC programs with when a target says so, as the
 /// repository's `.cargo/config.toml` does: rustc finds it in the toolchain, not on the PATH.
 pub(crate) fn rust_lld() -> PathBuf {
@@ -225,4 +270,31 @@ fn with_library(sysroot: &Path, release: &str) -> Result<(), String> {
         "Rust {release} has no source of its standard library, which blaze compiles: \
          `rustup component add rust-src --toolchain {release}` adds it"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rust_version_up_to_blazes_release_builds() {
+        let ours = semver::Version::parse(ours_release()).unwrap();
+        assert!(!newer_than_ours(1, 56, 0));
+        assert!(!newer_than_ours(ours.major, ours.minor, ours.patch));
+        assert!(newer_than_ours(ours.major, ours.minor, ours.patch + 1));
+        assert!(newer_than_ours(ours.major, ours.minor + 1, 0));
+    }
+
+    #[test]
+    fn the_nearest_toolchain_file_is_found() {
+        let root =
+            std::env::temp_dir().join(format!("blaze-toolchain-file-{}", std::process::id()));
+        let inner = root.join("a/b");
+        std::fs::create_dir_all(&inner).unwrap();
+        assert_eq!(toolchain_file(&inner).filter(|it| it.starts_with(&root)), None);
+        std::fs::write(root.join("a/rust-toolchain.toml"), "[toolchain]\nchannel = \"1.70\"\n")
+            .unwrap();
+        assert_eq!(toolchain_file(&inner), Some(root.join("a/rust-toolchain.toml")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

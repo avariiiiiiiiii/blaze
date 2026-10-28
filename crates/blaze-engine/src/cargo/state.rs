@@ -381,6 +381,11 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         anyhow::bail!(why);
     }
     let metadata = metadata(asked);
+    if !asked.typed("--ignore-rust-version")
+        && let Some(why) = super::toolchain::too_new(&metadata.workspace_packages())
+    {
+        anyhow::bail!(why);
+    }
     let root = metadata.workspace_root.clone().into_std_path_buf();
     let project =
         project(asked, &std::env::current_dir()?, &metadata).map_err(anyhow::Error::msg)?;

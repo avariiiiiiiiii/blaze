@@ -74,6 +74,11 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         say::error(&why);
         std::process::exit(FAILED);
     }
+    if let Asked::Build(build) = &asked
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        toolchain::say_toolchain_file(&cwd, build.flags.verbose);
+    }
     let code = match asked {
         Asked::Build(asked) if matches!(asked.subcommand, Subcommand::Build | Subcommand::Run) => {
             whole::build(&asked)?

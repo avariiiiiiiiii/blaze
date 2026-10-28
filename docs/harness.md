@@ -357,7 +357,7 @@ for each platform, each on a machine of its own kind.
 
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
-| `blaze.yaml` (`gate`) | pull request | on Linux x86-64: the build and the unit tests; `harness/imports.py`, `harness/rustcsites.py` | about 5 min |
+| `blaze.yaml` (`gate`) | pull request | on Linux x86-64: the build and the unit tests; `harness/imports.py`, `harness/rustcsites.py`; after the build, the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`, 74 s) | about 5 min |
 | `blaze.yaml` (`warm`) | push to main | the build and the unit tests on Linux x86-64, AArch64 and macOS, and the rust tests checkout: they write the caches the other runs read | about 8 min |
 | `fmt.yaml` | push to main | `cargo fmt --all`, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |

@@ -13,6 +13,9 @@
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
  *   threads of that doc if it is the page shown.
  *
+ * The socket also says which build of the site is live (a `build` frame on every connect): client/lib/update.ts takes
+ * a new one in, a reload or a swap in place.
+ *
  * Without JS, or with the socket down, the page is as it was.
  *
  * Signed-in people are their GitHub avatar; anonymous ones a GitHub-style identicon of the key the worker gives them
@@ -21,6 +24,7 @@
 
 import { tipOn } from './tip';
 import * as chat from './chat';
+import * as update from './update';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
@@ -28,6 +32,9 @@ type Person = Who & { country: string | null; since?: number; pages: { path: str
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
+/** The close code of a tab pushed out by a newer one (worker/presence.ts). */
+const TOO_MANY_TABS = 4001;
+let pushedOut = false;
 const BASE = (() => {
 	const css = document.querySelector<HTMLLinkElement>('link[rel="stylesheet"][href$="site.css"]');
 	return css ? new URL('.', css.href).pathname : '/';
@@ -400,6 +407,7 @@ function connect(): void {
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
 		if (chat.message(msg)) return;
+		if (msg.t === 'build') return update.build(m as { build?: unknown; assets?: unknown });
 		if (msg.t === 'comments') {
 			const doc = (m as { doc?: unknown }).doc;
 			if (typeof doc === 'string') dispatchEvent(new CustomEvent(COMMENTS, { detail: doc }));
@@ -418,9 +426,11 @@ function connect(): void {
 		} else return;
 		draw();
 	});
-	s.addEventListener('close', () => {
+	s.addEventListener('close', (e) => {
 		if (ws !== s) return;
 		ws = null;
+		// A newer tab of the same person's took this one's place (worker/presence.ts MAX_TABS): back when shown again.
+		if (e.code === TOO_MANY_TABS) return void (pushedOut = true);
 		// Back off up to a minute; a page that came back from the bfcache reconnects on pageshow.
 		setTimeout(connect, retry + Math.random() * 500);
 		retry = Math.min(retry * 2, 60_000);
@@ -435,7 +445,11 @@ addEventListener('pagehide', () => {
 addEventListener('pageshow', (e) => {
 	if (e.persisted && !ws) connect();
 });
-document.addEventListener('visibilitychange', send);
+document.addEventListener('visibilitychange', () => {
+	if (!pushedOut || document.hidden) return send();
+	pushedOut = false;
+	connect();
+});
 addEventListener(PAGE, send);
 addEventListener(THREADS, drawDiscuss);
 document.addEventListener('keydown', (e) => {

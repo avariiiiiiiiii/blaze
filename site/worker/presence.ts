@@ -24,6 +24,10 @@
  *                                                                  THREAD_SHOWN), and the message itself (null if gone)
  *                     {t: "typing", key, login, avatar}           someone signed in is writing (at most every TYPING_MS)
  *                     {t: "error", text}                        why the tab's last chat message was refused
+ *                     {t: "build", build, assets}               on connect, last, and to every socket when a
+ *                                                                  deploy's code first runs (sockets outlive a
+ *                                                                  deploy): the live build (gen/build.ts's
+ *                                                                  build.json); client/lib/update.ts takes it in
  *   client -> server  {t: "at", path, away}                       the page the tab shows (a site path) and whether
  *                                                                  it is hidden; unknown paths count as no page
  *                     {t: "typing"}                            chat: the reader is writing a message
@@ -43,15 +47,20 @@
  * comment routes (worker/comments.ts) call `announce` after each write, so open pages refresh their threads live.
  */
 import { DurableObject } from 'cloudflare:workers';
+import buildJson from '../.gen/build.json';
 import pagesJson from '../.gen/pages.json';
 import { currentUser, hasSessionCookie, isAdmin } from './auth';
 import type { Env } from './env';
 import { json, plain, sameOrigin } from './http';
 
 const PATHS = new Set<string>(pagesJson.map((p) => p.url));
+/** This deploy's build, sent on every connect: the object runs the same bundle as the worker that serves the pages. */
+const BUILD = JSON.stringify({ t: 'build', build: buildJson.hash, assets: buildJson.assets });
 const BROADCAST_MS = 300;
 const MAX_SOCKETS = 4000;
 const MAX_TABS = 16;
+/** The close code of a tab pushed out by a newer one of the same person's (MAX_TABS). */
+const TOO_MANY_TABS = 4001;
 const MAX_FRAME = 4096;
 const CHAT_MAX = 500;
 const CHAT_SHOWN = 80;
@@ -125,6 +134,20 @@ export class Presence extends DurableObject<Env> {
 			// The column is there.
 		}
 		ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS chat_parent ON chat (parent)');
+		// A deploy doesn't drop hibernated sockets: the new code wakes on the next message or connect with the old
+		// build's tabs still attached. The first time it runs, it tells them.
+		ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
+		const last = ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'build'").toArray()[0]?.v;
+		if (last !== BUILD) {
+			ctx.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('build', ?)", BUILD);
+			for (const ws of ctx.getWebSockets()) {
+				try {
+					ws.send(BUILD);
+				} catch {
+					// Closing: it reconnects and gets the build then.
+				}
+			}
+		}
 	}
 
 	override async fetch(request: Request): Promise<Response> {
@@ -138,7 +161,20 @@ export class Presence extends DurableObject<Env> {
 		const who: Who = whoHeader
 			? (JSON.parse(whoHeader) as Who)
 			: { key: await this.anonKey(request.headers.get('x-presence-ip') ?? '', request.headers.get('x-presence-ua') ?? ''), login: null, avatar: null };
-		if (this.ctx.getWebSockets(who.key).length >= MAX_TABS) return json({ error: 'Too many tabs.' }, 429);
+		// One person's tabs past MAX_TABS: the newest stays and the one used longest ago goes (a hidden one first). It
+		// closes with TOO_MANY_TABS, and reconnects only when it is shown again (client/lib/presence.ts).
+		const mine = this.ctx.getWebSockets(who.key);
+		const rank = (ws: WebSocket) => {
+			const t = ws.deserializeAttachment() as Tab | null;
+			return (t?.away === false ? 1e15 : 0) + (t?.seen ?? t?.since ?? 0);
+		};
+		for (const ws of mine.sort((a, b) => rank(a) - rank(b)).slice(0, Math.max(0, mine.length - MAX_TABS + 1))) {
+			try {
+				ws.close(TOO_MANY_TABS, 'Too many tabs.');
+			} catch {
+				// Already closed.
+			}
+		}
 
 		const { 0: client, 1: server } = new WebSocketPair();
 		this.ctx.acceptWebSocket(server, [who.key]);
@@ -151,6 +187,7 @@ export class Presence extends DurableObject<Env> {
 		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, admin: !!who.admin, signIn: request.headers.get('x-presence-signin') === '1' }));
 		server.send(this.snapshot());
 		server.send(JSON.stringify({ t: 'chat', messages: this.history() }));
+		server.send(BUILD);
 		return new Response(null, { status: 101, webSocket: client });
 	}
 

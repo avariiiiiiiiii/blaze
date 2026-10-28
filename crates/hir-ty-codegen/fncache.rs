@@ -1333,7 +1333,10 @@ impl<'db> Walk<'db> {
                 let why = format!("it reaches `{symbol}`, which {what}");
                 return Some((kind, symbol, why));
             }
-            if pure_foreign(&symbol) || func.krate(db).data(db).origin.is_lang() {
+            if pure_foreign(&symbol)
+                || locates_errno(&symbol)
+                || func.krate(db).data(db).origin.is_lang()
+            {
                 return None;
             }
             let why =
@@ -1565,6 +1568,13 @@ fn pure_foreign(symbol: &str) -> bool {
         || matches!(symbol, "memcpy" | "memmove" | "memset" | "memcmp" | "bcmp" | "strlen")
         || LIBM.iter().any(|it| symbol == *it || symbol.strip_suffix('f') == Some(it))
         || symbol.strip_prefix("llvm.").is_some_and(|it| !MACHINE.iter().any(|m| it.contains(m)))
+}
+
+/// The C library's functions that give where this thread's `errno` is: what is read there was
+/// set by the foreign calls before it, each of which is told by what it is. Not pure for a
+/// cached function, whose result would keep the address.
+fn locates_errno(symbol: &str) -> bool {
+    matches!(symbol, "__errno_location" | "__error" | "__errno" | "_errno")
 }
 
 /// What a function of core does that gives another result in another run, where the same
@@ -2381,5 +2391,7 @@ mod tests {
         assert_eq!(kind("pthread_create"), Some(Kind::Thread));
         assert_eq!(kind("write"), None);
         assert_eq!(kind("memcpy"), None);
+        assert_eq!(kind("__errno_location"), None);
+        assert!(locates_errno("__errno_location") && !pure_foreign("__errno_location"));
     }
 }

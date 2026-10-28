@@ -783,7 +783,7 @@ its hash. Nothing is guessed pure: what blaze can't see into blocks.
 | `env` | `getenv`, `environ`, `setenv` and the like | yes |
 | `net` | `socket`, `connect`, `bind`, `accept`, `getaddrinfo` | yes |
 | `process` | starting a process (`posix_spawn`, `fork`, `execve`, `CreateProcessW`), or ending this one (`exit`, which ends every other test of the run with it) | yes |
-| `ffi` | a foreign function or static declared outside the toolchain that is not known pure (the allocator, `mem*`, libm) nor one of the above: its code is not blaze's to see | yes |
+| `ffi` | a foreign function or static declared outside the toolchain that is not known pure (the allocator, `mem*`, libm, where `errno` is: `__errno_location`, `__error`) nor one of the above: its code is not blaze's to see | yes |
 | `asm` | assembly in a function outside the toolchain | yes |
 | `indirect` | a function pointer made of data (a `transmute` to a `fn` type outside the toolchain): what it calls is no function the walk found | yes |
 | `uncompiled` | a function blaze can't compile, whose code tells nothing | yes |

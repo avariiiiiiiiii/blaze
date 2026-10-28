@@ -311,6 +311,56 @@ pub fn read_request(stream: &UnixStream) -> io::Result<String> {
     Ok(request)
 }
 
+/// What a client of the daemon sends: a frame of [`blaze_protocol`], or a line, an editor's
+/// `edit` or a request of a blaze from before the frames.
+pub enum Asked {
+    Frame(Vec<u8>),
+    Line(String),
+}
+
+/// Reads the one request a client of the daemon sends, as [`read_request`] does a line. A
+/// frame starts with a zero byte, as no line does: its length is less than 16 MiB. The
+/// newline after it is for a daemon that reads lines, to answer that it is of another
+/// version rather than wait for one.
+pub fn read_asked(stream: &UnixStream) -> io::Result<Asked> {
+    check_peer(stream)?;
+    unless_hung_up(stream.set_write_timeout(Some(REPLY_TIMEOUT)))?;
+    unless_hung_up(stream.set_read_timeout(Some(REQUEST_TIMEOUT)))?;
+    let mut first = [0];
+    io::Read::read_exact(&mut &*stream, &mut first)?;
+    let asked = match first[0] {
+        0 => {
+            let mut framed = io::Read::chain(&first[..], stream.take(LONGEST_REQUEST));
+            let item = blaze_protocol::read_frame(&mut framed)?;
+            let item = item.ok_or(io::ErrorKind::UnexpectedEof)?;
+            let mut end = [0];
+            io::Read::read_exact(&mut &*stream, &mut end)?;
+            if end != *b"\n" {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "a frame without its end"));
+            }
+            Asked::Frame(item)
+        }
+        _ => {
+            let rest = BufReader::new(io::Read::chain(&first[..], stream).take(LONGEST_REQUEST));
+            Asked::Line(read_line_of(rest)?)
+        }
+    };
+    unless_hung_up(stream.set_read_timeout(None))?;
+    Ok(asked)
+}
+
+fn read_line_of(mut lines: BufReader<impl io::Read>) -> io::Result<String> {
+    let mut line = String::new();
+    lines.read_line(&mut line)?;
+    match line.strip_suffix('\n') {
+        Some(line) => Ok(line.to_owned()),
+        None if line.len() as u64 >= LONGEST_REQUEST => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "the request is too long"))
+        }
+        None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the request has no end")),
+    }
+}
+
 /// Reads the two lines a client of a worker sends, as [`read_request`] does one: the
 /// request, and the variables of the client's process.
 pub fn read_request_and_env(stream: &UnixStream) -> io::Result<[String; 2]> {

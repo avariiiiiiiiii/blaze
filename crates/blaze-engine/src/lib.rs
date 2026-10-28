@@ -7,8 +7,8 @@
 // as they were, `crate::cargo::...`.
 use blaze_cargo::{
     RUN_TOOL_TARGET, Told, answers, cargo, dep_info, deps, end_with_reader, errors, lock, memory,
-    plan, process, progress, refused_error, remote, renamed, replace, sandbox, socket, stub, trace,
-    tree, version, weaken,
+    plan, process, refused_error, remote, renamed, replace, sandbox, socket, stub, trace, tree,
+    version, weaken,
 };
 
 mod as_rustc;
@@ -17,6 +17,7 @@ mod check;
 mod content;
 mod doc;
 mod doctest;
+mod events;
 mod frozen;
 mod inputs;
 mod link;
@@ -2362,6 +2363,14 @@ fn closure_number(
 /// library and its binary may share the name, and both are being built. A `krate` that is the
 /// path of a `.rs` file is the one target with that root file, which tells a test from an
 /// example of the same name.
+/// What the records of a build call the crate `args` builds ([`events`]): its name, or what
+/// `--crate` says.
+fn shown_crate(db: &RootDatabase, args: &Args) -> String {
+    let named = crates_named(db, &args.krate, args).unwrap_or_default();
+    let name = named.first().and_then(|it| it.display_name(db));
+    name.map_or_else(|| args.krate.clone(), |it| it.to_string())
+}
+
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
     let mut found = crates_called(db, krate, args);
     if args.library {
@@ -4741,7 +4750,7 @@ fn std_unit_at(
         debug,
         ..args.clone()
     };
-    progress::phase("Compiling", "the standard library (once, kept in the store)");
+    events::at(events::Step::Std, None);
     let built = build_unheld(db, table, &of_unit, &mut Rejections::default(), listed)
         .with_context(|| {
             let names: Vec<&str> = unit.iter().map(|it| it.0.as_str()).collect();
@@ -8584,9 +8593,9 @@ fn run_holding(
     });
 
     if let Some(socket) = &args.socket {
-        progress::said_beside(socket);
+        events::said_beside(socket);
     }
-    progress::phase("Loading", "workspace");
+    events::at(events::Step::LoadWorkspace, None);
     let start = Instant::now();
     let selection = args.selection.clone();
     blaze_store::identify_ahead();
@@ -8701,7 +8710,7 @@ fn run_holding(
     if remote::required() {
         shared = pulled(pulling.take().expect("not joined yet"))?;
     }
-    progress::phase("Resolving", "names");
+    events::at(events::Step::Resolve, None);
     let built = built_crates(&db, &args)?;
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
@@ -8863,7 +8872,7 @@ fn run_holding(
                 cold
             }
             None => {
-                progress::phase("Compiling", &format!("the functions of {}", args.krate));
+                let _compiling = events::compiling(&shown_crate(&db, &args));
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled.
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -8934,7 +8943,7 @@ fn run_holding(
                 .collect();
             let mut all: Vec<_> = paths.keys().copied().collect();
             all.sort_unstable();
-            progress::phase("Checking", &format!("{} files", all.len()));
+            events::at(events::Step::Check, Some(&format!("{} files", all.len())));
             let sources = Sources { paths };
             let lints = !args.lints_capped;
             let within = Some(within);
@@ -8951,7 +8960,9 @@ fn run_holding(
         }
         memory::report(&mut db, "build")?;
         report_stats(&known.stats);
-        progress::phase("Linking", &args.krate);
+        let named = shown_crate(&db, &args);
+        events::built(&db, &named, &known.stats, None);
+        events::at(events::Step::Link, Some(&named));
         link(
             args.link_cmd.as_deref(),
             args.splice.as_deref(),
@@ -9055,7 +9066,7 @@ fn run_holding(
             Some((inside.to_owned(), db.file_text(id).text(&db).clone()))
         })
         .collect();
-    progress::idle();
+    events::idle();
     let listener = match &args.socket {
         Some(path) => match socket::Served::bind(path) {
             Ok(served) => Some(served),
@@ -10134,6 +10145,7 @@ fn run_holding(
                         Err(panic) => Some(Ok(program.panicked(&*panic))),
                     };
                     end_link();
+                    events::idle();
                     let _ = sender.send(Event::Built(at, program, answer));
                 });
             }
@@ -10196,6 +10208,7 @@ fn run_holding(
             }
             listed.touch(&db, Some(&late));
         };
+        events::idle();
         if std::env::var_os("BLAZE_QUERIES").is_some() {
             let ran: Vec<String> = ide_db::executions::take(&db)
                 .iter()
@@ -10738,6 +10751,8 @@ impl Program {
             }
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
+        let named = shown_crate(db, args);
+        let compiling = events::compiling(&named);
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
@@ -10823,6 +10838,15 @@ impl Program {
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
+        drop(compiling);
+        let edited_paths: FxHashMap<vfs::FileId, PathBuf> = edited
+            .iter()
+            .filter_map(|file| {
+                let path = paths.paths.get(file)?;
+                Some((*file, path.strip_prefix(&args.checkout).unwrap_or(path).to_owned()))
+            })
+            .collect();
+        events::built(db, &named, &known.stats, Some(&edited_paths));
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let dated = start.elapsed();
@@ -10893,6 +10917,7 @@ impl Program {
             let (splice, patch) = (args.splice.as_deref(), args.patch.as_deref());
             let cmd = args.link_cmd.as_deref().filter(|_| failed.is_none() && link_it);
             begin_link();
+            events::at(events::Step::Link, Some(&named));
             let packs = packs_whole(args);
             let own_line = args.exe.is_some();
             let unlinked = link(

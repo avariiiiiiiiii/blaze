@@ -8,6 +8,19 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Added
+
+- A build shows what it does while it does it. The daemon and its workers speak deterministic
+  CBOR frames (RFC 8949 §4.2.1) instead of JSON lines, and a worker publishes the build as
+  events: each step (loading the workspace, resolving names, compiling, checking, linking),
+  each crate's functions compiled and reused, and every function an edit rebuilt with why (its
+  body was edited, or it uses what was). On a terminal a live region is redrawn, never silent
+  for more than a second, and the build ends with one line (`Rebuilt 3 fns: render
+  (src/main.rs edited), draw, tick (uses what changed); 0.21s`); off a terminal cargo-like
+  lines. `-q` shows none.
+- `blaze why [fn|crate]` says what the last build rebuilt and why.
+- `--events json|cbor` writes the build's events to stdout, one record a line or frame.
+
 ## [0.20261028.2] - 2026-10-28
 
 ### Added

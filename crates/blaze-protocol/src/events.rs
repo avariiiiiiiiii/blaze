@@ -28,6 +28,8 @@ pub enum Event {
     Crate { name: String, state: CrateState, fns: Fns },
     /// Why a unit or a function was compiled again rather than taken as it was.
     Rebuilt { name: String, krate: String, cause: Cause },
+    /// How many more functions were compiled again than the [`Event::Rebuilt`] records name.
+    Unlisted { count: u64 },
     /// What blaze does not build, which fails the build (docs/architecture.md, "Never
     /// guess; refuse visibly").
     Refused { name: String, why: String },
@@ -135,6 +137,9 @@ pub enum Cause {
     Signature,
     /// A function it inlines or calls by its code changed.
     Callee { name: String },
+    /// Something it is compiled from changed, in a file other than its own: a type, a
+    /// constant, a function it inlines.
+    Uses,
     /// A dependency is of another version, features or flags.
     Dependency { name: String },
     /// What it is compiled with changed: the toolchain, a flag, a variable.
@@ -150,6 +155,7 @@ impl Cause {
             Cause::Body => "body edited".to_owned(),
             Cause::Signature => "signature changed".to_owned(),
             Cause::Callee { name } => format!("calls {name}"),
+            Cause::Uses => "uses what changed".to_owned(),
             Cause::Dependency { name } => format!("{name} changed"),
             Cause::Flags { what } => format!("{what} changed"),
         }

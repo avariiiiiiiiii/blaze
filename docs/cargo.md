@@ -106,7 +106,7 @@ other subcommand of cargo's is blaze's own, or fails saying blaze has none yet: 
 to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
 While a build or check waits for the daemon, the command shows what the worker is at
-(`crates/blaze-cargo/src/progress.rs`): the worker writes a status word and its object to a
+(`crates/blaze-engine/src/progress.rs`): the worker writes a status word and its object to a
 `phase` file beside its socket (`Loading workspace`, `Resolving names`, `Compiling the
 functions of app`, `Checking 12 files`, `Linking app`), and the daemon sends it to the waiting
 command every 250 ms as a `Progress` line ahead of the answer. On a terminal that is one line

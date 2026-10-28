@@ -10,6 +10,7 @@
 
 pub mod cbor;
 pub mod events;
+pub mod follow;
 
 #[cfg(test)]
 mod tests;
@@ -72,8 +73,9 @@ pub fn read_frame(from: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         let said = format!("a frame of {len} bytes, longer than {LONGEST_FRAME}");
         return Err(io::Error::new(io::ErrorKind::InvalidData, said));
     }
-    // Read rather than made room for: the length is the peer's word until the bytes are here.
-    let mut item = Vec::new();
+    // Room for at most a megabyte before the bytes are here, the length being the peer's
+    // word: a frame of that much is read in one go.
+    let mut item = Vec::with_capacity((len as usize).min(1 << 20));
     from.take(u64::from(len)).read_to_end(&mut item)?;
     if item.len() != len as usize {
         return Err(io::ErrorKind::UnexpectedEof.into());

@@ -9049,7 +9049,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(PassMode::Indirect);
         }
         Ok(match (layout.backend_repr, layout.size.bytes()) {
-            (BackendRepr::SimdVector { .. }, _) => unsupported!("vector in the C ABI"),
+            // rustc hands LLVM the vector as it is, and LLVM's Win64 convention passes one of
+            // 16, 32 or 64 bytes by reference and returns one of 16 in `xmm0`.
+            (BackendRepr::SimdVector { .. }, 16 | 32 | 64) if !is_ret => PassMode::Indirect,
+            (BackendRepr::SimdVector { .. }, 16) => PassMode::Cast(types::I64X2),
+            (BackendRepr::SimdVector { .. }, size) => {
+                unsupported!("a vector of {size} bytes in the C ABI of 64-bit Windows")
+            }
             (BackendRepr::Scalar(scalar), size) if size <= 8 => {
                 PassMode::Direct(self.scalar(scalar)?)
             }

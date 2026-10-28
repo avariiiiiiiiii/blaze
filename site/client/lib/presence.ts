@@ -23,7 +23,7 @@ import * as chat from './chat';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -178,6 +178,23 @@ function drawHere(): void {
 	hereSlot.append(b);
 }
 
+const regions = (() => {
+	try {
+		return new Intl.DisplayNames(undefined, { type: 'region' });
+	} catch {
+		return null;
+	}
+})();
+
+/** A country's flag: its two letters as regional indicator symbols, named in a tooltip. */
+function flag(cc: string): HTMLElement {
+	const f = el('span', 'flag', String.fromCodePoint(...[...cc].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)));
+	const n = regions?.of(cc) ?? cc;
+	f.title = n;
+	f.setAttribute('aria-label', n);
+	return f;
+}
+
 function drawList(): void {
 	if (list.hidden) return;
 	list.replaceChildren(el('p', 'tl-head', total === 1 ? 'Only you, right now' : `${total} on the site`));
@@ -190,6 +207,7 @@ function drawList(): void {
 			who.rel = 'nofollow noopener';
 		}
 		li.append(face(p, p.pages.length > 0 && p.pages.every((x) => x.away)), who);
+		if (p.country) li.append(flag(p.country));
 		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
 		const where = el('span', 'where');
 		for (const pg of p.pages) {

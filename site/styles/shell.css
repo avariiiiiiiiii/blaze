@@ -223,6 +223,7 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-list ul { margin: 0; padding: 0; list-style: none; }
 .tl-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 4px; border-top: 1px solid var(--line); }
 .tl-list .who { color: var(--ink-1); text-decoration: none; }
+.tl-list .flag { font-size: 15px; line-height: 1; cursor: default; }
 .tl-list .tag { padding: 0 6px; border-radius: 6px; background: var(--s-tint); color: var(--ink-3); font-size: 11px; }
 .tl-list .where { display: flex; flex-wrap: wrap; gap: 4px 10px; flex-basis: 100%; padding-left: 28px; }
 .tl-list .where a { color: var(--ink-3); text-decoration: none; }

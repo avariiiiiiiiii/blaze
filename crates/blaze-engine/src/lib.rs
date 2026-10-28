@@ -8159,6 +8159,7 @@ pub fn main() -> anyhow::Result<()> {
         }
         Some("std") => return shipped::command(std::env::args().skip(2)),
         Some("version-fetch") => return versions::command(std::env::args().skip(2)),
+        Some("version-resolve") => return versions::resolve_command(std::env::args().skip(2)),
         #[cfg(unix)]
         Some("closure") => {
             end_with_reader();

@@ -173,7 +173,7 @@ rustc's definitions of the same symbols, so on Mach-O the definitions in rustc's
 rlibs are made weak (`blaze-engine weaken`, used by the harnesses through `harness/linkline.py`),
 and blaze's own objects are written the same way. Linux keeps the flag it had.
 
-The splice (`crates/blaze-engine/src/splice/macho.rs`). The loader wants `__LINKEDIT` last and the
+The splice (`crates/blaze-splice/src/macho.rs`). The loader wants `__LINKEDIT` last and the
 signature at the end of it, so the patch goes where `__LINKEDIT` was, in two new segments
 (`__BLAZE_TEXT` for code, constants, stubs and the unwind tables; `__BLAZE_DATA` for writable
 data and address slots), and `__LINKEDIT` is written again behind them. That keeps W^X and

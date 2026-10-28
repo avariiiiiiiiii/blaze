@@ -83,7 +83,7 @@ crate sees (`hashbrown`'s `Equivalent` on `gix_diff::blob::Algorithm`, from `ima
 ### The load is one-shot, in the command's process
 
 `blaze doc` loads the workspace in its own process, as the daemon's checker loads it
-(`crate::load` in `crates/blaze-engine`, from `crates/blaze-engine/src/cargo/own/doc.rs`), writes the pages
+(`crate::load` in `crates/blaze-engine`, from `crates/blaze-engine/src/doc.rs`), writes the pages
 and exits. It does not ask the daemon: a database for documentation needs every dependency's
 items and bodies' signatures, with `cfg(doc)` set, and a daemon would hold that only for `doc`
 to read once; the one-shot load needs no daemon running and leaves nothing behind.

@@ -1,7 +1,10 @@
 # How blaze works
 
 This is a map of the code for someone who wants to read or change it. Paths are those of the
-published tree: `crates/blaze-engine` is the daemon, `crates/hir-ty-codegen` is the code generator
+published tree: `crates/blaze-engine` is the worker, which compiles and links, over `crates/blaze-cargo`,
+the cargo drop-in (commands, the daemon and its client, plans, the sandbox and the remote store, which
+call up into the engine only through `blaze_cargo::engine`) and `crates/blaze-splice`, which writes an
+edit into the executable of the last link and depends on none of the front end; `crates/hir-ty-codegen` is the code generator
 (a crate over `hir-ty`'s MIR, see [contributing.md](contributing.md)), and the front end is
 the crates derived from rust-analyzer (`hir-def`, `hir-ty`, `syntax`, `parser` and the rest), with
 the borrow checker as its crate `hir-ty-borrowck` ([borrowck.md](borrowck.md)).
@@ -30,8 +33,7 @@ built. Where they differ, blaze is wrong.
 
 **Never guess; refuse visibly.** The code generator returns "unsupported" with a reason for
 anything it has no explicit lowering for. Under `blaze` a refused function fails the
-build, which names it (`cargo/whole.rs`); plain cargo after `blaze enable` still has rustc
-build what blaze does not ([no-rustc.md](no-rustc.md#today)). A refusal is printed, counted
+build, which names it (`cargo/whole.rs`). A refusal is printed, counted
 and listed (`--report`, `blaze status`); it is treated as a bug to fix, not as a
 normal path. What must not happen is a best-effort lowering of input the generator does not
 understand, because that is wrong code nobody sees.
@@ -52,7 +54,7 @@ reason (`refused` in `cargo/whole.rs`), and hands nothing to cargo.
                                                         │                │
                                                         └── more workers └── one database
 
-The **client** (`crates/blaze-engine/src/cargo/`, entry in `mod.rs`) is what `blaze` runs.
+The **client** (`crates/blaze-cargo/src/cargo/`, entry in `mod.rs`) is what `blaze` runs.
 It parses the command line (`cli.rs`), decides whether the daemon can serve it (`state.rs`),
 and asks the daemon; `build`, `run` and `test` are whole builds (`whole.rs`) and run no cargo.
 
@@ -177,7 +179,7 @@ object holding the changed functions is linked ahead of it (`patch.rs`). Anythin
 cannot express starts a full object again.
 
 **Splice.** Linking still rewrites the whole executable. The splice
-(`crates/blaze-engine/src/splice.rs`) leaves the executable of the last full link as it is and
+(`crates/blaze-splice/src/lib.rs`) leaves the executable of the last full link as it is and
 appends the patch: it lays the patch out behind everything the linker loaded, resolves its
 references against the executable's symbols, and writes a jump to the new code over the
 entry of each replaced function. Calls, vtables and function pointers still arrive at the
@@ -247,7 +249,7 @@ locking, integrity checks and size limits are in [cache.md](cache.md).
 
 ## The remote store
 
-`crates/blaze-engine/src/remote.rs` and `remote/` keep a local store in step with a directory or
+`crates/blaze-cargo/src/remote.rs` and `remote/` keep a local store in step with a directory or
 an S3 bucket. Because packs are immutable and named by their hash, a remote is a set of
 pack files, a key list per pack, and a manifest per project. `transfer.rs` moves one object
 so that the local file is either complete or absent; `s3.rs` is the bucket through the AWS
@@ -262,8 +264,9 @@ Since 2026-10-27 ([#408](https://github.com/indexable-inc/blaze/pull/408),
 are whole builds: every crate is compiled from source over the shipped standard library and
 linked by blaze, with no cargo build and no rustc (`cargo/whole.rs`). This section and the next
 describe the model `blaze` had before, a first build by cargo and rustc that the daemon
-took over from. The wrapper part of it remains for plain cargo after `blaze enable`, until step
-M of [no-rustc.md](no-rustc.md#the-plan) removes it.
+took over from. Step M of [no-rustc.md](no-rustc.md#the-plan) removed the rest of it
+(2026-10-27): the wrapper behind plain cargo after `blaze enable` (`cargo/wrapper.rs`) and the
+patches of rustc's executable (`patch::Base::of_rustc`) are gone.
 
 `blaze` needs three things from cargo for every program: the rlibs and objects rustc
 built, the line rustc ran the linker with, and which workspace crates are in the program.
@@ -277,7 +280,7 @@ build beside it never changes a file under it.
 
 From those records `cargo/plan.rs` works out what the daemon is asked to build a program
 from: its workspace crates, the files to read symbols from, and rustc's link line with the
-daemon's objects ahead of rustc's. `crates/blaze-engine/src/plan.rs` computes the units of a build
+daemon's objects ahead of rustc's. `crates/blaze-cargo/src/plan.rs` computes the units of a build
 with the features and profile settings of each, which `cargo metadata` does not give per
 build.
 
@@ -357,7 +360,7 @@ more than one of is one of the new. On x86-64 a function's room for the jump run
 one field needs (`mov`, `ret`: 4 bytes). A patch's function of 2 bytes or more with no such
 room hops: a 2-byte `jmp` to 5 bytes of a run of `int3`s between two functions within 127
 bytes of it (`Image::pads`), and a `jmp` on from there, both undone with the patch;
-`BLAZE_SPLICE_HOPS` has every short function hop, for `rustcbase.py hop`. One of a single
+`BLAZE_SPLICE_HOPS` has every short function hop. One of a single
 byte, or with no run near it, is built in full. The executable is read again in the background with the
 object's symbols in it, the base of the patches after, which name against rustc's symbols too
 and are spliced onto what the whole splice left, an `#[inline]` function's edit too, since that
@@ -374,7 +377,8 @@ first edits' splice fails: that is what splicing can't do, and an own base links
 such an edit still links in full, and the link takes the room for splices that the executable
 there wanted (`headerpad_ahead`), so it is not linked twice.
 
-`BLAZE_RUSTC_BASE=0` makes the first build the daemon's own, as before. `harness/rustcbase.py` checks every kind of edit against cargo.
+`BLAZE_RUSTC_BASE=0` made the first build the daemon's own, and `harness/rustcbase.py` checked
+every kind of edit against cargo, until both went with the wrapper.
 
 An alternative wrapper exists in `stub.rs` (`BLAZE_WRAPS_RUSTC`), where rustc compiles only
 a stub for each workspace crate and all code is blaze's. It makes the first build faster,

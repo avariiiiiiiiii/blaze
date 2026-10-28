@@ -1379,9 +1379,6 @@ pub(crate) struct Rejected {
     why: String,
 }
 
-/// What [`Rejections`] knows of the executable rustc linked, as a base to patch.
-pub struct RustcBase(patch::Base);
-
 /// The functions of compiler-builtins that compiled code calls for what Cranelift or LLVM has
 /// no instruction of: 128-bit division and checked multiplication, and conversions between
 /// 128-bit integers and floats, and halves. rustc's code may call none of them, and an
@@ -1516,13 +1513,6 @@ impl Rejections {
         self.base.is_some() || self.patched().is_some()
     }
 
-    /// Has the next builds patch the executable rustc linked, until one in full makes a base
-    /// of ours: rustc compiled what the daemon reads. `debug` is whether a patch says which
-    /// lines its code is of.
-    pub fn start_from_rustc(&mut self, debug: bool) {
-        self.rustc = Some(patch::Base::of_rustc(debug));
-    }
-
     /// Whether the edits are patches of what rustc linked, which a build in full while
     /// nobody waits would replace with a base of ours.
     pub fn wants_base(&self) -> bool {
@@ -1537,16 +1527,6 @@ impl Rejections {
     /// Whether the next build is the one [`Rejections::build_base`] asked for.
     pub fn builds_base(&self) -> bool {
         self.full && self.rustc.is_some() && self.base.is_none()
-    }
-
-    /// Takes what rustc linked as a base out, to keep it through what forgets the rest.
-    pub fn take_rustc(&mut self) -> Option<RustcBase> {
-        self.full = false;
-        self.rustc.take().map(RustcBase)
-    }
-
-    pub fn put_rustc(&mut self, rustc: Option<RustcBase>) {
-        self.rustc = rustc.map(|it| it.0);
     }
 
     /// Forgets what the builds found, for a program that is built as if never built: after a

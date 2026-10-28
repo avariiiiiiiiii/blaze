@@ -68,13 +68,41 @@ pub(crate) fn pinned(manifest: &Path) -> Result<Option<String>, String> {
         table.get("workspace").and_then(|it| it.get("metadata")).and_then(|it| it.get("blaze"));
     let Some(version) = blaze.and_then(|it| it.get("version")) else { return Ok(None) };
     match version.as_str() {
-        Some(version) if is_version(version) => Ok(Some(version.to_owned())),
+        Some(version) if is_version(version) || is_channel(version) => Ok(Some(version.to_owned())),
         _ => Err(format!(
             "{} pins blaze to {version} under `[workspace.metadata.blaze]`, which is not a \
-             version of blaze (`0.YYYYMMDD.N`, as `blaze pin` writes it)",
+             version of blaze (`0.YYYYMMDD.N`, as `blaze pin` writes it) or a channel \
+             (\"stable\", \"canary\")",
             manifest.display()
         )),
     }
+}
+
+/// Whether a pin names a channel (docs/release.md): `stable`, the releases that passed the heavy
+/// tests, or `canary`, the newest release. It runs the release the channel names, read again
+/// once [`CHANNEL_FRESH`] has passed.
+pub(crate) fn is_channel(name: &str) -> bool {
+    name == "stable" || name == "canary"
+}
+
+/// How long the version a channel named is the one a pin to it runs, before it is read again.
+pub(crate) const CHANNEL_FRESH: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Where blaze keeps the version `channel` named when it was last read: `channels/<channel>`
+/// beside [`versions`].
+pub(crate) fn channel_file(channel: &str) -> Option<PathBuf> {
+    Some(versions()?.parent()?.join("channels").join(channel))
+}
+
+/// The version `file` (a [`channel_file`]) holds, and whether it was read within
+/// [`CHANNEL_FRESH`].
+pub(crate) fn channel_known(file: &Path) -> Option<(String, bool)> {
+    let version = std::fs::read_to_string(file).ok()?.trim().to_owned();
+    if !is_version(&version) {
+        return None;
+    }
+    let age = std::fs::metadata(file).ok()?.modified().ok()?.elapsed().unwrap_or_default();
+    Some((version, age < CHANNEL_FRESH))
 }
 
 /// Whether `version` is a release's version: numbers with dots between, so that it names a
@@ -130,6 +158,29 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[workspace.metadata.blaze]\nversion = 3\n")
             .unwrap();
         assert!(pinned(&found).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_pin_names_a_channel() {
+        let root = std::env::temp_dir().join(format!("blaze-pin-channel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("Cargo.toml");
+        for (pin, read) in
+            [("stable", Ok(Some("stable"))), ("canary", Ok(Some("canary"))), ("nightly", Err(()))]
+        {
+            std::fs::write(&manifest, format!("[workspace.metadata.blaze]\nversion = \"{pin}\"\n"))
+                .unwrap();
+            let got = pinned(&manifest);
+            assert_eq!(got.as_ref().map(|it| it.as_deref()).map_err(|_| ()), read, "{pin}");
+        }
+        let file = root.join("channels/canary");
+        assert_eq!(channel_known(&file), None);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "0.20261028.1\n").unwrap();
+        assert_eq!(channel_known(&file), Some(("0.20261028.1".to_owned(), true)));
+        std::fs::write(&file, "../x\n").unwrap();
+        assert_eq!(channel_known(&file), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

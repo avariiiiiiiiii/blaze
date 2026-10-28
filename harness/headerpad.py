@@ -13,9 +13,7 @@ The program is built with `blaze build` until the daemon serves the build, then
 edited a few times. The first link is told the room the unwind information of what it links
 wants, so it is linked once (#173: a large program was linked a second time, 260 s more), and
 every edit after the first one (which writes the whole object again) has to be spliced, and
-print what the source says. The first edits would otherwise go into rustc's link, which the
-wrapper gives room of its own (rustcbase.py has those), so the daemon is run with
-`BLAZE_RUSTC_BASE=0`.
+print what the source says.
 
 It is built for macOS 14, as nix's shell builds, for which Apple's linker writes the loader's
 fixups as chains unless the daemon's link line says otherwise; a splice declines those
@@ -82,7 +80,7 @@ def main():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
-               BLAZE_RUSTC_BASE="0", MACOSX_DEPLOYMENT_TARGET="14.0")
+               MACOSX_DEPLOYMENT_TARGET="14.0")
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "spad"), os.path.join(ws, "src", "main.rs")

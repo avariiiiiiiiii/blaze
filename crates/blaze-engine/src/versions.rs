@@ -137,21 +137,69 @@ pub(crate) fn why_this_one() -> String {
 
 /// The asset `name` of the release `version`.
 fn read(version: &str, name: &str) -> anyhow::Result<Vec<u8>> {
+    let read = read_at(&format!("v{version}"), name)?;
+    read.with_context(|| format!("blaze {version} has no {name}: is {version} a release of blaze?"))
+}
+
+/// The asset `name` of the release tagged `tag`, `None` when it has none.
+fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let given = std::env::var(RELEASES_FROM).ok().filter(|it| !it.is_empty());
     if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
-        let file = Path::new(dir).join(format!("v{version}")).join(name);
-        return std::fs::read(&file).with_context(|| format!("reading {}", file.display()));
+        let file = Path::new(dir).join(tag).join(name);
+        return match std::fs::read(&file) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+        };
     }
     let base = given.unwrap_or_else(|| RELEASES.to_owned());
-    let address = url::Url::parse(&format!("{}/v{version}/", base.trim_end_matches('/')))?;
+    let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?;
     let traffic = Arc::new(crate::remote::Traffic::new(1));
     let web = crate::remote::Https::open(&address, PATIENCE, traffic)?;
     let runtime = crate::remote::runtime()?;
     let read = runtime.block_on(web.read_small(name, MOST))?;
-    let (bytes, _) = read.with_context(|| {
-        format!("blaze {version} has no {name} at {address}: is {version} a release of blaze?")
+    Ok(read.map(|(bytes, _)| bytes))
+}
+
+/// The tag of the release whose assets are the channels' pointers (docs/release.md).
+const POINTERS: &str = "channels";
+
+/// `blaze version-resolve <channel>`: the version `channel` names now, printed, and kept in
+/// its [`pin::channel_file`] for the launcher, which runs that release for a pin to the channel.
+pub(crate) fn resolve_command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let channel = args.next().context("`version-resolve` is told the channel")?;
+    println!("{}", resolve(&channel)?);
+    Ok(())
+}
+
+/// The version `channel` names: its pointer, the asset `<channel>` of the release `channels`.
+pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
+    if !pin::is_channel(channel) {
+        bail!("blaze has no channel {channel}: the channels are stable and canary");
+    }
+    let bytes = read_at(POINTERS, channel)?.with_context(|| {
+        format!("blaze's releases name no release for the {channel} channel yet")
     })?;
-    Ok(bytes)
+    let version = String::from_utf8_lossy(&bytes).trim().to_owned();
+    if !pin::is_version(&version) {
+        bail!(
+            "the {channel} channel of blaze's releases names {version:?}, which is not a version"
+        );
+    }
+    if let Some(file) = pin::channel_file(channel) {
+        let kept = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
+            let staged = file.with_extension(format!("{}", std::process::id()));
+            std::fs::write(&staged, format!("{version}\n"))?;
+            std::fs::rename(&staged, &file)
+        });
+        if let Err(e) = kept {
+            eprintln!(
+                "blaze: could not keep the {channel} channel's version in {}: {e}",
+                file.display()
+            );
+        }
+    }
+    Ok(version)
 }
 
 /// Unpacks the `.tar.gz` `bytes`, whose files are under `top`, into `dir`. Unpacked beside it

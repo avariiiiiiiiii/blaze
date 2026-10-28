@@ -289,7 +289,7 @@ half-way had the line of the `async` block and was laid out first, so a breakpoi
 handler's line stopped in the drop path (that code, and the blocks that panic when a
 finished future is polled again, are now cold and laid out behind the body); and perf could not unwind through spliced
 code, because the segment a splice appends was not as far from the unwind table in the file
-as in memory. `Image::behind` in `crates/blaze-engine/src/splice.rs` now places it so.
+as in memory. `Image::behind` in `crates/blaze-splice/src/lib.rs` now places it so.
 
 ### A line for every instruction
 
@@ -541,7 +541,7 @@ A function is put in the patch again not only when its code changes but when any
 lines change, so adding a line at the top of a file re-describes the functions below it. Its
 compiled code comes from the cache; only the line lookup is redone.
 
-The code is in `crates/blaze-engine/src/splice/debug.rs`.
+The code is in `crates/blaze-splice/src/debug.rs`.
 
 ## What was measured
 

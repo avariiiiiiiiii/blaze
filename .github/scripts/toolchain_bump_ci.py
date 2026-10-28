@@ -35,8 +35,8 @@ BRANCH = "toolchain/bump"
 # The train of the main commit the bump is on: what the bump's train is compared with.
 BASE = "toolchain/base"
 PIN = os.path.join(ROOT, "harness/toolchain")
-PINS = os.path.join(ROOT, "crates/blaze-engine/src/cargo/toolchain/pins.txt")
-ANSWERS = os.path.join(ROOT, "crates/blaze-engine/src/answers/rustc.json")
+PINS = os.path.join(ROOT, "crates/blaze-cargo/src/cargo/toolchain/pins.txt")
+ANSWERS = os.path.join(ROOT, "crates/blaze-cargo/src/answers/rustc.json")
 # The issue is one for as long as the bump is blocked, retitled to the nightly it is on.
 TITLE = "Toolchain bump to {date} is blocked"
 TITLED = re.compile(r"^Toolchain bump to (\d{4}-\d{2}-\d{2}) is blocked$")

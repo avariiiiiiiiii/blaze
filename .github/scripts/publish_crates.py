@@ -81,7 +81,7 @@ EXTRAS: dict[str, list[Extra]] = {
         Extra(
             "harness/toolchain",
             "toolchain",
-            "src/cargo/state.rs",
+            "src/cargo/toolchain.rs",
             'include_str!("../../../../harness/toolchain")',
             'include_str!("../../toolchain")',
         ),
@@ -426,7 +426,7 @@ def staged_manifest(c: Crate, by_dir: dict[Path, Crate], stage: Path) -> dict[st
                 continue  # the staged workspace's table names it
             dep = by_dir[d]
             new = {
-                k: v for k, v in spec.items() if k not in ("path", "version", "package")
+                k: v for k, v in (spec.items() if isinstance(spec, dict) else ()) if k not in ("path", "version", "package")
             }
             new = {"path": f"../{dep.name}", "version": dep.requirement, **new}
             if dep.name != key:

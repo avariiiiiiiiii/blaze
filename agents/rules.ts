@@ -5,7 +5,7 @@
 //   bun agents/rules.ts            header and numbered rules, no reasons: what Claude's SessionStart
 //                                  hook (.claude/settings.json) puts into every session
 //   bun agents/rules.ts --reasons  the same with each rule's reason
-//   bun agents/rules.ts --write    regenerate AGENTS.md (read by Codex and other tools)
+//   bun agents/rules.ts --write    regenerate AGENTS.md (read by Claude Code, Codex and other tools)
 //   bun agents/rules.ts --check    fail if AGENTS.md is not what --write would write (CI, fmt job)
 //
 // A rule's identity is its `id` (kebab case, never reused or renamed lightly); its number is only
@@ -24,7 +24,7 @@ type Rule = {
 
 const header = `# blaze
 
-How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
+How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md). No CLAUDE.md: Claude Code reads AGENTS.md. Skills: .agents/skills/ (.claude/skills links there).`;
 
 export const rules = [
 	{

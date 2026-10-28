@@ -81,7 +81,8 @@ jobs:
         run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
       # A canary's tag is on a commit whose workspace version is the last release commit's.
       - if: github.ref_type == 'tag'
-        run: python3 -I .github/scripts/canary.py stamp "{\"tag\": \"$GITHUB_REF_NAME\"}"
+        run: |
+          python3 -I .github/scripts/canary.py stamp "{\"tag\": \"$GITHUB_REF_NAME\"}"
       # No build cache: release binaries come from a clean build. With the `llvm` feature, so
       # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
       # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a

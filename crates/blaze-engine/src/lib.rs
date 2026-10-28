@@ -6265,6 +6265,8 @@ const SURE: &[&str] = &[
     "E0560",
     "E0583",
     "E0599",
+    "E0665",
+    "builtin-derive-error",
     "unresolved-macro-call",
 ];
 

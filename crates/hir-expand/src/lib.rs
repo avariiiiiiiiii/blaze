@@ -119,6 +119,10 @@ impl ExpandError {
     pub fn other(span: Span, msg: impl Into<Box<str>>) -> Self {
         ExpandError { inner: Arc::new((ExpandErrorKind::Other(msg.into()), span)) }
     }
+    /// A semantic refusal of a built-in derive, rather than a failure to parse or expand it.
+    pub fn builtin_derive(span: Span, msg: impl Into<Box<str>>) -> Self {
+        Self::new(span, ExpandErrorKind::BuiltinDerive(msg.into()))
+    }
     pub fn kind(&self) -> &ExpandErrorKind {
         &self.inner.0
     }
@@ -143,6 +147,8 @@ pub enum ExpandErrorKind {
     Mbe(mbe::ExpandErrorKind),
     RecursionOverflow,
     Other(Box<str>),
+    BuiltinDerive(Box<str>),
+    DefaultNoVariant,
     ProcMacroPanic(Box<str>),
 }
 
@@ -212,6 +218,16 @@ impl ExpandErrorKind {
                 message: (**e).to_owned(),
                 error: true,
                 kind: RenderedExpandError::GENERAL_KIND,
+            },
+            ExpandErrorKind::BuiltinDerive(e) => RenderedExpandError {
+                message: (**e).to_owned(),
+                error: true,
+                kind: "builtin-derive-error",
+            },
+            ExpandErrorKind::DefaultNoVariant => RenderedExpandError {
+                message: "`#[derive(Default)]` on enum with no `#[default]`".to_owned(),
+                error: true,
+                kind: "E0665",
             },
             ExpandErrorKind::ProcMacroPanic(e) => RenderedExpandError {
                 message: format!("proc-macro panicked: {e}"),

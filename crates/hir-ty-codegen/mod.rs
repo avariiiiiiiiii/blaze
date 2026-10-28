@@ -2838,10 +2838,53 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
     rows.collect()
 }
 
+/// How many functions and instances this process has compiled: salsa running the query, not
+/// handing back what it has. What a build says of itself as it goes reads it.
+static COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The functions of the source compiled since [`take_recompiled`], the first
+/// [`RECOMPILED_KEPT`] of them, and how many there were: what a build says it rebuilt.
+static RECOMPILED: std::sync::Mutex<(Vec<FunctionId>, usize)> =
+    std::sync::Mutex::new((Vec::new(), 0));
+const RECOMPILED_KEPT: usize = 64;
+
+/// How many functions and instances this process has compiled.
+pub fn compiled_so_far() -> usize {
+    COMPILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A function of the source a build compiled: its name, the crate it is of and the file it
+/// is written in.
+pub struct Recompiled {
+    pub name: String,
+    pub krate: String,
+    pub file: base_db::FileId,
+}
+
+/// The functions of the source compiled since the last call, the first 64 of them, and how
+/// many there were in all.
+pub fn take_recompiled(db: &dyn HirDatabase) -> (Vec<Recompiled>, usize) {
+    let (funcs, all) = std::mem::take(&mut *RECOMPILED.lock().unwrap_or_else(|e| e.into_inner()));
+    let named = funcs.into_iter().map(|func| Recompiled {
+        name: FunctionSignature::of(db, func).name.as_str().to_owned(),
+        krate: fncache::crate_name(db, func.krate(db)),
+        file: func.lookup(db).id.file_id.original_file(db).file_id(db),
+    });
+    (named.collect(), all)
+}
+
 /// The code of a non-generic function.
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
+    COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut recompiled = RECOMPILED.lock().unwrap_or_else(|e| e.into_inner());
+        if recompiled.1 < RECOMPILED_KEPT {
+            recompiled.0.push(func);
+        }
+        recompiled.1 += 1;
+    }
     tier::for_build(|| root_code(db, func, false)).map(Produced::code)
 }
 
@@ -3035,6 +3078,7 @@ fn compiled_instance<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
+    COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
 }
 

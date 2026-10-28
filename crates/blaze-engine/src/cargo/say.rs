@@ -91,7 +91,7 @@ pub(crate) fn shell_note(text: &str) {
     eprintln!("{}: {text}", painted(GREEN, "note"));
 }
 
-/// Whether the command was asked to be quiet (`-q`), which shows no [`Waiting`].
+/// Whether the command was asked to be quiet (`-q`), which shows no [`Shown`].
 static QUIET: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn quiet(quiet: bool) {
@@ -119,63 +119,113 @@ pub(crate) fn terminal_width() -> Option<usize> {
 }
 
 /// How long a command waits before a terminal shows what it waits for: an answer sooner
-/// than this is shown nothing of, as cargo shows no progress bar of a quick build.
+/// than this is shown nothing of but its last line, as cargo shows no progress bar of a
+/// quick build.
 const SHOWN_AFTER: Duration = Duration::from_millis(500);
 
-/// What a command that waits for the daemon shows of what the daemon says it is at. On a
-/// terminal: one line, written over as it changes and with the seconds of the step, taken
-/// away when the answer comes, as cargo's progress bar is. Elsewhere: a line for each step
-/// the worker names, once, and nothing of a wait it names no step of (a build of an edit),
-/// for a log to read as cargo's.
-pub(crate) struct Waiting {
+/// What a command that waits for the daemon shows of the build's records
+/// ([`crate::events`]). On a terminal: a region below the lines that stay, drawn again as
+/// records come and time passes, and at the end the build's last line in its place
+/// ([`blaze_ui::live`]). Elsewhere: cargo's lines, for a log ([`blaze_ui::plain`]). Nothing
+/// when the command is quiet.
+pub(crate) struct Shown {
     asked: Instant,
-    /// The word of a wait whose step is not said: `Building`, `Checking`.
-    doing: &'static str,
-    step: Option<((String, String), Instant)>,
-    drawn: bool,
+    to: Option<Rendering>,
+    /// What a terminal is not shown yet, before [`SHOWN_AFTER`].
+    held: Option<String>,
 }
 
-impl Waiting {
-    pub(crate) fn new(doing: &'static str) -> Waiting {
-        Waiting { asked: Instant::now(), doing, step: None, drawn: false }
-    }
+enum Rendering {
+    Live(blaze_ui::live::Live),
+    Plain(blaze_ui::plain::Plain),
+}
 
-    pub(crate) fn show(&mut self, step: Option<(String, String)>) {
-        if QUIET.load(Ordering::Relaxed) {
-            return;
-        }
+impl Shown {
+    pub(crate) fn new() -> Shown {
         let terminal = std::io::stderr().is_terminal();
-        let changed = self.step.as_ref().map(|it| &it.0) != step.as_ref();
-        if changed {
-            self.step = step.map(|it| (it, Instant::now()));
-            if !terminal && let Some(((word, what), _)) = &self.step {
-                status(false, word, what);
+        let to = match () {
+            () if QUIET.load(Ordering::Relaxed) => None,
+            () if terminal => {
+                let width = terminal_width().unwrap_or(80);
+                Some(Rendering::Live(blaze_ui::live::Live::new(width, colored())))
             }
+            () => Some(Rendering::Plain(blaze_ui::plain::Plain::new(colored()))),
+        };
+        let held = terminal.then(String::new);
+        Shown { asked: Instant::now(), to, held }
+    }
+
+    fn now_ns(&self) -> u64 {
+        u64::try_from(self.asked.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn record(&mut self, record: &blaze_protocol::events::Record) {
+        let now_ns = self.now_ns();
+        let out = match &mut self.to {
+            Some(Rendering::Live(live)) => live.record(record, now_ns),
+            Some(Rendering::Plain(plain)) => plain.record(record),
+            None => return,
+        };
+        self.write(&out);
+    }
+
+    /// Draws the region again for the time that passed, or says a step is still under way.
+    pub(crate) fn tick(&mut self) {
+        let now_ns = self.now_ns();
+        let out = match &mut self.to {
+            Some(Rendering::Live(live)) => {
+                if let Some(width) = terminal_width() {
+                    live.resize(width);
+                }
+                live.tick(now_ns)
+            }
+            Some(Rendering::Plain(plain)) => plain.tick(now_ns),
+            None => return,
+        };
+        self.write(&out);
+    }
+
+    /// The answer came: the region is taken away, and what was held back of a quick build is
+    /// its last line alone.
+    pub(crate) fn done(&mut self) {
+        let Some(Rendering::Live(live)) = &mut self.to else { return };
+        // The record of the build's end drew its last line in the region's place already.
+        let out = match live.build().finished {
+            Some(_) => String::new(),
+            None => live.finish(),
+        };
+        match self.held.take() {
+            Some(_) => {
+                let last = live.build().finished.as_ref();
+                let last = last.map(|it| blaze_ui::summary_line(it, colored()) + "\n");
+                eprint!("{}", last.unwrap_or_default());
+            }
+            None => eprint!("{out}"),
         }
-        if !terminal || self.asked.elapsed() < SHOWN_AFTER {
+        self.to = None;
+    }
+
+    fn write(&mut self, out: &str) {
+        if let Some(held) = &mut self.held {
+            held.push_str(out);
+            if self.asked.elapsed() < SHOWN_AFTER {
+                return;
+            }
+            let held = self.held.take().unwrap_or_default();
+            eprint!("{held}");
             return;
         }
-        let ((word, what), since) = match &self.step {
-            Some(((word, what), since)) => ((word.as_str(), what.as_str()), *since),
-            None => ((self.doing, ""), self.asked),
-        };
-        let secs = since.elapsed().as_secs();
-        let after = if secs == 0 { String::new() } else { format!(" ({secs} s)") };
-        // A line longer than the terminal wraps, and is then not one to write over.
-        let room = terminal_width().unwrap_or(80).saturating_sub(12 + 1 + after.len() + 1);
-        let what: String = match what.chars().count() > room {
-            true => what.chars().take(room.saturating_sub(3)).chain("...".chars()).collect(),
-            false => what.to_owned(),
-        };
-        eprint!("\r{} {what}{after}\x1b[K", painted(CYAN, &format!("{word:>12}")));
-        self.drawn = true;
+        eprint!("{out}");
     }
 }
 
-impl Drop for Waiting {
+impl Drop for Shown {
     fn drop(&mut self) {
-        if self.drawn {
-            eprint!("\r\x1b[K");
+        if let Some(Rendering::Live(live)) = &mut self.to
+            && self.held.is_none()
+            && live.build().finished.is_none()
+        {
+            eprint!("{}", live.finish());
         }
     }
 }

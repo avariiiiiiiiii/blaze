@@ -13,6 +13,7 @@ mod dep_info;
 mod deps;
 mod doctest;
 mod errors;
+mod events;
 mod frozen;
 mod inputs;
 mod link;
@@ -25,7 +26,6 @@ mod mirdump;
 mod outline;
 mod plan;
 mod process;
-mod progress;
 mod remote;
 mod renamed;
 mod sandbox;
@@ -4911,7 +4911,7 @@ fn std_unit_at(
         debug,
         ..args.clone()
     };
-    progress::phase("Compiling", "the standard library (once, kept in the store)");
+    events::at(events::Step::Std, None);
     let built = build_unheld(db, table, &of_unit, &mut Rejections::default(), listed)
         .with_context(|| {
             let names: Vec<&str> = unit.iter().map(|it| it.0.as_str()).collect();
@@ -9023,9 +9023,9 @@ fn run_holding(
     });
 
     if let Some(socket) = &args.socket {
-        progress::said_beside(socket);
+        events::said_beside(socket);
     }
-    progress::phase("Loading", "workspace");
+    events::at(events::Step::LoadWorkspace, None);
     let start = Instant::now();
     let selection = args.selection.clone();
     blaze_store::identify_ahead();
@@ -9140,7 +9140,7 @@ fn run_holding(
     if remote::required() {
         shared = pulled(pulling.take().expect("not joined yet"))?;
     }
-    progress::phase("Resolving", "names");
+    events::at(events::Step::Resolve, None);
     let built = built_crates(&db, &args)?;
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
@@ -9325,7 +9325,7 @@ fn run_holding(
                     cold
                 }
                 None => {
-                    progress::phase("Compiling", &format!("the functions of {}", args.krate));
+                    let _compiling = events::compiling(&args.krate);
                     let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                     // An `include!` in a body is first seen when the body is compiled.
                     if WatchedFile::include_sources(&mut files, &mut tree, &mut db)
@@ -9398,7 +9398,7 @@ fn run_holding(
                     .collect();
                 let mut all: Vec<_> = paths.keys().copied().collect();
                 all.sort_unstable();
-                progress::phase("Checking", &format!("{} files", all.len()));
+                events::at(events::Step::Check, Some(&format!("{} files", all.len())));
                 let sources = Sources { paths };
                 let lints = !args.lints_capped;
                 let within = Some(within);
@@ -9416,7 +9416,8 @@ fn run_holding(
             }
             memory::report(&mut db, "build")?;
             report_stats(&known.stats);
-            progress::phase("Linking", &args.krate);
+            events::built(&db, &args.krate, &known.stats, None);
+            events::at(events::Step::Link, Some(&args.krate));
             link(
                 args.link_cmd.as_deref(),
                 args.splice.as_deref(),
@@ -9523,7 +9524,7 @@ fn run_holding(
             Some((inside.to_owned(), db.file_text(id).text(&db).clone()))
         })
         .collect();
-    progress::idle();
+    events::idle();
     let listener = match &args.socket {
         Some(path) => match socket::Served::bind(path) {
             Ok(served) => Some(served),
@@ -10602,6 +10603,7 @@ fn run_holding(
                         Err(panic) => Some(Ok(program.panicked(&*panic))),
                     };
                     end_link();
+                    events::idle();
                     let _ = sender.send(Event::Built(at, program, answer));
                 });
             }
@@ -10664,6 +10666,7 @@ fn run_holding(
             }
             listed.touch(&db, Some(&late));
         };
+        events::idle();
         if std::env::var_os("BLAZE_QUERIES").is_some() {
             let ran: Vec<String> = ide_db::executions::take(&db)
                 .iter()
@@ -11211,6 +11214,7 @@ impl Program {
             }
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
+        let compiling = events::compiling(&args.krate);
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
@@ -11296,6 +11300,15 @@ impl Program {
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
+        drop(compiling);
+        let edited_paths: FxHashMap<vfs::FileId, PathBuf> = edited
+            .iter()
+            .filter_map(|file| {
+                let path = paths.paths.get(file)?;
+                Some((*file, path.strip_prefix(&args.checkout).unwrap_or(path).to_owned()))
+            })
+            .collect();
+        events::built(db, &args.krate, &known.stats, Some(&edited_paths));
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let dated = start.elapsed();
@@ -11367,6 +11380,7 @@ impl Program {
             let cmd = args.link_cmd.as_deref().filter(|_| failed.is_none() && link_it);
             let (over_rustc, onto) = (known.stats.over_rustc, known.stats.onto_rustcs);
             begin_link();
+            events::at(events::Step::Link, Some(&args.krate));
             let packs = packs_whole(args);
             let own_line = args.exe.is_some();
             let unlinked = link(

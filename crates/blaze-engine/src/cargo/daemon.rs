@@ -28,7 +28,12 @@ use std::os::unix::net::UnixStream;
 use uds_windows::UnixStream;
 
 use super::{plan::Plan, units::stamp_of};
-use crate::socket::{self, NotServed, Served, private_dir, private_file, read_request};
+use blaze_protocol::{
+    Message,
+    events::{Event, Record},
+};
+
+use crate::socket::{self, Asked, NotServed, Served, private_dir, private_file};
 
 /// How long the daemon and each worker live without being asked, unless
 /// `BLAZE_IDLE_SECS` says otherwise.
@@ -134,6 +139,14 @@ pub(crate) fn errors_beside(socket: &Path) -> PathBuf {
     socket.with_file_name("errors")
 }
 
+/// What the daemon reads of a request of a blaze from before the frames, which sent JSON:
+/// whether it starts a daemon of its own.
+#[derive(Deserialize)]
+struct Older {
+    #[serde(default)]
+    replaces: bool,
+}
+
 /// A request with the version of the client that sends it.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Envelope {
@@ -204,11 +217,6 @@ pub(crate) enum Reply {
     },
     Status(Status),
     Stopping,
-    /// Not the answer, which is still to come: what the process the answer waits for is at,
-    /// a status word and what it is of, when it says ([`crate::progress`]).
-    Progress {
-        step: Option<(String, String)>,
-    },
 }
 
 /// Why the worker did not build a program.
@@ -494,7 +502,7 @@ impl Worker {
         // is not the one to connect to.
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(errors_beside(&socket));
-        let _ = std::fs::remove_file(crate::progress::beside(&socket));
+        crate::events::forget_beside(&socket);
         let config = &checkout.config;
         let mut args = config.args(&checkout.root, &first.crates);
         let rustcs: [(&str, &Path); 5] = [
@@ -939,7 +947,7 @@ impl Checker {
         private_dir(dir)?;
         let (socket, log) = (dir.join("sock"), dir.join("log"));
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_file(crate::progress::beside(&socket));
+        crate::events::forget_beside(&socket);
         let mut args: Vec<OsString> = vec!["--check".into()];
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
@@ -1171,54 +1179,129 @@ pub(crate) fn serve() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How often a command that waits for an answer is told what the process it waits for is at.
-const TELLING: Duration = Duration::from_millis(250);
+/// How often a command that waits for an answer is handed what the process it waits for
+/// said since.
+const RELAYED: Duration = Duration::from_millis(100);
 
-/// The answer `answering` gives, with the command that waits for it told what the process
-/// that writes `phase` is at every [`TELLING`] meanwhile ([`Reply::Progress`]): a command
-/// that says nothing for the minute a load and a first build can take looks stuck.
-fn telling(stream: &UnixStream, phase: &Path, answering: impl FnOnce() -> Reply) -> Reply {
+/// What the daemon sends a client in answer to a request: the records of the build it waits
+/// for as they come, then the reply.
+#[derive(Serialize, Deserialize, Debug)]
+pub(crate) enum Answer {
+    Record(Record),
+    Reply(Reply),
+}
+
+/// The answer `answering` gives, with the command that waits for it, request `id`, handed
+/// each record the process in `dir` writes meanwhile ([`crate::events`]), its times from
+/// when the command asked, and last how the build went. A command that says nothing for
+/// the minute a load and a first build can take looks stuck.
+fn relaying(
+    stream: &UnixStream,
+    id: u64,
+    dir: &Path,
+    command: &str,
+    answering: impl FnOnce() -> Reply,
+) -> Reply {
+    let began_ns = crate::events::now_ns();
+    let build = std::sync::Mutex::new(blaze_ui::Build::default());
+    let gone = AtomicBool::new(false);
+    let send = |event: Event, at_ns: u64| {
+        let record = Record { at_ns: at_ns.saturating_sub(began_ns), event };
+        lock(&build).apply(&record);
+        // A command that went away is handed nothing more; its answer goes nowhere too.
+        if !gone.load(Relaxed)
+            && blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Record(record))).is_err()
+        {
+            gone.store(true, Relaxed);
+        }
+    };
+    let follow = std::sync::Mutex::new(crate::events::Follow::new());
+    let relay = || {
+        let Some(path) = crate::events::written_in(dir) else { return };
+        for record in lock(&follow).read(&path, true) {
+            send(record.event, record.at_ns);
+        }
+    };
+    let root = dir.to_owned();
+    send(Event::Began { build: id, command: command.to_owned(), root }, began_ns);
     let (answered, told) = std::sync::mpsc::channel::<()>();
-    std::thread::scope(|scope| {
+    let relay = &relay;
+    let reply = std::thread::scope(|scope| {
         scope.spawn(move || {
-            while told.recv_timeout(TELLING) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                let step = crate::progress::read(phase);
-                let Ok(mut line) = serde_json::to_string(&Reply::Progress { step }) else { break };
-                line.push('\n');
-                // A command that went away is told nothing more; its answer goes nowhere too.
-                if (&*stream).write_all(line.as_bytes()).is_err() {
-                    break;
-                }
+            while told.recv_timeout(RELAYED) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                relay();
             }
         });
         let reply = answering();
         drop(answered);
         reply
-    })
+    });
+    // What the process said before it answered.
+    relay();
+    let first_line = |text: String| text.lines().next().unwrap_or_default().to_owned();
+    let error = match &reply {
+        Reply::Synced { programs, .. } => {
+            programs.iter().find_map(|it| it.as_ref().err()).map(|it| first_line(it.clone().why()))
+        }
+        Reply::Checked { errors: Some(said) } => Some(first_line(said.to_string())),
+        Reply::Cold { reason } => Some(first_line(reason.clone())),
+        _ => None,
+    };
+    let ok = error.is_none();
+    let now_ns = crate::events::now_ns();
+    let summary = lock(&build).summary(now_ns.saturating_sub(began_ns), error);
+    send(Event::Finished { ok, summary }, now_ns);
+    reply
 }
 
 impl Daemon {
     /// Reads the one request of a connection and answers it.
     fn answer(&self, stream: UnixStream) -> anyhow::Result<()> {
         let began = Instant::now();
-        let line = read_request(&stream)?;
-        // An editor's text, on a line of its own that is not JSON: it is long and comes
-        // with every key typed. The worker answers as to `blaze build`.
+        let line = match socket::read_asked(&stream)? {
+            Asked::Frame(item) => return self.answer_frame(&stream, &item, began),
+            Asked::Line(line) => line,
+        };
+        // An editor's text, on a line of its own: it is long and comes with every key typed.
+        // The worker answers as to `blaze build`.
         if line.starts_with("edit\t") {
             let reply = self.edit(&line).unwrap_or_else(|why| format!("error: {why:#}"));
             // An editor's client reads the errors as text.
             let reply = crate::errors::Said::text_of_reply(&reply);
             return Ok((&stream).write_all(format!("{}\n", reply.replace('\n', " ")).as_bytes())?);
         }
-        let envelope = serde_json::from_str::<Envelope>(&line);
-        // A request that can't be read is one of another version too, and of a client
-        // that waits for an answer it can read: it gets none, and the daemon stays.
-        let replaced = envelope.as_ref().is_ok_and(|it| it.replaces && it.version != self.version);
+        // Any other line is the JSON of a blaze from before the frames, of another version: it
+        // is answered so in its JSON, and the daemon exits for one that starts its own.
+        let replaces = serde_json::from_str::<Older>(&line).is_ok_and(|it| it.replaces);
+        let mut text = serde_json::to_string(&Reply::Restart { version: self.version.clone() })?;
+        text.push('\n');
+        let sent = (&stream).write_all(text.as_bytes());
+        if replaces {
+            self.end();
+        }
+        Ok(sent?)
+    }
+
+    /// Answers the request of a frame, a [`Message`] of an [`Envelope`].
+    fn answer_frame(&self, stream: &UnixStream, item: &[u8], began: Instant) -> anyhow::Result<()> {
+        // One that can't be read is of another version, and of a client that waits for an
+        // answer it can read: it gets none, and the daemon stays.
+        let message = blaze_protocol::cbor::from_slice::<Message<Envelope>>(item).ok();
+        let (id, envelope) = match message {
+            Some(message) if message.schema == blaze_protocol::SCHEMA => {
+                (message.id, Some(message.body))
+            }
+            Some(message) => (message.id, None),
+            None => (0, None),
+        };
+        let replaced = envelope.as_ref().is_some_and(|it| it.replaces && it.version != self.version);
         let read = Instant::now();
         let mut reply = match envelope {
-            Ok(envelope) if envelope.version == self.version => {
-                match self.phase_of(&envelope.request) {
-                    Some(phase) => telling(&stream, &phase, || self.handle(envelope.request)),
+            Some(envelope) if envelope.version == self.version => {
+                match self.followed_in(&envelope.request) {
+                    Some((dir, command)) => {
+                        relaying(stream, id, &dir, command, || self.handle(envelope.request))
+                    }
                     None => self.handle(envelope.request),
                 }
             }
@@ -1229,10 +1312,9 @@ impl Daemon {
             spans.push(crate::trace::span("daemon read request", level, began, read));
             spans.push(crate::trace::span("daemon", level, read, Instant::now()));
         }
-        let mut text = serde_json::to_string(&reply)?;
-        text.push('\n');
-        let sent = (&stream).write_all(text.as_bytes());
-        if replaced || matches!(reply, Reply::Stopping) {
+        let stopping = matches!(reply, Reply::Stopping);
+        let sent = blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Reply(reply)));
+        if replaced || stopping {
             self.end();
         }
         Ok(sent?)
@@ -1268,17 +1350,20 @@ impl Daemon {
         }
     }
 
-    /// The file the process that answers `request` says what it is at in, for a request
-    /// that can take long: a build, which may load the workspace first, and a check.
-    fn phase_of(&self, request: &Request) -> Option<PathBuf> {
-        let dir = match request {
-            Request::Build(checkout) => self.home.join("workers").join(checkout.config.id()),
-            Request::Check(ahead) | Request::Lint(ahead, _) => {
-                self.home.join("checkers").join(ahead.config.id())
+    /// The directory of the process that answers `request`, whose records the command that
+    /// asks is handed ([`crate::events`]), and what the request is: a build, which may load
+    /// the workspace first, and a check, which can take long.
+    fn followed_in(&self, request: &Request) -> Option<(PathBuf, &'static str)> {
+        match request {
+            Request::Build(checkout) => {
+                Some((self.home.join("workers").join(checkout.config.id()), "build"))
             }
-            Request::Warm(_) | Request::Status | Request::Stop => return None,
-        };
-        Some(crate::progress::beside(&dir.join("sock")))
+            Request::Check(ahead) => Some((self.home.join("checkers").join(ahead.config.id()), "check")),
+            Request::Lint(ahead, _) => {
+                Some((self.home.join("checkers").join(ahead.config.id()), "clippy"))
+            }
+            Request::Warm(_) | Request::Status | Request::Stop => None,
+        }
     }
 
     fn handle(&self, request: Request) -> Reply {

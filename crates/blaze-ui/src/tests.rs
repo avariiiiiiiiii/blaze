@@ -111,7 +111,7 @@ fn a_cold_build_off_a_terminal_is_a_line_per_step() {
         "   Compiling functions (18.5s)",
         "    Compiled anim: 5351 fns compiled, 2 kept in 33.3s",
         "     Linking anim",
-        "    Finished compiled 5351 fns in 1 crate, 2 kept; 1m14s",
+        "    Compiled 5351 fns in 1 crate, 2 kept; 1m14s",
     ];
     assert_eq!(out, expected.map(|it| format!("{it}\n")).concat());
 }
@@ -122,8 +122,8 @@ fn an_edit_says_what_it_rebuilt_and_why() {
     let out: String = edit().iter().map(|it| plain.record(it)).collect();
     assert_eq!(
         out,
-        "   Compiling functions\n   Compiling anim\n    Finished rebuilt 3 fns: render (body \
-         edited), draw, tick (calls render); 0.21s\n"
+        "   Compiling functions\n   Compiling anim\n     Rebuilt 3 fns: render (body edited), draw, \
+         tick (calls render); 0.21s\n"
     );
     let finished = plain.build().finished.clone().unwrap();
     assert!(summary_line(&finished, true).contains("\x1b["));
@@ -162,7 +162,7 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
     }
     let last = &screens.last().unwrap().1;
     assert!(
-        last.ends_with("    Finished compiled 5351 fns in 1 crate, 2 kept; 1m14s\n"),
+        last.ends_with("    Compiled 5351 fns in 1 crate, 2 kept; 1m14s\n"),
         "{last:?}"
     );
     // In the middle of the compile: the step, the crate under way, its count.
@@ -192,5 +192,5 @@ fn region_len(lines: &[&str]) -> usize {
 }
 
 fn live_finished(rest: &str) -> bool {
-    rest.contains("    Finished ")
+    rest.contains("    Compiled 5351 fns in 1 crate")
 }

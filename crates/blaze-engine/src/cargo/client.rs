@@ -16,8 +16,10 @@ use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 use uds_windows::UnixStream;
 
+use blaze_protocol::Message;
+
 use super::{
-    daemon::{Envelope, Reply, Request, SPARE, home, socket_in, version},
+    daemon::{Answer, Envelope, Reply, Request, SPARE, home, socket_in, version},
     say, switch, wrapper,
 };
 use crate::socket::{connect, private_dir, private_file};
@@ -45,23 +47,19 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
     // A whole build is asked for at once: no cargo builds meanwhile for a spare to load beside.
     let spares = !matches!(&request, Request::Build(checkout) if checkout.config.whole);
     let started = |home: &Path| started(home, spares);
-    let doing = match &request {
-        Request::Check(_) | Request::Lint(..) => "Checking",
-        _ => "Building",
-    };
-    let exchange = |stream: &mut UnixStream, envelope: &str| exchange(stream, envelope, doing);
+    let exchange = |stream: &mut UnixStream, envelope: &[u8]| exchange(stream, envelope, replaces);
     let request = request.of_this_command();
-    let envelope = serde_json::to_string(&Envelope { version: version(), replaces, request })?;
+    let envelope = framed(&Envelope { version: version(), replaces, request })?;
     let mut stream = match (connect(&socket), start) {
         (Ok(stream), _) => stream,
         (Err(_), Start::Never) => return Ok(None),
         (Err(_), Start::IfMissing) => started(&home)?,
     };
-    let mut reply = match exchange(&mut stream, &envelope) {
+    let mut reply = match exchange(&mut stream, &envelope[..]) {
         // A daemon that was on its way out when it was asked is as good as none.
         Err(_) if start == Start::IfMissing => {
             gone(&socket);
-            exchange(&mut started(&home)?, &envelope)?
+            exchange(&mut started(&home)?, &envelope[..])?
         }
         // One that took its socket with it shut down; one that was killed left it.
         Err(_) if left(&socket) => return Ok(None),
@@ -80,7 +78,7 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
             return Ok(Some(reply));
         }
         gone(&socket);
-        reply = exchange(&mut started(&home)?, &envelope)?;
+        reply = exchange(&mut started(&home)?, &envelope[..])?;
     }
     Ok(Some(reply))
 }
@@ -167,33 +165,123 @@ pub(crate) fn why_none() -> String {
     }
 }
 
-/// Sends `envelope` and reads the answer, showing what the daemon says it is at until it
-/// comes ([`Reply::Progress`]), or that it is `doing` the request when it does not say.
-fn exchange(
-    stream: &mut UnixStream,
-    envelope: &str,
-    doing: &'static str,
-) -> anyhow::Result<Reply> {
-    stream.write_all(format!("{envelope}\n").as_bytes())?;
-    let mut waiting = say::Waiting::new(doing);
-    let mut reader = BufReader::new(stream);
+/// `envelope` as the daemon reads it: a frame of a [`Message`], and a newline after it for a
+/// daemon of before the frames, which reads a line ([`crate::socket::read_asked`]).
+fn framed(envelope: &Envelope) -> anyhow::Result<Vec<u8>> {
+    let item = blaze_protocol::cbor::to_vec(&Message::new(ASKED, envelope))?;
+    let mut framed = Vec::with_capacity(item.len() + 5);
+    blaze_protocol::write_frame(&mut framed, &item)?;
+    framed.push(b'\n');
+    Ok(framed)
+}
+
+/// The id of the one request a connection carries.
+const ASKED: u64 = 1;
+
+/// How often what a command shows of the build it waits for is drawn again.
+const TICK: Duration = Duration::from_millis(100);
+
+/// What the daemon sent next.
+enum Got {
+    Answer(Answer),
+    /// A line of JSON: the daemon is of a blaze from before the frames.
+    Older(String),
+    /// The daemon hung up.
+    Ended,
+}
+
+/// Sends `envelope` and reads the answer, showing the records of the build it waits for as
+/// they come ([`say::Shown`]). A daemon from before the frames is told to stop in its own
+/// JSON, when the client `replaces` it, and answers as one of another version.
+fn exchange(stream: &mut UnixStream, envelope: &[u8], replaces: bool) -> anyhow::Result<Reply> {
+    stream.write_all(envelope)?;
+    let mut reader = stream.try_clone()?;
+    let (sender, got) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let next = next(&mut reader);
+            let last = !matches!(next, Ok(Got::Answer(Answer::Record(_))));
+            if sender.send(next).is_err() || last {
+                break;
+            }
+        }
+    });
+    let mut shown = say::Shown::new();
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line);
-        // A line without its end is one the daemon did not live to finish.
-        if !matches!(read, Ok(1..)) || !line.ends_with('\n') {
-            drop(waiting);
-            let log = home()?.join("daemon.log");
-            anyhow::bail!(
-                "the daemon ended before it answered (killed?), its log is {}",
-                log.display()
-            );
+        let next = match got.recv_timeout(TICK) {
+            Ok(next) => next,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                shown.tick();
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(Got::Ended),
+        };
+        match next.context("the daemon's answer is not one of this version")? {
+            Got::Answer(Answer::Record(record)) => shown.record(&record),
+            Got::Answer(Answer::Reply(reply)) => {
+                shown.done();
+                return Ok(reply);
+            }
+            Got::Older(line) => {
+                drop(shown);
+                let reply = serde_json::from_str::<Reply>(&line);
+                let version = match reply {
+                    Ok(Reply::Restart { version }) => version,
+                    _ => "of before the frames".to_owned(),
+                };
+                if replaces {
+                    stop_older(&socket_in(&home()?));
+                }
+                return Ok(Reply::Restart { version });
+            }
+            Got::Ended => {
+                drop(shown);
+                let log = home()?.join("daemon.log");
+                anyhow::bail!(
+                    "the daemon ended before it answered (killed?), its log is {}",
+                    log.display()
+                );
+            }
         }
-        let reply = serde_json::from_str::<Reply>(&line);
-        match reply.context("the daemon's answer is not one of this version")? {
-            Reply::Progress { step } => waiting.show(step),
-            reply => return Ok(reply),
+    }
+}
+
+/// The next thing the daemon sends on `stream`.
+fn next(stream: &mut UnixStream) -> std::io::Result<Got> {
+    let mut first = [0];
+    loop {
+        match std::io::Read::read(stream, &mut first) {
+            Ok(0) => return Ok(Got::Ended),
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
+    }
+    if first == *b"{" {
+        let mut line = "{".to_owned();
+        BufReader::new(stream).read_line(&mut line)?;
+        return Ok(Got::Older(line));
+    }
+    let mut framed = std::io::Read::chain(&first[..], &mut *stream);
+    let item = match blaze_protocol::read_frame(&mut framed) {
+        Ok(Some(item)) => item,
+        // A frame without its end is one the daemon did not live to finish.
+        Ok(None) => return Ok(Got::Ended),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Got::Ended),
+        Err(error) => return Err(error),
+    };
+    let message = blaze_protocol::cbor::from_slice::<Message<Answer>>(&item)
+        .map_err(|it| std::io::Error::new(std::io::ErrorKind::InvalidData, it))?;
+    Ok(Got::Answer(message.body))
+}
+
+/// Has the daemon at `socket`, of a blaze from before the frames, exit: it reads a request
+/// in JSON, and one of another version that replaces it ends it.
+fn stop_older(socket: &Path) {
+    let Ok(mut stream) = connect(socket) else { return };
+    let stop = "{\"version\":\"\",\"replaces\":true,\"request\":\"Stop\"}\n";
+    if stream.write_all(stop.as_bytes()).is_ok() {
+        ended(&mut stream);
     }
 }
 

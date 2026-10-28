@@ -126,9 +126,11 @@ impl Live {
                 true => "\u{2514}\u{2500}",
                 false => "\u{251c}\u{2500}",
             };
-            let fns = match krate.fns.total {
-                0 => String::new(),
-                total => format!("  {}/{total} fns", krate.fns.done),
+            // A compile under way knows how many it did, and not yet of how many.
+            let fns = match (krate.fns.total, krate.fns.done) {
+                (0, 0) => String::new(),
+                (0, done) => format!("  {done} fns"),
+                (total, done) => format!("  {done}/{total} fns"),
             };
             let rest = format!("{}{fns}  {}", krate.name, since(krate.began_ns));
             lines.push(self.fit(CYAN, &format!("{:>14}", branch), &rest));

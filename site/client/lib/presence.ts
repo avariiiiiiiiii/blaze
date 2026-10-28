@@ -11,7 +11,9 @@
  * - the sidebar: a small stack of faces on each page's row that someone else is reading, and when one of them says
  *   something in the chat, a speech bubble out of their face for a few seconds (`speak`);
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
- *   threads of that doc if it is the page shown.
+ *   threads of that doc if it is the page shown;
+ * - the page itself: the pointers of the others on it, and where on it each is reading (client/lib/cursors.ts, which
+ *   rides this socket too).
  *
  * The socket also says which build of the site is live (a `build` frame on every connect): client/lib/update.ts takes
  * a new one in, a reload or a swap in place.
@@ -24,6 +26,7 @@
 
 import { tipOn } from './tip';
 import * as chat from './chat';
+import * as cursors from './cursors';
 import * as update from './update';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
@@ -58,7 +61,22 @@ function sitePath(): string {
 }
 
 const href = (path: string) => BASE + path.slice(1);
-const name = (w: Who) => (w.login ? `@${w.login}` : `anon ${w.key.slice(1, 5)}`);
+/** Words for anonymous readers' names: the same key is always the same "Quiet Otter", here and on every tab. */
+const ADJECTIVES = [
+	'Amber', 'Brave', 'Bright', 'Calm', 'Clever', 'Cosmic', 'Curious', 'Dapper', 'Eager', 'Fuzzy', 'Gentle', 'Golden',
+	'Happy', 'Jolly', 'Kind', 'Lucky', 'Merry', 'Mighty', 'Nimble', 'Quiet', 'Rapid', 'Rusty', 'Shiny', 'Sleepy',
+	'Snappy', 'Sunny', 'Swift', 'Tidy', 'Witty', 'Zesty', 'Plucky', 'Cozy',
+];
+const ANIMALS = [
+	'Otter', 'Fox', 'Panda', 'Koala', 'Falcon', 'Badger', 'Heron', 'Lynx', 'Moose', 'Owl', 'Penguin', 'Rabbit', 'Raven',
+	'Seal', 'Sparrow', 'Tiger', 'Turtle', 'Walrus', 'Whale', 'Wombat', 'Yak', 'Zebra', 'Crab', 'Gecko', 'Hedgehog',
+	'Lemur', 'Llama', 'Narwhal', 'Octopus', 'Puffin', 'Squid', 'Crane',
+];
+const anonName = (key: string) => {
+	const n = parseInt(key.slice(1, 7), 16) || 0;
+	return `${ADJECTIVES[n % ADJECTIVES.length]} ${ANIMALS[Math.floor(n / ADJECTIVES.length) % ANIMALS.length]}`;
+};
+const name = (w: Who) => (w.login ? `@${w.login}` : anonName(w.key));
 const awayOn = (p: Person, path: string) => p.pages.filter((x) => x.path === path).every((x) => x.away);
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''): HTMLElementTagNameMap[K] {
@@ -213,7 +231,10 @@ setInterval(() => drawList(), 30_000);
 
 function drawList(): void {
 	if (list.hidden) return;
-	list.replaceChildren(el('p', 'tl-head', total === 1 ? 'Only you, right now' : `${total} on the site`));
+	const head = el('p', 'tl-head', total === 1 ? 'Only you, right now' : `${total} on the site`);
+	const flip = cursors.toggle();
+	if (flip) head.append(flip);
+	list.replaceChildren(head);
 	const ul = el('ul');
 	for (const p of people) {
 		const li = el('li');
@@ -371,6 +392,11 @@ for (const t of ['scroll', LEAVE] as const) addEventListener(t, () => {
 }, { capture: true, passive: true });
 
 function draw(): void {
+	const path = sitePath();
+	cursors.setPeople(
+		path,
+		people.filter((p) => p.key !== you?.key && p.pages.some((x) => x.path === path)).map((p) => ({ key: p.key, login: p.login, avatar: p.avatar, away: awayOn(p, path) })),
+	);
 	mount();
 	drawDiscuss();
 	drawHere();
@@ -395,6 +421,7 @@ function connect(): void {
 	ws = s;
 	s.addEventListener('open', () => {
 		retry = 1000;
+		cursors.reset();
 		send();
 	});
 	s.addEventListener('message', (e) => {
@@ -406,6 +433,7 @@ function connect(): void {
 		}
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
+		if (cursors.message(msg)) return;
 		if (chat.message(msg)) return;
 		if (msg.t === 'build') return update.build(m as { build?: unknown; assets?: unknown });
 		if (msg.t === 'comments') {
@@ -459,7 +487,9 @@ document.addEventListener('click', (e) => {
 	if (!(e.target instanceof Node && list.contains(e.target))) closeList();
 });
 
-chat.setup({ send: (m) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m)), base: BASE, face, speak });
+const out = (m: object) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m));
+chat.setup({ send: out, base: BASE, face, speak });
+cursors.setup({ send: out, face, name });
 onPage(() => {
 	closeList();
 	draw();

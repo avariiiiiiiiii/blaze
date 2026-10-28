@@ -24,6 +24,9 @@
  *                                                                  THREAD_SHOWN), and the message itself (null if gone)
  *                     {t: "typing", key, login, avatar}           someone signed in is writing (at most every TYPING_MS)
  *                     {t: "error", text}                        why the tab's last chat message was refused
+ *                     {t: "c", k, c}                            someone else on this tab's page moved their pointer:
+ *                                                                  `k` their key, `c` as they sent it, or null
+ *                     {t: "v", k, v}                            the same for the part of the page they are reading
  *                     {t: "build", build, assets}               on connect, last, and to every socket when a
  *                                                                  deploy's code first runs (sockets outlive a
  *                                                                  deploy): the live build (gen/build.ts's
@@ -35,6 +38,14 @@
  *                                                                  reply in that top-level message's thread
  *                     {t: "unsay", id}                          chat: for the author or a COMMENT_ADMINS id
  *                     {t: "thread", id}                         chat: asks for that message's thread
+ *                     {t: "c", c: [x, block, f] | null}         the tab's pointer, or null when it left the page
+ *                     {t: "v", v: [block, f, block, f] | null}  the top and bottom of the tab's viewport
+ *
+ * `c` and `v` are positions in the page's text (client/lib/cursors.ts): x a fraction of the article's width, a block
+ * index and a fraction of that block's height. They go only to the other people's tabs on the same page (pointers
+ * not to hidden tabs), rebuilt from the numbers, never stored: nothing is written, not even to the socket's
+ * attachment, so they cost a wake-up and nothing else. Each person gets MOVE_RATE a second (MOVE_BURST at once),
+ * pointers and viewports together; the rest is dropped.
  *
  * Msg is {id, key, login, avatar, text, at, parent?}; a top-level one in `chat` and `thread` frames also carries its
  * Summary, {replies, last, repliers}: how many replies, when the last came (ISO), and up to three of the latest
@@ -70,6 +81,11 @@ const RATE_SHORT = 5;
 const RATE_LONG = 120;
 const MAX_PEOPLE = 300;
 const TYPING_MS = 2000;
+const MOVE_RATE = 30;
+const MOVE_BURST = 60;
+/** Bounds on the numbers in `c` and `v`: blocks are indexes into a page, the rest fractions, a little past 0 to 1. */
+const MAX_BLOCK = 100_000;
+const MAX_FRAC = 50;
 /** A reload or a dropped connection shorter than this keeps someone's time on the site. */
 const RETURN_MS = 120_000;
 
@@ -94,6 +110,7 @@ export async function handlePresence(request: Request, env: Env): Promise<Respon
 	headers.set('x-presence-country', /^[A-Z]{2}$/.test(country) && country !== 'XX' ? country : '');
 	headers.set('x-presence-ua', (request.headers.get('user-agent') ?? '').slice(0, 512));
 	headers.set('x-presence-signin', env.GITHUB_CLIENT_ID ? '1' : '');
+	headers.set('x-presence-built', String(buildJson.at));
 	const stub = env.PRESENCE.get(env.PRESENCE.idFromName('site'));
 	return stub.fetch(new Request(request.url, { headers }));
 }
@@ -121,6 +138,10 @@ export class Presence extends DurableObject<Env> {
 	private typed = new Map<string, number>();
 	/** When each person came, and when their last tab went (null while one is open). Lost on hibernation; then a tab's own `since` stands. */
 	private arrived = new Map<string, { at: number; gone: number | null }>();
+	/** Each person's budget for `c` and `v` frames (a token bucket). Lost on hibernation, which only forgives. */
+	private moved = new Map<string, { at: number; n: number }>();
+	/** The open tabs on each page, for `c` and `v`; rebuilt from the attachments after any tab moves, comes or goes. */
+	private rooms: Map<string, { ws: WebSocket; key: string; away: boolean }[]> | null = null;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -156,6 +177,10 @@ export class Presence extends DurableObject<Env> {
 			this.broadcast(JSON.stringify({ t: 'comments', doc }));
 			return new Response(null, { status: 204 });
 		}
+		// Cloudflare doesn't restart a Durable Object with open sockets on a deploy, while the worker in front of it runs
+		// the new code at once: an object older than the worker that sent this resets itself, and the tab's retry (and
+		// everyone's next message) meets the new code, whose constructor tells the open tabs.
+		if (Number(request.headers.get('x-presence-built')) > buildJson.at) this.ctx.abort('A newer deploy.');
 		if (this.ctx.getWebSockets().length >= MAX_SOCKETS) return json({ error: 'Too many visitors right now.' }, 503);
 		const whoHeader = request.headers.get('x-presence-who');
 		const who: Who = whoHeader
@@ -193,13 +218,15 @@ export class Presence extends DurableObject<Env> {
 
 	override webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
 		if (typeof message !== 'string' || message.length > MAX_FRAME) return ws.close(1009, 'Too big.');
-		let m: { t?: unknown; path?: unknown; away?: unknown; text?: unknown; id?: unknown; parent?: unknown };
+		let m: { t?: unknown; path?: unknown; away?: unknown; text?: unknown; id?: unknown; parent?: unknown; c?: unknown; v?: unknown };
 		try {
 			m = JSON.parse(message) as typeof m;
 		} catch {
 			return ws.close(1003, 'Not JSON.');
 		}
 		const tab = ws.deserializeAttachment() as Tab;
+		if (m.t === 'c') return this.relay(tab, 'c', m.c, 3);
+		if (m.t === 'v') return this.relay(tab, 'v', m.v, 4);
 		if (m.t === 'typing') {
 			const now = Date.now();
 			if (!tab.login || now - (this.typed.get(tab.key) ?? 0) < TYPING_MS) return;
@@ -214,6 +241,7 @@ export class Presence extends DurableObject<Env> {
 		const away = m.away === true;
 		if (tab.path === path && tab.away === away) return;
 		ws.serializeAttachment({ ...tab, path, away, seen: Date.now() } satisfies Tab);
+		this.rooms = null;
 		this.schedule();
 	}
 
@@ -223,11 +251,69 @@ export class Presence extends DurableObject<Env> {
 		} catch {
 			// Already closed.
 		}
+		this.rooms = null;
 		this.schedule();
 	}
 
 	override webSocketError(): void {
+		this.rooms = null;
 		this.schedule();
+	}
+
+	/**
+	 * Passes a pointer (`c`) or viewport (`v`) on to the other people on the tab's page: `n` numbers, every other one
+	 * a block index (for `c` the second; for `v` the first and third), or null. Anything else is dropped.
+	 */
+	private relay(tab: Tab, t: 'c' | 'v', raw: unknown, n: number): void {
+		if (!tab.path) return;
+		let at: number[] | null = null;
+		if (raw !== null) {
+			if (!Array.isArray(raw) || raw.length !== n) return;
+			at = [];
+			for (let i = 0; i < n; i++) {
+				const x: unknown = raw[i];
+				if (typeof x !== 'number' || !Number.isFinite(x)) return;
+				const block = t === 'c' ? i === 1 : i % 2 === 0;
+				if (block ? !Number.isInteger(x) || x < 0 || x > MAX_BLOCK : Math.abs(x) > MAX_FRAC) return;
+				at.push(block ? x : Math.round(x * 1000) / 1000);
+			}
+		}
+		if (!this.allow(tab.key)) return;
+		const out = JSON.stringify({ t, k: tab.key, [t]: at });
+		for (const r of this.room(tab.path)) {
+			if (r.key === tab.key || (t === 'c' && r.away)) continue;
+			try {
+				r.ws.send(out);
+			} catch {
+				// Closing.
+			}
+		}
+	}
+
+	/** Takes one of `key`'s MOVE_BURST tokens, which come back at MOVE_RATE a second; false when none is left. */
+	private allow(key: string): boolean {
+		const now = Date.now();
+		const b = this.moved.get(key) ?? { at: now, n: MOVE_BURST };
+		b.n = Math.min(MOVE_BURST, b.n + ((now - b.at) / 1000) * MOVE_RATE);
+		b.at = now;
+		this.moved.set(key, b);
+		if (b.n < 1) return false;
+		b.n--;
+		return true;
+	}
+
+	private room(path: string): { ws: WebSocket; key: string; away: boolean }[] {
+		if (!this.rooms) {
+			this.rooms = new Map();
+			for (const ws of this.open()) {
+				const tab = ws.deserializeAttachment() as Tab | null;
+				if (!tab?.path) continue;
+				const l = this.rooms.get(tab.path) ?? [];
+				l.push({ ws, key: tab.key, away: tab.away });
+				this.rooms.set(tab.path, l);
+			}
+		}
+		return this.rooms.get(path) ?? [];
 	}
 
 	private say(ws: WebSocket, tab: Tab, raw: unknown, rawParent: unknown): void {
@@ -380,6 +466,7 @@ export class Presence extends DurableObject<Env> {
 			else if (a.gone === null) a.gone = now;
 			else if (now - a.gone > RETURN_MS) this.arrived.delete(key);
 		}
+		for (const key of this.moved.keys()) if (!people.has(key)) this.moved.delete(key);
 		// Each person's pages, the one in front of them first: in view before hidden, then the latest moved to.
 		for (const p of people.values()) p.pages.sort((a, b) => Number(a.away) - Number(b.away) || (seen.get(b) ?? 0) - (seen.get(a) ?? 0));
 		const list = [...people.values()]

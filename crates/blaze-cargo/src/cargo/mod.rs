@@ -444,9 +444,13 @@ fn build_here() -> anyhow::Result<String> {
         records.iter().any(|it| matches!(it.event, blaze_protocol::events::Event::Finished { .. }));
     let when = if finished { "last" } else { "under way" };
     let mut said = format!("  {command} of {} ({when}):\n", root.display());
-    let mut plain = blaze_ui::Plain::new(false);
+    // What the live view of it shows, as of its last record.
+    let mut live = blaze_ui::Live::new(100, false);
     for record in &records {
-        said.push_str(&plain.record(record));
+        live.record(record, record.at_ns);
+    }
+    for line in live.snapshot(live.build().last_ns) {
+        said.push_str(&format!("    {line}\n"));
     }
     Ok(said)
 }

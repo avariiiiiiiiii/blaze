@@ -107,11 +107,9 @@ fn a_cold_build_off_a_terminal_is_a_line_per_step() {
         "      Loaded workspace in 38.3s",
         "   Resolving names",
         "    Resolved names in 3.20s",
-        "   Compiling functions",
         "   Compiling anim",
-        "   Compiling functions (18.5s)",
+        "   Compiling functions",
         "    Compiled anim: 5351 fns compiled, 2 kept in 33.3s",
-        "     Linking anim",
         "    Compiled 5351 fns in 1 crate, 2 kept; 1m14s",
     ];
     assert_eq!(out, expected.map(|it| format!("{it}\n")).concat());
@@ -123,8 +121,20 @@ fn an_edit_says_what_it_rebuilt_and_why() {
     let out: String = edit().iter().map(|it| plain.record(it)).collect();
     assert_eq!(
         out,
-        "   Compiling functions\n   Compiling anim\n     Rebuilt 3 fns: render (body edited), draw, \
-         tick (calls render); 0.21s\n"
+        "   Compiling anim\n     Rebuilt 3 fns: render (body edited), draw, tick (calls render); \
+         0.21s\n"
+    );
+    // `blaze status` of it: the steps it did and its last line, as the live view ends.
+    let mut live = Live::new(100, false);
+    for record in edit() {
+        live.record(&record, record.at_ns);
+    }
+    assert_eq!(
+        live.snapshot(live.build().last_ns),
+        [
+            "\u{2713} codegen 0.18s",
+            "     Rebuilt 3 fns: render (body edited), draw, tick (calls render); 0.21s",
+        ]
     );
     let finished = plain.build().finished.clone().unwrap();
     assert!(summary_line(&finished, true).contains("\x1b["));

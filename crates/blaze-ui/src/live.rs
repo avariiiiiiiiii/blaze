@@ -103,6 +103,15 @@ impl Live {
         out
     }
 
+    /// What `blaze status` says of the build: the region at `now_ns` while it goes on, and
+    /// once it is over every kind of step it did and its last lines.
+    pub fn snapshot(&self, now_ns: u64) -> Vec<String> {
+        let Some(finished) = &self.build.finished else { return self.region(now_ns) };
+        let mut lines: Vec<String> = self.strip(finished.at_ns).into_iter().collect();
+        lines.extend(last_lines(finished, self.color, false));
+        lines
+    }
+
     /// The region at `now_ns`: the command and how long it has taken, every kind of step so
     /// far, what is under way with the time it has taken, and a count of what is done. Each
     /// line fits the width, so the region is as many rows as lines.

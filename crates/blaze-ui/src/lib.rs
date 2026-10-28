@@ -727,7 +727,8 @@ fn done_word(step: Step) -> &'static str {
 }
 
 /// A step or crate done sooner than this is not said done in lines that stay, but for a
-/// crate built on a terminal: cargo says each.
+/// crate built on a terminal: cargo says each. Off a terminal, a step is not said begun
+/// before it has gone on for this long ([`Plain`]).
 const NEWS_NS: u64 = 500_000_000;
 
 /// The lines `change` adds that stay: on a terminal (`live`) above the region, elsewhere all
@@ -742,10 +743,6 @@ fn staying(
     let status =
         |word: &str, rest: &str| format!("{} {rest}", paint(GREEN, &format!("{word:>12}"), color));
     match change {
-        Change::Began(at) if !live => {
-            let stepped = &build.steps[*at];
-            vec![status(stepped.step.word(), stepped.what())]
-        }
         Change::Ended(at) => {
             let stepped = &build.steps[*at];
             let took_ns = stepped.ended_ns.unwrap_or(stepped.began_ns) - stepped.began_ns;

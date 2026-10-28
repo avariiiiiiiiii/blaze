@@ -63,7 +63,7 @@ which are not about the target (see "Harness results"). The x86-64 numbers are u
   address is passed last, as clang does), and `TypeId` hashes that take the target's word
   into account. `symbols.rs` in the daemon reads data symbols out of wasm rlibs, which the
   `object` crate reports without a section.
-- `crates/blaze-engine/src/splice/wasm.rs` (new): the splice of a wasm module, described under
+- `crates/blaze-splice/src/wasm.rs` (new): the splice of a wasm module, described under
   "The edit loop".
 - Harnesses: `BLAZE_TARGET=wasm32-wasip1` makes every harness build cargo's side for that
   target, capture `rust-lld`'s line instead of `cc`'s, run programs under wasmtime, use
@@ -189,7 +189,7 @@ The three options, compared:
    180 ms for the Dioxus app (29 MB with debug info, 277 ms when the symbol table is kept).
    That is already far below cargo's rebuild, and it is what every harness runs when the
    splice declines.
-2. Patch the module in place. This is what was built (`crates/blaze-engine/src/splice/wasm.rs`).
+2. Patch the module in place. This is what was built (`crates/blaze-splice/src/wasm.rs`).
    The daemon reads the linked module once after each full link (its symbol table, types,
    bodies, data segments, the table's element segment, the memory limits), and for each
    patch writes a new file: the code section with the patch's bodies under the indices of the

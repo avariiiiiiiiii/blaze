@@ -46,7 +46,7 @@ said plainly when it happens:
 ## What blaze takes from a Rust toolchain today
 
 Measured on main at 012f0e91e3 (2026-10-25); the sizes are those of `nightly-2026-10-25`'s
-components, as `crates/blaze-engine/src/cargo/toolchain/pins.txt` lists them. Each piece, what uses
+components, as `crates/blaze-cargo/src/cargo/toolchain/pins.txt` lists them. Each piece, what uses
 it, and the step that ends the need for it ([no-rustc.md](no-rustc.md#the-plan)).
 
 | Piece | Size (xz, Linux x86-64) | What uses it | Removed by |
@@ -80,7 +80,7 @@ to it, that no project's pin or `PATH` changes:
   lays out a toolchain, with its channel manifest, so that blaze's sysroot rules read it
   unchanged.
 - **Checked:** the sha256 of each component is compiled into blaze, from the channel
-  manifest of the nightly (`crates/blaze-engine/src/cargo/toolchain/pins.txt`); a download whose
+  manifest of the nightly (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`); a download whose
   bytes differ is not used.
 - **When:** install.sh fetches it after installing blaze, and blaze fetches it itself on the
   first build that needs it and finds no other copy (a `cargo install` of blaze, a deleted
@@ -235,8 +235,10 @@ store, measured and published beside cargo's.
 
 **M, the wrapper and the fallback** ([#93](https://github.com/indexable-inc/blaze/issues/93)).
 Once K and J are the default: `blaze-rustc`, `blaze-rustc-first`, the stand-ins, the dep-info
-runs, `settle`, `by_cargo`, `ToCargo` and `only_cargo` are deleted; plain cargo after `blaze
-enable` names blaze as `build.rustc`; the count of [no-rustc.md](no-rustc.md#how-often) is zero.
+runs, `settle`, `by_cargo`, `ToCargo` and `only_cargo` are deleted; the count of
+[no-rustc.md](no-rustc.md#how-often) is zero. Done of it (2026-10-27): `blaze enable` and the
+wrapper behind plain cargo, `blaze-rustc-first`, `by_cargo`, `ToCargo` and `only_cargo` are
+gone, plain cargo is cargo's alone, and `blaze-rustc` is left as a load's wrapper only.
 Then blaze's own toolchain loses `rustc` and `rust-std`. The link still needs an lld on ELF
 targets (rustc's `rust-lld` today, through `gcc-ld`): blaze ships one in its release, or links
 with the system's `cc` and an lld it finds, a choice for that step, measured on the bench apps.

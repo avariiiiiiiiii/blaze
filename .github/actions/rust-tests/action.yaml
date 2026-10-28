@@ -10,7 +10,7 @@ runs:
   steps:
     - id: pin
       shell: bash
-      run: echo "commit=$(awk '/^commit /{print $2}' crates/blaze-engine/src/cargo/toolchain/pins.txt)" >> "$GITHUB_OUTPUT"
+      run: echo "commit=$(awk '/^commit /{print $2}' crates/blaze-cargo/src/cargo/toolchain/pins.txt)" >> "$GITHUB_OUTPUT"
     - id: restore
       uses: actions/cache/restore@v6
       with:

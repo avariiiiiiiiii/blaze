@@ -40,7 +40,7 @@ The parts of the corpus (harness/resolve/corpus.json) are
               roots, and cargo's error when it refuses the build; units that differ only
               in what they depend on, which cargo orders by their address, in either order
   ctdeps      what `blaze-engine compile-time-deps` (blaze's own build of the build scripts and
-              proc macros of a load, crates/blaze-engine/src/cargo/compile_time.rs) says against
+              proc macros of a load, crates/blaze-cargo/src/cargo/compile_time.rs) says against
               rust-analyzer's `cargo check --compile-time-deps --message-format=json`, read as
               rust-analyzer reads it, for a build and a test (CTDEPS_RUNS) of
               harness/norustc/fixture and the bench projects: per package its script's cfgs,

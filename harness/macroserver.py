@@ -14,7 +14,7 @@ library, and every output has to be the toolchain's, spans and all.
 Then the package is built whole by blaze into its own target directory (`--own-target`) and
 run, twice: once as before, where the load's `cargo check --compile-time-deps` has rustc build
 the proc macros, and once with `BLAZE_PROC_MACRO_SERVER` naming the server, where blaze links
-each of them (crates/blaze-engine/src/cargo/own_macro.rs) and that server expands with them. Each
+each of them (crates/blaze-cargo/src/cargo/own_macro.rs) and that server expands with them. Each
 program has to print what cargo's does, and the proc-macro libraries in the target directory
 have to be all rustc's, then all blaze's. Every build shares one store: the package whole,
 which names the standard library's crates, has to refuse what the server's and libraries'

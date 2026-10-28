@@ -1,4 +1,4 @@
-//! Expansions kept by everything they were made from, as `crates/blaze-engine/src/cargo/keyed.rs`
+//! Expansions kept by everything they were made from, as `crates/blaze-cargo/src/cargo/keyed.rs`
 //! keeps a build script's or a proc macro's build: a first key of what is known before the
 //! expansion, slots of read sets under it, and a second key of the first, a read set and what
 //! each of its reads finds now. The format is that file's, but for two things that make an
@@ -54,7 +54,7 @@ pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
 }
 
 /// What is at `path`: a file's contents, a directory's names, or that nothing is, as
-/// `crates/blaze-engine/src/cargo/sandboxed.rs` says it.
+/// `crates/blaze-cargo/src/cargo/sandboxed.rs` says it.
 pub(crate) fn digest_of(path: &Path) -> String {
     let Ok(meta) = std::fs::metadata(path) else { return "-".to_owned() };
     let mut hash = Sha256::new();

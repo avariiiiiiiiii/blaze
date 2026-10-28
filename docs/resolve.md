@@ -58,7 +58,7 @@ cargo rejects is rejected with cargo's message. Part of the self-contained blaze
 - A manifest that does not parse or fit the schema is shown as cargo shows it, a snippet with
   the place marked (`blaze_manifest::diagnostic`).
 
-`blaze` reads the workspace with it (`crates/blaze-engine/src/cargo/metadata.rs`): every
+`blaze` reads the workspace with it (`crates/blaze-cargo/src/cargo/metadata.rs`): every
 command's `cargo metadata --no-deps`, with `--manifest-path` and `--config` as the command was
 given them. A manifest cargo refuses ends the command with cargo's message and status 101.
 
@@ -190,7 +190,7 @@ the 12 targets, each `--no-deps` and full; 15 packages without dependencies, 30 
 
 The `toolchain` part asks what a workspace load asked cargo of the toolchain and the
 configuration, of cargo and of `blaze-engine cargo-answer`, which answers it with no cargo run
-(`crates/blaze-engine/src/answers/cargo.rs` over blaze-manifest): `cargo --version`, `cargo config
+(`crates/blaze-cargo/src/answers/cargo.rs` over blaze-manifest): `cargo --version`, `cargo config
 get` as TOML with `--show-origin` and as JSON, `cargo rustc --print cfg -- -O` and `--print
 target-spec-json` for the host and five other targets (and for `build.target`), comparing exit
 code and stdout as text, and, in a tree with a package, the flags cargo hands rustc for each
@@ -224,7 +224,7 @@ missing `vendor/lolhtml` first, blaze-metadata the missing `vendor/rust-argon2`,
 path packages in another order than cargo's resolver asks for them.
 
 The `ctdeps` part (named only: it builds what it compares) holds blaze's own build of a load's
-build scripts and proc macros (`crates/blaze-engine/src/cargo/compile_time.rs`, in place of
+build scripts and proc macros (`crates/blaze-cargo/src/cargo/compile_time.rs`, in place of
 rust-analyzer's `cargo check --compile-time-deps`) to cargo's. For harness/norustc/fixture and
 each bench project, copied into a directory of its own, and for a build and a test load (the
 test adds `--cfg-test`, cargo's `--all-targets`, and the project's `test=[...]` flags of

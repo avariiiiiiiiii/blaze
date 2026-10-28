@@ -73,8 +73,17 @@ jobs:
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --title "LLVM for blaze ($tag)" \
               --notes "The LLVM blaze's \`llvm\` feature links, built by .github/scripts/llvm.py from indexable-inc/llvm at the commit crates/hir-ty-codegen/llvm.json pins. One archive per target, named by its sha256. Not a release of blaze."
-          # Content-addressed names: an asset already there is this same file.
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP"/llvm/*/*.tar.xz --clobber
+          # Content-addressed names: an asset already there is this same file, and is left alone.
+          # --clobber would delete it first, and every fetch of the pin (the flake, every CI
+          # build) gets a 404 until the upload ends.
+          have=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          for archive in "$RUNNER_TEMP"/llvm/*/*.tar.xz; do
+            if grep -qxF "$(basename "$archive")" <<< "$have"; then
+              echo "already there: $(basename "$archive")"
+            else
+              gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$archive"
+            fi
+          done
       - name: Pins
         run: |
           python3 .github/scripts/llvm.py pin "$RUNNER_TEMP"/llvm/*

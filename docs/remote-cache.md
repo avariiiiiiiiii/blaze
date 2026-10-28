@@ -128,7 +128,7 @@ Non-goals:
 
 ## What exists today
 
-From [cache.md](cache.md) and `crates/blaze-engine/src/remote.rs` (**read**):
+From [cache.md](cache.md) and `crates/blaze-cargo/src/remote.rs` (**read**):
 
 - The remote is a directory, `s3://` (the AWS SDK) or a read-only `https://` address. It holds
   `packs/<sha256>.pack` (or `.pack.zst`), `keys/<sha256>` (the keys in one pack),

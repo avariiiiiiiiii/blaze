@@ -46,7 +46,7 @@ jobs:
       # The tests from rust-lang/rust at the pinned nightly commit.
       - name: rust-lang/rust, the pinned nightly, tests only
         run: |
-          commit=$(awk '/^commit /{print $2}' crates/blaze-engine/src/cargo/toolchain/pins.txt)
+          commit=$(awk '/^commit /{print $2}' crates/blaze-cargo/src/cargo/toolchain/pins.txt)
           git init -q "$RUNNER_TEMP/rust-pin"
           cd "$RUNNER_TEMP/rust-pin"
           git remote add origin https://github.com/rust-lang/rust

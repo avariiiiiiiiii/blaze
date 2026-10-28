@@ -128,9 +128,11 @@ PATH for an installed release).
   those of the crates below gpui, since the whole suite with both builds is longer than a
   hosted runner's six hours), servo v0.7.0 (`--version`; the tests of crates without a window
   or a GPU), bun's Rust port (bun-v1.4.3, after `harness/bunprep.py` built its C and C++ in
-  `nix develop .#bench-bun`), and NVIDIA Dynamo v1.6.1 (the workspace, on macOS `dynamo-llm`
+  `nix develop .#bench-bun`), NVIDIA Dynamo v1.6.1 (the workspace, on macOS `dynamo-llm`
   without its Linux-only default feature; its Python bindings built and imported; the CPU-only
-  vLLM mocker server's `--help`; its tests that need no GPU). What a runner without a GPU cannot
+  vLLM mocker server's `--help`; its tests that need no GPU), and flox v1.19.2 (in the
+  environment of flox's own package build, which `harness/floxprep.py` takes from its flake:
+  the CLI's `--version`; the tests of flox-core and flox-config). What a runner without a GPU cannot
   build or test is listed with why in the entry's `excluded`, which smoke.py prints. Each is also
   measured against cargo (above); cargo builds dynamo with its pinned Rust 1.96.1, which its
   users build with.

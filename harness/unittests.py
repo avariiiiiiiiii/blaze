@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """unittests.py: the crates' own tests, with the ones known to fail named.
 
-usage: unittests.py [cargo test argument ...]
+usage: unittests.py [--cargo] [test argument ...]
 
-Runs `cargo test --release --no-fail-fast` of CRATES, one cargo run in the root workspace, with
-the arguments given. A failing test that is not in OPEN fails the run, and so does a test in
+Runs `blaze test --release --no-fail-fast` of CRATES (blaze tests blaze, AGENTS.md rule
+blaze-builds-blaze; `--cargo`: plain `cargo test`, on Windows, which has no release of blaze to
+test with yet), one run in the root workspace, with the arguments given. A failing test that is not in OPEN fails the run, and so does a test in
 OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
 its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
 `hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
@@ -42,8 +43,9 @@ OPEN = {
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 # A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and
-# `build/<package>/<hash>/out/<name>-<hash>` in its second (nightly cargo's default).
-RUNNING = re.compile(r"^\s+Running .*[/\\](?:deps|out)[/\\](\w+?)-[0-9a-f]{16}\b")
+# `build/<package>/<hash>/out/<name>-<hash>` in its second (nightly cargo's default); blaze names
+# it `deps/<name>-<hash>` too, a bin's name with its dashes.
+RUNNING = re.compile(r"^\s+Running .*[/\\](?:deps|out)[/\\]([\w-]+?)-[0-9a-f]{16}\b")
 DOCTESTS = re.compile(r"^\s+Doc-tests (\w+)")
 RESULT = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)")
 
@@ -58,7 +60,7 @@ def run(command, cwd, env, seen, failed):
         sys.stdout.write(line)
         line = COLOR.sub("", line)
         if m := RUNNING.match(line) or DOCTESTS.match(line):
-            binary = m.group(1)
+            binary = m.group(1).replace("-", "_")
         elif m := RESULT.match(line):
             name = f"{binary}::{m.group(1)}"
             seen.add(name)
@@ -69,7 +71,10 @@ def run(command, cwd, env, seen, failed):
 
 
 def main():
-    command = ["cargo", "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *sys.argv[1:]]
+    args = sys.argv[1:]
+    plain = args[:1] == ["--cargo"]
+    args = args[plain:]
+    command = [*(["cargo"] if plain else ["blaze"]), "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *args]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
     seen, failed = set(), set()

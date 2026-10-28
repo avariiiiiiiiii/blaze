@@ -61,14 +61,11 @@ env:
   BLAZE_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
   # Git Bash on Windows has `python` and no `python3`.
   PYTHON: ${{ startsWith(inputs.os, 'windows') && 'python' || 'python3' }}
-  # sccache keeps what rustc compiled in the Actions cache, for the steps that set RUSTC_WRAPPER:
-  # rust-cache keeps the dependencies from crates.io and drops the crates of this repository and
-  # vendor/, which are most of a build. The harnesses run without it, since blaze_cli.py
-  # tests a user's own wrapper.
-  SCCACHE_GHA_ENABLED: "true"
-  # Main alone writes it, as with rust-cache: what a pull request or a merge-queue entry writes
-  # is kept for that ref alone, which nothing reads again, and it pushes main's out of the 10 GB.
-  SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+  # blaze builds and tests blaze (AGENTS.md rule blaze-builds-blaze): the latest release is the
+  # compiler and its store the one cache, pulled from the shared remote main's runs push to
+  # (.github/actions/blaze). Windows builds with cargo, and no cache, since release.yaml makes
+  # no release of blaze for Windows yet, so there is no blaze there to build with.
+  BLAZE: ${{ !startsWith(inputs.os, 'windows') }}
 
 defaults:
   run:
@@ -79,21 +76,46 @@ jobs:
     name: tests
     runs-on: ${{ inputs.os }}
     timeout-minutes: 60
+    # The remote's write token and signing key, for main's push alone.
+    environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
+    env:
+      # A pull request runs the tests its change reached and takes the rest as passed from
+      # main's store; main runs every test, which records each pass for the pull requests after
+      # it, and says of each that passed before whether it passed again.
+      BLAZE_TESTS: ${{ github.ref == 'refs/heads/main' && 'verify' || 'affected' }}
+      # As WebAssembly, the derives of hir-ty's type folding do not expand, and blaze refuses
+      # 196 of its functions (https://github.com/indexable-inc/blaze/issues/828); natively,
+      # they do. Take it out with that fix.
+      BLAZE_PROC_MACRO_WASM: "0"
     steps:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
-      # Caches are written by main alone: a pull request reads main's and writes none.
-      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - run: $PYTHON harness/unittests.py
-        env:
-          RUSTC_WRAPPER: sccache
-      - run: sccache --show-stats
+          llvm: ${{ env.BLAZE == 'true' && 'build' || 'none' }}
+      - if: env.BLAZE == 'true'
+        id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: tests
+      # `blaze test`, in the flake's dev shell for its C toolchain; cargo's on Windows.
+      - if: env.BLAZE == 'true'
+        run: nix develop --command $PYTHON harness/unittests.py
+      - if: env.BLAZE != 'true'
+        run: $PYTHON harness/unittests.py --cargo
+      # What was compiled, and each test that passed, for the runs after this one; a run whose
+      # tests failed pushes too, since what it compiled is no less right. The daemons end
+      # first: a push sends sealed packs, and a daemon's last pack seals when it ends.
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+        run: blaze stop
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+        uses: ./.github/actions/blaze-remote
+        with:
+          mode: push
+          project: ${{ steps.blaze.outputs.project }}
+          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
+          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
       # On a push to main, rustc's tests into the cache for the borrowck and pinned-ui jobs of
       # the runs after it, which then need not fetch them.
       - if: inputs.tier == 'warm' && (inputs.borrowck || inputs.pinned-ui)
@@ -103,6 +125,11 @@ jobs:
     name: build
     runs-on: ${{ inputs.os }}
     timeout-minutes: 60
+    # The remote's write token and signing key, for main's push alone.
+    environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
+    env:
+      # As in the tests job (https://github.com/indexable-inc/blaze/issues/828).
+      BLAZE_PROC_MACRO_WASM: "0"
     outputs:
       parts: ${{ steps.parts.outputs.parts }}
     steps:
@@ -112,43 +139,54 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           llvm: build
-      - uses: Swatinem/rust-cache@v2
+      - if: env.BLAZE == 'true'
+        id: blaze
+        uses: ./.github/actions/blaze
         with:
-          shared-key: build
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
+          job: build
       # In the flake's dev shell, against the LLVM it pins. On Windows, which has no Nix, the
       # build is against the static C runtime, and names libraries of the SDK that the linker is
       # not otherwise shown.
+      - name: blaze build -p blaze-engine --release --features llvm
+        if: env.BLAZE == 'true'
+        run: nix develop --command blaze build -p blaze-engine --release --features llvm --locked
       - name: cargo build -p blaze-engine --release --features llvm
+        if: env.BLAZE != 'true'
         run: |
-          if [ "$RUNNER_OS" = Windows ]; then
-            sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
-            export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
-            cargo build -p blaze-engine --release --features llvm --locked
-          else
-            nix develop --command cargo build -p blaze-engine --release --features llvm --locked
-          fi
-        env:
-          RUSTC_WRAPPER: sccache
-      - run: sccache --show-stats
+          sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
+          export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
+          cargo build -p blaze-engine --release --features llvm --locked
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+        run: blaze stop
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+        uses: ./.github/actions/blaze-remote
+        with:
+          mode: push
+          project: ${{ steps.blaze.outputs.project }}
+          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
+          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
+      # What follows is for the harnesses of the `fast` and `full` tiers, which run this build;
+      # the merge gate's and main's tiers run none.
+      #
       # blaze's proc-macro server beside blaze, as a release has it: a load into blaze's own
       # target directory has blaze link every proc macro for that server, and fails without
       # one ("blaze did not build the proc macro", docs/no-rustc.md, J). Not on Windows, whose
       # release blaze does not build yet.
       - name: blaze's proc-macro server
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && (inputs.tier == 'fast' || inputs.tier == 'full')
         run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/blaze-engine
       # The binaries run each other from next to themselves (`blaze enable` links `cargo fmt`
       # and `cargo clippy` to the blaze beside it, and fails without one; a load finds
       # blaze-proc-macro-srv beside blaze). A tar keeps them executable.
       - name: Pack
+        if: inputs.tier == 'fast' || inputs.tier == 'full'
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
           server=$([ -f blaze-proc-macro-srv ] && echo blaze-proc-macro-srv || true)
           tar -cf blaze.tar blaze-engine$exe blaze$exe blaze-rustc$exe $server
-      - uses: actions/upload-artifact@v7
+      - if: inputs.tier == 'fast' || inputs.tier == 'full'
+        uses: actions/upload-artifact@v7
         with:
           name: blaze-${{ inputs.platform }}
           path: target/release/blaze.tar

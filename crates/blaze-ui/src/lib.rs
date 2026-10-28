@@ -52,6 +52,10 @@ pub struct Build {
     /// The nodes of [`Build::graph`] that held the build up, from the first
     /// ([`Event::Critical`]).
     pub critical: Vec<usize>,
+    /// How busy the worker was, in hundredths of a core, from each time on
+    /// ([`Event::Cores`]), and of how many cores.
+    pub cores: Vec<(u64, u32)>,
+    pub cores_of: u32,
     /// Since when no step is under way, and the step that ended then.
     idle: Option<(u64, Step)>,
 }
@@ -239,6 +243,10 @@ pub struct Finished {
     pub chain: Vec<String>,
     pub chain_ns: u64,
     pub unnamed: Option<Unnamed>,
+    /// How many cores each of the summary's slowest steps kept busy on average, when the
+    /// worker said, and of how many.
+    pub cores: Vec<Option<f64>>,
+    pub cores_of: u32,
 }
 
 /// What a record changed, for a renderer to say.
@@ -348,11 +356,27 @@ impl Build {
                 let (chain, chain_ns) = self.critical_path(at);
                 let chain = chain.iter().rev().map(|&it| self.crates[it].name.clone()).collect();
                 let (ok, summary, unnamed) = (*ok, summary.clone(), self.unnamed);
-                self.finished = Some(Finished { ok, summary, at_ns: at, chain, chain_ns, unnamed });
+                let cores = summary.slowest.iter().map(|it| self.busy_in(it, at)).collect();
+                let cores_of = self.cores_of;
+                self.finished = Some(Finished {
+                    ok,
+                    summary,
+                    at_ns: at,
+                    chain,
+                    chain_ns,
+                    unnamed,
+                    cores,
+                    cores_of,
+                });
                 Change::Finished
             }
             Event::Critical { path } => {
                 self.critical = path.iter().filter_map(|&it| self.node(it)).collect();
+                Change::Nothing
+            }
+            Event::Cores { busy, of } => {
+                self.cores.push((at, *busy));
+                self.cores_of = *of;
                 Change::Nothing
             }
         }
@@ -387,6 +411,42 @@ impl Build {
         }
         strip.retain(|it| it.running || it.took_ns >= 50_000_000);
         strip
+    }
+
+    /// How many cores the worker kept busy at `at`, in hundredths: as it said last before.
+    pub fn busy_at(&self, at: u64) -> Option<u32> {
+        let after = self.cores.partition_point(|it| it.0 <= at);
+        after.checked_sub(1).map(|it| self.cores[it].1)
+    }
+
+    /// How many cores the worker kept busy on average from `from` to `to`, when it said.
+    fn busy_between(&self, from: u64, to: u64) -> Option<(f64, u64)> {
+        let first = self.busy_at(from).or_else(|| self.cores.first().map(|it| it.1))?;
+        let (mut sum, mut at, mut level) = (0.0, from, first);
+        for &(when, busy) in self.cores.iter().filter(|it| it.0 > from && it.0 < to) {
+            sum += f64::from(level) * (when - at) as f64;
+            (at, level) = (when, busy);
+        }
+        sum += f64::from(level) * to.saturating_sub(at) as f64;
+        let spent = to.saturating_sub(from);
+        (spent > 0).then(|| (sum / spent as f64 / 100.0, spent))
+    }
+
+    /// How many cores the steps `took` adds up kept busy on average, by `now_ns`.
+    fn busy_in(&self, took: &Took, now_ns: u64) -> Option<f64> {
+        let (mut sum, mut spent) = (0.0, 0);
+        for stepped in self
+            .steps
+            .iter()
+            .filter(|it| it.step == took.step && (it.step == Step::Codegen || it.of == took.of))
+        {
+            let ended = stepped.ended_ns.unwrap_or(now_ns);
+            if let Some((busy, ns)) = self.busy_between(stepped.began_ns, ended) {
+                sum += busy * ns as f64;
+                spent += ns;
+            }
+        }
+        (spent > 0).then(|| sum / spent as f64)
     }
 
     /// The row of [`Build::crates`] named `name`, a new one waiting from `at` if none is.
@@ -547,9 +607,14 @@ pub fn why_lines(finished: &Finished, color: bool) -> Vec<String> {
         let steps: Vec<String> = summary
             .slowest
             .iter()
-            .map(|it| {
+            .enumerate()
+            .map(|(at, it)| {
                 let what = it.of.as_deref().unwrap_or(it.step.whole());
-                format!("{} {what} {}", it.step.word().to_lowercase(), took(it.took_ns))
+                let cores = match finished.cores.get(at).copied().flatten() {
+                    Some(busy) => format!(" ({busy:.1}/{} cores)", finished.cores_of),
+                    None => String::new(),
+                };
+                format!("{} {what} {}{cores}", it.step.word().to_lowercase(), took(it.took_ns))
             })
             .collect();
         lines.push(status("Took", &format!("{}: {}", took(took_ns), steps.join(", "))));

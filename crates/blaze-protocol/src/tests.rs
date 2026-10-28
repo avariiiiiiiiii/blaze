@@ -247,6 +247,7 @@ fn an_event_is_these_bytes() {
             at_ns: 0,
             event: Event::Node { id: 1, kind: NodeKind::Std, name: "std".into(), deps: vec![0] },
         },
+        Record { at_ns: 0, event: Event::Cores { busy: 790, of: 8 } },
     ];
     let hexes: Vec<String> = records.iter().map(|it| hex(&to_vec(it).unwrap())).collect();
     let expected = [
@@ -269,6 +270,8 @@ fn an_event_is_these_bytes() {
         // {"at_ns": 0, "event": {"Node": {"id": 1, "deps": [0], "kind": "Std", "name": "std"}}}
         "a2 6561745f6e73 00 656576656e74 a1 644e6f6465 a4 626964 01 6464657073 81 00 \
          646b696e64 63537464 646e616d65 63737464",
+        // {"at_ns": 0, "event": {"Cores": {"of": 8, "busy": 790}}}
+        "a2 6561745f6e73 00 656576656e74 a1 65436f726573 a2 626f66 08 6462757379 190316",
     ];
     for ((hexed, expected), record) in hexes.iter().zip(expected).zip(&records) {
         assert_eq!(hexed, &expected.replace(' ', ""), "{record:?}");

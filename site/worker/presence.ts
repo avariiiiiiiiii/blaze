@@ -27,7 +27,7 @@
  *                     {t: "c", k, c}                            someone else on this tab's page moved their pointer:
  *                                                                  `k` their key, `c` as they sent it, or null
  *                     {t: "v", k, v}                            the same for the part of the page they are reading
- *                    {t: "say-live", k, text, done}            someone else on this tab's page is writing a line by
+ *                     {t: "say-live", k, text, done}            someone else on this tab's page is writing a line by
  *                                                                 their pointer (client/lib/cursors.ts): `text` as it
  *                                                                 stands, null when they gave up; `done` once sent
  *                     {t: "build", build, assets}               on connect, last, and to every socket when a
@@ -43,7 +43,7 @@
  *                     {t: "thread", id}                         chat: asks for that message's thread
  *                     {t: "c", c: [x, block, f] | null}         the tab's pointer, or null when it left the page
  *                     {t: "v", v: [block, f, block, f] | null}  the top and bottom of the tab's viewport
- *                    {t: "say-live", text: string | null, done?}  the line the reader is writing by their pointer (any
+ *                     {t: "say-live", text: string | null, done?}  the line the reader is writing by their pointer (any
  *                                                                 reader, signed in or not), at most CHAT_MAX; null to
  *                                                                 take it back; `done` when sent (a signed-in reader
  *                                                                 sends it to the chat too, as a `say`)

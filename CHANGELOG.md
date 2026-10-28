@@ -8,6 +8,8 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+## [0.20261028.1] - 2026-10-28
+
 ### Fixed
 
 - A program that spawns a thread or makes a `HashMap` builds with the standard library a
@@ -21,6 +23,13 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   program links to the unit's one copy of each static. The unit's store key changes, so it is
   built or fetched once again. `harness/stdstatics.py` makes the unit from std's sources in
   another directory and runs the three programs, dev and `--release`.
+
+### Merged
+
+- std statics in bodies: name their place by a path every machine shares (#840) (#857)
+- experience.py flags the names blaze no longer has, not every mention of blaze (#869)
+- nix/units: blaze-protocol and blaze-ui (main's unit-graph check, stale since #855/#856) (#871)
+- agents: scripts take one typed JSON input, not flags (#874)
 
 ## [0.20261028.0] - 2026-10-28
 
@@ -2703,7 +2712,8 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.0...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.1...HEAD
+[0.20261028.1]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.1
 [0.20261028.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.0
 [0.20261027.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261027.0
 [0.1.0]: https://github.com/indexable-inc/ra-jit/releases/tag/v0.1.0

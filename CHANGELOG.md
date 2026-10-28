@@ -68,6 +68,8 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   do, where the operation is undefined: an overflow, a shift past the width, a division by
   zero or of the least value by -1, and an `exact_div` with a remainder (#862). Some gave a
   wrong value instead: `unchecked_div(-128i8, -1)`, and `exact_div` with a remainder.
+- A static whose initializer writes to a static, another or itself, fails to evaluate, as rustc's
+  does (#862). It was evaluated as if the write had not been made.
 - Invalid built-in derives now fail `blaze check` and `blaze build`, including `Default` on an enum without a default variant and derives on unsupported item shapes (#751).
 - `Location::caller()` in a constant is evaluated, as rustc does: the place of the first call up
   the stack that does not track its caller, under the file name the build uses (#862). A function

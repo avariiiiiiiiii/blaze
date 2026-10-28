@@ -221,16 +221,19 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-list { position: absolute; top: calc(100% + 2px); right: clamp(12px, 2vw, 20px); width: min(360px, calc(100vw - 24px)); max-height: min(60vh, 480px); overflow: auto; padding: 10px; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 16px 40px rgb(0 0 0 / 0.25); font-size: 13px; }
 .tl-list[hidden] { display: none; }
 .tl-list ul { margin: 0; padding: 0; list-style: none; }
-.tl-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 4px; border-top: 1px solid var(--line); }
-.tl-list .who { color: var(--ink-1); text-decoration: none; }
+.tl-list li { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-top: 1px solid var(--line); }
+.tl-list .who { flex: none; color: var(--ink-1); text-decoration: none; }
 .tl-list .flag { font-size: 15px; line-height: 1; cursor: default; }
 .tl-list .tag { padding: 0 6px; border-radius: 6px; background: var(--s-tint); color: var(--ink-3); font-size: 11px; }
-.tl-list .where { display: flex; flex-wrap: wrap; gap: 4px 10px; flex-basis: 100%; padding-left: 28px; }
+/* One line a person: their pages sit to the right and end in an ellipsis when they do not fit. */
+.tl-list .where { flex: 1; min-width: 0; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.tl-list .where a + a { margin-left: 10px; }
 .tl-list .where a { color: var(--ink-3); text-decoration: none; }
 .tl-list .where a:hover { color: var(--ink-1); }
 .tl-list .where a.away { opacity: 0.55; }
 .tl-head { margin: 0 4px 6px; color: var(--ink-3); }
 .tl-list li.tl-head { border: 0; }
+.tl-list .face, .tl-list .flag, .tl-list .tag { flex: none; }
 .faces { display: inline-flex; align-items: center; }
 .faces .face + .face { margin-left: -6px; }
 .face { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: var(--bg-4); box-shadow: 0 0 0 2px var(--bg); transition: opacity 0.2s; }

@@ -227,8 +227,12 @@ impl Live {
             totals.push(format!("{done}/{crates} crates"));
         }
         let fns = build.fns();
-        if fns.total > 0 {
+        // A crate whose total is not known yet counts in the done and not in the total.
+        let unknown = build.crates.iter().any(|it| it.fns.total == 0 && it.fns.done > 0);
+        if fns.total > 0 && !unknown {
             totals.push(format!("{}/{} fns", fns.done, fns.total));
+        } else if fns.done > 0 {
+            totals.push(format!("{} fns", fns.done));
         }
         // Between one step's end and the next one's start, the step that ended.
         let step = build.running().last().or_else(|| build.steps.last());

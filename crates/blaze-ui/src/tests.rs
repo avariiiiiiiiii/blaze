@@ -365,7 +365,7 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
         lines,
         [
             "    Compiled 77917 fns in 1 crate, 0 kept; 1m57s",
-            "        Took 1m57s: checking 14 files 1m40s, loading workspace 10.7s, compiling anim 4.20s",
+            "        Took 1m57s: check 14 files 1m40s, workspace 10.7s, codegen anim 4.20s",
             "       Cache cold: cache keys changed since blaze 0.20261027.0 (fb82b09)",
             "             `blaze why` says more",
         ]
@@ -431,15 +431,29 @@ fn the_cores_kept_busy_show_as_it_goes_and_at_the_end() {
         at(4 * S, Event::Finished { ok: true, summary }),
     ];
     let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
-    assert!(
-        drawn.contains("Took 4.00s: compiling the standard library (once, kept in the store) 4.00s (2.7/8 cores)"),
-        "{drawn:?}"
-    );
+    assert!(drawn.contains("Took 4.00s: std 4.00s (2.7/8 cores)"), "{drawn:?}");
 }
 
 /// The lines that stay are those before the region: the region is its header, the steps,
 /// the crates under way and the count of those done. A test of the renderer's own text, with
 /// no color.
+/// The functions done of a crate whose total is not known yet count in no `done/total`, which
+/// would read more done than there are.
+#[test]
+fn functions_with_a_total_unknown_are_a_count() {
+    let mut live = Live::new(120, false);
+    for record in [
+        at(0, Event::Started { step: Step::Codegen, of: None }),
+        at(0, anim(CrateState::Running, 1200, 0)),
+        at(0, crate_is("std", CrateState::Running, 6275)),
+    ] {
+        live.record(&record, record.at_ns);
+    }
+    let drawn = live.tick(S);
+    assert!(drawn.contains(" \u{b7} 7475 fns"), "{drawn}");
+    assert!(!drawn.contains("/5353 fns\n"), "{drawn}");
+}
+
 fn region_len(lines: &[&str]) -> usize {
     let header = lines.iter().rposition(|it| it.starts_with("blaze "));
     header.map_or(0, |at| lines.len() - at)

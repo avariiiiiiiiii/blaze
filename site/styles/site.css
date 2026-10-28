@@ -1,12 +1,7 @@
-/* Page layout and the blocks render/render.ts writes (were the Svelte components' styles). */
-main { max-width: 720px; margin: 0 auto; padding: 64px 20px 96px; }
-main.narrow { max-width: 560px; }
-main.wide { max-width: 960px; }
-h1 { margin: 0 0 0.2em; font-size: 44px; font-weight: 700; letter-spacing: -0.03em; color: var(--ink-1); line-height: 1.15; }
-.doc .lede { font-size: 20px; line-height: 1.45; color: var(--ink-1); }
-main > img, .doc img { display: block; width: 100%; height: auto; margin: 0 0 1.5em; border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line); background: var(--code-bg); }
-.back { margin: 0 0 1.5em; font-size: 14px; color: var(--ink-4); }
-.meta { margin: 0 0 2em; font-size: 14px; color: var(--ink-3); }
+/* The blocks renderer/core render.rs writes. The page shell (sidebar, header, outline, pager) is in shell.css. */
+.doc .lede { max-width: 62ch; font-size: 17px; line-height: 1.55; color: var(--ink-3); }
+.doc img { display: block; width: 100%; height: auto; margin: 0 0 1.5em; border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line); background: var(--code-bg); }
+.meta { margin: 14px 0 0; font-size: 14px; color: var(--ink-3); }
 .meta span { color: var(--ink-4); }
 .doc h2 a.hash { color: inherit; text-decoration: none; }
 
@@ -65,7 +60,7 @@ img + .c-btn { position: static; display: block; margin: -1.2em 0 1.2em auto; }
 [data-block]:hover > .c-btn, img[data-block]:hover + .c-btn, .c-btn:hover, .c-btn.has, .c-btn:focus-visible, .c-btn[aria-expanded=true] { opacity: 1; }
 .c-btn.has, .c-btn[aria-expanded=true] { color: var(--ink-1); }
 .c-btn:hover { background: var(--bg-4); }
-@media (max-width: 860px) {
+@media (max-width: 1180px) {
 	.c-btn { position: static; margin-left: 0.5em; opacity: 0.55; vertical-align: 0.1em; }
 	.codeblock > .c-btn, .ref > .c-btn { position: absolute; }
 }
@@ -152,16 +147,6 @@ li > .c-thread { margin: 0.5em 0 0.8em; }
 .chart a { cursor: pointer; }
 .chart .empty { display: grid; place-items: center; aspect-ratio: 340 / 168; margin: 0; color: var(--ink-3); font-size: 14px; }
 
-/* The top bar (render/render.ts topbar): the site's name, then pages with Nav and nav's Links. */
-.topbar { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: inset 0 -1px 0 var(--line); }
-.topbar nav { display: flex; align-items: center; gap: 20px; max-width: 960px; margin: 0 auto; padding: 0 20px; height: 52px; font-size: 14px; }
-.topbar a { color: var(--ink-3); text-decoration: none; white-space: nowrap; }
-.topbar a:hover, .topbar a[aria-current="page"] { color: var(--ink-1); }
-.topbar .home { font-weight: 700; color: var(--ink-1); letter-spacing: -0.01em; }
-.topbar .links { display: flex; gap: 18px; margin-left: auto; overflow-x: auto; scrollbar-width: none; }
-.topbar .out::after { content: "↗"; margin-left: 0.2em; color: var(--ink-4); }
-main { padding-top: 48px; }
-
 /* Narration (client/listen.ts, audio/README.md): the player under the title, "play from here" beside each block's
    comment button, the block being read and the word being said. */
 .listen { margin: 0.25em 0 2.25em; min-height: 36px; }
@@ -190,7 +175,7 @@ li > .say-btn:has(+ .c-btn) { left: -102px; }
 .say-btn .listen-icon { width: 10px; height: 10px; }
 [data-say]:hover > .say-btn, .say-btn:hover, .say-btn:focus-visible { opacity: 1; }
 .say-btn:hover { background: var(--bg-4); color: var(--ink-1); }
-@media (max-width: 860px) {
+@media (max-width: 1180px) {
 	.say-btn, .say-btn:has(+ .c-btn), li > .say-btn, li > .say-btn:has(+ .c-btn) { position: static; margin-left: 0.5em; opacity: 0.55; vertical-align: 0.1em; }
 	.codeblock > .say-btn, .cmd > .say-btn, .ref > .say-btn { position: absolute; }
 }

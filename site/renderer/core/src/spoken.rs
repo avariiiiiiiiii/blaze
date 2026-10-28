@@ -4,14 +4,15 @@
 //! - prose (Lede, P, Dim, Li) loses its inline markup; a code span is said as words (`inline::say_code`), a link
 //!   its label, a reference its label without an identifier before a colon, and a parenthesis of bare references
 //!   (`([[a]], [[b]])`, a citation) is dropped;
-//! - a Section's title becomes a transition ("Next: Prior art."), an H3 its title, an Issue "Open question: ...";
+//! - a Section's title becomes a transition ("Next: Prior art."), an H3 its title, an Issue "Open question: ...", a
+//!   Goal its title and status;
 //! - a Table is read row by row against its header ("Function in the main crate: cargo 1.76 seconds, ...");
 //! - an Img is its alt text ("On screen: ...");
 //! - Code and Command blocks are skipped, citations are never read, References, the signup form and the bench widget
 //!   are skipped, and the RFC index reads each RFC's number and title.
 //!
 //! An author overrides any block's line with `Say: {"..."}` (Drama 3 directions such as `[warm]` allowed). On a
-//! container (Section, Issue, Li, Ul, Ol) the `Say` stands for its whole subtree: its children are not read, so one
+//! container (Section, Issue, Goal, Li, Ul, Ol) the `Say` stands for its whole subtree: its children are not read, so one
 //! authored line can tell a whole section. The `Silent` tag drops a block and everything under it. A page can carry
 //! `Intro` (said first; the default is its title, and for an RFC its number) and `Outro` (said last). Derived lines
 //! never carry a direction: brackets and angle brackets are taken out of them, so only an author's `Say` steers the
@@ -147,8 +148,9 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<(), String> {
         return Ok(());
     }
     let id = ctx.block_id(n);
-    let walk =
-        ["Section", "Issue", "Li"].iter().any(|c| e.has(c)) || e.has_tag("Ul") || e.has_tag("Ol");
+    let walk = ["Section", "Issue", "Goal", "Li"].iter().any(|c| e.has(c))
+        || e.has_tag("Ul")
+        || e.has_tag("Ol");
     if let Some(say) = text_of(e, "Say") {
         // An authored line tells the block and everything under it: a container's children are not read.
         ctx.push(id.clone(), id, authored(&say), true);
@@ -209,6 +211,11 @@ fn derive(n: Id, ctx: &mut Ctx) -> Result<Option<String>, String> {
             _ => "Question",
         };
         return Ok(Some(format!("{status}: {title}")));
+    }
+    if let Some(v) = e.value("Goal") {
+        let title = ctx.plain(&js::string(v.get("title")), n)?;
+        let status = e.targets("Status").and_then(|t| t.first()).map(String::as_str).unwrap_or("");
+        return Ok(Some(if status.is_empty() { title } else { format!("{title}. {status}") }));
     }
     if e.has_tag("Table") {
         return table(n, ctx).map(Some);

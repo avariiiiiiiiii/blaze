@@ -1,4 +1,4 @@
-/* Syntax colours for code blocks, copied from ix packages/web/src/styles/doc-code.css (dark values).
+/* Syntax colours for code blocks, copied from ix packages/web/src/styles/doc-code.css (dark, and light below).
    Roles: keyword red, string green, call purple, type and name blue, number orange, comment grey. */
 .code-roles {
 	--syn-keyword: #ff7b72;
@@ -9,7 +9,18 @@
 	--syn-comment: #7d8590;
 }
 
-.hljs { color: var(--g-12); background: transparent; }
+@media (prefers-color-scheme: light) {
+	.code-roles {
+		--syn-keyword: #cf222e;
+		--syn-string: #0a7d4f;
+		--syn-title: #6639ba;
+		--syn-attr: #0b5fc4;
+		--syn-number: #b35900;
+		--syn-comment: #8a8a85;
+	}
+}
+
+.hljs { color: var(--code-ink); background: transparent; }
 .code-roles .hljs-keyword,
 .code-roles .hljs-literal,
 .code-roles .hljs-selector-tag { color: var(--syn-keyword); font-weight: 600; }

@@ -7,29 +7,33 @@
 //! - `snapshot`: a world from a flecs-snapshot DAG-CBOR document, which is what hosts load.
 //! - `scripts` (feature `scripts`, native): the content scripts run in Flecs and snapshotted.
 //! - `render`, `inline`, `comments`: render/render.ts, widgets.ts, inline.ts and comments.ts.
+//! - `side`, `icons`: the sidebar every page carries (sections, rows, the pager, the outline) and its icons.
 //! - `spoken`: a page's spoken version (the narration's lines), derived from its blocks or written with `Say`.
 
 pub mod comments;
+pub mod icons;
 pub mod inline;
 pub mod js;
 pub mod render;
 #[cfg(feature = "scripts")]
 pub mod scripts;
+pub mod side;
 pub mod snapshot;
 pub mod spoken;
 pub mod text;
 pub mod world;
 
 pub use comments::{Comment, Discussion, FormError, Viewer};
-pub use render::{Blocks, NavItem, Page, Served};
+pub use render::{Blocks, Page, Served};
 pub use world::{Entity, Id, Scalar, Value, World};
 
-/// A site ready to render: the world and the indexes the TS builds once per isolate (pages, the top bar, refs).
+/// A site ready to render: the world and the indexes built once per isolate (pages, the sidebar, refs).
 pub struct Site {
     world: World,
     site: Id,
     pages: Vec<Page>,
-    nav: Vec<NavItem>,
+    /// The sidebar's sections (`side.rs`).
+    nav: Vec<side::Group>,
     refs: Option<Id>,
     served: Served,
     /// Per discussable page (by URL): its blocks from a comment-less render, which says where comments hang.
@@ -48,7 +52,7 @@ impl Site {
     pub fn new(world: World) -> Result<Site, String> {
         let site = world.lookup("site").ok_or("the world has no `site` entity")?;
         let pages = render::pages(&world, site);
-        let nav = render::bar(&world, &pages)?;
+        let nav = side::build(&world, &pages)?;
         let refs = world.lookup("refs");
         let served = Served::of(&world, site)?;
         let mut site = Site { world, site, pages, nav, refs, served, threads: Default::default() };

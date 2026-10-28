@@ -32,13 +32,6 @@ pub struct Blocks {
     pub blocks: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct NavItem {
-    pub label: String,
-    pub href: String,
-    pub order: f64,
-}
-
 pub fn is_page(e: &Entity) -> bool {
     e.is_a("Page")
 }
@@ -71,44 +64,6 @@ fn field(v: Option<&Value>, k: &str) -> String {
 
 fn text(e: &Entity, comp: &str) -> String {
     field(e.value(comp), "text")
-}
-
-/// The top bar's links: pages with Nav and nav's Link children, by order.
-pub fn bar(world: &World, list: &[Page]) -> Result<Vec<NavItem>, String> {
-    let mut items: Vec<NavItem> = list
-        .iter()
-        .filter_map(|p| {
-            let v = world.get(p.node).value("Nav")?;
-            Some(NavItem {
-                label: field(Some(v), "label"),
-                href: p.url.clone(),
-                order: js::to_number(v.get("order")),
-            })
-        })
-        .collect();
-    if let Some(nav) = world.lookup("nav") {
-        for &c in &world.get(nav).children {
-            let n = world.get(c);
-            let v =
-                n.value("Link").ok_or_else(|| format!("{}: nav's children are Links", n.path))?;
-            let href = field(Some(v), "href");
-            if !(href.starts_with("http://")
-                || href.starts_with("https://")
-                || href.starts_with('/'))
-            {
-                return Err(format!("{}: a Link's href is http(s) or /", n.path));
-            }
-            items.push(NavItem {
-                label: field(Some(v), "label"),
-                href,
-                order: js::to_number(v.get("order")),
-            });
-        }
-    }
-    // Array.prototype.sort is stable, as sort_by is.
-    items
-        .sort_by(|a, b| (a.order - b.order).partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(items)
 }
 
 /// Where the site is served (`Served` on `site`): the origin (`https://ix.dev`) and the path every page sits under
@@ -158,7 +113,8 @@ pub struct Site<'w> {
     pub world: &'w World,
     pub site: Id,
     pub pages: &'w [Page],
-    pub nav: &'w [NavItem],
+    /// The sidebar's sections (side.rs), built once.
+    pub nav: &'w [crate::side::Group],
     pub refs: Option<Id>,
     pub served: &'w Served,
 }
@@ -476,6 +432,28 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
             a.attr, a.button, a.thread
         ));
     }
+    if let Some(v) = e.value("Goal") {
+        // A card: an icon, the title and where it stands, then its paragraphs.
+        let title = field(Some(v), "title");
+        let id = esc(&ctx.block_id(n));
+        let a = anchor(n, ctx, &title)?;
+        let path = ctx.e(n).path.clone();
+        let t = ctx.inline(&title, &path)?;
+        let st = status(ctx.e(n));
+        let icon = match field(ctx.e(n).value("Icon"), "name") {
+            i if i.is_empty() => String::new(),
+            i => format!(
+                "<span class=\"goal-icon\">{}</span>",
+                crate::icons::svg(&i)
+                    .ok_or_else(|| format!("{path}: Icon {i:?} is not in icons.rs"))?
+            ),
+        };
+        let kids = children(n, ctx)?;
+        return Ok(format!(
+            "<article class=\"goal\" id=\"{id}\"><header>{icon}<h3{}>{t}{}</h3>{st}</header>{}\n{kids}\n</article>",
+            a.attr, a.button, a.thread
+        ));
+    }
     if e.has_tag("Ul") || e.has_tag("Ol") {
         let t = if e.has_tag("Ul") { "ul" } else { "ol" };
         return Ok(format!("<{t}>\n{}\n</{t}>", children(n, ctx)?));
@@ -553,58 +531,6 @@ fn references_html(ctx: &Ctx) -> String {
     format!(
         "<section id=\"references\"><h2>References</h2><ol class=\"references\">{items}</ol></section>"
     )
-}
-
-fn topbar(page: &Page, items: &[NavItem], served: &Served) -> String {
-    let links: String = items
-        .iter()
-        .map(|i| {
-            let here = i.href == page.url
-                || (i.href != "/" && page.url.starts_with(&format!("{}/", i.href)));
-            let outside = i.href.starts_with("http:") || i.href.starts_with("https:");
-            format!(
-                "<a href=\"{}\"{}{}>{}</a>",
-                esc(&served.href(&i.href)),
-                if here { " aria-current=\"page\"" } else { "" },
-                if outside { " class=\"out\"" } else { "" },
-                esc(&i.label)
-            )
-        })
-        .collect();
-    format!(
-        "<header class=\"topbar\"><nav><a class=\"home\" href=\"{}\">blaze</a><span class=\"links\">{links}</span></nav></header>",
-        esc(&served.href("/"))
-    )
-}
-
-/// The trail of pages above this one: RFCs / .
-fn trail(ctx: &Ctx) -> String {
-    if ctx.page.url == "/" {
-        return String::new();
-    }
-    let mut up = Vec::new();
-    let mut n = ctx.e(ctx.page.node).parent;
-    while let Some(id) = n {
-        if id == ctx.s.site {
-            break;
-        }
-        if let Some(p) = ctx.s.page_of(id) {
-            up.insert(
-                0,
-                format!(
-                    "<a href=\"{}\">{}</a>",
-                    esc(&ctx.s.served.href(&p.url)),
-                    esc(&text(ctx.e(id), "Title"))
-                ),
-            );
-        }
-        n = ctx.e(id).parent;
-    }
-    // The top bar links home, so the trail starts at the first page below it, and only below the top level.
-    if up.is_empty() {
-        return String::new();
-    }
-    format!("<nav class=\"back\">{} <span>/</span></nav>", up.join(" <span>/</span> "))
 }
 
 /// RFC 0001 · Draft · Read first: Charter
@@ -736,6 +662,8 @@ pub fn render(
     } else {
         ""
     };
+    // Every page has the sidebar's script (folds, the phone drawer, search, the outline's scroll spy).
+    ctx.script("side");
     let scripts = ctx
         .scripts
         .iter()
@@ -751,12 +679,53 @@ pub fn render(
     let extra_head = "";
     let doc_attr =
         if discussable { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
+    let say_intro = if audio.is_some() {
+        format!(" data-say=\"{}\"", crate::spoken::INTRO)
+    } else {
+        String::new()
+    };
+    let listen = match &audio {
+        // The player (client/listen.ts) builds its controls in here; without JS it stays empty.
+        Some(m) => {
+            format!("\n<div class=\"listen\" data-audio=\"{}\"></div>", esc(&s.served.href(m)))
+        }
+        None => String::new(),
+    };
+    // The home page's title is the logo, large; every other page has the docs' header: where it sits, the title,
+    // the RFC line.
+    let head = if n.has_tag("Hero") {
+        format!(
+            "<header class=\"hero\"><h1 class=\"hero-logo\"{say_intro}><span class=\"sr\">{}</span>{}</h1>{listen}</header>",
+            esc(&title),
+            crate::side::picture(s.world, s.site, s.served, "logo", "")
+        )
+    } else {
+        format!(
+            "<header class=\"head\">{}<h1{say_intro}>{}</h1>{}{listen}</header>",
+            crate::side::crumb(s.nav, page, s.served),
+            esc(&title),
+            meta(&ctx)?
+        )
+    };
+    // "On this page": the page's top-level sections, then its references.
+    let mut heads: Vec<(String, String)> = Vec::new();
+    for &c in &n.children {
+        if let Some(v) = s.world.get(c).value("Section") {
+            let t = field(Some(v), "title").replace(['`', '*'], "");
+            heads.push((ctx.block_id(c), t));
+        }
+    }
+    if !ctx.cited.is_empty() {
+        heads.push(("references".into(), "References".into()));
+    }
+    let toc = if n.has_tag("Wide") { String::new() } else { crate::side::toc(&heads) };
     let html = format!(
         "<!doctype html>
 <html lang=\"en\">
 <head>
 <meta charset=\"utf-8\" />
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+<meta name=\"color-scheme\" content=\"dark light\" />
 <title>{}</title>
 {description}
 {canonical}
@@ -765,32 +734,27 @@ pub fn render(
 {scripts}
 </head>
 <body>
+<div class=\"frame\">
 {}
+<div class=\"pane\">
+{}
+<div class=\"grid{width}\">
 <main class=\"doc{width}\"{doc_attr}>
-{}
-<h1{}>{}</h1>
-{}{}
+{head}
 {body}
+{}
 </main>
+{toc}
+</div>
+</div>
+</div>
 </body>
 </html>
 ",
         esc(&tab),
-        topbar(page, s.nav, s.served),
-        trail(&ctx),
-        if audio.is_some() {
-            format!(" data-say=\"{}\"", crate::spoken::INTRO)
-        } else {
-            String::new()
-        },
-        esc(&title),
-        meta(&ctx)?,
-        match &audio {
-            // The player (client/listen.ts) builds its controls in here; without JS it stays empty.
-            Some(m) =>
-                format!("\n<div class=\"listen\" data-audio=\"{}\"></div>", esc(&s.served.href(m))),
-            None => String::new(),
-        },
+        crate::side::sidebar(s.nav, page, s.served, s.world, s.site),
+        crate::side::mobile_bar(s.served, s.world, s.site),
+        crate::side::pager(s.nav, page, s.served),
         css = esc(&s.served.href("/site.css")),
     );
     Ok((html, out_blocks))

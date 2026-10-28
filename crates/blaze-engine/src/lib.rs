@@ -3737,13 +3737,7 @@ fn harness_alone(args: &Args) -> Option<String> {
 
 /// Writes [`cargo::plan::REACH`] beside the program of tests of `args` when a client asked for
 /// it, and takes away the one of an older build: `built` is whether this build is the program.
-fn write_reach(
-    db: &RootDatabase,
-    table: &SymbolTable,
-    listed: &Listed,
-    args: &Args,
-    built: bool,
-) {
+fn write_reach(db: &RootDatabase, table: &SymbolTable, listed: &Listed, args: &Args, built: bool) {
     let Some(dir) = args.out.parent() else { return };
     let file = dir.join(cargo::plan::REACH);
     if !built || !dir.join(cargo::plan::REACH_WANTED).is_file() {
@@ -5743,7 +5737,6 @@ impl LinkFailed {
         "Undefined symbols for architecture",
         "unresolved external symbol",
     ];
-
 }
 
 impl std::fmt::Display for LinkFailed {
@@ -8839,8 +8832,7 @@ fn run_holding(
         }
         let start = Instant::now();
         let manifest_mode = manifest::mode();
-        let manifest_key =
-            manifest_mode.and_then(|_| manifest::key(&db, &args, table.is_empty()));
+        let manifest_key = manifest_mode.and_then(|_| manifest::key(&db, &args, table.is_empty()));
         let files_of_manifest = match (manifest_mode, &manifest_key) {
             (Some(manifest::Mode::Use), Some(key)) => match manifest::lookup(&db, &args, key) {
                 Ok(files) => Some(files),
@@ -8867,9 +8859,7 @@ fn run_holding(
             None => {
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled.
-                if WatchedFile::include_sources(&mut files, &mut tree, &mut db)
-                    != Loaded::Nothing
-                {
+                if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
                     known.touch(&db, None);
                     listed.touch(&db, None);
                     cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
@@ -8941,9 +8931,8 @@ fn run_holding(
             let lints = !args.lints_capped;
             let within = Some(within);
             let broken = broken_in(&db, &all, &sources, &args.checkout, within, lints);
-            let why = hir::attach_db(&db, || {
-                refusal(&db, &all, &sources, &args.checkout, broken, None)
-            });
+            let why =
+                hir::attach_db(&db, || refusal(&db, &all, &sources, &args.checkout, broken, None));
             eprintln!("check: {} files in {:.1?}", all.len(), checking.elapsed());
             if let Some(why) = why {
                 if let Refused::Error(said) = &why {
@@ -8995,9 +8984,9 @@ fn run_holding(
                     "manifest: check: the build wrote what the store's manifest has ({:.1?})",
                     start.elapsed()
                 ),
-                _ if again.as_ref() != Some(key) => eprintln!(
-                    "manifest: not kept, the build loaded files its key was made without"
-                ),
+                _ if again.as_ref() != Some(key) => {
+                    eprintln!("manifest: not kept, the build loaded files its key was made without")
+                }
                 _ => match manifest::keep(&db, &args, key, &cold.wrote) {
                     Ok(bytes) => eprintln!(
                         "manifest: kept, {} files, {bytes} bytes ({:.1?})",

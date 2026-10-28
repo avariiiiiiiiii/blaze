@@ -291,7 +291,8 @@ mod tests {
         let (_, line) = wrapper_line(before).unwrap();
         let written = "[build]\r\nrustc-workspace-wrapper = \"/opt/blaze/blaze-rustc\"\r\n";
         assert_eq!(without_wrapper(written, Some(&line)).unwrap(), before);
-        let dotted = "build.rustc-workspace-wrapper = \"/opt/blaze/blaze-rustc\"\n[net]\noffline = true\n";
+        let dotted =
+            "build.rustc-workspace-wrapper = \"/opt/blaze/blaze-rustc\"\n[net]\noffline = true\n";
         assert_eq!(without_wrapper(dotted, None).unwrap(), "[net]\noffline = true\n");
     }
 

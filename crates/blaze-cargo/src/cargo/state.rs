@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     cli::{Invocation, worker_env},
     daemon::{self, Checkout, WorkerConfig},
-    package,
-    home, script,
+    home, package, script,
     units::{stamp_now, stamp_of},
 };
 
@@ -264,7 +263,6 @@ impl Guard {
                 .then(|| format!("the environment variable {name} changed")),
         }
     }
-
 }
 
 /// A hash of the Rust source in `file` with every item marked `#[test]` or `#[cfg(test)]`
@@ -549,7 +547,6 @@ impl State {
     pub fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
         self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
     }
-
 }
 
 impl Program {

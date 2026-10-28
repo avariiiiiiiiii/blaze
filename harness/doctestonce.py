@@ -62,7 +62,7 @@ def tested(ws, command, args, extra, target_dir):
     `Doc-tests` lines and cargo's lines of what failed, and all that was said beside."""
     path = os.path.dirname(RA_JIT) + os.pathsep + os.environ["PATH"]
     env = {**os.environ, **extra, "PATH": path, "CARGO_TARGET_DIR": target_dir}
-    run = subprocess.run(["cargo", *command, "test", "--doc", *args], cwd=ws, capture_output=True,
+    run = subprocess.run([*(command or ["cargo"]), "test", "--doc", *args], cwd=ws, capture_output=True,
                          text=True, timeout=3600, env=env)
     libraries = [doctest_report("running " + it) for it in re.split(r"(?m)^running ", run.stdout)[1:]]
     # Cargo colors its lines under `CARGO_TERM_COLOR=always`, as CI has it; the text is compared.

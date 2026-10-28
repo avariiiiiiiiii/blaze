@@ -19,7 +19,7 @@ use serde_derive::{Deserialize, Serialize};
 const LTO_ACCEPTED: &str = "lto: accepted, no cross-function optimization";
 
 /// Which build of a package the daemon stands in for, as the flags of `cargo build` say it.
-/// `cargo ra-jit` and `ra-jit` itself both say a build with this.
+/// `blaze` and the engine both say a build with this.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Selection {
     /// The name of the profile: `dev` unless `--release` or `--profile` says otherwise.

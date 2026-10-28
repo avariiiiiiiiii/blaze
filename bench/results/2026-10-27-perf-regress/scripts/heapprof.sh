@@ -10,7 +10,7 @@ tc=$(cat harness/toolchain)
 export CARGO_TARGET_DIR=/root/perf/target-heap CARGO_INCREMENTAL=0
 nix develop --command bash -c "export RUSTUP_TOOLCHAIN=$tc PATH=/nix/var/nix/profiles/default/bin:\$PATH; cargo build -j 8 -p ra-jit --release --locked --features heap-profile" 2>&1 | tail -2
 bin=/root/perf/bin/heapprof; rm -rf $bin; mkdir -p $bin
-for x in ra-jit cargo-ra-jit cargo-blaze blaze ra-jit-rustc ra-jit-rustc-first; do cp $CARGO_TARGET_DIR/release/$x $bin/ 2>/dev/null; done
+for x in blaze-engine blaze blaze-rustc; do cp $CARGO_TARGET_DIR/release/$x $bin/ 2>/dev/null; done
 out=/root/perf/heap; rm -rf $out; mkdir -p $out/tables
 p=/root/perf/heap-ws; rm -rf $p; mkdir -p $p
 cp -r /root/ra-jit-projects/ripgrep $p/rg; rm -rf $p/rg/target $p/rg/.git

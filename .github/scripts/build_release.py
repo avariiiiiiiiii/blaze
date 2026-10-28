@@ -93,7 +93,7 @@ SERVER_CRATE = "rust_analyzer_proc_macro_srv"
 SERVER_BIN = "blaze-proc-macro-srv"
 # What LLVM says of a function whose control flow changed since the profile was trained.
 STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
-# The hash rustc gives the crate ra-jit, in each of its symbols. Cargo derives it from the
+# The hash rustc gives the crate blaze-engine, in each of its symbols. Cargo derives it from the
 # whole graph of the build: every crate's name, version, source and features, the profile
 # (whether it builds incrementally too), the toolchain, and a wrapper of rustc around the
 # workspace's crates. LLVM finds a function of the
@@ -187,7 +187,7 @@ def build(target, target_dir, rustflags, cflags, features=None):
 
 def crate_hash(binaries):
     """The crate hash of ra-jit, read from the symbols of the binary."""
-    binary = next(b for b in binaries if b.stem == "ra-jit")
+    binary = next(b for b in binaries if b.stem == "blaze-engine")
     found = collections.Counter(CRATE.findall(binary.read_bytes()))
     return found.most_common(1)[0][0].decode() if found else None
 
@@ -392,7 +392,7 @@ def ship(args, binaries):
     for binary in binaries:
         shutil.copy2(binary, args.out / binary.name)
     if args.server:
-        proc_macro_server(args.out / "ra-jit", args.out)
+        proc_macro_server(args.out / "blaze-engine", args.out)
     check_loads(args.out)
     if "linux" in args.target:
         check_nix(args.out) if args.nix else check_glibc(args.out)

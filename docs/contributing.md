@@ -17,8 +17,8 @@ you send them, including fixes you find here and want to upstream.
 
 ## Layout of the tree
 
-    crates/ra-jit/             the daemon, the cargo drop-in, the splice, the remote
-    crates/ra-jit/src/bin/     cargo-ra-jit
+    crates/blaze-engine/       the daemon, the cargo drop-in, the splice, the remote
+    crates/blaze-engine/src/bin/ blaze, blaze-rustc
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
     crates/ra-jit-store/      the disk store of compiled code, which knows nothing about Rust
     crates/ra-jit-fuzz/       made-up and damaged inputs for the tests of what reads the store

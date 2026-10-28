@@ -78,7 +78,7 @@ pub(crate) fn mode(
     if mode.is_some() && !cfg!(feature = "wasi") {
         anyhow::bail!(
             "the build script of `{package}` is to run under WASI ({why}), and this ra-jit is \
-             built without Wasmtime: build it with the feature `wasi` of the crate `ra-jit`"
+             built without Wasmtime: build it with the feature `wasi` of the crate `blaze-engine`"
         );
     }
     Ok(mode)

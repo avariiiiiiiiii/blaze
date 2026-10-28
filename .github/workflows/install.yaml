@@ -2,7 +2,7 @@ name: install
 
 # install.sh, run as a user runs it, on each platform it installs on: from the newest release
 # (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
-# `blaze` and `cargo blaze` in a new project. And this commit's build, installed in a Debian
+# `blaze` in a new project. And this commit's build, installed in a Debian
 # container with no Rust at all, which runs `blaze run` in a project written by hand. On a
 # change to the script, on each release once it is published, weekly (a release's assets or
 # GitHub's redirects can change under it) and by hand. Not a check the merge queue requires.
@@ -61,36 +61,23 @@ jobs:
       - name: what it installed runs
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
-          for bin in cargo-blaze ra-jit cargo-ra-jit ra-jit-rustc; do test -x "$CARGO_HOME/bin/$bin"; done
-          cargo blaze --help | head -n 3
-          # A release from before blaze had its own Rust has rustup install the pinned nightly instead.
-          tc=$(cat harness/toolchain)
-          if [ -x "$CARGO_HOME/bin/blaze" ]; then
-            blaze toolchain | tee /dev/stderr | grep -F "blaze's toolchain (Rust $tc)"
-          else
-            rustup run "$tc" rustc --version
-            rustup component list --toolchain "$tc" --installed | grep -q '^rust-src'
-          fi
+          # Until a release after the rename (#270), the newest has the programs' old names.
+          test -x "$CARGO_HOME/bin/blaze"
+          test -x "$CARGO_HOME/bin/blaze-engine" || test -x "$CARGO_HOME/bin/ra-jit" # rename: old name
+          for bin in cargo-blaze cargo-ra-jit; do if test -e "$CARGO_HOME/bin/$bin"; then exit 1; fi; done # rename: old name
+          blaze --help | head -n 3
+          blaze toolchain | tee /dev/stderr | grep -F "blaze's toolchain (Rust $(cat harness/toolchain))"
       - name: again, which upgrades in place
         run: sh install.sh --verbose
       - name: blaze in a new project
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
-          tc=$(cat harness/toolchain)
           cd "$RUNNER_TEMP"
-          cargo new --quiet hello
+          blaze new --quiet hello
           cd hello
-          if [ -x "$CARGO_HOME/bin/blaze" ]; then
-            blaze build
-            blaze run | grep -F "Hello, world!"
-            cargo blaze run | grep -F "Hello, world!"
-            blaze stop
-          else
-            rustup override set "$tc"
-            cargo blaze build
-            cargo blaze run | grep -F "Hello, world!"
-            cargo blaze stop
-          fi
+          blaze build
+          blaze run | grep -F "Hello, world!"
+          blaze stop
       - name: a release that is not there says so
         run: |
           if sh install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi

@@ -61,10 +61,11 @@ pub(crate) fn wrapper_path() -> std::io::Result<PathBuf> {
     Ok(this.with_file_name(format!("ra-jit-rustc{}", std::env::consts::EXE_SUFFIX)))
 }
 
-/// Whether `path` is the wrapper, under either of its names.
+/// Whether `path` is the wrapper, under its name or one it had before the rename: a cargo
+/// configuration `enable` wrote then names one, which is never chained to.
 pub(crate) fn is_wrapper(path: &Path) -> bool {
     let stem = path.file_stem().and_then(|it| it.to_str());
-    stem.is_some_and(|it| it == "ra-jit-rustc" || it == "ra-jit-rustc-first")
+    stem.is_some_and(|it| it == "blaze-rustc" || crate::renamed::OLD_WRAPPERS.contains(&it))
 }
 
 impl Enabled {

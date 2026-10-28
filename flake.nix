@@ -137,17 +137,17 @@
         # What `nix profile install` puts on PATH: the same binaries, with the toolchain.
         daemon = pkgs.runCommand "blaze-${version}" {
           nativeBuildInputs = [ pkgs.makeWrapper ];
-          meta.mainProgram = "cargo-blaze";
+          meta.mainProgram = "blaze";
         } ''
           mkdir -p $out/bin
           for bin in ${dist}/bin/*; do
             makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin
           done
         '';
-        # `nix run github:indexable-inc/blaze#blaze -- build` is `cargo blaze build`.
+        # `blaze` with the toolchain and the other programs first on PATH.
         run = pkgs.writeShellScriptBin "blaze" ''
           export PATH=${daemon}/bin:${rust}/bin:$PATH
-          exec ${daemon}/bin/cargo-blaze blaze "$@"
+          exec ${daemon}/bin/blaze "$@"
         '';
 
         # eframe/winit dlopen these at run time.
@@ -205,12 +205,10 @@
         '';
       in {
         packages = {
-          # `nix profile install github:indexable-inc/blaze`: cargo-blaze and the programs it runs, so
-          # `cargo blaze` and `cargo blaze enable` work. `#blaze` names it too, and `ra-jit` is its
-          # name from before.
+          # `nix profile install github:indexable-inc/blaze`: blaze and the programs it runs, so
+          # `blaze build` and `blaze enable` work. `#blaze` names it too.
           default = daemon;
           blaze = daemon;
-          ra-jit = daemon;
           inherit dist daemon run life daemon-units life-bin;
           # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
           # read debug info, and the prefix a build of the `llvm` feature links.
@@ -226,10 +224,6 @@
           program = "${life}/bin/ra-jit-life";
         };
         apps.blaze = {
-          type = "app";
-          program = "${run}/bin/blaze";
-        };
-        apps.ra-jit = {
           type = "app";
           program = "${run}/bin/blaze";
         };

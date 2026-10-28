@@ -3,7 +3,7 @@
 corpus. cargo is the oracle; blaze never runs it outside this harness.
 
 usage: resolve.py [PART...] [--work DIR] [--jobs N] [--blaze BIN] [--blaze-metadata BIN]
-                  [--ra-jit BIN] [--out FILE] [--limit N]
+                  [--engine BIN] [--out FILE] [--limit N]
        resolve.py DIR...                 compare the workspaces at DIR... only
        resolve.py --fixtures             write the expected JSON of the fixtures with cargo
        resolve.py --top-crates N         list the N most downloaded crates.io crates, newest
@@ -32,7 +32,7 @@ The parts of the corpus (harness/resolve/corpus.json) are
               each target, seen by a wrapper) against `ra-jit cargo-answer`, which answers
               them with no cargo run, on the trees of harness/resolve/toolchain-fixtures and
               the config fixtures, harness/norustc/fixture and the bench projects: exit code
-              and stdout compared as text (`--ra-jit BIN`, default target/release/ra-jit)
+              and stdout compared as text (`--engine BIN`, default target/release/blaze-engine)
   units       the whole of `cargo <run> --unit-graph -Zunstable-options` against the `units`
               example of blaze-metadata's (blaze's own unit graph, crates/blaze-units), each
               of UNIT_RUNS, on harness/norustc/fixture and the bench repositories: every
@@ -45,7 +45,7 @@ The parts of the corpus (harness/resolve/corpus.json) are
               rust-analyzer reads it, for a build and a test (CTDEPS_RUNS) of
               harness/norustc/fixture and the bench projects: per package its script's cfgs,
               variables and the files of its OUT_DIR (sha256, its own path replaced), and
-              which packages have a proc macro built. `--ra-jit` names the ra-jit (default
+              which packages have a proc macro built. `--engine` names the engine (default
               target/release/ra-jit, with blaze-proc-macro-srv beside it); the part is not in
               the default set, as it builds what it compares
 and every part but ctdeps runs when none is named. Each is fetched under `--work` (default
@@ -299,7 +299,7 @@ def ancestors(path, root):
         path = os.path.dirname(path)
 
 
-def toolchain_runs(root, spec, ra_jit, cargo_home, host, cargo):
+def toolchain_runs(root, spec, engine, cargo_home, host, cargo):
     """Each question on the tree at root: (name, cargo's, ra-jit's), each {code, stdout}."""
     home = os.path.join(root, spec["home"]) if spec.get("home") else cargo_home
     base = {k: v for k, v in clean_env(home).items() if k != "CARGO_ORACLE" and not k.startswith(("BLAZE_", "RUSTC"))}
@@ -322,7 +322,7 @@ def toolchain_runs(root, spec, ra_jit, cargo_home, host, cargo):
         for name, args, variables in toolchain_questions(host):
             env = dict(base, **variables)
             c = norm(run([cargo, *args], cwd, env))
-            b = norm(run([ra_jit, "cargo-answer", cargo, *args], cwd, dict(mine_env, **variables)))
+            b = norm(run([engine, "cargo-answer", cargo, *args], cwd, dict(mine_env, **variables)))
             yield name, c, b
         # The flags cargo hands rustc for each target, as Flags::of reads them for the plan,
         # which asks in a workspace only: `cargo rustc` needs a package to answer.
@@ -331,7 +331,7 @@ def toolchain_runs(root, spec, ra_jit, cargo_home, host, cargo):
             env = dict(base, RUSTC_BOOTSTRAP="1", RUSTC_WRAPPER=wrapper)
             code, out, err = run([cargo, "rustc", "-Zunstable-options", "--print", "cfg", "--target", target], cwd, env)
             c = dict(code=code, stdout=json.dumps(json.loads(out)[:-4]) if code == 0 else "")
-            b = norm(run([ra_jit, "cargo-answer", cargo, "--rustflags", target], cwd, dict(mine_env, RUSTC_BOOTSTRAP="1")))
+            b = norm(run([engine, "cargo-answer", cargo, "--rustflags", target], cwd, dict(mine_env, RUSTC_BOOTSTRAP="1")))
             if b["code"] == 0:
                 b["stdout"] = json.dumps(json.loads(b["stdout"]))
             yield f"rustflags {target}", c, b
@@ -339,7 +339,7 @@ def toolchain_runs(root, spec, ra_jit, cargo_home, host, cargo):
         shutil.rmtree(answers, ignore_errors=True)
 
 
-def compare_toolchain(case, ra_jit, cargo_home, host, cargo):
+def compare_toolchain(case, engine, cargo_home, host, cargo):
     """Asks every question of case["dir"] of cargo and of ra-jit, a fixture copied away first."""
     result = dict(name=case["name"], part=case["part"])
     work = tempfile.mkdtemp(prefix="blaze-toolchain-")
@@ -350,7 +350,7 @@ def compare_toolchain(case, ra_jit, cargo_home, host, cargo):
             spec = config_case(case["dir"])
         else:
             root, spec = case["dir"], {}
-        runs = list(toolchain_runs(root, spec, ra_jit, cargo_home, host, cargo))
+        runs = list(toolchain_runs(root, spec, engine, cargo_home, host, cargo))
     finally:
         shutil.rmtree(work)
     for name, c, b in runs:
@@ -803,7 +803,7 @@ def missing(text, root):
     return None
 
 
-def compare_ctdeps(case, ra_jit, cargo_home, work):
+def compare_ctdeps(case, engine, cargo_home, work):
     """Each load of CTDEPS_RUNS of case["dir"], copied into a directory of its own below `work`:
     cargo's `--compile-time-deps` against `ra-jit compile-time-deps`, package by package."""
     result = dict(name=case["name"], part=case["part"])
@@ -827,7 +827,7 @@ def compare_ctdeps(case, ra_jit, cargo_home, work):
                     "--manifest-path", os.path.join(root, "Cargo.toml"), "--target-dir", os.path.join(root, "target", CTDEPS_CARGO_TARGET),
                     "--keep-going", "--compile-time-deps", "-Zunstable-options"]
             c_code, c_out, c_err = run(CARGO + args, root, env)
-            b_code, b_out, b_err = run([ra_jit, "compile-time-deps", root, *flags], root, {**env, "RUST_BACKTRACE": "0"})
+            b_code, b_out, b_err = run([engine, "compile-time-deps", root, *flags], root, {**env, "RUST_BACKTRACE": "0"})
             b_error = ra_jit_error(b_err)
             if c_code and b_code:
                 # The same failure when blaze names the package whose script or proc macro
@@ -1032,7 +1032,7 @@ def main():
     out = option(argv, "--out")
     limit = int(option(argv, "--limit", "1000000"))
     blaze = option(argv, "--blaze")
-    ra_jit = os.path.abspath(option(argv, "--ra-jit", os.path.join(ROOT, "target", "release", "ra-jit")))
+    engine = os.path.abspath(option(argv, "--engine", os.path.join(ROOT, "target", "release", "ra-jit")))
     needs_examples = bool(set(argv or PARTS) - {"toolchain", *NAMED_PARTS})
     built = {name: os.path.join(os.path.dirname(blaze), name) for name in ("config", "profiles", "units")} | dict(metadata=blaze) if blaze else build_blaze() if needs_examples else {}
     blaze_metadata = option(argv, "--blaze-metadata")
@@ -1060,11 +1060,11 @@ def main():
         if case["part"] == "sysroot":
             return compare_sysroot(case, built["sysroot"], cargo_home)
         if case["part"] == "ctdeps":
-            return compare_ctdeps(case, ra_jit, cargo_home, work)
+            return compare_ctdeps(case, engine, cargo_home, work)
         if case["part"] == "profiles":
             return compare_profiles(case, built["profiles"], cargo_home, host)
         if case["part"] == "toolchain":
-            return compare_toolchain(case, ra_jit, cargo_home, host, cargo)
+            return compare_toolchain(case, engine, cargo_home, host, cargo)
         if case["part"] == "units":
             return compare_units(case, built["units"], cargo_home)
         return compare(case, built["metadata"], cargo_home)

@@ -11,7 +11,7 @@ t nix develop --command true
 t nix develop --command cargo build -p ra-jit --release --features llvm --locked || exit 1
 t nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/ra-jit || exit 1
 mkdir -p /root/rb/bin
-for b in ra-jit cargo-ra-jit cargo-blaze blaze ra-jit-rustc ra-jit-rustc-first blaze-proc-macro-srv; do
+for b in blaze-engine blaze blaze-rustc blaze-proc-macro-srv; do
   cp target/release/$b /root/rb/bin/ || echo "missing $b"
 done
 ls -la /root/rb/bin

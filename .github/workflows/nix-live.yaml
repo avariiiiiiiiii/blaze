@@ -81,12 +81,11 @@ jobs:
         run: |
           nix run .#blaze -- --help
           nix run .#blaze -- --version || true
-          nix run .#ra-jit -- --version || true
       - name: the binaries run each other from next to themselves
         run: |
           for attr in daemon daemon-units; do
             out=$(nix build --no-link --print-out-paths .#$attr)
-            for bin in cargo-blaze ra-jit cargo-ra-jit ra-jit-rustc ra-jit-rustc-first; do test -x "$out/bin/$bin"; done
+            for bin in blaze blaze-engine blaze-rustc; do test -x "$out/bin/$bin"; done
           done
 
   nix-darwin:

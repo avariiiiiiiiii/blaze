@@ -1,8 +1,8 @@
 [package]
 name = "ra-jit"
 description = "blaze: cargo build, test and run from a daemon that keeps your workspace compiled, with live edits"
-# Published as `cargo-blaze` by .github/scripts/publish_crates.py, which publishes the vendored
-# crates it depends on by path as `ra-jit-<name>` and rewrites this manifest to name them.
+# Published by .github/scripts/publish_crates.py, which publishes the vendored crates it depends
+# on by path as `ra-jit-<name>` and rewrites this manifest to name them.
 publish = false
 
 version.workspace = true
@@ -13,10 +13,9 @@ rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
-categories = ["development-tools::cargo-plugins", "development-tools::build-utils", "compilers"]
+categories = ["development-tools::build-utils", "compilers"]
 
-# The program the other binaries run, named apart from the package, which is published as
-# `cargo-blaze`.
+# The program `blaze` and blaze-rustc run.
 [[bin]]
 name = "ra-jit"
 path = "src/main.rs"
@@ -29,7 +28,7 @@ unsandboxed-tests = [
     "sandbox::linux::tests::a_view_binds_a_store_path_from_anywhere",
 ]
 
-# `cargo binstall cargo-blaze`: the archive the release workflow makes for each target, named and
+# `cargo binstall blaze-engine`: the archive the release workflow makes for each target, named and
 # laid out as `blaze-v<version>-<target>/` in .github/workflows/release.yaml (and install.sh). A
 # target with no archive is built from source; a third party's build is never used.
 [package.metadata.binstall]

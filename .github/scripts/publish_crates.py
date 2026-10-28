@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Publish blaze (the crate `cargo-blaze`) and the forked crates it depends on to crates.io.
+"""Publish blaze (the crate `blaze-engine`) and the forked crates it depends on to crates.io.
 
   publish_crates.py --stage DIR          # write the crates to publish into DIR, nothing else
   publish_crates.py --dry-run            # stage, then `cargo package --workspace` (builds each)
   publish_crates.py --publish            # stage, verify as above, then publish what is missing
 
-blaze's crate, `crates/ra-jit` in the repository, is published as `cargo-blaze`, so that
-`cargo install cargo-blaze` installs it; its binaries keep their names. It depends by path on
+blaze's crate, `crates/ra-jit` in the repository, is published as `blaze-engine`, so that
+`cargo install blaze-engine` installs it and its programs (`blaze` among them). It depends by path on
 the front end's crates, derived from rust-analyzer's (crates/hir-ty, hir-def and the rest), and
 on rustc's rustc_abi (crates/rustc_abi), which crates.io does not have in this form. Each one in
 ra-jit's dependency closure is published as `ra-jit-<name>` at the workspace version, without
@@ -48,7 +48,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[2]
 ROOT_CRATE = ROOT / "crates" / "ra-jit"
 # The root crate's name on crates.io.
-ROOT_NAME = "cargo-blaze"
+ROOT_NAME = "blaze-engine"
 REPOSITORY = "https://github.com/indexable-inc/blaze"
 USER_AGENT = "blaze-publish (https://github.com/indexable-inc/blaze)"
 DEP_TABLES = ("dependencies", "build-dependencies")
@@ -75,6 +75,10 @@ class Extra:
     old: str
     new: str
 
+
+# Forks whose name with the prefix another project has on crates.io: each is published as
+# `<prefix>fork-<name>` instead.
+TAKEN = {"macros"}
 
 EXTRAS: dict[str, list[Extra]] = {
     "ra-jit": [
@@ -208,15 +212,11 @@ class Repo:
             manifest = load(d / "Cargo.toml")
             package = manifest["package"]
             orig = package["name"]
-            # Forks: vendor/, the crates in crates/ derived from rust-analyzer (which keep its version,
-            # 0.0.0), and rowan and rustc_abi, forks of crates on crates.io.
-            fork = (
-                not d.is_relative_to(ROOT / "crates")
-                or package["version"] == "0.0.0"
-                or orig in ("rowan", "ra-ap-rustc_abi")
-            )
+            # Forks: vendor/, and the crates in crates/ derived from others (rust-analyzer's, rowan,
+            # rustc_abi), which are at version 0.0.0.
+            fork = not d.is_relative_to(ROOT / "crates") or package["version"] == "0.0.0"
             if fork:
-                name, version = "ra-jit-" + orig.removeprefix("ra-ap-"), self.version
+                name, version = "ra-jit-" + ("fork-" if orig in TAKEN else "") + orig, self.version
             else:
                 if d == ROOT_CRATE.resolve():
                     name = ROOT_NAME
@@ -380,7 +380,7 @@ def fork_readme(c: Crate) -> str:
     return (
         f"# {c.name}\n\n"
         f"A fork of {upstream}, published only so that [blaze]({REPOSITORY}) can be installed "
-        "with `cargo install cargo-blaze`. It is not a supported API and follows blaze's version, "
+        "with `cargo install blaze-engine`. It is not a supported API and follows blaze's version, "
         "not upstream's. For rust-analyzer's crates as a library, use the `ra_ap_*` crates.\n\n"
         "Licensed under MIT or Apache-2.0, as upstream.\n"
     )

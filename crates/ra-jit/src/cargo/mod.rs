@@ -61,6 +61,9 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     if !matches!(asked, Asked::Build(_)) {
         crate::end_with_reader();
     }
+    if let Ok(home) = daemon::home() {
+        crate::renamed::say_old_dirs(&home);
+    }
     if let Asked::Build(_) = asked
         && let Err(why) = toolchain::settle(true)
     {

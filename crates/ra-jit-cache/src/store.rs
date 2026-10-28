@@ -26,7 +26,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::__private::{Code, decode, encode};
 
 /// What an entry's file begins with; another format is another name.
-const MAGIC: &[u8; 16] = b"ra-jit-fn-cache2";
+const MAGIC: &[u8; 16] = b"blaze-fn-cache-3";
 
 /// The directory of the index, beside the directories of the codes.
 const INDEX: &str = "index";

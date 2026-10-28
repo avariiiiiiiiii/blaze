@@ -255,7 +255,7 @@ def ra_jit(root, crate, out, exe, target, store, *extra):
                 *extra], root, f"ra-jit {crate} ({target})", env)
 
 
-def cargo_blaze(root, what, store, runtime, target):
+def blaze_build(root, what, store, runtime, target):
     """`cargo blaze build` as a user runs it, the `cargo-blaze` beside ra-jit first on the path
     and a daemon of its own, in a copy of the package without cargo's build. Returns the copy
     and how long the build took."""
@@ -349,12 +349,12 @@ def main():
             lines.append(f"{what} ({UNKNOWN}): built and linked in {took:.2f} s, the standard "
                          f"library {std}, the link {link_took}, {len(calls)} calls as cargo's; "
                          f"{kib(ours)}, cargo's {kib(theirs)}")
-            copy, took = cargo_blaze(root, what, store, runtime, UNKNOWN)
+            copy, took = blaze_build(root, what, store, runtime, UNKNOWN)
             served = os.path.join(copy, "target", UNKNOWN, "debug", f"{name}.wasm")
             got = invoked(served, root, calls)
             if got != expected:
                 raise SystemExit(f"FAIL: cargo blaze's {what} differs from cargo's:\n"
-                                 f"cargo:  {expected}\ncargo blaze: {got}")
+                                 f"cargo: {expected}\nblaze: {got}")
             lines.append(f"{what} by `cargo blaze build`: {took:.2f} s, {len(calls)} calls as "
                          f"cargo's; {kib(served)}")
         print("\n".join(lines))

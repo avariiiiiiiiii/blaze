@@ -6,3 +6,5 @@ crates derived from rust-analyzer (MIT OR Apache-2.0): the front end's crates in
 (hir-ty, hir-def, hir-expand, syntax, parser, base-db, rowan and the rest), copyright the
 rust-analyzer developers; their license texts are licenses/rust-analyzer-LICENSE-MIT and
 licenses/rust-analyzer-LICENSE-APACHE.
+
+syntax-tree started as rowan 0.17.0 (MIT/Apache-2.0); its license texts are in crates/rowan.

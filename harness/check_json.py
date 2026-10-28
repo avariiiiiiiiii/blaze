@@ -108,8 +108,8 @@ def make(work, name, files):
 
 
 def run(at, command, fmt, home):
-    """stdout's JSON messages, stderr's lines and the status of `cargo COMMAND check`."""
-    args = ["cargo", *command, "check", f"--message-format={fmt}"]
+    """stdout's JSON messages, stderr's lines and the status of `COMMAND check` (cargo's with none)."""
+    args = [*(command or ["cargo"]), "check", f"--message-format={fmt}"]
     done = subprocess.run(args, cwd=at, env=env(home), capture_output=True, text=True, timeout=600)
     messages = [json.loads(line) for line in done.stdout.splitlines() if line.startswith("{")]
     return messages, done.stderr.splitlines(), done.returncode

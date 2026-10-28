@@ -145,7 +145,7 @@ Branch `one-build`, from main at 22b1267233, 2026-10-21. Until then the flake an
 | way in | builds |
 |---|---|
 | a release's binaries | `build_release.py --target T --strict`: `dist` with the profile `pgo/profiles.json` pins for T |
-| `nix run`, `nix profile install`, `nix build .#daemon` (and `.#dist`, `.#ra-jit`, the demo) | the same script inside the derivation, the same profile fetched by its sha256 |
+| `nix run`, `nix profile install`, `nix build .#daemon` (and `.#dist`, `.#blaze`, the demo) | the same script inside the derivation, the same profile fetched by its sha256 |
 | from a checkout | the same script |
 | `cargo install --locked --profile dist ra-jit` | `dist` without PGO |
 

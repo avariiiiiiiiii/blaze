@@ -222,9 +222,9 @@ are recomputed from what it put back.
 
 ## In den
 
-den's native app takes edits to its own code this way: `just dev --ra-jit` in den builds it
-through the daemon, starts it with `DEN_RA_JIT=1`, watches its crates, builds again after an
-edit, and starts it again when it is asked to. den's module crates keep their own hot reload,
+den's native app takes edits to its own code this way: a mode of `just dev` in den builds it
+through the daemon, starts it, watches its crates, builds again after an edit, and starts it
+again when it is asked to (den names the mode and its variable). den's module crates keep their own hot reload,
 which ra-jit does not touch. Measured on 2026-10-20 on an M-series Mac:
 
 - a cold build of den-native (5,076 of 5,193 functions of its own compiled, 190,067 instances)

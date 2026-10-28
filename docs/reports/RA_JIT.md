@@ -228,7 +228,7 @@ and useful on its own for clean builds.
 
 ## 7. Tracking upstream rust-analyzer
 
-The fork is RA plus two things: the `ra-jit` crate and the codegen module. Policy:
+The fork is RA plus two things: the `blaze-engine` crate and the codegen module. Policy:
 
 - Rebase onto upstream weekly. The scoreboard is the acceptance test for the rebase.
 - Keep changes to existing RA files minimal and mechanical (visibility, a module declaration).

@@ -1,13 +1,12 @@
-# Using blaze with cargo
+# Using blaze
 
-There are two ways to use blaze from cargo. `cargo blaze <command>` is an explicit
-subcommand, described here. The second, switching blaze on globally so that plain `cargo`
-goes through it, has its own section at the end.
+`blaze <command>` takes cargo's commands and flags (`blaze build`, `blaze test`, `blaze run`),
+described here. The other way, switching blaze on globally so that plain `cargo` goes through
+it, has its own section at the end.
 
-blaze was called ra-jit until 2026-10-24. `cargo ra-jit` is still the same command as
-`cargo blaze`. Every setting below is `BLAZE_<NAME>`; its old name, `RA_JIT_<NAME>`, is not
-read, and blaze stops when one is set, saying for each what it is called now. The engine
-`cargo blaze` runs, its helpers and its directories keep the name ra-jit for now.
+blaze had another name and another command before 2026-10-28; [rename.md](rename.md) maps them.
+Every setting below is `BLAZE_<NAME>`, and blaze stops when one is set under its name from
+before, saying what it is called now.
 
 Everything in this file was checked against the code in `crates/ra-jit/src/cargo/` and run on
 Linux x86-64. On macOS arm64 `harness/cargo_ra_jit.py --small` was run, and what is known of
@@ -16,14 +15,12 @@ it is under [macOS arm64](#macos-arm64). The design notes it was written from ar
 
 ## Install
 
-`cargo blaze` is cargo's way of running a program called `cargo-blaze` on your `PATH`. That
-program is built with blaze and runs the `ra-jit` executable in the same directory, blaze's
-engine, so the two have to be installed side by side, with `ra-jit-rustc` and
-`ra-jit-rustc-first` (and `cargo-ra-jit`, the old name of `cargo-blaze`). The
-[installer](../install.sh) and `cargo install` both do that:
+`blaze` runs the `blaze-engine` executable in the same directory, blaze's engine, so the two
+have to be installed side by side, with `blaze-rustc`. The [installer](../install.sh) and
+`cargo install` both do that:
 
     curl -fsSL https://ix.dev/blaze | sh
-    cargo +nightly-2026-10-27 install --locked cargo-blaze
+    cargo +nightly-2026-10-27 install --locked blaze-engine
 
 From the release after 0.1.0, `--profile dist` builds the profile a release is built with, less
 the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0.1.0 has no such
@@ -1029,11 +1026,11 @@ before changing it.
 `cargo blaze` needs whoever runs the build to type something different. The global switch is
 for when they won't: agents, scripts, editors that call `cargo build` themselves.
 
-    ra-jit enable     # plain cargo now goes through ra-jit, for this user
-    ra-jit status     # is it on, and what the daemon served or left to rustc
-    ra-jit disable    # back to how it was
+    blaze enable      # plain cargo now goes through blaze, for this user
+    blaze status      # is it on, and what the daemon served or left to rustc
+    blaze disable     # back to how it was
 
-`ra-jit`, `cargo-ra-jit` and `ra-jit-rustc` have to be in the same directory.
+`blaze`, `blaze-engine` and `blaze-rustc` have to be in the same directory.
 
 ### What `enable` changes
 
@@ -1043,7 +1040,7 @@ One key in `$CARGO_HOME/config.toml` (usually `~/.cargo/config.toml`):
     rustc-workspace-wrapper = "<dir>/ra-jit-rustc"
 
 And `$CARGO_HOME/bin/cargo-fmt` and `cargo-clippy`, for those of the two that are blaze's own:
-links to `cargo-blaze`, with what was there kept in `$CARGO_HOME/blaze-kept`
+links to `blaze`, with what was there kept in `$CARGO_HOME/blaze-kept`
 ([Plain `cargo <command>` after `enable`](#plain-cargo-command-after-enable)).
 
 No shell profile or environment variable is touched. `enable` keeps a copy of the file as it
@@ -1274,11 +1271,11 @@ other commands stay cargo's entirely. Here is what each way of sending them to b
 
 - **`fmt` and `clippy`** are not built into cargo: it runs `cargo-fmt` and `cargo-clippy`,
   looking in `~/.cargo/bin` before `PATH`. `enable` puts links named so there, to
-  `cargo-blaze`, for each of the two that is blaze's own (`cargo blaze --list`), so plain
+  `blaze`, for each of the two that is blaze's own (`blaze --list`), so plain
   `cargo fmt` and `cargo clippy` run blaze's, with nothing printed of it. The file a link
   replaces, rustup's proxy, is kept in `~/.cargo/blaze-kept` and `disable` puts it back;
   `status` says whose each command is, and notices when `rustup update` put its proxy back
-  (`enable` links it again). macOS and Linux only. An `[alias]` (`fmt = "blaze fmt"`) would
+  (`enable` links it again). macOS and Linux only. An `[alias]` would
   route them too, but cargo warns on every run that it shadows an external command and means
   to make that an error
   ([rust-lang/cargo#10049](https://github.com/rust-lang/cargo/issues/10049)).

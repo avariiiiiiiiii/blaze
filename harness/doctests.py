@@ -32,7 +32,7 @@ CRATES = [
 def tested(crate, command, target_dir):
     """How the crate's doctests ended, what they printed, and what was said beside."""
     path = os.path.dirname(RA_JIT) + os.pathsep + os.environ["PATH"]
-    run = subprocess.run(["cargo", *command, "test", "--doc"], cwd=crate, capture_output=True, text=True,
+    run = subprocess.run([*(command or ["cargo"]), "test", "--doc"], cwd=crate, capture_output=True, text=True,
                          timeout=3600, env={**os.environ, "PATH": path, "CARGO_TARGET_DIR": target_dir})
     return run.returncode, doctest_report(run.stdout), run.stderr
 

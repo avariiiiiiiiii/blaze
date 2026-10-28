@@ -118,6 +118,38 @@ pub(crate) fn terminal_width() -> Option<usize> {
     (got == 0 && size.ws_col > 0).then_some(usize::from(size.ws_col))
 }
 
+/// What `--events` asked: the records of the build on standard output, as JSON lines or as
+/// the frames of [`blaze_protocol`]. JSON is a rendering of the same records, lossless.
+static EVENTS: AtomicU8 = AtomicU8::new(NONE);
+const NONE: u8 = 0;
+const JSON: u8 = 1;
+const CBOR: u8 = 2;
+
+pub(crate) fn events(format: &str) -> Result<(), String> {
+    let format = match format {
+        "json" => JSON,
+        "cbor" => CBOR,
+        other => return Err(format!("`--events {other}`: the records are `json` or `cbor`")),
+    };
+    EVENTS.store(format, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Writes `record` to standard output as `--events` asked.
+fn event_out(record: &blaze_protocol::events::Record) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = match EVENTS.load(Ordering::Relaxed) {
+        JSON => serde_json::to_string(record).map_or(Ok(()), |line| writeln!(out, "{line}")),
+        CBOR => match blaze_protocol::cbor::to_vec(record) {
+            Ok(item) => blaze_protocol::write_frame(&mut out, &item),
+            Err(_) => Ok(()),
+        },
+        _ => return,
+    };
+    let _ = out.flush();
+}
+
 /// How long a command waits before a terminal shows what it waits for: an answer sooner
 /// than this is shown nothing of but its last line, as cargo shows no progress bar of a
 /// quick build.
@@ -133,6 +165,8 @@ pub(crate) struct Shown {
     to: Option<Rendering>,
     /// What a terminal is not shown yet, before [`SHOWN_AFTER`].
     held: Option<String>,
+    /// Every record, for `blaze why` ([`super::why::keep`]).
+    records: Vec<blaze_protocol::events::Record>,
 }
 
 enum Rendering {
@@ -152,7 +186,7 @@ impl Shown {
             () => Some(Rendering::Plain(blaze_ui::plain::Plain::new(colored()))),
         };
         let held = terminal.then(String::new);
-        Shown { asked: Instant::now(), to, held }
+        Shown { asked: Instant::now(), to, held, records: Vec::new() }
     }
 
     fn now_ns(&self) -> u64 {
@@ -160,6 +194,8 @@ impl Shown {
     }
 
     pub(crate) fn record(&mut self, record: &blaze_protocol::events::Record) {
+        event_out(record);
+        self.records.push(record.clone());
         let now_ns = self.now_ns();
         let out = match &mut self.to {
             Some(Rendering::Live(live)) => live.record(record, now_ns),
@@ -186,8 +222,9 @@ impl Shown {
     }
 
     /// The answer came: the region is taken away, and what was held back of a quick build is
-    /// its last line alone.
+    /// its last line alone. The records are kept for `blaze why`.
     pub(crate) fn done(&mut self) {
+        super::why::keep(&std::mem::take(&mut self.records));
         let Some(Rendering::Live(live)) = &mut self.to else { return };
         // The record of the build's end drew its last line in the region's place already.
         let out = match live.build().finished {

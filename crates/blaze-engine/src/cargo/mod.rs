@@ -37,6 +37,7 @@ pub(crate) mod toolchain;
 mod units;
 pub(crate) mod wasi_script;
 pub(crate) mod whole;
+mod why;
 
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -66,6 +67,12 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     }
     if let Asked::Build(asked) = &asked {
         say::quiet(asked.flags.quiet);
+        if let Some(format) = &asked.flags.events
+            && let Err(why) = say::events(format)
+        {
+            say::error(&why);
+            std::process::exit(FAILED);
+        }
         let cwd = std::env::current_dir()?;
         layout::first_unless_chosen(&cwd, &asked.flags.config, &asked.flags.unstable);
     }
@@ -90,6 +97,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Cache(args) => cache(args)?,
         Asked::Status => status()?,
         Asked::Stop => stop()?,
+        Asked::Why(args) => why::command(&args)?,
         Asked::Enable => switch::enable()?,
         Asked::Disable => switch::disable()?,
         Asked::Toolchain { path } => match toolchain::settle() {
@@ -123,6 +131,7 @@ const HELP: &str = "\
 blaze: cargo's build, run, test and check, from a daemon that keeps the workspace compiled
 
 usage: blaze <command> [cargo's flags]    (or blaze <command>)
+       --events json|cbor   the records of the build on standard output as they come
 
   build, run         each program built whole by blaze, with no rustc and no cargo build
   test               each test built whole by blaze and run as cargo runs it, then the doc
@@ -131,6 +140,7 @@ usage: blaze <command> [cargo's flags]    (or blaze <command>)
                      otherwise what the daemon finds loading the workspace as it, with no rustc
   status             whether blaze is enabled, what the daemon has loaded, what fell back
   stop               ends the daemon; the next build starts one
+  why [fn|crate]     what the last build compiled again and why
   enable, disable    plain `cargo build|run|test|check` through blaze, and back
   toolchain          blaze's own toolchain, which it builds every project with, downloaded once
                      if it has none (`--path`: its directory)

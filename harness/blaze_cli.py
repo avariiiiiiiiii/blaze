@@ -1412,9 +1412,13 @@ def cbor(value):
     raise TypeError(value)
 
 
+# The daemon answers a message of another schema as one of another version (`Restart`).
+SCHEMA = int(re.search(r"^pub const SCHEMA: u32 = (\d+);", open(os.path.join(ROOT, "crates/blaze-protocol/src/lib.rs")).read(), re.M)[1])
+
+
 def framed(body):
     """A request as the daemon reads one: a frame of a `blaze_protocol::Message`."""
-    item = cbor({"schema": 1, "id": 1, "body": body})
+    item = cbor({"schema": SCHEMA, "id": 1, "body": body})
     return (len(item).to_bytes(4, "big") + item).hex()
 
 LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\nos.chmod(sys.argv[1], 0o666)\ns.listen()\nprint('listening', flush=True)\ns.settimeout(20)\ntry:\n    c, _ = s.accept()\n    c.settimeout(5)\n    print('heard:', len(c.recv(65536)))\nexcept OSError as e:\n    print('heard: nothing,', e)\n"

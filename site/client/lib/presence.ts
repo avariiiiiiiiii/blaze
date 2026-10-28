@@ -47,6 +47,8 @@ const ROW_FACES = 3;
 /** Only someone whose visit began this recently is new (a reload or a reconnect keeps their start: worker/presence.ts). */
 const ARRIVAL_MS = 20_000;
 const ARRIVAL_GAP_MS = 4000;
+const SETTLE_MS = 15_000;
+let connectedAt = 0;
 const BAR_FACES = 5;
 
 let you: You | null = null;
@@ -146,7 +148,8 @@ let known: Set<string> | null = null;
 let lastArrival = 0;
 function announce(): void {
 	const now = Date.now();
-	const fresh = known === null ? [] : people.filter((p) => !known!.has(p.key) && p.key !== you?.key && now - (p.since ?? 0) < ARRIVAL_MS);
+	// Right after this tab (re)connects everyone else is new to it, and after a deploy everyone reconnects at once.
+	const fresh = known === null || now - connectedAt < SETTLE_MS ? [] : people.filter((p) => !known!.has(p.key) && p.key !== you?.key && now - (p.since ?? 0) < ARRIVAL_MS);
 	known = new Set(people.map((p) => p.key));
 	// A crowd arriving at once is one pop-up, not a stack.
 	if (!fresh.length || now - lastArrival < ARRIVAL_GAP_MS) return;
@@ -487,6 +490,7 @@ function connect(): void {
 	const s = new WebSocket(url);
 	ws = s;
 	s.addEventListener('open', () => {
+		connectedAt = Date.now();
 		retry = 1000;
 		cursors.reset();
 		send();

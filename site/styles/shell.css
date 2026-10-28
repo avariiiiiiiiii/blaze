@@ -307,6 +307,9 @@ main .discussion { scroll-margin-top: 64px; }
 .chat-mute.on { color: var(--ink-1); }
 /* Full screen: over the whole content pane, beside the sidebar (the frame's grid, above). */
 body.chat-full .chat { left: calc(var(--side-w) + 4px); width: auto; box-shadow: inset 0 0 0 1px var(--line-2); }
+/* Full screen, the chat takes the page's place: the page under it neither shows at its edges nor scrolls. */
+body.chat-full .frame > .pane, body.chat-full .cursors { visibility: hidden; }
+html:has(body.chat-full) { overflow: hidden; }
 body.chat-full .chat > .resizer { display: none; }
 body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typing { width: 100%; max-width: 860px; margin-inline: auto; }
 @media (max-width: 800px) { .chat-full { display: none; } }

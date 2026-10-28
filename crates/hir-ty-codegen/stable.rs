@@ -1027,6 +1027,9 @@ mod tests {
             path_everywhere(fetched.to_owned(), Some("/home/me/.cargo")),
             "/cargo/registry/src/index.crates.io-1/x-1.0.0/src/lib.rs"
         );
-        assert_eq!(path_everywhere("src/main.rs".to_owned(), Some("/home/me/.cargo")), "src/main.rs");
+        assert_eq!(
+            path_everywhere("src/main.rs".to_owned(), Some("/home/me/.cargo")),
+            "src/main.rs"
+        );
     }
 }

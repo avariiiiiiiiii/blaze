@@ -172,6 +172,8 @@ function sendCursor(): void {
 }
 
 function queueCursor(): void {
+	// While the reader writes, their pointer stays where they pressed the key, for them and for the others.
+	if (saying) return;
 	if (peers.size && fine.matches) cTimer ??= setTimeout(sendCursor, MOVE_MS);
 }
 
@@ -476,6 +478,8 @@ let sentSay = '';
 let sayQueue: ReturnType<typeof setTimeout> | undefined;
 let sayKeep: ReturnType<typeof setInterval> | undefined;
 let sayFade: ReturnType<typeof setTimeout> | undefined;
+/** Where on the page (document px) the composer opened, or null at the foot of the window. */
+let sayAt: { x: number; y: number } | null = null;
 
 const line = (v: string) => v.replace(/\s+/g, ' ').trim();
 
@@ -492,15 +496,15 @@ function queueSay(): void {
 }
 
 /**
- * Beside the pointer, kept inside the window, and following it; at the foot of the window when it opened with the
- * pointer off the page (a pointer that leaves later leaves the box where it was).
+ * Where the pointer was when the composer opened, scrolling with the page and kept inside the window; at the foot of
+ * the window when it opened with the pointer off the page.
  */
 function placeBox(): void {
 	if (sayBox.hidden) return;
-	if (!pointer) return void sayBox.classList.toggle('at-foot', !sayBox.style.left);
-	sayBox.classList.remove('at-foot');
-	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, pointer.x + 14)))}px`;
-	sayBox.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, pointer.y + 18)))}px`;
+	sayBox.classList.toggle('at-foot', !sayAt);
+	if (!sayAt) return void (sayBox.style.left = sayBox.style.top = '');
+	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x - scrollX + 14)))}px`;
+	sayBox.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, sayAt.y - scrollY + 18)))}px`;
 }
 
 function openSay(): void {
@@ -515,7 +519,12 @@ function openSay(): void {
 	sayField.value = '';
 	sayField.placeholder = w?.login ? 'Say something on this page' : 'Say hi to this page (not kept)';
 	tipOn(sayKey, 'Enter sends, Esc cancels');
-	sayBox.style.left = sayBox.style.top = '';
+	sayBox.querySelector(':scope > .face')?.remove();
+	if (w) sayBox.prepend(face(w));
+	sayAt = pointer ? { x: pointer.x + scrollX, y: pointer.y + scrollY } : null;
+	// The others' copy of the pointer parks here too, so the bubble they see stays put.
+	clearTimeout(cTimer);
+	if (peers.size) sendCursor();
 	sayBox.hidden = false;
 	placeBox();
 	sayField.focus({ preventScroll: true });
@@ -546,6 +555,7 @@ function closeSay(text: string | null): void {
 		sayBox.hidden = true;
 	}
 	sentSay = '';
+	queueCursor();
 }
 
 sayField.addEventListener('input', () => {
@@ -571,12 +581,16 @@ sayBox.addEventListener('mousedown', (e) => {
 	if (e.target !== sayField) e.preventDefault();
 });
 
-/** T, on a desk, when the key would type nothing anywhere else. */
+/**
+ * T, on a desk, when the key would type nothing anywhere else; Enter too, for readers whose T an extension takes first
+ * (Vimium opens a tab with it, before the page hears the key), when it would not press a link or a button.
+ */
 function sayKeyDown(e: KeyboardEvent): void {
 	if (e.defaultPrevented || e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-	if ((e.key !== 't' && e.key !== 'T') || !fine.matches) return;
+	if ((e.key !== 't' && e.key !== 'T' && e.key !== 'Enter') || !fine.matches) return;
 	const t = e.target instanceof HTMLElement ? e.target : null;
 	if (t && (t.isContentEditable || t.closest('input, textarea, select, [contenteditable]'))) return;
+	if (e.key === 'Enter' && t?.closest('a[href], button, summary, [role="button"], [tabindex]')) return;
 	if (document.querySelector('dialog[open]') || document.body.classList.contains('chat-full')) return;
 	e.preventDefault();
 	openSay();
@@ -663,7 +677,8 @@ export function toggle(): HTMLElement | null {
 export function hint(): HTMLElement | null {
 	if (!fine.matches) return null;
 	const p = el('p', 'tl-hint');
-	p.append('Press ', el('kbd', '', 'T'), ' to say something on this page');
+	p.append('Press ', el('kbd', '', 'T'), ' or ', el('kbd', '', '↵'), ' to say something on this page');
+	tipOn(p, 'If Vimium or another extension takes T, use Enter, or exclude the key t for ix.dev in its options.');
 	return p;
 }
 
@@ -689,7 +704,6 @@ export function setup(opts: {
 			if (e.pointerType === 'touch') return;
 			pointer = { x: e.clientX, y: e.clientY };
 			queueCursor();
-			placeBox();
 		},
 		{ passive: true },
 	);
@@ -705,6 +719,7 @@ export function setup(opts: {
 			if (pointer) queueCursor();
 			queueView();
 			moved();
+			placeBox();
 			for (const r of remotes.values()) placeSay(r);
 		},
 		{ passive: true },

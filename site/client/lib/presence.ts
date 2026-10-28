@@ -23,7 +23,7 @@ import * as chat from './chat';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -178,6 +178,23 @@ function drawHere(): void {
 	hereSlot.append(b);
 }
 
+const regions = (() => {
+	try {
+		return new Intl.DisplayNames(undefined, { type: 'region' });
+	} catch {
+		return null;
+	}
+})();
+
+/** A country's flag: its two letters as regional indicator symbols, named in a tooltip. */
+function flag(cc: string): HTMLElement {
+	const f = el('span', 'flag', String.fromCodePoint(...[...cc].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)));
+	const n = regions?.of(cc) ?? cc;
+	f.title = n;
+	f.setAttribute('aria-label', n);
+	return f;
+}
+
 function drawList(): void {
 	if (list.hidden) return;
 	list.replaceChildren(el('p', 'tl-head', total === 1 ? 'Only you, right now' : `${total} on the site`));
@@ -190,6 +207,7 @@ function drawList(): void {
 			who.rel = 'nofollow noopener';
 		}
 		li.append(face(p, p.pages.length > 0 && p.pages.every((x) => x.away)), who);
+		if (p.country) li.append(flag(p.country));
 		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
 		const where = el('span', 'where');
 		for (const pg of p.pages) {
@@ -277,13 +295,15 @@ const bubbles = new Map<string, HTMLElement>();
 function speak(key: string, login: string, text: string): void {
 	bubbles.get(key)?.remove();
 	const p = people.find((x) => x.key === key);
-	let at: Element | null = document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
-	if (!at && p) {
-		for (const pg of p.pages) {
-			at = document.querySelector(`.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`);
-			if (at) break;
-		}
+	// The page they are looking at first, then any other tab of theirs.
+	let at: Element | null = null;
+	const pages = p ? [...p.pages].sort((a, b) => Number(a.away) - Number(b.away)) : [];
+	for (const pg of pages) {
+		const row = `.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`;
+		at = document.querySelector(`${row} > .face[data-key="${CSS.escape(key)}"]`) ?? document.querySelector(row);
+		if (at) break;
 	}
+	at ??= document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
 	const r = at?.getBoundingClientRect();
 	if (!at || !r || r.width === 0 || r.bottom < 0 || r.top > innerHeight) return;
 	const b = el('div', 'say-bubble');

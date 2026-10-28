@@ -49,8 +49,9 @@ const MAX_PEOPLE = 300;
 type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean };
 type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string };
 /** Kept on each socket (`serializeAttachment`), so it survives hibernation. */
-type Tab = Who & { path: string | null; away: boolean };
-type Person = Who & { pages: { path: string; away: boolean }[] };
+type Tab = Who & { path: string | null; away: boolean; country: string | null };
+/** `country` is Cloudflare's two-letter guess from the IP (`request.cf.country`), shown as a flag; null when unknown or Tor. */
+type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
 
 /** The worker side of GET /api/presence. */
 export async function handlePresence(request: Request, env: Env): Promise<Response> {
@@ -61,6 +62,8 @@ export async function handlePresence(request: Request, env: Env): Promise<Respon
 	const headers = new Headers({ upgrade: 'websocket' });
 	if (user) headers.set('x-presence-who', JSON.stringify({ key: `u${user.id}`, login: user.login, avatar: avatarOf(user.avatar_url), admin: isAdmin(env, user) }));
 	headers.set('x-presence-ip', request.headers.get('cf-connecting-ip') ?? '');
+	const country = String(request.cf?.country ?? '');
+	headers.set('x-presence-country', /^[A-Z]{2}$/.test(country) && country !== 'XX' ? country : '');
 	headers.set('x-presence-ua', (request.headers.get('user-agent') ?? '').slice(0, 512));
 	headers.set('x-presence-signin', env.GITHUB_CLIENT_ID ? '1' : '');
 	const stub = env.PRESENCE.get(env.PRESENCE.idFromName('site'));
@@ -109,7 +112,7 @@ export class Presence extends DurableObject<Env> {
 
 		const { 0: client, 1: server } = new WebSocketPair();
 		this.ctx.acceptWebSocket(server, [who.key]);
-		const tab: Tab = { ...who, path: null, away: false };
+		const tab: Tab = { ...who, path: null, away: false, country: request.headers.get('x-presence-country') || null };
 		server.serializeAttachment(tab);
 		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, admin: !!who.admin, signIn: request.headers.get('x-presence-signin') === '1' }));
 		server.send(this.snapshot());
@@ -214,7 +217,7 @@ export class Presence extends DurableObject<Env> {
 			if (!tab) continue;
 			let p = people.get(tab.key);
 			if (!p) {
-				p = { key: tab.key, login: tab.login, avatar: tab.avatar, pages: [] };
+				p = { key: tab.key, login: tab.login, avatar: tab.avatar, country: tab.country ?? null, pages: [] };
 				people.set(tab.key, p);
 			}
 			if (tab.path && !p.pages.some((x) => x.path === tab.path && x.away === tab.away)) p.pages.push({ path: tab.path, away: tab.away });

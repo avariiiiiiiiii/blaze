@@ -6,6 +6,7 @@ pub mod keyed;
 pub mod load_wrapper;
 
 pub mod affected;
+pub mod backend;
 pub mod cli;
 pub mod client;
 #[cfg(unix)]
@@ -74,8 +75,8 @@ pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         let cwd = std::env::current_dir()?;
         layout::first_unless_chosen(&cwd, &asked.flags.config, &asked.flags.unstable);
     }
-    if let Asked::Build(_) = asked
-        && let Err(why) = toolchain::settle()
+    if let Asked::Build(asked) = &asked
+        && let Err(why) = toolchain::settle().and_then(|_| backend::follow_profile(asked))
     {
         say::error(&why);
         std::process::exit(FAILED);

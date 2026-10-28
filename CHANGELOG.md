@@ -21,6 +21,14 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 - `blaze why [fn|crate]` says what the last build rebuilt and why.
 - `--events json|cbor` writes the build's events to stdout, one record a line or frame.
 
+### Changed
+
+- Release profiles build with LLVM at the profile's level (#831): `opt-level` 2 and 3
+  (`release`, `bench`, a profile that inherits them) build at `-O2` and `-O3`, `s` and `z` at
+  `-O2`, and 0 and 1 (`dev`, `test`) stay on Cranelift. `BLAZE_BACKEND` and `BLAZE_OPT` still
+  choose. A dev build and a release build of one project keep separate workers. A blaze built
+  without its `llvm` feature refuses a profile that asks for LLVM instead of using Cranelift.
+
 ## [0.20261028.2] - 2026-10-28
 
 ### Added

@@ -278,6 +278,40 @@ PROJECTS = {
         ),
         test=["-p", "dynamo-tokens"],
     ),
+    # A file finder (formerly fff.nvim): its MCP server, over the search core, the grep and the
+    # query parser. The run is its health check, which prints the paths it is given as given.
+    "fff": dict(
+        repo="dmtrKovalenko/fff", tag="v0.11.0", rev="95fd777c2529fc7b4d7572dabff64cc07268f2c5",
+        build=["-p", "fff-mcp", "--bin", "fff-mcp"],
+        run=["--healthcheck", "--frecency-db", "target/bench-fff/frecency", "--history-db", "target/bench-fff/history",
+             "--log-file", "target/bench-fff/fff.log", "crates"],
+        edits=dict(
+            body=body("crates/fff-mcp/src/main.rs", "fn resolve_defaults(args: &mut Args) {"),
+            # Defined in the query parser, called from the core, the server and the Neovim binding.
+            signature=parameter("crates/fff-query-parser/src/parser.rs", "grep_text", "String", "crates/**/*.rs"),
+            leaf=body("crates/fff-grep/src/matcher.rs", "    pub fn len(&self) -> usize {"),
+            # Instantiated for each ParserConfig (the file picker's, grep's, the default).
+            generic=body("crates/fff-query-parser/src/parser.rs",
+                         "fn parse_token<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Constraint<'a>> {"),
+        ),
+        test=["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
+    ),
+    # A video rendering framework: its hello-world example's renderer, over FFmpeg (a prebuilt
+    # static one ffmpeg-sys-fframes downloads) and Skia. The run is one frame by the CPU
+    # backend. Its build scripts need nasm and libclang: measured only when named.
+    "fframes": dict(
+        repo="dmtrKovalenko/fframes", tag="v1.3.0", rev="69174f0187b5d8e92329246898f70250b59f08f2", named=True,
+        build=["-p", "hello-world-example", "--bin", "hello_world_example_bin"],
+        run=["--renderer", "cpu", "svg", "1s"],
+        edits=dict(
+            body=body("examples/hello-world/src/main.rs", "fn main() -> ExitCode {"),
+            # fframes-media is below fframes and its media proc macro.
+            leaf=body("fframes-media/src/audio.rs", "    pub fn duration_in_seconds(&self) -> f32 {"),
+            generic=body("fframes/src/fframes_context.rs",
+                         "    pub fn get_scene_info<T: crate::Scene>(&self, scene: &T) -> Option<&crate::SceneInfo> {"),
+        ),
+        test=["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
+    ),
     # The environment manager built on Nix: its CLI over the SDK, the manifest and the catalog
     # client. Its crates read Nix store paths at compile time, which floxprep.py takes from its
     # flake: measured only when named.

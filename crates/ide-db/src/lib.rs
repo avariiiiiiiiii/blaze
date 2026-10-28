@@ -54,7 +54,7 @@ pub mod syntax_helpers {
     pub use parser::LexedStr;
 }
 
-pub use hir::{ChangeWithProcMacros, EditionedFileId};
+pub use hir::{ChangeWithProcMacros, EditionedFileId, const_macro};
 use salsa::Durability;
 
 use std::{fmt, mem::ManuallyDrop};

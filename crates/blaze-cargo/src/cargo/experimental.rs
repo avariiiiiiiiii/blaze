@@ -20,8 +20,12 @@ pub const KEY: &str = "experimental";
 /// kept by what the test read ([`super::sandboxed`]).
 pub const SANDBOXED_TESTS: &str = "sandboxed-tests";
 
+/// Proc macros written as functions of a file of the package itself, `const-macros` under its
+/// `[package.metadata.blaze]`, and expanded by the const evaluator (docs/future/const-macros.md).
+pub const CONST_MACROS: &str = "const-macros";
+
 /// The experiments there are.
-pub const KNOWN: &[&str] = &[SANDBOXED_TESTS];
+pub const KNOWN: &[&str] = &[SANDBOXED_TESTS, CONST_MACROS];
 
 /// The experiments a workspace's root manifest opts into.
 #[derive(Default, Debug)]
@@ -98,7 +102,9 @@ mod tests {
         write("[workspace]\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-test\"]\n");
         let error = of(&dir).unwrap_err().to_string();
         assert!(
-            error.contains("`sandboxed-test` is not known (known: `sandboxed-tests`)"),
+            error.contains(
+                "`sandboxed-test` is not known (known: `sandboxed-tests`, `const-macros`)"
+            ),
             "{error}"
         );
         write("[workspace]\n[workspace.metadata.blaze]\nexperimental = \"sandboxed-tests\"\n");

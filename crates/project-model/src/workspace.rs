@@ -28,7 +28,9 @@ use crate::{
     WorkspaceBuildScripts,
     build_dependencies::{BuildScriptOutput, ProcMacroDylibPath},
     cargo_config_file::CargoConfigFile,
-    cargo_workspace::{CargoMetadataConfig, DepKind, FetchMetadata, PackageData, RustLibSource},
+    cargo_workspace::{
+        CONST_MACROS, CargoMetadataConfig, DepKind, FetchMetadata, PackageData, RustLibSource,
+    },
     env::{
         cargo_config_env, inject_cargo_env, inject_cargo_executables_env, inject_cargo_package_env,
         inject_rustc_tool_env,
@@ -495,6 +497,9 @@ impl ProjectWorkspace {
         let const_eval = crate::cargo_workspace::const_eval_budget(&meta.workspace_metadata)
             .with_context(|| format!("[workspace.metadata.blaze] of {cargo_toml}"))?;
         let mut cargo = CargoWorkspace::new(meta, cargo_toml.clone(), cargo_env, false);
+        if let Some(error) = cargo.const_macros_error() {
+            anyhow::bail!("{error}");
+        }
         cargo.set_executables(config.executables.clone());
         if let Ok(Some(loaded_sysroot)) = &loaded_sysroot {
             tracing::info!(src_root = ?sysroot.rust_lib_src_root(), root = %loaded_sysroot, "Loaded sysroot");
@@ -1356,6 +1361,7 @@ fn cargo_to_crate_graph(
     // Mapping of a package to its library target
     let mut pkg_to_lib_crate = FxHashMap::default();
     let mut pkg_crates = FxHashMap::default();
+    let mut const_macro_crates = FxHashMap::default();
     let workspace_proc_macro_cwd = Arc::new(cargo.workspace_root().to_path_buf());
     // As cargo builds them, the unit tests of a library are a crate of their own, its root
     // file with `cfg(test)` and its dev-dependencies, which nothing depends on; every other
@@ -1388,6 +1394,10 @@ fn cargo_to_crate_graph(
             }
 
             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
+            // What a crate tests to tell rustc, which has no const macros, apart.
+            if let Some(Ok(_)) = cargo[pkg].const_macros {
+                cfg_options.insert_atom(Symbol::intern("blaze_const_macros"));
+            }
             cfg_options
         };
         let cfg_options = options(set_test);
@@ -1507,6 +1517,56 @@ fn cargo_to_crate_graph(
                 add_dep(crate_graph, from, name, to);
             }
         }
+
+        // The package's const macros are a crate of their own, of the analysis only, which its
+        // other crates depend on and which depends on none of them (docs/future/const-macros.md).
+        if let Some(Ok(path)) = &cargo[pkg].const_macros
+            && let Some(file_id) = load(path)
+        {
+            let pkg_data = &cargo[pkg];
+            let name = path.file_stem().unwrap_or(CONST_MACROS);
+            let kind = TargetKind::Lib { is_proc_macro: true };
+            let origin = match pkg_data.is_local {
+                true => CrateOrigin::Local {
+                    repo: pkg_data.repository.clone(),
+                    name: Some(Symbol::intern(&pkg_data.name)),
+                },
+                false => CrateOrigin::Library {
+                    repo: pkg_data.repository.clone(),
+                    name: Symbol::intern(&pkg_data.name),
+                },
+            };
+            let proc_macro_cwd = match pkg_data.is_member {
+                true => workspace_proc_macro_cwd.clone(),
+                false => Arc::new(pkg_data.manifest.parent().to_path_buf()),
+            };
+            let macros = add_target_crate_root(
+                crate_graph,
+                proc_macros,
+                cargo,
+                pkg_data,
+                None,
+                options(false),
+                file_id,
+                name,
+                kind,
+                origin,
+                crate_ws_data.clone(),
+                proc_macro_cwd,
+                &cargo_path,
+            );
+            proc_macros.insert(macros, Ok((name.to_owned(), path.clone())));
+            public_deps.add_to_crate_graph(crate_graph, macros);
+            if let Some(proc_macro) = libproc_macro {
+                add_proc_macro_dep(crate_graph, macros, proc_macro, true);
+            }
+            for &(from, kind) in pkg_crates.get(&pkg).into_iter().flatten() {
+                if kind != TargetKind::BuildScript {
+                    add_dep(crate_graph, from, CrateName::normalize_dashes(name), macros);
+                }
+            }
+            const_macro_crates.insert(pkg, macros);
+        }
     }
 
     let mut delayed_dev_deps = vec![];
@@ -1523,6 +1583,11 @@ fn cargo_to_crate_graph(
             }
 
             let name = CrateName::new(&dep.name).unwrap();
+            if dep.kind == DepKind::Normal
+                && let Some(&macros) = const_macro_crates.get(&pkg)
+            {
+                add_dep(crate_graph, macros, name.clone(), to);
+            }
             for &(from, kind) in targets {
                 // Build scripts may only depend on build dependencies.
                 if (dep.kind == DepKind::Build) != (kind == TargetKind::BuildScript) {

@@ -45,6 +45,12 @@ use vfs::{
     loader::{Handle, LoadingProgress},
 };
 
+/// Whether the proc macros at `path` are a package's const macros, the source file project-model
+/// names in place of a library (docs/future/const-macros.md), which blaze's const evaluator runs.
+pub fn is_const_macros(path: &AbsPath) -> bool {
+    path.extension() == Some("rs")
+}
+
 #[derive(Debug)]
 pub struct LoadCargoConfig {
     pub load_out_dirs_from_check: bool,
@@ -217,7 +223,11 @@ impl Loaded {
                 let mut unlisted = Vec::new();
                 for (id, it) in &proc_macros {
                     let Ok((name, library)) = it else { continue };
-                    if is_listed(library) || is_wasm(library) || !seen.insert(library.clone()) {
+                    if is_listed(library)
+                        || is_wasm(library)
+                        || is_const_macros(library)
+                        || !seen.insert(library.clone())
+                    {
                         continue;
                     }
                     let sysroot = ws.sysroot.root();
@@ -280,7 +290,7 @@ impl Loaded {
         // so a load whose proc macros are all listed starts none of the toolchain's.
         let wanted = |listed_one: bool, outside_one: bool| {
             proc_macros.values().any(|it| match it {
-                Ok((_, path)) if is_wasm(path) => false,
+                Ok((_, path)) if is_wasm(path) || is_const_macros(path) => false,
                 Ok((_, path)) => {
                     listed.contains(path) == listed_one && outside.contains(path) == outside_one
                 }
@@ -325,12 +335,26 @@ impl Loaded {
             let [outside_server, outside_listed_server] =
                 [&self.unsandboxed_servers[0], &self.unsandboxed_servers[1]].map(running);
             let mut refused = Vec::new();
+            let mut const_macros = false;
             let loaded: Vec<_> = proc_macros
                 .into_iter()
                 .map(|(crate_id, path)| {
                     (
                         crate_id,
                         path.and_then(|(name, path)| {
+                            if is_const_macros(&path) {
+                                let vfs_path = VfsPath::from(path.clone());
+                                let Some((file, _)) = vfs.file_id(&vfs_path) else {
+                                    return Err(ProcMacroLoadingError::ProcMacroSrvError(
+                                        format!("the const macros of `{name}` ({path}) are not loaded")
+                                            .into(),
+                                    ));
+                                };
+                                let text = String::from_utf8_lossy(vfs.file_contents(file));
+                                const_macros = true;
+                                let edition = crate_graph[crate_id].basic.edition;
+                                return Ok(ide_db::const_macro::load(file, &text, edition));
+                            }
                             if is_wasm(&path) {
                                 let loaded = wasm::load(&path);
                                 if let Err(why) = &loaded {
@@ -358,6 +382,9 @@ impl Loaded {
             if !refused.is_empty() {
                 refused.sort();
                 anyhow::bail!("{}", refused.join("\n"));
+            }
+            if const_macros {
+                ide_db::const_macro::enable(&*db);
             }
             loaded.into_iter().collect()
         };

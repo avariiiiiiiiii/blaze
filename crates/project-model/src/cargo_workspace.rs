@@ -314,6 +314,9 @@ pub struct PackageData {
     pub links: Option<String>,
     /// The contents of [package.metadata.rust-analyzer]
     pub metadata: RustAnalyzerPackageMetaData,
+    /// `const-macros` in [package.metadata.blaze]: the file whose functions are the package's
+    /// const macros (docs/future/const-macros.md), or why it can't be.
+    pub const_macros: Option<Result<AbsPathBuf, String>>,
     /// If this package is a member of the workspace, store all direct and transitive
     /// dependencies as long as they are workspace members, to track dependency relationships
     /// between members.
@@ -455,7 +458,58 @@ struct PackageMetadata {
     rust_analyzer: Option<RustAnalyzerPackageMetaData>,
 }
 
+/// The experiment const macros are behind, in `experimental` of [workspace.metadata.blaze].
+pub const CONST_MACROS: &str = "const-macros";
+
+/// Whether the root manifest's [workspace.metadata.blaze] lists [`CONST_MACROS`] in
+/// `experimental`. That list's other names and its shape are blaze-cargo's to check.
+fn const_macros_on(workspace_metadata: &serde_json::Value) -> bool {
+    let listed = workspace_metadata.get("blaze").and_then(|it| it.get("experimental"));
+    listed
+        .and_then(|it| it.as_array())
+        .is_some_and(|names| names.iter().any(|it| it.as_str() == Some(CONST_MACROS)))
+}
+
+/// `const-macros` of a package's [package.metadata.blaze], whose manifest is at `manifest`.
+fn const_macros_of(
+    metadata: &serde_json::Value,
+    manifest: &Utf8Path,
+    root_manifest: &ManifestPath,
+    on: bool,
+) -> Option<Result<AbsPathBuf, String>> {
+    let value = metadata.get("blaze")?.get(CONST_MACROS)?;
+    let Some(path) = value.as_str() else {
+        return Some(Err(format!(
+            "`{CONST_MACROS}` under [package.metadata.blaze] in {manifest} is a path, as a string"
+        )));
+    };
+    if !on {
+        return Some(Err(format!(
+            "`{CONST_MACROS}` under [package.metadata.blaze] in {manifest} is an experiment: \
+             `experimental = [\"{CONST_MACROS}\"]` under [workspace.metadata.blaze] in \
+             {root_manifest} turns it on"
+        )));
+    }
+    let file = AbsPath::assert(manifest).parent()?.join(path);
+    if !std::fs::exists(&file).unwrap_or(false) {
+        return Some(Err(format!(
+            "`{CONST_MACROS}` under [package.metadata.blaze] in {manifest} names {file}, \
+             which does not exist"
+        )));
+    }
+    Some(Ok(file))
+}
+
 impl CargoWorkspace {
+    /// Why a package's `const-macros` can't be used, for the first package of the workspace
+    /// whose can't.
+    pub fn const_macros_error(&self) -> Option<&str> {
+        self.packages
+            .iter()
+            .find_map(|(_, it)| it.const_macros.as_ref()?.as_ref().err())
+            .map(String::as_str)
+    }
+
     pub fn new(
         mut meta: cargo_metadata::Metadata,
         ws_manifest_path: ManifestPath,
@@ -480,6 +534,7 @@ impl CargoWorkspace {
         let mut requires_rustc_private = false;
 
         let mut members = FxHashSet::default();
+        let const_macros_on = const_macros_on(&meta.workspace_metadata);
 
         meta.packages.sort_by(|a, b| a.id.cmp(&b.id));
         for meta_pkg in meta.packages {
@@ -517,6 +572,8 @@ impl CargoWorkspace {
                 Some((key.replace('-', "_"), key, kind, dep.optional))
             });
             manifest_deps.insert(id.clone(), declared.collect());
+            let const_macros =
+                const_macros_of(&metadata, &manifest_path, &ws_manifest_path, const_macros_on);
             let meta = from_value::<PackageMetadata>(metadata).unwrap_or_default();
             let edition = match edition {
                 cargo_metadata::Edition::E2015 => Edition::Edition2015,
@@ -559,6 +616,7 @@ impl CargoWorkspace {
                 profile_cfg: None,
                 primary: false,
                 metadata: meta.rust_analyzer.unwrap_or_default(),
+                const_macros,
                 all_member_deps: None,
             });
             if is_member {
@@ -1097,5 +1155,41 @@ impl PackageData {
             _ => *it == parsed,
         };
         Some(written.filter(same).unwrap_or(parsed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn const_macros_are_a_file_of_the_package_and_an_experiment_of_the_root() {
+        let dir = std::env::temp_dir().join(format!("blaze-const-macros-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/macros.rs"), "").unwrap();
+        let manifest = Utf8PathBuf::from_path_buf(dir.join("Cargo.toml")).unwrap();
+        let root = ManifestPath::try_from(AbsPathBuf::assert(manifest.clone())).unwrap();
+        let of = |metadata: serde_json::Value, on: bool| {
+            const_macros_of(&metadata, &manifest, &root, on)
+        };
+
+        assert!(const_macros_on(&json!({ "blaze": { "experimental": ["const-macros"] } })));
+        assert!(!const_macros_on(&json!({ "blaze": { "experimental": ["sandboxed-tests"] } })));
+        assert!(!const_macros_on(&serde_json::Value::Null));
+
+        let declared = json!({ "blaze": { "const-macros": "src/macros.rs" } });
+        let file = of(declared.clone(), true).unwrap().unwrap();
+        assert_eq!(file, AbsPathBuf::assert(manifest.parent().unwrap().join("src/macros.rs")));
+        let off = of(declared, false).unwrap().unwrap_err();
+        assert!(off.contains("`experimental = [\"const-macros\"]` under [workspace.metadata.blaze]"));
+        let missing = of(json!({ "blaze": { "const-macros": "src/none.rs" } }), true);
+        assert!(missing.unwrap().unwrap_err().contains("which does not exist"));
+        let wrong = of(json!({ "blaze": { "const-macros": true } }), true);
+        assert!(wrong.unwrap().unwrap_err().contains("is a path, as a string"));
+        assert!(of(json!({ "blaze": {} }), true).is_none());
+        assert!(of(serde_json::Value::Null, true).is_none());
+        _ = std::fs::remove_dir_all(&dir);
     }
 }

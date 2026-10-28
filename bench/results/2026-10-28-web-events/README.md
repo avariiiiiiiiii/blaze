@@ -36,5 +36,18 @@ A no-op does not reach the codegen and costs the same. The cold build's records 
 beside the build's other records once; the two cold samples of each arm differ by more than
 the arms do. The body edit's patch says the few functions it compiled again.
 
-What the after arm was here also kept the program in the daemon on the relay's thread
-(an earlier blaze-web); the build page's change moves that to a thread of its own.
+The after arm measured here also kept the program in the daemon on the relay's thread (an
+earlier build page), which this change leaves out: this change alone does less.
+
+## The daemon's memory
+
+The resident memory of the daemon after a cold build of anim, in a run of its own on the same
+VM (a fresh `BLAZE_HOME` and store, `ps -o rss`), 5 s and 60 s after the build ended:
+
+| | before (`4e644980cc`) | this change |
+|---|---|---|
+| 5 s | 23 MB | 30.6 MB |
+| 60 s | not measured | 30.6 MB |
+
+The daemon reads the 37 MB of records from the worker's events file and drops the functions';
+what it keeps is the allocator's.

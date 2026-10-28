@@ -3773,7 +3773,11 @@ fn write_reach(db: &RootDatabase, table: &SymbolTable, listed: &Listed, args: &A
         Err(panic) => format!("*\tblaze panicked: {}\n", panic_message(&*panic)),
     };
     let writing = dir.join(format!("{}.writing", cargo::plan::REACH));
-    if std::fs::write(&writing, text).and_then(|()| std::fs::rename(&writing, &file)).is_err() {
+    let by = dir.join(cargo::plan::REACH_BY);
+    let written = std::fs::write(&by, reach_by())
+        .and_then(|()| std::fs::write(&writing, text))
+        .and_then(|()| std::fs::rename(&writing, &file));
+    if written.is_err() {
         _ = std::fs::remove_file(&file);
     }
     if std::env::var_os("BLAZE_STATS").is_some() {
@@ -3782,11 +3786,20 @@ fn write_reach(db: &RootDatabase, table: &SymbolTable, listed: &Listed, args: &A
 }
 
 /// Whether the program whose object is `out` is to be built again for its
-/// [`cargo::plan::REACH`] alone: a client asked for it since the program was last built.
+/// [`cargo::plan::REACH`] alone: a client asked for it since the program was last built, or
+/// another build of blaze wrote it.
 fn reach_owed(out: &Path) -> bool {
     out.parent().is_some_and(|dir| {
-        dir.join(cargo::plan::REACH_WANTED).is_file() && !dir.join(cargo::plan::REACH).is_file()
+        dir.join(cargo::plan::REACH_WANTED).is_file()
+            && (!dir.join(cargo::plan::REACH).is_file()
+                || std::fs::read_to_string(dir.join(cargo::plan::REACH_BY))
+                    .map_or(true, |it| it != reach_by()))
     })
+}
+
+/// What [`cargo::plan::REACH_BY`] says of this build of blaze.
+fn reach_by() -> String {
+    blaze_store::build_name().unwrap_or_default()
 }
 
 /// The text of [`cargo::plan::REACH`] for the program of tests of `args`. A test's hash is of

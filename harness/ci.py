@@ -94,6 +94,8 @@ HARNESSES = [
     # fails naming it (#730); a program built with #731's unstable rustflags has its edits spliced.
     ("core", ["artifactedits.py"], {}, on("linux", "macos"), 1),
     ("core", ["testselect.py"], {}, on("linux", "macos"), 2),
+    # Each kind of reason a test is not hermetic, told from its code, and pure tests kept by it.
+    ("core", ["hermetic.py"], {}, on("linux", "macos"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
     ("core", ["asmedits.py"], {}, EVERYWHERE, 1),
     # The assembler of a build of blaze without LLVM, which is the release's.
@@ -173,6 +175,7 @@ FAST = {
     "loadedits.py": (19, (X64, MAC)),
     "artifactedits.py": (40, ()),
     "testselect.py": (58, (X64, MAC)),
+    "hermetic.py": (15, (X64, MAC)),
     "doctestonce.py": (92, (X64,)),
     "asmedits.py": (12, ()),
     "BLAZE_ASSEMBLER=cc asmedits.py": (12, ()),

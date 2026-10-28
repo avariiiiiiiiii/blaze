@@ -921,6 +921,8 @@ pub fn render(
         heads.push(("references".into(), "References".into()));
     }
     let toc = if n.has_tag("Wide") { String::new() } else { crate::side::toc(&heads) };
+    // The square icon (docs/brand/fire/icon.py); the dark one carries its own background, so it reads on any tab bar.
+    let icon = esc(&s.served.href("/brand/blaze-icon-dark.svg"));
     let html = format!(
         "<!doctype html>
 <html lang=\"en\">
@@ -929,6 +931,7 @@ pub fn render(
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 <meta name=\"color-scheme\" content=\"dark light\" />
 <title>{}</title>
+<link rel=\"icon\" type=\"image/svg+xml\" href=\"{icon}\" />
 {description}
 {canonical}
 <link rel=\"stylesheet\" href=\"{css}\" />

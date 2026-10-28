@@ -859,7 +859,11 @@ impl<'db> Walk<'db> {
             // working directory changes what a failure prints.
             // The stack a thread is started with is sized by `RUST_MIN_STACK`, which a test
             // can't tell but by running out of it.
-            if makes_seed(db, func) || of_backtrace(db, func) || sizes_stack(db, func) {
+            if makes_seed(db, func)
+                || of_backtrace(db, func)
+                || sizes_stack(db, func)
+                || (self.sizes_stack_at(from) && is_std_function(db, func, "var_os"))
+            {
                 return (Node::Leaf(name(), None), site, false);
             }
             // What a test reaches is all that decides how it ends, so only the toolchain's
@@ -872,7 +876,10 @@ impl<'db> Walk<'db> {
                 base_db::CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc) => {
                     (Node::Leaf(name(), None), site, false)
                 }
-                base_db::CrateOrigin::Lang(_) if diverges(db, func) => {
+                // A panic ends the test alone; `exit` ends every test of the process.
+                base_db::CrateOrigin::Lang(_)
+                    if diverges(db, func) && !is_std_function(db, func, "exit") =>
+                {
                     (Node::Leaf(name(), None), site, false)
                 }
                 _ => (Node::Root(func), site, false),
@@ -1301,6 +1308,19 @@ impl<'db> Walk<'db> {
             Node::Leaf(..) => return true,
         };
         krate.data(db).origin.is_lang()
+    }
+
+    /// Whether the node is the closure std's `spawn_unchecked` sizes a thread's stack in, by
+    /// `RUST_MIN_STACK` (what `min_stack` was).
+    fn sizes_stack_at(&self, at: u32) -> bool {
+        let db = self.db;
+        let Node::Instance(instance, _) = &self.nodes[at as usize].node else { return false };
+        let InstanceDef::Closure(id) = instance.def else { return false };
+        InternedClosureId::from_id(id)
+            .loc(db)
+            .owner
+            .as_function()
+            .is_some_and(|owner| is_std_function(db, owner, "spawn_unchecked"))
     }
 
     /// What a call a test reaches makes its end depend on, by kind, for [`tests_reach`]: a
@@ -1734,8 +1754,12 @@ fn fn_from_data(db: &dyn HirDatabase, body: &MirBody<'_>) -> Option<MirSpan> {
 
 /// Whether `func` is std's `min_stack`, which reads `RUST_MIN_STACK` for a thread's stack.
 fn sizes_stack(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    is_std_function(db, func, "min_stack")
+}
+
+fn is_std_function(db: &dyn HirDatabase, func: FunctionId, name: &str) -> bool {
     matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std))
-        && FunctionSignature::of(db, func).name.as_str() == "min_stack"
+        && FunctionSignature::of(db, func).name.as_str() == name
 }
 
 fn is_std_struct(db: &dyn HirDatabase, ty: Ty<'_>, name: &str) -> bool {

@@ -441,12 +441,14 @@ jobs:
   # archives, is what a canary passes to become stable (promote.yaml).
   smoke:
     name: smoke (std)
-    if: inputs.smoke
+    # Not in the merge gate while blaze's own code runs ten to twenty times slower than rustc's
+    # (https://github.com/indexable-inc/blaze/issues/899): 74 s with a blaze rustc built, 17 to
+    # 30 min with the one blaze builds, which no warm store shortens. Main runs it after each
+    # merge, and promote.yaml runs the whole corpus on every release before it is stable.
+    if: inputs.smoke && inputs.tier != 'gate'
     needs: build
     runs-on: ${{ inputs.os }}
-    # 74 s with a blaze rustc built; about 17 min with the one blaze builds in the merge gate and
-    # on main (https://github.com/indexable-inc/blaze/issues/899, as in the build job).
-    timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 35 }}
+    timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 60 }}
     steps:
       - uses: actions/checkout@v7
       # With Nix: the build's programs ask for the dev shell's glibc, from the Nix store.

@@ -11,7 +11,8 @@ blaze's answers are crates/blaze-cargo/src/answers/rustc.json, of the toolchain 
 Another toolchain is asked once per question and its answers are kept, as before. The target specs
 depend on the host rustc was built for (x86-64 Linux's links with its own lld): --write keeps
 those of the other hosts and writes this host's, so it is run on each host CI has (Linux
-x86-64 and AArch64, macOS arm64).
+x86-64 and AArch64, macOS arm64). On a host not written (Windows) blaze answers the spec all
+written hosts print, and has no answer of one they differ on.
 """
 import concurrent.futures, json, os, shutil, subprocess, sys, tempfile
 
@@ -262,7 +263,9 @@ def check():
             return None
         if "target-spec-json" in args:
             target = args[args.index("--target") + 1] if "--target" in args else host
-            if host not in data["targets"].get(target, {}).get("target_spec_json", {}):
+            specs = data["targets"].get(target, {}).get("target_spec_json", {})
+            # Of a host not recorded, blaze answers the spec every recorded host prints.
+            if host not in specs and len(set(specs.values())) != 1:
                 # rustc is asked, once per toolchain.
                 return "unknown", target, want[1]
         got = ask([BLAZE, "rustc-wrapper", rust, *args],

@@ -111,7 +111,7 @@ HARNESSES = [
     ("core", ["nativespans.py"], {}, on("linux", "macos"), 2),
     ("core", ["gitindex.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     # blaze answers what is asked of rustc as rustc answers it, on every target it knows.
-    ("core", ["answers.py"], {}, on("linux", "macos", backend="cranelift"), 1),
+    ("core", ["answers.py"], {}, on(backend="cranelift"), 1),
     ("core", ["worktrees.py"], {}, EVERYWHERE, 2),
     ("core", ["worktrees.py", "--join", "--together"], {}, on("macos"), 2),
     ("core", ["worktrees.py", "--overlay"], {}, on("macos"), 2),

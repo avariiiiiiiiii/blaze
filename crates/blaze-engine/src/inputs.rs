@@ -169,6 +169,11 @@ impl Inputs {
                 files.push(Watched::new(manifest.to_owned(), false));
                 // A script that appears there is run without the manifest naming it.
                 files.push(Watched::new(manifest.with_file_name("build.rs"), false));
+                // A proc macro is executable input to its callers, rather than source
+                // those callers can update in the database without loading it again.
+                if cargo[package].targets.iter().any(|&it| cargo[it].kind.is_proc_macro()) {
+                    files.push(Watched::new(manifest.parent().unwrap().to_owned(), true));
+                }
             }
         }
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();

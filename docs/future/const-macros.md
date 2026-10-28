@@ -1,0 +1,276 @@
+# Const macros: proc macros written inline as `const fn`
+
+Status: design, with a prototype behind `experimental = ["const-macros"]`. Nothing here is
+on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query), #867
+(const traits, const closures, const heap, step budget), #863 (the build graph's `map`).
+
+## What it is
+
+A const macro is a procedural macro whose body is a `const fn` over token trees, written in
+the package that uses it, and expanded by blaze's own const evaluator inside the compiler's
+process:
+
+```toml
+# Cargo.toml of the workspace root
+[workspace.metadata.blaze]
+experimental = ["const-macros"]
+
+# Cargo.toml of the package
+[package.metadata.blaze]
+const-macros = "src/macros.rs"
+```
+
+```rust
+// src/macros.rs
+use proc_macro::{TokenStream, TokenTree};
+
+#[proc_macro_derive(Named)]
+pub const fn named(input: TokenStream) -> TokenStream {
+    let name = item_name(&input);
+    quote_const!(impl crate::Named for #name { const NAME: &str = stringify!(#name); })
+}
+```
+
+```rust
+// src/lib.rs
+pub trait Named { const NAME: &'static str; }
+
+#[derive(macros::Named)]
+pub struct Point { x: i32, y: i32 }
+```
+
+There is no proc-macro crate, no second package, no dylib, no WebAssembly module and no
+process. Expanding `#[derive(macros::Named)]` is a call of `named` by the evaluator in
+`crates/hir-ty-mir/src/mir/eval.rs`, made from the proc-macro expansion query of `hir-expand`,
+and its result is a salsa value like any other expansion.
+
+The direction this comes from: const is purity (`/tmp/blaze-lanes/const-sketch.md`, Andrew,
+2026-10-28). A const fn reads its arguments and rodata, writes only its own scratch memory,
+and touches no state, files, clock or network. That is exactly what a cached macro needs to
+be, so blaze checks it once in the front end instead of building a sandbox around it.
+
+## Why not just today's proc macros
+
+Today a proc macro is a crate of its own (`proc-macro = true`), compiled for the host, or for
+`wasm32-wasip1` and run under Wasmtime (`crates/blaze-macro-wasm`). That costs:
+
+- A second package, with its own manifest, for every crate that wants one derive.
+- Compiling it, and usually syn and quote, before the first expansion: seconds cold, on the
+  critical path of every crate that uses it.
+- A boundary per expansion: a request to the proc-macro server, or a fresh wasm instance, with
+  the input and output encoded across it.
+- Purity by containment. A proc macro can read files and the environment; the sandbox
+  (`macro_sandbox.rs`) and the store's key (`crates/blaze-expand`, `blaze-macro-wasm/keyed.rs`)
+  record what it read so its expansion can be kept. That works, but it is checked at run time
+  and guessed for function-like macros (`BLAZE_PROC_MACRO_CACHE=all` is opt-in).
+
+A const macro has none of these: nothing to compile but the macro's own MIR, which the front
+end lowers anyway; nothing to cross; and purity proven before it runs, so every expansion, of
+every kind, is a function of its input and can always be kept.
+
+What it does not replace: macros that need what const can't do (read a file, run a program,
+call C) stay ordinary proc macros. The two use the same expander interface
+(`hir_expand::proc_macro::ProcMacroExpander`), so a crate can use both.
+
+## Spelling, and what plain rustc says
+
+Everything blaze-only is in blaze's own namespace, so a project that uses const macros is a
+project only blaze builds, and rustc says so at the first use, not by doing something else:
+
+- `[workspace.metadata.blaze] experimental` and `[package.metadata.blaze] const-macros` are
+  keys cargo ignores.
+- `src/macros.rs` is not a module of the crate (no `mod macros;`), so rustc never reads it.
+  blaze makes it the root of a crate of its own (below), named for the file's stem, in the
+  extern prelude of every target of the package.
+- A use is `#[derive(macros::Named)]` or `use macros::Named;`. Under cargo and rustc it is
+  `error[E0433]: failed to resolve: use of unresolved module or unlinked crate `macros``.
+- To make that error name blaze, a crate can add:
+
+  ```rust
+  #[cfg(not(blaze_const_macros))]
+  compile_error!("this crate's macros are blaze const macros (src/macros.rs): build it with blaze");
+  ```
+
+  For this, blaze is to set `--cfg blaze_const_macros` for a package whose `const-macros` key
+  it honours. rustc's `unexpected_cfgs` lint warns about the name unless the package lists it
+  (`[lints.rust] unexpected_cfgs = { level = "warn", check-cfg = ["cfg(blaze_const_macros)"] }`).
+
+The superset rule (AGENTS.md, superset-of-rust) is intact: no program rustc accepts changes
+meaning. A package without `const-macros` is built exactly as before, and the key itself is
+blaze's. `const-macros` without the experiment is an error naming the line to add
+(`Experiments::how_to`), never a silent ignore (no-fallback).
+
+The macro file is also a valid proc-macro crate root: its token API has `proc_macro`'s names
+and signatures (below). Moving a const macro to a real proc-macro crate, for users who must
+build with rustc, is copying the file and dropping `const`.
+
+## Why the macros are a file of their own (v1)
+
+A macro used in the crate that defines it is a cycle. The crate's def map is what expanding
+`#[derive(Named)]` adds items to; evaluating `named` needs `named`'s MIR, which needs its
+types, which need the same crate's def map. rustc forbids it outright (proc macros can't be
+used in their own crate). Salsa would report it as a cycle.
+
+v1 breaks it the way the proc-macro crate does, without making the user write the second
+package: blaze adds the macro file to the analysis crate graph as a crate of its own.
+
+- Its root is `const-macros`'s file. Its dependencies are the package's normal dependencies
+  (not dev or build), its edition and cfgs the package's.
+- It is a proc-macro crate to the def map collector (`target_kind` proc-macro), so its
+  `#[proc_macro_derive]`, `#[proc_macro_attribute]` and `#[proc_macro]` functions are exported
+  as macros by the code that does so for every proc-macro crate (`export_proc_macro` in
+  `hir-def/src/nameres/collector.rs`). Its `ProcMacros` entry lists them with the const
+  expander.
+- It is in the analysis graph only. Cargo knows nothing of it, codegen never compiles it, and
+  no artifact is made: the evaluator runs its MIR.
+- It can't name the package's own items (`crate::` in it is itself), which is the rule that
+  makes the graph acyclic. The generated code can: an expansion is tokens, and `crate::Named`
+  in them resolves at the call site.
+- A library that offers its const derives to other crates re-exports them
+  (`pub use macros::Named;`), as serde re-exports serde_derive.
+
+### v2: anywhere in the crate
+
+The long-term form is a `#[proc_macro_derive]` const fn in any module of the crate, with a
+stage rule instead of a file rule: a const macro, and everything it reaches, may not use
+items that const macros produce. blaze would collect the crate's def map twice, a stage-0 map
+with const-macro calls left unexpanded, against which macro bodies are typed and evaluated,
+and the full map. That needs item ids that are the same in both maps (today a `FunctionId`
+is interned under its def map's module), so it waits until v1 has users. The file of v1
+stays valid under v2.
+
+## The token API in const
+
+The macro is written against `proc_macro`'s API: `TokenStream`, `TokenTree`, `Group`,
+`Ident`, `Punct`, `Literal`, `Span`, `Delimiter`, `Spacing`. In a const-macro crate blaze puts
+its own `proc_macro` in place of the standard library's, as it does for wasm macros: the value
+implementation in `crates/blaze-macro-wasm/guest/proc_macro.rs`, where a stream is a vector of
+token trees in the macro's memory and a span is a number the host hands out, with:
+
+- every function `const`, and every trait impl the API has (`FromIterator`, `Extend`,
+  `IntoIterator`, `Display`, `FromStr`, `Clone`) an `impl const`;
+- the host calls (span joins, `Span::call_site()`, a string lexed by `FromStr`) intrinsics the
+  evaluator answers, where the wasm build has imports.
+
+That is what needs the other const lanes:
+
+| Needs | Lane | Why |
+|---|---|---|
+| const heap: `Vec`, `Rc`/`Box`, `String` in const fn, freed or made global at the end | cheap | a stream is a vector; output outlives the call |
+| const traits: `impl const FromIterator`, `[const] Iterator`, `const Drop` | ctraits | `collect`, `for` loops, `quote`'s `Extend` |
+| blaze's own check_consts | ccheck | the purity proof; refuses statics, atomics, FFI, pointer-to-int |
+| step budget, gaps in the evaluator | cgaps / #867 | a looping macro ends with an error, not a hang |
+
+Until those land the prototype uses a stage-0 interface that needs none of them (below).
+
+`quote!` itself is a macro_rules macro over `proc_macro2`; once the API is const, a const
+`quote` is a port of its macro_rules part with `proc_macro` paths. syn is a larger question:
+it is not const today, and running it in the evaluator is the "non-const proc macros in the
+evaluator" item under Later.
+
+### Spans and hygiene
+
+A span in the macro is an index into the call's span table, the same table
+`crates/blaze-expand` keys expansions by: `def_site`, `call_site`, `mixed_site`, then each
+distinct span of the input, in order of first appearance. The macro can copy spans, compare
+them, set them on new tokens and ask for the three sites; it cannot read a span's file, line
+or text in v1 (`Span::source_text`, `line`, `file` are refused at evaluation with an error
+naming the call), because those would make the expansion depend on more than its input.
+
+After evaluation, each output span index is mapped back to the real `Span` of the call, so
+hygiene is exactly that of a proc macro today: input tokens keep their contexts, tokens made
+with `Span::call_site()` resolve at the call, `mixed_site()` gives macro_rules hygiene for
+locals, `def_site()` is the macro's own (unstable upstream, as for proc macros). A const macro
+can't make spans another call couldn't be given back, so every expansion is keepable, which
+blaze-expand can't promise for proc macros.
+
+### Errors
+
+- The macro panics: the expansion fails with the panic's message at the call site, with the
+  evaluator's stack of const fn frames in `macros.rs` as notes. Same as a proc macro's panic
+  today (`ProcMacroExpansionError::Panic`), more precise.
+- The macro returns tokens with `compile_error!`: as for any proc macro.
+- The body is not const-callable (reads a static, calls a non-const fn, uses an atomic): a
+  const-check error in `macros.rs` at the offending call, from ccheck's check, before any
+  expansion. This is the purity proof failing, and it fails where the code is.
+- The evaluator runs out of steps or memory: "the const macro `Named` stopped after N steps
+  expanding `Point`", at the call site. Deterministic, so it is kept like a success.
+- The evaluator can't do something (an intrinsic it lacks): an error naming it, never a
+  fallback to running the macro another way (no-fallback). It is a cgaps bug.
+
+## Caching
+
+Within a daemon, the expansion is salsa's: `expand_proc_macro` for the call reads the call's
+tokens and, through the evaluator, the MIR of every function the macro reaches. Editing the
+macro re-expands each call (and only those calls) whose result changes; editing an item
+re-expands that item's derives. Nothing is keyed by hand.
+
+Across daemons and machines, an expansion is kept in blaze's store under (code hash, input
+hash), the shape blaze-expand uses with the dylib's content replaced by the code hash:
+
+- code hash: fn-cache's `cache_code` of the macro function, which covers every function and
+  constant it reaches (docs/fn-cache.md), plus the evaluator's version;
+- input hash: the input tokens, and the attribute's tokens for an attribute, with spans
+  replaced by their index in the span table (as above), and the macro's name and kind.
+
+No environment, current directory or file reads are in the key, because a const fn can't
+reach them. Unlike today's proc-macro cache this holds for function-like macros too.
+
+## How it compares
+
+| | macro_rules | proc macro (dylib/wasm) | const macro |
+|---|---|---|---|
+| where written | anywhere | its own crate | `const-macros` file of the package (v1), anywhere (v2) |
+| language | patterns | Rust, anything | Rust, const fn |
+| runs | blaze's mbe | proc-macro server or Wasmtime | blaze's const evaluator, in-process |
+| compiled first | no | yes, with its dependencies | no (MIR only) |
+| pure | yes | by sandbox and recorded reads | by const check |
+| kept across machines | n/a (cheap) | derives and attributes; bang opt-in | every kind |
+| plain rustc | yes | yes | no: clear error |
+
+## The prototype (stage 0)
+
+Behind `experimental = ["const-macros"]`, the smallest working path, so the plumbing exists
+before the const heap and const traits do:
+
+- `[package.metadata.blaze] const-macros = "<file>"` adds the macro crate to the analysis
+  graph as described, and its `ProcMacros` entry lists the file's `#[proc_macro_derive]`,
+  `#[proc_macro_attribute]` and `#[proc_macro]` functions (found by parsing the file at load).
+- The stage-0 signature is text: `fn(&str) -> String` for a derive or function-like macro,
+  `fn(&str, &str) -> String` for an attribute. The input is the token stream printed; the
+  output is lexed back into tokens, every one with the call-site span (as `quote!` with
+  `Span::call_site()` gives). The evaluator is called directly, the way
+  `render_const_using_debug_impl` calls `std::fmt::format`: the input written into its heap,
+  the `String` read back from the result's three words.
+- The expander downcasts the `&dyn SourceDatabase` it is given to `&dyn HirDatabase` through
+  salsa's views; this is sound because the macro crate never depends on the crate being
+  expanded.
+
+Stage 0 is not the API. It is deleted when the const `proc_macro` lands, and macros written
+for it move by changing their signature.
+
+## Later
+
+- v2 (anywhere in the crate), above.
+- Non-const proc macros in the evaluator: the evaluator is itself a sandbox (no files, no
+  FFI, deterministic), so an existing syn-based proc macro could run there with no wasm
+  build. The open question is speed: the MIR interpreter is far slower than Wasmtime's
+  compiled code, and syn parses every token. Worth measuring on serde_derive before choosing.
+- Const macros in dependencies: a crates.io package that declares `const-macros` is built
+  the same way; only a workspace that opts in can use one.
+- #863's `Graph::map(inputs, args, f)` with `f` a `const fn` or a const closure runs through
+  the same call path: the evaluator, keyed by `cache_code`, with no wasm instance.
+
+## Performance
+
+"Faster than cargo, always" applies. The measures for a const macro against the same derive
+as a proc-macro crate, on the same command:
+
+- cold build of the using crate: the proc-macro path compiles the macro crate (and syn,
+  quote); the const path compiles nothing extra. Expected to win by seconds.
+- no-op and edit: expansions are salsa-cached either way; a re-expansion is one evaluation
+  versus one wasm instance or server round trip. The evaluator is the risk here and is
+  measured per expansion before the experiment is proposed as a default.
+- load of a fresh daemon: both are kept in the store.
+
+Nothing in this design touches a package that does not declare `const-macros`.

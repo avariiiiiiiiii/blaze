@@ -1839,6 +1839,14 @@ impl<'db> DefCollector<'db> {
             tracing::warn!("macro expansion is too deep");
             return;
         }
+        let def = macro_call_id.loc(self.db).def;
+        if let MacroDefKind::ProcMacro(_, exp, _) = def.kind
+            && exp.requires_session(self.db, def.krate)
+        {
+            // Equal expansion output still has state changes to replay next revision.
+            self.db.report_untracked_read();
+            self.def_map.session_macros = true;
+        }
         let file_id = macro_call_id.into();
 
         let item_tree = file_item_tree(self.db, file_id, self.def_map.krate);

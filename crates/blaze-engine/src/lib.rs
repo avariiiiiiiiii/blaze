@@ -2772,7 +2772,9 @@ impl Checkouts {
             self.loaded.replace(at, self.split(base, &over, &own));
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
         }
-        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        prepare_macro_sessions(db);
+        Ok(())
     }
 
     /// How the daemon builds `project`: as itself when its checkout is loaded, and as its
@@ -2916,6 +2918,7 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
             let files = start.elapsed() - workspaces_at;
             eprintln!(
@@ -3007,6 +3010,7 @@ impl Checkouts {
             self.debug[at] = self.debug[base].clone();
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        prepare_macro_sessions(db);
         failed
     }
 
@@ -3505,6 +3509,17 @@ fn resolve_names(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
     });
 }
 
+/// Establishes declaration-order macro state before incremental queries validate bodies.
+fn prepare_macro_sessions(db: &RootDatabase) {
+    hir::attach_db(db, || {
+        for &krate in &*ide_db::base_db::all_crates(db) {
+            if hir_def::nameres::may_have_session_macros(db, krate) {
+                _ = hir::crate_def_map(db, krate);
+            }
+        }
+    });
+}
+
 /// Resolves the names and finds the impls of `crates`, on `threads`.
 fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: usize) {
     // A crate comes after its dependencies in the list: a thread that starts on one whose
@@ -3915,6 +3930,7 @@ fn write_harnesses(db: &mut RootDatabase, texts: Vec<(vfs::FileId, String)>) -> 
     for (file, text) in &texts {
         db.set_file_text_with_durability(*file, text, Durability::LOW);
     }
+    prepare_macro_sessions(db);
     texts.into_iter().map(|it| it.0).collect()
 }
 
@@ -4861,7 +4877,6 @@ fn link_executable(
         Ok(exports)
     });
     let exports = exports.transpose()?;
-    blaze_macro_wasm::flush();
     let took = link::executable(
         db,
         &program,
@@ -6528,6 +6543,7 @@ impl WatchedFile {
         if added.is_empty() {
             return Loaded::Nothing;
         }
+        prepare_macro_sessions(db);
         let mut was = FxHashMap::default();
         files.retain(|it| {
             let watched = matches!(it.file, Watched::Included(_))
@@ -6579,6 +6595,7 @@ impl WatchedFile {
             });
             changed |= db.reload_included_file(&path);
         }
+        prepare_macro_sessions(db);
         changed
     }
 }
@@ -8390,6 +8407,7 @@ fn follow_cargo(
             checkouts.loaded.replace(beside.at, workspace);
             let Checkouts { loaded, cargo_config, load_config, .. } = checkouts;
             loaded.add(Vec::new(), &cargo_config.extra_env, load_config, vfs, db)?;
+            prepare_macro_sessions(db);
             beside.applied = lines.len();
             all_applied = all;
         }
@@ -8694,6 +8712,7 @@ fn run_holding(
     if args.run_tool {
         run_tool_std(&mut db)?;
     }
+    prepare_macro_sessions(&db);
 
     if args.out.is_dir() {
         let texts = harnesses(&db, [&args], None);
@@ -9105,6 +9124,7 @@ fn run_holding(
     {
         use ide_db::base_db::salsa::{Database, Durability};
         db.synthetic_write(Durability::LOW);
+        prepare_macro_sessions(&db);
     }
     // Only a worker that serves builds again and lets go after; the bookkeeping of an `lru`
     // costs every fetch of its queries.
@@ -9363,6 +9383,7 @@ fn run_holding(
                         }
                         builds.settle(&mut db, &mut programs)?;
                         let reading = process::turn(&mut db, stream.env.clone());
+                        prepare_macro_sessions(&db);
                         if !reading.is_empty() {
                             for program in &mut programs {
                                 program.known.touch(&db, Some(&reading));
@@ -9854,6 +9875,7 @@ fn run_holding(
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        prepare_macro_sessions(&db);
         // Without clients, the first program is built whenever a file changes.
         let building: FxHashSet<usize> = match serving {
             true => clients.iter().map(|it| it.0).collect(),
@@ -9941,6 +9963,7 @@ fn run_holding(
         // A write stops the builds under way, so nothing is written when nothing changed.
         if changed != 0 || !background {
             db.apply_change(change);
+            prepare_macro_sessions(&db);
         }
         // The tests of a crate an edited file is of are listed again after the edit, and those
         // of a program asked for the first time; a root file the edit did not touch is noted
@@ -9971,6 +9994,7 @@ fn run_holding(
         let applied_change = start.elapsed();
         if !removed.is_empty() {
             tree.remove(&mut db, &removed);
+            prepare_macro_sessions(&db);
             let mut index = 0;
             files.retain(|_| {
                 index += 1;
@@ -9987,6 +10011,7 @@ fn run_holding(
         for path in included {
             db.reload_included_file(&path);
         }
+        prepare_macro_sessions(&db);
         // Asked of every file before any is noted: noting one forgets the functions listed.
         for program in &mut programs {
             // A harness written into the root of a library is an edit of the program of its
@@ -10214,6 +10239,7 @@ fn run_holding(
             if late.is_empty() {
                 break answers;
             }
+            prepare_macro_sessions(&db);
             for program in &mut programs {
                 program.known.touch(&db, Some(&late));
                 program.unbuilt.stale = true;

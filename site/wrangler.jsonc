@@ -1,5 +1,5 @@
 {
-  "name": "blaze",
+  "name": "ra-jit", // rename: old name, the Cloudflare resource is still called this
   "compatibility_date": "2026-10-01",
   "workers_dev": false,
   // The site is https://ix.dev/blaze/ (Served in content/site.flecs). worker/ takes every request: it redirects the old
@@ -25,11 +25,11 @@
   "version_metadata": { "binding": "CF_VERSION" },
   // ix.dev/blaze* on the ix.dev zone: more specific than ix-web's ix.dev/* (indexable-inc/ix,
   // nix/terraform/cloudflare/template.json), so it wins. One pattern with the trailing *, because a pattern without
-  // one does not match a query (`ix.dev/blaze` missed /blaze?x=1); /blazefoo also lands here and gets a 404. blaze.ix.dev (the old home) and blaze.ix.dev are custom
+  // one does not match a query (`ix.dev/blaze` missed /blaze?x=1); /blazefoo also lands here and gets a 404. ra-jit.ix.dev (the old home) and blaze.ix.dev are custom // rename: old name
   // domains of this worker, which answers them with a 301 to the same path under https://ix.dev/blaze.
   "routes": [
     { "pattern": "ix.dev/blaze*", "zone_name": "ix.dev" },
-    { "pattern": "blaze.ix.dev", "custom_domain": true },
+    { "pattern": "ra-jit.ix.dev", "custom_domain": true }, // rename: old name, the Cloudflare resource is still called this
     { "pattern": "blaze.ix.dev", "custom_domain": true }
   ],
   "vars": {
@@ -43,11 +43,11 @@
     "COMMENT_ADMINS": "7644264"
   },
   // Narration files (audio/README.md): content-hashed .webm, uploaded from the Mac after audio/generate.py.
-  "r2_buckets": [{ "binding": "AUDIO", "bucket_name": "blaze-audio" }],
+  "r2_buckets": [{ "binding": "AUDIO", "bucket_name": "ra-jit-audio" }], // rename: old name, the Cloudflare resource is still called this
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "blaze-updates",
+      "database_name": "ra-jit-updates", // rename: old name, the Cloudflare resource is still called this
       "database_id": "c8d4a72a-3d01-48d5-9af5-46ce7b0f4670",
       "migrations_dir": "migrations"
     }

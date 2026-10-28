@@ -412,7 +412,7 @@ mod tests {
         std::fs::create_dir_all(toolchain.join("bin")).unwrap();
         std::fs::create_dir_all(toolchain.join("lib/rustlib")).unwrap();
         std::fs::write(&script, "#!/bin/sh\nexec rustup-init \"$@\"\n").unwrap();
-        let rustc = toolchain.join("bin/rustc");
+        let rustc = toolchain.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&rustc, "").unwrap();
         let var = |name: &str| match name {
             "RUSTUP_TOOLCHAIN" => Some(OsString::from("nightly")),

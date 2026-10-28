@@ -1,11 +1,11 @@
-# blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the latest release,
+# blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the newest release,
 # installed by install.sh into ~/.cargo/bin, and blaze's store, the one cache, pulled from the
 # shared remote (.github/actions/blaze-remote) that main's runs push to after their tests. The
 # remote's project is the job's, the platform's and the release's: what one release of blaze
 # compiled is no use to the next, and a project's manifest only grows, so each release starts
 # one of its own.
 name: blaze
-description: the latest release of blaze, and the store main's runs pushed
+description: the newest release of blaze, and the store main's runs pushed
 inputs:
   job:
     description: the job whose store this is (build, tests)
@@ -17,13 +17,15 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: blaze (the latest release)
+    # The canary channel, the newest release: blaze's own tree takes each release first, before
+    # it is promoted to stable for everyone else.
+    - name: blaze (the newest release)
       id: install
       shell: bash
       env:
         JOB: ${{ inputs.job }}
       run: |
-        sh install.sh --no-toolchain --verbose
+        sh install.sh --channel canary --no-toolchain --verbose
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }

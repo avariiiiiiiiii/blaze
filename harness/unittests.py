@@ -43,7 +43,7 @@ OPEN = {
 # Known to fail when blaze builds and tests them, and not when rustc does: OPEN too on a blaze run.
 OPEN_BLAZE = {
     # https://github.com/indexable-inc/blaze/issues/892
-    *(f"blaze_engine::socket::tests::{t}" for t in [
+    *(f"blaze_cargo::socket::tests::{t}" for t in [
         "a_client_that_never_reads_is_given_up_on", "a_directory_others_can_swap_is_refused",
         "a_log_that_was_there_becomes_the_users_alone", "a_reply_has_a_time_limit_once_the_request_is_read",
         "a_silent_or_endless_client_is_given_up_on", "a_socket_in_a_shared_directory_is_never_open_to_others",
@@ -51,7 +51,7 @@ OPEN_BLAZE = {
         "one_process_serves_a_socket", "the_directory_and_the_socket_are_the_users_alone",
     ]),
     # https://github.com/indexable-inc/blaze/issues/893
-    "blaze_engine::remote::gateway::tests::what_is_over_a_put_goes_up_in_parts_checked_whole",
+    "blaze_cargo::remote::gateway::tests::what_is_over_a_put_goes_up_in_parts_checked_whole",
 }
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")

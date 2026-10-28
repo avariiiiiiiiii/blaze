@@ -79,16 +79,16 @@ directory, so keep them together. If you installed `ra-jit` with cargo before, r
 ## With Nix
 
 ```sh
-nix profile install github:indexable-inc/blaze#blaze
+nix profile install github:indexable-inc/blaze
 ```
 
-Or try it without installing anything: in a project, `nix run github:indexable-inc/blaze#blaze -- build`
+Or try it without installing anything: in a project, `nix run github:indexable-inc/blaze -- build`
 is `cargo blaze build`. In a flake, take the package from the input:
 
 ```nix
 {
   inputs.blaze.url = "github:indexable-inc/blaze";
-  # ... then use blaze.packages.${system}.blaze in a dev shell or a profile.
+  # ... then use blaze.packages.${system}.default in a dev shell or a profile.
 }
 ```
 

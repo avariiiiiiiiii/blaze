@@ -390,8 +390,9 @@ function drawSide(): void {
 	const byPath = new Map<string, Person[]>();
 	for (const p of people) {
 		if (p.key === you?.key) continue;
-		// One face a person, on the page in front of them (the presence object sends that page first).
-		const pg = p.pages[0];
+		// One face a person, on the page they have in front of them (the presence object sends that page first), and
+		// only while they are there: someone whose every tab is in the background shows on no page.
+		const pg = p.pages.find((x) => !x.away);
 		if (!pg) continue;
 		const l = byPath.get(pg.path) ?? [];
 		l.push(p);

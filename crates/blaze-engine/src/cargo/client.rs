@@ -3,7 +3,7 @@
 
 use std::{
     fs::OpenOptions,
-    io::{BufRead as _, BufReader, Write as _},
+    io::Write as _,
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -186,93 +186,87 @@ enum Got {
     Answer(Answer),
     /// A line of JSON: the daemon is of a blaze from before the frames.
     Older(String),
-    /// The daemon hung up.
-    Ended,
 }
 
 /// Sends `envelope` and reads the answer, showing the records of the build it waits for as
-/// they come ([`say::Shown`]). A daemon from before the frames is told to stop in its own
-/// JSON, when the client `replaces` it, and answers as one of another version.
+/// they come ([`say::Shown`]), and drawing them again every [`TICK`] that brings none. A
+/// daemon from before the frames is told to stop in its own JSON, when the client
+/// `replaces` it, and answers as one of another version.
 fn exchange(stream: &mut UnixStream, envelope: &[u8], replaces: bool) -> anyhow::Result<Reply> {
     stream.write_all(envelope)?;
-    let mut reader = stream.try_clone()?;
-    let (sender, got) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        loop {
-            let next = next(&mut reader);
-            let last = !matches!(next, Ok(Got::Answer(Answer::Record(_))));
-            if sender.send(next).is_err() || last {
-                break;
+    stream.set_read_timeout(Some(TICK))?;
+    let mut shown = say::Shown::new();
+    // What was read and is not a whole frame yet.
+    let mut got = Vec::new();
+    let mut chunk = vec![0; 64 << 10];
+    loop {
+        while let Some(next) =
+            next(&mut got).context("the daemon's answer is not one of this version")?
+        {
+            match next {
+                Got::Answer(Answer::Record(record)) => shown.record(&record),
+                Got::Answer(Answer::Reply(reply)) => {
+                    shown.done();
+                    return Ok(reply);
+                }
+                Got::Older(line) => {
+                    drop(shown);
+                    let reply = serde_json::from_str::<Reply>(&line);
+                    let version = match reply {
+                        Ok(Reply::Restart { version }) => version,
+                        _ => "of before the frames".to_owned(),
+                    };
+                    if replaces {
+                        stop_older(&socket_in(&home()?));
+                    }
+                    return Ok(Reply::Restart { version });
+                }
             }
         }
-    });
-    let mut shown = say::Shown::new();
-    loop {
-        let next = match got.recv_timeout(TICK) {
-            Ok(next) => next,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        match std::io::Read::read(stream, &mut chunk) {
+            Ok(0) => break,
+            Ok(read) => got.extend_from_slice(&chunk[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 shown.tick();
-                continue;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(Got::Ended),
-        };
-        match next.context("the daemon's answer is not one of this version")? {
-            Got::Answer(Answer::Record(record)) => shown.record(&record),
-            Got::Answer(Answer::Reply(reply)) => {
-                shown.done();
-                return Ok(reply);
-            }
-            Got::Older(line) => {
-                drop(shown);
-                let reply = serde_json::from_str::<Reply>(&line);
-                let version = match reply {
-                    Ok(Reply::Restart { version }) => version,
-                    _ => "of before the frames".to_owned(),
-                };
-                if replaces {
-                    stop_older(&socket_in(&home()?));
-                }
-                return Ok(Reply::Restart { version });
-            }
-            Got::Ended => {
-                drop(shown);
-                let log = home()?.join("daemon.log");
-                anyhow::bail!(
-                    "the daemon ended before it answered (killed?), its log is {}",
-                    log.display()
-                );
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            // One that took its socket with it, or hung up, is as good as gone.
+            Err(_) => break,
         }
     }
+    drop(shown);
+    let log = home()?.join("daemon.log");
+    anyhow::bail!("the daemon ended before it answered (killed?), its log is {}", log.display())
 }
 
-/// The next thing the daemon sends on `stream`.
-fn next(stream: &mut UnixStream) -> std::io::Result<Got> {
-    let mut first = [0];
-    loop {
-        match std::io::Read::read(stream, &mut first) {
-            Ok(0) => return Ok(Got::Ended),
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
+/// The next whole thing the daemon sent of what was read, `got`, taken out of it; `None`
+/// until the rest of it is read.
+fn next(got: &mut Vec<u8>) -> std::io::Result<Option<Got>> {
+    if got.first() == Some(&b'{') {
+        let Some(end) = got.iter().position(|&it| it == b'\n') else { return Ok(None) };
+        let line: Vec<u8> = got.drain(..=end).collect();
+        return Ok(Some(Got::Older(String::from_utf8_lossy(&line).into_owned())));
     }
-    if first == *b"{" {
-        let mut line = "{".to_owned();
-        BufReader::new(stream).read_line(&mut line)?;
-        return Ok(Got::Older(line));
-    }
-    let mut framed = std::io::Read::chain(&first[..], &mut *stream);
-    let item = match blaze_protocol::read_frame(&mut framed) {
-        Ok(Some(item)) => item,
-        // A frame without its end is one the daemon did not live to finish.
-        Ok(None) => return Ok(Got::Ended),
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Got::Ended),
-        Err(error) => return Err(error),
+    let Some(len) = got.first_chunk::<4>().map(|it| u32::from_be_bytes(*it)) else {
+        return Ok(None);
     };
-    let message = blaze_protocol::cbor::from_slice::<Message<Answer>>(&item)
-        .map_err(|it| std::io::Error::new(std::io::ErrorKind::InvalidData, it))?;
-    Ok(Got::Answer(message.body))
+    if len > blaze_protocol::LONGEST_FRAME {
+        let said = format!("a frame of {len} bytes");
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, said));
+    }
+    let end = 4 + len as usize;
+    if got.len() < end {
+        return Ok(None);
+    }
+    let message = blaze_protocol::cbor::from_slice::<Message<Answer>>(&got[4..end])
+        .map_err(|it| std::io::Error::new(std::io::ErrorKind::InvalidData, it));
+    got.drain(..end);
+    Ok(Some(Got::Answer(message?.body)))
 }
 
 /// Has the daemon at `socket`, of a blaze from before the frames, exit: it reads a request

@@ -1072,7 +1072,8 @@ struct Daemon {
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
     asked: Mutex<Instant>,
-    watched: Mutex<Watched>,
+    watched: Arc<Mutex<Watched>>,
+    relays: Arc<Relays>,
 }
 
 /// The records of the builds under way and of the last of each workspace, for the commands
@@ -1234,7 +1235,8 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
-        watched: Mutex::default(),
+        watched: Arc::default(),
+        relays: Arc::default(),
     });
     // A build starts the daemon, and is given this one.
     daemon.spare();
@@ -1248,6 +1250,10 @@ pub(crate) fn serve() -> anyhow::Result<()> {
     {
         let daemon = daemon.clone();
         std::thread::spawn(move || daemon.reap());
+    }
+    {
+        let relays = daemon.relays.clone();
+        std::thread::spawn(move || relays.serve());
     }
     for (stream, open) in served.incoming() {
         let daemon = daemon.clone();
@@ -1281,62 +1287,130 @@ pub(crate) enum Answer {
     Reply(Reply),
 }
 
+/// The commands that wait for their answers, each handed what the process it waits for said
+/// ([`blaze_protocol::follow`]) every [`RELAYED`] by one thread, rather than a thread each:
+/// a quick build is answered before the first.
+#[derive(Default)]
+struct Relays {
+    under_way: Mutex<Vec<Arc<Relay>>>,
+    more: std::sync::Condvar,
+}
+
+impl Relays {
+    fn serve(&self) {
+        loop {
+            let waiting = lock(&self.under_way);
+            let waiting = self.more.wait_while(waiting, |it| it.is_empty());
+            drop(waiting.unwrap_or_else(PoisonError::into_inner));
+            std::thread::sleep(RELAYED);
+            let under_way = lock(&self.under_way).clone();
+            for relay in under_way {
+                let mut relayed = lock(&relay.relayed);
+                if !relayed.done {
+                    relay.relay(&mut relayed);
+                    relay.flush(&mut relayed);
+                }
+            }
+        }
+    }
+
+    fn add(&self, relay: &Arc<Relay>) {
+        lock(&self.under_way).push(relay.clone());
+        self.more.notify_one();
+    }
+
+    fn remove(&self, relay: &Arc<Relay>) {
+        lock(&self.under_way).retain(|it| !Arc::ptr_eq(it, relay));
+    }
+}
+
+/// A command that waits for request `id`, handed the records of build `number`: their times
+/// from when it asked, `began_ns`.
+struct Relay {
+    stream: UnixStream,
+    id: u64,
+    dir: PathBuf,
+    began_ns: u64,
+    number: u64,
+    watched: Arc<Mutex<Watched>>,
+    relayed: Mutex<Relayed>,
+}
+
+#[derive(Default)]
+struct Relayed {
+    follow: blaze_protocol::follow::Follow,
+    build: blaze_ui::Build,
+    /// Frames not sent yet: they go with the next of [`Relays`], or with the answer.
+    unsent: Vec<u8>,
+    /// The command went away: it is handed nothing more, and its answer goes nowhere.
+    gone: bool,
+    /// It was answered: nothing more is its.
+    done: bool,
+}
+
+impl Relay {
+    fn send(&self, relayed: &mut Relayed, event: Event, at_ns: u64) {
+        let record = Record { at_ns: at_ns.saturating_sub(self.began_ns), event };
+        relayed.build.apply(&record);
+        lock(&self.watched).record(self.number, &record);
+        if !relayed.gone {
+            let message = Message::new(self.id, Answer::Record(record));
+            relayed.gone = blaze_protocol::send(&mut relayed.unsent, &message).is_err();
+        }
+    }
+
+    /// What the process said since.
+    fn relay(&self, relayed: &mut Relayed) {
+        let Some((path, len)) = blaze_protocol::follow::written_in(&self.dir) else { return };
+        for record in relayed.follow.read(&path, len) {
+            match record {
+                Ok(record) => self.send(relayed, record.event, record.at_ns),
+                Err(why) => eprintln!("{}: a record is not read: {why}", path.display()),
+            }
+        }
+    }
+
+    fn flush(&self, relayed: &mut Relayed) {
+        if !relayed.gone && !relayed.unsent.is_empty() {
+            relayed.gone = (&self.stream).write_all(&relayed.unsent).is_err();
+        }
+        relayed.unsent.clear();
+    }
+}
+
 /// The answer `answering` gives, with the command that waits for it, request `id`, handed
-/// each record the process in `dir` writes meanwhile ([`blaze_protocol::follow`]), its times from
-/// when the command asked, and last how the build went. A command that says nothing for
-/// the minute a load and a first build can take looks stuck.
+/// each record the process it waits for writes meanwhile ([`Relays`]), and last how the build
+/// went; and the frames of those not sent yet, to go with the answer. A command that says
+/// nothing for the minute a load and a first build can take looks stuck.
 fn relaying(
     stream: &UnixStream,
     id: u64,
     followed: &Followed,
-    watched: &Mutex<Watched>,
+    daemon: &Daemon,
     answering: impl FnOnce() -> Reply,
-) -> Reply {
+) -> anyhow::Result<(Reply, Vec<u8>)> {
     let Followed { dir, root, command } = followed;
     let began_ns = blaze_protocol::follow::now_ns();
-    let build = std::sync::Mutex::new(blaze_ui::Build::default());
-    let number = lock(watched).began(root);
-    let gone = AtomicBool::new(false);
-    let send = |event: Event, at_ns: u64| {
-        let record = Record { at_ns: at_ns.saturating_sub(began_ns), event };
-        lock(&build).apply(&record);
-        lock(watched).record(number, &record);
-        // A command that went away is handed nothing more; its answer goes nowhere too.
-        if !gone.load(Relaxed)
-            && blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Record(record)))
-                .is_err()
-        {
-            gone.store(true, Relaxed);
-        }
-    };
-    let follow = std::sync::Mutex::new(blaze_protocol::follow::Follow::from_now(dir));
-    let relay = || {
-        let Some(path) = blaze_protocol::follow::written_in(dir) else { return };
-        for record in lock(&follow).read(&path) {
-            match record {
-                Ok(record) => send(record.event, record.at_ns),
-                Err(why) => eprintln!("{}: a record is not read: {why}", path.display()),
-            }
-        }
-    };
-    send(
-        Event::Began { build: number, command: (*command).to_owned(), root: root.clone() },
+    let number = lock(&daemon.watched).began(root);
+    let follow = blaze_protocol::follow::Follow::from_now(dir);
+    let relay = Arc::new(Relay {
+        stream: stream.try_clone()?,
+        id,
+        dir: dir.clone(),
         began_ns,
-    );
-    let (answered, told) = std::sync::mpsc::channel::<()>();
-    let relay = &relay;
-    let reply = std::thread::scope(|scope| {
-        scope.spawn(move || {
-            while told.recv_timeout(RELAYED) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                relay();
-            }
-        });
-        let reply = answering();
-        drop(answered);
-        reply
+        number,
+        watched: daemon.watched.clone(),
+        relayed: Mutex::new(Relayed { follow, ..Relayed::default() }),
     });
+    let began = Event::Began { build: number, command: (*command).to_owned(), root: root.clone() };
+    relay.send(&mut lock(&relay.relayed), began, began_ns);
+    daemon.relays.add(&relay);
+    let reply = answering();
+    daemon.relays.remove(&relay);
+    let mut relayed = lock(&relay.relayed);
+    relayed.done = true;
     // What the process said before it answered.
-    relay();
+    relay.relay(&mut relayed);
     let first_line = |text: String| text.lines().next().unwrap_or_default().to_owned();
     let error = match &reply {
         Reply::Synced { programs, .. } => {
@@ -1348,9 +1422,10 @@ fn relaying(
     };
     let ok = error.is_none();
     let now_ns = blaze_protocol::follow::now_ns();
-    let summary = lock(&build).summary(now_ns.saturating_sub(began_ns), error);
-    send(Event::Finished { ok, summary }, now_ns);
-    reply
+    let summary = relayed.build.summary(now_ns.saturating_sub(began_ns), error);
+    relay.send(&mut relayed, Event::Finished { ok, summary }, now_ns);
+    let unsent = if relayed.gone { Vec::new() } else { std::mem::take(&mut relayed.unsent) };
+    Ok((reply, unsent))
 }
 
 impl Daemon {
@@ -1396,19 +1471,19 @@ impl Daemon {
         let replaced =
             envelope.as_ref().is_some_and(|it| it.replaces && it.version != self.version);
         let read = Instant::now();
-        let mut reply = match envelope {
+        let (mut reply, mut unsent) = match envelope {
             Some(envelope) if envelope.version == self.version => {
                 match (self.followed_in(&envelope.request), envelope.request) {
                     (_, Request::Watch { subscribe, follow }) => {
-                        self.watch(stream, id, &subscribe, follow)
+                        (self.watch(stream, id, &subscribe, follow), Vec::new())
                     }
                     (Some(followed), request) => {
-                        relaying(stream, id, &followed, &self.watched, || self.handle(request))
+                        relaying(stream, id, &followed, self, || self.handle(request))?
                     }
-                    (None, request) => self.handle(request),
+                    (None, request) => (self.handle(request), Vec::new()),
                 }
             }
-            _ => Reply::Restart { version: self.version.clone() },
+            _ => (Reply::Restart { version: self.version.clone() }, Vec::new()),
         };
         if let Reply::Synced { spans, .. } = &mut reply {
             let level = Some(crate::trace::DAEMON);
@@ -1416,7 +1491,9 @@ impl Daemon {
             spans.push(crate::trace::span("daemon", level, read, Instant::now()));
         }
         let stopping = matches!(reply, Reply::Stopping);
-        let sent = blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Reply(reply)));
+        blaze_protocol::send(&mut unsent, &Message::new(id, Answer::Reply(reply)))?;
+        // The records not sent yet and the answer in one write: a quick build's in one read.
+        let sent = (&*stream).write_all(&unsent);
         if replaced || stopping {
             self.end();
         }

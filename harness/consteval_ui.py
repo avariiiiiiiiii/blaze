@@ -294,6 +294,11 @@ def score(units):
             continue
         failed = {it["name"]: it.get("error", "") for it in items if not it["ok"] and (it["eager"] or it["name"] in unit.expected)}
         for name in sorted(set(failed) - unit.expected):
+            # rustc reports one that fails through a constant it named as "erroneous constant
+            # encountered", which FOLLOW_ON does not count.
+            through = re.search(r'ConstEvalError\("([^"]+)"', failed[name])
+            if through and through[1].rsplit("::", 1)[-1] in {e.rsplit("::", 1)[-1] for e in unit.expected}:
+                continue
             unit.differences.append(("blaze fails where rustc evaluates", f"{name}: {kind_of_error(failed[name])}"))
         for name in sorted(unit.expected - set(failed)):
             unit.differences.append(("rustc fails where blaze evaluates", f"{name}: {kind_of_rustc(unit.path, unit.revision, name)}"))

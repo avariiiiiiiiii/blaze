@@ -353,7 +353,7 @@ jobs:
           tmp = os.environ["RUNNER_TEMP"]
           print(json.dumps({"rust": f"{tmp}/rust", "bin": "target/release/blaze-engine", "jobs": 4,
                             "work": f"{tmp}/consteval", "out": f"{tmp}/consteval-out",
-                            "min_evaluation": 0, "min_run_pass": 0}))')" || status=$?
+                            "min_evaluation": 709, "min_run_pass": 0}))')" || status=$?
           cat "$RUNNER_TEMP/consteval-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           exit "${status:-0}"
       - uses: actions/upload-artifact@v7

@@ -121,14 +121,16 @@ The daily workflow does this every day and opens the pull request
 ([toolchain.md, "The daily bump"](toolchain.md#the-daily-bump)); by hand it is for fixing what
 a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly:
 
-    python3 harness/toolchain_bump.py                    # the newest nightly blaze can use
-    python3 harness/toolchain_bump.py --date 2026-11-02  # or a given one
+    python3 harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
+    python3 harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
 
 picks the nightly (the newest of the last two weeks whose manifest has every component blaze
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
 `pins.txt`, re-vendors `crates/rustc_abi` and `vendor/proc-macro-srv` from rust-lang/rust at
 the new commit (blaze's changes to the server carried over by a three-way apply; a conflict
-stops it and names the files), moves the pin where else it is written (`install.sh`, the
+stops it and names the files), merges that nightly's standard library into `library/`
+(`harness/library.py merge`: upstream's changes applied three-way, so blaze's own changes to it
+are kept; a conflict stops it and names the files), moves the pin where else it is written (`install.sh`, the
 server's version string and manifest, `Cargo.toml`, the flake's rust-overlay input) and
 installs the nightly with rustup. Each step names itself when it fails.
 
@@ -143,7 +145,7 @@ What it leaves to a person, and prints at the end:
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `python3 harness/toolchain_bump.py --checks` in an ix VM, under Cranelift and under LLVM
+3. `python3 harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
    (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
    blaze and runs, in parallel, what proves blaze and the nightly agree: `toolchain_pins.py`,
    `answers.py`, `macroserver.py`, the corpus with its `nightly` feature and `--layouts`, and

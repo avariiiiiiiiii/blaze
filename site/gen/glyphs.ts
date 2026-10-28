@@ -36,6 +36,9 @@ const arc = (d: string): Shape => `<path d="${d}"/>`;
 const cell = (cx: number, cy: number, s = 3.2): Shape =>
 	`<rect class="g-cell" x="${r2(cx - s / 2)}" y="${r2(cy - s / 2)}" width="${r2(s)}" height="${r2(s)}" fill="currentColor" stroke="none"/>`;
 
+/** `s` with a class, the part of its glyph styles/learn.css moves on hover. */
+const as = (c: string, ...shapes: Shape[]): Shape[] => shapes.map((sh) => sh.replace(/^<(\w+) /, `<$1 class="${c}" `));
+
 // ---- the glyphs ----
 
 /** A source file: a page with a folded corner and two lines of text. */
@@ -46,15 +49,15 @@ const page = (x: number, y: number, w = 9, h = 11): Glyph => [
 ];
 
 export const GLYPHS: Record<string, Glyph> = {
-	/** Lesson 1: two source files compiled, then linked into one program (the cell). */
-	pipeline: [...page(3.5, 3.5), ...page(3.5, 17.5), curve(12.5, 9, 19.5, 13), curve(12.5, 23, 19.5, 19), box(19.5, 9.5, 9, 13, 2), cell(24, 16)],
+	/** Lesson 1: two source files compiled (the curves), then linked into one program (the box, its cell). */
+	pipeline: [...page(3.5, 3.5), ...page(3.5, 17.5), ...as('flow', curve(12.5, 9, 19.5, 13), curve(12.5, 23, 19.5, 19)), ...as('link', box(19.5, 9.5, 9, 13, 2)), cell(24, 16)],
 	/** Lesson 2: a grid of functions, one of them changed. */
-	functions: [0, 1, 2].flatMap((y) => [0, 1, 2].map((x) => (x === 2 && y === 1 ? cell(7.5 + x * 8.5, 7.5 + y * 8.5, 5.4) : box(4.75 + x * 8.5, 4.75 + y * 8.5, 5.5, 5.5, 1)))),
+	functions: [0, 1, 2].flatMap((y) => [0, 1, 2].flatMap((x) => (x === 2 && y === 1 ? [cell(7.5 + x * 8.5, 7.5 + y * 8.5, 5.4)] : as('fn', box(4.75 + x * 8.5, 4.75 + y * 8.5, 5.5, 5.5, 1))))),
 	/** Lesson 3: code that writes code, in a box. */
-	sandbox: [box(3.5, 5.5, 25, 21, 3), line(12.5, 11.5, 8.5, 16, 12.5, 20.5), line(19.5, 11.5, 23.5, 16, 19.5, 20.5), cell(16, 16)],
-	/** Lesson 4: a sealed box, the same from every side. */
-	sealed: [closed(16, 3.5, 27.5, 9.5, 16, 15.5, 4.5, 9.5), line(4.5, 9.5, 4.5, 22.5, 16, 28.5, 27.5, 22.5, 27.5, 9.5), line(16, 15.5, 16, 28.5), cell(16, 9.5)],
-	/** Lesson 5: one store, and two machines that share it. */
+	sandbox: [...as('wall', box(3.5, 5.5, 25, 21, 3)), ...as('code', line(12.5, 11.5, 8.5, 16, 12.5, 20.5), line(19.5, 11.5, 23.5, 16, 19.5, 20.5)), cell(16, 16)],
+	/** Lesson 4: a sealed box, the same from every side; the lid (the top face) closes it. */
+	sealed: [...as('lid', closed(16, 3.5, 27.5, 9.5, 16, 15.5, 4.5, 9.5)), line(4.5, 9.5, 4.5, 22.5, 16, 28.5, 27.5, 22.5, 27.5, 9.5), line(16, 15.5, 16, 28.5), cell(16, 9.5)],
+	/** Lesson 5: one store, and two machines that share it; the pulses are work going in, unseen until hovered. */
 	store: [
 		arc('M10 19.5a6 2.2 0 1 0 12 0a6 2.2 0 1 0 -12 0'),
 		arc('M10 19.5v6.5a6 2.2 0 0 0 12 0v-6.5'),
@@ -62,6 +65,7 @@ export const GLYPHS: Record<string, Glyph> = {
 		box(21, 3.5, 7.5, 6, 1.2),
 		curve(7.25, 9.5, 12.5, 17),
 		curve(24.75, 9.5, 19.5, 17),
+		...as('pulse', curve(7.25, 9.5, 12.5, 17), curve(24.75, 9.5, 19.5, 17)),
 		cell(16, 24.2, 2.8),
 	],
 };
@@ -70,7 +74,7 @@ export const GLYPHS: Record<string, Glyph> = {
 export function glyphSvg(name: string): string {
 	const g = GLYPHS[name];
 	if (!g) throw new Error(`gen/glyphs.ts: no glyph "${name}" (have ${Object.keys(GLYPHS).join(', ')})`);
-	// Each stroke measures 1 (`pathLength`), so styles/learn.css can draw the glyph again when its lesson is hovered.
+	// Each stroke measures 1 (`pathLength`), so styles/learn.css can draw parts of it again when its lesson is hovered.
 	const shapes = g.map((sh) => (sh.includes('g-cell') ? sh : sh.replace(/^<(\w+) /, '<$1 pathLength="1" ')));
-	return `<svg class="glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${shapes.join('')}</svg>`;
+	return `<svg class="glyph g-${name}" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${shapes.join('')}</svg>`;
 }

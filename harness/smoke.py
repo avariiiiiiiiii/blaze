@@ -21,7 +21,11 @@ whose `blaze test` passes `tests` tests. A project is a repository at a pinned c
 arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
 harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
-(bun: bunprep.py, its own build of its C and C++).
+(bun: bunprep.py, its own build of its C and C++). Its `builds` are `blaze build` with `args` in
+the checkout's `dir` (a workspace of its own, as dynamo's Python bindings are), each then running
+`then` (`{target}` is that directory's target/<profile>) to print what it says. `macos` holds the
+fields that are otherwise on macOS, and `excluded` says what the corpus leaves out of a project
+and why (printed with its results), so that the list shrinks.
 
 Groups: `std` (no dependencies: the merge gate's, every pull request), `crates` (from
 crates.io), `projects` (a project's default), and `apps` (the large applications, each in a job
@@ -229,6 +233,10 @@ class Smoke:
                        shown(["blaze", "test", *p], extra, f"harness/smoke/{name}"), spec.get("open"))
 
     def project(self, name, spec):
+        if sys.platform == "darwin":
+            spec = {**spec, **spec.get("macos", {})}
+        for left_out, why in spec.get("excluded", {}).items():
+            print(f"excluded {name}: {left_out}: {why}", flush=True)
         rev = spec["rev"].replace("{blaze}", self.blaze_rev)
         cwd = os.path.join(self.work, "projects", name)
         out_dir = os.path.join(self.work, "out", name)
@@ -265,8 +273,30 @@ class Smoke:
                 args = [a.replace(key, value) for a in args]
             return args
 
+        def judged(step):
+            def judge(code, out):
+                if code != 0:
+                    return f"exit {code}"
+                if "stdout" in step and out != step["stdout"]:
+                    return f"stdout {out!r}, want {step['stdout']!r}"
+                if "contains" in step and step["contains"] not in out:
+                    return f"stdout has no {step['contains']!r}"
+                return None
+            return judge
+
         for profile in self.profiles:
             p = self.profile_args(profile)
+            for i, step in enumerate(spec.get("builds", [])):
+                at = os.path.join(cwd, step.get("dir", "."))
+                built = shown(["blaze", "build", *p, *step.get("args", [])], spec.get("env"), step.get("dir"))
+                self.check(f"{name} {profile} build {i}", [self.blaze, "build", *p, *step.get("args", [])], at, env,
+                           seconds, judged({}), f"{clone} && {built}", spec.get("open"))
+                if "then" in step:
+                    out_of = os.path.join("target", "release" if profile == "release" else "debug")
+                    then = [a.replace("{target}", os.path.join(at, out_of)) for a in fill(step["then"])]
+                    self.check(f"{name} {profile} build {i} then", then, at, env, seconds, judged(step),
+                               f"{clone} && {built} && {shown([a.replace('{target}', out_of) for a in step['then']])}",
+                               spec.get("open"))
             for i, step in enumerate(spec.get("runs", [])):
                 args = [*p, *step.get("select", []), "--", *fill(step["args"])]
                 file = fill([step["file"]])[0] if "file" in step else None
@@ -274,12 +304,8 @@ class Smoke:
                     os.remove(file)
 
                 def ran(code, out, step=step, file=file):
-                    if code != 0:
-                        return f"exit {code}"
-                    if "stdout" in step and out != step["stdout"]:
-                        return f"stdout {out!r}, want {step['stdout']!r}"
-                    if "contains" in step and step["contains"] not in out:
-                        return f"stdout has no {step['contains']!r}"
+                    if why := judged(step)(code, out):
+                        return why
                     if file:
                         if not os.path.isfile(file):
                             return f"it wrote no {file}"

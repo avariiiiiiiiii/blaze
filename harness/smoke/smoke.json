@@ -82,6 +82,44 @@
       "seconds": 18000,
       "runs": [{ "select": ["-p", "bun-exe"], "args": ["-e", "console.log(1 + 2)"], "stdout": "3\n" }],
       "test": ["-p", "bun_semver"]
+    },
+    "dynamo": {
+      "group": "apps",
+      "repo": "ai-dynamo/dynamo",
+      "rev": "0d9c24a8bf6db13c1a1223cf15fcbee9140d1ac3",
+      "note": "NVIDIA Dynamo v1.6.1, as its AGENTS.md builds it, on runners without a GPU: the workspace (`cargo build`; on macOS dynamo-llm without its Linux-only default feature), and the Python bindings, a workspace of their own that maturin builds with cargo, imported. CUDA is loaded at run time (cudarc's fallback-latest) and nixl-sys builds its stubs without NIXL, so the default features build. The build scripts need protoc and libclang (bindgen). The program run is the CPU-only vLLM mocker server.",
+      "apt": ["clang", "cmake", "libclang-dev", "libssl-dev", "pkg-config", "protobuf-compiler"],
+      "brew": ["cmake", "protobuf"],
+      "seconds": 18000,
+      "builds": [
+        { "args": ["--workspace"] },
+        {
+          "dir": "lib/bindings/python",
+          "then": ["python3", "-c", "import glob, importlib.machinery as m, importlib.util as u; p = [f for f in glob.glob('{target}/lib_core.*') if f.endswith(('.so', '.dylib'))][0]; l = m.ExtensionFileLoader('_core', p); s = u.spec_from_loader('_core', l); c = u.module_from_spec(s); l.exec_module(c); print('DistributedRuntime' in dir(c))"],
+          "stdout": "True\n"
+        }
+      ],
+      "runs": [{ "select": ["-p", "dynamo-vllm-mocker-server", "--bin", "dynamo-vllm-mocker-server"], "args": ["--help"], "contains": "CPU-only, Mocker-backed" }],
+      "test": ["-p", "dynamo-tokens", "-p", "dynamo-kv-hashing", "-p", "dynamo-truthy"],
+      "excluded": {
+        "dynamo-llm features cuda, nccl, testing-cuda, testing-nixl (testing-full)": "they need a GPU with CUDA, NCCL or NIXL at build or test time; the runners have none",
+        "lib/bindings/kvbm": "a workspace of its own whose default (block-manager) needs CUDA at run time; not built yet"
+      },
+      "macos": {
+        "builds": [
+          { "args": ["-p", "dynamo-llm", "--no-default-features"] },
+          {
+            "dir": "lib/bindings/python",
+            "then": ["python3", "-c", "import glob, importlib.machinery as m, importlib.util as u; p = [f for f in glob.glob('{target}/lib_core.*') if f.endswith(('.so', '.dylib'))][0]; l = m.ExtensionFileLoader('_core', p); s = u.spec_from_loader('_core', l); c = u.module_from_spec(s); l.exec_module(c); print('DistributedRuntime' in dir(c))"],
+            "stdout": "True\n"
+          }
+        ],
+        "excluded": {
+          "dynamo-llm features cuda, nccl, testing-cuda, testing-nixl (testing-full)": "they need a GPU with CUDA, NCCL or NIXL at build or test time; the runners have none",
+          "lib/bindings/kvbm": "a workspace of its own whose default (block-manager) needs CUDA at run time; not built yet",
+          "dynamo-llm's default feature block-manager, and so `--workspace`": "NIXL, NUMA and O_DIRECT code that dynamo builds on Linux only (its AGENTS.md: dynamo-llm with --no-default-features on macOS)"
+        }
+      }
     }
   }
 }

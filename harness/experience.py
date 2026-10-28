@@ -16,7 +16,8 @@ variable, and reads nothing but what the commands print and leave behind. A step
 run when it is a rough edge a user would trip on:
 
   - a command that exits other than as cargo's does (cargo exits 0 where blaze does not);
-  - `blaze` in anything printed (the program is blaze);
+  - a name blaze no longer has in anything printed (docs/rename.md: `ra-jit`, `RA_JIT_*`, `cargo blaze`;
+    rename: old name);
   - a line that is not cargo's, the program's or the compiler's own, unless the project's
     transcript in `experience/` has it (a new message is looked at before it is accepted);
   - a build slower than cargo's of the same step, by more than `SLACK` (cold, no-op, edit);
@@ -248,6 +249,10 @@ PROJECTS = {
     }, edit=("src/main.rs", '"before"', '"after"'), says=("before", "after"), release=True, macos=True),
 }
 
+# What blaze was called before the rename (#270, docs/rename.md): a message, path or variable
+# that says one is out of date.
+DEAD_NAMES = re.compile(r"ra[-_]jit|RA_JIT|cargo[- ]blaze")  # rename: old name
+
 # cargo's progress lines, whose order a parallel build does not fix.
 PROGRESS = re.compile(r"^\s*(Compiling|Checking|Downloading|Downloaded|Updating|Locking|Adding|Fresh|"
                       r"Blocking|Building|Packaging|Unpacking|Fetching|Documenting|Removed|Updated)\b")
@@ -335,7 +340,7 @@ def blaze_processes():
     for line in out.splitlines():
         pid, _, command = line.strip().partition(" ")
         program = os.path.basename(command.split(" ", 1)[0]) if command else ""
-        if re.fullmatch(r"(cargo-)?(blaze|blaze)(-[\w-]+)?", program):
+        if re.fullmatch(r"(cargo-)?(blaze|ra-jit)(-[\w-]+)?", program):  # rename: old name
             left.append(f"{pid} {command[:160]}")
     return left
 
@@ -420,9 +425,8 @@ def flow(name, spec, work, env):
         if s.code != 0 and s.name not in [ours.name for ours, _ in pairs]:
             rough.append((s.name, f"exit {s.code}", "P0"))
         for line in (s.out + s.err).splitlines():
-            # Directories keep the old name (#270); a word of what it says does not.
-            if re.search(r"(?<![/\w.-])blaze(?![/\w-])", line):
-                rough.append((s.name, f"says blaze: {line.strip()}", "P2"))
+            if DEAD_NAMES.search(line):
+                rough.append((s.name, f"says a name blaze no longer has: {line.strip()}", "P2"))
     for ours, theirs in pairs:
         compiled = lambda step: sorted(l.split()[1] for l in step.err.splitlines() if l.strip().startswith("Compiling "))
         if compiled(ours) and not compiled(theirs) and ours.code == 0:

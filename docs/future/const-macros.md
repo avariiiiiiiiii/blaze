@@ -310,4 +310,14 @@ as a proc-macro crate, on the same command:
   measured per expansion before the experiment is proposed as a default.
 - load of a fresh daemon: both are kept in the store.
 
+Measured with stage 0 (2026-10-28, ix VM, arm64, 16 CPUs, three alternating rounds, a fresh
+`BLAZE_HOME` each): harness/constmacros's derive, against the same derive (same body, taking
+`proc_macro::TokenStream`) as a proc-macro crate of the workspace. Each cell is `blaze run`'s
+time, and both print the same output at every step:
+
+| | cold | warm | the macro's output edited |
+|---|---|---|---|
+| proc-macro crate | 20.15-22.93 s | 0.01 s | 0.97-1.01 s |
+| const macro | 13.71-14.96 s | 0.01-0.03 s | 0.04-0.05 s |
+
 Nothing in this design touches a package that does not declare `const-macros`.

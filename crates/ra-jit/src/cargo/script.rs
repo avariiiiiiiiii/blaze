@@ -211,10 +211,7 @@ pub(crate) fn run_as_cargo_does(
             }
             let script_sandbox::Ran { output, .. } =
                 script_sandbox::run(&running, &plan, Stdio::inherit())?;
-            let unset = match output.status.success() {
-                true => unset_now(&output.stdout, &ran.env, &plan, &declared),
-                false => Vec::new(),
-            };
+            let unset = unset_now(&output.stdout, &ran.env, &plan, &declared);
             let refused = directives::refused(&output.stdout, &directives);
             if unset.is_empty() {
                 std::io::stdout().write_all(&hermetic::for_cargo(&output.stdout))?;
@@ -286,10 +283,10 @@ pub(crate) fn run_as_cargo_does(
         }
         let script_sandbox::Ran { output, reads } =
             script_sandbox::run(&running, &plan, Stdio::inherit())?;
-        let unset = match output.status.success() {
-            true => unset_now(&output.stdout, &ran.env, &plan, &declared),
-            false => Vec::new(),
-        };
+        // A run that failed without what it said it reads (`env::var("X").expect(..)`, or a
+        // download the sandbox refused for want of the local copy `X` names) failed as cargo's
+        // would not: its failure is the one of the run given it.
+        let unset = unset_now(&output.stdout, &ran.env, &plan, &declared);
         let refused = directives::refused(&output.stdout, &directives);
         if unset.is_empty() {
             std::io::stdout().write_all(&output.stdout)?;

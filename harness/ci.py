@@ -63,6 +63,8 @@ HARNESSES = [
     ("core", ["coldbuild.py"], {}, on("linux"), 2),
     # A load refused for configuration must be retried without stopping the daemon (#597).
     ("core", ["loadretry.py"], {}, on("linux", "macos"), 2),
+    # A build script reads the command's environment, not the daemon's (#720).
+    ("core", ["scriptenv.py"], {}, on("linux", "macos"), 2),
     # Its program of writable statics of its own crates on macOS too, where anim's `HOME` was refused.
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),
@@ -155,6 +157,7 @@ FAST = {
     "growth.py": (31, (X64,)),
     "coldbuild.py": (78, (X64,)),
     "loadretry.py": (30, ()),
+    "scriptenv.py": (70, ()),
     "splices.py": (51, ()),
     "live_e2e.py": (16, ()),
     "live_types.py": (9, ()),

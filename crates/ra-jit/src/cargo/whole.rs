@@ -513,6 +513,7 @@ fn checkout(
         cfg_test: unit_tests,
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
+        command_env: BTreeMap::new(),
         whole: true,
     };
     // A worker links its programs where it was started to and builds again only what was

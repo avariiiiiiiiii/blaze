@@ -109,7 +109,7 @@ function narration(pages: Page[], spoken: Map<string, { hash: string; lines: Spo
 	return bakes;
 }
 
-const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css'];
+const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css', 'learn.css'];
 
 type Baked = SnapshotInput['bakes'];
 

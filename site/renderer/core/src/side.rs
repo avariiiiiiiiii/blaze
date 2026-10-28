@@ -4,7 +4,10 @@
 //! - a section is a child of `nav` with `Group {title, order}` and `Icon {name}`;
 //! - a page joins one with `Nav {label, order}`, `Icon` and `(InGroup, nav.<section>)`;
 //! - a `Link {label, href, order}` child of a section is a row that goes elsewhere (another site, or an anchor);
-//! - a page's RFCs (`World::rfcs`, by number) are its row's kids, folded under a caret.
+//! - a page's RFCs (`World::rfcs`, by number) are its row's kids, folded under a caret;
+//! - a page holding a `Course` (the home page) is followed by its lessons, numbered, each with a progress mark that
+//!   client/side.ts fills from the reader's progress;
+//! - a section with `FoldOnPhone` (Reference) starts folded in the phone drawer (client/keep.ts).
 //!
 //! Rows sort by `order` within their section, sections by theirs. Folding is `<details>`, so it works without JS;
 //! client/side.ts remembers what the reader folded, opens the phone drawer, runs the search and the scroll spy.
@@ -19,12 +22,14 @@ use crate::world::{Entity, Id, World};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub label: String,
-    /// A site path (`/install`, `/#goals`) or an outside URL.
+    /// A site path (`/install`, `/#speed`) or an outside URL.
     pub href: String,
     pub icon: String,
     pub order: f64,
     /// An RFC's number, shown before its title (`0001`).
     pub num: Option<String>,
+    /// A lesson row: the lesson's name and its question ids, for its progress mark.
+    pub lesson: Option<(String, String)>,
     pub kids: Vec<Row>,
 }
 
@@ -42,6 +47,8 @@ pub struct Group {
     pub title: String,
     pub icon: String,
     pub order: f64,
+    /// Folded in the phone drawer until the reader opens it.
+    pub phone_fold: bool,
     pub rows: Vec<Row>,
 }
 
@@ -96,6 +103,7 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
                 icon: icon_of(l, "out")?,
                 order: js::to_number(l.value("Link").and_then(|v| v.get("order"))),
                 num: None,
+                lesson: None,
                 kids: Vec::new(),
             });
         }
@@ -106,6 +114,7 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
                 title: field(e, "Group", "title"),
                 icon: icon_of(e, "compass")?,
                 order: js::to_number(e.value("Group").and_then(|v| v.get("order"))),
+                phone_fold: e.has_tag("FoldOnPhone"),
                 rows,
             },
         ));
@@ -131,6 +140,7 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
                 icon: icon_of(re, "file")?,
                 order: 0.0,
                 num: Some(js::pad_zero(&field(re, "Number", "value"), 4)),
+                lesson: None,
                 kids: Vec::new(),
             });
         }
@@ -140,13 +150,34 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
             icon: icon_of(e, "file")?,
             order: js::to_number(nav_value.get("order")),
             num: None,
+            lesson: None,
             kids,
         };
         let (_, g) = groups
             .iter_mut()
             .find(|(path, _)| path == section)
             .ok_or_else(|| format!("{}: (InGroup, {section}) is not a section of nav", e.path))?;
+        // The page holding the course map is followed by its lessons, numbered in course order.
+        let mut lessons = Vec::new();
+        if let Some(c) = world.course_in(p.node) {
+            for (i, l) in world.lessons(world.course_source(c)?).into_iter().enumerate() {
+                let le = world.get(l);
+                let lp = page_of(l)
+                    .ok_or_else(|| format!("{}: a Lesson that is not a page", le.path))?;
+                let (_, quizzes) = crate::render::lesson_parts(world, l);
+                lessons.push(Row {
+                    label: field(le, "Title", "text"),
+                    href: lp.url.clone(),
+                    icon: String::new(),
+                    order: row.order + (i + 1) as f64 / 1000.0,
+                    num: Some((i + 1).to_string()),
+                    lesson: Some((le.name.clone(), quizzes.join(" "))),
+                    kids: Vec::new(),
+                });
+            }
+        }
         g.rows.push(row);
+        g.rows.extend(lessons);
     }
     let mut out: Vec<Group> = groups.into_iter().map(|(_, g)| g).collect();
     for g in &mut out {
@@ -219,6 +250,14 @@ fn row_html(row: &Row, page: &Page, served: &Served, depth: usize) -> String {
         Some(n) => format!("<span class=\"num\">{}</span>", esc(n)),
         None => String::new(),
     };
+    // A lesson's progress mark stands where a row's icon is (client/side.ts sets data-state).
+    let (lead, lesson) = match &row.lesson {
+        Some((name, quizzes)) => (
+            "<span class=\"mark\" aria-hidden=\"true\"></span>".to_string(),
+            format!(" data-lesson=\"{}\" data-quizzes=\"{}\"", esc(name), esc(quizzes)),
+        ),
+        None => (svg(&row.icon), String::new()),
+    };
     let kids = if row.kids.is_empty() {
         String::new()
     } else {
@@ -230,13 +269,12 @@ fn row_html(row: &Row, page: &Page, served: &Served, depth: usize) -> String {
         )
     };
     format!(
-        "<div class=\"rowwrap{}\"><a class=\"row\" href=\"{}\" title=\"{}\"{}{}>{}{num}<span class=\"label\">{}</span>{}</a>{kids}</div>",
+        "<div class=\"rowwrap{}\"><a class=\"row\" href=\"{}\" title=\"{}\"{}{}{lesson}>{lead}{num}<span class=\"label\">{}</span>{}</a>{kids}</div>",
         if depth > 0 { " kid" } else { "" },
         esc(&served.href(&row.href)),
         esc(&row.label),
         if here { " aria-current=\"page\"" } else { "" },
         if out { " rel=\"noopener\"" } else { "" },
-        svg(&row.icon),
         esc(&row.label),
         if out {
             svg("out").replace("class=\"icon\"", "class=\"icon outmark\"")
@@ -254,9 +292,10 @@ pub fn sidebar(groups: &[Group], page: &Page, served: &Served, world: &World, si
             let rows: String = g.rows.iter().map(|r| row_html(r, page, served, 0)).collect();
             let has = g.rows.iter().any(|r| holds(r, &page.url));
             format!(
-                "<details class=\"sec\" open data-sec=\"{}\"{}><summary class=\"sechead\">{}<span>{}</span>{}</summary><div class=\"items\">{rows}</div></details>",
+                "<details class=\"sec\" open data-sec=\"{}\"{}{}><summary class=\"sechead\">{}<span>{}</span>{}</summary><div class=\"items\">{rows}</div></details>",
                 esc(&g.key),
                 if has { " data-here=\"\"" } else { "" },
+                if g.phone_fold { " data-phone-fold=\"\"" } else { "" },
                 svg(&g.icon),
                 esc(&g.title),
                 svg("caret").replace("class=\"icon\"", "class=\"icon chev\"")

@@ -10,7 +10,12 @@
  * - Search: the pill (and ⌘K, Ctrl K or /) opens a dialog over `search.json` (gen/build.ts writes it: one entry per
  *   page and per section, with its text); every word typed must appear, title and heading matches rank first.
  * - The outline: the section being read is marked, as the ix docs' "On this page" does.
+ *
+ * The sidebar outlives the client router's swaps (client/nav.ts), so everything but the outline is set up once; the
+ * outline is the page's own and is set up again on every page (client/lib/page.ts), and a swap closes the drawer.
  */
+
+import { PAGE, onPage } from './lib/page';
 
 type Entry = { u: string; t: string; h: string; x: string };
 
@@ -162,6 +167,8 @@ function drawer() {
 	document.addEventListener('keydown', (e) => {
 		if (e.key === 'Escape' && side.classList.contains('open')) close();
 	});
+	// A link followed from the drawer: the next page shows with the drawer shut, as after a load.
+	addEventListener(PAGE, () => side.classList.remove('open'));
 }
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -287,10 +294,8 @@ function search() {
 		} else if (e.key === 'Enter') {
 			e.preventDefault();
 			const a = shown[sel];
-			if (a) {
-				dialog.close();
-				location.href = a.href;
-			}
+			// A click, so the router takes it (the link's own click listener closes the dialog).
+			a?.click();
 		}
 	});
 	dialog.addEventListener('click', (e) => {
@@ -307,7 +312,7 @@ function search() {
 	});
 }
 
-function spy() {
+function spy(signal: AbortSignal) {
 	const links = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[href^="#"]')];
 	if (links.length === 0) return;
 	const heads = links.map((a) => document.getElementById(decodeURIComponent(a.hash.slice(1))));
@@ -320,7 +325,8 @@ function spy() {
 		});
 		links.forEach((a, i) => a.classList.toggle('cur', i === cur));
 	};
-	addEventListener('scroll', () => (frame ||= requestAnimationFrame(mark)), { passive: true });
+	addEventListener('scroll', () => (frame ||= requestAnimationFrame(mark)), { passive: true, signal });
+	signal.addEventListener('abort', () => cancelAnimationFrame(frame));
 	mark();
 }
 
@@ -328,4 +334,4 @@ folds();
 glide();
 drawer();
 search();
-spy();
+onPage(spy);

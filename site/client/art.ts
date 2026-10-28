@@ -9,7 +9,11 @@
  * - It draws only while its goal is open, on screen and the tab visible, at 30 frames a second; opening a goal starts
  *   its story from the beginning. Under prefers-reduced-motion it draws one still frame, a moment that tells it.
  * - Cells sit on whole device pixels (the canvas is sized at the device pixel ratio), so they stay crisp.
+ * - Set up again on every page (client/lib/page.ts); leaving the page stops each piece's observers, listeners and
+ *   animation frame.
  */
+
+import { onPage } from './lib/page';
 
 type Inks = { ink: string; mid: string; faint: string; fire: string };
 
@@ -376,11 +380,11 @@ function inks(el: Element): Inks {
 	return { ink: v('--art-ink', '#ebeae6'), mid: v('--art-mid', '#878684'), faint: v('--art-faint', '#57575a'), fire: v('--art-fire', '#e0461a') };
 }
 
-function mount(el: HTMLElement) {
+function mount(el: HTMLElement, signal: AbortSignal): () => void {
 	const piece = PIECES[el.dataset.piece ?? ''];
 	const canvas = el.querySelector('canvas');
 	const ctx = canvas?.getContext('2d');
-	if (!piece || !canvas || !ctx) return;
+	if (!piece || !canvas || !ctx) return () => {};
 	const goal = el.closest('details');
 	let k = inks(el);
 	let clock = 0;
@@ -422,30 +426,50 @@ function mount(el: HTMLElement) {
 			raf = 0;
 		}
 	};
-	new IntersectionObserver((entries) => {
+	const io = new IntersectionObserver((entries) => {
 		seen = entries.some((e) => e.isIntersecting);
 		sync();
-	}).observe(el);
-	new ResizeObserver(paint).observe(el);
-	goal?.addEventListener('toggle', () => {
-		if (goal.open) {
-			clock = 0;
+	});
+	io.observe(el);
+	const ro = new ResizeObserver(paint);
+	ro.observe(el);
+	goal?.addEventListener(
+		'toggle',
+		() => {
+			if (goal.open) {
+				clock = 0;
+				paint();
+			}
+			sync();
+		},
+		{ signal },
+	);
+	document.addEventListener('visibilitychange', sync, { signal });
+	dark.addEventListener(
+		'change',
+		() => {
+			k = inks(el);
 			paint();
-		}
-		sync();
-	});
-	document.addEventListener('visibilitychange', sync);
-	dark.addEventListener('change', () => {
-		k = inks(el);
-		paint();
-	});
-	still.addEventListener('change', () => {
-		paint();
-		sync();
-	});
+		},
+		{ signal },
+	);
+	still.addEventListener(
+		'change',
+		() => {
+			paint();
+			sync();
+		},
+		{ signal },
+	);
+	return () => {
+		io.disconnect();
+		ro.disconnect();
+		cancelAnimationFrame(raf);
+		raf = 0;
+	};
 }
 
-for (const el of document.querySelectorAll<HTMLElement>('.art[data-piece]')) mount(el);
-
-// A module, so its names stay its own (the other client scripts share the global scope under tsc).
-export {};
+onPage((signal) => {
+	const stops = [...document.querySelectorAll<HTMLElement>('.art[data-piece]')].map((el) => mount(el, signal));
+	return () => stops.forEach((stop) => stop());
+});

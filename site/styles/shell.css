@@ -178,16 +178,22 @@ main.wide { max-width: none; }
 	.side, .sechead .chev, .fold > .caret .icon, .navlist .glide-hov { transition: none; }
 }
 
-/* Moving between pages: a real load, made to feel like the ix docs' client-side routing. Same-origin navigations are
-   a view transition (Chrome and Edge 126+, Safari 18.2+; elsewhere a plain load): the sidebar and the phone bar are
-   their own layers and swap in place, so only the page column cross-fades, quickly. */
+/* Moving between pages. The client router (client/nav.ts) swaps the page column without a load, inside a
+   same-document view transition: the sidebar and the phone bar are their own layers and stay put, and only the page
+   column cross-fades, quickly. The few navigations it leaves to the browser (a fallback, /updates with Turnstile) are
+   the same cross-fade as a cross-document view transition (Chrome and Edge 126+, Safari 18.2+; elsewhere a plain
+   load). Neither runs under prefers-reduced-motion (nav.ts skips its transition). */
 @view-transition { navigation: auto; }
 .side { view-transition-name: side; }
 .mbar { view-transition-name: mbar; }
 ::view-transition-group(side), ::view-transition-group(mbar),
 ::view-transition-new(side), ::view-transition-new(mbar) { animation: none; }
 ::view-transition-old(side), ::view-transition-old(mbar) { display: none; }
-::view-transition-old(root), ::view-transition-new(root) { animation-duration: 150ms; }
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: 120ms; }
 @media (prefers-reduced-motion: reduce) {
 	@view-transition { navigation: none; }
 }
+/* The router moves focus to the new page's title for screen readers; it is not a control, so no ring. A slow fetch
+   shows the progress cursor. */
+main h1[tabindex="-1"]:focus { outline: none; }
+html.nav-wait, html.nav-wait * { cursor: progress; }

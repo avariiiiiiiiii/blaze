@@ -37,7 +37,11 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `(InGroup, nav.x)`; `renderer/core/src/side.rs` draws the sidebar, crumb, pager and outline from them, in the ix
   docs' layout.
 - `client/`: browser scripts (the sidebar's folds, drawer, search over `dist/search.json` and outline in `side.ts`;
-  comment enhancements, the signup form, /bench, copy buttons).
+  comment enhancements, the signup form, /bench, copy buttons). `nav.ts` is the client router: a click on a link to
+  another page fetches it (fetched ahead on hover) and swaps only the page column, the head's tags and the sidebar's
+  open row, without a load, as the ix docs move between pages; anything unexpected falls back to a plain load. Each
+  page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
+  next.
 
 The flecs skill (`.claude/skills/flecs/`) has the script syntax and its traps.
 

@@ -666,7 +666,9 @@ pub fn render(
     } else {
         ""
     };
-    // Every page has the sidebar's script (folds, the phone drawer, search, the outline's scroll spy).
+    // Every page has the client router (moving between pages without a load) and the sidebar's script (folds, the
+    // phone drawer, search, the outline's scroll spy).
+    ctx.script("nav");
     ctx.script("side");
     let scripts = ctx
         .scripts
@@ -679,13 +681,6 @@ pub fn render(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // Hovering a link to another page of the site prerenders it (Chromium's Speculation Rules; others ignore the
-    // script), so the click shows a page that is already loaded, as the ix docs' client-side routing feels. Not the
-    // worker's /api and /auth routes, which act.
-    let base = &s.served.base;
-    let extra_head = format!(
-        "<script type=\"speculationrules\">{{\"prerender\":[{{\"where\":{{\"and\":[{{\"href_matches\":\"{base}/*\"}},{{\"not\":{{\"href_matches\":\"{base}/api/*\"}}}},{{\"not\":{{\"href_matches\":\"{base}/auth/*\"}}}}]}},\"eagerness\":\"moderate\"}}]}}</script>"
-    );
     let doc_attr =
         if discussable { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
     let say_intro = if audio.is_some() {
@@ -739,7 +734,6 @@ pub fn render(
 {description}
 {canonical}
 <link rel=\"stylesheet\" href=\"{css}\" />
-{extra_head}
 {scripts}
 </head>
 <body>

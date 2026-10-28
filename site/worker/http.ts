@@ -1,4 +1,5 @@
 /** Small helpers shared by the routes: cookies, origin checks, redirects, tokens. */
+import buildJson from '../.gen/build.json';
 import { COOKIE_PATH } from './base';
 
 export function json(body: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -153,9 +154,7 @@ const TURNSTILE = 'https://challenges.cloudflare.com';
 export function csp({ turnstile = false } = {}): string {
 	return [
 		"default-src 'self'",
-		// 'inline-speculation-rules' lets in only the page's <script type="speculationrules"> (hover prerendering),
-		// never inline code.
-		turnstile ? `script-src 'self' 'inline-speculation-rules' ${TURNSTILE}` : "script-src 'self' 'inline-speculation-rules'",
+		turnstile ? `script-src 'self' ${TURNSTILE}` : "script-src 'self'",
 		"style-src 'self'",
 		"img-src 'self' https://avatars.githubusercontent.com https://github.com",
 		"connect-src 'self'",
@@ -168,9 +167,18 @@ export function csp({ turnstile = false } = {}): string {
 	].join('; ');
 }
 
+/**
+ * The build of the client scripts and styles the site's pages run with (gen/build.ts). Sent with every page as
+ * `x-blaze-assets`: the client router (client/nav.ts) swaps a page in only when it matches its own, so after a deploy
+ * an open tab's next click is a load.
+ */
+export const ASSETS_HEADER = 'x-blaze-assets';
+export const ASSETS = buildJson.assets;
+
 /** A static file (the ASSETS binding) with the headers every page gets: the CSP above, nosniff, the referrer policy. */
 export function assetHeaders(res: Response): Response {
 	const out = new Response(res.body, res);
+	out.headers.set(ASSETS_HEADER, ASSETS);
 	out.headers.set('content-security-policy', csp());
 	out.headers.set('x-content-type-options', 'nosniff');
 	out.headers.set('referrer-policy', 'strict-origin-when-cross-origin');

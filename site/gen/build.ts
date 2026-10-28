@@ -18,7 +18,8 @@
  *      site.wasm, site.cbor   the renderer and the snapshot (worker/renderer.ts)
  *      pages.json             every page: [{url, file, doc, discussable}] (what the worker routes)
  *      discussable.json       doc -> title and each block's text (what comments may attach to)
- *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key)
+ *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key), and
+ *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts)
  *      spoken.json            every page's spoken lines and their hash (the input of audio/generate.py)
  *      site.json              {origin, base}: where the site is served (`Served` on `site` in content/site.flecs)
  *
@@ -31,7 +32,7 @@
  *   bun gen/build.ts --watch   # again on every change under content/, gen/, client/, styles/
  */
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
 import { benchHistory } from './bench';
@@ -237,7 +238,24 @@ async function build() {
 	}
 
 	const client = readdirSync(path.join(root, 'client')).filter((f) => f.endsWith('.ts')).map((f) => path.join(root, 'client', f));
-	const bundled = await Bun.build({ entrypoints: client, outdir: path.join(dist, 'js'), minify: true, target: 'browser' });
+	// What the pages run and look with: the client router swaps in a page only when its build had the same (nav.ts).
+	const assetsHash = createHash('sha256');
+	for (const dir of ['client', 'styles', 'gen/bench']) {
+		for (const f of (readdirSync(path.join(root, dir), { recursive: true }) as string[]).sort()) {
+			const file = path.join(root, dir, f);
+			if (statSync(file).isFile()) assetsHash.update(`${dir}/${f}`).update(readFileSync(file));
+		}
+	}
+	const assets = assetsHash.digest('hex').slice(0, 16);
+	// `root` keeps the output flat (dist/js/<name>.js): bench.ts imports from gen/, which would otherwise widen it to site/.
+	const bundled = await Bun.build({
+		entrypoints: client,
+		root: path.join(root, 'client'),
+		outdir: path.join(dist, 'js'),
+		minify: true,
+		target: 'browser',
+		define: { BLAZE_ASSETS: JSON.stringify(assets) },
+	});
 	if (!bundled.success) throw new AggregateError(bundled.logs, 'client bundle failed');
 
 	rmSync(path.join(dist, 'rfcs'), { recursive: true, force: true });
@@ -267,7 +285,7 @@ async function build() {
 	const hash = createHash('sha256');
 	for (const f of ['site.cbor', 'site.wasm']) hash.update(f).update(readFileSync(path.join(gen, f)));
 	for (const f of readdirSync(path.join(dist, 'js')).sort()) hash.update(f).update(readFileSync(path.join(dist, 'js', f)));
-	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16) }));
+	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets }));
 	const narrated = Object.keys(audio).length ? `, ${Object.keys(audio).length} with audio` : '';
 	console.log(`built ${pages.length} pages${narrated} (snapshot ${snap.length} bytes) in ${Math.round(performance.now() - t0)} ms`);
 }

@@ -1,8 +1,8 @@
-//! blaze's own answers to rustc's questions, from what it knows of a release of rustc and of
-//! the targets that release has: no rustc runs. The data of each release is what that rustc
-//! printed for every target blaze has (`harness/answers.py --write`), and the cfgs that follow
-//! from the arguments are added here, as rustc adds them. A question this does not understand
-//! whole is answered `None`, and rustc is asked.
+//! blaze's answers to rustc's questions, from what it knows of its own release of rustc and of
+//! the targets that release has: no rustc runs. The data of the release is what its rustc
+//! printed for every target blaze has (`harness/answers.py --write`, when the pin moves), and
+//! the cfgs that follow from the arguments are added here, as rustc adds them. A question this
+//! does not understand whole is answered `None`, and fails.
 
 use std::{
     collections::BTreeMap,
@@ -136,45 +136,24 @@ fn releases() -> &'static [Release] {
     })
 }
 
-/// Whether `sysroot` has the compiler's library, which is what makes it a toolchain. rustc
-/// loads it from `lib/librustc_driver-*`, and on Windows, where a DLL is found beside the
-/// executable, from `bin/rustc_driver-*.dll`.
-fn has_driver(sysroot: &Path) -> bool {
-    [("lib", "librustc_driver-"), ("bin", "rustc_driver-")].into_iter().any(|(dir, prefix)| {
-        std::fs::read_dir(sysroot.join(dir)).is_ok_and(|mut found| {
-            found.any(|it| {
-                it.is_ok_and(|it| it.file_name().to_str().is_some_and(|it| it.starts_with(prefix)))
-            })
-        })
-    })
-}
-
-/// The toolchain `rustc` is of, as far as blaze can tell without running it.
+/// blaze's own release, the one every rustc is answered as: its data, and the host this blaze
+/// runs on. Where its files are ([`sysroot`]) is looked for only when asked.
 struct Toolchain {
-    sysroot: PathBuf,
-    host: String,
+    host: &'static str,
     release: &'static Release,
 }
 
 impl Toolchain {
-    /// From rustup's records in the sysroot: the release of rustc and the host it runs on.
-    /// rustc finds its sysroot by where its library is, which is beside it.
-    fn of(rustc: &Path) -> Option<Toolchain> {
-        let sysroot = rustc.parent()?.parent()?.to_owned();
-        if !has_driver(&sysroot) {
-            return None;
-        }
-        let rustlib = sysroot.join("lib").join("rustlib");
-        let host = std::fs::read_dir(&rustlib).ok()?.flatten().find_map(|it| {
-            it.file_name().to_str()?.strip_prefix("manifest-rustc-").map(str::to_owned)
-        })?;
-        let manifest =
-            std::fs::read_to_string(rustlib.join("multirust-channel-manifest.toml")).ok()?;
-        let (_, rest) = manifest.split_once("\n[pkg.rustc]\nversion = \"")?;
-        let (version, _) = rest.split_once('"')?;
+    fn ours() -> Option<Toolchain> {
+        let version = crate::cargo::toolchain::ours_says();
         let release = releases().iter().find(|it| it.version == version)?;
-        Some(Toolchain { sysroot, host, release })
+        Some(Toolchain { host: crate::cargo::toolchain::host()?, release })
     }
+}
+
+/// Where blaze's release is, found with nothing run.
+fn sysroot() -> Option<PathBuf> {
+    crate::cargo::toolchain::sysroot()
 }
 
 /// What `cargo --version` says after `cargo ` for the toolchain at `sysroot`, from rustup's
@@ -406,10 +385,9 @@ fn is_plain_cfg(cfg: &str) -> bool {
     plain_name && !builtin && plain_value
 }
 
-/// What `rustc` (the toolchain's executable) prints for `args` with `stdin`, with the
-/// variables `var` reads; `None` for what this does not answer.
+/// What rustc of blaze's release prints for `args` with `stdin`, with the variables `var`
+/// reads; `None` for what this does not answer.
 pub(super) fn answer(
-    rustc: &Path,
     args: &[OsString],
     stdin: &[u8],
     var: &dyn Fn(&str) -> Option<OsString>,
@@ -418,11 +396,7 @@ pub(super) fn answer(
         return None;
     }
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
-    // A driver of rustc's (clippy's) may answer otherwise.
-    if rustc.file_stem()? != "rustc" {
-        return None;
-    }
-    let toolchain = Toolchain::of(rustc)?;
+    let toolchain = Toolchain::ours()?;
     let release = toolchain.release;
     // Whether unstable features are allowed: always on a nightly (the toolchain blaze is
     // pinned to), unless `RUSTC_BOOTSTRAP=-1` makes it act as a stable release; a list of
@@ -438,7 +412,7 @@ pub(super) fn answer(
     {
         let verbose = args.iter().any(|it| matches!(*it, "-v" | "-vV" | "--verbose"));
         let text = if verbose {
-            release.verbose.replace("{host}", &toolchain.host)
+            release.verbose.replace("{host}", toolchain.host)
         } else {
             format!("rustc {}\n", release.version)
         };
@@ -448,14 +422,14 @@ pub(super) fn answer(
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
-    let tuple = given.target.unwrap_or(&toolchain.host);
+    let tuple = given.target.unwrap_or(toolchain.host);
     let target = release.targets.get(tuple)?;
     let mut out = String::new();
     for print in &given.prints {
         match *print {
-            "sysroot" => out += &format!("{}\n", toolchain.sysroot.to_str()?),
+            "sysroot" => out += &format!("{}\n", sysroot()?.to_str()?),
             "target-libdir" => {
-                let dir = toolchain.sysroot.join("lib/rustlib").join(tuple).join("lib");
+                let dir = sysroot()?.join("lib/rustlib").join(tuple).join("lib");
                 out += &format!("{}\n", dir.to_str()?);
             }
             "host-tuple" => out += &format!("{}\n", toolchain.host),
@@ -505,7 +479,7 @@ pub(super) fn answer(
                     }
                     let cpu = match given.target_cpu {
                         // LLVM's host CPU, for any target of the host's architecture.
-                        Some("native") if arch(tuple) == arch(&toolchain.host) => {
+                        Some("native") if arch(tuple) == arch(toolchain.host) => {
                             let (name, features) = hir_ty_codegen::host_cpu()?;
                             Some((name, Some(features)))
                         }
@@ -561,7 +535,7 @@ pub(super) fn answer(
                     && nightly
                     && APPLE.iter().all(|it| var(it).is_none()) =>
             {
-                out += target.target_spec_json.get(&toolchain.host)?;
+                out += target.target_spec_json.get(toolchain.host)?;
             }
             _ => return None,
         }
@@ -572,27 +546,6 @@ pub(super) fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The compiler's library is beside rustc on Windows and in `lib` elsewhere: a sysroot with
-    /// neither is no toolchain.
-    #[test]
-    fn a_toolchain_has_the_compilers_library_in_lib_or_beside_rustc() {
-        let dir = std::env::temp_dir().join(format!("blaze-driver-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sysroot = |name: &str| {
-            let sysroot = dir.join(name);
-            std::fs::create_dir_all(sysroot.join("lib")).unwrap();
-            std::fs::create_dir_all(sysroot.join("bin")).unwrap();
-            sysroot
-        };
-        let (unix, windows, neither) = (sysroot("unix"), sysroot("windows"), sysroot("neither"));
-        std::fs::write(unix.join("lib/librustc_driver-0123abcd.so"), b"").unwrap();
-        std::fs::write(windows.join("bin/rustc_driver-0123abcd.dll"), b"").unwrap();
-        std::fs::write(neither.join("lib/libstd-0123abcd.so"), b"").unwrap();
-        let found = [&unix, &windows, &neither].map(|it| has_driver(it));
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(found, [true, true, false]);
-    }
 
     #[test]
     fn cfgs_given() {

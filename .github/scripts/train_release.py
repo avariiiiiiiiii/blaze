@@ -2,7 +2,7 @@
 """train_release.py: the release train's release, in two steps, once main is green.
 
     train_release.py prepare [--push]   (train.yaml, after a green train)
-    train_release.py tag [--push]       (pgo.yaml, after it pinned the profiles)
+    train_release.py tag [--push]       (prepare --push runs it; PGO is off for now)
 
 Versions are dated, and still semver, as cargo and crates.io need: `0.YYYYMMDD.N`, N counting
 the releases of that day (UTC) from 0, so 0.20261026.0, then 0.20261026.1; the tag is
@@ -30,7 +30,7 @@ Without --push nothing leaves the checkout: the commit or tag is made and shown.
 (GH_TOKEN with contents: write and actions: write), and for `prepare` nix (the flake's dev shell
 runs cargo and nix/unit_graph.py). Python 3.11+, stdlib.
 """
-import argparse, asyncio, datetime, json, os, re, sys, tomllib
+import argparse, asyncio, datetime, os, re, sys, tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -151,30 +151,14 @@ async def push_main(*, step):
             await asyncio.sleep(10 * attempt)
 
 
-async def last_pgo_since(commit):
-    """The pgo workflow's last finished run on main after `commit`, as (conclusion, url), or None."""
-    stamp = int(await run("git", "log", "-1", "--format=%ct", commit, step="the release commit's date"))
-    when = datetime.datetime.fromtimestamp(stamp, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S")
-    runs = json.loads(await run("gh", "run", "list", "-R", REPO, "-w", "pgo.yaml", "-b", "main", "-L", "20",
-                                "--json", "conclusion,status,createdAt,url", step="the pgo workflow's runs"))
-    after = [r for r in runs if r["createdAt"][:19] >= when]
-    if any(r["status"] != "completed" for r in after):
-        return None
-    done = [r for r in after if r["conclusion"] not in ("cancelled", "skipped")]
-    return (done[0]["conclusion"], done[0]["url"]) if done else None
-
 
 async def prepare(args):
     version, base, waiting = await state()
     summary = []
     if waiting:
-        pgo = await last_pgo_since(waiting)
-        said = f"v{version} (release commit {waiting[:10]}) waits for the pgo workflow to pin its profiles"
-        if pgo and pgo[0] != "success":
-            raise StepFailed(f"{said}, and its last run failed: {pgo[1]}. Fix it and run pgo.yaml again; "
-                             "its pin job tags the release")
-        print(said, flush=True)
-        return [said]
+        # A release commit no tag has yet (one made while PGO gated releases): tag it now.
+        print(f"v{version} (release commit {waiting[:10]}) has no tag yet", flush=True)
+        return await tag(args)
     titles = await changes(base)
     if not titles:
         print(f"nothing to release: no change since {base} but the bots' own", flush=True)
@@ -204,8 +188,10 @@ async def prepare(args):
     summary += [f"release commit for v{new}: {len(titles)} changes since {base}"]
     if args.push:
         await push_main(step="push the release commit")
-        await run("gh", "workflow", "run", "pgo.yaml", "-R", REPO, "--ref", "main", step="dispatch pgo.yaml")
-        summary.append("pushed to main; pgo.yaml dispatched, and its pin job tags the release")
+        # PGO is off for now (release.yaml builds with --no-pgo): the release commit is tagged
+        # here, not by pgo.yaml's pin job.
+        summary.append("pushed to main")
+        summary += await tag(args)
     return summary
 
 

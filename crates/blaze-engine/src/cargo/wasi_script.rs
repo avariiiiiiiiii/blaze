@@ -126,7 +126,6 @@ fn not_built_of(module: &Path) -> PathBuf {
 pub(crate) fn compile(
     mode: Mode,
     package: &str,
-    rustc: &OsStr,
     args: &[String],
     cwd: &Path,
     source: &Path,
@@ -136,7 +135,7 @@ pub(crate) fn compile(
     let module = module_of(exe);
     let not_built = not_built_of(&module);
     _ = std::fs::remove_file(&not_built);
-    let Err(why) = own_script::compile_wasi(rustc, args, cwd, source, &module, dir) else {
+    let Err(why) = own_script::compile_wasi(args, cwd, source, &module, dir) else {
         return Ok(());
     };
     _ = std::fs::remove_file(&module);
@@ -637,7 +636,7 @@ mod running {
         for (name, value) in &env {
             key.field(name.as_bytes()).field(&text(value.as_bytes()));
         }
-        let sysroot = script::sysroot_of(plan.env());
+        let sysroot = script::sysroot_of();
         key.field(sysroot.as_deref().map(keyed::toolchain).unwrap_or_default().as_bytes());
         let path = plan.env().iter().find(|it| it.0 == "PATH").map(|it| it.1.as_str());
         let var = |name: &str| plan.env().iter().find(|it| it.0 == name).map(|it| it.1.clone());

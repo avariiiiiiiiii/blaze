@@ -19,7 +19,7 @@ experimental = ["sandboxed-tests"]
 build-script-env = ["LLVM_SYS_231_PREFIX"]
 
 [workspace.package]
-version = "0.20261027.0"
+version = "0.20261028.0"
 rust-version = "1.101"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -94,6 +94,8 @@ blaze-units = { path = "crates/blaze-units" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-tree = { path = "crates/blaze-tree" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
+blaze-protocol = { path = "crates/blaze-protocol" }
+blaze-ui = { path = "crates/blaze-ui" }
 hir-ide = { path = "crates/hir-ide", version = "0.0.0" }
 ide-db = { path = "crates/ide-db", version = "0.0.0" }
 ide-diagnostics = { path = "crates/ide-diagnostics", version = "0.0.0" }

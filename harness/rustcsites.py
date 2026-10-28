@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""rustcsites.py: the places in crates/ that start rustc, rustdoc or cargo, or read which one
-to start, counted per file against norustc/sites.json. One more in a file fails: blaze is to
-run no rustc (docs/no-rustc.md), so no new place may start one, and a place that goes lowers
-the count.
+"""rustcsites.py: the places in crates/ that start rustc, rustdoc, cargo or rustup, or read
+which one to start, counted per file against norustc/sites.json. One more in a file fails:
+blaze is to run no rustc (docs/no-rustc.md), so no new place may start one, and a place that
+goes lowers the count.
 
     rustcsites.py [--record]
 
@@ -14,8 +14,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SITES = os.path.join(HERE, "norustc", "sites.json")
 PLACE = re.compile(
-    r"Command::new\([^)]*(rustc|rustdoc|cargo)"
-    r"|toolchain::command\([^,]*(rustc|rustdoc|cargo)"
+    r"Command::new\([^)]*(rustc|rustdoc|cargo|rustup)"
+    r"|toolchain::command\([^,]*(rustc|rustdoc|cargo|rustup)"
     r"|var(_os)?\(\"(RUSTC|RUSTDOC|CARGO)\"\)"
     r"|MetadataCommand::new\(\)"
     r"|\.tool\(Tool::(Rustc|Cargo)",
@@ -60,9 +60,9 @@ def main():
     for line in more:
         print(f"NEW: {line}")
     if more:
-        print("a new place starts rustc, rustdoc or cargo: docs/no-rustc.md says why that is refused")
+        print("a new place starts rustc, rustdoc, cargo or rustup: docs/no-rustc.md says why that is refused")
         sys.exit(1)
-    print(f"{sum(counts.values())} places start rustc, rustdoc or cargo, none new")
+    print(f"{sum(counts.values())} places start rustc, rustdoc, cargo or rustup, none new")
 
 
 if __name__ == "__main__":

@@ -273,21 +273,21 @@ Paths are under `crates/`; line numbers are of 41e7906192.
 |---|---|---|
 | `hir-ty-codegen/mod.rs:149` `NoSymbol`, `:152` `Private` | leaves a function to rustc's copy because rustc exported no symbol blaze's could replace | every build; most of the functions left to rustc |
 | `hir-ty-codegen/mod.rs:772` and the reasons of [support.md](support.md#language) | leaves a function blaze cannot compile to rustc's copy | every build |
-| `blaze/src/main.rs:3300` `rustc_symbols`, `blaze/src/symbols.rs` | reads rustc's symbol names from its rlibs | every build |
-| `blaze/src/main.rs:1592` `links_core`, `blaze/src/cargo/plan.rs` | links with rustc's recorded link line, ahead of its rlibs and the sysroot's | every full link |
+| `blaze-engine/src/lib.rs:3300` `rustc_symbols`, `blaze/src/symbols.rs` | reads rustc's symbol names from its rlibs | every build |
+| `blaze-engine/src/lib.rs:1592` `links_core`, `blaze/src/cargo/plan.rs` | links with rustc's recorded link line, ahead of its rlibs and the sysroot's | every full link |
 | `blaze/src/weaken.rs` | makes rustc's Mach-O objects weak so blaze's win | every full link on macOS |
-| `blaze/src/main.rs:2720` `rustcs_to_patch`, `hir-ty-codegen/patch.rs:948` `Base::of_rustc` | splices the first edits into rustc's executable (#11) | the first edits after a cold build, unless `BLAZE_RUSTC_BASE=0` |
+| `blaze-engine/src/lib.rs:2720` `rustcs_to_patch`, `hir-ty-codegen/patch.rs:948` `Base::of_rustc` | splices the first edits into rustc's executable (#11) | the first edits after a cold build, unless `BLAZE_RUSTC_BASE=0` |
 | `blaze/src/cargo/state.rs:1071` `sysroot_libraries` | asks rustc where the sysroot's rlibs are | the first build |
 
 **Loading the workspace** (steps B, I, J)
 
 | Where | What it does | When |
 |---|---|---|
-| `blaze/src/main.rs:2261` `ProjectWorkspace::load` | `cargo metadata`, plus rustc's `-vV`, `--print sysroot`, `--print cfg`, `--print target-spec-json` through `cargo rustc --print` (`crates/project-model/src/toolchain_info/`) | every load: the daemon's workers and spares, and each doctest process; since B, blaze answers them (`answers/own.rs`); the `cargo metadata` of the sysroot's `library/` (rust-analyzer's `Sysroot::load_workspace`, two per load and per unit load of a build script or proc macro) is blaze-metadata's since 2026-10-27 (`cargo/metadata.rs` `library`); since 2026-10-27 too no cargo runs for `cargo --version`, `cargo config get --format toml --show-origin` (`cargo_config_file.rs`) or `cargo rustc --print cfg` / `target-spec-json`: `answers/cargo.rs` answers them with blaze-manifest's configuration (`config/print.rs` for the flags cargo hands rustc), held equal to cargo's by `resolve.py toolchain` |
-| `blaze/src/main.rs:2272` | asks rustc for the target triple | every load |
+| `blaze-engine/src/lib.rs:2261` `ProjectWorkspace::load` | `cargo metadata`, plus rustc's `-vV`, `--print sysroot`, `--print cfg`, `--print target-spec-json` through `cargo rustc --print` (`crates/project-model/src/toolchain_info/`) | every load: the daemon's workers and spares, and each doctest process; since B, blaze answers them (`answers/own.rs`); the `cargo metadata` of the sysroot's `library/` (rust-analyzer's `Sysroot::load_workspace`, two per load and per unit load of a build script or proc macro) is blaze-metadata's since 2026-10-27 (`cargo/metadata.rs` `library`); since 2026-10-27 too no cargo runs for `cargo --version`, `cargo config get --format toml --show-origin` (`cargo_config_file.rs`) or `cargo rustc --print cfg` / `target-spec-json`: `answers/cargo.rs` answers them with blaze-manifest's configuration (`config/print.rs` for the flags cargo hands rustc), held equal to cargo's by `resolve.py toolchain` |
+| `blaze-engine/src/lib.rs:2272` | asks rustc for the target triple | every load |
 | `blaze/src/plan.rs` `UnitGraph::of` | until 2026-10-27, `cargo build --unit-graph`, which asks rustc about the target; now blaze-units' graph (`blaze_metadata::units`), no cargo and no rustc; the rustflags of each target (`Flags::of`) are blaze-manifest's since 2026-10-27 (`answers::cargo_rustflags`), no `cargo config get --format json` | every load, and every doctest run per library |
-| `blaze/src/main.rs:2314`, `blaze/src/inputs.rs:282` `run_build_scripts` | into blaze's own target directory (every load of `blaze` and the daemon) no cargo since 2026-10-27 (the `ctdeps` lane): blaze compiles the build scripts and proc macros over the build's unit graph and runs the scripts itself (`cargo/compile_time.rs`, project-model's `OwnBuildScripts` hook), and a script or proc macro it cannot build or run fails the load; `harness/resolve.py ctdeps` holds what the load reads to rust-analyzer's `cargo check --compile-time-deps`. Before, nothing was rustc's there (J, below) but cargo scheduled the compiles and runs. Into cargo's target directory (a load without `--own-target`, the harness's reference builds) and with `BLAZE_PROC_MACRO_SERVER=off`, rust-analyzer's `cargo check --compile-time-deps` still runs and rustc compiles them all | a load that is neither beside nor after a cargo build of the workspace (a worker after one reads what cargo said, `cargo/state.rs` `kept_said`), whose target directory does not have them yet; after an edit to a proc macro or build script |
-| `blaze/src/main.rs:5287`, `blaze/src/borrowck.rs:113` `ProcMacroServerChoice::Sysroot` | expands with the toolchain's `rust-analyzer-proc-macro-srv` loading rustc's proc-macro libraries | every load that has a proc macro |
+| `blaze-engine/src/lib.rs:2314`, `blaze/src/inputs.rs:282` `run_build_scripts` | into blaze's own target directory (every load of `blaze` and the daemon) no cargo since 2026-10-27 (the `ctdeps` lane): blaze compiles the build scripts and proc macros over the build's unit graph and runs the scripts itself (`cargo/compile_time.rs`, project-model's `OwnBuildScripts` hook), and a script or proc macro it cannot build or run fails the load; `harness/resolve.py ctdeps` holds what the load reads to rust-analyzer's `cargo check --compile-time-deps`. Before, nothing was rustc's there (J, below) but cargo scheduled the compiles and runs. Into cargo's target directory (a load without `--own-target`, the harness's reference builds) and with `BLAZE_PROC_MACRO_SERVER=off`, rust-analyzer's `cargo check --compile-time-deps` still runs and rustc compiles them all | a load that is neither beside nor after a cargo build of the workspace (a worker after one reads what cargo said, `cargo/state.rs` `kept_said`), whose target directory does not have them yet; after an edit to a proc macro or build script |
+| `blaze-engine/src/lib.rs:5287`, `blaze/src/borrowck.rs:113` `ProcMacroServerChoice::Sysroot` | expands with the toolchain's `rust-analyzer-proc-macro-srv` loading rustc's proc-macro libraries | every load that has a proc macro |
 | `blaze/src/cargo/state.rs` `other_toolchain` | `rustc --version`, `--print=sysroot` | every client command; its `cargo metadata --no-deps` is blaze-manifest's reading since 2026-10-25 ([resolve.md](resolve.md)) |
 
 **Tests, doctests, check, assembly** (steps C, H, L, D)
@@ -299,7 +299,7 @@ Paths are under `crates/`; line numbers are of 41e7906192.
 | `blaze/src/doctest.rs:301` `leave_to_rustdoc` | hands the library to rustdoc | `-q`, a library blaze cannot load; until A, every package whose features `cargo build --unit-graph` rejected (below) |
 | `blaze/src/cargo/mod.rs:48` | `blaze check` is `cargo check` | a check with `--message-format`, unstable cargo flags, `--exclude`, several targets or an unknown triple; until 2026-10-23, every check |
 | `blaze/src/test_harness.rs` `module` returning `None` | leaves the test program's harness to rustc, and a test added to cargo | a bench, an `ignore` written as a token tree (H) |
-| `blaze/src/main.rs:5084`, `:5127` `BLAZE_WRAPS_RUSTC` | blaze standing in for rustc for a whole build | the harness's "alone" builds |
+| `blaze-engine/src/lib.rs:5084`, `:5127` `BLAZE_WRAPS_RUSTC` | blaze standing in for rustc for a whole build | the harness's "alone" builds |
 | `harness/apps.py:113` | the harness's "alone" mode: cargo with blaze as `RUSTC_WRAPPER`, linking the sysroot's rlibs | the harness only |
 
 ### How often
@@ -558,6 +558,40 @@ AArch64's target specs came from answers.py's run in CI there, and its cold buil
 6 with them. Codegen options that change no answer (`-C link-dead-code`, `rpath`,
 `force-frame-pointers`, `force-unwind-tables`) no longer send a question to rustc: count.py's
 `RUSTFLAGS` have the first, so every question of ripgrep's went to rustc until then.
+
+Done (the `nopin` lane, 2026-10-28; Andrew 2026-10-28 03:30Z, no Rust toolchain pinning): no
+question goes to rustc at all, in any environment. Every rustc is answered as blaze's own
+release, whichever one was named (`RUSTC`, `build.rustc`, rustup's proxy, a rustc on `PATH`):
+the version and host from blaze's build, the cfgs and target specs from `rustc.json`, the
+sysroot and target libdir from where blaze's release is (`cargo/toolchain.rs`, found on disk
+with nothing run). A question `answers/own.rs` does not model (the list above) fails with
+`blaze has no answer to rustc ...`, as no-fallback says, and nothing asks rustc and keeps its
+answer any more: the cache of rustc's answers, `BLAZE_ANSWERS` and the reading of rustup's
+`RUSTUP_TOOLCHAIN`/`RUSTUP_HOME` to tell which rustc a proxy runs are gone. Nor does
+`toolchain::settle` ask the project's rustc its version and sysroot, or note that the project
+names another toolchain, which is what made main's no-op `blaze build` run 8 rustc processes
+(4 questions through rustup's proxy, #833). `rustcsites.py`: 33 places to 27. rustup is not
+run either: loading a workspace took cargo from `rustup which cargo` and ran it through rustup's
+proxy, and ran `rustup component add rust-src` when the library's source was missing; the
+sysroot's own `bin/cargo` is run now, and a missing source is an error that says to add it.
+`rustcsites.py` counts the places that start rustup too: 29 to 28. The one left,
+`cargo/own_macro.rs`'s `rustup target add wasm32-wasip1`, installs WASI's libc for proc-macro
+modules when blaze's release has none; it asks nothing.
+
+Measured (ix VM, x86_64, 64 cores; release build with `--features llvm` and the proc-macro
+server beside it; fresh project, daemon warm; median of 30 alternated no-op `blaze build -q`
+after 3 warm-up runs; execs by `strace -f -e trace=execve` over the client and the daemon):
+
+| setup | before (ee8870419e) | after |
+|---|---|---|
+| rustup, default nightly, `rust-toolchain.toml` pinning 1.80.0 | 18.4 ms, 2 rustc | 7.4 ms, 0 rustc |
+| no Rust installed (rustc, cargo, rustup hidden) | 8.6 ms, 1 rustc (not found) | 8.4 ms, 0 rustc |
+| plain `cargo build -q` with the rustup setup | 13.3 ms, 2 (cargo and rustc through rustup) | |
+
+What is left of the 7 to 8 ms is starting the binaries (`blaze-engine --version` alone takes 6 ms
+on that VM), not a question. A cold build of a project using anyhow, thiserror, rustversion,
+num-traits (autocfg), indexmap, version_check and proc-macro-error2 with no Rust installed
+runs 0 rustc: each build script's 11 runs of `$RUSTC` are blaze's stand-in.
 
 **C. `asm!` assembled in process.** ([#83](https://github.com/indexable-inc/blaze/issues/83)) The assembly text blaze already produces goes to LLVM's
 assembler (the LLVM backend links LLVM already) or to an assembler crate, in process. Risk is

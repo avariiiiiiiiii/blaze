@@ -18,6 +18,45 @@
 
 use std::path::Path;
 
+/// The variable cargo reads `unstable.build-dir-new-layout` from: which layout it builds in.
+pub(crate) const NEW_LAYOUT: &str = "CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT";
+
+/// The key of cargo's configuration, and of `-Z`, that [`NEW_LAYOUT`] stands for.
+const NEW_LAYOUT_KEY: &str = "build-dir-new-layout";
+
+/// Has every cargo this command starts, the daemon's workers' too, build in the first layout,
+/// as stable cargo does, unless the user chose a layout: by the variable, by `-Z` (`unstable`,
+/// its values) or in the configuration cargo reads in `cwd` with `--config` (`config`). A test
+/// that finds its package's programs from its own path (`current_exe()`'s grandparent) finds
+/// them only from `deps`, where blaze's own build puts it too, and the user's stable cargo
+/// shares what blaze's cargo built.
+pub(crate) fn first_unless_chosen(cwd: &Path, config: &[String], unstable: &[String]) {
+    if !chosen(cwd, std::env::vars(), config, unstable) {
+        // SAFETY: before any thread is started.
+        unsafe { std::env::set_var(NEW_LAYOUT, "false") };
+    }
+}
+
+/// Whether the variables `env`, `-Z` or the configuration choose the layout. A configuration
+/// that does not load is cargo's to report, and chooses nothing here.
+fn chosen(
+    cwd: &Path,
+    env: impl Iterator<Item = (String, String)>,
+    config: &[String],
+    unstable: &[String],
+) -> bool {
+    if unstable.iter().any(|it| it.split('=').next() == Some(NEW_LAYOUT_KEY)) {
+        return true;
+    }
+    let env: Vec<(String, String)> = env.collect();
+    if env.iter().any(|(name, _)| name == NEW_LAYOUT) {
+        return true;
+    }
+    let configured = blaze_manifest::Config::load(cwd, env, config)
+        .and_then(|it| it.get::<Option<bool>>(&format!("unstable.{NEW_LAYOUT_KEY}")));
+    !matches!(configured, Ok(None))
+}
+
 /// The directories of a profile that cargo has rustc write to in the first layout.
 const FIRST: [&str; 4] = ["deps", "examples", "build", ".fingerprint"];
 
@@ -197,6 +236,34 @@ mod tests {
         let found = unit_dir(Path::new(&out)).unwrap();
         assert_eq!((found.package, found.hash), ("ct", HASH));
         assert_eq!(unit_dir(Path::new("/t/debug/build/ct-1/out")), None);
+    }
+
+    #[test]
+    fn the_layout_is_the_users_when_they_chose_one() {
+        let dir = std::env::temp_dir().join(format!("blaze-chosen-{}", std::process::id()));
+        let (home, ws) = (dir.join("cargo-home"), dir.join("ws"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(ws.join(".cargo")).unwrap();
+        let env = |more: &[(&str, &str)]| {
+            let home = ("CARGO_HOME".to_owned(), home.display().to_string());
+            let more = more.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned()));
+            std::iter::once(home).chain(more).collect::<Vec<_>>().into_iter()
+        };
+        let chosen = |more: &[(&str, &str)], config: &[&str], unstable: &[&str]| {
+            let owned = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+            super::chosen(&ws, env(more), &owned(config), &owned(unstable))
+        };
+        assert!(!chosen(&[], &[], &[]));
+        assert!(!chosen(&[], &[], &["unstable-options"]));
+        assert!(chosen(&[(NEW_LAYOUT, "true")], &[], &[]));
+        assert!(chosen(&[], &[], &["build-dir-new-layout"]));
+        assert!(chosen(&[], &["unstable.build-dir-new-layout=true"], &[]));
+        std::fs::write(ws.join(".cargo/config.toml"), "[unstable]\nbuild-dir-new-layout = true\n")
+            .unwrap();
+        assert!(chosen(&[], &[], &[]));
+        std::fs::write(ws.join(".cargo/config.toml"), "[unstable]\nother = true\n").unwrap();
+        assert!(!chosen(&[], &[], &[]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

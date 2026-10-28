@@ -1,23 +1,20 @@
-//! The questions cargo, rust-analyzer and blaze ask rustc, answered by blaze: `-vV`,
-//! `--print cfg`, `sysroot`, `target-libdir`, `target-spec-json`, the names of the files of
-//! each kind of crate, and the rest of what a release of rustc says the same way every time
-//! it is asked. blaze answers from what it knows of the release and its targets ([`own`]),
-//! running no rustc. A question it does not know the answer of is asked of rustc once per
-//! toolchain and the answer is kept, byte for byte; every later asker, the daemon's workers
-//! and spares among them, is given that.
+//! The questions cargo, rust-analyzer, build scripts and blaze ask rustc, answered by blaze:
+//! `-vV`, `--print cfg`, `sysroot`, `target-libdir`, `target-spec-json`, the names of the files
+//! of each kind of crate, and the rest of what a release of rustc says the same way every time
+//! it is asked. blaze answers them for its own release, whichever rustc was named, from what it
+//! knows of that release and its targets ([`own`]). No rustc is ever run to answer: a question
+//! blaze does not know the answer of fails, saying which.
 //!
-//! cargo asks through its wrapper, which is blaze's in the builds of `blaze` and in
-//! the cargos blaze runs only to ask; rust-analyzer asks through [`ask`], which blaze hands
-//! it; blaze itself through [`answer`].
+//! cargo asks through its wrapper, which is blaze's in the builds of `blaze` and in the cargos
+//! blaze runs only to ask; rust-analyzer asks through [`ask`], which blaze hands it; a build
+//! script through blaze's rustc stand-in ([`crate::as_rustc`]); blaze itself through [`ours`].
 
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Read as _, Write as _},
-    path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output, Stdio},
+    path::Path,
+    process::{Command, ExitStatus, Output},
 };
-
-use sha2::{Digest as _, Sha256};
 
 mod cargo;
 mod own;
@@ -65,29 +62,12 @@ const ALSO_VALUED: [&str; 9] = [
 /// is part of the question.
 const ABOUT_INPUT: [&str; 2] = ["file-names", "crate-name"];
 
-/// The variables that change what rustc answers.
-const READ_BY_RUSTC: [&str; 9] = [
-    "RUSTC_BOOTSTRAP",
-    "RUSTC_OVERRIDE_VERSION_STRING",
-    "RUST_TARGET_PATH",
-    "SDKROOT",
-    "MACOSX_DEPLOYMENT_TARGET",
-    "IPHONEOS_DEPLOYMENT_TARGET",
-    "TVOS_DEPLOYMENT_TARGET",
-    "WATCHOS_DEPLOYMENT_TARGET",
-    "XROS_DEPLOYMENT_TARGET",
-];
-
 /// The variable that names the wrapper cargo runs every rustc through.
 const WRAPPER: &str = "RUSTC_WRAPPER";
 
 /// The variable that tells blaze as cargo's wrapper only to answer questions, and to leave
 /// what cargo compiles as it would be without blaze.
 pub(crate) const ONLY_ASKS: &str = "BLAZE_ONLY_ASKS";
-
-/// The variable that says which answers are given: `0` none, so rustc is asked every time;
-/// `own` only blaze's own, so a question it has no answer of fails.
-const OFF: &str = "BLAZE_ANSWERS";
 
 /// Whether rustc run with `args` compiles nothing and says only what its release, the
 /// arguments and standard input decide.
@@ -139,61 +119,59 @@ pub(crate) fn is_question(args: &[OsString]) -> bool {
         && (kinds.iter().all(about_rustc) || (from_stdin && inputs == 0))
 }
 
-/// What blaze itself answers to what `command` asks rustc, given `stdin`, or `None` when it
-/// has no answer of its own. No rustc runs.
+/// What blaze answers to what `command` asks rustc, given `stdin`, with the variables
+/// `command` has; `None` when it has no answer. Nothing runs.
 pub(crate) fn own_answer(command: &Command, stdin: &[u8]) -> Option<Vec<u8>> {
     let var = |name: &str| var_of(command, name);
     let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
-    let rustc = toolchain_rustc(command.get_program(), &var)?;
-    own::answer(&rustc, &args, stdin, &var)
+    answered_as(command.get_program(), &args, stdin, &var)
 }
 
-/// What blaze itself answers to rustc of the toolchain `rustc` is, asked with `args` and
-/// `stdin` in this process's environment, or `None` when it has no answer of its own. No
-/// rustc runs.
-pub(crate) fn own_answer_of(rustc: &OsStr, args: &[OsString], stdin: &[u8]) -> Option<Vec<u8>> {
-    let var = |name: &str| std::env::var_os(name);
-    own::answer(&toolchain_rustc(rustc, &var)?, args, stdin, &var)
+/// What blaze answers to rustc asked `args` with `stdin`, in this process's environment;
+/// `None` when it has no answer. Nothing runs.
+pub(crate) fn ours(args: &[OsString], stdin: &[u8]) -> Option<Vec<u8>> {
+    own::answer(args, stdin, &|name| std::env::var_os(name))
 }
 
-/// rustc's answer to what `command` asks it, given `stdin`: blaze's own, the kept answer, or
-/// rustc's now, kept when it is one. `command` runs rustc and asks a question ([`is_question`]).
-pub(crate) fn answer(command: &mut Command, stdin: &[u8]) -> io::Result<Output> {
-    let given = std::env::var_os(OFF);
-    if given.as_ref().is_none_or(|it| it != "0")
-        && let Some(stdout) = own_answer(command, stdin)
-    {
-        return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
+/// [`ours`] of text arguments, as text, failing with the question blaze has no answer to.
+pub(crate) fn ours_said(args: &[&str]) -> anyhow::Result<String> {
+    let asked: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let answer = ours(&asked, &[]).ok_or_else(|| no_answer(&asked))?;
+    Ok(String::from_utf8_lossy(&answer).trim().to_owned())
+}
+
+/// [`own::answer`] of `program`, which is answered only as rustc: a driver of rustc's
+/// (clippy's) may answer otherwise.
+fn answered_as(
+    program: &OsStr,
+    args: &[OsString],
+    stdin: &[u8],
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<Vec<u8>> {
+    if Path::new(program).file_stem()? != "rustc" {
+        return None;
     }
-    if given.is_some_and(|it| it == "own") {
-        return Err(io::Error::other("blaze has no answer of its own to this question"));
+    own::answer(args, stdin, var)
+}
+
+fn no_answer(args: &[OsString]) -> anyhow::Error {
+    let shown: Vec<_> = args.iter().map(|it| it.to_string_lossy()).collect();
+    anyhow::anyhow!(
+        "blaze has no answer to `rustc {}`, and runs no rustc to ask (docs/no-rustc.md)",
+        shown.join(" ")
+    )
+}
+
+/// rustc's answer to what `command` asks it, given `stdin`, as blaze answers it. `command`
+/// asks a question ([`is_question`]); one blaze has no answer to is an error, and nothing runs.
+pub(crate) fn answer(command: &Command, stdin: &[u8]) -> io::Result<Output> {
+    match own_answer(command, stdin) {
+        Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
+        None => {
+            let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
+            Err(io::Error::other(no_answer(&args).to_string()))
+        }
     }
-    let key = key(command, stdin);
-    let file = key.as_ref().and_then(|key| Some(dir()?.join(key)));
-    if let Some(stdout) = file.as_deref().and_then(kept) {
-        return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-    }
-    // The workers and spares of one load ask the same questions at once: one asks rustc, and
-    // the others wait for its answer.
-    let _held = file.as_deref().and_then(hold);
-    if let Some(stdout) = file.as_deref().and_then(kept) {
-        return Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() });
-    }
-    let mut child =
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    if let Some(mut input) = child.stdin.take() {
-        // rustc may answer without reading what it was given.
-        _ = input.write_all(stdin);
-    }
-    let output = child.wait_with_output()?;
-    // A question rustc did not answer is asked again, and what it warns of is said each time.
-    if let Some(file) = file
-        && output.status.success()
-        && output.stderr.is_empty()
-    {
-        keep(&file, &output.stdout);
-    }
-    Ok(output)
 }
 
 /// What rust-analyzer runs to learn of the toolchain, answered here when it asks rustc.
@@ -248,58 +226,14 @@ pub(crate) fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>>
     {
         return Some(Err(e));
     }
-    let output = answer(Command::new(rustc).args(args), &stdin);
-    Some(output.and_then(|output| {
-        io::stdout().write_all(&output.stdout)?;
-        io::stderr().write_all(&output.stderr)?;
-        Ok(output.status.code().unwrap_or(1))
-    }))
-}
-
-/// Where the answers are kept: in `BLAZE_HOME` when it is set, else in the user's cache
-/// directory, which outlives the session.
-fn dir() -> Option<PathBuf> {
-    if std::env::var_os(OFF).is_some_and(|it| it == "0") {
-        return None;
-    }
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(Path::new(&home).join("answers"));
-    }
-    let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let caches = caches.or_else(|| Some(PathBuf::from(home?).join(".cache")))?;
-    Some(caches.join("blaze/answers"))
-}
-
-/// The name of the question: the rustc that is asked, its arguments, what it reads of its
-/// environment and of standard input. `None` when which rustc runs is not known.
-fn key(command: &Command, stdin: &[u8]) -> Option<String> {
-    let var = |name: &str| var_of(command, name);
-    let rustc = toolchain_rustc(command.get_program(), &var)?;
-    let is = std::fs::metadata(&rustc).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"blaze answer 1\0");
-    hasher.update(rustc.as_os_str().as_encoded_bytes());
-    hasher.update([0]);
-    hasher.update(is.len().to_le_bytes());
-    let modified = is.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-    hasher.update(modified.as_nanos().to_le_bytes());
-    for arg in command.get_args() {
-        hasher.update(arg.as_encoded_bytes());
-        hasher.update([0]);
-    }
-    for name in READ_BY_RUSTC {
-        hasher.update(name);
-        match var(name) {
-            Some(value) => {
-                hasher.update([1]);
-                hasher.update(value.as_encoded_bytes());
-            }
-            None => hasher.update([0]),
+    let var = |name: &str| std::env::var_os(name);
+    Some(match answered_as(rustc, args, &stdin, &var) {
+        Some(answer) => io::stdout().write_all(&answer).map(|()| 0),
+        None => {
+            eprintln!("error: {}", no_answer(args));
+            Ok(1)
         }
-    }
-    hasher.update(stdin);
-    Some(hasher.finalize().iter().map(|it| format!("{it:02x}")).collect())
+    })
 }
 
 /// The variable `name` as `command` will have it.
@@ -307,66 +241,6 @@ fn var_of(command: &Command, name: &str) -> Option<OsString> {
     match command.get_envs().find(|(it, _)| *it == name) {
         Some((_, value)) => value.map(OsStr::to_owned),
         None => std::env::var_os(name),
-    }
-}
-
-/// The rustc of the toolchain that `program`, as this process would run it, is.
-pub(crate) fn toolchain_rustc_of(program: &OsStr) -> Option<PathBuf> {
-    toolchain_rustc(program, &|name| std::env::var_os(name))
-}
-
-/// The executable of the toolchain that `program` runs. A toolchain's rustc is in the `bin` of
-/// its sysroot, beside `lib/rustlib`; any other is a proxy, which runs the toolchain rustup set
-/// for the process it started and is not known without that. A proxy is rustup's own binary
-/// under another name, or a script that starts it: Homebrew's rustup installs `rustc` as a
-/// script beside no toolchain, which was taken for one with no standard library.
-pub(crate) fn toolchain_rustc(
-    program: &OsStr,
-    var: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<PathBuf> {
-    let found = if Path::new(program).components().count() > 1 {
-        PathBuf::from(program)
-    } else {
-        let paths = var("PATH")?;
-        let name = Path::new(program).with_extension(std::env::consts::EXE_EXTENSION);
-        std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())?
-    };
-    let real = std::fs::canonicalize(found).ok()?;
-    if in_sysroot(&real) {
-        return Some(real);
-    }
-    let toolchain = PathBuf::from(var("RUSTUP_TOOLCHAIN")?);
-    let dir = if toolchain.is_absolute() {
-        toolchain
-    } else {
-        PathBuf::from(var("RUSTUP_HOME")?).join("toolchains").join(toolchain)
-    };
-    let rustc = dir.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
-    std::fs::canonicalize(rustc).ok()
-}
-
-/// Whether `rustc` is a toolchain's own: in the `bin` of a sysroot that has `lib/rustlib`.
-fn in_sysroot(rustc: &Path) -> bool {
-    rustc.parent().and_then(Path::parent).is_some_and(|root| root.join("lib/rustlib").is_dir())
-}
-
-fn kept(file: &Path) -> Option<Vec<u8>> {
-    std::fs::read(file).ok()
-}
-
-/// The lock of the question whose answer is `file`, held until it is dropped.
-fn hold(file: &Path) -> Option<std::fs::File> {
-    std::fs::create_dir_all(file.parent()?).ok()?;
-    let lock = std::fs::File::create(file.with_extension("lock")).ok()?;
-    lock.lock().ok()?;
-    Some(lock)
-}
-
-fn keep(file: &Path, stdout: &[u8]) {
-    let Some(dir) = file.parent() else { return };
-    if std::fs::create_dir_all(dir).is_ok() {
-        // An answer not kept is asked again.
-        _ = blaze_store::write_file_whole(file, stdout);
     }
 }
 
@@ -401,29 +275,22 @@ mod tests {
         ));
     }
 
-    /// Homebrew's rustup installs `rustc` as a script that starts rustup, in a directory
-    /// beside no toolchain: it is a proxy, and the toolchain is the one rustup names.
+    /// Any rustc is answered as blaze's release, whatever toolchain rustup, `RUSTC` or a
+    /// toolchain file would pick, and a rustc that is no toolchain's is answered too.
     #[test]
-    fn a_rustc_outside_a_toolchain_is_a_proxy_whatever_its_name() {
-        let root = std::env::temp_dir().join(format!("blaze-proxy-{}", std::process::id()));
-        let script = root.join("homebrew/bin/rustc");
-        let toolchain = root.join("rustup/toolchains/nightly");
-        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
-        std::fs::create_dir_all(toolchain.join("lib/rustlib")).unwrap();
-        std::fs::write(&script, "#!/bin/sh\nexec rustup-init \"$@\"\n").unwrap();
-        let rustc = toolchain.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
-        std::fs::write(&rustc, "").unwrap();
+    fn every_rustc_is_answered_as_blazes_release() {
         let var = |name: &str| match name {
-            "RUSTUP_TOOLCHAIN" => Some(OsString::from("nightly")),
-            "RUSTUP_HOME" => Some(root.join("rustup").into_os_string()),
+            "RUSTUP_TOOLCHAIN" => Some(OsString::from("1.70.0")),
+            "RUSTC" => Some(OsString::from("/no/such/rustc")),
             _ => None,
         };
-        let found = toolchain_rustc(script.as_os_str(), &var);
-        assert_eq!(found, Some(std::fs::canonicalize(&rustc).unwrap()));
-        // the toolchain's own rustc is itself
-        assert_eq!(toolchain_rustc(rustc.as_os_str(), &var), found);
-        std::fs::remove_dir_all(&root).unwrap();
+        let version = [OsString::from("--version")];
+        for program in ["rustc", "/no/such/toolchain/bin/rustc", "/usr/bin/rustc"] {
+            let said = answered_as(OsStr::new(program), &version, &[], &var).unwrap();
+            let said = String::from_utf8(said).unwrap();
+            assert_eq!(said.trim(), format!("rustc {}", crate::cargo::toolchain::ours_says()));
+        }
+        assert_eq!(answered_as(OsStr::new("clippy-driver"), &version, &[], &var), None);
     }
 
     #[test]

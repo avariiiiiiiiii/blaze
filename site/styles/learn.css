@@ -305,12 +305,12 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 
 /* The way in: the next lesson to start or finish (the first without JS). */
 .course-top { display: grid; gap: 14px; margin: 0 0 30px; }
-.doc .course-go { display: inline-grid; justify-self: start; gap: 2px; min-width: min(100%, 320px); padding: 14px 22px 15px; border-radius: 16px; background: var(--ink-1); color: var(--bg); text-decoration: none; transition: transform 0.12s; }
+.doc .course-go { display: inline-grid; justify-self: start; gap: 2px; min-width: min(100%, 320px); padding: 14px 22px 15px; border-radius: 16px; background: var(--ink-1); color: var(--bg); text-decoration: none; transition: background-color 0.2s; }
 .course-go .k { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
 .course-go .k::after { content: ' →'; }
 .course-go .t { color: color-mix(in srgb, var(--bg) 70%, var(--ink-1)); font-size: 14.5px; }
-.doc .course-go:hover { transform: translateY(-1px); }
-.doc .course-go:active { transform: translateY(1px); }
+.doc .course-go:hover { background: color-mix(in srgb, var(--ink-1) 88%, var(--bg)); }
+.doc .course-go:active { box-shadow: inset 0 2px 6px rgb(0 0 0 / 0.28); }
 .doc .course-go:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 3px; }
 @media (max-width: 560px) { .doc .course-go { justify-self: stretch; } }
 
@@ -332,7 +332,7 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 .path-end { --x: var(--sway); }
 
 /* A node: the disc with the lesson's glyph; the ring round it (how far into the lesson); the check once done. */
-.course .pin { position: relative; display: block; width: var(--disc); height: var(--disc); margin-left: calc(var(--x, 0px) + 8px); transition: transform 0.15s; }
+.course .pin { position: relative; display: block; width: var(--disc); height: var(--disc); margin-left: calc(var(--x, 0px) + 8px); }
 .course .disc {
 	display: grid;
 	place-items: center;
@@ -389,7 +389,23 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 .course .go { justify-self: start; display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 8px 16px 8px 18px; border-radius: 999px; background: var(--ink-1); color: var(--bg); font-size: 14.5px; font-weight: 600; }
 .course .go::after { content: '→'; }
 
-.doc .path a:hover .pin { transform: translateY(-2px); }
+/* Hovering a lesson, or the way in that leads to it, draws its glyph again, stroke after stroke as a pen would,
+   and lights its cell in the fire orange: nothing moves, the picture is made in front of you. */
+.doc .path a:is(:hover, :focus-visible) .glyph :not(.g-cell),
+.course:has(.course-go:hover) .node[data-next] .glyph :not(.g-cell) { stroke-dasharray: 1; animation-name: g-draw; animation-duration: 0.5s; animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1); animation-fill-mode: both; }
+/* Stroke after stroke (the page's CSP refuses style attributes, so the order is counted here). */
+.course .glyph :nth-child(2) { animation-delay: 70ms; }
+.course .glyph :nth-child(3) { animation-delay: 140ms; }
+.course .glyph :nth-child(4) { animation-delay: 210ms; }
+.course .glyph :nth-child(5) { animation-delay: 280ms; }
+.course .glyph :nth-child(n + 6) { animation-delay: 350ms; }
+.doc .path a:is(:hover, :focus-visible) .g-cell,
+.course:has(.course-go:hover) .node[data-next] .g-cell { fill: var(--fire); transition: fill 0.15s 0.35s; }
+.doc .path .node[data-state='todo']:not([data-next]) a:hover .disc { box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+@keyframes g-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@media (prefers-reduced-motion: reduce) {
+	.doc .path a .glyph *, .course .glyph * { animation: none !important; transition: none !important; }
+}
 .doc .path a:hover .t { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
 .doc .path a:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 4px; }
 

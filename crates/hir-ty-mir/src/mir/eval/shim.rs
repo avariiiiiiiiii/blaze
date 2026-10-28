@@ -1290,6 +1290,24 @@ impl<'db> Evaluator<'db> {
                     s => not_supported!("destination with size {s} for rotate_right"),
                 }
             }
+            "variant_count" => {
+                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
+                    return Err(MirEvalError::InternalError(
+                        "variant_count generic arg is not provided".into(),
+                    ));
+                };
+                let count = match ty.kind() {
+                    TyKind::Adt(adt_def, _) => match adt_def.def_id() {
+                        AdtId::EnumId(id) => id.enum_variants(self.db).variants.len() as u64,
+                        AdtId::StructId(_) | AdtId::UnionId(_) => 1,
+                    },
+                    TyKind::Param(_) | TyKind::Alias(..) => {
+                        not_supported!("variant_count of a type that is not known")
+                    }
+                    _ => 0,
+                };
+                destination.write_from_bytes(self, &count.to_le_bytes()[0..destination.size])
+            }
             "discriminant_value" => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(

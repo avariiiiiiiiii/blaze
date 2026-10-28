@@ -933,6 +933,7 @@ fn resolve(
         platform: Some(blaze_metadata::TargetPlatform { triple: target, cfg: &cfg }),
         offline: false,
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let json = blaze_metadata::metadata(&asked)?;
     let metadata: cargo_metadata::Metadata = serde_json::from_str(&json)?;

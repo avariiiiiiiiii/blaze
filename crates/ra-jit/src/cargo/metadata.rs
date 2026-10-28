@@ -91,6 +91,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
             platform: Some(blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
             offline: false,
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let json = blaze_metadata::metadata(&asked)?;
         serde_json::from_str(&json).context("blaze's own metadata is not cargo's form")
@@ -190,6 +191,7 @@ fn library_read(
         platform: triple.map(|triple| blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
         offline: false,
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let json = match no_deps {
         true => blaze_metadata::metadata_no_deps(&asked)?,
@@ -244,6 +246,7 @@ pub(crate) fn programs(
             platform: Some(blaze_metadata::TargetPlatform { triple: &triple, cfg: &cfg }),
             offline: false,
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         Ok(blaze_metadata::programs(&asked, targets)?.1)
     }
@@ -322,6 +325,7 @@ pub(crate) fn units(
         }),
         offline: false,
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let units = blaze_metadata::Units {
         intent,
@@ -427,6 +431,7 @@ pub(crate) fn checked(
         }),
         offline: false,
         store: None,
+        rustc_version: told.lines().find_map(|it| it.strip_prefix("release: ")),
     };
     let units = blaze_metadata::Units {
         intent,
@@ -597,6 +602,7 @@ mod tests {
             }),
             offline: true,
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let made = blaze_metadata::metadata(&asked);
         let _ = std::fs::remove_dir_all(&root);

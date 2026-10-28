@@ -101,7 +101,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if asked.subcommand == Subcommand::Run {
         programs.retain(|it| !it.kind.linked_library());
     }
-    if let Some(it) = programs.iter().find(|it| it.kind == Kind::Staticlib) {
+    if let Some(it) = programs.iter().find(|it| matches!(it.kind, Kind::Staticlib | Kind::Dylib)) {
         let kind = format!("{:?}", it.kind).to_lowercase();
         say::error(&format!(
             "blaze does not link the `{kind}` of `{}` (target `{}`) yet, so it would write no `{}` (#262)",
@@ -364,7 +364,7 @@ fn state_kind(kind: Kind) -> super::state::Kind {
         Kind::Bin => super::state::Kind::Bin,
         Kind::Example => super::state::Kind::Example,
         Kind::Test => super::state::Kind::Test,
-        Kind::Cdylib | Kind::Staticlib => super::state::Kind::Lib,
+        Kind::Cdylib | Kind::Staticlib | Kind::Dylib => super::state::Kind::Lib,
     }
 }
 
@@ -425,8 +425,8 @@ impl Unbuilt {
 fn turned_down(program: &Program, said: &crate::errors::Said) -> String {
     let name = &program.name;
     let target = match (program.kind, program.test) {
-        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, false) => "lib".to_owned(),
-        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, true) => "lib test".to_owned(),
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib | Kind::Dylib, false) => "lib".to_owned(),
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib | Kind::Dylib, true) => "lib test".to_owned(),
         (Kind::Bin, false) => format!("bin \"{name}\""),
         (Kind::Bin, true) => format!("bin \"{name}\" test"),
         (Kind::Example, _) => format!("example \"{name}\""),
@@ -513,6 +513,7 @@ fn checkout(
         cfg_test: unit_tests,
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
+        command_env: BTreeMap::new(),
         whole: true,
     };
     // A worker links its programs where it was started to and builds again only what was
@@ -765,15 +766,17 @@ fn planned(
         out.push(triple);
     }
     out.push(profile);
-    // Cargo's tests are in its build directory (`build.build-dir`), in the layout of it that
-    // cargo has: a test that finds a program from where it is itself finds what it finds there.
+    // A test is in the `deps` of cargo's build directory (`build.build-dir`), where stable
+    // cargo puts it, also where nightly's second layout would put it in its unit's directory:
+    // a test that finds its package's programs from its own path (`current_exe()`'s
+    // grandparent, the `executable-path` crate, assert_cmd's `cargo_bin`) finds them only
+    // from `deps`.
     let build_dir = metadata.build_directory.as_ref().map_or(target, |it| it.as_std_path());
     let mut built = build_dir.to_owned();
     if let Some(triple) = &selection.target {
         built.push(triple);
     }
     built.push(profile);
-    let second = second_layout(&asked.flags.config);
     let mut programs = Vec::new();
     for program in planned {
         let Some(package) = metadata.packages.iter().find(|it| it.id.repr == program.package)
@@ -792,7 +795,9 @@ fn planned(
         };
         let executable = match (program.kind, program.test) {
             (Kind::Example, _) => out.join("examples").join(exe(&program.name)),
-            (Kind::Cdylib, _) => out.join(library(named.dll_prefix, named.dll_suffix)),
+            (Kind::Cdylib | Kind::Dylib, _) => {
+                out.join(library(named.dll_prefix, named.dll_suffix))
+            }
             (Kind::Staticlib, _) => out.join(match cfg!(windows) {
                 true => library("", ".lib"),
                 false => library("lib", ".a"),
@@ -802,14 +807,7 @@ fn planned(
             // what tells its tests apart.
             (_, true) => {
                 let hash = test_hash(&package.id.repr, &kind, &program.name, &built);
-                let name = exe(&format!("{}-{hash}", program.name));
-                match second {
-                    true => {
-                        let unit = built.join("build").join(package.name.as_str()).join(&hash);
-                        unit.join("out").join(name)
-                    }
-                    false => built.join("deps").join(name),
-                }
+                built.join("deps").join(exe(&format!("{}-{hash}", program.name)))
             }
         };
         // A test's directory has the file that says it starts in the harness, and a build of
@@ -834,16 +832,6 @@ fn planned(
         });
     }
     Ok(programs)
-}
-
-/// Whether cargo lays its build directory out in its second layout ([`super::layout`]): the
-/// nightly blaze pins does, unless `unstable.build-dir-new-layout` (or
-/// `CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT`) is false. `config` is cargo's `--config` arguments.
-fn second_layout(config: &[String]) -> bool {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let config = blaze_manifest::Config::load(&cwd, std::env::vars(), config);
-    let set = config.and_then(|it| it.get::<Option<bool>>("unstable.build-dir-new-layout"));
-    set.map_or(true, |it| it != Some(false))
 }
 
 /// Sixteen hexadecimal digits, as cargo names a unit by, of the test `name` of `kind` in

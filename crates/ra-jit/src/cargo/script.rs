@@ -22,11 +22,9 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{
-    directives,
-    hermetic::{self, InView},
-    keyed, own_script, sandboxed, script_sandbox, wasi_script,
-};
+use super::{directives, keyed, own_script, sandboxed, script_sandbox, wasi_script};
+#[cfg(unix)]
+use super::{hermetic, script_sandbox::InView};
 
 /// The variable that names the script itself to `ra-jit build-script`.
 pub(crate) const REAL: &str = "RA_JIT_BUILD_SCRIPT";
@@ -175,6 +173,11 @@ pub(crate) fn run_as_cargo_does(
         };
         let directives =
             directives::Ran { package_dir: &cwd, out_dir: &out_dir, link_dirs: &link_dirs };
+        #[cfg(not(unix))]
+        if let Some(in_view) = &in_view {
+            match *in_view {}
+        }
+        #[cfg(unix)]
         if let Some(in_view) = &in_view {
             let key = view_key(&real, &cwd, &args, plan.env(), &places, in_view)?;
             // What a run left that names where it ran in a file that is no text is kept for
@@ -208,10 +211,7 @@ pub(crate) fn run_as_cargo_does(
             }
             let script_sandbox::Ran { output, .. } =
                 script_sandbox::run(&running, &plan, Stdio::inherit())?;
-            let unset = match output.status.success() {
-                true => unset_now(&output.stdout, &ran.env, &plan, &declared),
-                false => Vec::new(),
-            };
+            let unset = unset_now(&output.stdout, &ran.env, &plan, &declared);
             let refused = directives::refused(&output.stdout, &directives);
             if unset.is_empty() {
                 std::io::stdout().write_all(&hermetic::for_cargo(&output.stdout))?;
@@ -283,10 +283,10 @@ pub(crate) fn run_as_cargo_does(
         }
         let script_sandbox::Ran { output, reads } =
             script_sandbox::run(&running, &plan, Stdio::inherit())?;
-        let unset = match output.status.success() {
-            true => unset_now(&output.stdout, &ran.env, &plan, &declared),
-            false => Vec::new(),
-        };
+        // A run that failed without what it said it reads (`env::var("X").expect(..)`, or a
+        // download the sandbox refused for want of the local copy `X` names) failed as cargo's
+        // would not: its failure is the one of the run given it.
+        let unset = unset_now(&output.stdout, &ran.env, &plan, &declared);
         let refused = directives::refused(&output.stdout, &directives);
         if unset.is_empty() {
             std::io::stdout().write_all(&output.stdout)?;
@@ -376,6 +376,7 @@ fn same_as_kept(package: &str, kept: &Kept, made: &Kept, out_dir: &Path) {
 /// cargo's and the closure (each with what stands for the places of this checkout), and what
 /// [`hermetic::key_of`] adds: its package's source, the closure's NarHashes and its
 /// dependencies' `OUT_DIR`s. Nothing of what it was seen reading: it sees nothing else.
+#[cfg(unix)]
 fn view_key(
     real: &Path,
     cwd: &Path,
@@ -435,6 +436,7 @@ fn watched(stdout: &[u8], cwd: &Path) -> Vec<String> {
 pub(super) const RUNS: &str = "build script runs 5";
 
 /// The kind of the key of a run that saw its closure alone ([`view_key`]).
+#[cfg(unix)]
 const IN_VIEW: &str = "build script runs in their closure 1";
 
 /// The variables of a run that change nothing it prints or writes: the jobs it may start, and

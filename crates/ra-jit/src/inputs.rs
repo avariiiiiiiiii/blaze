@@ -214,6 +214,14 @@ impl Scripts {
             return None;
         };
         let (mut scripts, mut variables) = (Vec::new(), Vec::new());
+        // Every script in the sandbox is given these; a table that can't be read failed the
+        // load that ran them.
+        let root: &Path = cargo.workspace_root().as_ref();
+        let given = crate::cargo::sandboxed::workspace_opt_out(root).map(|it| it.build_script_env);
+        variables.extend(given.unwrap_or_default().into_iter().map(|it| {
+            let value = run_with(config, &it);
+            (it, value)
+        }));
         for package in cargo.packages() {
             let Some(out_dir) = build_scripts.out_dir(package) else { continue };
             let root: &Path = cargo[package].manifest.parent().as_ref();

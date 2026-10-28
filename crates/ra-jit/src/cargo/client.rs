@@ -45,6 +45,7 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
     // A whole build is asked for at once: no cargo builds meanwhile for a spare to load beside.
     let spares = !matches!(&request, Request::Build(checkout) if checkout.config.whole);
     let started = |home: &Path| started(home, spares);
+    let request = request.of_this_command();
     let envelope = serde_json::to_string(&Envelope { version: version(), replaces, request })?;
     let mut stream = match (connect(&socket), start) {
         (Ok(stream), _) => stream,

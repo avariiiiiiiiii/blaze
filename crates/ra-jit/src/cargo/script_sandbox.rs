@@ -53,8 +53,18 @@ use std::{
 
 use anyhow::Context as _;
 
-use super::{hermetic, sandboxed};
+#[cfg(unix)]
+use super::hermetic;
+#[cfg(unix)]
+pub(crate) use super::hermetic::InView;
+use super::sandboxed;
 use crate::sandbox::{self, Line, Reached, Spec};
+
+/// A run in its closure alone, which Windows has none of: `hermetic` is the closure's, and
+/// the closure is Linux's.
+#[cfg(not(unix))]
+#[derive(Clone, Debug)]
+pub(crate) enum InView {}
 
 /// The file beside a script's `OUT_DIR` with what its last run of cargo's read, when that is
 /// what decides whether it runs again ([`reads_unchanged`]): a first line [`READS_HEAD`], then
@@ -108,9 +118,9 @@ pub(crate) enum Plan {
         /// The system directories its `rustc-link-search` may name besides those it always may
         /// (`directives.rs`): `build-script-link-dirs` of the root manifest.
         link_dirs: Vec<PathBuf>,
-        /// The closure it sees alone, when it does ([`hermetic::VAR`]): then its run is kept by
-        /// what it is made of, and not by what it was seen reading.
-        in_view: Option<hermetic::InView>,
+        /// The closure it sees alone, when it does (`RA_JIT_SCRIPT_VIEW`): then its run is kept
+        /// by what it is made of, and not by what it was seen reading.
+        in_view: Option<InView>,
     },
 }
 
@@ -172,12 +182,20 @@ fn on_in(env: &[(String, String)]) -> bool {
     sandbox::on_with(|name| env.iter().find(|it| it.0 == name).map(|it| it.1.clone()))
 }
 
-/// The workspace a script's run is part of: the one around its package, for a package not
-/// below cargo's home; else the one around the target directory its `OUT_DIR` is in; else the
-/// one the shell that ran cargo was in. `PWD` comes last: it is wherever the command was
-/// started, which for a command run by another program (a harness, an editor) is not the
-/// workspace built.
+/// The variable that names to a run the root of the workspace being built, set by the
+/// daemon's load (`compile_time.rs`): a path dependency that is a workspace of its own is
+/// still the build's, whose root manifest says how its script runs. The script is not given it.
+pub(crate) const ROOT: &str = "RA_JIT_BUILD_ROOT";
+
+/// The workspace a script's run is part of: the one [`ROOT`] names; else the one around its
+/// package, for a package not below cargo's home; else the one around the target directory
+/// its `OUT_DIR` is in; else the one the shell that ran cargo was in. `PWD` comes last: it is
+/// wherever the command was started, which for a command run by another program (a harness,
+/// an editor) is not the workspace built.
 fn workspace_of(script: &Script<'_>) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(root) = script.var(ROOT).filter(|it| !it.is_empty()) {
+        return Ok(Some(PathBuf::from(root)));
+    }
     let home = script.var("CARGO_HOME").map(Path::new);
     if !home.is_some_and(|it| script.cwd.starts_with(it))
         && let Some(root) = sandboxed::workspace_root(script.cwd)?
@@ -205,7 +223,8 @@ pub(crate) fn target_of(out_dir: &Path) -> Option<&Path> {
 /// sandbox's spec. `Err` is a manifest that says it wrongly.
 pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let package = script.package();
-    let env = with_own_rustc(script.env, script.scratch)?;
+    let mut env = with_own_rustc(script.env, script.scratch)?;
+    env.retain(|it| it.0 != ROOT);
     if !on_in(script.env) {
         return Ok(Plan::Outside(format!("{}=off", crate::sandbox::VAR_BLAZE), env));
     }
@@ -245,6 +264,11 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     writable.extend(user_cache());
     let mut readable = vec![script.cwd.to_owned()];
     readable.extend(root.clone());
+    // A path dependency's own workspace, which is not below the build's.
+    let home = script.var("CARGO_HOME").map(Path::new);
+    if script.var(ROOT).is_some() && !home.is_some_and(|it| script.cwd.starts_with(it)) {
+        readable.extend(sandboxed::workspace_root(script.cwd)?);
+    }
     readable.extend(target_of(script.out_dir).map(Path::to_owned));
     // The programs cargo names, and the directories of `PATH`, where a sandbox has empty
     // directories: `RUSTC` is ra-jit's own, which may be built below `/dev/shm`.
@@ -271,6 +295,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let mut not_inputs = vec![script.real.to_owned()];
     not_inputs.extend(std::fs::canonicalize(script.real).ok());
     let root_manifest = root.as_ref().map(|it| it.join("Cargo.toml"));
+    #[cfg(unix)]
     if hermetic::wanted(script.env) && cfg!(target_os = "linux") {
         let overrides = match &root_manifest {
             Some(manifest) => hermetic::system_deps(manifest)?,
@@ -573,8 +598,7 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
     } else if !output.status.success()
         && let Some(in_view) = in_view
     {
-        let root = root_manifest.as_deref();
-        let note = hermetic::failed_note(package, &in_view.closure, &output.stderr, root);
+        let note = failed_note(package, in_view, &output.stderr, root_manifest.as_deref());
         output.stderr.extend(format!("note: {note}\n").into_bytes());
     }
     if in_view.is_some() {
@@ -583,6 +607,18 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
     let reads = lines.filter(|it| it.iter().all(|it| it.reached != Reached::Incomplete));
     let reads = reads.map(|lines| inputs(&lines, script, spec));
     Ok(Ran { output, reads })
+}
+
+/// What a run of `package` in its closure that failed with `stderr` is told
+/// ([`hermetic::failed_note`]).
+#[cfg(unix)]
+fn failed_note(package: &str, in_view: &InView, stderr: &[u8], root: Option<&Path>) -> String {
+    hermetic::failed_note(package, &in_view.closure, stderr, root)
+}
+
+#[cfg(not(unix))]
+fn failed_note(_: &str, in_view: &InView, _: &[u8], _: Option<&Path>) -> String {
+    match *in_view {}
 }
 
 fn running(script: &Script<'_>) -> String {
@@ -822,6 +858,49 @@ mod tests {
         let unset = plan(&Script { declared: &[], ..script }).unwrap();
         assert_eq!(names(&unset), ["CARGO_PKG_NAME"]);
         assert_eq!(not_given(stdout, &env, &unset), ["BM_LEVEL"]);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_path_dependency_in_a_workspace_of_its_own_reads_the_builds_root_manifest() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-build-root-{}", std::process::id()));
+        let (root, dep) = (dir.join("app"), dir.join("vendor/vendor"));
+        let out_dir = root.join("target/debug/build/vendor-1/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n[workspace.metadata.blaze.sandbox]\nbuild-script-env = [\"VENDOR_DIR\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("vendor/Cargo.toml"), "[workspace]\nmembers = [\"vendor\"]\n")
+            .unwrap();
+        std::fs::write(
+            dep.join("Cargo.toml"),
+            "[package]\nname = \"vendor\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+        let told = [
+            pair("CARGO_PKG_NAME", "vendor"),
+            pair("VENDOR_DIR", "/opt/vendor"),
+            pair(ROOT, root.to_str().unwrap()),
+        ];
+        let script = Script {
+            real: Path::new("/nonexistent/build_script_build"),
+            args: &[],
+            cwd: &dep,
+            env: &told,
+            out_dir: &out_dir,
+            scratch: out_dir.parent().unwrap(),
+            declared: &[],
+        };
+        let names = |plan: &Plan| plan.env().iter().map(|it| it.0.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&plan(&script).unwrap()), ["CARGO_PKG_NAME", "VENDOR_DIR"]);
+        let Plan::Sandboxed { spec, .. } = plan(&script).unwrap() else { panic!("outside") };
+        assert!(spec.readable.contains(&dir.join("vendor")), "{:?}", spec.readable);
+        let untold = plan(&Script { env: &told[..2], ..script }).unwrap();
+        assert_eq!(names(&untold), ["CARGO_PKG_NAME"]);
         _ = std::fs::remove_dir_all(&dir);
     }
 

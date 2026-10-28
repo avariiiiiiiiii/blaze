@@ -128,8 +128,8 @@ build, which says which and why; nothing is handed to cargo or rustc:
 What blaze does not build yet fails the same way, saying what: the targets `--bins`,
 `--examples`, `--tests`, `--benches` and `--all-targets` pick, several `--target`s,
 `--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`, and a
-library whose crate types include `staticlib` when the build would write it (a plain `build`,
-or `--lib`): blaze does not link one yet, and says which
+library whose crate types include `staticlib` or `dylib` when the build would write it (a
+plain `build`, or `--lib`): blaze does not link one yet, and says which
 ([#262](https://github.com/indexable-inc/blaze/issues/262)). A library's `cdylib` (a native
 Node addon, a Python extension, a plugin) is a program of the build: a plain `build` or
 `--lib` links it as a shared library at cargo's path (`target/debug/lib<name>.so`, `.dylib`
@@ -351,7 +351,15 @@ pkg-config's variables (`CC`, `CFLAGS_<target>`, `PKG_CONFIG_PATH`, `NIX_CFLAGS_
 what the root manifest's `build-script-env` names, and what it says it reads
 (`cargo:rerun-if-env-changed=OPENSSL_DIR`) as cargo has it; what else the shell had is not
 there. A run that said it reads a variable it was not given saw it unset, so the script runs
-again given it, and the store keeps that run under the variable's value. The machine is
+again given it, whether the first run succeeded or failed (`env::var("SDK_DIR").expect(..)`,
+or a download the sandbox refused), and the store keeps that run under the variable's value.
+The variables are the command's, not those of whoever started the daemon: `SDK_DIR=/opt/sdk
+blaze build` gives the script `SDK_DIR` with a daemon started without it, and a command
+without it, to a daemon started with it, gives it none. A command with another value of a
+variable a script read, or of one `build-script-env` names, has the worker run the scripts
+again and load the workspace with what they print
+([#720](https://github.com/indexable-inc/blaze/issues/720)). The root manifest is the one of
+the workspace built, also for a path dependency that is a workspace of its own. The machine is
 read-only; it writes
 its `OUT_DIR` for real, which is the one directory the Cargo book lets a script write ("Scripts
 should not modify any files outside of that directory"); the temporary directories start empty;
@@ -1169,7 +1177,7 @@ cargo reads them. The table is `SUBCOMMANDS` in `crates/ra-jit/src/cargo/own/mod
 | Command | blaze's | What it is, and what it waits for |
 |---|---|---|
 | `build` (`b`), `run` (`r`), `test` (`t`), `check` (`c`) | the build | [above](#commands) |
-| `metadata` | yes | `crates/blaze-metadata`: the workspace read by blaze-manifest, every locked package fetched by blaze-registry, resolved by blaze-resolve; `--no-deps`, `--features`, `--all-features`, `--no-default-features`, one `--filter-platform` (its `cfg` as blaze answers `rustc --print cfg` itself), `--manifest-path`, `--offline`. Held equal to cargo's by `harness/own_metadata.py`; against the pinned nightly's cargo, ripgrep, fd, helix, nushell and biome print the same JSON for each form (`harness/own_commands.py`, with `locate-project`, `verify-project`, `pkgid`, `read-manifest`, `fetch` and `clean`: 130 of 130 cases over the five). A package's `hints` has cargo 1.101's `"min-opt-level"`, always `null`: blaze-manifest does not read a value of it yet. Several `--filter-platform`s, and a workspace whose lock file is missing or stale, fail with the reason (choosing versions is #321) |
+| `metadata` | yes | `crates/blaze-metadata`: the workspace read by blaze-manifest, every locked package fetched by blaze-registry, resolved by blaze-resolve; `--no-deps`, `--features`, `--all-features`, `--no-default-features`, one `--filter-platform` (its `cfg` as blaze answers `rustc --print cfg` itself), `--manifest-path`, `--offline`. Held equal to cargo's by `harness/own_metadata.py`; against the pinned nightly's cargo, ripgrep, fd, helix, nushell and biome print the same JSON for each form (`harness/own_commands.py`, with `locate-project`, `verify-project`, `pkgid`, `read-manifest`, `fetch` and `clean`: 130 of 130 cases over the five). A package's `hints` has cargo 1.101's `"min-opt-level"`, always `null`: blaze-manifest does not read a value of it yet. A registry package the lock file does not pin, the lock file missing or stale, is chosen from the registry's index as cargo chooses it (blaze-registry's `IndexRegistry`), and the lock file written as cargo writes it. Several `--filter-platform`s fail with the reason |
 | `locate-project` | yes | `--workspace`, `--message-format plain\|json`, `--manifest-path` |
 | `verify-project` | yes | `{"success":"true"}`, or `{"invalid":...}` and status 1 |
 | `version`, `help` | yes | blaze's version and help |

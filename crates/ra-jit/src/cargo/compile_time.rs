@@ -711,7 +711,13 @@ impl<'a> Driver<'a> {
             },
             dep_info: deps.join(format!("{stem}.d")),
         };
-        let compiled = self.compile(&crates, &made, &deps.join(&stem));
+        let mut compiled = self.compile(&crates, &made, &deps.join(&stem));
+        // Compiled for this host from here, beside the other units, rather than in the load,
+        // which loads one module after another.
+        if wasm && compiled.is_ok() {
+            compiled = ra_jit_macro_wasm::prepare_soon(&made.exe, own_script::store())
+                .map_err(anyhow::Error::msg);
+        }
         if let (true, Err(why)) = (wasm, &compiled) {
             let root: &Path = self.cargo.workspace_root().as_ref();
             anyhow::bail!(super::own_macro::refusal(&name, &format!("{why:#}"), root));
@@ -796,6 +802,8 @@ impl<'a> Driver<'a> {
         command.arg("build-script");
         env.apply(&mut command);
         command.env(super::script::REAL, &exe).current_dir(package.manifest.parent());
+        let root: &Path = self.cargo.workspace_root().as_ref();
+        command.env(super::script_sandbox::ROOT, root);
         let ran = script::run::run(&described, command).map_err(|it| anyhow::anyhow!(it.0))?;
         let cx = script::output::Context::of(&described, &self.inherited);
         let output = ran.finish(&described, &cx).map_err(|failed| {

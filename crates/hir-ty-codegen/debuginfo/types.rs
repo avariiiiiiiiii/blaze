@@ -28,7 +28,6 @@ use intern::{Interned, Symbol};
 use super::super::vtable::{HEADER, VtableLayout};
 use super::set::{self, Made, Own};
 use super::{Aggregate, DebugType, Field, Tag, TypeIndex, TypeSet, Variant};
-use hir_ty_mir::mir::type_name::rustc_debug_name;
 use hir_ty::{
     InferenceResult, ParamEnvAndCrate,
     closure_analysis::ProjectionKind,
@@ -47,6 +46,7 @@ use hir_ty::{
     },
     traits::StoredParamEnvAndCrate,
 };
+use hir_ty_mir::mir::type_name::rustc_debug_name;
 
 /// A type of the program, and how many more pointers are followed from it.
 pub(crate) type Key = (StoredTy, u32);

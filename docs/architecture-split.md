@@ -44,7 +44,9 @@ So the fix is to make the split real, in both directions:
 3. **MIR building, the runtime MIR phase, the MIR passes and the interpreter stay where they
    already are, in `hir-ty`.** The interpreter runs runtime and optimized MIR, so the passes
    have to sit at or below it; a separate pass crate would have to take the interpreter and
-   const eval with it.
+   const eval with it. **Superseded 2026-10-28 by step 8**: they are `crates/hir-ty-mir`, the
+   interpreter and const eval's evaluation with them, and `hir-ty` reaches them through
+   `HirDatabase` methods the database implements.
 4. **The fn-cache "code hash" stays with the code generator.** It hashes the machine code
    blaze compiled, not the source or the MIR (read: `crates/hir-ty-codegen/fncache.rs:1-12`).
 5. **The disk store moves out of the code generator** into a small crate of its own
@@ -261,6 +263,7 @@ The subtree never depends on `crates/`.
       hir-ty                              upstream + MIR building, runtime phase, passes, interpreter (A-D)
                                           loses: #[path] modules, 15 dependencies, features llvm and wasm
                                           gains: a short list of items made public for the crates below
+      hir-ty-mir             NEW (step 8) hir-ty/src/mir's lowering, passes, monomorphization, interpreter
       hir-ty-borrowck        NEW          from crates/hir-ty-borrowck; depends on hir-ty
       hir-ide, hir, ide-*                 upstream; hir's diagnostics call hir_ty_borrowck
     crates/
@@ -294,7 +297,9 @@ case); the gain is in what each crate can see and what each edit rebuilds, not i
   them, so the crate would have to sit below the interpreter, which means taking
   `mir/eval*` and const eval out of `hir-ty` too, and those are called by `hir-ty`'s layout and
   inference queries. Revisit if upstream's `hir-ty` split moves MIR into a crate of its own;
-  then put the passes there.
+  then put the passes there. Done otherwise in step 8: what `hir-ty` asks of them (the MIR body
+  queries, `interpret_mir`, `opaque_of_impl`) are required `HirDatabase` methods, as upstream's
+  `type_name` is, which `hir-ide`'s `impl_hir_database!` implements by calling `hir-ty-mir`.
 - **The fn-cache hash into `hir-ty`.** It is a hash of compiled code; it needs the code
   generator. A hash of a function's MIR and its callees, if one is ever wanted, would be a
   `hir-ty` query in a new file.
@@ -360,6 +365,7 @@ known tests, the corpus under Cranelift and LLVM (with `--layouts`), `mixfutures
 | 5 | **Fork check.** Withdrawn 2026-10-28 with the fork (one workspace). Was done on `fork-check`, 2026-10-21: CI's job `fork alone` copies `vendor/rust-analyzer` out of the repository, which is the tree `fork sync` pushes, and runs `cargo test -p hir-ty -p hir-ty-borrowck && cargo check -p hir` there; `ci` needs it. Copying rather than cloning the fork catches a dependency on `crates/` before it merges, not after. The fork alone needed two fixes: its workspace patched `rustc_abi` from `lib/rustc_abi`, a directory the fork never had, and now takes it from `indexable-inc/rustc_abi` `main` (the subtree of `crates/rustc_abi`, identical to it at `8f6db283fd`; blaze's own workspace still patches it by path); and its `Cargo.lock` was brought up to date (it lacked `hir-ty-borrowck`, `stacker`, `unicode-width`) | the job's commands, run in a copy of the subtree | done |
 | 6 | **Shrink the edit surface.** Withdrawn 2026-10-28: nothing is sent upstream any more. Was: send group F upstream in small pull requests, parser and `macro_rules!` first, each with the rustc source it follows (upstream's AI rule); when one merges, the next `vendor/subtree.py upstream` takes upstream's version. Move group G's additions to new files where they are additive (`Files`'s view, include and env fields behind one field of a type defined in a new `base-db` module). Watch upstream's `hir-ty` split and put new MIR code where upstream's plan will put MIR | each pull request under upstream's CI; the gate here when each comes back through a merge | a day per batch, spread out |
 | 7 | **Optional.** `type_id.rs` and `vtable.rs` into `hir-ty` when the interpreter needs them; a look at whether `outline.rs` can be an `ItemTree` comparison | the corpus' `TypeId` and `dyn` cases; `growth.py`, `movedlines.py` for `outline.rs` | a day each |
+| 8 | **MIR's passes become a crate.** Done 2026-10-28 (crate split 4c), in three commits: what `hir-ty` asks of them moves to `HirDatabase`, the `git mv` alone, then the crate. `crates/hir-ty-mir` has `mir/{lower,eval,optimize,transform}*`, `monomorphization`, `pretty`, `type_name`, `storage`, `location` and `overflow`; `hir-ty`'s `mir.rs` keeps the types and gains the errors (`MirLowerError`, `MirEvalError`, which `ConstEvalError` contains and which contains it), `VTableMap`, `MirOptLevel` and `is_by_move_coroutine`; `held.rs` and `target.rs` stay, as layout reads them. The MIR body queries, `interpret_mir` and `opaque_of_impl` are required `HirDatabase` methods (upstream's pattern for `type_name`), implemented in `hir-ide`'s `impl_hir_database!` for `RootDatabase` and `TestDB`, the only databases. `hir-ty-mir`'s root imports `hir_ty::*` and its `mir` re-exports `hir_ty::mir::*` with the passes as children, so their `crate::` and `super::` paths did not change; the `hir-ty` items they use are `pub`, and `MirBody::frame_storage_conflicts` is the trait `FrameStorage`'s. Downstream, `hir_ty::mir` is `hir_ty_mir::mir` | the gate (3488 tests, the same as `main`); a pass edit 54 to 40 s, an edit of `hir-ty` no slower ([bench/results/2026-10-28-crate-split](../bench/results/2026-10-28-crate-split/README.md)) | done |
 
 ### 4.1 Sequencing around the branches in flight
 

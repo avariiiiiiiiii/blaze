@@ -13,7 +13,6 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-cov-mark = "2.0.0"
 itertools.workspace = true
 arrayvec.workspace = true
 smallvec.workspace = true
@@ -22,12 +21,10 @@ tracing = { workspace = true, features = ["attributes"] }
 rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
-indexmap.workspace = true
 rustc_apfloat = "0.2.3"
 oorandom = "11.1.5"
 unicode-width.workspace = true
 salsa.workspace = true
-bitflags.workspace = true
 
 rustc_abi.workspace = true
 ra-ap-rustc_index.workspace = true

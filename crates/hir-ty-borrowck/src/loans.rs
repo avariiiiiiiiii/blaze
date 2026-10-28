@@ -726,7 +726,9 @@ impl Loans {
                 }
                 StatementKind::InlineAsm(asm) => {
                     for operand in &asm.operands {
-                        if let hir_ty_mir::mir::AsmOperand::Reg { output: Some(output), .. } = operand {
+                        if let hir_ty_mir::mir::AsmOperand::Reg { output: Some(output), .. } =
+                            operand
+                        {
                             self.kill_on_place(
                                 ctx,
                                 body,

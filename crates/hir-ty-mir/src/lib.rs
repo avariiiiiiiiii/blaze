@@ -12,9 +12,6 @@
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate ra_ap_rustc_index as rustc_index;
-extern crate rustc_abi;
-extern crate rustc_next_trait_solver;
-extern crate rustc_type_ir;
 
 use hir_def::CallableDefId;
 #[allow(unused_imports, reason = "hir-ty's root, which the passes name as `crate::`")]

@@ -338,8 +338,8 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
 
 /// The coroutines `body` makes, in the order it makes them.
 fn coroutines<'db>(body: &MirBody<'db>) -> Vec<InternedCoroutineId<'db>> {
-    use hir_ty_mir::mir::{AggregateKind, Rvalue, StatementKind};
     use hir_ty::next_solver::TyKind;
+    use hir_ty_mir::mir::{AggregateKind, Rvalue, StatementKind};
     use rustc_type_ir::inherent::IntoKind;
     let mut out = Vec::new();
     for (_, block) in body.basic_blocks.iter() {
@@ -420,8 +420,8 @@ fn inline_consts<'db>(
     body: &MirBody<'db>,
 ) -> Vec<hir_ty::db::AnonConstId<'db>> {
     use hir_ty::db::GeneralConstId;
-    use hir_ty_mir::mir::{OperandKind, Rvalue, StatementKind};
     use hir_ty::next_solver::ConstKind;
+    use hir_ty_mir::mir::{OperandKind, Rvalue, StatementKind};
     use rustc_type_ir::inherent::IntoKind;
     let mut out = Vec::new();
     for (_, block) in body.basic_blocks.iter() {

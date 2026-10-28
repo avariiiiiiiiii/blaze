@@ -291,6 +291,19 @@ mod tests {
     }
 
     #[test]
+    fn a_target_directory_is_tagged_as_cargo_tags_it() {
+        let dir = std::env::temp_dir().join(format!("blaze-tagged-{}", std::process::id()));
+        let target = dir.join("target");
+        make_tagged(&target);
+        let text = std::fs::read_to_string(target.join(CACHE_TAG)).unwrap();
+        assert!(text.starts_with("Signature: 8a477f597d28d172789f06886806bc55\n"), "{text}");
+        make_tagged(&target);
+        let names: Vec<_> = std::fs::read_dir(&target).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_dylibs_of_the_second_layout_are_found() {
         let dir = std::env::temp_dir().join(format!("blaze-layout-{}", std::process::id()));
         let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);

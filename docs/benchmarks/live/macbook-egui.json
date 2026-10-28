@@ -3338,7 +3338,7 @@
        "round": 0,
        "key": 58,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=53 files=1 ms=413"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=53 files=1 ms=413"
       },
       {
        "round": 0,
@@ -3392,13 +3392,13 @@
        "round": 0,
        "key": 89,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=378"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=378"
       },
       {
        "round": 0,
        "key": 90,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=12"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=12"
       },
       {
        "round": 0,
@@ -3434,13 +3434,13 @@
        "round": 0,
        "key": 98,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=375"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=375"
       },
       {
        "round": 0,
        "key": 100,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=32"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=32"
       },
       {
        "round": 0,
@@ -3608,13 +3608,13 @@
        "round": 0,
        "key": 186,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=5 files=1 ms=535"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=5 files=1 ms=535"
       },
       {
        "round": 0,
        "key": 187,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=21"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=21"
       },
       {
        "round": 0,
@@ -3698,7 +3698,7 @@
        "round": 0,
        "key": 59,
        "ms": 154.446,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=152"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=152"
       },
       {
        "round": 0,
@@ -3836,7 +3836,7 @@
        "round": 0,
        "key": 99,
        "ms": 424.314,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=423"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=423"
       },
       {
        "round": 0,
@@ -3914,7 +3914,7 @@
        "round": 0,
        "key": 126,
        "ms": 432.024,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=7 files=1 ms=430"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=7 files=1 ms=430"
       },
       {
        "round": 0,
@@ -4118,7 +4118,7 @@
        "round": 0,
        "key": 185,
        "ms": 219.831,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=213"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=213"
       },
       {
        "round": 0,
@@ -4148,19 +4148,19 @@
        "round": 0,
        "key": 195,
        "ms": 463.481,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=458"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=458"
       },
       {
        "round": 0,
        "key": 196,
        "ms": 52.675,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=32"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=32"
       },
       {
        "round": 0,
        "key": 197,
        "ms": 59.902,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=46"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=46"
       },
       {
        "round": 1,
@@ -4220,7 +4220,7 @@
        "round": 1,
        "key": 56,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=3 files=1 ms=410"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=3 files=1 ms=410"
       },
       {
        "round": 1,
@@ -4286,13 +4286,13 @@
        "round": 1,
        "key": 85,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=558"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=558"
       },
       {
        "round": 1,
        "key": 86,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=32"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=32"
       },
       {
        "round": 1,
@@ -4310,13 +4310,13 @@
        "round": 1,
        "key": 95,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=436"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=436"
       },
       {
        "round": 1,
        "key": 96,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=21"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=21"
       },
       {
        "round": 1,
@@ -4388,7 +4388,7 @@
        "round": 1,
        "key": 122,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=6 files=1 ms=444"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=6 files=1 ms=444"
       },
       {
        "round": 1,
@@ -4466,13 +4466,13 @@
        "round": 1,
        "key": 181,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=53 files=1 ms=612"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=53 files=1 ms=612"
       },
       {
        "round": 1,
        "key": 183,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=21"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=21"
       },
       {
        "round": 1,
@@ -4508,7 +4508,7 @@
        "round": 1,
        "key": 191,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=445"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=445"
       },
       {
        "round": 1,
@@ -4718,7 +4718,7 @@
        "round": 1,
        "key": 57,
        "ms": 209.913,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=203"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=203"
       },
       {
        "round": 1,
@@ -4856,7 +4856,7 @@
        "round": 1,
        "key": 94,
        "ms": 517.7,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=507"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=507"
       },
       {
        "round": 1,
@@ -5138,7 +5138,7 @@
        "round": 1,
        "key": 182,
        "ms": 219.122,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=216"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=216"
       },
       {
        "round": 1,
@@ -5156,13 +5156,13 @@
        "round": 1,
        "key": 192,
        "ms": 497.287,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=491"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=491"
       },
       {
        "round": 1,
        "key": 193,
        "ms": 36.388,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=29"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=29"
       },
       {
        "round": 2,
@@ -5240,7 +5240,7 @@
        "round": 2,
        "key": 56,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=3 files=1 ms=444"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=3 files=1 ms=444"
       },
       {
        "round": 2,
@@ -5330,13 +5330,13 @@
        "round": 2,
        "key": 85,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=518"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=518"
       },
       {
        "round": 2,
        "key": 86,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=28"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=28"
       },
       {
        "round": 2,
@@ -5450,7 +5450,7 @@
        "round": 2,
        "key": 122,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=6 files=1 ms=420"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=6 files=1 ms=420"
       },
       {
        "round": 2,
@@ -5528,7 +5528,7 @@
        "round": 2,
        "key": 182,
        "asked after": true,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=55 files=1 ms=568"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=55 files=1 ms=568"
       },
       {
        "round": 2,
@@ -5756,7 +5756,7 @@
        "round": 2,
        "key": 57,
        "ms": 176.769,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=175"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=175"
       },
       {
        "round": 2,
@@ -5852,7 +5852,7 @@
        "round": 2,
        "key": 96,
        "ms": 575.408,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=564"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=564"
       },
       {
        "round": 2,
@@ -6116,13 +6116,13 @@
        "round": 2,
        "key": 181,
        "ms": 283.596,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=253"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=0 files=1 ms=253"
       },
       {
        "round": 2,
        "key": 183,
        "ms": 103.635,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=54"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=37 files=1 ms=54"
       },
       {
        "round": 2,
@@ -6152,13 +6152,13 @@
        "round": 2,
        "key": 191,
        "ms": 717.004,
-       "answer": "ok object=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/ra-jit.o functions=2 files=1 ms=715"
+       "answer": "ok object=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/blaze.o functions=2 files=1 ms=715"
       },
       {
        "round": 2,
        "key": 193,
        "ms": 110.624,
-       "answer": "ok patch=ra-jit/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=102"
+       "answer": "ok patch=blaze/a88ec09d1a152055/programs/liveegui-0800a82ca374ea80/patch.o functions=63 files=1 ms=102"
       }
      ]
     },
@@ -6431,7 +6431,7 @@
        "round": 0,
        "key": 58,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=3 files=1 ms=390"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=3 files=1 ms=390"
       },
       {
        "round": 0,
@@ -6473,13 +6473,13 @@
        "round": 0,
        "key": 89,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=301"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=301"
       },
       {
        "round": 0,
        "key": 90,
        "asked after": true,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=9"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=9"
       },
       {
        "round": 0,
@@ -6503,13 +6503,13 @@
        "round": 0,
        "key": 99,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=323"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=323"
       },
       {
        "round": 0,
        "key": 100,
        "asked after": true,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=18"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=18"
       },
       {
        "round": 0,
@@ -6827,7 +6827,7 @@
        "round": 0,
        "key": 59,
        "ms": 167.43,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=165"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=165"
       },
       {
        "round": 0,
@@ -6983,7 +6983,7 @@
        "round": 0,
        "key": 98,
        "ms": 384.925,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=383"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=383"
       },
       {
        "round": 0,
@@ -7079,7 +7079,7 @@
        "round": 0,
        "key": 126,
        "ms": 331.287,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=7 files=1 ms=325"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=7 files=1 ms=325"
       },
       {
        "round": 0,
@@ -7331,19 +7331,19 @@
        "round": 0,
        "key": 185,
        "ms": 140.538,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=138"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=138"
       },
       {
        "round": 0,
        "key": 186,
        "ms": 17.052,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=15"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=15"
       },
       {
        "round": 0,
        "key": 187,
        "ms": 17.48,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=16"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=16"
       },
       {
        "round": 0,
@@ -7385,19 +7385,19 @@
        "round": 0,
        "key": 195,
        "ms": 318.208,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=316"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=316"
       },
       {
        "round": 0,
        "key": 196,
        "ms": 16.486,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=11"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 197,
        "ms": 19.299,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=17"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=17"
       },
       {
        "round": 1,
@@ -7433,7 +7433,7 @@
        "round": 1,
        "key": 56,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=3 files=1 ms=304"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=3 files=1 ms=304"
       },
       {
        "round": 1,
@@ -7493,13 +7493,13 @@
        "round": 1,
        "key": 85,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=382"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=382"
       },
       {
        "round": 1,
        "key": 86,
        "asked after": true,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=12"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=12"
       },
       {
        "round": 1,
@@ -7535,13 +7535,13 @@
        "round": 1,
        "key": 95,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=377"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=377"
       },
       {
        "round": 1,
        "key": 96,
        "asked after": true,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=25"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=25"
       },
       {
        "round": 1,
@@ -7637,7 +7637,7 @@
        "round": 1,
        "key": 122,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=5 files=1 ms=326"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=5 files=1 ms=326"
       },
       {
        "round": 1,
@@ -7697,13 +7697,13 @@
        "round": 1,
        "key": 182,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=53 files=1 ms=350"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=53 files=1 ms=350"
       },
       {
        "round": 1,
        "key": 183,
        "asked after": true,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=11"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=11"
       },
       {
        "round": 1,
@@ -7985,7 +7985,7 @@
        "round": 1,
        "key": 57,
        "ms": 145.652,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=143"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=143"
       },
       {
        "round": 1,
@@ -8105,7 +8105,7 @@
        "round": 1,
        "key": 94,
        "ms": 475.403,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=472"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=472"
       },
       {
        "round": 1,
@@ -8381,7 +8381,7 @@
        "round": 1,
        "key": 181,
        "ms": 197.734,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=194"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=194"
       },
       {
        "round": 1,
@@ -8399,19 +8399,19 @@
        "round": 1,
        "key": 191,
        "ms": 439.893,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=438"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=438"
       },
       {
        "round": 1,
        "key": 192,
        "ms": 18.689,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=13"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=13"
       },
       {
        "round": 1,
        "key": 193,
        "ms": 22.526,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=20"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=20"
       },
       {
        "round": 2,
@@ -8453,7 +8453,7 @@
        "round": 2,
        "key": 56,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=3 files=1 ms=357"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=3 files=1 ms=357"
       },
       {
        "round": 2,
@@ -8573,7 +8573,7 @@
        "round": 2,
        "key": 96,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=298"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=298"
       },
       {
        "round": 2,
@@ -8651,7 +8651,7 @@
        "round": 2,
        "key": 122,
        "asked after": true,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=6 files=1 ms=335"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=6 files=1 ms=335"
       },
       {
        "round": 2,
@@ -8957,7 +8957,7 @@
        "round": 2,
        "key": 57,
        "ms": 182.219,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=179"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=179"
       },
       {
        "round": 2,
@@ -9029,7 +9029,7 @@
        "round": 2,
        "key": 85,
        "ms": 181.855,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=2 files=1 ms=180"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=2 files=1 ms=180"
       },
       {
        "round": 2,
@@ -9053,7 +9053,7 @@
        "round": 2,
        "key": 94,
        "ms": 465.112,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=461"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=461"
       },
       {
        "round": 2,
@@ -9353,19 +9353,19 @@
        "round": 2,
        "key": 181,
        "ms": 203.89,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=201"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=201"
       },
       {
        "round": 2,
        "key": 182,
        "ms": 27.373,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=22"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=22"
       },
       {
        "round": 2,
        "key": 183,
        "ms": 44.735,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=31"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=37 files=1 ms=31"
       },
       {
        "round": 2,
@@ -9401,19 +9401,19 @@
        "round": 2,
        "key": 191,
        "ms": 347.988,
-       "answer": "ok object=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/ra-jit.o functions=2 files=1 ms=346"
+       "answer": "ok object=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/blaze.o functions=2 files=1 ms=346"
       },
       {
        "round": 2,
        "key": 192,
        "ms": 15.836,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=10"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=0 files=1 ms=10"
       },
       {
        "round": 2,
        "key": 193,
        "ms": 20.445,
-       "answer": "ok patch=ra-jit/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=18"
+       "answer": "ok patch=blaze/006ca4f5b7e55ff6/programs/liveegui-b311be8adf56e623/patch.o functions=63 files=1 ms=18"
       }
      ]
     },

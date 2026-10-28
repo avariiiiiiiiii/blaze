@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""How fast tiered code runs (macOS on AArch64, ra-jit built with `--features llvm`):
+"""How fast tiered code runs (macOS on AArch64, blaze built with `--features llvm`):
 demo/lifebench, the Game of Life on a 512 x 512 grid run flat out, built each way the
 table of docs/tiers.md has, each run for the same time, the steady rate the mean of the
 half-second rates from `--from` seconds on.
 
 usage: tierbench.py [--seconds 25] [--from 15] [--rounds 1] [--together] [--only NAME,...]
-                    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+                    (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 The builds, by NAME:
 
@@ -83,7 +83,7 @@ async def main() -> None:
     bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
     work = Path(tempfile.mkdtemp(prefix="rjb-", dir="/tmp"))
     try:
-        shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
+        shutil.copytree(ROOT / "crates" / "blaze-live", work / "crates" / "blaze-live")
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
         base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=tiers.PIN)
@@ -145,7 +145,7 @@ async def main() -> None:
                 continue
             stop = dict(os.environ, BLAZE_HOME=str(home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
             try:
-                proc = await asyncio.create_subprocess_exec("cargo-ra-jit", "ra-jit", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                proc = await asyncio.create_subprocess_exec("blaze", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 await asyncio.wait_for(proc.wait(), 30)
             except (OSError, TimeoutError):
                 pass

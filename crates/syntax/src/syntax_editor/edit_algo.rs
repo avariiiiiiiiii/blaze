@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range};
 
-use rowan::TextRange;
+use syntax_tree::TextRange;
 use rustc_hash::FxHashMap;
 use stdx::format_to;
 
@@ -448,7 +448,7 @@ impl TreeState {
         }
 
         let parent = parent_path.resolve(&self.root).and_then(SyntaxElement::into_node).unwrap();
-        let green = rowan::GreenNodeData::splice_children(
+        let green = syntax_tree::GreenNodeData::splice_children(
             parent.green(),
             deleted.clone(),
             inserted.into_iter().map(PreparedElement::into_green),
@@ -541,7 +541,7 @@ struct PreparedElement {
 }
 
 impl PreparedElement {
-    fn into_green(self) -> rowan::NodeOrToken<rowan::GreenNode, rowan::GreenToken> {
+    fn into_green(self) -> syntax_tree::NodeOrToken<syntax_tree::GreenNode, syntax_tree::GreenToken> {
         match self.syntax {
             SyntaxElement::Node(node) => NodeOrToken::Node(node.green().to_owned()),
             SyntaxElement::Token(token) => NodeOrToken::Token(token.green().to_owned()),

@@ -1,8 +1,8 @@
-# ra-jit on Windows x86-64 (MSVC)
+# blaze on Windows x86-64 (MSVC)
 
-Branch `ra-jit-windows`, off `ra-jit-spike`. Everything below marked "measured" was run on this
+Branch `blaze-windows`, off `blaze-spike`. Everything below marked "measured" was run on this
 machine: Windows Server 2022 (10.0.20348), x86-64, 8 cores of a Xeon 8559C, 32 GB, MSVC
-`link.exe` 14.44, the harness toolchain `nightly-2026-05-10`, ra-jit built with rustc 1.99.1.
+`link.exe` 14.44, the harness toolchain `nightly-2026-05-10`, blaze built with rustc 1.99.1.
 Anything I did not run is marked "inferred" or "not run".
 
 The sections from "Harness results" down describe that first port. What changed after it
@@ -12,7 +12,7 @@ disagree.
 
 ## What works
 
-ra-jit builds with `cargo build -p ra-jit --release` and runs as the daemon on Windows. It emits
+blaze builds with `cargo build -p blaze-engine --release` and runs as the daemon on Windows. It emits
 COFF objects, they link with MSVC `link.exe` (the linker rustc itself picks for this target; the
 harnesses take the line from rustc, and also accept `rust-lld`/`lld-link` lines), and the
 programs behave as rustc's do. With `--splice` the daemon appends a patch into the linked
@@ -50,7 +50,7 @@ What changed, by area:
 
 ## The PE splice
 
-`crates/ra-jit/src/splice/pe.rs`. The contract is the ELF one: `Baseline::read` and `Addition`
+`crates/blaze-engine/src/splice/pe.rs`. The contract is the ELF one: `Baseline::read` and `Addition`
 are shared, and the format is chosen by what the executable is.
 
 - Symbols. A PE has no symbol table and `link.exe` cannot write one, so names come from the
@@ -85,7 +85,7 @@ the helpers for either kind of link line and the others use them.
 
 | Harness | Result |
 |---|---|
-| `difftest.py corpus --bin runner --crate cases` | MATCH, 674/680 functions from ra-jit |
+| `difftest.py corpus --bin runner --crate cases` | MATCH, 674/680 functions from blaze |
 | `programs.py` | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts |
 | `breakers.py` | 15 of 15, 1 open (`future_size`, open on Linux too) |
@@ -119,12 +119,12 @@ they are. The LLVM backend (`--features llvm`) was not built or tried on Windows
 Commit `a5aedad842` of this branch on Linux x86-64, same harness toolchain: corpus 679/680
 MATCH, programs 22/22, stress 99/99, breakers 15/15 (1 open), unwinds 8/8, splices 71/71,
 worktrees 52/52, asmedits 10/10, deps 10/10, includes 9/9, and `bench.py toy corpus` ran in
-both modes (10/10 spliced with `BLAZE_SPLICE`). These are the numbers of `ra-jit-spike`. The
+both modes (10/10 spliced with `BLAZE_SPLICE`). These are the numbers of `blaze-spike`. The
 two commits after `a5aedad842` change a harness JSON path, a docstring and parentheses in the
 Windows-only `seh.rs`; they were not rerun on Linux.
 
-`cargo clippy -p ra-jit --all-targets` fails on Linux with one `large_enum_variant` error in
-`remote.rs`; `ra-jit-spike` fails the same way. The branch adds three style warnings in
+`cargo clippy -p blaze-engine --all-targets` fails on Linux with one `large_enum_variant` error in
+`remote.rs`; `blaze-spike` fails the same way. The branch adds three style warnings in
 `pe.rs` (`chunks_exact` with a constant).
 
 ## Edit to binary: full link vs splice (measured)
@@ -137,10 +137,10 @@ does not include starting the program. The edit flips a literal in a function bo
 |---|---|---:|---:|---:|---:|
 | toy (`demo`, 7 functions) | full link | 6.4 | 87.1 | 98 | 251 |
 | toy | splice | 4.3 | 0.22 | 9.4 | 245 |
-| regex (`bench2`: regex-automata, 1989 of 2494 functions from ra-jit) | full link | 241 | 303 | 548 | 2927 |
+| regex (`bench2`: regex-automata, 1989 of 2494 functions from blaze) | full link | 241 | 303 | 548 | 2927 |
 | regex | splice | 6.3 | 0.53 | 18 | 2938 |
 
-The full-link mode of `bench.py` is the one on `ra-jit-spike`: no `--patch`, so each edit also
+The full-link mode of `bench.py` is the one on `blaze-spike`: no `--patch`, so each edit also
 writes the whole object again, which is the codegen difference on regex. The link column is
 the cleaner comparison: 87 ms to 0.2 ms and 303 ms to 0.5 ms. All 10 of 10 edits were spliced
 in both programs. The first edit after a start is slower (toy 6.8 ms, regex 294 ms with
@@ -159,7 +159,7 @@ Without splice it ran (link 339 ms).
    static.
 3. Thread-local data in a patch declines the splice.
 4. The PDB is stale after a splice; debugging spliced code shows the wrong source.
-5. Exceptions other than C++ ones (structured exceptions, foreign unwinds) pass through ra-jit
+5. Exceptions other than C++ ones (structured exceptions, foreign unwinds) pass through blaze
    frames without running their cleanup. A Rust panic is a C++ exception on MSVC, so panics
    are not affected. Inferred from the personality's filter, not tested.
 6. Executables with Control Flow Guard, signed, or linked without a PDB always take the full
@@ -168,7 +168,7 @@ Without splice it ran (link 339 ms).
    a later link by a daemon for the same executable removes them. Inferred from the code.
 
 One thing I saw and did not explain: `stress.py` on Windows answers steps 56 and 58 (a
-static's value changed) with a patch where the `STRESS.md` committed on `ra-jit-spike` shows a
+static's value changed) with a patch where the `STRESS.md` committed on `blaze-spike` shows a
 full build. Both give rustc's output. I left the committed `STRESS.md` as it is.
 
 ## What is left, ranked
@@ -206,7 +206,7 @@ Windows port second.
 ## Since the first port
 
 This section is newer than the rest of the file and was measured on the same machine, on
-`ra-jit-windows-variadic` (commit `250adbbcb2`, on `ra-jit-collate` `530ce12b8f`), with stable
+`blaze-windows-variadic` (commit `250adbbcb2`, on `blaze-collate` `530ce12b8f`), with stable
 1.99.0 as the harness toolchain and LLVM 20.1.8.
 
 ### The LLVM backend
@@ -219,7 +219,7 @@ Windows; nothing is left to Cranelift in any harness. What it took:
   `.pdata`/`.xdata` rather than looking for `.eh_frame`.
 - A call with a landing pad is an `invoke` under LLVM. The pad stores the exception in a
   slot of the function's own, and the table of pads is read back from `.xdata`. The pad table
-  ra-jit writes is three `u32` per entry (the range of return addresses and the pad), and the
+  blaze writes is three `u32` per entry (the range of return addresses and the pad), and the
   personality enters the pad rather than returning to the call.
 - LLVM writes no `.pdata` entry for a leaf that leaves the stack alone, and the splice tells
   where a function ends from that entry, so such a function gets a frameless `UNWIND_INFO`.
@@ -229,7 +229,7 @@ Windows; nothing is left to Cranelift in any harness. What it took:
   `__chkstk`, through `Target::stack_probe`.
 
 Building it is not in the repository: the LLVM release for Windows is built against the
-static C runtime, so ra-jit needs `-C target-feature=+crt-static`, the Windows SDK library
+static C runtime, so blaze needs `-C target-feature=+crt-static`, the Windows SDK library
 directory on `-L native=`, and a stub `libxml2s.lib`.
 
 ### Two floats returned in registers
@@ -261,7 +261,7 @@ other than `C` and `win64`; and `va_arg` of a type wider than 8 bytes. None is i
 
 ### Naked functions and asm labels
 
-These needed nothing in ra-jit. The corpus cases were System V only because two of them name
+These needed nothing in blaze. The corpus cases were System V only because two of them name
 `rdi` and `rsi`; they have Windows variants now, and `varargs_abi` calls `snprintf` as
 `extern "win64"` there. `snprintf` is in `legacy_stdio_definitions.lib` on MSVC.
 
@@ -287,7 +287,7 @@ to Cranelift.
 | `worktrees.py --join --together` | 52 of 52 | 2385 / 0 | 52 of 52 |
 | `worktrees.py --overlay` | 61 of 61 | 1950 / 0 | 61 of 61 |
 
-The corpus has 806 functions on Windows and ra-jit compiles all of them. `deps.py` compiles
+The corpus has 806 functions on Windows and blaze compiles all of them. `deps.py` compiles
 no function; it pushes and pulls dependency archives.
 
 `splices.py` splices 59 to 61 of the 71 steps and the rest take the full link. Repeated runs
@@ -299,7 +299,7 @@ run to run under both backends. I did not find out why.
 
 ## The ABI round after that
 
-Measured on `ra-jit-windows-abi2` (on `ra-jit-collate` `6d12f21c86`), on the same machine, with
+Measured on `blaze-windows-abi2` (on `blaze-collate` `6d12f21c86`), on the same machine, with
 stable 1.99.0 and LLVM 20.1.8. Where this section disagrees with the ones above, this one
 is current.
 
@@ -340,7 +340,7 @@ than `C` and `win64`. None is in the corpus.
 ### `naked_asm!` with `sym` and `const`
 
 A `sym` operand goes through MIR as `AsmOperand::Sym`. The assembly names it
-`ra_jit_sym_N`, the relocations of the assembled object against those names are read back
+`blaze_sym_N`, the relocations of the assembled object against those names are read back
 (COFF and ELF; a `rel32` call or jump, a `rip`-relative reference, an absolute 64-bit
 address), and become relocations of the function against the function or static meant.
 `const` was already put into the text. The corpus case `naked_sym` jumps to and calls a
@@ -349,13 +349,13 @@ function, loads a static, takes the address of one and adds to it in place.
 Turned down, with the reason logged: `sym` in `asm!` that is not naked, a `sym` that names
 a generic function or a thread-local static, and a relocation of another kind. The case is
 in the corpus on x86-64 Unix too and the Linux harness jobs pass with it in CI, but I did
-not check there that ra-jit compiled it rather than leaving it to rustc. Mach-O relocations
+not check there that blaze compiled it rather than leaving it to rustc. Mach-O relocations
 are not read.
 
 ### CI
 
-`.github/workflows/ra-jit.yaml` has two Windows jobs on `windows-latest` with MSVC:
-`fmt and tests (windows)`, and `harness (windows, cranelift|llvm)`, which builds ra-jit with
+`.github/workflows/blaze.yaml` has two Windows jobs on `windows-latest` with MSVC:
+`fmt and tests (windows)`, and `harness (windows, cranelift|llvm)`, which builds blaze with
 `--features llvm` against the LLVM 20.1.8 release and runs the matrix. Two things it needed:
 Git's `/usr/bin/link.exe` is ahead of MSVC's linker in bash and is removed, and a stub
 `libxml2s.lib` is made with `llvm-ar`. All four Windows and Linux harness jobs and both
@@ -399,19 +399,19 @@ process read by `option_env!`, and the release profile, each "again" and "elsewh
 
 1. `sym` in `asm!` that is not naked, and `sym` of a generic function.
 2. A variadic function with no named parameter.
-3. `naked_asm!` with `sym` on Mach-O, and a check on Linux that ra-jit compiles the ELF case.
+3. `naked_asm!` with `sym` on Mach-O, and a check on Linux that blaze compiles the ELF case.
 
 ## The production round: debug info, the build model, the disk store
 
-Measured on `ra-jit-windows-prod`, which is `ra-jit-windows-abi2` with `ra-jit-collate`
+Measured on `blaze-windows-prod`, which is `blaze-windows-abi2` with `blaze-collate`
 `0151c01218` merged in, on the same machine (Windows Server 2022, x86-64, MSVC 14.44, stable
 1.99.0, LLVM 20.1.8). Where this section disagrees with the ones above, this one is current.
 Everything was run natively. Nothing in the `sym`, variadic or stacked-argument code was
-changed in this round; what the branch has there is what `ra-jit-windows-abi2` had.
+changed in this round; what the branch has there is what `blaze-windows-abi2` had.
 
 ### Debug info
 
-ra-jit now writes CodeView for its functions on COFF, under both backends: a `.debug$S`
+blaze now writes CodeView for its functions on COFF, under both backends: a `.debug$S`
 section in the C13 format with one `S_GPROC32` procedure per function, its lines, the file
 names and their checksums. `link.exe /DEBUG` puts them in the PDB next to rustc's. The
 writer is `crates/hir-ty/src/mir/codegen/debuginfo/codeview.rs`; it takes the same
@@ -426,10 +426,10 @@ same under Cranelift and LLVM unless said:
   LLVM where the optimizer leaves one frame out) has the file and line the cargo build has.
   The same holds for the stress program and rung2. Function names are compared by their last
   part, because rustc's CodeView spells a path differently from the mangled name.
-- The PDB. `llvm-pdbutil` reads it without complaint, and every function of ra-jit's that has
+- The PDB. `llvm-pdbutil` reads it without complaint, and every function of blaze's that has
   a `.pdata` entry has a procedure that covers the same range (under LLVM 11689 in the
   corpus, 1720 in stress, 3011 in rung2).
-- cdb. A breakpoint by file and line in ra-jit's code stops there, the stack above it is
+- cdb. A breakpoint by file and line in blaze's code stops there, the stack above it is
   named, and stepping moves through the following lines (for example `lib.rs:1962` in the
   corpus, then 1945 to 1948 in the function it calls).
 - The splice. A PDB is a file only the linker writes, so a splice leaves it as it was. The
@@ -466,15 +466,15 @@ oldest. The pack is opened with that right now.
 
 `buildmodel.py`: 176 rows as expected, 0 wrong, 4 skipped, in one run that covers both backends. The two Linux cross targets are skipped off Linux, and the
 table prints them as `skipped` with the reason, apart from `WRONG`. What had to change was
-in the harness and its cases, not in ra-jit: `file://` URLs made by `setup.sh` from a
+in the harness and its cases, not in blaze: `file://` URLs made by `setup.sh` from a
 Windows path, the daemon's socket path going past the length limit, and five cases that
 only built with Unix tools (`no_std_no_main`, `script_link_lib`, `target_specific_deps`,
 `crate_cdylib`, `crate_staticlib`).
 
 The last two deserve a warning. Their `run.sh` called `cc`; on a machine without it both
-the cargo build and ra-jit's failed alike and the row read "supported", which is how I first
+the cargo build and blaze's failed alike and the row read "supported", which is how I first
 reported 176 of 176 when four of those rows compared nothing. They now link with `cl`, and
-both builds print 42. For the DLL, ra-jit's link keeps the `symbols.o` that carries the
+both builds print 42. For the DLL, blaze's link keeps the `symbols.o` that carries the
 export directives (the `.def` file rustc writes is empty) and writes its own import
 library rather than over cargo's. A row where both builds fail the same way still counts
 as the same; the harness does not tell that apart, on any platform.
@@ -556,16 +556,16 @@ changes in `c7774bc1cc`. No Rust code differs between the two.
   discarded count apply on every platform.
 - `harness/linkline.py`: `/IMPLIB:` follows `/OUT:`, on MSVC lines only.
 
-## `cargo ra-jit`, the remote store and the fuzzer on Windows
+## `blaze`, the remote store and the fuzzer on Windows
 
-Measured on `ra-jit-windows-prod` with `ra-jit-collate` `3d47ed59bf` merged in (head `10c09c813d` plus this report). `ra-jit-collate-next` is not merged, on the same
+Measured on `blaze-windows-prod` with `blaze-collate` `3d47ed59bf` merged in (head `10c09c813d` plus this report). `blaze-collate-next` is not merged, on the same
 machine. Where this section disagrees with the ones above, this one is current. Everything
-was run natively, with one ra-jit built with `--features llvm`.
+was run natively, with one blaze built with `--features llvm`.
 
 ### What state Windows is in
 
-On Windows x86-64 MSVC ra-jit passes every harness the Linux gate has, under Cranelift and
-under LLVM, and `cargo ra-jit` serves the seven projects of `cargo_ra_jit.py` with no
+On Windows x86-64 MSVC blaze passes every harness the Linux gate has, under Cranelift and
+under LLVM, and `blaze` serves the seven projects of `blaze_cli.py` with no
 difference from cargo. LLVM compiles every function itself and leaves none to Cranelift.
 The table is under "Harness results" below.
 
@@ -580,11 +580,11 @@ What is not there:
 - SeaweedFS (`weed`) is not installed here, so `remote.py` ran against MinIO alone.
 - Only x86-64 MSVC was built or run. Nothing is known of AArch64 Windows or the GNU targets.
 
-### `cargo ra-jit`
+### `blaze`
 
-Nothing of `cargo ra-jit` had run on Windows before this round: the link plan refused any
+Nothing of `blaze` had run on Windows before this round: the link plan refused any
 line that was not an ELF `cc` line, so every build went to cargo. Running
-`harness/cargo_ra_jit.py` found the following, in the order they came up. Each is fixed.
+`harness/blaze_cli.py` found the following, in the order they came up. Each is fixed.
 
 - The link plan now takes a `link.exe` line. The daemon's objects go ahead of rustc's with
   `/FORCE:MULTIPLE`, the output and the PDB are named by path, and the directories of `LIB`
@@ -593,15 +593,15 @@ line that was not an ELF `cc` line, so every build went to cargo. Running
   written with `/FORCE` (LNK4088) and cannot be told not to, and ripgrep's build script
   asks for warnings to fail the link.
 - The daemon's link asks for an 8 MiB stack for the first thread when the line asks for
-  none. This is a workaround. A function compiled by ra-jit can have a frame about twice the
-  size of rustc's: clap's `augment_args` in fd takes 1014 KiB from ra-jit and 482 KiB from
+  none. This is a workaround. A function compiled by blaze can have a frame about twice the
+  size of rustc's: clap's `augment_args` in fd takes 1014 KiB from blaze and 482 KiB from
   rustc, and the first overflows the 1 MiB that `link.exe` gives by default, under both
   backends. The frame size itself is not fixed.
 - The daemon inherited the handles of the command that started it, so anything that read
   the command's output through a pipe waited for the daemon to end. It is now started in a
   process group and console of its own and inherits nothing but its log.
 - Build scripts. On Unix the wrapper puts a shell script in front of a build script so that
-  the daemon learns how cargo runs it. On Windows ra-jit is hard-linked where rustc linked
+  the daemon learns how cargo runs it. On Windows blaze is hard-linked where rustc linked
   the script and runs it as cargo does. Before this a package whose build script names no
   `rerun-if` was cargo's on every change. Where the link cannot be made (another volume)
   that is still so.
@@ -623,15 +623,15 @@ line that was not an ELF `cc` line, so every build went to cargo. Running
 - A worker is told its symbol files in a file. nushell has more of them than the command
   line of a Windows process holds, and no worker started for it.
 
-The socket is hardened as on Unix, in `crates/ra-jit/src/socket/windows.rs`. The daemon's
+The socket is hardened as on Unix, in `crates/blaze-engine/src/socket/windows.rs`. The daemon's
 directory is refused unless the user owns it and its access control list admits only the
 user, SYSTEM and Administrators; a directory the daemon creates is given such a list, and so
 is the socket. A peer is found with `SIO_AF_UNIX_GETPEERPID` and turned away unless its
 process token is the daemon's user. One unit test covers this. It was not tested against a
 second user.
 
-`cargo_ra_jit.py` on this head: seven projects, no differences from cargo, and the flag and
-daemon checks all hold. Seconds, `cargo ra-jit` / plain cargo; bold is a build the daemon
+`blaze_cli.py` on this head: seven projects, no differences from cargo, and the flag and
+daemon checks all hold. Seconds, `blaze` / plain cargo; bold is a build the daemon
 did, `(c)` one cargo did in its place.
 
 | Project | cold build | warm-up | warm build | cold test | test warm-up | warm test | edit build | edit test | broken | mended | Differences |
@@ -665,7 +665,7 @@ outright pushes nothing, as on Unix.
 
 `harness/fuzz/fuzz.py smoke` runs on Windows after two harness changes (no `resource` module
 there, so a generated program is held to its time and not to a memory limit; sources are
-written as UTF-8). Under each backend: 2 programs, 505 functions compiled by ra-jit, 0
+written as UTF-8). Under each backend: 2 programs, 505 functions compiled by blaze, 0
 differences, 0 crashes, 0 left to rustc. The long fuzzing runs were not done here.
 
 ### Harness results (measured)
@@ -675,7 +675,7 @@ One binary; the Cranelift column is the default backend, the LLVM column is
 
 | Harness | Cranelift | LLVM |
 |---|---|---|
-| corpus `--layouts` | MATCH, 830/830 from ra-jit, 0 of 899 layouts differ | MATCH, 830/830, 0 of 899 |
+| corpus `--layouts` | MATCH, 830/830 from blaze, 0 of 899 layouts differ | MATCH, 830/830, 0 of 899 |
 | `scoreboard.py` | 6 targets match | 6 targets match |
 | `programs.py` | 22/22 | 22/22 |
 | `stress.py` | 99/99, 0 restarts | 99/99, 0 restarts |
@@ -699,7 +699,7 @@ One binary; the Cranelift column is the default backend, the LLVM column is
 | `fuzz/fuzz.py smoke` | 505 functions, 0 findings | 505 functions, 0 findings |
 | `backends.py` | | not finished: the disk filled |
 | `buildmodel.py` (both backends in one run) | not run on this head | |
-| `cargo_ra_jit.py` | not run on this head | not run |
+| `blaze_cli.py` | not run on this head | not run |
 
 The table is the gate on `10c09c813d`. It was stopped before it finished: the machine's disk
 filled with the harnesses' scratch directories during the LLVM leg. What that leaves:
@@ -712,10 +712,10 @@ filled with the harnesses' scratch directories during the LLVM leg. What that le
   of are not fetched again": one pack was fetched again) and none wrong in the next run.
   That is not explained. A third run stopped because MinIO was not ready when its bucket
   was made.
-- `buildmodel.py` and `cargo_ra_jit.py` did not run on this head. On `b0025a2ff5`
+- `buildmodel.py` and `blaze_cli.py` did not run on this head. On `b0025a2ff5`
   `buildmodel.py` was 186 of 190 with 4 skipped; the four wrong rows were
   `reload_git_checkout` and `reload_lock_version` under each backend, whose `setup.sh` is
-  fixed since and which pass when run alone. `cargo_ra_jit.py` passed there: seven
+  fixed since and which pass when run alone. `blaze_cli.py` passed there: seven
   projects, no differences, flags and daemon checks hold. The table above is from that run.
 - Six cases of `breakers.py` are open: the ones the harness lists as open and the ones it
   counts as left to rustc. `arg_frames` is not among them any more. It overflowed the 1 MiB
@@ -731,27 +731,27 @@ ten full links of `splices.py` are declines with a reason, the same under both b
 
 ### What is next
 
-1. Run `remote.py` and `backends.py` under LLVM, `buildmodel.py` and `cargo_ra_jit.py` on
+1. Run `remote.py` and `backends.py` under LLVM, `buildmodel.py` and `blaze_cli.py` on
    the head, with the scratch directories cleared between harnesses, and merge
-   `ra-jit-collate-next`.
+   `blaze-collate-next`.
 2. Find why one pack was fetched again in `remote.py` once.
 3. `.debug$T`: types, parameters and locals. Not started.
 4. The PDB after a splice. Not started.
-5. The size of ra-jit's frames, which the 8 MiB stack of the daemon's link works around.
+5. The size of blaze's frames, which the 8 MiB stack of the daemon's link works around.
 
 ### To recheck on Linux
 
-- `crates/load-cargo/src/lib.rs` and `ra-jit/src/main.rs`: CR LF in a `.rs` file is read as LF.
-- `crates/ra-jit/src/cargo/daemon.rs`: a worker that loads is not idle; a worker reads its
+- `crates/load-cargo/src/lib.rs` and `blaze/src/main.rs`: CR LF in a `.rs` file is read as LF.
+- `crates/blaze-engine/src/cargo/daemon.rs`: a worker that loads is not idle; a worker reads its
   symbol files from a file (`--symbols-in`).
-- `crates/ra-jit/src/cargo/state.rs`: the repository of a checkout is spelled as the file
+- `crates/blaze-engine/src/cargo/state.rs`: the repository of a checkout is spelled as the file
   system spells it.
-- `crates/ra-jit/src/cargo/plan.rs`: `target-feature=+crt-static` alone is served, on every
+- `crates/blaze-engine/src/cargo/plan.rs`: `target-feature=+crt-static` alone is served, on every
   target. The ELF path of the link plan is moved into `command_of_cc`, not changed.
-- `crates/ra-jit/src/symbols.rs`: a symbol file with no hash in its name names its crate.
+- `crates/blaze-engine/src/symbols.rs`: a symbol file with no hash in its name names its crate.
 - `harness/deps.py`: the changed archive is looked for by `rejected units/<name>`; the old
-  wording is not in ra-jit any more, so the check could not pass anywhere.
+  wording is not in blaze any more, so the check could not pass anywhere.
 - `harness/remote.py`: the test authority has a key usage (Python 3.13 asks for one), and
   the link line is quoted with `linkline.join`.
-- `harness/cargo_ra_jit.py`, `harness/fuzz/fuzz.py`, `harness/s3fake.py`: process handling
+- `harness/blaze_cli.py`, `harness/fuzz/fuzz.py`, `harness/s3fake.py`: process handling
   and encodings that differ by platform.

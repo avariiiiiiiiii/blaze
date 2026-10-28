@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use rowan::TextRange;
+use syntax_tree::TextRange;
 use rustc_hash::FxHashMap;
 
 use crate::{

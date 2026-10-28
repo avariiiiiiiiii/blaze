@@ -64,8 +64,8 @@ impl IndentLevel {
     }
     pub fn from_element(element: &SyntaxElement) -> IndentLevel {
         match element {
-            rowan::NodeOrToken::Node(it) => IndentLevel::from_node(it),
-            rowan::NodeOrToken::Token(it) => IndentLevel::from_token(it),
+            syntax_tree::NodeOrToken::Node(it) => IndentLevel::from_node(it),
+            syntax_tree::NodeOrToken::Token(it) => IndentLevel::from_token(it),
         }
     }
 
@@ -92,7 +92,7 @@ impl IndentLevel {
         let tokens = node
             .preorder_with_tokens()
             .filter_map(|event| match event {
-                rowan::WalkEvent::Leave(NodeOrToken::Token(it)) => Some(it),
+                syntax_tree::WalkEvent::Leave(NodeOrToken::Token(it)) => Some(it),
                 _ => None,
             })
             .filter_map(ast::Whitespace::cast)
@@ -109,7 +109,7 @@ impl IndentLevel {
         let tokens = node
             .preorder_with_tokens()
             .filter_map(|event| match event {
-                rowan::WalkEvent::Leave(NodeOrToken::Token(it)) => Some(it),
+                syntax_tree::WalkEvent::Leave(NodeOrToken::Token(it)) => Some(it),
                 _ => None,
             })
             .filter_map(ast::Whitespace::cast)

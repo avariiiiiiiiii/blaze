@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""basebench.py: ra-jit compiling every crate of a workspace, against rustc doing the same.
+"""basebench.py: blaze compiling every crate of a workspace, against rustc doing the same.
 
 usage: basebench.py WORKSPACE PACKAGE [--runs N] [--out FILE] [--keep WORK]
 
 The registry crates are built once and stay. Then, N times each (default 3):
   cargo build   every package of the workspace cleaned, `cargo build -p PACKAGE`
   cargo check   the same with `cargo check`; build minus check is rustc's code generation
-  ra-jit cold    ra-jit on every crate of the workspace the program uses, with an empty store
-  ra-jit warm    the same again with the store the cold run filled
-  ra-jit none    the same with no store
-For ra-jit the time is the process's, loading included, with the split its `BLAZE_STATS`
+  blaze cold    blaze on every crate of the workspace the program uses, with an empty store
+  blaze warm    the same again with the store the cold run filled
+  blaze none    the same with no store
+For blaze the time is the process's, loading included, with the split its `BLAZE_STATS`
 lines give, and user and system CPU seconds next to the wall time. Every run is printed.
 """
 import json, os, re, resource, shutil, statistics, subprocess, sys, tempfile, time
@@ -17,7 +17,7 @@ import json, os, re, resource, shutil, statistics, subprocess, sys, tempfile, ti
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
-from difftest import Fixture, RA_JIT, TARGET_ARGS, sysroot_rlibs
+from difftest import Fixture, BLAZE, TARGET_ARGS, sysroot_rlibs
 if INCREMENTAL is None:
     os.environ.pop("CARGO_INCREMENTAL", None)
 
@@ -40,7 +40,7 @@ def seconds(text):
 
 
 def split(stderr):
-    """What ra-jit says of where its time went."""
+    """What blaze says of where its time went."""
     found = {}
     for name, pattern in [("load", r"^load(?:ed)?[^\n]*? in ([\d.]+\S+)"), ("roots", r"roots: (\S+),"), ("revalidate", r"revalidate: (\S+),"),
                           ("compile", r"compile: (\S+)$"), ("emit", r"\(\+(\S+) emit\)")]:
@@ -60,7 +60,7 @@ def main():
     option = lambda name, default: argv[argv.index(name) + 1] if name in argv else default
     runs, out, work = int(option("--runs", 3)), option("--out", None), option("--keep", None)
     source, package = argv[0], argv[1]
-    ws = work or tempfile.mkdtemp(prefix="ra-jit-base-")
+    ws = work or tempfile.mkdtemp(prefix="blaze-base-")
     if not os.path.exists(os.path.join(ws, "Cargo.toml")):
         shutil.copytree(source, ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target*", ".git"))
     meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1"], cwd=ws))
@@ -79,7 +79,7 @@ def main():
     ours = [packages[i] for i in used & members]
     crates = [t["name"].replace("-", "_") for p in ours for t in p["targets"] if "lib" in t["kind"] or (p["id"] == root and "bin" in t["kind"])]
     clean = ["cargo", "clean", *(x for p in ours for x in ("-p", p["name"]))]
-    result = dict(workspace=source, package=package, crates=sorted(set(crates)), ra_jit=RA_JIT, rows={})
+    result = dict(workspace=source, package=package, crates=sorted(set(crates)), blaze=BLAZE, rows={})
     print(f"work {ws}; {len(ours)} packages; crates {' '.join(sorted(set(crates)))}", flush=True)
 
     subprocess.run(["cargo", "build", "-p", package], cwd=ws, check=True, capture_output=True)
@@ -99,7 +99,7 @@ def main():
     fx.rustc_build()
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     obj = os.path.join(fx.work, "all.o")
-    command = [RA_JIT, ws, *(x for c in sorted(set(crates)) for x in ("--crate", c)), "--out", obj, *TARGET_ARGS, *symbols]
+    command = [BLAZE, ws, *(x for c in sorted(set(crates)) for x in ("--crate", c)), "--out", obj, *TARGET_ARGS, *symbols]
     open(os.path.join(fx.work, "command.json"), "w").write(json.dumps(command))
     print(f"command in {fx.work}/command.json", flush=True)
     store = os.path.join(fx.work, "store")
@@ -114,9 +114,9 @@ def main():
             open(os.path.join(fx.work, f"{name}.stderr"), "w").write(stderr)
             row.update(split(stderr))
             rows.append(row)
-            print(f"ra-jit {name:5}  {row['wall']:7.2f}s wall {row['cpu']:7.2f}s cpu {row['rss']:6} MB  " +
+            print(f"blaze {name:5}  {row['wall']:7.2f}s wall {row['cpu']:7.2f}s cpu {row['rss']:6} MB  " +
                   " ".join(f"{k} {v}" for k, v in row.items() if k not in ("wall", "cpu", "rss")), flush=True)
-        result["rows"][f"ra-jit {name}"] = rows
+        result["rows"][f"blaze {name}"] = rows
     fx.link([obj])
     ran = subprocess.run([fx.binary, "--version"], capture_output=True, text=True)
     print(f"linked: `--version` exits {ran.returncode}: {ran.stdout.strip()[:80]}")

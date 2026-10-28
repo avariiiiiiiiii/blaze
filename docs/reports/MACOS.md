@@ -1,10 +1,10 @@
-# ra-jit on macOS aarch64
+# blaze on macOS aarch64
 
-Branch `ra-jit-macos`, off `ra-jit-spike`. Everything below was run on one machine: an Apple M4
+Branch `blaze-macos`, off `blaze-spike`. Everything below was run on one machine: an Apple M4
 (virtual), macOS 26.5.2, `uname -m` says `arm64`, Apple ld 1267, nightly-2026-05-10. Where I
 say "measured" I ran it there. Where I say "inferred" I did not.
 
-The short version: ra-jit builds, the corpus matches rustc, every harness in the task list
+The short version: blaze builds, the corpus matches rustc, every harness in the task list
 passes, and the splice works on Mach-O arm64 for executables that use dyld info (which is
 what rustc's default deployment target of macOS 11 produces). On ripgrep the splice takes a
 link from 89 ms to 42 ms. I could not run anything on Linux, so "Linux is unchanged" is by
@@ -12,11 +12,11 @@ construction and not by test.
 
 ## What works (measured)
 
-`cargo build -p ra-jit --release` builds.
+`cargo build -p blaze-engine --release` builds.
 
-| harness | result here | Linux on `ra-jit-spike` |
+| harness | result here | Linux on `blaze-spike` |
 |---|---|---|
-| `difftest.py corpus --bin runner --crate cases` | MATCH, 655/656 functions from ra-jit | 679/680 |
+| `difftest.py corpus --bin runner --crate cases` | MATCH, 655/656 functions from blaze | 679/680 |
 | `programs.py` | 22 of 22 | 22/22 |
 | `stress.py` | 99 of 99, 0 restarts | 99/99 |
 | `breakers.py` | 15 of 15, 1 open, 0 functions skipped | 15/15 |
@@ -33,7 +33,7 @@ Also run: `BLAZE_SPLICE=1 programs.py` 22 of 22, and `splices.py` with `SPLICES_
 Notes on those numbers:
 
 - The corpus has 656 functions here and not 680 because the x86 SIMD and x86 `asm!` cases are
-  behind `cfg(target_arch = "x86_64")`. The one function not from ra-jit is the same
+  behind `cfg(target_arch = "x86_64")`. The one function not from blaze is the same
   `type_id_hashes::elided` that is skipped on Linux.
 - `difftest.py corpus` has to be run from `harness/`. From the repo root it looks for
   `./corpus` and fails. I did not change that.
@@ -58,13 +58,13 @@ Notes on those numbers:
 
 Everything above ran on Cranelift, the default. The LLVM backend also builds and runs here:
 `brew install llvm@20`, then
-`LLVM_SYS_201_PREFIX=/opt/homebrew/opt/llvm@20 cargo build -p ra-jit --release --features llvm`
+`LLVM_SYS_201_PREFIX=/opt/homebrew/opt/llvm@20 cargo build -p blaze-engine --release --features llvm`
 (LLVM 20.1.8). Homebrew has since dropped `llvm@20`; the supported LLVM is now the flake's,
 the same 20.1.8 ([contributing.md](../contributing.md#llvm-for---features-llvm)). With `BLAZE_BACKEND=llvm`, at the default `BLAZE_OPT=2`:
 
 | harness | result |
 |---|---|
-| `difftest.py corpus --bin runner --crate cases` | MATCH, 655/656 functions from ra-jit |
+| `difftest.py corpus --bin runner --crate cases` | MATCH, 655/656 functions from blaze |
 | `programs.py` | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts |
 | `breakers.py` | 15 of 15, 1 open |
@@ -80,9 +80,9 @@ did go through LLVM.
 `backends.py` says how much LLVM compiled itself. On the corpus, of 10770 functions, 2 are
 left to Cranelift at both levels ("more than two return values"). On ripgrep 14.1.1 (the
 `rg` crate, 14352 functions) none are, and the program prints the same as cargo's with
-Cranelift, LLVM -O0 and LLVM -O2 (`rg --sort path -n -i 'splice|unwind\b' crates/ra-jit/src`).
+Cranelift, LLVM -O0 and LLVM -O2 (`rg --sort path -n -i 'splice|unwind\b' crates/blaze-engine/src`).
 
-| ripgrep, `rg` crate | producing code, s (all threads) | code bytes | ra-jit wall, s |
+| ripgrep, `rg` crate | producing code, s (all threads) | code bytes | blaze wall, s |
 |---|---:|---:|---:|
 | cranelift | 2.1 | 5969204 | 2.8 |
 | llvm -O0 | 7.7 | 6535252 | 3.7 |
@@ -168,12 +168,12 @@ small structs go in register units, larger ones by pointer, and Apple's variadic
 for the personality, and the LSDA no longer goes into a section named `.gcc_except_table`,
 which Mach-O cannot name. `asm!` has an AArch64 wrapper next to the x86 one.
 
-Linking. Apple's linker has no `--allow-multiple-definition`. ra-jit's object has to win over
+Linking. Apple's linker has no `--allow-multiple-definition`. blaze's object has to win over
 rustc's definitions of the same symbols, so on Mach-O the definitions in rustc's objects and
-rlibs are made weak (`ra-jit weaken`, used by the harnesses through `harness/linkline.py`),
-and ra-jit's own objects are written the same way. Linux keeps the flag it had.
+rlibs are made weak (`blaze-engine weaken`, used by the harnesses through `harness/linkline.py`),
+and blaze's own objects are written the same way. Linux keeps the flag it had.
 
-The splice (`crates/ra-jit/src/splice/macho.rs`). The loader wants `__LINKEDIT` last and the
+The splice (`crates/blaze-engine/src/splice/macho.rs`). The loader wants `__LINKEDIT` last and the
 signature at the end of it, so the patch goes where `__LINKEDIT` was, in two new segments
 (`__BLAZE_TEXT` for code, constants, stubs and the unwind tables; `__BLAZE_DATA` for writable
 data and address slots), and `__LINKEDIT` is written again behind them. That keeps W^X and
@@ -210,7 +210,7 @@ It needs two more load commands than the linker leaves room for, so the link lin
 6. The AArch64 `asm!` wrapper covers general and vector registers and the register classes
    `reg`, `vreg`, `vreg_low16`. Other classes and clobber-only ABIs are not handled, and the
    only test is `asmedits.py`.
-7. `ra-jit weaken` has only seen the objects and rlibs these harnesses produce.
+7. `blaze-engine weaken` has only seen the objects and rlibs these harnesses produce.
 8. `harness/linkbench.py` still passes `--allow-multiple-definition` to `ld -r` and was not
    ported or run. `bench.py`, `agents.py`, `dxedits.py`, `invalidation.py`, `uitest.py` and
    the other harnesses outside the task list use the new link line but were not run.

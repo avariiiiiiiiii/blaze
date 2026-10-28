@@ -447,7 +447,7 @@ impl DefMap {
         }
     }
 
-    /// Whether `module` is ra-jit's test harness, which names every test of its crate as the
+    /// Whether `module` is blaze's test harness, which names every test of its crate as the
     /// harness rustc writes does: a private one too.
     fn is_test_harness(&self, db: &dyn SourceDatabase, module: ModuleId) -> bool {
         let def_map = match module.krate(db) == self.krate && module.block(db) == self.block_id() {
@@ -459,7 +459,7 @@ impl DefMap {
             .module(db, parent)
             .children(db)
             .iter()
-            .any(|(name, &it)| it == module && name.as_str() == "__ra_jit_test_harness")
+            .any(|(name, &it)| it == module && name.as_str() == "__blaze_test_harness")
     }
 
     /// The visibility `e` is declared with. Its variants are that visible, even when the

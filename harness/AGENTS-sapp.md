@@ -13,7 +13,7 @@
 | 6 | unit 4 added (closure) | patch | 88 | same |
 | 7 | unit 4 (closure) to version 1 | patch | 48 | same |
 | 8 | unit 5 added (async) | patch | 83 | same |
-| 9 | BROKEN: syntax error in app/src/ra_jit_u4.rs | error | 209 | said so |
+| 9 | BROKEN: syntax error in app/src/blaze_u4.rs | error | 209 | said so |
 | 10 | mended | full | 63 | same |
 | 11 | unit 6 added (static) | patch | 74 | same |
 | 12 | unit 7 added (plain) | patch | 66 | same |
@@ -49,7 +49,7 @@
 | 42 | unit 18 (async) to version 1 | patch | 83 | same |
 | 43 | unit 28 added (generic) | patch | 135 | same |
 | 44 | blank in app/src/main.rs | patch | 81 | same |
-| 45 | BROKEN: unresolved name in app/src/ra_jit_u0.rs | error | 48 | said so |
+| 45 | BROKEN: unresolved name in app/src/blaze_u0.rs | error | 48 | said so |
 | 46 | mended | patch | 80 | same |
 | 47 | unit 30 added (struct) | patch | 133 | same |
 | 48 | unit 31 added (async) | patch | 123 | same |

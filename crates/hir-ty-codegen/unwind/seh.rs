@@ -40,10 +40,10 @@ use cranelift_object::{
 use super::FunctionUnwind;
 
 /// Throws again what a landing pad was entered with. Takes the pad's exception.
-pub(in super::super) const RESUME: &str = "ra-jit.seh.resume";
+pub(in super::super) const RESUME: &str = "blaze.seh.resume";
 /// Frees what a landing pad that stops the unwind was entered with.
-pub(in super::super) const RELEASE: &str = "ra-jit.seh.release";
-pub(in super::super) const PERSONALITY: &str = "ra-jit.seh.personality";
+pub(in super::super) const RELEASE: &str = "blaze.seh.release";
+pub(in super::super) const PERSONALITY: &str = "blaze.seh.personality";
 
 /// The bit of a source location that marks a call that has a landing pad, for [`function`]
 /// to find them. The rest is the statement the call is of, as without it.

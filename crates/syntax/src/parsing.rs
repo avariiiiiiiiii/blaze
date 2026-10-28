@@ -3,7 +3,7 @@
 
 mod reparsing;
 
-use rowan::TextRange;
+use syntax_tree::TextRange;
 
 use crate::{SyntaxError, SyntaxTreeBuilder, Tree};
 

@@ -1,7 +1,7 @@
 //! library/coretests any.rs, `distinct_type_names` and `dyn_type_name`, std's
 //! type-name-unsized.rs and tests/ui/type/type-name-basic.rs: `type_name` of a trait object
 //! with associated types, with `Fn` sugar or with auto traits alone, of a function pointer,
-//! of a constructor and of an `async` block. ra-jit had no spelling for these and left their
+//! of a constructor and of an `async` block. blaze had no spelling for these and left their
 //! callers to rustc.
 
 use std::any::{type_name, type_name_of_val};

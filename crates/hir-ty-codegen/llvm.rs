@@ -50,7 +50,7 @@ const REBASED: &str = "function(instcombine<no-verify-fixpoint>,sroa,gvn,dse,\
 use lower::{Defined, Lowering};
 
 /// The name of the function being compiled, in the module and in the object.
-const OWN: &str = "ra-jit.own";
+const OWN: &str = "blaze.own";
 const PERSONALITY: &str = "rust_eh_personality";
 
 /// Whether every call of `func` that unwinds has one handler, which takes the exception alone.
@@ -208,7 +208,7 @@ fn compiled(
         .map(|(&name, defined)| Defined { name, ..defined })
         .collect();
     Machine::with(optimization, |context, machine| {
-        let module = context.create_module("ra-jit");
+        let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
@@ -419,7 +419,7 @@ fn compiled(
 /// type, which the other functions of the module call.
 fn declared_only<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>) {
     let name = function.get_name().to_owned();
-    function.as_global_value().set_name("ra-jit.unlowered");
+    function.as_global_value().set_name("blaze.unlowered");
     let declaration =
         module.add_function(&name.to_string_lossy(), function.get_type(), Some(Linkage::External));
     function.replace_all_uses_with(declaration);
@@ -428,7 +428,7 @@ fn declared_only<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>) {
 }
 
 /// The function being compiled, when it is [`wrap`]ped.
-const INNER: &str = "ra-jit.inner";
+const INNER: &str = "blaze.inner";
 
 /// Has the function being compiled, `inner`, called by one that only calls it, under the
 /// name [`OWN`], with the same parameters, and built into that one.
@@ -517,7 +517,7 @@ pub(super) fn export(
         return Err(Unhandled::Shape("a body too large to export"));
     }
     Machine::with(optimization, |context, machine| {
-        let module = context.create_module("ra-jit");
+        let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
@@ -626,7 +626,7 @@ fn imported<'ctx>(
     }
     // In two steps, as a name given may be one another still has.
     for (at, (global, _)) in names.iter().enumerate() {
-        global.set_name(&format!("ra-jit.import.{at}"));
+        global.set_name(&format!("blaze.import.{at}"));
     }
     for (global, name) in &names {
         global.set_name(name);
@@ -768,7 +768,7 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
 /// What the body of the requested function `id` that LLVM is shown is called in the module.
 /// No symbol of a program has such a name.
 fn shown_name(id: u32) -> String {
-    format!("ra-jit.a.{id}")
+    format!("blaze.a.{id}")
 }
 
 /// Has every call of a body shown that LLVM kept call the function itself, and drops the
@@ -793,7 +793,7 @@ fn unshow<'ctx>(module: &Module<'ctx>, shown: &FxHashMap<u32, FunctionValue<'ctx
 /// ([`diagnosed`]).
 pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
     Machine::with(Optimization::NONE, |context, machine| {
-        let module = context.create_module("ra_jit_asm");
+        let module = context.create_module("blaze_asm");
         module.set_triple(&machine.get_triple());
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
         let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
@@ -834,7 +834,7 @@ pub(super) fn inline_threshold() -> u32 {
 fn set_options(arch: Arch) {
     static SET: Once = Once::new();
     SET.call_once(|| {
-        let mut arguments = vec![c"ra-jit".as_ptr()];
+        let mut arguments = vec![c"blaze".as_ptr()];
         if arch == Arch::Aarch64 {
             arguments.push(c"-aarch64-enable-global-isel-at-O=-1".as_ptr());
         }
@@ -1056,18 +1056,18 @@ impl Symbol {
     }
 
     fn parse(name: &str) -> Option<Symbol> {
-        if let Some(index) = name.strip_prefix("ra-jit.f.") {
+        if let Some(index) = name.strip_prefix("blaze.f.") {
             return index.parse().ok().map(Symbol::Func);
         }
-        name.strip_prefix("ra-jit.d.")?.parse().ok().map(Symbol::Data)
+        name.strip_prefix("blaze.d.")?.parse().ok().map(Symbol::Data)
     }
 }
 
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Symbol::Func(index) => write!(f, "ra-jit.f.{index}"),
-            Symbol::Data(index) => write!(f, "ra-jit.d.{index}"),
+            Symbol::Func(index) => write!(f, "blaze.f.{index}"),
+            Symbol::Data(index) => write!(f, "blaze.d.{index}"),
         }
     }
 }
@@ -1248,39 +1248,39 @@ declare void @llvm.assume(i1 noundef)
 
     /// An export that calls itself and its request 1, and reads its datum 0.
     const EXPORTED: &str = r#"
-@"ra-jit.d.0" = external global i32
+@"blaze.d.0" = external global i32
 
-define i32 @"ra-jit.own"(i32 %n) {
+define i32 @"blaze.own"(i32 %n) {
   %stop = icmp eq i32 %n, 0
   br i1 %stop, label %done, label %more
 more:
   %less = sub i32 %n, 1
-  %rest = call i32 @"ra-jit.f.0"(i32 %less)
+  %rest = call i32 @"blaze.f.0"(i32 %less)
   ret i32 %rest
 done:
-  %read = load i32, ptr @"ra-jit.d.0"
-  %other = call i32 @"ra-jit.f.1"(i32 %read)
+  %read = load i32, ptr @"blaze.d.0"
+  %other = call i32 @"blaze.f.1"(i32 %read)
   ret i32 %other
 }
 
-declare i32 @"ra-jit.f.0"(i32)
-declare i32 @"ra-jit.f.1"(i32)
+declare i32 @"blaze.f.0"(i32)
+declare i32 @"blaze.f.1"(i32)
 "#;
 
     /// An export that writes through an address it has as an integer, by its request 1.
     const PASSES_AN_ADDRESS: &str = r#"
-define void @"ra-jit.own"(i64 %to, ptr %from) {
-  call void @"ra-jit.f.1"(i64 %to, ptr nonnull %from)
+define void @"blaze.own"(i64 %to, ptr %from) {
+  call void @"blaze.f.1"(i64 %to, ptr nonnull %from)
   ret void
 }
 
-declare void @"ra-jit.f.1"(i64, ptr)
+declare void @"blaze.f.1"(i64, ptr)
 "#;
 
     /// `ptr::write`, which has the address as a pointer, and that of what it writes as an
     /// integer.
     const WRITES: &str = r#"
-define void @"ra-jit.own"(ptr %to, i64 %from) {
+define void @"blaze.own"(ptr %to, i64 %from) {
   %address = inttoptr i64 %from to ptr
   %value = load i64, ptr %address
   store i64 %value, ptr %to
@@ -1307,7 +1307,7 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         let context = Context::create();
         let passes = exported(&context, PASSES_AN_ADDRESS, vec![5, 6], 5);
         let writes = exported(&context, WRITES, vec![6], 6);
-        let module = context.create_module("ra-jit");
+        let module = context.create_module("blaze");
         let (i64, ptr) = (context.i64_type(), context.ptr_type(Default::default()));
         let own = module.add_function(
             OWN,
@@ -1318,16 +1318,16 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         agree_calls(&context, &module).unwrap();
         let builder = context.create_builder();
         builder.position_at_end(context.append_basic_block(own, ""));
-        let callee = module.get_function("ra-jit.f.5").unwrap();
+        let callee = module.get_function("blaze.f.5").unwrap();
         let args = [own.get_nth_param(0).unwrap().into(), own.get_nth_param(1).unwrap().into()];
         builder.build_direct_call(callee, &args, "").unwrap();
         builder.build_return(None).unwrap();
         module.verify().unwrap();
-        let body = module.get_function("ra-jit.f.5").unwrap();
+        let body = module.get_function("blaze.f.5").unwrap();
         let text = body.print_to_string().to_string_lossy().into_owned();
         let all = module.print_to_string().to_string_lossy().into_owned();
         let agreed =
-            ["inttoptr i64 %to to ptr", "ptrtoint ptr %from to i64", "@ra-jit.f.6(ptr %1, i64 %2)"];
+            ["inttoptr i64 %to to ptr", "ptrtoint ptr %from to i64", "@blaze.f.6(ptr %1, i64 %2)"];
         assert!(agreed.iter().all(|it| text.contains(it)), "{all}");
 
         let optimization =
@@ -1366,12 +1366,12 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         };
         // As `emit` has it: the function compiled is added, what it imports linked in, and
         // its body, which calls the import, lowered.
-        let module = context.create_module("ra-jit");
+        let module = context.create_module("blaze");
         let i32 = context.i32_type();
         let own = module.add_function(OWN, i32.fn_type(&[], false), None);
         link(&context, &module, std::slice::from_ref(&import), Linkage::AvailableExternally)
             .unwrap();
-        let body = module.get_function("ra-jit.f.5").expect("the import, linked in");
+        let body = module.get_function("blaze.f.5").expect("the import, linked in");
         assert_eq!(body.get_linkage(), Linkage::AvailableExternally);
         let builder = context.create_builder();
         builder.position_at_end(context.append_basic_block(own, ""));
@@ -1379,8 +1379,8 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         let returned = called.try_as_basic_value().basic().unwrap();
         builder.build_return(Some(&returned)).unwrap();
         module.verify().unwrap();
-        assert!(module.get_function("ra-jit.f.7").is_some_and(|it| it.count_basic_blocks() == 0));
-        assert!(module.get_global("ra-jit.d.3").is_some());
+        assert!(module.get_function("blaze.f.7").is_some_and(|it| it.count_basic_blocks() == 0));
+        assert!(module.get_global("blaze.d.3").is_some());
         let names: Vec<String> =
             module.get_functions().map(|it| it.get_name().to_string_lossy().into_owned()).collect();
         assert!(
@@ -1390,7 +1390,7 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
             "{names:?}"
         );
         let text = body.print_to_string().to_string_lossy().into_owned();
-        assert!(text.contains("call i32 @ra-jit.f.5(i32"), "{text}");
+        assert!(text.contains("call i32 @blaze.f.5(i32"), "{text}");
 
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
@@ -1401,9 +1401,9 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         // Built in, the call is of the other function with the datum, and the body is gone.
         let own = module.get_function(OWN).unwrap();
         let text = own.print_to_string().to_string_lossy().into_owned();
-        assert!(text.contains("@ra-jit.f.7(") && text.contains("@ra-jit.d.3"), "{text}");
-        assert!(!text.contains("ra-jit.f.5"), "{text}");
-        assert!(module.get_function("ra-jit.f.5").is_none_or(|it| it.count_basic_blocks() == 0));
+        assert!(text.contains("@blaze.f.7(") && text.contains("@blaze.d.3"), "{text}");
+        assert!(!text.contains("blaze.f.5"), "{text}");
+        assert!(module.get_function("blaze.f.5").is_none_or(|it| it.count_basic_blocks() == 0));
     }
 
     /// The imports of a compile are linked to each other before they are linked into its
@@ -1413,11 +1413,11 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         let context = Context::create();
         let imports: Vec<Import> =
             (4..7).map(|id| exported(&context, WRITES, vec![id], id)).collect();
-        let module = context.create_module("ra-jit");
+        let module = context.create_module("blaze");
         link(&context, &module, &imports, Linkage::AvailableExternally).unwrap();
         module.verify().unwrap();
         for id in 4..7 {
-            let body = module.get_function(&format!("ra-jit.f.{id}")).unwrap();
+            let body = module.get_function(&format!("blaze.f.{id}")).unwrap();
             assert_eq!(body.get_linkage(), Linkage::AvailableExternally);
             assert!(body.count_basic_blocks() > 0);
         }
@@ -1510,14 +1510,14 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
         use super::super::fragment::FuncTarget;
 
         const NOT_BUILT_IN: &str = r#"
-define double @"ra-jit.own"(double %x) #0 {
+define double @"blaze.own"(double %x) #0 {
   %y = fmul double %x, 3.0
   ret double %y
 }
 attributes #0 = { noinline }
 "#;
         const BUILT_IN: &str = r#"
-define double @"ra-jit.own"(double %x) #0 {
+define double @"blaze.own"(double %x) #0 {
   %y = fadd double %x, 2.0
   ret double %y
 }

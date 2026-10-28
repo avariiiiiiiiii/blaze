@@ -1,4 +1,4 @@
-//! Reductions of what broke ra-jit in the crate sweep, one module each, with the cause on top.
+//! Reductions of what broke blaze in the crate sweep, one module each, with the cause on top.
 //! `breakers.py` runs every one on its own, so that a crash in one does not hide the others.
 
 macro_rules! cases {

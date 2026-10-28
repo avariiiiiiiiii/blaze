@@ -1,4 +1,4 @@
-// The C runtime's `main`: with no `main` of Rust's, ra-jit compiles every function of the
+// The C runtime's `main`: with no `main` of Rust's, blaze compiles every function of the
 // crates it is given, as it did all of bun's.
 #![no_main]
 

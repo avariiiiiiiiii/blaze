@@ -1,6 +1,6 @@
 # Formatting, after the merge instead of before it: no check refuses a pull request for it. On
 # each push to main, `cargo fmt --all` (vendor/ too: the forks' rustfmt.toml files are read for
-# their code, and a fork's own edits are held to them like ra-jit's), and when that changes a
+# their code, and a fork's own edits are held to them like blaze's), and when that changes a
 # file, a commit `fmt` on main. The token that pushes is the one pgo.yaml's pin uses: the
 # ruleset on main refuses a push from the workflow's own token (docs/harness.md, "CI"). Its
 # push starts the train again, on the formatted commit, which is the newest; the run of this
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: ./.github/actions/toolchain
         with:
           components: rustfmt

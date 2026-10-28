@@ -15,7 +15,7 @@ Each worker has a checkout of the stress workspace and a store of its own. A kil
            pack that grows, a pack that gets its name, a merged pack on its way to its name
 
 The moment is random, SIGKILL is the signal, and the daemons are started with sizes that make
-them seal, merge and evict on nearly every build. After every kill `ra-jit cache verify` has to
+them seal, merge and evict on nearly every build. After every kill `blaze-engine cache verify` has to
 find nothing in the store that is not what was written, and a new daemon on the same store
 has to build a program that prints what cargo's does.
 
@@ -43,7 +43,7 @@ SIZES = [{"BLAZE_CACHE_SEAL_AT": "1"}, {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE
 class Worker:
     def __init__(self, number, kills):
         self.rng = random.Random(SEED * 1000 + number)
-        self.work = scratch(f"ra-jit-storekills-{number}-")
+        self.work = scratch(f"blaze-storekills-{number}-")
         self.store = os.path.join(self.work, "store")
         self.checkout = Checkout(self.work)
         self.kills, self.number = kills, number

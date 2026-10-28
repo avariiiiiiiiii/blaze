@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-S1-2-c7.rs`): the order of drops when an
 //! operand panics in an aggregate or a call that is the tail of a block with locals of its
 //! own. The operands made so far are dropped before the block's locals, in every edition;
-//! only the temporaries of the tail outlive the block before 2024. ra-jit handed the operands
+//! only the temporaries of the tail outlive the block before 2024. blaze handed the operands
 //! to the enclosing scope along with the temporaries and dropped the locals first.
 
 use std::cell::RefCell;

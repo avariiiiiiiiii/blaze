@@ -4,7 +4,7 @@ already has every function, with nothing of rustc's to start from (#41).
 
 Every step has `BLAZE_RUSTC_BASE=0`, so the first build of a daemon is its own, as it is
 without rustc (docs/no-rustc.md, step K):
-  first    a checkout and an empty store: `cargo ra-jit build` and the wait until ready
+  first    a checkout and an empty store: `blaze build` and the wait until ready
   warm     a second checkout of the same commit with a home of its own and the store the first
            filled
   restart  the second checkout's daemon stopped and started again with nothing changed: its
@@ -22,8 +22,8 @@ Writes the steps as JSON on stdout's last line. The projects are bench.py's, fet
 """
 import json, os, re, shutil, sys
 
-import bench, cargo_ra_jit, memory
-from cargo_ra_jit import Side, fetch, program_output, wait_warm
+import bench, blaze_cli, memory
+from blaze_cli import Side, fetch, program_output, wait_warm
 
 
 def from_store(said):
@@ -51,7 +51,7 @@ def main():
     def checkout(label):
         ws = os.path.join(work, label)
         shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
-        env = dict(cargo_ra_jit.base_env(os.path.join(work, f"home-{label}")), **spec.get("env", {}), **extra_env)
+        env = dict(blaze_cli.base_env(os.path.join(work, f"home-{label}")), **spec.get("env", {}), **extra_env)
         env.update(BLAZE_CACHE=store, BLAZE_RUSTC_BASE="0", BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
         return Side(ws, env, True)

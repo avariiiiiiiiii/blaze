@@ -1,6 +1,6 @@
 # Stress edits
 
-99 of 99 steps right, 0 restarts. Log: /tmp/ra-jit-stress-out-4kd9d848/daemon.log
+99 of 99 steps right, 0 restarts. Log: /tmp/blaze-stress-out-4kd9d848/daemon.log
 
 | # | Edit | Reply | ms | Result |
 |---|---|---|---:|---|
@@ -77,27 +77,27 @@
 | 70 | #[inline(never)] and #[cold] added | patch | 76 | same |
 | 71 | cfg(debug_assertions) branch | patch | 133 | same |
 | 72 | visibility narrowed and widened | patch | 93 | same |
-| 73 | BROKEN: syntax error | error | 338 | said so (error: /tmp/ra-jit-stress-2u_jflxh/mid/src/text.rs:17: expect) |
+| 73 | BROKEN: syntax error | error | 338 | said so (error: /tmp/blaze-stress-2u_jflxh/mid/src/text.rs:17: expect) |
 | 74 | fixed again, with a body change | full | 81 | same |
-| 75 | BROKEN: type error in a body | error | 148 | said so (error: `main` is not compiled by ra-jit: unsupported: callee ) |
-| 76 | BROKEN: still broken, another file edited too | error | 12 | said so (error: `main` is not compiled by ra-jit: unsupported: callee ) |
+| 75 | BROKEN: type error in a body | error | 148 | said so (error: `main` is not compiled by blaze: unsupported: callee ) |
+| 76 | BROKEN: still broken, another file edited too | error | 12 | said so (error: `main` is not compiled by blaze: unsupported: callee ) |
 | 77 | fixed again | full | 97 | same |
-| 78 | BROKEN: unresolved name in main | error | 65 | said so (error: `main` has an error ra-jit cannot say more of: fronten) |
+| 78 | BROKEN: unresolved name in main | error | 65 | said so (error: `main` has an error blaze cannot say more of: fronten) |
 | 79 | fixed again by adding the missing function | full | 113 | same |
-| 80 | BROKEN: caller not updated after a signature change | error | 53 | said so (error: `main` has an error ra-jit cannot say more of: fronten) |
+| 80 | BROKEN: caller not updated after a signature change | error | 53 | said so (error: `main` has an error blaze cannot say more of: fronten) |
 | 81 | fixed again: caller updated | full | 135 | same |
-| 82 | BROKEN: file emptied | error | 66 | said so (error: `main` has an error ra-jit cannot say more of: fronten) |
+| 82 | BROKEN: file emptied | error | 66 | said so (error: `main` has an error blaze cannot say more of: fronten) |
 | 83 | file restored and three crates edited in one build | full | 110 | same |
 | 84 | thread_local of the first source given another value | full | 120 | same |
-| 85 | BROKEN: struct literal without one of its fields | error | 14 | said so (error: /tmp/ra-jit-stress-2u_jflxh/base/src/lib.rs:109:5: mis) |
+| 85 | BROKEN: struct literal without one of its fields | error | 14 | said so (error: /tmp/blaze-stress-2u_jflxh/base/src/lib.rs:109:5: mis) |
 | 86 | mended: the field given | patch | 10 | same |
-| 87 | BROKEN: match without one of its arms | error | 25 | said so (error: /tmp/ra-jit-stress-2u_jflxh/mid/src/lib.rs:199:11: mis) |
+| 87 | BROKEN: match without one of its arms | error | 25 | said so (error: /tmp/blaze-stress-2u_jflxh/mid/src/lib.rs:199:11: mis) |
 | 88 | mended: the arm given | patch | 14 | same |
-| 89 | BROKEN: impl without one of its trait's methods | error | 23 | said so (error: /tmp/ra-jit-stress-2u_jflxh/app/src/main.rs:106:6: not) |
+| 89 | BROKEN: impl without one of its trait's methods | error | 23 | said so (error: /tmp/blaze-stress-2u_jflxh/app/src/main.rs:106:6: not) |
 | 90 | mended: the method given | patch | 21 | same |
-| 91 | BROKEN: method that no type has | error | 10 | said so (error: /tmp/ra-jit-stress-2u_jflxh/mid/src/text.rs:22:7: no m) |
+| 91 | BROKEN: method that no type has | error | 10 | said so (error: /tmp/blaze-stress-2u_jflxh/mid/src/text.rs:22:7: no m) |
 | 92 | mended: the method named right | patch | 9 | same |
-| 93 | BROKEN: import of a name that is not there | error | 35 | said so (error: /tmp/ra-jit-stress-2u_jflxh/app/src/main.rs:102:5: unr) |
+| 93 | BROKEN: import of a name that is not there | error | 35 | said so (error: /tmp/blaze-stress-2u_jflxh/app/src/main.rs:102:5: unr) |
 | 94 | mended: the import removed | patch | 35 | same |
 | 95 | whole file rewritten in another order | patch | 11 | same |
 | 96 | large generated function added | patch | 155 | same |

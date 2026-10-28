@@ -581,10 +581,10 @@ impl Left {
 pub struct OutOfDate {
     /// `None` for an instance written in no function, as drop glue is.
     pub func: Option<FunctionId>,
-    /// Why ra-jit leaves it to rustc.
+    /// Why blaze leaves it to rustc.
     pub why: String,
     /// Whether it was left to rustc in the build the daemon started from, when rustc compiled
-    /// it from source that built: the reason is then ra-jit's, not an error of the source.
+    /// it from source that built: the reason is then blaze's, not an error of the source.
     pub left_from_the_start: bool,
     /// What rustc's copy calls a copy of rustc's of that changed, when it is not the function
     /// itself. `None` in it for code of no function of its own.
@@ -907,7 +907,7 @@ pub(super) struct Base {
     /// to rustc, and stays there for as long as the base does.
     rejected: Vec<(Instance, StoredParamEnvAndCrate)>,
     pub(super) bodies: usize,
-    /// The roots and instances that are `#[ra_jit::cache]` functions, by their index in
+    /// The roots and instances that are `#[blaze::cache]` functions, by their index in
     /// `compiled` and `instances`. The hash of what each reaches is in its code, and an edit
     /// anywhere can change that.
     cached_roots: Vec<u32>,
@@ -1183,7 +1183,7 @@ pub(super) struct Patch {
 /// An object that defines nothing.
 pub(super) fn empty_object() -> Result<Vec<u8>> {
     let builder =
-        ObjectBuilder::new(target()?.clone(), "ra-jit", cranelift_module::default_libcall_names())?;
+        ObjectBuilder::new(target()?.clone(), "blaze", cranelift_module::default_libcall_names())?;
     let object = ObjectModule::new(builder)
         .finish()
         .emit()
@@ -2930,7 +2930,7 @@ impl Base {
             let decls = cg.module.declarations();
             let anew = (cg.instances.values())
                 .filter(|&&id| {
-                    decls.get_function_decl(id).linkage_name(id).starts_with("ra-jit.patch::")
+                    decls.get_function_decl(id).linkage_name(id).starts_with("blaze.patch::")
                 })
                 .count();
             eprintln!("patch: {anew} instances the base has no code for");

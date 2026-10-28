@@ -30,7 +30,7 @@ def links(text):
 
 
 def main():
-    work, store = scratch("ra-jit-storefirst-"), scratch("ra-jit-storefirst-store-")
+    work, store = scratch("blaze-storefirst-"), scratch("blaze-storefirst-store-")
     daemons, passed = [], False
     try:
         checkout = Checkout(work)

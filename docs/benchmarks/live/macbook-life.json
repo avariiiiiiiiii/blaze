@@ -5965,13 +5965,13 @@
        "round": 0,
        "key": 10,
        "asked after": true,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=3 files=1 ms=449"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=3 files=1 ms=449"
       },
       {
        "round": 0,
        "key": 11,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=26"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=26"
       },
       {
        "round": 0,
@@ -5989,7 +5989,7 @@
        "round": 0,
        "key": 84,
        "asked after": true,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=536 files=1 ms=437"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=536 files=1 ms=437"
       },
       {
        "round": 0,
@@ -6163,19 +6163,19 @@
        "round": 0,
        "key": 235,
        "asked after": true,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=2 files=1 ms=519"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=2 files=1 ms=519"
       },
       {
        "round": 0,
        "key": 236,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=20"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=20"
       },
       {
        "round": 0,
        "key": 237,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 0,
@@ -6193,7 +6193,7 @@
        "round": 0,
        "key": 0,
        "ms": 9.434,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
@@ -6223,25 +6223,25 @@
        "round": 0,
        "key": 9,
        "ms": 328.18,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=2 files=1 ms=327"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=2 files=1 ms=327"
       },
       {
        "round": 0,
        "key": 12,
        "ms": 21.853,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=18"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=18"
       },
       {
        "round": 0,
        "key": 13,
        "ms": 35.284,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=22"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=22"
       },
       {
        "round": 0,
        "key": 14,
        "ms": 9.575,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
@@ -6253,55 +6253,55 @@
        "round": 0,
        "key": 16,
        "ms": 10.894,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 17,
        "ms": 10.902,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 18,
        "ms": 9.172,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 19,
        "ms": 25.093,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=20"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=20"
       },
       {
        "round": 0,
        "key": 20,
        "ms": 9.574,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 21,
        "ms": 9.198,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 22,
        "ms": 12.03,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 23,
        "ms": 12.766,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 24,
        "ms": 13.932,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
@@ -6313,259 +6313,259 @@
        "round": 0,
        "key": 26,
        "ms": 15.781,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 0,
        "key": 27,
        "ms": 25.998,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
       },
       {
        "round": 0,
        "key": 28,
        "ms": 15.788,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 0,
        "key": 29,
        "ms": 18.641,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=17"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=17"
       },
       {
        "round": 0,
        "key": 30,
        "ms": 14.792,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 31,
        "ms": 14.629,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 32,
        "ms": 13.241,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 33,
        "ms": 11.927,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 34,
        "ms": 12.137,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 35,
        "ms": 10.626,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 36,
        "ms": 12.608,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 37,
        "ms": 13.993,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 38,
        "ms": 13.04,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 39,
        "ms": 13.226,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 40,
        "ms": 13.363,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 41,
        "ms": 18.128,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 0,
        "key": 42,
        "ms": 13.962,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 43,
        "ms": 14.204,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 44,
        "ms": 13.067,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 45,
        "ms": 15.65,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 0,
        "key": 46,
        "ms": 14.363,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 47,
        "ms": 15.847,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 0,
        "key": 48,
        "ms": 16.737,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 0,
        "key": 49,
        "ms": 13.067,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 50,
        "ms": 15.574,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 51,
        "ms": 22.835,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
       },
       {
        "round": 0,
        "key": 52,
        "ms": 25.565,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
       },
       {
        "round": 0,
        "key": 53,
        "ms": 14.071,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 54,
        "ms": 12.022,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 55,
        "ms": 13.727,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 56,
        "ms": 34.594,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=26"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=26"
       },
       {
        "round": 0,
        "key": 57,
        "ms": 13.13,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 58,
        "ms": 11.795,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 59,
        "ms": 14.07,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 60,
        "ms": 12.335,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 61,
        "ms": 12.832,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 62,
        "ms": 11.549,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 63,
        "ms": 10.381,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 64,
        "ms": 11.623,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 65,
        "ms": 12.884,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 66,
        "ms": 11.274,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
        "key": 67,
        "ms": 10.897,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 68,
        "ms": 10.597,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 0,
@@ -6649,7 +6649,7 @@
        "round": 0,
        "key": 85,
        "ms": 202.423,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=201"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=201"
       },
       {
        "round": 0,
@@ -7183,13 +7183,13 @@
        "round": 0,
        "key": 196,
        "ms": 381.918,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=557 files=1 ms=380"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=557 files=1 ms=380"
       },
       {
        "round": 0,
        "key": 197,
        "ms": 27.055,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=22"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=22"
       },
       {
        "round": 0,
@@ -7357,7 +7357,7 @@
        "round": 0,
        "key": 225,
        "ms": 434.752,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=49 files=1 ms=433"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=49 files=1 ms=433"
       },
       {
        "round": 0,
@@ -7375,25 +7375,25 @@
        "round": 0,
        "key": 234,
        "ms": 338.709,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=2 files=1 ms=337"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=2 files=1 ms=337"
       },
       {
        "round": 0,
        "key": 238,
        "ms": 16.978,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 239,
        "ms": 8.805,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 0,
        "key": 240,
        "ms": 9.862,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
@@ -7405,37 +7405,37 @@
        "round": 0,
        "key": 242,
        "ms": 7.715,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 0,
        "key": 243,
        "ms": 9.51,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 244,
        "ms": 9.469,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 245,
        "ms": 9.28,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 246,
        "ms": 8.129,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 0,
        "key": 247,
        "ms": 8.219,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 0,
@@ -7453,7 +7453,7 @@
        "round": 0,
        "key": 252,
        "ms": 16.111,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 0,
@@ -7519,7 +7519,7 @@
        "round": 0,
        "key": 263,
        "ms": 14.344,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 0,
@@ -7639,7 +7639,7 @@
        "round": 0,
        "key": 283,
        "ms": 8.821,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 0,
@@ -7687,13 +7687,13 @@
        "round": 0,
        "key": 291,
        "ms": 368.621,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=3 files=1 ms=367"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=3 files=1 ms=367"
       },
       {
        "round": 0,
        "key": 292,
        "ms": 19.617,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=15"
       },
       {
        "round": 1,
@@ -7741,37 +7741,37 @@
        "round": 1,
        "key": 9,
        "asked after": true,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=2 files=1 ms=636"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=2 files=1 ms=636"
       },
       {
        "round": 1,
        "key": 10,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=29"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=29"
       },
       {
        "round": 1,
        "key": 11,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 12,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 13,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 14,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 1,
@@ -7783,43 +7783,43 @@
        "round": 1,
        "key": 16,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 17,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 18,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 19,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 20,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=18"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=18"
       },
       {
        "round": 1,
        "key": 21,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=15"
       },
       {
        "round": 1,
        "key": 22,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
@@ -7831,103 +7831,103 @@
        "round": 1,
        "key": 24,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 1,
        "key": 25,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 1,
        "key": 27,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 29,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 1,
        "key": 30,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 1,
        "key": 31,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 1,
        "key": 32,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 1,
        "key": 33,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=22"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=22"
       },
       {
        "round": 1,
        "key": 34,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 1,
        "key": 35,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=20"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=20"
       },
       {
        "round": 1,
        "key": 36,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 1,
        "key": 38,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 1,
        "key": 39,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 1,
        "key": 40,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 1,
        "key": 41,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 1,
        "key": 42,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=22"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=22"
       },
       {
        "round": 1,
        "key": 58,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=61"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=61"
       },
       {
        "round": 1,
@@ -7999,13 +7999,13 @@
        "round": 1,
        "key": 82,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=292"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=292"
       },
       {
        "round": 1,
        "key": 83,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=44"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=44"
       },
       {
        "round": 1,
@@ -8455,37 +8455,37 @@
        "round": 1,
        "key": 234,
        "asked after": true,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=2 files=1 ms=582"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=2 files=1 ms=582"
       },
       {
        "round": 1,
        "key": 235,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=16"
       },
       {
        "round": 1,
        "key": 236,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 237,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=10"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 238,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=13"
       },
       {
        "round": 1,
        "key": 239,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 1,
@@ -8509,7 +8509,7 @@
        "round": 1,
        "key": 252,
        "asked after": true,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: UnresolvedName { owner: Body(FunctionId(FunctionId(6bfe8))), path: BarePath(ModPath { kind: Plain, segments: [Name { symbol: \"s\", c"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: UnresolvedName { owner: Body(FunctionId(FunctionId(6bfe8))), path: BarePath(ModPath { kind: Plain, segments: [Name { symbol: \"s\", c"
       },
       {
        "round": 1,
@@ -8545,7 +8545,7 @@
        "round": 1,
        "key": 0,
        "ms": 27.442,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=25"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=25"
       },
       {
        "round": 1,
@@ -8557,145 +8557,145 @@
        "round": 1,
        "key": 26,
        "ms": 1478.73,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=3 files=1 ms=1474"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=3 files=1 ms=1474"
       },
       {
        "round": 1,
        "key": 43,
        "ms": 49.278,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=46"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=46"
       },
       {
        "round": 1,
        "key": 44,
        "ms": 42.735,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=40"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=40"
       },
       {
        "round": 1,
        "key": 45,
        "ms": 31.928,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=29"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=29"
       },
       {
        "round": 1,
        "key": 46,
        "ms": 30.485,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=29"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=29"
       },
       {
        "round": 1,
        "key": 47,
        "ms": 36.366,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=35"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=35"
       },
       {
        "round": 1,
        "key": 48,
        "ms": 37.223,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=33"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=33"
       },
       {
        "round": 1,
        "key": 49,
        "ms": 37.158,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
       },
       {
        "round": 1,
        "key": 50,
        "ms": 22.194,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=17"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=17"
       },
       {
        "round": 1,
        "key": 51,
        "ms": 15.457,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=13"
       },
       {
        "round": 1,
        "key": 52,
        "ms": 29.559,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
       },
       {
        "round": 1,
        "key": 53,
        "ms": 31.019,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=29"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=29"
       },
       {
        "round": 1,
        "key": 54,
        "ms": 32.477,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=31"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=31"
       },
       {
        "round": 1,
        "key": 55,
        "ms": 22.666,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=20"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=20"
       },
       {
        "round": 1,
        "key": 56,
        "ms": 16.59,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=15"
       },
       {
        "round": 1,
        "key": 57,
        "ms": 198.275,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=154"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=154"
       },
       {
        "round": 1,
        "key": 59,
        "ms": 47.071,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=41"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=41"
       },
       {
        "round": 1,
        "key": 60,
        "ms": 36.799,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
       },
       {
        "round": 1,
        "key": 61,
        "ms": 60.638,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=46"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=46"
       },
       {
        "round": 1,
        "key": 62,
        "ms": 29.147,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=27"
       },
       {
        "round": 1,
        "key": 63,
        "ms": 41.822,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=40"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=40"
       },
       {
        "round": 1,
        "key": 64,
        "ms": 42.075,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=38"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=38"
       },
       {
        "round": 1,
        "key": 65,
        "ms": 18.302,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=16"
       },
       {
        "round": 1,
        "key": 66,
        "ms": 21.129,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=15"
       },
       {
        "round": 1,
@@ -8995,13 +8995,13 @@
        "round": 1,
        "key": 196,
        "ms": 725.589,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=536 files=1 ms=724"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=536 files=1 ms=724"
       },
       {
        "round": 1,
        "key": 197,
        "ms": 36.074,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=30"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=30"
       },
       {
        "round": 1,
@@ -9163,13 +9163,13 @@
        "round": 1,
        "key": 225,
        "ms": 909.118,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=17 files=1 ms=907"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=17 files=1 ms=907"
       },
       {
        "round": 1,
        "key": 240,
        "ms": 28.524,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=22"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=22"
       },
       {
        "round": 1,
@@ -9181,37 +9181,37 @@
        "round": 1,
        "key": 242,
        "ms": 19.32,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=16"
       },
       {
        "round": 1,
        "key": 243,
        "ms": 14.47,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=13"
       },
       {
        "round": 1,
        "key": 244,
        "ms": 13.528,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 245,
        "ms": 15.3,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=14"
       },
       {
        "round": 1,
        "key": 246,
        "ms": 13.875,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 247,
        "ms": 19.14,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=18"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=18"
       },
       {
        "round": 1,
@@ -9253,7 +9253,7 @@
        "round": 1,
        "key": 263,
        "ms": 29.592,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 1,
@@ -9373,7 +9373,7 @@
        "round": 1,
        "key": 283,
        "ms": 13.649,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 1,
@@ -9421,13 +9421,13 @@
        "round": 1,
        "key": 291,
        "ms": 708.369,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=9 files=1 ms=706"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=9 files=1 ms=706"
       },
       {
        "round": 1,
        "key": 292,
        "ms": 25.575,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=20"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=20"
       },
       {
        "round": 2,
@@ -9451,31 +9451,31 @@
        "round": 2,
        "key": 10,
        "asked after": true,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=3 files=1 ms=564"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=3 files=1 ms=564"
       },
       {
        "round": 2,
        "key": 11,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=24"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=24"
       },
       {
        "round": 2,
        "key": 12,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 13,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 14,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=18"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=18"
       },
       {
        "round": 2,
@@ -9487,31 +9487,31 @@
        "round": 2,
        "key": 17,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=21"
       },
       {
        "round": 2,
        "key": 18,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 2,
        "key": 19,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 20,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=15"
       },
       {
        "round": 2,
        "key": 21,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 2,
@@ -9529,13 +9529,13 @@
        "round": 2,
        "key": 80,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=32"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=32"
       },
       {
        "round": 2,
        "key": 81,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 2,
@@ -9823,13 +9823,13 @@
        "round": 2,
        "key": 228,
        "asked after": true,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=2 files=1 ms=505"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=2 files=1 ms=505"
       },
       {
        "round": 2,
        "key": 229,
        "asked after": true,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=24"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=24"
       },
       {
        "round": 2,
@@ -9841,7 +9841,7 @@
        "round": 2,
        "key": 0,
        "ms": 13.086,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=11"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=0 files=1 ms=11"
       },
       {
        "round": 2,
@@ -9877,13 +9877,13 @@
        "round": 2,
        "key": 9,
        "ms": 930.966,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=2 files=1 ms=929"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=2 files=1 ms=929"
       },
       {
        "round": 2,
        "key": 22,
        "ms": 24.579,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=19"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=19"
       },
       {
        "round": 2,
@@ -9895,247 +9895,247 @@
        "round": 2,
        "key": 24,
        "ms": 16.55,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 2,
        "key": 25,
        "ms": 17.021,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 2,
        "key": 26,
        "ms": 30.084,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=29"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=29"
       },
       {
        "round": 2,
        "key": 27,
        "ms": 35.588,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=34"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=34"
       },
       {
        "round": 2,
        "key": 28,
        "ms": 15.248,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 29,
        "ms": 17.334,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 2,
        "key": 30,
        "ms": 18.219,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 2,
        "key": 31,
        "ms": 14.559,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 32,
        "ms": 22.644,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
       },
       {
        "round": 2,
        "key": 33,
        "ms": 14.245,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 34,
        "ms": 28.863,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=27"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=27"
       },
       {
        "round": 2,
        "key": 35,
        "ms": 14.636,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 36,
        "ms": 21.003,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=19"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=19"
       },
       {
        "round": 2,
        "key": 37,
        "ms": 24.971,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=23"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=23"
       },
       {
        "round": 2,
        "key": 38,
        "ms": 32.509,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=26"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=26"
       },
       {
        "round": 2,
        "key": 39,
        "ms": 86.857,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=76"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=76"
       },
       {
        "round": 2,
        "key": 40,
        "ms": 65.52,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=64"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=64"
       },
       {
        "round": 2,
        "key": 41,
        "ms": 54.179,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=52"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=52"
       },
       {
        "round": 2,
        "key": 42,
        "ms": 19.171,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=18"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=18"
       },
       {
        "round": 2,
        "key": 43,
        "ms": 47.093,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=45"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=45"
       },
       {
        "round": 2,
        "key": 44,
        "ms": 21.894,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=20"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=20"
       },
       {
        "round": 2,
        "key": 45,
        "ms": 15.651,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 46,
        "ms": 39.021,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=37"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=37"
       },
       {
        "round": 2,
        "key": 47,
        "ms": 54.527,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=53"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=53"
       },
       {
        "round": 2,
        "key": 48,
        "ms": 17.564,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 2,
        "key": 49,
        "ms": 37.392,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=35"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=35"
       },
       {
        "round": 2,
        "key": 50,
        "ms": 57.174,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=55"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=55"
       },
       {
        "round": 2,
        "key": 51,
        "ms": 17.203,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 2,
        "key": 52,
        "ms": 22.622,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=21"
       },
       {
        "round": 2,
        "key": 53,
        "ms": 15.31,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 54,
        "ms": 19.598,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 55,
        "ms": 57.007,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=55"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=55"
       },
       {
        "round": 2,
        "key": 56,
        "ms": 41.997,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=40"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=40"
       },
       {
        "round": 2,
        "key": 57,
        "ms": 16.552,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 2,
        "key": 58,
        "ms": 15.927,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 59,
        "ms": 17.746,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 2,
        "key": 60,
        "ms": 18.096,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 2,
        "key": 61,
        "ms": 14.481,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 62,
        "ms": 28.682,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=26"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=26"
       },
       {
        "round": 2,
        "key": 63,
        "ms": 15.582,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 64,
        "ms": 15.552,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
@@ -10663,13 +10663,13 @@
        "round": 2,
        "key": 192,
        "ms": 559.754,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=536 files=1 ms=558"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=536 files=1 ms=558"
       },
       {
        "round": 2,
        "key": 193,
        "ms": 38.7,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=32"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=32"
       },
       {
        "round": 2,
@@ -10807,37 +10807,37 @@
        "round": 2,
        "key": 219,
        "ms": 773.114,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=17 files=1 ms=771"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=17 files=1 ms=771"
       },
       {
        "round": 2,
        "key": 230,
        "ms": 25.694,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=21"
       },
       {
        "round": 2,
        "key": 231,
        "ms": 29.675,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=25"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=25"
       },
       {
        "round": 2,
        "key": 232,
        "ms": 50.417,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=48"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=48"
       },
       {
        "round": 2,
        "key": 233,
        "ms": 13.808,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 234,
        "ms": 10.825,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=9"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=9"
       },
       {
        "round": 2,
@@ -10849,37 +10849,37 @@
        "round": 2,
        "key": 236,
        "ms": 22.696,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=21"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=21"
       },
       {
        "round": 2,
        "key": 237,
        "ms": 14.398,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 238,
        "ms": 13.891,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 239,
        "ms": 21.983,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=20"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=20"
       },
       {
        "round": 2,
        "key": 240,
        "ms": 18.529,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=13"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 241,
        "ms": 13.951,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=2 files=1 ms=12"
       },
       {
        "round": 2,
@@ -10903,7 +10903,7 @@
        "round": 2,
        "key": 246,
        "ms": 20.375,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 2,
@@ -10969,7 +10969,7 @@
        "round": 2,
        "key": 257,
        "ms": 18.746,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 2,
@@ -11089,7 +11089,7 @@
        "round": 2,
        "key": 277,
        "ms": 15.338,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 2,
@@ -11137,13 +11137,13 @@
        "round": 2,
        "key": 285,
        "ms": 470.748,
-       "answer": "ok object=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/ra-jit.o functions=3 files=1 ms=469"
+       "answer": "ok object=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/blaze.o functions=3 files=1 ms=469"
       },
       {
        "round": 2,
        "key": 286,
        "ms": 71.18,
-       "answer": "ok patch=ra-jit/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=69"
+       "answer": "ok patch=blaze/0a2637f70a78ada2/programs/life-55ce99744fec04d8/patch.o functions=7 files=1 ms=69"
       }
      ]
     },
@@ -11600,19 +11600,19 @@
        "round": 0,
        "key": 10,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=3 files=1 ms=526"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=3 files=1 ms=526"
       },
       {
        "round": 0,
        "key": 11,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=19"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=19"
       },
       {
        "round": 0,
        "key": 12,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
       },
       {
        "round": 0,
@@ -11660,7 +11660,7 @@
        "round": 0,
        "key": 84,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=536 files=1 ms=688"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=536 files=1 ms=688"
       },
       {
        "round": 0,
@@ -11834,7 +11834,7 @@
        "round": 0,
        "key": 197,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=299"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=299"
       },
       {
        "round": 0,
@@ -11906,37 +11906,37 @@
        "round": 0,
        "key": 234,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=2 files=1 ms=443"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=2 files=1 ms=443"
       },
       {
        "round": 0,
        "key": 235,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=20"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=20"
       },
       {
        "round": 0,
        "key": 236,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 237,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
        "key": 238,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 240,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 0,
@@ -11948,13 +11948,13 @@
        "round": 0,
        "key": 244,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 245,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
@@ -11978,7 +11978,7 @@
        "round": 0,
        "key": 252,
        "asked after": true,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: UnresolvedName { owner: Body(FunctionId(FunctionId(68a68))), path: BarePath(ModPath { kind: Plain, segments: [Name { symbol: \"s\", c"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: UnresolvedName { owner: Body(FunctionId(FunctionId(68a68))), path: BarePath(ModPath { kind: Plain, segments: [Name { symbol: \"s\", c"
       },
       {
        "round": 0,
@@ -11990,7 +11990,7 @@
        "round": 0,
        "key": 0,
        "ms": 23.391,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=22"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=22"
       },
       {
        "round": 0,
@@ -12002,55 +12002,55 @@
        "round": 0,
        "key": 9,
        "ms": 677.665,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=2 files=1 ms=676"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=2 files=1 ms=676"
       },
       {
        "round": 0,
        "key": 17,
        "ms": 24.688,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=23"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=23"
       },
       {
        "round": 0,
        "key": 18,
        "ms": 10.886,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 19,
        "ms": 14.484,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 20,
        "ms": 11.144,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 21,
        "ms": 13.382,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 22,
        "ms": 12.157,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 23,
        "ms": 11.325,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 0,
        "key": 24,
        "ms": 35.565,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=25"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=25"
       },
       {
        "round": 0,
@@ -12062,259 +12062,259 @@
        "round": 0,
        "key": 26,
        "ms": 24.989,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=23"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=23"
       },
       {
        "round": 0,
        "key": 27,
        "ms": 27.172,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=25"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=25"
       },
       {
        "round": 0,
        "key": 28,
        "ms": 14.73,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 29,
        "ms": 25.159,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=23"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=23"
       },
       {
        "round": 0,
        "key": 30,
        "ms": 41.296,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=40"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=40"
       },
       {
        "round": 0,
        "key": 31,
        "ms": 25.239,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
       },
       {
        "round": 0,
        "key": 32,
        "ms": 49.767,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=48"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=48"
       },
       {
        "round": 0,
        "key": 33,
        "ms": 36.743,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=35"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=35"
       },
       {
        "round": 0,
        "key": 34,
        "ms": 35.578,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=34"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=34"
       },
       {
        "round": 0,
        "key": 35,
        "ms": 14.895,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 36,
        "ms": 34.97,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=33"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=33"
       },
       {
        "round": 0,
        "key": 37,
        "ms": 25.266,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=23"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=23"
       },
       {
        "round": 0,
        "key": 38,
        "ms": 17.335,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 0,
        "key": 39,
        "ms": 33.833,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=32"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=32"
       },
       {
        "round": 0,
        "key": 40,
        "ms": 25.398,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
       },
       {
        "round": 0,
        "key": 41,
        "ms": 23.398,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
       },
       {
        "round": 0,
        "key": 42,
        "ms": 14.522,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 43,
        "ms": 21.519,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 0,
        "key": 44,
        "ms": 40.48,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=31"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=31"
       },
       {
        "round": 0,
        "key": 45,
        "ms": 13.524,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 46,
        "ms": 27.613,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=26"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=26"
       },
       {
        "round": 0,
        "key": 47,
        "ms": 15.604,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 0,
        "key": 48,
        "ms": 16.325,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 0,
        "key": 49,
        "ms": 16.097,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 0,
        "key": 50,
        "ms": 36.0,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=34"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=34"
       },
       {
        "round": 0,
        "key": 51,
        "ms": 29.583,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=28"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=28"
       },
       {
        "round": 0,
        "key": 52,
        "ms": 14.367,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 0,
        "key": 53,
        "ms": 12.26,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 0,
        "key": 54,
        "ms": 24.022,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
       },
       {
        "round": 0,
        "key": 55,
        "ms": 18.051,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 56,
        "ms": 37.781,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=35"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=35"
       },
       {
        "round": 0,
        "key": 57,
        "ms": 15.092,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 58,
        "ms": 21.042,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=19"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=19"
       },
       {
        "round": 0,
        "key": 59,
        "ms": 47.48,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=45"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=45"
       },
       {
        "round": 0,
        "key": 60,
        "ms": 28.595,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
       },
       {
        "round": 0,
        "key": 61,
        "ms": 20.073,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=18"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=18"
       },
       {
        "round": 0,
        "key": 62,
        "ms": 32.084,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=30"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=30"
       },
       {
        "round": 0,
        "key": 63,
        "ms": 18.272,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 0,
        "key": 64,
        "ms": 16.811,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 0,
        "key": 65,
        "ms": 33.747,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=32"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=32"
       },
       {
        "round": 0,
        "key": 66,
        "ms": 40.881,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=30"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=30"
       },
       {
        "round": 0,
        "key": 67,
        "ms": 14.921,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 0,
        "key": 68,
        "ms": 11.606,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 0,
@@ -12374,7 +12374,7 @@
        "round": 0,
        "key": 85,
        "ms": 340.908,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=339"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=339"
       },
       {
        "round": 0,
@@ -12872,7 +12872,7 @@
        "round": 0,
        "key": 196,
        "ms": 739.502,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=538 files=1 ms=731"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=538 files=1 ms=731"
       },
       {
        "round": 0,
@@ -13016,7 +13016,7 @@
        "round": 0,
        "key": 225,
        "ms": 613.061,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=129 files=1 ms=611"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=129 files=1 ms=611"
       },
       {
        "round": 0,
@@ -13028,19 +13028,19 @@
        "round": 0,
        "key": 239,
        "ms": 565.37,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=3 files=1 ms=554"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=3 files=1 ms=554"
       },
       {
        "round": 0,
        "key": 246,
        "ms": 24.717,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=18"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=18"
       },
       {
        "round": 0,
        "key": 247,
        "ms": 41.849,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=25"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=25"
       },
       {
        "round": 0,
@@ -13106,7 +13106,7 @@
        "round": 0,
        "key": 263,
        "ms": 16.34,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 0,
@@ -13226,7 +13226,7 @@
        "round": 0,
        "key": 283,
        "ms": 13.869,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 0,
@@ -13274,13 +13274,13 @@
        "round": 0,
        "key": 291,
        "ms": 589.354,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=22 files=1 ms=586"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=22 files=1 ms=586"
       },
       {
        "round": 0,
        "key": 292,
        "ms": 25.729,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=19"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=19"
       },
       {
        "round": 1,
@@ -13310,25 +13310,25 @@
        "round": 1,
        "key": 10,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=3 files=1 ms=534"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=3 files=1 ms=534"
       },
       {
        "round": 1,
        "key": 11,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=20"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=20"
       },
       {
        "round": 1,
        "key": 12,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 13,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 1,
@@ -13352,7 +13352,7 @@
        "round": 1,
        "key": 82,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=536 files=1 ms=436"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=536 files=1 ms=436"
       },
       {
        "round": 1,
@@ -13604,67 +13604,67 @@
        "round": 1,
        "key": 234,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=2 files=1 ms=349"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=2 files=1 ms=349"
       },
       {
        "round": 1,
        "key": 235,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=19"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=19"
       },
       {
        "round": 1,
        "key": 236,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 237,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 238,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 239,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 240,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 242,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 243,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=6"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=6"
       },
       {
        "round": 1,
        "key": 244,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 246,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
@@ -13688,7 +13688,7 @@
        "round": 1,
        "key": 0,
        "ms": 9.182,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=7"
       },
       {
        "round": 1,
@@ -13718,13 +13718,13 @@
        "round": 1,
        "key": 9,
        "ms": 352.339,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=2 files=1 ms=351"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=2 files=1 ms=351"
       },
       {
        "round": 1,
        "key": 14,
        "ms": 17.64,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
       },
       {
        "round": 1,
@@ -13736,43 +13736,43 @@
        "round": 1,
        "key": 16,
        "ms": 8.101,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 17,
        "ms": 8.365,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 18,
        "ms": 8.611,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 19,
        "ms": 8.209,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 20,
        "ms": 8.559,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 21,
        "ms": 8.157,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=7"
       },
       {
        "round": 1,
        "key": 22,
        "ms": 40.655,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
       },
       {
        "round": 1,
@@ -13784,259 +13784,259 @@
        "round": 1,
        "key": 24,
        "ms": 10.077,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 25,
        "ms": 9.793,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
       },
       {
        "round": 1,
        "key": 26,
        "ms": 9.589,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
       },
       {
        "round": 1,
        "key": 27,
        "ms": 10.185,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 28,
        "ms": 9.841,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 29,
        "ms": 13.265,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 30,
        "ms": 12.921,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 31,
        "ms": 16.678,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 1,
        "key": 32,
        "ms": 11.3,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 33,
        "ms": 10.751,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 34,
        "ms": 11.154,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 35,
        "ms": 9.292,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
       },
       {
        "round": 1,
        "key": 36,
        "ms": 11.071,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 37,
        "ms": 12.62,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
       },
       {
        "round": 1,
        "key": 38,
        "ms": 10.391,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 39,
        "ms": 9.519,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
       },
       {
        "round": 1,
        "key": 40,
        "ms": 10.46,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 41,
        "ms": 9.636,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
       },
       {
        "round": 1,
        "key": 42,
        "ms": 10.41,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 43,
        "ms": 11.605,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 44,
        "ms": 11.857,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 45,
        "ms": 11.099,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 46,
        "ms": 10.129,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
        "key": 47,
        "ms": 9.883,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=8"
       },
       {
        "round": 1,
        "key": 48,
        "ms": 11.905,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 49,
        "ms": 11.72,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 50,
        "ms": 11.68,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 51,
        "ms": 11.741,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 52,
        "ms": 11.383,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 53,
        "ms": 11.953,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 1,
        "key": 54,
        "ms": 13.175,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 55,
        "ms": 12.711,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 56,
        "ms": 13.473,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 57,
        "ms": 14.709,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 1,
        "key": 58,
        "ms": 12.202,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 59,
        "ms": 12.951,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 60,
        "ms": 12.424,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 61,
        "ms": 13.932,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 1,
        "key": 62,
        "ms": 12.863,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 1,
        "key": 63,
        "ms": 15.775,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 1,
        "key": 64,
        "ms": 133.272,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=122"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=122"
       },
       {
        "round": 1,
        "key": 65,
        "ms": 17.82,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 1,
        "key": 66,
        "ms": 11.33,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 1,
@@ -14114,7 +14114,7 @@
        "round": 1,
        "key": 83,
        "ms": 294.279,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=292"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=292"
       },
       {
        "round": 1,
@@ -14588,13 +14588,13 @@
        "round": 1,
        "key": 196,
        "ms": 722.132,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=536 files=1 ms=720"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=536 files=1 ms=720"
       },
       {
        "round": 1,
        "key": 197,
        "ms": 30.967,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=25"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=25"
       },
       {
        "round": 1,
@@ -14756,7 +14756,7 @@
        "round": 1,
        "key": 225,
        "ms": 517.379,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=17 files=1 ms=516"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=17 files=1 ms=516"
       },
       {
        "round": 1,
@@ -14774,13 +14774,13 @@
        "round": 1,
        "key": 245,
        "ms": 317.604,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=315"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=315"
       },
       {
        "round": 1,
        "key": 247,
        "ms": 27.214,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=21"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=21"
       },
       {
        "round": 1,
@@ -14792,7 +14792,7 @@
        "round": 1,
        "key": 252,
        "ms": 12.455,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 1,
@@ -14858,7 +14858,7 @@
        "round": 1,
        "key": 263,
        "ms": 11.124,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 1,
@@ -14978,7 +14978,7 @@
        "round": 1,
        "key": 283,
        "ms": 13.047,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 1,
@@ -15026,13 +15026,13 @@
        "round": 1,
        "key": 291,
        "ms": 589.858,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=3 files=1 ms=588"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=3 files=1 ms=588"
       },
       {
        "round": 1,
        "key": 292,
        "ms": 23.656,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=18"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=18"
       },
       {
        "round": 2,
@@ -15056,25 +15056,25 @@
        "round": 2,
        "key": 10,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=3 files=1 ms=307"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=3 files=1 ms=307"
       },
       {
        "round": 2,
        "key": 11,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 12,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=6"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=6"
       },
       {
        "round": 2,
        "key": 13,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=6"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=6"
       },
       {
        "round": 2,
@@ -15092,7 +15092,7 @@
        "round": 2,
        "key": 80,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 2,
@@ -15230,25 +15230,25 @@
        "round": 2,
        "key": 229,
        "asked after": true,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=2 files=1 ms=326"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=2 files=1 ms=326"
       },
       {
        "round": 2,
        "key": 230,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=20"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=20"
       },
       {
        "round": 2,
        "key": 231,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 2,
        "key": 232,
        "asked after": true,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 2,
@@ -15260,7 +15260,7 @@
        "round": 2,
        "key": 0,
        "ms": 8.148,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=7"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=0 files=1 ms=7"
       },
       {
        "round": 2,
@@ -15296,13 +15296,13 @@
        "round": 2,
        "key": 9,
        "ms": 415.405,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=2 files=1 ms=414"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=2 files=1 ms=414"
       },
       {
        "round": 2,
        "key": 14,
        "ms": 22.232,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=17"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=17"
       },
       {
        "round": 2,
@@ -15314,43 +15314,43 @@
        "round": 2,
        "key": 16,
        "ms": 10.882,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 2,
        "key": 17,
        "ms": 10.876,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=9"
       },
       {
        "round": 2,
        "key": 18,
        "ms": 14.625,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 19,
        "ms": 13.905,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 20,
        "ms": 31.829,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=27"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=27"
       },
       {
        "round": 2,
        "key": 21,
        "ms": 31.129,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=25"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=25"
       },
       {
        "round": 2,
        "key": 22,
        "ms": 24.081,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=22"
       },
       {
        "round": 2,
@@ -15362,247 +15362,247 @@
        "round": 2,
        "key": 24,
        "ms": 19.641,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=18"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=18"
       },
       {
        "round": 2,
        "key": 25,
        "ms": 12.229,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 2,
        "key": 26,
        "ms": 85.613,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=83"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=83"
       },
       {
        "round": 2,
        "key": 27,
        "ms": 21.659,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=20"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=20"
       },
       {
        "round": 2,
        "key": 28,
        "ms": 13.889,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 29,
        "ms": 62.53,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=48"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=48"
       },
       {
        "round": 2,
        "key": 30,
        "ms": 32.236,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=21"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=21"
       },
       {
        "round": 2,
        "key": 31,
        "ms": 15.868,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 32,
        "ms": 16.834,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 2,
        "key": 33,
        "ms": 20.01,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=17"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=17"
       },
       {
        "round": 2,
        "key": 34,
        "ms": 16.923,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 2,
        "key": 35,
        "ms": 12.504,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 2,
        "key": 36,
        "ms": 13.789,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 37,
        "ms": 14.642,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 38,
        "ms": 17.013,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 39,
        "ms": 13.036,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 2,
        "key": 40,
        "ms": 10.828,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=9"
       },
       {
        "round": 2,
        "key": 41,
        "ms": 78.224,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=71"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=71"
       },
       {
        "round": 2,
        "key": 42,
        "ms": 14.922,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 43,
        "ms": 34.833,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=29"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=29"
       },
       {
        "round": 2,
        "key": 44,
        "ms": 44.443,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=43"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=43"
       },
       {
        "round": 2,
        "key": 45,
        "ms": 15.314,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 46,
        "ms": 13.941,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 47,
        "ms": 22.437,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=17"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=17"
       },
       {
        "round": 2,
        "key": 48,
        "ms": 30.524,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=27"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=27"
       },
       {
        "round": 2,
        "key": 49,
        "ms": 43.237,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=38"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=38"
       },
       {
        "round": 2,
        "key": 50,
        "ms": 52.308,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=37"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=37"
       },
       {
        "round": 2,
        "key": 51,
        "ms": 14.393,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 52,
        "ms": 12.705,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 2,
        "key": 53,
        "ms": 17.293,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=16"
       },
       {
        "round": 2,
        "key": 54,
        "ms": 45.938,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=43"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=43"
       },
       {
        "round": 2,
        "key": 55,
        "ms": 15.618,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 56,
        "ms": 11.769,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=10"
       },
       {
        "round": 2,
        "key": 57,
        "ms": 33.498,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=31"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=31"
       },
       {
        "round": 2,
        "key": 58,
        "ms": 33.418,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=24"
       },
       {
        "round": 2,
        "key": 59,
        "ms": 22.848,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=15"
       },
       {
        "round": 2,
        "key": 60,
        "ms": 14.108,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 61,
        "ms": 12.438,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 2,
        "key": 62,
        "ms": 27.72,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=26"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=26"
       },
       {
        "round": 2,
        "key": 63,
        "ms": 23.166,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=21"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=21"
       },
       {
        "round": 2,
        "key": 64,
        "ms": 13.374,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=8 files=1 ms=11"
       },
       {
        "round": 2,
@@ -15686,7 +15686,7 @@
        "round": 2,
        "key": 81,
        "ms": 223.206,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=221"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=221"
       },
       {
        "round": 2,
@@ -16268,13 +16268,13 @@
        "round": 2,
        "key": 192,
        "ms": 363.141,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=539 files=1 ms=362"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=539 files=1 ms=362"
       },
       {
        "round": 2,
        "key": 193,
        "ms": 17.391,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=16"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=16"
       },
       {
        "round": 2,
@@ -16424,7 +16424,7 @@
        "round": 2,
        "key": 219,
        "ms": 312.359,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=17 files=1 ms=311"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=17 files=1 ms=311"
       },
       {
        "round": 2,
@@ -16436,19 +16436,19 @@
        "round": 2,
        "key": 228,
        "ms": 412.139,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=2 files=1 ms=407"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=2 files=1 ms=407"
       },
       {
        "round": 2,
        "key": 233,
        "ms": 25.133,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=20"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=20"
       },
       {
        "round": 2,
        "key": 234,
        "ms": 40.349,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=24"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=24"
       },
       {
        "round": 2,
@@ -16460,37 +16460,37 @@
        "round": 2,
        "key": 236,
        "ms": 13.058,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=11"
       },
       {
        "round": 2,
        "key": 237,
        "ms": 9.683,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 2,
        "key": 238,
        "ms": 16.204,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=14"
       },
       {
        "round": 2,
        "key": 239,
        "ms": 14.46,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=12"
       },
       {
        "round": 2,
        "key": 240,
        "ms": 15.223,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=13"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=13"
       },
       {
        "round": 2,
        "key": 241,
        "ms": 9.573,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=1 files=1 ms=8"
       },
       {
        "round": 2,
@@ -16514,7 +16514,7 @@
        "round": 2,
        "key": 246,
        "ms": 8.515,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 2,
@@ -16580,7 +16580,7 @@
        "round": 2,
        "key": 257,
        "ms": 18.262,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 2,
@@ -16700,7 +16700,7 @@
        "round": 2,
        "key": 277,
        "ms": 9.76,
-       "answer": "error: `step` has an error ra-jit cannot say more of: frontend: mir: IncompleteExpr"
+       "answer": "error: `step` has an error blaze cannot say more of: frontend: mir: IncompleteExpr"
       },
       {
        "round": 2,
@@ -16748,13 +16748,13 @@
        "round": 2,
        "key": 285,
        "ms": 393.166,
-       "answer": "ok object=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/ra-jit.o functions=3 files=1 ms=392"
+       "answer": "ok object=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/blaze.o functions=3 files=1 ms=392"
       },
       {
        "round": 2,
        "key": 286,
        "ms": 11.131,
-       "answer": "ok patch=ra-jit/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=10"
+       "answer": "ok patch=blaze/a6568a096c8e8c36/programs/life-ad192d1c94a2aeb1/patch.o functions=7 files=1 ms=10"
       }
      ]
     },

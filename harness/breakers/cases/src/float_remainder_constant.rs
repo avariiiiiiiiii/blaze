@@ -1,5 +1,5 @@
 //! tests/ui/numbers-arithmetic/apfloat-modulo-wrong.rs: `%` of two floats in a constant.
-//! ra-jit's evaluator had no float remainder and left the function that reads the constant
+//! blaze's evaluator had no float remainder and left the function that reads the constant
 //! to rustc.
 
 const SINGLE: f32 = 7.5 % 2.0;

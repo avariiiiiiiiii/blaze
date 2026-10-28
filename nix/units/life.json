@@ -1078,7 +1078,7 @@
    {
     "dependencies": [
      "eframe",
-     "ra-jit-live"
+     "blaze-live"
     ],
     "name": "life",
     "version": "0.1.0"
@@ -1801,7 +1801,7 @@
     "version": "6.0.0"
    },
    {
-    "name": "ra-jit-live",
+    "name": "blaze-live",
     "version": "0.1.0"
    },
    {
@@ -2932,8 +2932,8 @@
     ],
     "version": "0.37"
    },
-   "ra-jit-live": {
-    "path": "../../crates/ra-jit-live"
+   "blaze-live": {
+    "path": "../../crates/blaze-live"
    }
   },
   "package": {
@@ -6024,19 +6024,19 @@
    },
    "version": "6.0.0"
   },
-  "ra-jit-live@0.1.0": {
+  "blaze-live@0.1.0": {
    "authors": "Indexable, Inc.",
-   "description": "Applies ra-jit's edits to a program while it runs",
+   "description": "Applies blaze's edits to a program while it runs",
    "homepage": "https://ix.dev/blaze",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
    "links": null,
-   "name": "ra-jit-live",
+   "name": "blaze-live",
    "readme": "README.md",
    "repository": "https://github.com/indexable-inc/blaze",
    "rust_version": "",
    "source": {
-    "dir": "crates/ra-jit-live",
+    "dir": "crates/blaze-live",
     "kind": "path"
    },
    "version": "0.1.0"
@@ -10051,8 +10051,8 @@
        "unit": "eframe@0.37.0 lib eframe build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       }
      ],
      "edition": "2024",
@@ -11409,14 +11409,14 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -11427,7 +11427,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",
@@ -14659,8 +14659,8 @@
        "unit": "eframe@0.37.0 lib eframe build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       }
      ],
      "edition": "2024",
@@ -15698,14 +15698,14 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -15716,7 +15716,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",
@@ -20206,8 +20206,8 @@
        "unit": "eframe@0.37.0 lib eframe build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       }
      ],
      "edition": "2024",
@@ -21564,14 +21564,14 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21582,7 +21582,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",
@@ -24814,8 +24814,8 @@
        "unit": "eframe@0.37.0 lib eframe build"
       },
       {
-       "name": "ra_jit_live",
-       "unit": "ra-jit-live@0.1.0 lib ra_jit_live build"
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
       }
      ],
      "edition": "2024",
@@ -25853,14 +25853,14 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "ra-jit-live@0.1.0 lib ra_jit_live build": {
+    "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "ra-jit-live@0.1.0",
+     "pkg": "blaze-live@0.1.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -25871,7 +25871,7 @@
       "panic": "unwind"
      },
      "src": "src/lib.rs",
-     "target": "ra_jit_live"
+     "target": "blaze_live"
     },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",

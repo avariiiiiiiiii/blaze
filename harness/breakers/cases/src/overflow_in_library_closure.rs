@@ -1,6 +1,6 @@
 //! tests/ui/iterators/iter-sum-overflow-debug.rs: `Iterator::sum` adds in a closure of `core`
 //! marked `#[rustc_inherit_overflow_checks]`, which checks for overflow when the crate that
-//! calls `sum` does. ra-jit read the attribute on functions only, and the sum wrapped.
+//! calls `sum` does. blaze read the attribute on functions only, and the sum wrapped.
 
 use std::panic::catch_unwind;
 

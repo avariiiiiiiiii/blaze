@@ -1,6 +1,6 @@
-# Where ra-jit's time goes
+# Where blaze's time goes
 
-Measurements of `cargo ra-jit` against plain cargo on three pinned workspaces, what the daemon
+Measurements of `blaze` against plain cargo on three pinned workspaces, what the daemon
 says about its own time, profiles of the slow cases, and what was changed because of them.
 Everything here was run on one machine: x86-64 Linux, 8 cores, 31 GB, Rust 1.99.0, LLVM 20.
 What was measured and what is inferred from it are kept apart; inferences are marked.
@@ -11,10 +11,10 @@ What was measured and what is inferred from it are kept apart; inferences are ma
 pinned checkout of ripgrep 15.1.0, cargo 0.92.0 or nushell 0.108.0, copies it, and under each
 backend, with a store, a daemon and a home of its own, runs:
 
-- **cold**: `cargo ra-jit build` from nothing, then the wait until `cargo ra-jit status` says the
+- **cold**: `blaze build` from nothing, then the wait until `blaze status` says the
   workspace is ready. Cargo's own cold build is started only after that, so the two do not
   share the cores.
-- **no-op**: `cargo ra-jit build` with nothing changed.
+- **no-op**: `blaze build` with nothing changed.
 - **body**: a statement is added to one function of the program's own crate.
 - **signature**: a method gets another parameter and every caller the argument.
 - **leaf**: a statement is added to a function in a crate of the workspace that the others
@@ -54,7 +54,7 @@ why CI has ripgrep alone.
 
 ## What the harness measured
 
-Seconds, `cargo ra-jit` then plain cargo, on the branch before any fix. Edits are the median of
+Seconds, `blaze` then plain cargo, on the branch before any fix. Edits are the median of
 three; "first" is the first of the three where it differed much from the others.
 
 | Cranelift | ripgrep | cargo | nushell |
@@ -87,7 +87,7 @@ What these say, before any profile:
 - A "refused" edit is one the daemon turned down with a reason and cargo built. The time is
   cargo's build plus the daemon's attempt, and after it the daemon loads the workspace again
   from the start, because what cargo linked is no longer what the daemon's objects are of
-  (`Daemon::warm` in `crates/ra-jit/src/cargo/daemon.rs` replaces the worker when the
+  (`Daemon::warm` in `crates/blaze-engine/src/cargo/daemon.rs` replaces the worker when the
   generation differs). On cargo that reload is about 150 s during which every build is cargo's.
 - Cargo's signature edit (`GlobalContext::cli_unstable`, 113 places in 49 files) is refused
   with "`publish` has errors: frontend: mir: HasErrors". Nushell's signature and leaf edits are
@@ -125,10 +125,10 @@ on the same switch and as lines of the same kind:
   round, so a build of four rounds showed three quarters of its time as "compile-rest".
 
 The client, the daemon and the worker also record spans of every build on one clock, always
-(`crates/ra-jit/src/trace.rs`): the worker sends its own with its answer, the daemon adds its
+(`crates/blaze-engine/src/trace.rs`): the worker sends its own with its answer, the daemon adds its
 own, and the client puts them together. With them:
 
-- `BLAZE_STATS=1` makes `cargo ra-jit build` print `ra-jit time: 402.1 ms: check 285.5 (71%),
+- `BLAZE_STATS=1` makes `blaze build` print `blaze time: 402.1 ms: check 285.5 (71%),
   …` and a table of where the client's wall time went, step by step (client, daemon, worker),
   with `unaccounted` for moments no step had: the rows add up to the total.
 - `BLAZE_TRACE=<path>` writes the spans as a Chrome trace (ui.perfetto.dev and
@@ -154,9 +154,9 @@ nushell, and the profiles, are not in this file yet.
 
 ## Cargo's cold build, taken apart
 
-All of this is cargo 0.92.0 under Cranelift, built by `ra-jit DIR --crate … --out … --link-cmd …`
-as `harness/remote.py` does it (one process, no daemon, so that nothing but ra-jit is timed),
-with cargo's own artifacts built beforehand. Seconds are ra-jit's alone.
+All of this is cargo 0.92.0 under Cranelift, built by `blaze DIR --crate … --out … --link-cmd …`
+as `harness/remote.py` does it (one process, no daemon, so that nothing but blaze is timed),
+with cargo's own artifacts built beforehand. Seconds are blaze's alone.
 
 ### The store and debug info, each on and off
 
@@ -218,7 +218,7 @@ describing 180,000 instances, done three times, on one thread.
 - SHA-256, 23.3 s, none of it without the store: the key of an entry is a hash of its name,
   and the names of instances are long (9.1 s, half of it on the one thread, since the key is
   computed when a compiling thread looks the entry up and again when the entry is kept);
-  Cranelift's own cache of compiled functions, which ra-jit also points at the store, hashes
+  Cranelift's own cache of compiled functions, which blaze also points at the store, hashes
   every function's IR (7.4 s with what is hashed besides); a sealed pack is hashed for its
   name (3.1 s) and read back and checked (2.9 s).
 - Finding which function of the program an entry's names stand for
@@ -230,7 +230,7 @@ describing 180,000 instances, done three times, on one thread.
 The checksums of the records do not show (0.3 s).
 
 **Elsewhere:** Cranelift's verifier is 9.6 s of processor time (4%). It is what turns IR
-that ra-jit got wrong into a function left to rustc instead of a crash or wrong code, so it
+that blaze got wrong into a function left to rustc instead of a crash or wrong code, so it
 stays. Register allocation is 27 s, types 37 s, MIR 21 s; those are the work.
 
 ### What follows from it

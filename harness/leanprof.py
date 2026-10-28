@@ -7,8 +7,8 @@ profile of the whole run to be cut by ([research/lean-frontend.md](../docs/resea
     perf script -i run.data > run.txt
     python3 cpufold.py run.txt --phases W/phases.json
 
-The standard library's unit is made once with `ra-jit std` and fetched, as bench.py does. The
-phases: `cold` (`cargo ra-jit build` from nothing until the daemon is ready), `base` (the
+The standard library's unit is made once with `blaze-engine std` and fetched, as bench.py does. The
+phases: `cold` (`blaze build` from nothing until the daemon is ready), `base` (the
 build of its own base it makes once idle), each edit of `--edits` (default `body,signature`,
 from bench.py's `PROJECTS`) made and taken back `--rounds` times (default 3), and `warm` (the
 daemon stopped and started again on the same store and target directory, until ready) and
@@ -20,8 +20,8 @@ bench.py's, fetched as it fetches them. It measures and checks nothing.
 """
 import json, os, shutil, subprocess, sys, time
 
-import bench, cargo_ra_jit, memory
-from cargo_ra_jit import Side, fetch, wait_warm
+import bench, blaze_cli, memory
+from blaze_cli import Side, fetch, wait_warm
 from memsplit import wait_own_base
 
 
@@ -41,12 +41,12 @@ def main():
     os.makedirs(work)
     shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
     home = os.path.join(work, "home")
-    env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), **extra_env)
-    env["PATH"] = os.path.dirname(bench.ra_jit_of("cranelift")) + os.pathsep + env["PATH"]
+    env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
+    env["PATH"] = os.path.dirname(bench.blaze_of("cranelift")) + os.pathsep + env["PATH"]
     env.update(bench.BACKENDS["cranelift"], BLAZE_STATS="1", BLAZE_CACHE=os.path.join(work, "store"))
     env.pop("RUSTC_WRAPPER", None)
     # As bench.py's cold start: the standard library's unit is fetched as a release fetches it.
-    env["BLAZE_STD_FROM"], _ = bench.shipped_std(bench.ra_jit_of("cranelift"), "cranelift", work)
+    env["BLAZE_STD_FROM"], _ = bench.shipped_std(bench.blaze_of("cranelift"), "cranelift", work)
     reports = env.get("BLAZE_MEMORY")
     build = spec.get("build", [])
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """hotpatch.py: edit to running on one small program, hot-patched or built and started again (issue #8).
 
-    hotpatch.py [--edits N] [--tools subsecond,ra-jit,cargo] [--out FILE]
-    (BLAZE_BIN names the ra-jit built; `dx` on PATH for subsecond: the bench shell has it)
+    hotpatch.py [--edits N] [--tools subsecond,blaze,cargo] [--out FILE]
+    (BLAZE_BIN names the blaze built; `dx` on PATH for subsecond: the bench shell has it)
 
 harness/hotpatch is a program that calls `answer()` every millisecond through
 `subsecond::call` and writes to a file each time the number changes, with when (`at_us`) and
@@ -13,7 +13,7 @@ timed from just before the file is written to the program running the new number
   subsecond  `dx serve --hotpatch` (Dioxus 0.7.10) runs the program and patches it while it
              runs: dx sees the file change, rustc builds the crate, dx links a patch and sends
              it to the program, which swaps it in
-  ra-jit     the program is stopped, `cargo ra-jit build`, and it is started again. ra-jit
+  blaze     the program is stopped, `blaze build`, and it is started again. blaze
              does not patch a running program on Linux yet (on macOS it does: live_latency.py
              measures that)
   cargo      the program is stopped, incremental `cargo build`, and it is started again: what
@@ -27,8 +27,8 @@ counted as a restart. The medians, p90 and max of each tool go to stdout, every 
 """
 import json, os, platform, re, shutil, signal, statistics, subprocess, sys, tempfile, time
 
-import cargo_ra_jit
-from bench import machine, ra_jit_commit
+import blaze_cli
+from bench import machine, blaze_commit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STEP_SECS = 300
@@ -66,7 +66,7 @@ class Tool:
         raise SystemExit(f"{self.name} {step}: the program did not run {value} in {STEP_SECS}s:\n" + "\n".join(self.lines()[-10:]))
 
     def build(self, step):
-        command = ["cargo", *(["ra-jit"] if self.name == "ra-jit" else []), "build"]
+        command = [*(["blaze"] if self.name == "blaze" else ["cargo"]), "build"]
         ran = subprocess.run(command, cwd=self.ws, env=self.env, capture_output=True, text=True, timeout=STEP_SECS)
         if ran.returncode != 0:
             raise SystemExit(f"{self.name} {step}: {' '.join(command)} failed:\n{ran.stderr[-2000:]}")
@@ -87,16 +87,16 @@ class Tool:
         self.process = None
 
     def first(self):
-        """Builds and starts the program, and for ra-jit waits until the daemon builds it."""
+        """Builds and starts the program, and for blaze waits until the daemon builds it."""
         if self.name != "subsecond":
             self.build("first build")
-            if self.name == "ra-jit":
+            if self.name == "blaze":
                 for _ in range(240):
                     if "[blaze]" in self.build("wait for the daemon"):
                         break
                     time.sleep(0.5)
                 else:
-                    raise SystemExit("ra-jit: the daemon never built the program")
+                    raise SystemExit("blaze: the daemon never built the program")
         self.start()
         _, self.pid = self.wait_answer(1, "start")
 
@@ -111,8 +111,8 @@ class Tool:
             stderr = self.build(f"edit {self.value}")
             if counted:
                 self.build_times.append(round((time.time_ns() // 1000 - t0) / 1000, 2))
-            if counted and self.name == "ra-jit":
-                how = cargo_ra_jit.how_built(stderr)
+            if counted and self.name == "blaze":
+                how = blaze_cli.how_built(stderr)
                 self.built[how] = self.built.get(how, 0) + 1
             self.start()
         at, pid = self.wait_answer(self.value, f"edit {self.value}")
@@ -133,9 +133,9 @@ def main():
     argv = sys.argv[1:]
     take = lambda flag, default: argv[argv.index(flag) + 1] if flag in argv else default
     edits, out = int(take("--edits", "20")), take("--out", os.path.join(HERE, "hotpatch.json"))
-    names = take("--tools", "subsecond,ra-jit,cargo").split(",")
-    work = tempfile.mkdtemp(prefix="ra-jit-hotpatch-")
-    env = cargo_ra_jit.base_env(os.path.join(work, "home"))
+    names = take("--tools", "subsecond,blaze,cargo").split(",")
+    work = tempfile.mkdtemp(prefix="blaze-hotpatch-")
+    env = blaze_cli.base_env(os.path.join(work, "home"))
     env.pop("RUSTC_WRAPPER", None)
     env.pop("CARGO_INCREMENTAL", None)
     if "subsecond" in names and not shutil.which("dx", path=env["PATH"]):
@@ -152,8 +152,8 @@ def main():
     finally:
         for tool in tools:
             tool.stop()
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=work, env=env, capture_output=True)
-    result = dict(commit=ra_jit_commit(), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=machine(),
+        subprocess.run(["blaze", "stop"], cwd=work, env=env, capture_output=True)
+    result = dict(commit=blaze_commit(), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=machine(),
                   os=platform.system(), arch=platform.machine(), edits=edits,
                   dx=subprocess.run(["dx", "--version"], capture_output=True, text=True, env=env).stdout.strip() if "subsecond" in names else None,
                   tools={})

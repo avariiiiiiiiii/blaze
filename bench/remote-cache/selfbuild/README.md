@@ -3,16 +3,16 @@
 What it measures, for blaze's repository at a main commit and three pull request shapes (`a` no
 edit, `b` one function body, `body.patch`: `Symbol::intern` in `intern`, which most of the fork
 reaches; `c` one signature, `sig.patch`: `Symbol::empty` and its three callers), the build job
-(`build -p ra-jit --release --features llvm`) and the test job (the unit tests `harness/unittests.py`
+(`build -p blaze-engine --release --features llvm`) and the test job (the unit tests `harness/unittests.py`
 runs) of the merge gate:
 
 | arm | what |
 |---|---|
 | `cargo` | cargo with main's target directory, as CI's cache gives it |
-| `cold` | `cargo blaze` with an empty store |
-| `warm` | `cargo blaze` with a copy of the store main's cold run left: the most a remote can give |
-| `remote` | `cargo blaze` with an empty store that `ra-jit cache pull` fills from the gateway first, the pull counted in the time |
-| `fill` | `cargo blaze` on a store kept across runs: a run the machine runs out of memory for keeps the packs it sealed, so repeating it ends with main's store (then pushed, as cold `a 1` is) |
+| `cold` | `blaze` with an empty store |
+| `warm` | `blaze` with a copy of the store main's cold run left: the most a remote can give |
+| `remote` | `blaze` with an empty store that `blaze-engine cache pull` fills from the gateway first, the pull counted in the time |
+| `fill` | `blaze` on a store kept across runs: a run the machine runs out of memory for keeps the packs it sealed, so repeating it ends with main's store (then pushed, as cold `a 1` is) |
 
 Each blaze run is a fresh CI job: a fresh copy of the tree at `/root/rb/b`, an empty target
 directory, a new `BLAZE_HOME`, `BLAZE_STATS=1` and a trace. Results are rows of
@@ -24,7 +24,7 @@ In an ix VM (fleet-ops), as root, with the tree of the commit under test cloned 
 these files and the two patches in `/root/rb`, and the gateway's token, signing key and trust in
 `/root/.rcache-{token,sign,pub}` (mode 600, never printed):
 
-1. `bash step0.sh`: cargo builds the ra-jit to measure with (into `/root/rb/bin`) and warms the
+1. `bash step0.sh`: cargo builds the blaze to measure with (into `/root/rb/bin`) and warms the
    cargo arm's target directory (`/root/rb/c`) and test binaries.
 2. `bash driver.sh "cold a 1 build" "cold a 1 test" "cargo a 1 build" ...`: one systemd unit per
    run, so its cgroup's `memory.peak` is that run's, pinned to 4 CPUs (a GitHub runner's) and

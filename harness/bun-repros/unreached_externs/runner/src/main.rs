@@ -1,5 +1,5 @@
 // bun's `main` is the C runtime's, `#[no_mangle]` in `bun_runtime`: with no `main` of Rust's,
-// ra-jit compiles every function of the crates, as rustc does, and the link keeps what `main`
+// blaze compiles every function of the crates, as rustc does, and the link keeps what `main`
 // reaches.
 #![no_main]
 

@@ -70,8 +70,8 @@ struct ProcMacroLibrary {
     proc_macros: ProcMacros,
 }
 
-/// One entry of the list ra-jit writes into a proc-macro crate it links as a shared library,
-/// as `crates/ra-jit/src/macro_list.rs` declares it.
+/// One entry of the list blaze writes into a proc-macro crate it links as a shared library,
+/// as `crates/blaze-engine/src/macro_list.rs` declares it.
 #[repr(C)]
 struct Macro {
     kind: u32,
@@ -87,7 +87,7 @@ struct Macro {
 const SYMBOL: &std::ffi::CStr = c"BLAZE_PROC_MACROS";
 
 impl ProcMacroLibrary {
-    /// Loads the library and reads ra-jit's list of its macros. The library is never
+    /// Loads the library and reads blaze's list of its macros. The library is never
     /// unloaded, as rustc's loader leaks the libraries it loads: the clients and the names
     /// point into it.
     #[cfg(unix)]
@@ -118,19 +118,19 @@ impl ProcMacroLibrary {
         if list.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{shown} has no list of proc macros: ra-jit did not link it"),
+                format!("{shown} has no list of proc macros: blaze did not link it"),
             ));
         }
         // SAFETY: `list` is what `dlsym` found.
         unsafe { Self::from_list(&shown.to_string(), list) }
     }
 
-    /// The library behind `list`, the address of ra-jit's `static BLAZE_PROC_MACROS: &[Macro]`.
+    /// The library behind `list`, the address of blaze's `static BLAZE_PROC_MACROS: &[Macro]`.
     ///
     /// # Safety
     /// `list` is that static, in a library that stays loaded for as long as the process runs.
     unsafe fn from_list(shown: &str, list: *mut std::ffi::c_void) -> io::Result<Self> {
-        // SAFETY: ra-jit exports the list as a `static BLAZE_PROC_MACROS: &[Macro]`, and the
+        // SAFETY: blaze exports the list as a `static BLAZE_PROC_MACROS: &[Macro]`, and the
         // library stays loaded for as long as the process runs.
         let list: &'static [Macro] = unsafe { *list.cast::<&'static [Macro]>() };
         let mut macros = Vec::with_capacity(list.len());
@@ -153,7 +153,7 @@ impl ProcMacroLibrary {
     }
 
     /// The same on Windows, with `LoadLibraryW` and `GetProcAddress`: the library is a DLL
-    /// ra-jit linked, which exports the list by name.
+    /// blaze linked, which exports the list by name.
     #[cfg(windows)]
     fn open(path: &Path) -> io::Result<Self> {
         use std::ffi::c_void;
@@ -179,7 +179,7 @@ impl ProcMacroLibrary {
         if list.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{shown} has no list of proc macros: ra-jit did not link it"),
+                format!("{shown} has no list of proc macros: blaze did not link it"),
             ));
         }
         // SAFETY: `list` is what `GetProcAddress` found.
@@ -191,7 +191,7 @@ impl ProcMacroLibrary {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "cannot load {}: ra-jit's proc-macro libraries load on unix only",
+                "cannot load {}: blaze's proc-macro libraries load on unix only",
                 path.display()
             ),
         ))

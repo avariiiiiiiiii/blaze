@@ -483,7 +483,7 @@ impl Expr {
 
     fn is_ordered_before_parent_in_place_of(&self, parent: &Expr, place_of: &SyntaxNode) -> bool {
         use Expr::*;
-        use rowan::TextSize;
+        use syntax_tree::TextSize;
 
         let self_range = self.syntax().text_range();
         let place_of_range = place_of.text_range();

@@ -359,7 +359,7 @@ impl<'db> Keeper<'_, 'db> {
 
     /// What a patch base that has the code of `instance` from the store tells an edit of it by.
     /// `None` for code the base has to compile to tell: in a program with code of rustc's,
-    /// which settles what an instance is by its build, or of a `#[ra_jit::cache]` function,
+    /// which settles what an instance is by its build, or of a `#[blaze::cache]` function,
     /// whose code holds a hash of everything it reaches.
     fn tracked(
         &self,
@@ -371,7 +371,7 @@ impl<'db> Keeper<'_, 'db> {
         if let InstanceDef::Fn(func) = instance.def
             && fncache::cached_closure(self.db, func).is_some()
         {
-            return Err("a `#[ra_jit::cache]` function");
+            return Err("a `#[blaze::cache]` function");
         }
         let mark = patch::stable_mark(self.db, self.names, compiled, described)
             .ok_or("what it refers to has no stable name")?;
@@ -437,7 +437,7 @@ impl<'db> Keeper<'_, 'db> {
                 // rustc's copy of a function of the checkout is of the checkout as rustc
                 // built it, and uses rustc's copies of the statics.
                 let symbol = decl.linkage_name(id).into_owned();
-                // Checked too when it is one of an object ra-jit built before, the standard
+                // Checked too when it is one of an object blaze built before, the standard
                 // library's unit: a build that compiles std's crates itself has no such symbol.
                 let checked = self.symbols.provides(&symbol);
                 let mut copied = None;

@@ -1,14 +1,14 @@
-# ra-jit in the browser
+# blaze in the browser
 
-This is the report for the `ra-jit-wasm` spike: can ra-jit's compiler run in a web page,
+This is the report for the `blaze-wasm` spike: can blaze's compiler run in a web page,
 compile Rust there, and swap edited functions into a running program?
 
-Short answer: yes. The page in `crates/ra-jit-wasm/web` is a playground: a Dioxus app with
-an editor on the left and a running program on the right. It loads ra-jit built as wasm32,
+Short answer: yes. The page in `crates/blaze-wasm/web` is a playground: a Dioxus app with
+an editor on the left and a running program on the right. It loads blaze built as wasm32,
 compiles the program in the editor to wasm32, and on each edit compiles only the functions
 that changed and swaps them in while the program keeps its memory. Four of the programs are
 `#![no_std]` and draw on a canvas, with the parts of `core` they use compiled from source in
-the page. The fifth is a Dioxus counter: ra-jit compiles the app in the page and links it
+the page. The fifth is a Dioxus counter: blaze compiles the app in the page and links it
 into a module rustc built that holds `std`, Dioxus and the wasm-bindgen glue.
 
 The work went in two passes, and the report keeps both. Sections 1 to 4 were written after
@@ -24,12 +24,12 @@ Linux VM; where a number comes from a single run it says so.
 
     rustup component add rust-src
     cargo install wasm-bindgen-cli --version 0.2.122
-    crates/ra-jit-wasm/web/build.sh              # the compiler, and the source of core
-    crates/ra-jit-wasm/web/build-dioxus.sh       # the page itself and the packed Dioxus workspace, needs clang
-    python3 -m http.server -d crates/ra-jit-wasm/web 8377
+    crates/blaze-wasm/web/build.sh              # the compiler, and the source of core
+    crates/blaze-wasm/web/build-dioxus.sh       # the page itself and the packed Dioxus workspace, needs clang
+    python3 -m http.server -d crates/blaze-wasm/web 8377
 
 Then open `http://localhost:8377/` in Chrome. The line at the bottom shows what the last
-build did. `node crates/ra-jit-wasm/web/check.mjs` builds and edits the canvas programs
+build did. `node crates/blaze-wasm/web/check.mjs` builds and edits the canvas programs
 without a browser and asserts on what they draw.
 
 `wasm-bindgen` has to be the version in `web/dioxus/Cargo.lock`. A newer one refuses the
@@ -42,21 +42,21 @@ I ran it in the Chrome on this VM and in Node 24. I did not try Firefox or Safar
 
 - `crates/hir-ty/src/mir/codegen/wasm.rs` (about 2,200 lines, behind the `wasm` feature of
   `hir-ty`): lowers one function of Cranelift IR to a WebAssembly function body.
-- `crates/ra-jit-wasm`: a `Compiler` that holds a salsa database over an in-memory file set,
+- `crates/blaze-wasm`: a `Compiler` that holds a salsa database over an in-memory file set,
   a linker that turns the code generator's objects into a WebAssembly module (`link.rs`),
   the reading of a module rustc built and of rustc's symbol names (`host.rs`, `names.rs`),
   the packing of a cargo workspace (`pack.rs`), the proc macros that run in the compiler
   (`macros.rs`, `core-macro/`), a small C ABI for the page, and a CLI that does the packing
   natively.
-- `crates/ra-jit-wasm/web`: the playground (`dioxus/playground`, a Dioxus app), the JavaScript it
+- `crates/blaze-wasm/web`: the playground (`dioxus/playground`, a Dioxus app), the JavaScript it
   leaves the compiler to (`playground.js`, `worker.js`, `compiler.js`), the runtime that
   holds a program's memory and function table (`program.js`), the canvas programs
   (`demos/`), and the workspace of the Dioxus demo (`dioxus/`).
 - Small portability fixes in `stdx`, `paths` and `ide-db`, listed under "Blockers".
 
-`ra-jit-wasm` is a workspace of its own, outside the main one. The `wasm` feature changes
+`blaze-wasm` is a workspace of its own, outside the main one. The `wasm` feature changes
 what `codegen.rs` emits, and inside the main workspace cargo would unify that feature into
-native `ra-jit`. With the feature off, `codegen.rs` compiles as before apart from
+native `blaze`. With the feature off, `codegen.rs` compiles as before apart from
 `std::time::Instant` becoming `stdx::time::Instant`, which is a re-export on native.
 
 ## 1. Does the front end run on wasm?
@@ -83,7 +83,7 @@ generates code.
   codegen is serial here.
 - **Clock.** `std::time::Instant::now()` panics on `wasm*-unknown-unknown`. `codegen.rs`
   and `ide-db` time their phases with it. Added `stdx::time::Instant`, which is the std one
-  natively and reads an imported `ra-jit.now` on wasm.
+  natively and reads an imported `blaze.now` on wasm.
 - **`std::process`.** `stdx::process` already had a wasm stub, but gated on
   `target_arch = "wasm32"`. Changed to `target_family = "wasm"`.
 - **Paths.** `AbsPathBuf::assert("/")` panics on `wasm*-unknown-unknown` because
@@ -93,11 +93,11 @@ generates code.
   virtual paths; `vfs-notify` and the loader are not used. Files are set with
   `Compiler::set_file`.
 - **Cargo metadata and project loading.** Bypassed, not solved. `project-model` is not
-  compiled in; `ra-jit-wasm` builds a two-crate graph by hand (the program and `core`) with
+  compiled in; `blaze-wasm` builds a two-crate graph by hand (the program and `core`) with
   cfgs and a data layout for wasm64. A real project would need its crate graph computed
   somewhere else (a server, or ahead of time) and shipped as data.
 - **Sysroot.** The sources of `core` (plus the `core_arch` and `core_simd` files it
-  includes) are packed into one 6.7 MiB file by `ra-jit-wasm bundle` and loaded into the
+  includes) are packed into one 6.7 MiB file by `blaze-wasm bundle` and loaded into the
   in-memory file set. `alloc` and `std` are not loaded.
 - **Proc macros.** None are loaded; `core` needs none since its derives are built in. The
   proc-macro server loads native dylibs, which cannot work in wasm. The options I see are
@@ -116,7 +116,7 @@ generates code.
 
 (First pass. Both are wasm32 now, see section 5.)
 
-Two things in ra-jit assume the target's pointer is as wide as the compiler's own:
+Two things in blaze assume the target's pointer is as wide as the compiler's own:
 `codegen.rs` builds IR with `I64` pointers throughout, and the MIR interpreter, which
 evaluates constants, refuses a target whose pointer size differs from the host's
 (`mir/eval.rs`: "targets with different pointer size from host"). Compiling for wasm64
@@ -192,22 +192,22 @@ turns out too slow for real UI work, which nothing here measured.
 
 ## 3. Where do std and dependencies come from?
 
-For this demo, `core` is compiled from source by ra-jit in the page. Measured: the first
+For this demo, `core` is compiled from source by blaze in the page. Measured: the first
 module has 271 functions: 8 from the demo, 59 non-generic functions of `core`, and 204
 instances of generic ones. One function of `core` that the demo reaches was not compiled
 (`core::fmt::num::imp::_fmt_inner`, integer formatting, reached only through panic
 messages); it becomes an import that throws if called. I did not look into why.
 
 That is a narrow slice. Formatting, `alloc`, collections and `std` were not attempted in
-wasm, so I cannot say how much of them ra-jit's codegen handles on this target. Natively
-ra-jit leans on rustc's copies for what it cannot compile; in the browser there is no such
+wasm, so I cannot say how much of them blaze's codegen handles on this target. Natively
+blaze leans on rustc's copies for what it cannot compile; in the browser there is no such
 fallback, so a function that fails to compile is simply missing.
 
 The other route is to ship `core`, `alloc`, `std` and dependencies as wasm built by rustc
 ahead of time, and link the program against them in the page. Inferred, not tried: the
-linker here is about 500 lines because it only handles objects that ra-jit wrote; linking
+linker here is about 500 lines because it only handles objects that blaze wrote; linking
 rustc's wasm objects means reading the wasm object format and its relocations, and agreeing
-on an ABI. rustc targets wasm32 by default while this spike is wasm64, and ra-jit's "every
+on an ABI. rustc targets wasm32 by default while this spike is wasm64, and blaze's "every
 call through the table" convention has to meet rustc's direct calls. A wasm build of
 `wasm-ld` would do the format work but not the hot-swap part.
 
@@ -224,7 +224,7 @@ b. MIR for that program, produced in wasm;
 c. its functions run in the page as emitted wasm;
 d. an edit recompiles only what changed and swaps it in without a reload.
 
-The demo (now `crates/ra-jit-wasm/web/demos/balls.rs`) is `#![no_std]`: bouncing balls drawn through
+The demo (now `crates/blaze-wasm/web/demos/balls.rs`) is `#![no_std]`: bouncing balls drawn through
 four functions the page provides (`fill`, `rect`, `circle`, `text`). It uses a trait, an
 `impl`, slices, iterators, `f64::clamp`, tuples, `match`, overflow checks and a
 `static mut`. It is not web-sys and not a UI framework; both need `alloc`, `std` and proc
@@ -240,7 +240,7 @@ Compiler and sources (measured, sizes in bytes):
 
 | | raw | gzip -9 | brotli q9 |
 |-|-|-|-|
-| `ra_jit_wasm.wasm` | 23,566,999 | 4,543,855 | 3,403,701 |
+| `blaze_wasm.wasm` | 23,566,999 | 4,543,855 | 3,403,701 |
 | `core.bundle` | 7,003,958 | 1,354,134 | 1,053,260 |
 
 The compiler is a plain `--release` build. No `wasm-opt`, no `opt-level = "z"`, no LTO.
@@ -320,8 +320,8 @@ the dependencies are not compiled in the page. They come from rustc.
 
 **The host module.** `web/dioxus` is a cargo workspace with two crates: `app`, the counter
 the editor shows, and `playground`, the page itself (section 7), a staticlib that depends
-on Dioxus and exports `ra_jit_launch(app)`, which takes the table slot of the program's
-`App`, and `ra_jit_rerender()`. `build-dioxus.sh` builds `playground` with rustc and links
+on Dioxus and exports `blaze_launch(app)`, which takes the table slot of the program's
+`App`, and `blaze_rerender()`. `build-dioxus.sh` builds `playground` with rustc and links
 it with `rust-lld` itself, with `--whole-archive --export-all --no-gc-sections
 --export-table --growable-table` and an exported `__stack_pointer`, then runs
 `wasm-bindgen --keep-lld-exports` over it. This is the same shape as the fat module
@@ -330,21 +330,21 @@ subsecond builds for web hot-patching. Measured: 15.9 MB of wasm, 16,381 functio
 Until the playground became the host, the host was a crate of its own with only Dioxus in
 it, 7.3 MB.
 
-**The workspace.** ra-jit in the page still has to analyse everything the app's types come
-from. `ra-jit-wasm pack` loads the cargo workspace natively and writes one file with the
+**The workspace.** blaze in the page still has to analyse everything the app's types come
+from. `blaze-wasm pack` loads the cargo workspace natively and writes one file with the
 sources of all 206 crates (3,392 files, `std` included), the crate graph, and every proc
 macro expansion rust-analyzer made while analysing the app (652 of them). Measured: 74 MB
 as JSON, not compressed. In the page, name resolution over it takes 8 to 12 s and type
 inference of the app 3 to 6 s, and the compiler's memory is about 1 GiB.
 
-**The link.** ra-jit compiles the functions of `app` and the generic instances they need.
+**The link.** blaze compiles the functions of `app` and the generic instances they need.
 Everything else it calls resolves against the host module's exports: functions by symbol
 name with the wasm signatures compared (measured: 83 host functions called by the counter,
 no signature differing), statics through exported globals. The patch module is
 instantiated in the host's memory and table, in table slots and memory the page sets aside
 after the host's own. The host only ever reaches the program through function pointers
 (`launch(App)`, event closures), and a function pointer is a table slot, so overwriting a
-slot swaps the function. After a swap the page calls `ra_jit_rerender`, which marks every
+slot swaps the function. After a swap the page calls `blaze_rerender`, which marks every
 scope dirty. No jump table like `subsecond::call` was needed.
 
 Measured in Chrome, one run: first build 2.2 s (1,766 functions, 1.0 MB module); changing
@@ -353,9 +353,9 @@ functions). The count survives every edit. An edit that does not compile leaves 
 app running and fixing it recovers.
 
 **Matching rustc.** The program and the host must agree on layouts, symbol names, the call
-ABI, vtables and `TypeId`s. The last one bit: with the host on stable 1.99 and ra-jit
+ABI, vtables and `TypeId`s. The last one bit: with the host on stable 1.99 and blaze
 reproducing the `TypeId` hashes of an older nightly, Dioxus's `downcast` of an event failed
-and a click panicked. The `ra-jit-spike` branch has since pinned ra-jit to stable 1.99.0 with
+and a click panicked. The `blaze-spike` branch has since pinned blaze to stable 1.99.0 with
 its own copy of `rustc_abi` and fixed the hashing, this branch has that merged, and the
 host is built with 1.99.0 (`web/dioxus/rust-toolchain.toml`). Clicks work.
 
@@ -389,8 +389,8 @@ first needed and kept, so going from the counter to a canvas program and back ke
 counter's state.
 
 The playground is also the module the counter is linked into, so the page has one Dioxus.
-`ra_jit_launch` gets the table slot of the `App` ra-jit compiled, and the playground renders
-it in the output pane as a component of its own VirtualDom; after a swap `ra_jit_rerender`
+`blaze_launch` gets the table slot of the `App` blaze compiled, and the playground renders
+it in the output pane as a component of its own VirtualDom; after a swap `blaze_rerender`
 marks every scope dirty. Checked in Chrome, one run: clicks, an edited heading, a new
 `#[component]` with props, an edit that does not compile and its fix, and going to canvas
 programs and back with the count kept.
@@ -418,7 +418,7 @@ What unifying costs:
   not be built with a reason from MIR lowering or codegen ("not compiled: App: frontend:
   mir: HasErrors"), the old code keeps running, and fixing the error recovers.
 - A panic in the compiler ends it. The compiler is built without unwinding, and native
-  ra-jit relies on catching a panic to find out that an edit took away something the last
+  blaze relies on catching a panic to find out that an edit took away something the last
   build knew. Here a build that finds a function gone is a full build instead of a patch,
   which covers deleting or renaming a function. Other ways of invalidating what the last
   build held (I did not find one) would trap, and the page then needs a reload.
@@ -431,7 +431,7 @@ What unifying costs:
 - Layout changes to live data are not handled.
 - Hooks are not tracked. Adding or reordering hooks in a running component is whatever
   Dioxus does with a hook list that no longer matches.
-- Tests: `ra-jit-wasm` has unit tests for the macros only, and `check.mjs` covers the canvas
+- Tests: `blaze-wasm` has unit tests for the macros only, and `check.mjs` covers the canvas
   programs. The linker, the Dioxus demo and the playground are only tested by hand, in
   Chrome. With the `wasm` feature on, `hir-ty` has dead-code warnings for the native emit
   path.

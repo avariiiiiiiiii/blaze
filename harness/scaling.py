@@ -17,16 +17,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["BLAZE_STATS"] = "1"
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs
+from difftest import Fixture, BLAZE, sysroot_rlibs
 
-MARK = "ra-jit-scaling-edit"
+MARK = "blaze-scaling-edit"
 MAIN = re.compile(r"fn main\(\)[^{;]*\{\n")
-NEW_FN = "\nfn ra_jit_new_item(x: u32) -> u32 { x + 1 }\n"
+NEW_FN = "\nfn blaze_new_item(x: u32) -> u32 { x + 1 }\n"
 EDITS = [
     ("blank line at top", lambda t: "\n" + t),
     ("comment appended", lambda t: t + "// edit\n"),
     ("new private fn", lambda t: t + NEW_FN),
-    ("body: unused let", lambda t: MAIN.sub(lambda m: m[0] + "let _ra_jit_edit = 1u32;\n", t, 1)),
+    ("body: unused let", lambda t: MAIN.sub(lambda m: m[0] + "let _blaze_edit = 1u32;\n", t, 1)),
     ("body: println", lambda t: MAIN.sub(lambda m: m[0] + f'println!("{MARK}");\n', t, 1)),
 ]
 # The first function in a file that is written plainly: an edit to its body is seen by nothing else.
@@ -34,7 +34,7 @@ PLAIN_FN = re.compile(r"^ *(?:pub(?:\([a-z]+\))? )?fn \w+\([^)]*\)[^{;]*\{\n", r
 ELSEWHERE = [
     ("comment appended", lambda t: t + "// edit\n"),
     ("new private fn", lambda t: t + NEW_FN),
-    ("body: unused let", lambda t: PLAIN_FN.sub(lambda m: m[0] + "let _ra_jit_edit = 1u32;\n", t, 1)),
+    ("body: unused let", lambda t: PLAIN_FN.sub(lambda m: m[0] + "let _blaze_edit = 1u32;\n", t, 1)),
 ]
 BUILD = re.compile(
     r"edit \(apply (\S+)\): compiled (\d+) of (\d+) fns \(\+(\d+) instances\) in (\S+) .*\n(?:  .*\n)*"
@@ -56,14 +56,14 @@ def measure(name, spec, repeat):
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     link = list(fx.link_args)
-    obj, patch, binary = (os.path.join(fx.work, n) for n in ("ra-jit.o", "ra-jit.patch.o", "bin-ra-jit"))
-    link = linkline.ahead(link, [patch, obj], RA_JIT)
+    obj, patch, binary = (os.path.join(fx.work, n) for n in ("blaze.o", "blaze.patch.o", "bin-blaze"))
+    link = linkline.ahead(link, [patch, obj], BLAZE)
     link[link.index("-o") + 1] = binary
     if (ld := os.environ.get("SCALING_LD")) and "-fuse-ld=lld" in link:
         link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
         link[link.index("-fuse-ld=lld")] = "-B" + ld
-    # SCALING_SYNC: each build is asked for once the file is written, as `ra-jit sync` does.
-    socket = os.path.join(fx.work, "ra-jit.sock") if os.environ.get("SCALING_SYNC") else None
+    # SCALING_SYNC: each build is asked for once the file is written, as `blaze sync` does.
+    socket = os.path.join(fx.work, "blaze.sock") if os.environ.get("SCALING_SYNC") else None
     trigger = ["--socket", socket] if socket else ["--watch"]
     # SCALING_SPLICE: edits are added to the linked binary where that can be done.
     splice = ["--splice", binary] if os.environ.get("SCALING_SPLICE") else []
@@ -71,7 +71,7 @@ def measure(name, spec, repeat):
     out, log = open(log_path, "a"), open(log_path)
     start = time.time()
     daemon = subprocess.Popen(
-        [RA_JIT, os.path.dirname(fx.touch) if fixture else fx.ws, *[x for c in crates for x in ("--crate", c)],
+        [BLAZE, os.path.dirname(fx.touch) if fixture else fx.ws, *[x for c in crates for x in ("--crate", c)],
          "--out", obj, *trigger, "--patch", patch, "--link-cmd", shlex.join(link), *splice, *symbols],
         stderr=out, stdout=out)
 
@@ -109,8 +109,8 @@ def measure(name, spec, repeat):
             if nth >= len(spots[path]):
                 continue
             # Earlier edits to the file sit above this one or below it: count those above.
-            at = spots[path][nth] + sum(len(f"let _ra_jit_edit = {j}u32;\n") for j in range(k) if others[j % len(others)] == path and j // len(others) < nth)
-            new = now[path][:at] + f"let _ra_jit_edit = {k}u32;\n" + now[path][at:]
+            at = spots[path][nth] + sum(len(f"let _blaze_edit = {j}u32;\n") for j in range(k) if others[j % len(others)] == path and j // len(others) < nth)
+            new = now[path][:at] + f"let _blaze_edit = {k}u32;\n" + now[path][at:]
             jobs.append((f"kept body edit {k}", path, {path: (new, now[path])}))
             now[path] = new
         repeat = 1
@@ -131,7 +131,7 @@ def measure(name, spec, repeat):
                     for path, texts_ in writes.items():
                         open(path, "w").write(texts_[revert])
                     if socket:
-                        reply = subprocess.check_output([RA_JIT, os.environ.get("SCALING_REQUEST", "sync"), socket], text=True)
+                        reply = subprocess.check_output([BLAZE, os.environ.get("SCALING_REQUEST", "sync"), socket], text=True)
                         assert reply.startswith(("ok patch=" + patch, "ok object=" + obj)), reply
                     found = wait(BUILD.pattern, done)
                     done = len(found)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """norustc.py: how many times rustc and rustdoc run in each scenario of a small workspace built
-with `cargo ra-jit`, against the counts recorded in norustc/baseline.json. A count above its
-baseline fails: ra-jit is to run no rustc, and a change may only lower the counts
+with `blaze`, against the counts recorded in norustc/baseline.json. A count above its
+baseline fails: blaze is to run no rustc, and a change may only lower the counts
 (docs/no-rustc.md).
 
     norustc.py [--record] [--keep]
@@ -16,14 +16,14 @@ daemon does after a command is counted with it.
 
 --record writes this platform's and backend's counts into the baseline, after a change that
 lowered them. Where a count differs from run to run (cargo's own cache of what rustc answered
-is raced by the cargos ra-jit runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
+is raced by the cargos blaze runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
 scripts.
 """
 import json, os, platform, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 FIXTURE = os.path.join(HERE, "norustc", "fixture")
 BASELINE = os.path.join(HERE, "norustc", "baseline.json")
@@ -43,7 +43,7 @@ exec {real} "$@"
 """
 
 MAIN, LIB = "src/main.rs", "word/src/lib.rs"
-# The scenarios, each a list of (step, cargo ra-jit arguments, edits, whether to wait for the
+# The scenarios, each a list of (step, blaze arguments, edits, whether to wait for the
 # daemon to be ready). An edit is (file, old, new), or (file, None, text to add).
 SCENARIOS = [
     ("cold build", [("cold", ["build"], [], True)]),
@@ -160,10 +160,10 @@ def main():
     record, keep = "--record" in sys.argv, "--keep" in sys.argv
     # Under /tmp on macOS: the daemon's socket is in BLAZE_HOME below, and under $TMPDIR
     # (/var/folders/...) its path passes the 104 bytes macOS has for one.
-    work = tempfile.mkdtemp(prefix="ra-jit-norustc-", dir="/tmp" if sys.platform == "darwin" else None)
+    work = tempfile.mkdtemp(prefix="blaze-norustc-", dir="/tmp" if sys.platform == "darwin" else None)
     log = os.path.join(work, "runs.log")
     open(log, "w").close()
-    name = f"ra-jit-norustc-{os.getpid()}"
+    name = f"blaze-norustc-{os.getpid()}"
     toolchain = counted_toolchain(work, log)
     run(["rustup", "toolchain", "link", name, toolchain], check=True)
     ws = os.path.join(work, "ws")
@@ -179,7 +179,7 @@ def main():
     for key in [k for k in env if k.endswith("RUSTFLAGS")]:
         del env[key]
     env.update(RUSTUP_TOOLCHAIN=name, BLAZE_HOME=home, BLAZE_CACHE=os.path.join(work, "store"),
-               PATH=os.path.dirname(os.path.abspath(RA_JIT)) + os.pathsep + env["PATH"],
+               PATH=os.path.dirname(os.path.abspath(BLAZE)) + os.pathsep + env["PATH"],
                CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", CARGO_NET_OFFLINE="true")
     if os.environ.get("BLAZE_BACKEND"):
         env["BLAZE_BACKEND"] = os.environ["BLAZE_BACKEND"]
@@ -189,10 +189,10 @@ def main():
             began = len(open(log).read().splitlines())
             for step, args, edits, wait in steps:
                 apply(ws, edits)
-                ran = run(["cargo", "ra-jit", *args], cwd=ws, env=env, timeout=1200)
+                ran = run(["blaze", *args], cwd=ws, env=env, timeout=1200)
                 if wait and ran.returncode == 0:
                     for _ in range(600):
-                        status = run(["cargo", "ra-jit", "status"], cwd=ws, env=env).stdout
+                        status = run(["blaze", "status"], cwd=ws, env=env).stdout
                         if ": ready" in status:
                             break
                         time.sleep(1)
@@ -209,7 +209,7 @@ def main():
             print(f"{scenario}: rustc {runs['rustc']} ({questions} only asking), rustdoc {runs['rustdoc']}, "
                   f"cargo {runs['cargo']}", flush=True)
     finally:
-        run(["cargo", "ra-jit", "stop"], cwd=ws, env=env)
+        run(["blaze", "stop"], cwd=ws, env=env)
         run(["rustup", "toolchain", "uninstall", name])
     baseline = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
     recorded = baseline.get(PLACE)
@@ -240,7 +240,7 @@ def main():
     for line in failed:
         print(f"FAILED: {line}")
     if risen and not record:
-        print("ra-jit runs rustc more than it did: docs/no-rustc.md says why that is refused")
+        print("blaze runs rustc more than it did: docs/no-rustc.md says why that is refused")
         sys.exit(1)
     if failed:
         print("the fixture's doctests failed: they pass under rustdoc")

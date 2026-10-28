@@ -1,5 +1,5 @@
 //! Generated: each function of `core::arch::aarch64`'s SVE and SVE2 whose LLVM intrinsics
-//! ra-jit has a stub of, called with fixed inputs (edge values, partial predicates, each end
+//! blaze has a stub of, called with fixed inputs (edge values, partial predicates, each end
 //! of an immediate's range), each result hashed over the whole vector length. A machine
 //! without one of the extensions prints that it has not.
 

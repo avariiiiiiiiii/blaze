@@ -1,10 +1,10 @@
 # What the corpus's build scripts would be denied (2026-10-27, lane bscache)
 
 `README.md` and `denied.json` are `harness/bscache.py report` over the records `record` collected
-on one arm64 ix VM (16 cpus, 16 GB), ra-jit at 4e3510c84d, with every script run by
-`ra-jit build-script` in the sandbox of main (machine read-only, OUT_DIR writable, no network,
+on one arm64 ix VM (16 cpus, 16 GB), blaze at 4e3510c84d, with every script run by
+`blaze-engine build-script` in the sandbox of main (machine read-only, OUT_DIR writable, no network,
 reads recorded). The run per project is `cargo check -Zunstable-options --compile-time-deps
---workspace --all-targets` through `ra-jit-rustc`, in `nix develop .#bench` (`.#bench-zed` with
+--workspace --all-targets` through `blaze-rustc`, in `nix develop .#bench` (`.#bench-zed` with
 nixpkgs' lld on PATH for zed, whose `.cargo/config.toml` links aarch64 with `-fuse-ld=lld`).
 
 590 scripts ran; 573 reached nothing a hermetic sandbox would deny. No script reached the

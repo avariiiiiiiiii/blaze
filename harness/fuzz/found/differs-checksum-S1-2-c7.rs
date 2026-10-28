@@ -4,7 +4,7 @@
 // rustc:
 // panic: panicked at src/main.rs:362:9
 // c7 d39e62595e590c78 ok
-// ra-jit:
+// blaze:
 // panic: panicked at src/main.rs:362:9
 // c7 6209e2595e58e1d6 ok
 mod c7 {

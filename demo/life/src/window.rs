@@ -1,5 +1,5 @@
 //! The window: a readout at the top, the running Game of Life on the left with its tiers under
-//! it, and the editor on the right, in the Islands Dark theme. ra-jit-live applies each patch
+//! it, and the editor on the right, in the Islands Dark theme. blaze-live applies each patch
 //! on a thread of its own the moment it arrives; the next step of the simulation runs the new
 //! rules from main.rs.
 
@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use ra_jit_live::{Live, Outcome};
+use blaze_live::{Live, Outcome};
 
 use crate::editor::{self, Editor};
 use crate::theme::{self, Theme};
@@ -101,7 +101,7 @@ impl App {
                     // Where the time of this one edit went, adding up to it: waiting in the
                     // editor for the edit before to be answered, the daemon's build and the
                     // patch's way here, and the program's wait for its apply thread and the
-                    // apply (what ra-jit-live's line says too).
+                    // apply (what blaze-live's line says too).
                     let mut parts = vec![format!("in the editor {:.1} ms", ms(queued))];
                     if let Some((took, waited)) = self.apply {
                         let daemon = total.saturating_sub(queued + waited + took);
@@ -383,11 +383,11 @@ pub fn run(life: Life) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(theme::ISLANDS_DARK.metrics.window_size)
-            .with_title("ra-jit: Game of Life, live"),
+            .with_title("blaze: Game of Life, live"),
         ..Default::default()
     };
     eframe::run_native(
-        "ra-jit life",
+        "blaze life",
         options,
         Box::new(move |creation| {
             let ctx = creation.egui_ctx.clone();

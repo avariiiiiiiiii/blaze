@@ -1,4 +1,4 @@
-# A long differential fuzz run every night: generated programs built by rustc and by ra-jit
+# A long differential fuzz run every night: generated programs built by rustc and by blaze
 # under both producers, outputs compared. The seed is the run number, so every night covers
 # new programs and a failing night can be repeated with `fuzz.py run --seed N`.
 name: fuzz
@@ -27,11 +27,11 @@ jobs:
         with:
           llvm: build
       - uses: Swatinem/rust-cache@v2
-      - run: nix develop --command cargo build -p ra-jit --release --features llvm --locked
+      - run: nix develop --command cargo build -p blaze-engine --release --features llvm --locked
       - name: Fuzz
         working-directory: harness
         run: |
-          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
+          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine"
           python3 fuzz/fuzz.py run --seed "${{ inputs.seed || github.run_number }}" \
             --rounds "${{ inputs.rounds || '200' }}" --backends cranelift,llvm \
             --out "$RUNNER_TEMP/fuzz-out" || status=$?

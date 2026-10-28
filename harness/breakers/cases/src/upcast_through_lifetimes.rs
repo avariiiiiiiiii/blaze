@@ -1,6 +1,6 @@
 //! tests/ui/traits/trait-upcasting/multiple-supertraits-modulo-binder.rs and
 //! regions/regions-early-bound-trait-param.rs: a trait object is coerced to one of a supertrait
-//! that the vtable names with other lifetimes, or through an associated type. ra-jit compared
+//! that the vtable names with other lifetimes, or through an associated type. blaze compared
 //! the two spellings as written, found no supertrait and refused the function.
 
 trait Get<T> {

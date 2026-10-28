@@ -6,6 +6,6 @@
     "dep"
   ],
   "cargo": [],
-  "ra-jit": [],
+  "blaze": [],
   "expect": "supported"
 }

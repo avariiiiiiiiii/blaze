@@ -5,11 +5,11 @@ what a build costs on a fresh machine whose only warm thing is the remote (#41).
 
 A fresh CI machine has the checkout and the remote and nothing else: no home, no store, no
 target directory, no daemon. So:
-  seed     a checkout with an empty store and the remote: `cargo ra-jit build`, the wait until
-           ready, and `cargo ra-jit stop`, which pushes what it compiled to the remote
+  seed     a checkout with an empty store and the remote: `blaze build`, the wait until
+           ready, and `blaze stop`, which pushes what it compiled to the remote
   fresh-E  for each edit E (`none` first): the checkout copied again to the same path, with E
            written before anything runs, a home and a store of its own, empty, and the remote.
-           Its `cargo ra-jit build` is the time to a built program, the wait after it the time
+           Its `blaze build` is the time to a built program, the wait after it the time
            to ready.
 For each step: the command's seconds, the wait until ready, the most memory held, what the
 worker compiled and took from the store, its steps (load, resolve, compile, link) and the
@@ -17,24 +17,24 @@ threads' time per step (inference, MIR, monomorphization, translation). What eac
 is in `WORK/said-STEP.txt`. With a program to run, its output is checked against the seed's.
 
 PROJECT is one of bench.py's, fetched as it fetches them, or `blaze`: the tree at `--source`
-(blaze's own checkout), built `-p ra-jit --release`. Writes the steps as JSON on stdout's last
+(blaze's own checkout), built `-p blaze-engine --release`. Writes the steps as JSON on stdout's last
 line.
 """
 import json, os, re, shutil, sys, time
 
-import bench, cargo_ra_jit, memory
-from cargo_ra_jit import Side, fetch, program_output, wait_warm
+import bench, blaze_cli, memory
+from blaze_cli import Side, fetch, program_output, wait_warm
 
 BLAZE = dict(
-    build=["-p", "ra-jit", "--release"],
+    build=["-p", "blaze-engine", "--release"],
     run=["--version"],
-    run_bin="ra-jit",
+    run_bin="blaze",
     edits=dict(
         # Low in the graph: hir-def is under hir-ty, hir, the code generator and the daemon.
         body=bench.body("crates/hir-def/src/lib.rs", "    pub fn is_block_module(self, db: &dyn SourceDatabase) -> bool {"),
         # The daemon's own crate, which nothing in the checkout depends on.
-        top=bench.body("crates/ra-jit/src/content.rs", "fn of(&self, krate: Crate) -> std::sync::Arc<OnceLock<Option<ContentId>>> {"),
-        signature=[("crates/ra-jit-store/src/lib.rs", "pub fn parse_size(text: &str) -> Option<u64> {",
+        top=bench.body("crates/blaze-engine/src/content.rs", "fn of(&self, krate: Crate) -> std::sync::Arc<OnceLock<Option<ContentId>>> {"),
+        signature=[("crates/blaze-store/src/lib.rs", "pub fn parse_size(text: &str) -> Option<u64> {",
                     "pub fn parse_size(text: &str, _bench_edit: ()) -> Option<u64> {"),
                    ("crates/**/*.rs", "parse_size(&text)", "parse_size(&text, ())")],
     ),
@@ -76,7 +76,7 @@ def main():
         # One home at one path too, emptied: the machine has nothing of the one before.
         home = os.path.join(work, "home")
         shutil.rmtree(home, ignore_errors=True)
-        env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), **extra_env)
+        env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
         if label != "seed":
             env.update(fresh_env)
         env.update(BLAZE_CACHE=os.path.join(home, "store"), BLAZE_STATS="1")
@@ -84,10 +84,10 @@ def main():
         return Side(ws, env, True)
 
     def cache(side, command):
-        """`ra-jit cache push|pull REMOTE`, as CI runs it around a build, timed."""
+        """`blaze-engine cache push|pull REMOTE`, as CI runs it around a build, timed."""
         # The seed pushes unsigned: what signing costs is the remote's (rcache), not this.
         env = dict(side.env, BLAZE_REMOTE_UNSIGNED="1")
-        took, ran, _ = memory.run([cargo_ra_jit.RA_JIT, "cache", command, remote], side.ws, env, 3600)
+        took, ran, _ = memory.run([blaze_cli.BLAZE, "cache", command, remote], side.ws, env, 3600)
         assert ran.returncode == 0, f"cache {command}: {ran.stderr[-3000:]}"
         return round(took, 3), ran.stderr.strip().splitlines()[-3:]
 
@@ -133,7 +133,7 @@ def main():
                    phases=re.findall(r"^phases: (.*)$", said, re.M), store=from_store(said),
                    manifest=re.findall(r"^manifest: (.*)$", said, re.M), pull=pulled)
         row["output"] = output(side)
-        whole = os.path.join(side.ws, "target", "ra-jit", "whole")
+        whole = os.path.join(side.ws, "target", "blaze", "whole")
         if os.path.isdir(whole):
             shutil.copytree(whole, os.path.join(work, f"whole-{label}"), dirs_exist_ok=True)
         stopped(side, daemon)

@@ -1,5 +1,5 @@
 //! A function whose only generic parameters are lifetimes is one function in rustc's build,
-//! and ra-jit compiled a copy of its own for every call instead of calling rustc's.
+//! and blaze compiled a copy of its own for every call instead of calling rustc's.
 //! `DebugTuple<'a, 'b>::field` and `DebugList::entry` are such, so printing a nested value
 //! went through seventeen unoptimised frames a level where rustc's build has seven, and
 //! simd-json's `limit_fits_in_a_default_thread_stack` (1024 levels in 2 MiB) overflowed.

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """borrowck_speed.py: how long the borrow checker takes, next to type inference, on real code.
 
-usage: borrowck_speed.py [NAME...] [--bin ra-jit] [--apps-dir dir] [--modes polonius,nll]
+usage: borrowck_speed.py [NAME...] [--bin blaze-engine] [--apps-dir dir] [--modes polonius,nll]
                          [--jobs N] [--json out.json] [--md out.md] [--top 20]
 
-Runs `ra-jit borrowck --project WS --timings OUT` on each app (those of apps/apps.json, the
+Runs `blaze-engine borrowck --project WS --timings OUT` on each app (those of apps/apps.json, the
 harness's corpus, and EXTRA below), which checks every body in both modes, and reports for each:
 the bodies, type inference's total, the checker's total with and without MIR lowering, the
 checker's time per body (p50, p99, max), where it goes by phase, and the slowest bodies with
@@ -213,7 +213,7 @@ def markdown(results, modes, top):
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
-    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "blaze-engine"))
     ap.add_argument("--apps-dir", default=os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps"))
     ap.add_argument("--work", default=os.path.join(HERE, "vendor", "borrowck-speed"))
     ap.add_argument("--modes", default="polonius,nll")

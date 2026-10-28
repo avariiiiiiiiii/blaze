@@ -1,5 +1,5 @@
 //! A program whose C calls back into it: what cargo links for the stand-ins of a build with
-//! every crate ra-jit's has none of the functions the C calls.
+//! every crate blaze's has none of the functions the C calls.
 
 unsafe extern "C" {
     fn nativecalls_iterate(seed: u64, rounds: u64) -> u64;

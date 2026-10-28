@@ -1,5 +1,5 @@
 //! `Literal::i8_unsuffixed(-1)` is one token `-1`, which the compiler reads as a minus and a
-//! number. ra-jit read it as a number it could not parse, and num_enum's alternative `-1`
+//! number. blaze read it as a number it could not parse, and num_enum's alternative `-1`
 //! matched nothing.
 
 #[test]

@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L1-12-c3.rs`): when the temporaries of
 //! the tail of an `if` branch are dropped. Before the 2024 edition the temporaries of a
 //! block's tail live as long as those of the expression the block is in, but a branch of an
-//! `if` ends them: rustc drops them where the branch ends. ra-jit kept them to the end of the
+//! `if` ends them: rustc drops them where the branch ends. blaze kept them to the end of the
 //! statement the `if` was in.
 
 use std::cell::RefCell;

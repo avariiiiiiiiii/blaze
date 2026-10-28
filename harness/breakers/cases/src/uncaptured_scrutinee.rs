@@ -1,6 +1,6 @@
 //! Found by the fuzzer (`fuzz/found/left-mir-unresolvedupvar-L2-1-c27.rs`): a closure that
 //! matches on a field of a variable with patterns that bind nothing, and uses another field
-//! of it. What is matched on is not read, so the closure does not capture it, and ra-jit
+//! of it. What is matched on is not read, so the closure does not capture it, and blaze
 //! found no capture for the place: the closure's caller was left to rustc.
 
 use std::cell::RefCell;

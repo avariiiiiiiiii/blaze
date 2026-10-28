@@ -15,7 +15,7 @@
 // panic: panicked at src/main.rs:362:9
 // panic: panicked at src/main.rs:362:9
 // c5 a6495cd75f834ebc ok
-// ra-jit:
+// blaze:
 // panic: panicked at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library/core/src/num/mod.rs:1290:5:
 // attempt to exponentiate with overflow
 // panic: panicked at src/main.rs:362:9

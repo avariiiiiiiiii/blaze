@@ -24,7 +24,7 @@
   "runbench": {
     "builds": [
       "release",
-      "ra-jit"
+      "blaze"
     ],
     "variants": {},
     "programs": {
@@ -36,10 +36,10 @@
             "build_largest_mb": 4741,
             "size_mb": 103.09
           },
-          "ra-jit": {
+          "blaze": {
             "build_s": 983.1,
             "cargo_s": 18.8,
-            "ra_jit_s": 962.9,
+            "blaze_s": 962.9,
             "link_s": 1.4,
             "compiled": 62031,
             "left": 0,
@@ -64,7 +64,7 @@
               "peak_mb": 43,
               "peak_max_mb": 43
             },
-            "ra-jit": {
+            "blaze": {
               "median_s": 0.4154,
               "ratio": 1.249,
               "runs": [
@@ -83,7 +83,7 @@
     },
     "geomean": {
       "release": 1.0,
-      "ra-jit": 1.249
+      "blaze": 1.249
     }
   }
 }

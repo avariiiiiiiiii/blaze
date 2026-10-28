@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepares $NR_ROOT (default ~/no-rustc) on a Linux dev host for count.py: ra-jit at a
+# Prepares $NR_ROOT (default ~/no-rustc) on a Linux dev host for count.py: blaze at a
 # commit, built with the real toolchain, and a copy of the pinned nightly (harness/toolchain)
 # whose rustc, rustdoc and cargo log every run (wrap.sh), linked as the rustup toolchain nr-pin.
 # Remove with `rustup toolchain uninstall nr-pin` and rm -rf.
@@ -32,5 +32,5 @@ counted "$TC-x86_64-unknown-linux-gnu" pin
 ls "$L/tc-pin/lib/rustlib/src/rust/library" >/dev/null
 
 cd "$L/src"
-CARGO_TARGET_DIR=$L/target "${pin[@]}" cargo "+$TC" build -p ra-jit --release --bins 2>&1 | tail -3
-ls "$L/target/release/ra-jit"
+CARGO_TARGET_DIR=$L/target "${pin[@]}" cargo "+$TC" build -p blaze-engine --release --bins 2>&1 | tail -3
+ls "$L/target/release/blaze-engine"

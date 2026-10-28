@@ -28,10 +28,10 @@ use super::{
 mod aarch64;
 
 /// The name of the function in the text of a [`Wrapper`].
-const SYMBOL: &str = "ra_jit_asm_block";
+const SYMBOL: &str = "blaze_asm_block";
 
 /// What the name of an [`Operand::Sym`] starts with.
-const SYM: &str = "ra_jit_sym_";
+const SYM: &str = "blaze_sym_";
 
 /// A function of one instruction that Cranelift does not have: `xgetbv` reads the extended
 /// control register its argument numbers.
@@ -527,12 +527,12 @@ fn sym(index: usize) -> String {
 
 /// The name in a [`Wrapper`] of the label that is operand `index`.
 fn label(format: ObjectFormat, index: usize) -> String {
-    format!("{}ra_jit_label_{index}", format.local_label())
+    format!("{}blaze_label_{index}", format.local_label())
 }
 
 /// The name in a [`Wrapper`] of where every way out of the block meets.
 fn done(format: ObjectFormat) -> String {
-    format!("{}ra_jit_done", format.local_label())
+    format!("{}blaze_done", format.local_label())
 }
 
 /// The labels among the operands, by index.
@@ -1303,7 +1303,7 @@ impl Assembled {
 pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, String> {
     static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<Assembled>>>> = OnceLock::new();
     let mut hasher = Sha256::new();
-    hasher.update(b"ra-jit asm 3");
+    hasher.update(b"blaze asm 3");
     hasher.update(triple);
     hasher.update([0]);
     hasher.update(text);
@@ -1337,7 +1337,7 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, Strin
 enum Assembler {
     /// The platform's C compiler, run as a process: clang, or a `cc` for the host.
     Cc,
-    /// LLVM's, in this process, when ra-jit is built with LLVM.
+    /// LLVM's, in this process, when blaze is built with LLVM.
     #[cfg(feature = "llvm")]
     Llvm,
 }
@@ -1425,7 +1425,7 @@ fn c_compiler(triple: &str) -> Option<(PathBuf, Vec<String>)> {
     Some((find("cc").filter(|_| host)?, Vec::new()))
 }
 
-/// Why a block for `triple` is not assembled by a build of ra-jit without LLVM, and what to
+/// Why a block for `triple` is not assembled by a build of blaze without LLVM, and what to
 /// install that would.
 fn no_assembler(triple: &str) -> String {
     let host = triple.starts_with(std::env::consts::ARCH)
@@ -1445,7 +1445,7 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name: String =
         key[..8].iter().map(|it| format!("{it:02x}")).chain([format!("-{run}.o")]).collect();
-    let dir = std::env::temp_dir().join(format!("ra-jit-asm-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("blaze-asm-{}", std::process::id()));
     let failed = |what: &str, e: &dyn std::fmt::Display| format!("inline assembly: {what}: {e}");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Some(Err(failed("no directory to assemble in", &e)));

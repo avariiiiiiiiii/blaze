@@ -13,7 +13,7 @@ import os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import RUNNER, TARGET, profile_dir
-RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(HERE, "..", "target", "release", "ra-jit")
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(HERE, "..", "target", "release", "blaze-engine")
 LOCAL = ["app", "near"]
 
 def write(path, text):
@@ -45,7 +45,7 @@ def cargo(root):
 PROFILES = [("target/debug", "it")] + ([(profile_dir("target"), "it-" + TARGET)] if TARGET else [])
 
 class Said:
-    """What `ra-jit deps` said for each directory of the profile."""
+    """What `blaze-engine deps` said for each directory of the profile."""
     def __init__(self, outs):
         self.returncode = max(out.returncode for out in outs)
         self.stdout, self.stderr = ("".join(getattr(out, it) for out in outs) for it in ("stdout", "stderr"))
@@ -57,8 +57,8 @@ class Said:
 UNSIGNED = {**os.environ, "BLAZE_REMOTE_UNSIGNED": "1"}
 ASKED_FOR_NOTHING = {name: value for name, value in os.environ.items() if name != "BLAZE_REMOTE_UNSIGNED"}
 
-def ra_jit(root, verb, remote, env=UNSIGNED):
-    return Said([subprocess.run([RA_JIT, "deps", verb, remote, directory, name], cwd=root, capture_output=True, text=True, env=env)
+def blaze(root, verb, remote, env=UNSIGNED):
+    return Said([subprocess.run([BLAZE, "deps", verb, remote, directory, name], cwd=root, capture_output=True, text=True, env=env)
                  for directory, name in PROFILES])
 
 right = total = 0
@@ -68,36 +68,36 @@ def check(what, ok, detail=""):
     print(f"{what:55} {'right' if ok else 'WRONG'} {detail}", flush=True)
 
 def main():
-    top = tempfile.mkdtemp(prefix="ra-jit-deps-")
+    top = tempfile.mkdtemp(prefix="blaze-deps-")
     first, second, third, remote = (f"{top}/{it}" for it in ("first", "deeper/second", "third", "remote"))
     workspace(first)
     _, printed = cargo(first)
     shutil.copytree(first, second, ignore=shutil.ignore_patterns("target"))
     shutil.copytree(first, third, ignore=shutil.ignore_patterns("target"))
 
-    out = ra_jit(first, "push", remote, ASKED_FOR_NOTHING)
+    out = blaze(first, "push", remote, ASKED_FOR_NOTHING)
     check("the units are pushed", out.returncode == 0 and out.something, out.stdout.strip() + out.stderr.strip())
     listed = [line for _, name in PROFILES for line in open(f"{remote}/deps/{name}").read().split("\n")]
     check("none of a crate at a path", not any(re.split(r"[-/](?=[0-9a-f]{16}$)", line)[0] in LOCAL for line in listed))
-    out = ra_jit(first, "push", remote)
+    out = blaze(first, "push", remote)
     check("a second push sends nothing", out.nothing, out.stdout.strip())
 
-    out = ra_jit(second, "pull", remote, ASKED_FOR_NOTHING)
+    out = blaze(second, "pull", remote, ASKED_FOR_NOTHING)
     check("a pull from lists nobody signed is refused unless asked for",
           out.returncode != 0 and "BLAZE_REMOTE_UNSIGNED=1" in out.stderr and not any(os.path.exists(f"{second}/target/debug/{it}") for it in (".fingerprint", "build")),
           out.stderr.strip()[-80:])
-    out = ra_jit(second, "pull", remote)
+    out = blaze(second, "pull", remote)
     check("the units are pulled", out.returncode == 0, out.stdout.strip() + out.stderr.strip())
     said, again = cargo(second)
     check("cargo compiles the local crates only", said.get("Compiling") == set(LOCAL) and not said.get("Dirty"), str(said.get("Compiling")))
     check("and finds the others fresh", len(said.get("Fresh", ())) >= 10, str(len(said.get("Fresh", ()))))
     check("the program prints the same", again == printed and printed, repr(again))
-    out = ra_jit(second, "pull", remote)
+    out = blaze(second, "pull", remote)
     check("a second pull fetches nothing", out.nothing, out.stdout.strip())
 
     unit = sorted(os.listdir(f"{remote}/units"))[0]
     open(f"{remote}/units/{unit}", "ab").write(b"x")
-    out = ra_jit(third, "pull", remote)
+    out = blaze(third, "pull", remote)
     check("an archive that was changed is refused", out.returncode != 0 and f"rejected units/{unit}" in out.stderr
           and "1 of them rejected" in out.stderr, out.stderr.strip()[-80:])
     said, again = cargo(third)

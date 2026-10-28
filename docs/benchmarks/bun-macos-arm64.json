@@ -59,7 +59,7 @@
      "threads_s": {},
      "started_over": [],
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 13684,
        "peak_max_mb": 13684,
        "largest_mb": 11832,
@@ -89,7 +89,7 @@
     },
     "no-op": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 26053,
        "peak_max_mb": 34150,
        "largest_mb": 26014,
@@ -120,7 +120,7 @@
     },
     "body": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 26066,
        "peak_max_mb": 26338,
        "largest_mb": 26035,
@@ -188,7 +188,7 @@
     },
     "signature": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 27742,
        "peak_max_mb": 37616,
        "largest_mb": 27712,
@@ -256,7 +256,7 @@
     },
     "leaf": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 27729,
        "peak_max_mb": 27732,
        "largest_mb": 27699,
@@ -324,7 +324,7 @@
     },
     "generic": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 27741,
        "peak_max_mb": 27744,
        "largest_mb": 27713,
@@ -392,7 +392,7 @@
     },
     "newfn": {
      "memory": {
-      "ra-jit": {
+      "blaze": {
        "peak_mb": 27754,
        "peak_max_mb": 27755,
        "largest_mb": 27720,
@@ -514,7 +514,7 @@
      "-e",
      "const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)"
     ],
-    "ra-jit": {
+    "blaze": {
      "median_s": 1.3255,
      "min_s": 1.0785,
      "max_s": 1.5485,

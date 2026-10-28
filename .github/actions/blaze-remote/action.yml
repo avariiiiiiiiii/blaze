@@ -65,7 +65,7 @@ runs:
         esac
         log="$RUNNER_TEMP/blaze-remote-$MODE.log"
         start=$(date +%s.%N)
-        if ra-jit cache "$MODE" "$REMOTE" "$PROJECT" 2>&1 | tee "$log"; then
+        if blaze-engine cache "$MODE" "$REMOTE" "$PROJECT" 2>&1 | tee "$log"; then
           status=ok
         else
           status=failed

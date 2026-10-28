@@ -2,7 +2,7 @@
 
 A build script runs with no network. One that downloads a prebuilt library is given it instead,
 pinned in `Cargo.fetches.lock` by `blaze lock --fetches` and handed through the crate's own
-variable for a local copy (`crates/ra-jit/src/cargo/fetches.rs`, `OVERRIDES`).
+variable for a local copy (`crates/blaze-engine/src/cargo/fetches.rs`, `OVERRIDES`).
 
 Found by `/root/scan.py` over every build script of the corpus's `Cargo.lock`s (after
 `cargo fetch`; bevy has no `Cargo.lock` upstream and bun's `cargo fetch` fails on its missing

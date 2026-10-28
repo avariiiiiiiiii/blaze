@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""own_new.py: `cargo blaze new` and `cargo blaze init` against cargo's. cargo is the oracle;
+"""own_new.py: `blaze new` and `blaze init` against cargo's. cargo is the oracle;
 blaze never runs it outside this harness.
 
 usage: own_new.py [--blaze BIN] [--out FILE]
 
 Each case of CASES makes the same directory twice, runs `cargo ARGS` in one and `BIN cargo
-ARGS` (BIN: `ra-jit`, default `target/release/ra-jit`) in the other, with a home and a cargo
+ARGS` (BIN: `blaze`, default `target/release/blaze-engine`) in the other, with a home and a cargo
 home of their own, and compares the exit status, what each prints, and every file each leaves
 (a git repository by its `HEAD` and whether it is one). A case is equal or different; the
 first difference of each that is not is printed, `--out` writes them all as JSON, and the exit
@@ -146,7 +146,7 @@ def first_difference(what, a, b):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     opts = ap.parse_args()
     results = []

@@ -3,7 +3,7 @@
 //! The CST includes comments and whitespace, provides a single node type,
 //! `SyntaxNode`, and a basic traversal API (parent, children, siblings).
 //!
-//! The *real* implementation is in the (language-agnostic) `rowan` crate, this
+//! The *real* implementation is in the (language-agnostic) `syntax-tree` crate, this
 //! module just wraps its API.
 
 use std::sync::{
@@ -11,38 +11,38 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use rowan::{GreenNodeBuilder, Language};
+use syntax_tree::{GreenNodeBuilder, Language};
 
 use crate::{Parse, SyntaxError, SyntaxKind, TextSize};
 
-pub(crate) use rowan::{GreenNode, GreenToken, NodeOrToken};
+pub(crate) use syntax_tree::{GreenNode, GreenToken, NodeOrToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RustLanguage {}
 impl Language for RustLanguage {
     type Kind = SyntaxKind;
 
-    fn kind_from_raw(raw: rowan::SyntaxKind) -> SyntaxKind {
+    fn kind_from_raw(raw: syntax_tree::SyntaxKind) -> SyntaxKind {
         SyntaxKind::from(raw.0)
     }
 
-    fn kind_to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
-        rowan::SyntaxKind(kind.into())
+    fn kind_to_raw(kind: SyntaxKind) -> syntax_tree::SyntaxKind {
+        syntax_tree::SyntaxKind(kind.into())
     }
 }
 
-pub type SyntaxNode = rowan::SyntaxNode<RustLanguage>;
-pub type SyntaxToken = rowan::SyntaxToken<RustLanguage>;
-pub type SyntaxElement = rowan::SyntaxElement<RustLanguage>;
-pub type SyntaxNodeChildren = rowan::SyntaxNodeChildren<RustLanguage>;
-pub type SyntaxElementChildren = rowan::SyntaxElementChildren<RustLanguage>;
-pub type PreorderWithTokens = rowan::api::PreorderWithTokens<RustLanguage>;
+pub type SyntaxNode = syntax_tree::SyntaxNode<RustLanguage>;
+pub type SyntaxToken = syntax_tree::SyntaxToken<RustLanguage>;
+pub type SyntaxElement = syntax_tree::SyntaxElement<RustLanguage>;
+pub type SyntaxNodeChildren = syntax_tree::SyntaxNodeChildren<RustLanguage>;
+pub type SyntaxElementChildren = syntax_tree::SyntaxElementChildren<RustLanguage>;
+pub type PreorderWithTokens = syntax_tree::api::PreorderWithTokens<RustLanguage>;
 
 /// The tree of a parse: green, or flat when nobody edits it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tree {
     Green(GreenNode),
-    Flat(Arc<rowan::FlatTree>),
+    Flat(Arc<syntax_tree::FlatTree>),
 }
 
 impl Tree {
@@ -71,7 +71,7 @@ pub fn set_green_trees(green: bool) {
 
 enum Builder {
     Green(GreenNodeBuilder<'static>),
-    Flat(rowan::FlatTreeBuilder),
+    Flat(syntax_tree::FlatTreeBuilder),
 }
 
 pub struct SyntaxTreeBuilder {
@@ -83,7 +83,7 @@ impl Default for SyntaxTreeBuilder {
     fn default() -> SyntaxTreeBuilder {
         let inner = match GREEN_TREES.load(Ordering::Relaxed) {
             true => Builder::Green(GreenNodeBuilder::new()),
-            false => Builder::Flat(rowan::FlatTreeBuilder::new()),
+            false => Builder::Flat(syntax_tree::FlatTreeBuilder::new()),
         };
         SyntaxTreeBuilder { errors: Vec::new(), inner }
     }

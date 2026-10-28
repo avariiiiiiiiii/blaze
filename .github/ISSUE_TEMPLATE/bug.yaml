@@ -1,5 +1,5 @@
 name: Bug
-description: ra-jit built something wrong, crashed, or fell back to cargo when it should not have.
+description: blaze built something wrong, crashed, or fell back to cargo when it should not have.
 labels: ["bug"]
 body:
   - type: textarea
@@ -20,15 +20,15 @@ body:
   - type: input
     id: version
     attributes:
-      label: ra-jit version
-      description: Output of `ra-jit --version` (or the commit you built).
+      label: blaze version
+      description: Output of `blaze-engine --version` (or the commit you built).
     validations:
       required: true
   - type: input
     id: platform
     attributes:
       label: Platform
-      description: OS and architecture, and how you installed ra-jit (nix, release binary, source).
+      description: OS and architecture, and how you installed blaze (nix, release binary, source).
       placeholder: macOS 15, aarch64, nix
     validations:
       required: true
@@ -36,5 +36,5 @@ body:
     id: log
     attributes:
       label: Output
-      description: What ra-jit printed. `cargo ra-jit status` helps when it fell back to cargo.
+      description: What blaze printed. `blaze status` helps when it fell back to cargo.
       render: text

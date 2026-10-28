@@ -1,5 +1,5 @@
-//! What ra-jit emits code for. The target is an input of the process, named by its triple
-//! (`ra-jit --target <triple>`), and the host when nothing names one. Everything in the
+//! What blaze emits code for. The target is an input of the process, named by its triple
+//! (`blaze --target <triple>`), and the host when nothing names one. Everything in the
 //! backend that differs between platforms asks the [`Target`] for the property it depends
 //! on (architecture, object format, calling convention, unwind tables) and never asks what
 //! the daemon itself was built for.

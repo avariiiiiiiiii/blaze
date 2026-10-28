@@ -4,8 +4,8 @@
 # pick the evaluating system's.
 #
 # Why this caches well: a unit's derivation inputs are its own sources, its profile and features,
-# and the store paths of the units it depends on. Nothing else. Editing ra-jit's own sources changes
-# only the ra-jit unit; every registry crate and every front-end crate keeps its store
+# and the store paths of the units it depends on. Nothing else. Editing blaze's own sources changes
+# only the blaze unit; every registry crate and every front-end crate keeps its store
 # path and is a cache hit on any machine that has built or substituted it.
 #
 # Native builds only: host units (platform null in the graph) and target units are the same machine,
@@ -37,7 +37,7 @@ let
 
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that
   # editing anything else in the repo does not change the unit.
-  # crates/ra-jit include_str!s harness/toolchain.
+  # crates/blaze-engine include_str!s harness/toolchain.
   pathSource = p:
     let d = p.source.dir; in
     "${lib.fileset.toSource {
@@ -117,8 +117,8 @@ let
     // lib.optionalAttrs (u.kind == "bin") { CARGO_BIN_NAME = u.target; }
     // lib.optionalAttrs (builtins.elem i checked.roots || u.pkg == (U (builtins.head checked.roots)).pkg) { CARGO_PRIMARY_PACKAGE = "1"; }
     // lib.optionalAttrs (p.links != null) { CARGO_MANIFEST_LINKS = p.links; }
-    # `ra-jit --version` and the daemon's log name the commit, as the flake's `daemon` does.
-    // lib.optionalAttrs (p.name == "ra-jit" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
+    # `blaze-engine --version` and the daemon's log name the commit, as the flake's `daemon` does.
+    // lib.optionalAttrs (p.name == "blaze-engine" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
 
   mk = i:
     let
@@ -203,7 +203,7 @@ in
   roots = map drv checked.roots;
   # Every binary of the graph's roots in one bin/.
   bins = pkgs.symlinkJoin {
-    name = "ra-jit-units-bins";
+    name = "blaze-units-bins";
     paths = map (i: drv i) (lib.filter (i: (U i).kind == "bin") checked.roots);
   };
 }

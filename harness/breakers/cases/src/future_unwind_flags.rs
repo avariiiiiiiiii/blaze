@@ -2,7 +2,7 @@
 //! size of a future whose local holds a value at one call that may unwind and none at another.
 //! rustc's cleanup for the two calls shares the drop of the local, so it keeps a flag saying
 //! whether there is a value, and the flag is a byte of the future when a call after the await
-//! can unwind into that cleanup. ra-jit drops by where the call is and keeps no such byte.
+//! can unwind into that cleanup. blaze drops by where the call is and keeps no such byte.
 
 use std::future::Future;
 use std::mem::size_of_val;

@@ -6,7 +6,7 @@ A dependency under a registry's path, so that its `DefMap` is frozen, has its it
 `lib.rs` includes `../data/mod.rs`, which declares a `macro_rules!`, exports another and
 includes `items.rs.data`, whose items the macros write and which exports a macro of its own.
 A program calls those items and both exported macros, and an item of a second dependency that
-its build script writes into `OUT_DIR`. ra-jit builds it, with nothing of rustc's, on one store:
+its build script writes into `OUT_DIR`. blaze builds it, with nothing of rustc's, on one store:
 
   - cold: the def maps are frozen and written;
   - warm, twice: they are served, and the program is built and prints what cargo's does
@@ -26,7 +26,7 @@ import os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from allrajit import linked, outcome, ra_jit, run
+from allblaze import linked, outcome, blaze, run
 from storelib import scratch
 
 LIB = 'include!("../data/mod.rs");\n'
@@ -76,9 +76,9 @@ def frozen_line(ran):
 
 def main():
     if not sys.platform.startswith("linux"):
-        print("not run: the programs ra-jit links with nothing of rustc's are Linux's so far")
+        print("not run: the programs blaze links with nothing of rustc's are Linux's so far")
         return
-    work = scratch("ra-jit-frozenwarm-")
+    work = scratch("blaze-frozenwarm-")
     passed = False
     try:
         dep = os.path.join(work, "home/registry/src/index.crates.io-0000000000000000/incdata-0.1.0")
@@ -109,7 +109,7 @@ def main():
             parts the store has do not fit what is loaded. `at`: the checkout. Returns how
             many crates' def maps were served."""
             obj, binary = os.path.join(work, "app.o"), os.path.join(work, "app.bin")
-            ran, took = ra_jit(at, ["app"], obj, "--exe", binary, env={**store, **env})
+            ran, took = blaze(at, ["app"], obj, "--exe", binary, env={**store, **env})
             linked(ran, what)
             frozen = frozen_line(ran)
             if served != bool(re.search(r"def maps of [1-9]", frozen)):
@@ -121,7 +121,7 @@ def main():
             got = outcome(binary, [], at)
             if got != want:
                 raise SystemExit(f"FAIL: {what}: the program differs from cargo's:\n"
-                                 f"cargo:  {want}\nra-jit: {got}")
+                                 f"cargo:  {want}\nblaze: {got}")
             lines.append(f"{what}: {took:.2f} s, {frozen}")
             return int(re.search(r"def maps of (\d+)", frozen)[1])
 

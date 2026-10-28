@@ -1,6 +1,6 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L11-165-c0.rs`): the order of drops when
 //! the body of a loop panics and the loop is inside another loop. What the inner loop's body
-//! holds is dropped before what the loop iterates over. ra-jit read the order of the scopes off
+//! holds is dropped before what the loop iterates over. blaze read the order of the scopes off
 //! the order of the blocks, which inside a loop says nothing: the exit of the inner loop and
 //! its body each lead to the other, and what was iterated over was dropped first.
 

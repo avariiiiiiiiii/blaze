@@ -188,7 +188,7 @@ tar -xzof "$tmp/$asset" -C "$tmp/unpacked" 2>"$tmp/error" ||
     fail "the downloaded archive could not be unpacked." "$(cat "$tmp/error")"
 unpacked="$tmp/unpacked/${asset%.tar.gz}"
 # A release from before the rename (#270) has its programs' old names, by which they find each
-# other: they keep them, but for the launchers of `cargo blaze`, which is gone.
+# other: they keep them, but for the launchers of `blaze`, which is gone.
 old_release=""
 if [ ! -e "$unpacked/blaze-engine" ] && [ -x "$unpacked/ra-jit" ]; then # rename: old name
     old_release=1
@@ -312,5 +312,5 @@ say ""
 say "    $run"
 if command -v cargo >/dev/null 2>&1; then
     say ""
-    say "(cargo blaze run is the same.)"
+    say "(blaze run is the same.)"
 fi

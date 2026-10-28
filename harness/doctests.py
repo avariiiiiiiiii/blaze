@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""The doctests of real crates, run by `cargo test --doc` and by `cargo ra-jit test --doc`:
-the same tests must end the same way and print the same, in ra-jit's first run and in its
+"""The doctests of real crates, run by `cargo test --doc` and by `blaze test --doc`:
+the same tests must end the same way and print the same, in blaze's first run and in its
 second, which reuses the programs of the first. Each crate's line says how many examples
-ra-jit built and how many it did not: those fail, saying why, and are not compared.
+blaze built and how many it did not: those fail, saying why, and are not compared.
 
-    BLAZE_BIN=../target/release/ra-jit python3 doctests.py [--few] [name-version ...]
+    BLAZE_BIN=../target/release/blaze-engine python3 doctests.py [--few] [name-version ...]
 
 Each crate is unpacked by `vendor.sh` and built in a directory that is removed afterwards.
 A difference is WRONG and fails the run. `--few` is the first three crates."""
@@ -17,7 +17,7 @@ import tempfile
 from buildmodel import doctest_report, judge_doctests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RA_JIT = os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "..", "target", "release", "ra-jit")))
+BLAZE = os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "..", "target", "release", "blaze-engine")))
 CRATES = [
     "semver-1.0.28", "either-1.19.0", "smallvec-1.16.3",
     "serde_core-1.0.229", "regex-1.13.1", "itertools-0.15.0", "chrono-0.4.45", "anyhow-1.0.104",
@@ -31,7 +31,7 @@ CRATES = [
 
 def tested(crate, command, target_dir):
     """How the crate's doctests ended, what they printed, and what was said beside."""
-    path = os.path.dirname(RA_JIT) + os.pathsep + os.environ["PATH"]
+    path = os.path.dirname(BLAZE) + os.pathsep + os.environ["PATH"]
     run = subprocess.run([*(command or ["cargo"]), "test", "--doc"], cwd=crate, capture_output=True, text=True,
                          timeout=3600, env={**os.environ, "PATH": path, "CARGO_TARGET_DIR": target_dir})
     return run.returncode, doctest_report(run.stdout), run.stderr
@@ -41,11 +41,11 @@ def row(spec):
     """The crate's line: its verdict and what there is to say of it."""
     subprocess.run(["sh", os.path.join(HERE, "vendor.sh"), spec], check=True)
     crate = os.path.join(HERE, "vendor", spec.rsplit("-", 1)[0])
-    with tempfile.TemporaryDirectory(prefix="ra-jit-doctests-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="blaze-doctests-") as scratch:
         want = tested(crate, [], os.path.join(scratch, "cargo"))
-        got = tested(crate, ["ra-jit"], os.path.join(scratch, "ra-jit"))
+        got = tested(crate, ["blaze"], os.path.join(scratch, "blaze"))
         # The second run has the programs of the first, and the store.
-        again = tested(crate, ["ra-jit"], os.path.join(scratch, "ra-jit"))
+        again = tested(crate, ["blaze"], os.path.join(scratch, "blaze"))
     verdict = judged(want, got)
     if verdict[0] == "same" and want[:2] != again[:2]:
         return "WRONG", f"the second run differs: {judged(want, again)[1]}"

@@ -5,7 +5,7 @@
 
 Bun's own build (`bun scripts/build.ts`) compiles its C and C++ with ninja (JavaScriptCore from a
 prebuilt WebKit, BoringSSL, uSockets, ...), builds its Rust as one static library
-(`bun_runtime`) and links the two with clang. ra-jit builds and splices executables that rustc
+(`bun_runtime`) and links the two with clang. blaze builds and splices executables that rustc
 links, so the tree measured has one more workspace member, `bun-exe`: a `#![no_main]` binary of
 `bun_runtime`, whose `main` it is, with the native objects and libraries on rustc's link line.
 
@@ -39,7 +39,7 @@ FRAME_POINTERS = "[target.'cfg(all())']\nrustflags = [\"-C\", \"force-frame-poin
 # Flags of bun's link that are not kept, by why. Every other flag is: `--wrap`, the exported
 # symbols, the stack size and the libraries are what the program is.
 DROPPED = [
-    # An executable linked without `.eh_frame_hdr` has no index of its frames: ra-jit links
+    # An executable linked without `.eh_frame_hdr` has no index of its frames: blaze links
     # such a program again at every edit instead of adding the change to it. One linked
     # without compact unwind info is spliced (#33); bun's numbers are of the link without it.
     r"-Wl,-no_compact_unwind", r"-Wl,--no-eh-frame-hdr",
@@ -148,18 +148,18 @@ def native_targets(tree):
 
 
 def link_args(tree):
-    """The native half of bun's link, one argument per line in build/release/ra-jit-link.args:
+    """The native half of bun's link, one argument per line in build/release/blaze-link.args:
     every object and library but bun's own Rust (which `bun-exe` is), and the flags kept."""
     out = build_dir(tree)
     inputs, flags, lazy = link_statement(os.path.join(out, "build.ninja"))
     native = [os.path.join(out, path) for path in inputs if not path.startswith("rust-target/")]
     objects = [path for path in native if path.endswith(".o")]
-    filelist = os.path.join(out, "ra-jit-link.objects")
+    filelist = os.path.join(out, "blaze-link.objects")
     open(filelist, "w").write("\n".join(objects) + "\n")
     darwin = sys.platform == "darwin"
     args = [f"-Wl,-filelist,{filelist}"] if darwin else [f"@{filelist}"]
     if lazy:
-        lazylist = os.path.join(out, "ra-jit-link.lazy")
+        lazylist = os.path.join(out, "blaze-link.lazy")
         open(lazylist, "w").write("\n".join(it if it.startswith("-") else os.path.join(out, it) for it in lazy) + "\n")
         args.append(f"-Wl,@{lazylist}")
     args += [path for path in native if not path.endswith(".o")]
@@ -177,7 +177,7 @@ def link_args(tree):
     system = system_parts(tree, os.environ)
     if system:
         args.append(f"-L{system}/lib")
-    path = os.path.join(out, "ra-jit-link.args")
+    path = os.path.join(out, "blaze-link.args")
     open(path, "w").write("\n".join(args) + "\n")
     return path
 
@@ -197,7 +197,7 @@ def system_parts(tree, env):
     plain = {k: v for k, v in env.items() if k not in ("SDKROOT", "DEVELOPER_DIR")}
     apple = subprocess.run(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], env=plain,
                            capture_output=True, text=True, check=True).stdout.strip()
-    system = os.path.join(build_dir(tree), "ra-jit-system")
+    system = os.path.join(build_dir(tree), "blaze-system")
     for path in SYSTEM:
         target = os.path.join(apple, "usr", path)
         if not os.path.exists(target):
@@ -252,7 +252,7 @@ def edit(path, old, new):
 def env_of(tree):
     out = build_dir(tree)
     return {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "BLAZE_OTHER_TOOLCHAIN": "1",
-            "BUN_CODEGEN_DIR": os.path.join(out, "codegen"), "BUN_NATIVE_LINK_ARGS": os.path.join(out, "ra-jit-link.args")}
+            "BUN_CODEGEN_DIR": os.path.join(out, "codegen"), "BUN_NATIVE_LINK_ARGS": os.path.join(out, "blaze-link.args")}
 
 
 def head_of(tree):
@@ -318,7 +318,7 @@ def sources(ws):
     """What `cargo metadata` needs of a checkout without bun's own build: the crates its
     Cargo.toml has under `vendor/`, which that build fetches (scripts/build/deps/<name>.ts) at
     the commit the file pins, with the `.patch` files it lists applied as that build applies them
-    (rust-argon2's lifts its memory floor). Enough for `ra-jit borrowck --project`, which builds
+    (rust-argon2's lifts its memory floor). Enough for `blaze-engine borrowck --project`, which builds
     nothing."""
     for name in re.findall(r'path = "vendor/([^"/]+)"', open(os.path.join(ws, "Cargo.toml")).read()):
         dep = open(os.path.join(ws, "scripts", "build", "deps", f"{name}.ts")).read()

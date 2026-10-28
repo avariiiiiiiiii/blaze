@@ -19,7 +19,7 @@ libraries of the X86 and AArch64 targets, the headers, `llvm-config`, `llvm-dwar
 `llvm-pdbutil`. Its own tools link the C++ runtime statically, and it is built with none of
 zlib, zstd, libxml2 or terminfo, so neither it nor a binary that links it asks the system for
 more than libc. On Linux it is built on the oldest hosted Ubuntu (22.04) like the release, on
-macOS for macOS 13 like the release, and on Windows against the static C runtime like ra-jit's
+macOS for macOS 13 like the release, and on Windows against the static C runtime like blaze's
 Windows build. The prefix gets `blaze-llvm.json` (version, repository, commit, target), which
 crates/hir-ty-codegen/build.rs reads to refuse any other LLVM.
 
@@ -143,7 +143,7 @@ def cmake_args(target):
         # As the release: MACOSX_DEPLOYMENT_TARGET in release.yaml.
         args += ["-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0", "-DCMAKE_OSX_ARCHITECTURES=arm64"]
     elif "windows" in target:
-        # ra-jit's Windows build links the C runtime statically (+crt-static), so LLVM does too.
+        # blaze's Windows build links the C runtime statically (+crt-static), so LLVM does too.
         args += ["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
                  "-DLLVM_ENABLE_DIA_SDK=OFF"]
     return args

@@ -1,10 +1,10 @@
 # Tiers
 
-A program that takes edits with `ra-jit-live` is also made faster while it runs. The daemon
+A program that takes edits with `blaze-live` is also made faster while it runs. The daemon
 samples where its threads are, compiles the functions it spends its time in again with LLVM,
 and swaps them in as patches, the way HotSpot or V8 tier up, without a restart
-([#6](https://github.com/indexable-inc/ra-jit/issues/6)). macOS on Apple silicon only, as
-live edits are. Released binaries have LLVM in them (23.1.4, linked statically); a ra-jit
+([#6](https://github.com/indexable-inc/blaze/issues/6)). macOS on Apple silicon only, as
+live edits are. Released binaries have LLVM in them (23.1.4, linked statically); a blaze
 built from source needs `--features llvm` ([contributing.md](contributing.md#llvm-for---features-llvm)).
 
 ![The Tiers island of the Game of Life window](tiers.png)
@@ -17,13 +17,13 @@ built from source needs `--features llvm` ([contributing.md](contributing.md#llv
 | 2 | `Level::Llvm`, "LLVM -O3" (`O3`) | LLVM at `-O3`, with what the function calls built in where that is hot or small | a hot function, about a second after it gets hot; it counts its branches |
 | 3 | `Level::Pgo`, "LLVM -O3 + PGO" (`PGO`) | the same IR again, with what level 2 counted given to LLVM as `!prof` | a level-2 function that has counted for a second |
 
-The names are `ra_jit_live::format::LEVELS`, which the daemon's events and the window share.
+The names are `blaze_live::format::LEVELS`, which the daemon's events and the window share.
 
 ## How it goes
 
 1. **The program samples itself.** The worker that links a program's executable writes
-   `sample` in the program's directory (`~/.cache/ra-jit/live/<uuid>/`). The program's
-   `ra-jit-live-sample` thread then looks at one busy thread in turn every 2 ms
+   `sample` in the program's directory (`~/.cache/blaze/live/<uuid>/`). The program's
+   `blaze-live-sample` thread then looks at one busy thread in turn every 2 ms
    (`thread_get_state`, which stops the thread while it reads), counts the address it was
    at if that is the program's own code or a patch's, and writes `profile` four times a
    second: the counts since it started, the CPU it took itself, and the counters level-2
@@ -31,7 +31,7 @@ The names are `ra_jit_live::format::LEVELS`, which the daemon's events and the w
    names the worker that reads `profile`; once that process is gone (it exited, crashed or
    was killed, none of which removes the file) the program samples nothing until a worker
    asks again.
-2. **The worker puts each address in a function** (`crates/ra-jit/src/tier.rs`): the
+2. **The worker puts each address in a function** (`crates/blaze-engine/src/tier.rs`): the
    executable's own symbol table, or, for an address in the room for patches, the function
    a live patch put there in place of the executable's (`Baseline::live` says where each
    went). It keeps a second of samples per function.
@@ -50,7 +50,7 @@ The names are `ra_jit_live::format::LEVELS`, which the daemon's events and the w
    is spliced into the executable and published to the program, which writes a jump over
    the old entry. The program writes nothing it was not already writing.
 5. **It says what it did**: `tiers` in the program's directory (`format::Tiers`, read with
-   `ra_jit_live::tiers()`) has each hot function's level, share of the samples and what is
+   `blaze_live::tiers()`) has each hot function's level, share of the samples and what is
    under way, and the last events; the worker's log has the same events as `tier:` lines.
 
 ### What is built in
@@ -153,8 +153,8 @@ larger than rustc's.
 
 Level-2 code counts how often it is entered and, for each two-way branch of its IR in the
 order of the layout, how often it went each way: `select(condition, a, b)` picks the counter,
-so a branch costs one increment. The counters are `ra_jit_live_counters()`, a 64 K array in
-every program that links `ra-jit-live`, called by name; the worker hands out ranges of it.
+so a branch costs one increment. The counters are `blaze_live_counters()`, a 64 K array in
+every program that links `blaze-live`, called by name; the worker hands out ranges of it.
 Level 3 builds the same IR (the same functions built in), finds the same branches in the
 same order, and gives LLVM `!prof !{"branch_weights", taken, not}` on each and
 `!{"function_entry_count", n}` on the function; it counts nothing. When the branches do not

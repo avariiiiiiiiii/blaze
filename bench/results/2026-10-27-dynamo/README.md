@@ -5,7 +5,7 @@
 `lib/llm/src/tokens.rs`, a dependency of the cdylib:
 `(self.block_size as usize).saturating_sub(self.tokens.0.len())` wrapped in
 `std::hint::black_box(...)`, then reverted. Each arm has its own `CARGO_TARGET_DIR` and daemon
-home. Each step is one `cargo build` (or `cargo blaze build`) timed whole, followed by the
+home. Each step is one `cargo build` (or `blaze build`) timed whole, followed by the
 sha256 of the cdylib (first 12 hex digits).
 
 The machine was an ix VM: arm64 Neoverse-V3, 8 vCPU, 16 GiB committed, `CARGO_BUILD_JOBS=6`, in a systemd
@@ -13,7 +13,7 @@ unit with `MemoryMax=10G`. It isn't a dedicated bench VM, so the numbers are dia
 x86_64 could not be placed (`memory_full`, ix#5992), so there are no x86_64 numbers. The project
 pins `rust-toolchain.toml` 1.96.1, and its `.cargo/config.toml` sets `--cfg tokio_unstable` and
 `-C target-cpu=neoverse-n1 -C force-frame-pointers=yes` for aarch64. The cargo arm is rustup's
-1.96.1, as the pin asks. The blaze arm is main at 63aaa237db's `ra-jit` with its own
+1.96.1, as the pin asks. The blaze arm is main at 63aaa237db's `blaze` with its own
 nightly-2026-10-27, which `toolchain::settle` picks over the pin. Run it with `PROTOC`
 (nixpkgs protobuf) and `LIBCLANG_PATH` (nixpkgs libclang, for bindgen) set.
 
@@ -43,8 +43,8 @@ proc macro `macro_rules_attribute-proc_macro 0.2.2`, of which 3 functions do not
 frontend (`frontend: mir: UnresolvedMethod("vec")`, `("flat_map")`, `("vec")`). The crate
 defines `impl<T: IntoIterator> CollectVec for T {}` inside the body of the trait's own default
 method, and a method call outside that block does not find the impl. The 10-line repro is on
-#771. Expanding natively (`BLAZE_PROC_MACRO_WASM=0`, with blaze-proc-macro-srv beside ra-jit)
-fails the same way, because ra-jit links the proc macro there too. The blaze dev cold time
+#771. Expanding natively (`BLAZE_PROC_MACRO_WASM=0`, with blaze-proc-macro-srv beside blaze)
+fails the same way, because blaze links the proc macro there too. The blaze dev cold time
 includes downloading blaze's toolchain (6.4 s) and a crates.io retry.
 
 With plain cargo, blaze's nightly-2026-10-27 does not compile `dynamo-llm` either: E0277,

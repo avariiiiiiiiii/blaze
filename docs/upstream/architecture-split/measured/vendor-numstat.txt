@@ -1,4 +1,4 @@
-# ra-jit main 22b1267233 vendor/rust-analyzer against upstream 0b21bd6596: added, removed, path (git diff --numstat)
+# blaze main 22b1267233 vendor/rust-analyzer against upstream 0b21bd6596: added, removed, path (git diff --numstat)
 6	1	Cargo.toml
 3	2	crates/base-db/src/change.rs
 9	0	crates/base-db/src/input.rs

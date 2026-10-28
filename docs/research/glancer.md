@@ -1,4 +1,4 @@
-# Rust Glancer, matklad's three tiers, and what they mean for ra-jit
+# Rust Glancer, matklad's three tiers, and what they mean for blaze
 
 2026-10-21. What was fetched is in [docs/upstream/glancer/](../upstream/glancer/SOURCE.md). Each
 claim is marked **read** (in a source we read, or measured), **reported** (someone says so and we
@@ -35,7 +35,7 @@ did not check) or **unverified** (our inference). The plan this feeds is
   source, edition, targets, dependencies, cfg options, and a per-file source revision; plus a
   schema version in the header. It deliberately has no "analysis producer" version: the author
   rebuilds the cache by hand when the analysis changes (read:
-  `storage/cache/fingerprint.rs`, `storage/cache/header.rs`). ra-jit cannot take that shortcut:
+  `storage/cache/fingerprint.rs`, `storage/cache/header.rs`). blaze cannot take that shortcut:
   the store keys on its binary's hash (read: [cache.md](../cache.md)).
 - **Per-crate shards.** v0.2.0 split def-map and semantic artifacts per crate because packages
   with many targets (bevy, tokio) made one artifact per package enormous, and made bodies of
@@ -77,19 +77,19 @@ Read in full: `matklad/2026-08-21-rust-glancer.html`.
   ever look at, but which needs to be at least shallowly analyzed", for which "the primary AST
   structure should be just a list of arrays" (read).
 - **Bodies lazily, not incrementally:** index all items, analyse function bodies only for the
-  open file (read). For ra-jit the analogue is that only bodies whose code is needed are lowered,
+  open file (read). For blaze the analogue is that only bodies whose code is needed are lowered,
   which is already how its MIR queries are driven (unverified).
 - **Proc macros made rust-analyzer bulky.** Expanding them runs real code, so the usual IDE
   shortcuts do not apply, and they generate a lot of code; at one point he measured about 30% of
   rust-analyzer's binary size attributed to JSON parsing code (reported, his recollection). He
   suggests the Sorbet approach: do not run metaprogramming, have plugins "explain" its effects
-  (inject an empty `impl Serialize for T {}` instead of running serde) (read). ra-jit cannot do
+  (inject an empty `impl Serialize for T {}` instead of running serde) (read). blaze cannot do
   that: it needs the real bodies to generate code (unverified, but follows from "rustc is the
   reference").
 - **The LSP race.** rust-analyzer's core insists on consistent snapshots; LSP only allows being
   heuristically right, unlike the Dart Analyzer protocol's sound synchronisation; and
   rust-analyzer's own file watcher "was fundamentally racy" with the platform-specific work to
-  make it correct never done (read). For ra-jit, which builds what cargo would build, a racy
+  make it correct never done (read). For blaze, which builds what cargo would build, a racy
   watcher is a correctness problem, not a cosmetic one (unverified).
 - **The three backends of IntelliJ's PSI**, the "half-drawn horse": open files backed by
   concrete syntax trees; other project files by stub trees (compact on-disk external
@@ -128,14 +128,14 @@ From rustc 1.99.0's `rustc_metadata/src/rmeta/encoder.rs`, `should_encode_mir` (
 - Everything else has no MIR in `.rmeta`; its code exists only in the rlib's objects.
 
 So a frozen dependency artifact that holds MIR for that set holds what rustc itself needs to
-compile code against the dependency, and nothing ra-jit's code generator needs is missing
-(unverified: ra-jit also needs the MIR of non-generic functions it compiles itself, but it
+compile code against the dependency, and nothing blaze's code generator needs is missing
+(unverified: blaze also needs the MIR of non-generic functions it compiles itself, but it
 compiles only instances homed in a dependency, which are exactly the generic and inlinable ones;
 see `home.rs`).
 
 ## salsa's persistence
 
-- salsa 0.28.5, the version ra-jit pins, has a `persistence` feature: inputs, interned values,
+- salsa 0.28.5, the version blaze pins, has a `persistence` feature: inputs, interned values,
   tracked structs and tracked functions marked `persist` serialize with serde, with their
   revisions and durabilities, and the database can be restored from that (read:
   `salsa/0.28.5_tests_persistence.rs`, `Cargo.toml` features).

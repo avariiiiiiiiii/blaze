@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-panic-location-s1-2-c13.rs`): the column of a
 //! panic after characters that are not one column wide. rustc counts what a character takes
 //! on a terminal: two for `中` and `😀`, none for a combining accent or a joiner, four for a
-//! tab. ra-jit counted one for each.
+//! tab. blaze counted one for each.
 
 use std::hint::black_box;
 use std::panic::{AssertUnwindSafe, catch_unwind};

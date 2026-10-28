@@ -6,7 +6,7 @@
 //! 1. **Cranelift**: the code of every build.
 //! 2. **LLVM -O3**: the same IR with the hot functions it calls built into it, across crates
 //!    and the standard library alike, optimized by LLVM. It counts how often it is entered
-//!    and which way each two-way branch goes, in [`ra_jit_live_counters`].
+//!    and which way each two-way branch goes, in [`blaze_live_counters`].
 //! 3. **LLVM -O3 + PGO**: the same IR again, without the counting, with what level 2 counted
 //!    given to LLVM as branch weights and an entry count (`!prof`).
 //!
@@ -18,7 +18,7 @@
 //! function and of every function built into it; when one of those is another, the function
 //! is at level 1 again in that same build, and [`Tiers::take_demoted`] says so.
 //!
-//! [`ra_jit_live_counters`]: https://docs.rs/ra-jit-live
+//! [`blaze_live_counters`]: https://docs.rs/blaze-live
 
 use std::{
     cell::RefCell,
@@ -38,9 +38,9 @@ use super::{
     instance_serial, root_serial,
 };
 
-/// The symbol of the function that hands out the counters, which `ra-jit-live` defines in
+/// The symbol of the function that hands out the counters, which `blaze-live` defines in
 /// every program that takes edits.
-pub const COUNTERS: &str = "ra_jit_live_counters";
+pub const COUNTERS: &str = "blaze_live_counters";
 
 /// How deep functions are built into each other; how many instructions a hot body built in
 /// may have, and any other, counted with its locals out of the frame; how many a body LLVM

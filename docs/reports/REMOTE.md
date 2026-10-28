@@ -1,11 +1,11 @@
 # Remote hydration over S3
 
-Branch `ra-jit-s3`, from `ra-jit-collate` at `27315323cb`, with `ra-jit-collate-wip` at
-`0151c01218` (debug info, build model, disk cache) and then `ra-jit-collate` at `1547078a30`
+Branch `blaze-s3`, from `blaze-collate` at `27315323cb`, with `blaze-collate-wip` at
+`0151c01218` (debug info, build model, disk cache) and then `blaze-collate` at `1547078a30`
 merged in. The numbers below are from the third round (compressed packs) unless they say
 otherwise.
 
-`ra-jit cache push REMOTE` and `ra-jit cache pull REMOTE` had an S3 path that had never been
+`blaze-engine cache push REMOTE` and `blaze-engine cache pull REMOTE` had an S3 path that had never been
 run. This is what it took to make it real, what was measured, and what is still open.
 
 **Real AWS S3 was not run.** There are no AWS credentials in the session this was done in.
@@ -17,21 +17,21 @@ variable, `BLAZE_S3_REMOTE=s3://bucket/prefix`; nobody has done that yet.
 
 The S3 client is now the AWS SDK for Rust (`aws-config`, `aws-sdk-s3`) in place of
 `rusty-s3` and `ureq`. The reason is credentials: `rusty-s3` signs with a key pair you hand
-it, and the task asks for the sources the AWS tools read. With the SDK's default chain ra-jit
+it, and the task asks for the sources the AWS tools read. With the SDK's default chain blaze
 takes credentials from the environment, the shared config and credentials files (and a
 named profile), web identity tokens, ECS container credentials and EC2 instance roles,
-without ra-jit having any code for them. Of those, the environment and the shared files with a profile
+without blaze having any code for them. Of those, the environment and the shared files with a profile
 were run; web identity, container and instance roles were not, because there is nothing here
 that issues them.
 
-The code is in `crates/ra-jit/src/remote.rs` and three files under `crates/ra-jit/src/remote/`:
+The code is in `crates/blaze-engine/src/remote.rs` and three files under `crates/blaze-engine/src/remote/`:
 
 - `s3.rs`: the S3 calls. Ranged GET, HEAD, conditional PUT for lists, multipart upload.
 - `transfer.rs`: fetching an object into a file. Resuming, hashing, the limit on requests
   in flight, the counters.
 - `signed.rs`: signed manifests.
 
-`crates/ra-jit/src/deps.rs` (`ra-jit deps push|pull`, cargo's compiled units) moved onto the
+`crates/blaze-engine/src/deps.rs` (`blaze-engine deps push|pull`, cargo's compiled units) moved onto the
 same remote, so it has the same verification, retries and counters.
 
 ### On the store of the disk-cache branch
@@ -44,7 +44,7 @@ The merge put the remote on the format-2 store. What that means in the code:
 - A pack's keys for the remote come from `pack_keys`, which is the store's own check of
   the pack (magic, name, every record's checksum), so a pack the store would discard is
   never sent. The keys are the ones on disk, which already have the store's identity
-  (format, ra-jit build, toolchain) hashed in.
+  (format, blaze build, toolchain) hashed in.
 - There is one set of crash-safe writes. A fetched pack arrives in pieces, so it cannot be
   handed to `write_file_whole` as bytes; `store.rs` now has `name_file_whole`, which is the
   second half of its `write_whole` (sync, rename, sync the directory), and `write_whole`
@@ -70,7 +70,7 @@ The merge put the remote on the format-2 store. What that means in the code:
 - Lazy hydration keeps the key lists in memory. Nothing that is not the store's is written
   into the store's directory, so `cache stats` and `cache verify` count the same things
   after a pull as before.
-- `ra-jit cache stats|gc|verify` are the disk-cache branch's, unchanged. `cache keygen` is
+- `blaze-engine cache stats|gc|verify` are the disk-cache branch's, unchanged. `cache keygen` is
   next to them.
 
 New public items in `hir-ty`'s `codegen`, since that is an architectural change in this
@@ -79,12 +79,12 @@ tree: `name_file_whole`, `pack_keys`, `pack_format`, `StoreDir::keys`, and
 
 ### What the AWS SDK costs
 
-Measured on this machine (8 cores), `cargo build -p ra-jit --release` into an empty target
+Measured on this machine (8 cores), `cargo build -p blaze-engine --release` into an empty target
 directory with the crates already downloaded, Cranelift only:
 
-| | crates in ra-jit's tree | clean build | binary | stripped |
+| | crates in blaze's tree | clean build | binary | stripped |
 | --- | --- | --- | --- | --- |
-| `ra-jit-collate-wip` (`rusty-s3`, `ureq`) | 284 | 91.7 s, 85.5 s | 45.3 MB | 32.5 MB |
+| `blaze-collate-wip` (`rusty-s3`, `ureq`) | 284 | 91.7 s, 85.5 s | 45.3 MB | 32.5 MB |
 | the SDK with its default features | 380 | 129.2 s | 68.6 MB | 47.3 MB |
 | the SDK as it is on this branch | 347 | 113.5 s | 62.6 MB | 42.5 MB |
 
@@ -105,7 +105,7 @@ and role credentials, and the two SSO clients. Dropping the `sso` feature saves 
 1.3 MB stripped and 3 crates; it is kept because `aws sso login` is how most people get
 credentials on a laptop. If 10 MB is too much, the alternative is `rusty-s3` for signing
 plus `aws-config` only for credentials, or credentials from the environment only as
-before. That would lose nothing that was measured here, but ra-jit would own the request
+before. That would lose nothing that was measured here, but blaze would own the request
 code (multipart, retries, error parsing) that the SDK owns now.
 
 The remote is async on one tokio runtime of two worker threads, built once in a process.
@@ -126,7 +126,7 @@ calls `block_on` from inside a task.
 
 Anything the address leaves out comes from where the AWS tools look: `AWS_ENDPOINT_URL`,
 `AWS_REGION`, `AWS_PROFILE`, `~/.aws/config`. An unknown option is refused by name. With an
-endpoint of its own ra-jit addresses the bucket by path unless told `path-style=false`,
+endpoint of its own blaze addresses the bucket by path unless told `path-style=false`,
 because that is what most services that are not AWS need; without one it does what the SDK
 does for AWS.
 
@@ -147,21 +147,21 @@ does for AWS.
 In read-only mode `cache push` and `deps push` fail with "BLAZE_REMOTE_READONLY is set:
 nothing is sent", and the daemon does not push.
 
-Credentials are never printed. ra-jit does not hold them; the SDK does. Errors are printed
+Credentials are never printed. blaze does not hold them; the SDK does. Errors are printed
 as the service's error code and message, or the HTTP status, or the chain of causes of a
 transport error, none of which contain the request's headers. The harness greps everything
-ra-jit printed in the whole run for the secret key (and the session token when run against a
+blaze printed in the whole run for the secret key (and the session token when run against a
 real bucket), forwards and reversed.
 
 ## Robustness
 
 **Fetch.** An object is written to `<name>.fetch.tmp` under an exclusive lock, never to its
-final name. When the body breaks off, ra-jit asks again with `Range: bytes=N-` from the byte
+final name. When the body breaks off, blaze asks again with `Range: bytes=N-` from the byte
 it stopped at, up to 6 times in a row without getting further, waiting 250 ms, 500 ms, ...
 8 s in between; getting any bytes starts the count again. When the object is whole, its
 SHA-256 is compared with the name it was listed under, and only then is it synced and
 renamed to `<hash>.pack` by the store's `name_file_whole`. So a pack file in the store is
-always a whole, verified pack: a killed ra-jit or a killed server leaves the temporary file
+always a whole, verified pack: a killed blaze or a killed server leaves the temporary file
 or nothing. The next process to run picks it up and fetches only the rest, unless a
 collection got to it first (the store removes temporary files a minute after their last
 byte). If what is in it turns out not to be the start of this object (the hash does not
@@ -214,15 +214,15 @@ Key lists and cargo units are named and checked the same way. The store checks a
 each record again when it reads it. After a rejection the build compiles the functions
 itself, so the result is the code a local build gives.
 
-**Can the storage make ra-jit use code for the wrong thing?** A cache entry's key is a
+**Can the storage make blaze use code for the wrong thing?** A cache entry's key is a
 SHA-256 over the backend and optimisation level, the target triple, whether the build has
 debug info and overflow checks, and the function's stable name; the store then hashes that
-together with its format, the ra-jit executable's own hash and the toolchain's commit before
+together with its format, the blaze executable's own hash and the toolchain's commit before
 it is written to disk. The stable name holds the function's path, its
 generic arguments spelled out, and for the crate it is in either rustc's stable crate id
 (dependencies: name, version and the metadata cargo passes) or a hash of the crate's source
 (crates of the checkout). So an entry is only ever found by a machine running the same
-ra-jit binary against the same toolchain, for the same backend and target, for the same instance of the same crate
+blaze binary against the same toolchain, for the same backend and target, for the same instance of the same crate
 source. A remote cannot move an entry to another key without changing the pack's bytes and
 so its name.
 
@@ -233,7 +233,7 @@ bytes. Content addressing cannot catch that. Signing does: with `BLAZE_REMOTE_SI
 machine signs each manifest it writes (Ed25519, over the manifest's object name, its turn
 and its body, so one project's manifest cannot be replayed as another's), and with
 `BLAZE_REMOTE_TRUST` a machine refuses any manifest that is not signed by a key it lists.
-`ra-jit cache keygen FILE` makes a key and prints the public half.
+`blaze-engine cache keygen FILE` makes a key and prints the public half.
 
 **A machine that names no keys pulls nothing** unless `BLAZE_REMOTE_UNSIGNED=1` is set:
 "BLAZE_REMOTE_TRUST names no key, and without one whoever writes to the remote says what is
@@ -243,10 +243,10 @@ decided in the security round (`SECURITY.md`).
 **An old list.** A signature says who wrote a list, not that it is the newest. Each signed
 list carries a turn, a number inside the signed bytes that is one more than the turn of the
 list it replaces and never less than the signer's clock in seconds. A machine remembers the
-highest turn it took of each list of each remote, in `turns/` of its store (for `ra-jit
-deps` without a store, in `.ra-jit/turns` of the target directory), and refuses a list with
+highest turn it took of each list of each remote, in `turns/` of its store (for `blaze
+deps` without a store, in `.blaze/turns` of the target directory), and refuses a list with
 a lower one: "`manifests/default` is turn N, and this machine has taken turn M of it: an
-older list is not taken". `ra-jit cache forget REMOTE` removes what is remembered of a
+older list is not taken". `blaze-engine cache forget REMOTE` removes what is remembered of a
 remote. A machine that has never pulled remembers nothing and takes the first list it is
 given. The design, with what it does not cover, is in `SECURITY.md`.
 
@@ -259,11 +259,11 @@ longer is rejected and counted like one with the wrong hash, with nothing of it 
 disk.
 
 So the honest statement is: with `BLAZE_REMOTE_TRUST` set, nobody without a trusted signing
-key can make ra-jit emit different code than a local build, whatever they do to the bucket.
+key can make blaze emit different code than a local build, whatever they do to the bucket.
 With `BLAZE_REMOTE_UNSIGNED=1` instead, whoever can write to the bucket is trusted, the same
-as with sccache or a cargo registry mirror. A trusted signer is trusted completely; ra-jit does not recompile to check
+as with sccache or a cargo registry mirror. A trusted signer is trusted completely; blaze does not recompile to check
 them. One more assumption sits under all of it and predates this branch: two machines with
-the same ra-jit binary compile the same key to equivalent code. That is what the local store
+the same blaze binary compile the same key to equivalent code. That is what the local store
 already relies on between workspaces.
 
 Tested by the harness, on both servers:
@@ -289,13 +289,13 @@ Tested by the harness, on both servers:
 It is debug info. It is not the store's checksums or its syncs.
 
 Measured with the same build of each project run six times in a row from an empty store,
-changing one thing at a time (`~/work/slow.py`, not in the tree: it runs `ra-jit` on the
+changing one thing at a time (`~/work/slow.py`, not in the tree: it runs `blaze` on the
 workspace with the environment given and reads the `store:` and `cold:` lines). The first
 run of a series is always slower (2 s for ripgrep, 8 to 9 s for cargo) whatever it is, so
-the series starts with one that is thrown away. The numbers are ra-jit's seconds only, not
+the series starts with one that is thrown away. The numbers are blaze's seconds only, not
 cargo's.
 
-| cargo 0.92.0 | ra-jit | of that, code generation | store |
+| cargo 0.92.0 | blaze | of that, code generation | store |
 | --- | --- | --- | --- |
 | before the merge (`7b33ead6c2`) | 81.2 s | 71.0 s | 928,617,374 bytes |
 | after the merge | 101.9 s | 91.6 s | 1,067,053,828 bytes |
@@ -304,7 +304,7 @@ cargo's.
 | after, both | 87.2 s | 77.1 s | 927,233,654 bytes |
 | after, no store (`BLAZE_CACHE` not set) | 73.1 s | 63.3 s | 0 |
 
-| ripgrep 14.1.1 | ra-jit | store |
+| ripgrep 14.1.1 | blaze | store |
 | --- | --- | --- |
 | before the merge | 9.2 s | 41,551,465 bytes |
 | after the merge | 10.1 s | 51,806,179 bytes |
@@ -312,7 +312,7 @@ cargo's.
 | after, no sync | 10.4 s | 51,806,179 bytes |
 | after, no store | 7.3 s | 0 |
 
-So for cargo the merge cost 20.7 s of ra-jit. Turning debug info off gives back 14.7 s of
+So for cargo the merge cost 20.7 s of blaze. Turning debug info off gives back 14.7 s of
 it and all of the 140 MB the packs grew by. Turning every sync into nothing gives back
 nothing: the store syncs once a sealed pack, not once a record, and there are 16 packs.
 The other 6 s are still there with debug info off and syncs off, so they are in what the
@@ -334,7 +334,7 @@ a first-run effect in them as well; the tables above compare runs that are not t
 
 ## Compression
 
-Packs travel compressed with zstd at level 3. The `zstd` crate was in ra-jit already
+Packs travel compressed with zstd at level 3. The `zstd` crate was in blaze already
 (`deps.rs` packs cargo's units with it), so nothing was added.
 
 A pack is `packs/<digest of the pack>.pack.zst`. Its manifest line carries the digest and
@@ -382,7 +382,7 @@ fetched.
 
 ## Collecting a remote
 
-    ra-jit cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] [--dry-run]
+    blaze-engine cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] [--dry-run]
 
 An age is a count and `s`, `m`, `h` or `d`. The run does two things, in this order.
 
@@ -425,7 +425,7 @@ hour. 12 of 12 on MinIO and on SeaweedFS.
 
 A daemon given `--socket` or `--watch` used to pull when it started and push once after
 its first build. Now a thread of its own keeps the two in step
-(`crates/ra-jit/src/remote/keeper.rs`):
+(`crates/blaze-engine/src/remote/keeper.rs`):
 
 - It pushes right after the first build, then every `BLAZE_REMOTE_PUSH_EVERY` (five
   minutes), then once more when the daemon gets SIGTERM or SIGINT, after which the daemon
@@ -456,26 +456,26 @@ with the next one. On Windows only Ctrl-C is waited for, and that path was not r
 
 Machine: 8 cores, 31 GB, Linux x86-64. Cranelift backend. MinIO on loopback behind the
 harness's counting proxy, so transfer times are a lower bound; they say nothing about a real
-network. Each "machine" is its own HOME, checkout, cargo target directory and ra-jit store
+network. Each "machine" is its own HOME, checkout, cargo target directory and blaze store
 in a fresh directory. They are not separate containers. One run each, no repeats, so read
 differences of a few percent as noise.
 
 "To a running program" is everything a machine with a checkout and a toolchain does: pull
-cargo's units if any, `cargo rustc` for the dependencies and link line, ra-jit's build, run
+cargo's units if any, `cargo rustc` for the dependencies and link line, blaze's build, run
 the binary. Crates.io sources were already in `~/.cargo` for all of them.
 
     cd harness
-    BLAZE_BIN=.../ra-jit python3 remote.py --measure ~/work/rg-a -p ripgrep --bin rg \
+    BLAZE_BIN=.../blaze python3 remote.py --measure ~/work/rg-a -p ripgrep --bin rg \
         --crate rg,grep,grep_cli,grep_matcher,grep_printer,grep_regex,grep_searcher,globset,ignore
-    BLAZE_BIN=.../ra-jit python3 remote.py --measure ~/work/cargo-a -p cargo --bin cargo \
+    BLAZE_BIN=.../blaze python3 remote.py --measure ~/work/cargo-a -p cargo --bin cargo \
         --crate cargo,cargo_util,cargo_platform,cargo_util_schemas,crates_io,rustfix,cargo_credential
 
-ripgrep 14.1.1 (9 crates by ra-jit; 22,340 functions compiled cold):
+ripgrep 14.1.1 (9 crates by blaze; 22,340 functions compiled cold):
 
-| Fresh machine B | To a running program | cargo | ra-jit | Functions compiled | Requests | Bytes down |
+| Fresh machine B | To a running program | cargo | blaze | Functions compiled | Requests | Bytes down |
 | --- | --- | --- | --- | --- | --- | --- |
 | no remote | 16.8 s | 4.6 s | 12.2 s | 22,340 | 0 | 0 |
-| ra-jit's packs | 14.3 s | 4.8 s | 9.5 s | 0 | 3 | 7,355,315 |
+| blaze's packs | 14.3 s | 4.8 s | 9.5 s | 0 | 3 | 7,355,315 |
 | packs and cargo's units | 9.6 s | 2.0 s | 7.3 s | 0 | 45 | 59,161,263 |
 | the same, lazy | 10.0 s | 2.1 s | 7.6 s | 0 | 46 | 59,946,863 |
 
@@ -483,13 +483,13 @@ Machine A's push: 1 pack, 7,354,887 bytes in 432 ms, 9 requests; 41 cargo units,
 51,802,194 bytes in 427 ms, 85 requests. The bucket ends with 45 objects, 59,946,649
 bytes. Pulling the pack took 240 ms.
 
-cargo 0.92.0 (7 crates by ra-jit; 226,180 functions compiled cold, 3,599 of 3,602 functions
-of the workspace; the other three are refused by ra-jit and compiled by rustc, as on the base branch):
+cargo 0.92.0 (7 crates by blaze; 226,180 functions compiled cold, 3,599 of 3,602 functions
+of the workspace; the other three are refused by blaze and compiled by rustc, as on the base branch):
 
-| Fresh machine B | To a running program | cargo | ra-jit | Functions compiled | Requests | Bytes down |
+| Fresh machine B | To a running program | cargo | blaze | Functions compiled | Requests | Bytes down |
 | --- | --- | --- | --- | --- | --- | --- |
 | no remote | 152.4 s | 42.0 s | 110.3 s | 226,180 | 0 | 0 |
-| ra-jit's packs | 117.1 s | 43.4 s | 73.6 s | 0 | 18 | 95,048,041 |
+| blaze's packs | 117.1 s | 43.4 s | 73.6 s | 0 | 18 | 95,048,041 |
 | packs and cargo's units | 94.4 s | 25.2 s | 67.4 s | 0 | 406 | 525,028,848 |
 | the same, lazy | 100.2 s | 25.5 s | 73.1 s | 0 | 422 | 532,207,920 |
 
@@ -504,18 +504,18 @@ The same tables with plain packs, from the round before (same machine, same comm
 | Fresh machine B | ripgrep | bytes down | cargo | bytes down |
 | --- | --- | --- | --- | --- |
 | no remote | 17.3 s | 0 | 152.0 s | 0 |
-| ra-jit's packs | 14.5 s | 51,804,757 | 114.1 s | 1,066,942,095 |
+| blaze's packs | 14.5 s | 51,804,757 | 114.1 s | 1,066,942,095 |
 | packs and cargo's units | 9.4 s | 103,610,692 | 92.0 s | 1,496,922,653 |
 | the same, lazy | 9.8 s | 104,396,292 | 98.2 s | 1,504,101,885 |
 
 So compression cut the bytes a fresh machine takes by 43% for ripgrep and 65% for cargo
-(by 86% and 91% with ra-jit's packs alone) and left the time to a running program where it
+(by 86% and 91% with blaze's packs alone) and left the time to a running program where it
 was, within the few percent one run differs from the next. On loopback there was nothing
 to win in time: the pull was 3 s of 92 before. On a real network the bytes are the time;
 that is arithmetic, not something measured here.
 
 What the numbers say otherwise is what they said before: the remote removes all of
-ra-jit's code generation (0 functions compiled). What is left is ra-jit loading the
+blaze's code generation (0 functions compiled). What is left is blaze loading the
 workspace and walking every instance to find its key (the "cold:" line still reads 4.1 s
 for ripgrep and 57 s for cargo with nothing to compile), and cargo running build scripts
 and proc macros. Those are the next thing to cut and are not a remote problem.
@@ -546,11 +546,11 @@ machine A, and then checks, 178 checks in all across the two servers:
   left with no request made for it, and the same pack listed as format 2 is rejected;
 - a fetch killed half way leaves a store that verifies and counts the kept bytes as one
   temporary file;
-- multipart with bounded concurrency, and ra-jit's request count equal to the proxy's;
+- multipart with bounded concurrency, and blaze's request count equal to the proxy's;
 - 503 twice, 503 on a part, on completion and on the manifest, 503 forever;
 - connection dropped mid-body twice, closed with no answer twice, dropped mid-part;
 - a stall longer than the timeout, an answer slower than the timeout;
-- ra-jit killed mid-fetch, what it kept aside still there after a collection an hour
+- blaze killed mid-fetch, what it kept aside still there after a collection an hour
   later, the next run fetching only the rest, a stale temporary file of something else;
 - collecting a remote and a daemon that stays, as listed in their sections;
 - two processes fetching into one store; twelve packs with three requests at a time;
@@ -559,14 +559,14 @@ machine A, and then checks, 178 checks in all across the two servers:
 - the poisoning and signing cases listed under Trust;
 - lazy: nothing compiled, same output, the unused pack not fetched.
 
-    cd harness && BLAZE_BIN=../target/release/ra-jit python3 remote.py
+    cd harness && BLAZE_BIN=../target/release/blaze-engine python3 remote.py
 
 Takes about eight minutes with both servers. Results of this round are under Regression
 gate. The rounds before had 111 and then 131 checks.
 
 One check is conditional. MinIO reads again 1.3 s after a kill and a fetch always rides
 that out. SeaweedFS took between 14 and 23 s to read again in these runs, on either side of
-the 16 s ra-jit waits for a byte. So the harness times how long the server was away: under
+the 16 s blaze waits for a byte. So the harness times how long the server was away: under
 10 s the fetch has to succeed with at least one resume; over that it may either succeed, or
 fail with no pack in the store and succeed when run again. Before that was written down the
 check failed on SeaweedFS in two runs of eight.
@@ -578,7 +578,7 @@ or need to kill the server. **Not run.**
 
 ## Regression gate
 
-Run on Linux x86-64 on the code as pushed (`ra-jit-collate` at `1547078a30` merged in),
+Run on Linux x86-64 on the code as pushed (`blaze-collate` at `1547078a30` merged in),
 with the `--features llvm` binary (LLVM 20.1) under `BLAZE_BACKEND=cranelift` and under
 `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`. Both gave the same results:
 
@@ -604,7 +604,7 @@ with the `--features llvm` binary (LLVM 20.1) under `BLAZE_BACKEND=cranelift` an
 
 `breakers.py` has 5 open on the base branch as merged; the script exits 0 with them.
 `buildmodel.py` does both backends itself and was run once. The `cross_aarch64` row that
-failed last round passes with the fix on `ra-jit-collate`.
+failed last round passes with the fix on `blaze-collate`.
 
 `remote.py` was run twice under Cranelift with the Cranelift-only binary (7m38s, 7m45s)
 and once under LLVM (8m17s): 178/178 each time. While the round was being written three
@@ -614,13 +614,13 @@ waited out for 26 s (the cause sits inside two transport errors, not in their so
 chain), and one run in which the disk of this machine was full.
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p ra-jit`: 512, 24, 330, 33 and 56 passed, 0 failed.
+-p syntax -p blaze-engine`: 512, 24, 330, 33 and 56 passed, 0 failed.
 
-`ra-jit-collate` has moved to `526f2963ba` since this round started; that is not merged in.
+`blaze-collate` has moved to `526f2963ba` since this round started; that is not merged in.
 
 ### CI
 
-The Linux job of `.github/workflows/ra-jit.yaml` now runs `remote.py` after the store
+The Linux job of `.github/workflows/blaze.yaml` now runs `remote.py` after the store
 harnesses, under both backends. The runner can start MinIO without privileges: MinIO is one
 statically linked program, and the job takes it out of the `cgr.dev/chainguard/minio` image
 (pinned by digest) with `docker create` and `docker cp`, which the runner's user may do
@@ -631,7 +631,7 @@ not changed for it and the run of this push was not waited for.
 
 The CI run of the round before (run 39040145198): the MinIO step passed, and `remote.py`
 gave 67/67 under both backends on the runner. The two harness jobs are red all the same,
-for two things that are red on `ra-jit-collate-wip`'s own run (39031491164) too:
+for two things that are red on `blaze-collate-wip`'s own run (39031491164) too:
 `debuginfo.py` ("wrong: 4" under both backends on the runner; it passes here) and
 `buildmodel.py` (the `cross_aarch64` row). Everything else in both jobs passed, and `fmt and tests`
 is green.

@@ -1,4 +1,4 @@
-//! Each lint `cargo blaze clippy` has, firing, and its level set by attributes.
+//! Each lint `blaze clippy` has, firing, and its level set by attributes.
 
 pub enum Never {}
 

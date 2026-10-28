@@ -48,8 +48,8 @@ fn main() -> anyhow::Result<()> {
             }
             "--store" => {
                 let dir = PathBuf::from(args.next().context("--store needs a directory")?);
-                ra_jit_store::compiles_against("blaze-registry");
-                let store = ra_jit_store::Store::global_or(Some(&dir)).context("the store")?;
+                blaze_store::compiles_against("blaze-registry");
+                let store = blaze_store::Store::global_or(Some(&dir)).context("the store")?;
                 context.store = Some(Arc::new(StoreRef(store)));
             }
             other => bail!("unknown argument `{other}`"),
@@ -108,7 +108,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("{}", serde_json::to_string(&counts)?);
-    if let Some(store) = ra_jit_store::Store::global() {
+    if let Some(store) = blaze_store::Store::global() {
         store.flush();
     }
     Ok(())
@@ -157,7 +157,7 @@ fn read_config(file: &Path, config: &mut SourceConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct StoreRef(&'static ra_jit_store::Store);
+struct StoreRef(&'static blaze_store::Store);
 
 impl blaze_registry::Blobs for StoreRef {
     fn get(&self, sha256: &[u8; 32]) -> Option<Vec<u8>> {

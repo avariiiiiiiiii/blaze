@@ -18,8 +18,8 @@ use rustc_hash::FxHashMap;
 
 use super::FunctionDebug;
 
-/// What starts a version string of ra-jit's, which tells its modules in a PDB from rustc's.
-const PRODUCER: &str = concat!("ra-jit ", env!("CARGO_PKG_VERSION"));
+/// What starts a version string of blaze's, which tells its modules in a PDB from rustc's.
+const PRODUCER: &str = concat!("blaze ", env!("CARGO_PKG_VERSION"));
 
 /// The first four bytes of a `.debug$S` section of the C13 format.
 const SIGNATURE_C13: u32 = 4;
@@ -127,7 +127,7 @@ impl CodeView {
         section.subsection(Subsection::Symbols, |out| {
             out.symbol(Symbol::ObjName, |out| {
                 out.u32(0);
-                out.text("ra-jit");
+                out.text("blaze");
             });
             out.symbol(Symbol::Compile3, |out| {
                 out.u32(LANGUAGE_RUST);

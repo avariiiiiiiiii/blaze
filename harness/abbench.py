@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-"""abbench.py: two or more builds of ra-jit against each other on bench.py's edits, interleaved.
+"""abbench.py: two or more builds of blaze against each other on bench.py's edits, interleaved.
 
     abbench.py --bin NAME=DIR [--bin NAME=DIR ...] [--env NAME=KEY=VALUE ...] [PROJECT...]
                [--rounds R] [--runs N] [--kinds body,leaf,signature,no-op] [--out FILE]
                [--work DIR] [--pause SECS] [--train]
 
-Each DIR holds a `ra-jit` and the programs it runs from next to itself (`cargo-ra-jit`,
-`ra-jit-rustc`). A round goes through the builds in turn, in an order that rotates from round to
+Each DIR holds a `blaze` and the programs it runs from next to itself (`blaze`,
+`blaze-rustc`). A round goes through the builds in turn, in an order that rotates from round to
 round; each build gets a copy of the project and a home and store of its own that live for the
 whole run, and in its turn it stops any daemon of its own, starts one from nothing, waits until
 it is warm (the cold start), and makes every edit `--runs` times and takes it back. So a machine
 that is busier for a while is busier for all of them alike, and every number is a median over
 `rounds x runs` samples.
 
-An edit is timed three ways: the wall time of `cargo ra-jit build`, the daemon's own
+An edit is timed three ways: the wall time of `blaze build`, the daemon's own
 `edit-to-binary`, and (macOS) the CPU cycles and instructions the daemon's workers spent on it,
 which a loaded machine moves much less than the wall time. Memory is the most the workers have
 held at once (VmHWM on Linux, the lifetime peak physical footprint on macOS), read at the end
 of each turn. Plain cargo never builds here: bench.py compares against cargo, this compares
-builds of ra-jit. `--env NAME=KEY=VALUE` sets a variable for one build only (an allocator
+builds of blaze. `--env NAME=KEY=VALUE` sets a variable for one build only (an allocator
 option, for example); the same DIR may be given under two names with different variables.
 `--train` ends each turn so that an instrumented build writes its profile
 (.github/scripts/build_release.py trains the release build this way).
 """
 import ctypes, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
-import cargo_ra_jit
+import blaze_cli
 from bench import PROJECTS, Daemon, cold_steps, daemon_steps, options, write_edit
-from cargo_ra_jit import Side, base_env, fetch, how_built, wait_warm
+from blaze_cli import Side, base_env, fetch, how_built, wait_warm
 
 DARWIN = platform.system() == "Darwin"
 
@@ -75,7 +75,7 @@ class Usage:
 
 
 class Build:
-    """One build of ra-jit under test: its copy of the project, its home and its store."""
+    """One build of blaze under test: its copy of the project, its home and its store."""
 
     def __init__(self, name, bindir, extra, project, spec, work):
         self.name, self.bindir, self.spec = name, os.path.realpath(bindir), spec
@@ -152,7 +152,7 @@ def end_for_profile(side, workers):
     if daemon:
         os.kill(int(daemon[1]), 9)
     began = time.time()
-    while any(cargo_ra_jit.alive(pid) for pid in workers) and time.time() - began < 120:
+    while any(blaze_cli.alive(pid) for pid in workers) and time.time() - began < 120:
         time.sleep(0.2)
 
 
@@ -186,7 +186,7 @@ def main():
     pause = float(options(argv, "--pause", "0.3")[0])
     train = "--train" in argv
     out = options(argv, "--out", "abbench.json")[0]
-    work = (options(argv, "--work") or [None])[0] or tempfile.mkdtemp(prefix="ra-jit-ab-")
+    work = (options(argv, "--work") or [None])[0] or tempfile.mkdtemp(prefix="blaze-ab-")
     projects = [a for a in argv if not a.startswith("--")] or ["ripgrep"]
     os.makedirs(work, exist_ok=True)
     result = dict(date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), machine=platform.machine(), os=platform.system(),

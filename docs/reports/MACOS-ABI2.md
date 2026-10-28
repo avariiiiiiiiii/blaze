@@ -1,6 +1,6 @@
 # macOS arm64: the remaining ABI and backend gaps
 
-Branch `ra-jit-macos-abi2`, cut from `ra-jit-collate` at 6d12f21c86. Everything under
+Branch `blaze-macos-abi2`, cut from `blaze-collate` at 6d12f21c86. Everything under
 "Measured" ran natively on an Apple Silicon Mac (`uname -m` is `arm64`, stable
 1.99.0-aarch64-apple-darwin, LLVM 20.1.8 from Homebrew) or in GitHub Actions as stated.
 Nothing was emulated except the one x86_64-apple-darwin attempt, which did not get as far
@@ -20,7 +20,7 @@ backends take this from the same classification in `aapcs64_abi`, so there is no
 copy for LLVM.
 
 New corpus cases: `foreign::aligned` and `foreign::wide_last`; `foreign::wides` is now
-compiled by ra-jit.
+compiled by blaze.
 
 ### Variadic definitions on Apple arm64
 
@@ -36,14 +36,14 @@ compiled by ra-jit.
   code for it; a `va_arg` of anything that is not one scalar is refused as before.
 
 New corpus cases: `stabilized::c_variadic_named_stack`, `c_variadic_named_wide` (Apple
-only, since ra-jit refuses such a definition elsewhere), and `c_variadic_wide` behind the
+only, since blaze refuses such a definition elsewhere), and `c_variadic_wide` behind the
 corpus's `nightly` feature (128-bit `va_arg` needs it).
 
 ### `sym` operands of `naked_asm!`
 
 MIR lowering resolves a `sym` to a static or to a function without generic parameters
 (`AsmOperand::Function`, `AsmOperand::Static`); anything else is refused. The text of the
-function names the operand `ra_jit_asm_sym_N`, the assembler leaves a relocation against
+function names the operand `blaze_asm_sym_N`, the assembler leaves a relocation against
 that name, and `asm::code` turns each one into a relocation against the function or the
 static the operand names. Branches, page/page-offset pairs and GOT loads are translated for
 Mach-O arm64; the ELF arm64 and ELF x86-64 kinds are in the same table but have never been
@@ -58,7 +58,7 @@ static read through `@PAGE`/`@PAGEOFF` with and without an addend).
 
 ### CI
 
-`.github/workflows/ra-jit.yaml` has a `macos` job on `macos-latest` for both backends: fmt
+`.github/workflows/blaze.yaml` has a `macos` job on `macos-latest` for both backends: fmt
 and the tests (once, in the Cranelift leg), the build with `--features llvm`, then corpus
 with `--layouts`, programs, stress, breakers, unwinds, splices, asmedits, deps, includes,
 worktrees in its three modes, and keys. `deps.py` is not in it, as it is not in the Linux
@@ -74,7 +74,7 @@ BLAZE_EMIT=fast`.
 
 | harness | Cranelift | LLVM |
 |---|---|---|
-| `difftest.py corpus --layouts` | MATCH, 816/816 from ra-jit; layouts 0 of 913 differ | MATCH, 816/816; 0 of 913 |
+| `difftest.py corpus --layouts` | MATCH, 816/816 from blaze; layouts 0 of 913 differ | MATCH, 816/816; 0 of 913 |
 | corpus with the `nightly` feature | MATCH, 825/825 | MATCH, 825/825 |
 | `programs.py` | 22/22 | 22/22 |
 | `stress.py` | 99/99, 0 restarts | 99/99, 0 restarts |
@@ -99,7 +99,7 @@ The harnesses that had not been run under LLVM before (worktrees in three modes,
 includes, and also deps and keys) passed on the first run; nothing needed fixing.
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p ra-jit` passes. `cargo clippy -p ra-jit -p hir-ty --all-targets` has no errors.
+-p syntax -p blaze-engine` passes. `cargo clippy -p blaze-engine -p hir-ty --all-targets` has no errors.
 
 GitHub Actions, on 8354d5f92f (the commits after it change this report only):
 
@@ -117,8 +117,8 @@ So Linux x86-64 was run on this branch, by CI, not by me locally.
 ## A bug this found on Linux x86-64
 
 The first push had the new `foreign::aligned` case on every target, and both Linux harness
-jobs failed the corpus on it: ra-jit printed 37476700408053505959396591 where rustc prints
-37476700408053504415892978. The function was compiled by ra-jit (806/806) and no code of
+jobs failed the corpus on it: blaze printed 37476700408053505959396591 where rustc prints
+37476700408053504415892978. The function was compiled by blaze (806/806) and no code of
 this branch is on that path, so this is a bug that was there: on x86-64 an aggregate
 aligned to sixteen bytes that goes to the stack is a Cranelift `StructArgument`, which
 Cranelift places at the next multiple of eight. The case has three such arguments; the
@@ -130,7 +130,7 @@ AArch64 the same situation is what this round fixed.
 
 Tried locally under Rosetta 2, not on a runner. `Target::parse` refuses the triple today.
 With one line added to accept it as Mach-O with the System V convention (not committed),
-ra-jit compiled the whole corpus crate and the link failed:
+blaze compiled the whole corpus crate and the link failed:
 
     ld: __eh_frame unexpected relocation type (1) at r_address=0x00065DA9
 
@@ -155,7 +155,7 @@ By reading the code, these are also missing: x86-64 Mach-O relocations in
   object and the caller extracts the code.
 - `mir.rs`, `lower.rs`, `monomorphization.rs`: two new `AsmOperand` variants. A `sym` in a
   naked function is now accepted on every target; the relocation table decides whether the
-  use of it is one ra-jit knows.
+  use of it is one blaze knows.
 
 ## What is left
 

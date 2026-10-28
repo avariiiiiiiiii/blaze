@@ -3,8 +3,8 @@
 ix VM, arm64, 16 vCPU, cranelift, the flake's nightly. The corpus is one binary using the
 macros of serde (Serialize, Deserialize), clap (Parser), tokio (main), thiserror (Error),
 async-trait, pin-project, derive_more (Display) and strum (EnumString), with serde_json:
-8 proc-macro modules. Each run is one `ra-jit <ws> --own-target --crate pmcorpus --out ..
---exe ..` (the build `cargo blaze build`'s daemon makes) with `BLAZE_CACHE` set to the
+8 proc-macro modules. Each run is one `blaze <ws> --own-target --crate pmcorpus --out ..
+--exe ..` (the build `blaze build`'s daemon makes) with `BLAZE_CACHE` set to the
 arm's own store and `BLAZE_STATS=1`, timed whole. native is `BLAZE_PROC_MACRO_WASM=0`
 (blaze builds the macro crates as native libraries for its server).
 
@@ -43,7 +43,7 @@ are medians of 6:
 
 ## Expansions, wasm against native, byte for byte
 
-`ra-jit proc-macro-wasm <module> --macro M --input F --runs 20 --native <lib>.so --server
+`blaze-engine proc-macro-wasm <module> --macro M --input F --runs 20 --native <lib>.so --server
 blaze-proc-macro-srv`, the module and the library both blaze's builds of the crate from the
 corpus's cold runs, no `.cwasm` and no store: milliseconds. Every output was the same text.
 

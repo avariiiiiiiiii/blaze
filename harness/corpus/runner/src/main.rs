@@ -66,7 +66,7 @@ fn main() {
     case!(
         rev,
         slices::str_len("héllo"),
-        slices::bytes_hash("ra-jit"),
+        slices::bytes_hash("blaze"),
         slices::literal(0),
         slices::literal(1)
     );

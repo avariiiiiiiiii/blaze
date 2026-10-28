@@ -1,8 +1,8 @@
 # MIR passes: from built MIR to runtime MIR
 
-This fork (indexable-inc/rust-analyzer, branch `ra-jit`) gives rust-analyzer's MIR the
+This fork (indexable-inc/rust-analyzer, branch `blaze`) gives rust-analyzer's MIR the
 pre-codegen passes rustc runs, so that the code generator of
-[ra-jit](https://github.com/indexable-inc/ra-jit) (`crates/hir-ty-codegen`) and the interpreter
+[blaze](https://github.com/indexable-inc/blaze) (`crates/hir-ty-codegen`) and the interpreter
 (`hir-ty/src/mir/eval.rs`) execute a body as rustc's post-pass MIR says, instead of each
 re-deriving drop flags, moves and unwinding on its own.
 
@@ -180,12 +180,12 @@ bounds check reading its length into a temporary where rustc uses the constant, 
 what a future keeps only where such a temporary lives across a yield, or a no-unwind call
 changes which unwind paths there are.
 
-ra-jit mixes futures by default now; `BLAZE_SPLIT_FUTURES=1` keeps a future and everything
+blaze mixes futures by default now; `BLAZE_SPLIT_FUTURES=1` keeps a future and everything
 that makes, polls or drops it on one side, until mixing is verified (`harness/mixfutures`).
 
 ## What the consumers do with it
 
-**ra-jit codegen** (`crates/hir-ty-codegen/mod.rs`) generates a Runtime body directly, and
+**blaze codegen** (`crates/hir-ty-codegen/mod.rs`) generates a Runtime body directly, and
 generates nothing else:
 - no drop flags of its own, in `async` bodies too;
 - `Drop` is `drop_in_place` and a jump;
@@ -219,7 +219,7 @@ body: `optimized_mir_body(def, level)`, `optimized_mir_body_for_closure` and the
 `monomorphized_optimized_*` variants, again separate salsa queries so nothing else computes
 them. `MirOptLevel` is rustc's `-Zmir-opt-level`: `Off` is the runtime body unchanged,
 `Debug` is level 1 (what `-Copt-level=0` gets), `Release` level 2 (above `-Copt-level=0`).
-ra-jit picks the level from `BLAZE_MIR_OPT` (0, the default, 1 or 2); the interpreter takes
+blaze picks the level from `BLAZE_MIR_OPT` (0, the default, 1 or 2); the interpreter takes
 it from `set_interpreter_mir_opt_level`.
 
 - Level 1: `CleanupPostBorrowck` (fake reads, false edges, `CopyForDeref`; also the storage
@@ -248,7 +248,7 @@ Where a port differs from rustc:
   and terminators in range), which names the pass that broke it.
 
 The interpreter's tests run every program at all three levels and require the same output
-(`hir-ide/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`). `harness/mirparity.py` in ra-jit
+(`hir-ide/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`). `harness/mirparity.py` in blaze
 compares the result with rustc's `-Zunpretty=mir`.
 
 ## Not done yet

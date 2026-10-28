@@ -2,13 +2,13 @@
  "rss": {
   "total_mb": 7853,
   "groups": {
-   "ra-jit-other:ra-jit build": {
+   "blaze-other:blaze build": {
     "n": 1,
     "rss_mb": 2,
     "pss_mb": 0,
     "anon_mb": 0
    },
-   "ra-jit-other:cargo build": {
+   "blaze-other:cargo build": {
     "n": 1,
     "rss_mb": 33,
     "pss_mb": 15,
@@ -20,7 +20,7 @@
     "pss_mb": 4,
     "anon_mb": 3
    },
-   "ra-jit-other:/root/fixcold/empty-fix-hyperfine/src/ --own-target": {
+   "blaze-other:/root/fixcold/empty-fix-hyperfine/src/ --own-target": {
     "n": 1,
     "rss_mb": 45,
     "pss_mb": 20,
@@ -32,7 +32,7 @@
     "pss_mb": 38,
     "anon_mb": 26
    },
-   "ra-jit-other:rustc-wrapper /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/rustc": {
+   "blaze-other:rustc-wrapper /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/rustc": {
     "n": 16,
     "rss_mb": 223,
     "pss_mb": 44,
@@ -61,13 +61,13 @@
  "pss": {
   "total_mb": 7131,
   "groups": {
-   "ra-jit-other:ra-jit build": {
+   "blaze-other:blaze build": {
     "n": 1,
     "rss_mb": 2,
     "pss_mb": 0,
     "anon_mb": 0
    },
-   "ra-jit-other:cargo build": {
+   "blaze-other:cargo build": {
     "n": 1,
     "rss_mb": 33,
     "pss_mb": 15,
@@ -79,7 +79,7 @@
     "pss_mb": 4,
     "anon_mb": 3
    },
-   "ra-jit-other:/root/fixcold/empty-fix-hyperfine/src/ --own-target": {
+   "blaze-other:/root/fixcold/empty-fix-hyperfine/src/ --own-target": {
     "n": 1,
     "rss_mb": 45,
     "pss_mb": 20,
@@ -91,7 +91,7 @@
     "pss_mb": 38,
     "anon_mb": 26
    },
-   "ra-jit-other:rustc-wrapper /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/rustc": {
+   "blaze-other:rustc-wrapper /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/rustc": {
     "n": 16,
     "rss_mb": 223,
     "pss_mb": 44,

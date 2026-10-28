@@ -1,7 +1,7 @@
 //! delta's `format_and_paint_line_numbers`: `(true, Some(Right))` where `Right` is a variant
 //! re-exported under another name, `pub use Index::Plus as Right`, by a module that itself
 //! names the enum through a private import. A variant is as visible as its enum is declared,
-//! but ra-jit gave it the visibility of the import the enum was reached by, so the re-export
+//! but blaze gave it the visibility of the import the enum was reached by, so the re-export
 //! was private, `Right` resolved to nothing elsewhere, and the pattern became a binding that
 //! matched every side.
 

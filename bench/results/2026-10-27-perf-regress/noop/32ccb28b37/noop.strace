@@ -1,10 +1,10 @@
-398635 00:20:28.520853 execve("/run/current-system/sw/bin/taskset", ["taskset", "-c", "0-3", "cargo", "ra-jit", "build"], 0xffffcc6dd1b8 /* 20 vars */) = 0
+398635 00:20:28.520853 execve("/run/current-system/sw/bin/taskset", ["taskset", "-c", "0-3", "blaze", "build"], 0xffffcc6dd1b8 /* 20 vars */) = 0
 398635 00:20:28.521195 openat(AT_FDCWD, "/nix/store/nhphqkv18x8fpf3flz0bsm1h554pawn7-glibc-2.44-57/lib/libc.so.6", O_RDONLY|O_CLOEXEC) = 4
 398635 00:20:28.521823 openat(AT_FDCWD, "/run/current-system/sw/lib/locale/locale-archive", O_RDONLY|O_CLOEXEC) = 4
-398635 00:20:28.522010 execve("/root/perf/bin/32ccb28b37/cargo", ["cargo", "ra-jit", "build"], 0xffffe98f2710 /* 20 vars */) = -1 ENOENT (No such file or directory)
-398635 00:20:28.522079 execve("/nix/var/nix/profiles/default/bin/cargo", ["cargo", "ra-jit", "build"], 0xffffe98f2710 /* 20 vars */) = 0
+398635 00:20:28.522010 execve("/root/perf/bin/32ccb28b37/cargo", ["blaze", "build"], 0xffffe98f2710 /* 20 vars */) = -1 ENOENT (No such file or directory)
+398635 00:20:28.522079 execve("/nix/var/nix/profiles/default/bin/cargo", ["blaze", "build"], 0xffffe98f2710 /* 20 vars */) = 0
 398635 00:20:28.522343 openat(AT_FDCWD, "/nix/store/nhphqkv18x8fpf3flz0bsm1h554pawn7-glibc-2.44-57/lib/libc.so.6", O_RDONLY|O_CLOEXEC) = 4
-398635 00:20:28.522932 execve("/nix/store/z5fwb1020i3rf4qk88w3jkf1cm6yg175-rustup-1.29.1/bin/.rustup-wrapped", ["cargo", "ra-jit", "build"], 0xb2c565ec3010 /* 21 vars */) = 0
+398635 00:20:28.522932 execve("/nix/store/z5fwb1020i3rf4qk88w3jkf1cm6yg175-rustup-1.29.1/bin/.rustup-wrapped", ["blaze", "build"], 0xb2c565ec3010 /* 21 vars */) = 0
 398635 00:20:28.523286 openat(AT_FDCWD, "/nix/store/nw9zbfc171gdsali7fcgl6rayfy5ykkx-zlib-1.3.2/lib/libssl.so.3", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
 398635 00:20:28.523341 openat(AT_FDCWD, "/nix/store/r5w60683qmv7p1lzdj6xd9i0lms8b42i-curl-8.22.0/lib/libssl.so.3", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
 398635 00:20:28.523393 openat(AT_FDCWD, "/nix/store/33r0n37000780rlkipq2zna6yn0aw20f-openssl-3.5.9/lib/libssl.so.3", O_RDONLY|O_CLOEXEC) = 4
@@ -151,7 +151,7 @@
 398635 00:20:28.542107 openat(7, "nightly-2026-10-25-aarch64-unknown-linux-gnu", O_RDONLY|O_NOCTTY|O_CLOEXEC) = 8
 398635 00:20:28.542277 connect(7, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = 0
 398635 00:20:28.542502 connect(7, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = 0
-398635 00:20:28.542680 execve("/root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/cargo", ["/root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/cargo", "ra-jit", "build"], 0xb2fdd2611750 /* 25 vars */ <unfinished ...>
+398635 00:20:28.542680 execve("/root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/cargo", ["/root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/bin/cargo", "blaze", "build"], 0xb2fdd2611750 /* 25 vars */ <unfinished ...>
 398638 00:20:28.542787 +++ exited with 0 +++
 398637 00:20:28.542789 +++ exited with 0 +++
 398639 00:20:28.542791 +++ exited with 0 +++
@@ -190,7 +190,7 @@
 398635 00:20:28.549491 openat(AT_FDCWD, "/.cargo/config.toml", O_RDONLY|O_CLOEXEC) = 4
 398635 00:20:28.550512 openat(AT_FDCWD, "/dev/urandom", O_RDONLY) = 4
 398635 00:20:28.551771 openat(AT_FDCWD, "/etc/pki/tls/certs/ca-bundle.crt", O_RDONLY) = 4
-398635 00:20:28.560653 execve("/root/perf/bin/32ccb28b37/cargo-ra-jit", ["/root/perf/bin/32ccb28b37/cargo-ra-jit", "ra-jit", "build"], 0xad2ea7383310 /* 28 vars */) = 0
+398635 00:20:28.560653 execve("/root/perf/bin/32ccb28b37/blaze", ["/root/perf/bin/32ccb28b37/blaze", "blaze", "build"], 0xad2ea7383310 /* 28 vars */) = 0
 398635 00:20:28.561455 openat(AT_FDCWD, "/root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/lib/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
 398635 00:20:28.561510 openat(AT_FDCWD, "/nix/store/nw9zbfc171gdsali7fcgl6rayfy5ykkx-zlib-1.3.2/lib/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
 398635 00:20:28.561560 openat(AT_FDCWD, "/home/runner/work/blaze/blaze/outputs/out/lib/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
@@ -200,7 +200,7 @@
 398635 00:20:28.561930 openat(AT_FDCWD, "/nix/store/nw9zbfc171gdsali7fcgl6rayfy5ykkx-zlib-1.3.2/lib/libc.so.6", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
 398635 00:20:28.561959 openat(AT_FDCWD, "/nix/store/nhphqkv18x8fpf3flz0bsm1h554pawn7-glibc-2.44-57/lib/libc.so.6", O_RDONLY|O_CLOEXEC) = 4
 398635 00:20:28.562653 openat(AT_FDCWD, "/proc/self/maps", O_RDONLY|O_CLOEXEC) = 4
-398640 00:20:28.563323 execve("/root/perf/bin/32ccb28b37/ra-jit", ["/root/perf/bin/32ccb28b37/ra-jit", "cargo", "build"], 0xffffddbb7368 /* 28 vars */) = 0
+398640 00:20:28.563323 execve("/root/perf/bin/32ccb28b37/blaze", ["/root/perf/bin/32ccb28b37/blaze", "cargo", "build"], 0xffffddbb7368 /* 28 vars */) = 0
 398635 00:20:28.563452 wait4(398640 <unfinished ...>
 398640 00:20:28.563563 openat(AT_FDCWD, "/root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu/lib/libLLVM.so.20.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
 398640 00:20:28.563616 openat(AT_FDCWD, "/nix/store/nw9zbfc171gdsali7fcgl6rayfy5ykkx-zlib-1.3.2/lib/libLLVM.so.20.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
@@ -318,13 +318,13 @@
 398640 00:20:28.593797 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/crates/searcher/src/searcher", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 8
 398640 00:20:28.594512 connect(4, {sa_family=AF_UNIX, sun_path="/root/perf/noop-ws/32ccb28b37/home/daemon.sock"}, 49) = 0
 398640 00:20:28.596007 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/debug/.cargo-lock", O_RDONLY|O_CLOEXEC) = 4
-398640 00:20:28.596062 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/ra-jit/13235e8183f4dc96/programs/rg-30977ab954fffd64/bin", O_RDONLY|O_CLOEXEC) = 5
-398640 00:20:28.596155 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/ra-jit/13235e8183f4dc96/programs/rg-30977ab954fffd64/bin", O_RDONLY|O_CLOEXEC) = 6
+398640 00:20:28.596062 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/blaze/13235e8183f4dc96/programs/rg-30977ab954fffd64/bin", O_RDONLY|O_CLOEXEC) = 5
+398640 00:20:28.596155 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/blaze/13235e8183f4dc96/programs/rg-30977ab954fffd64/bin", O_RDONLY|O_CLOEXEC) = 6
 398640 00:20:28.596205 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/debug/rg", O_RDONLY|O_CLOEXEC) = 7
-398640 00:20:28.596294 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/ra-jit/13235e8183f4dc96/programs/rg-30977ab954fffd64/bin", O_RDONLY|O_CLOEXEC) = 6
+398640 00:20:28.596294 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/blaze/13235e8183f4dc96/programs/rg-30977ab954fffd64/bin", O_RDONLY|O_CLOEXEC) = 6
 398640 00:20:28.596340 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/debug/build/ripgrep/30977ab954fffd64/out/rg", O_RDONLY|O_CLOEXEC) = 7
 398640 00:20:28.596732 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/home/states/13235e8183f4dc96.398640.new", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 5
-398640 00:20:28.596908 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/debug/.ra-jit-units/rg-30977ab954fffd64/states", O_RDONLY|O_CLOEXEC) = 5
+398640 00:20:28.596908 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/rg/target/debug/.blaze-units/rg-30977ab954fffd64/states", O_RDONLY|O_CLOEXEC) = 5
 398640 00:20:28.597030 openat(AT_FDCWD, "/root/perf/noop-ws/32ccb28b37/home/states/13235e8183f4dc96.kept.json", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 5
 398640 00:20:28.597568 exit_group(0)    = ?
 398640 00:20:28.600019 +++ exited with 0 +++

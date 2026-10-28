@@ -60,13 +60,13 @@ the cache; it returns a WAV and word timings (Qwen3-ForcedAligner). ffmpeg norma
 
 ## Pronunciation: `audio/lexicon.toml`
 
-The voice reads technical words badly ("ra-jit" as "Rajeed", "1.99.0" as "1009.0"). Just before synthesis,
+The voice reads technical words badly ("blaze" as "Rajeed", "1.99.0" as "1009.0"). Just before synthesis,
 generate.py rewrites each line through the lexicon; the model gets the spoken form, the page and manifest keep theirs.
 
 ```toml
 [words]                      # whole word, case-sensitive: display form = spoken form
 "rustc" = "rust C"
-"ra-jit" = "R A jit"
+"blaze" = "R A jit"
 
 [[rules]]                    # regexes (Python `re`), applied after the words
 name = "version"
@@ -74,7 +74,7 @@ pattern = '(?<![\w.])(\d+)\.(\d+)\.(\d+)(?![\w]|\.\d)'
 spoken = '\1 point \2 point \3'
 ```
 
-- A word matches where it is not next to a letter, digit or underscore, so `ra-jit's`, `(rustc)` and `cap-std` match,
+- A word matches where it is not next to a letter, digit or underscore, so `blaze's`, `(rustc)` and `cap-std` match,
   `rustcx` does not. The longest entry wins (`DAG-CBOR` before `CBOR`). Words and rules work within one
   whitespace-separated word. Text inside `[directions]` and the `<tag>`/`</tag>` markers themselves is never
   touched; the words between an opening and closing tag are (`<emphasis>rustc</emphasis>` becomes
@@ -83,11 +83,11 @@ spoken = '\1 point \2 point \3'
   Whisper over them (what was done to seed the file). Capitalised and spelled forms matter: "R A" is said as letters,
   "Ra" is not.
 - Word timings: the aligner times the spoken words; the manifest gets one entry per page word, from the start of its
-  first spoken word to the end of its last (`ra-jit` spans "R A jit"). listen.ts matches manifest words to the page by
+  first spoken word to the end of its last (`blaze` spans "R A jit"). listen.ts matches manifest words to the page by
   their letters and digits, so the manifest words must be the page's.
 - The cache key holds the spoken text, so editing an entry regenerates only the lines it changes.
 - `--check` puts both the text and the transcript through the lexicon (the transcript in any case), spells numbers
-  out, and joins runs of single letters, so "R A jit", "RA-JIT" and "ra-jit" compare equal.
+  out, and joins runs of single letters, so "R A jit", "BLAZE" and "blaze" compare equal.
 
 ## The build
 
@@ -117,12 +117,12 @@ Safari 18.4.
 The files should not be in the Worker's static assets (they change as pages change, and the asset count is limited).
 The plan, none of it done (each step needs approval):
 
-1. `wrangler r2 bucket create ra-jit-audio`.
-2. In `wrangler.jsonc`: `"r2_buckets": [{ "binding": "AUDIO", "bucket_name": "ra-jit-audio" }]`. `worker/audio.ts`
+1. `wrangler r2 bucket create blaze-audio`.
+2. In `wrangler.jsonc`: `"r2_buckets": [{ "binding": "AUDIO", "bucket_name": "blaze-audio" }]`. `worker/audio.ts`
    already serves `/audio/<sha>.webm` from `AUDIO` when it is bound (with Range, which Safari needs, and
    `immutable` caching), and from the assets otherwise.
 3. Upload from the Mac after generating: for each file in `.audio/files/`,
-   `wrangler r2 object put ra-jit-audio/<name> --file .audio/files/<name> --content-type audio/webm --remote`.
+   `wrangler r2 object put blaze-audio/<name> --file .audio/files/<name> --content-type audio/webm --remote`.
    Names are content hashes, so uploading is add-only and safe to repeat.
 4. Commit `audio/manifests/`, and build with `SITE_AUDIO_REMOTE=1` in the `site` workflow, so manifests ship and the
    files are taken from R2.

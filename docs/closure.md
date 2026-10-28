@@ -1,7 +1,7 @@
 # The closure build scripts run with
 
 2026-10-27. Status: fetching, keeping and laying out the closure is built
-(`crates/ra-jit/src/cargo/closure/`). The mount namespace that shows a build script only this
+(`crates/blaze-engine/src/cargo/closure/`). The mount namespace that shows a build script only this
 closure, its package and its `OUT_DIR`, and the table of which crate needs which library, are
 other lanes' work and not built yet.
 
@@ -24,7 +24,7 @@ binary: blaze reads the cache's format itself.
 
 ## What is pinned
 
-`crates/ra-jit/src/cargo/closure/pins.txt`, written by `python3 harness/closure_pins.py
+`crates/blaze-engine/src/cargo/closure/pins.txt`, written by `python3 harness/closure_pins.py
 --write` (in an ix VM, where nix is: the script runs `nix eval` on the pinned revision to name
 each root's store path, and reads each path's NarHash and closure from cache.nixos.org's
 `.narinfo` files; it is a tool for moving the pin, not a part of blaze). It names:
@@ -55,7 +55,7 @@ libstdc++).
 
 ## From cache.nixos.org to blaze's store: CI only
 
-`ra-jit closure fetch [--host HOST] [ROOT...]`, every root of the host by default:
+`blaze-engine closure fetch [--host HOST] [ROOT...]`, every root of the host by default:
 
 1. Each root's `<hash>.narinfo` is read from cache.nixos.org (or `BLAZE_NIX_CACHE`, an address
    or a directory laid out as a cache is), then each path its `References` name, to the whole
@@ -74,13 +74,13 @@ libstdc++).
    sealed and every entry added is looked up again: an entry the store did not keep fails the
    fetch.
 
-Then CI sends the store to the remote cache like any other: `ra-jit cache push REMOTE
+Then CI sends the store to the remote cache like any other: `blaze-engine cache push REMOTE
 nix-closure`, from a store that holds only the closure, so that the project `nix-closure` lists
 only its packs. The gateway needs no change: these are ordinary packs.
 
 ## How the store keeps a store path
 
-- **Pieces.** Each file's bytes are cut into pieces of 1 MiB (`ra_jit_store::BLOCK_MAX`), the
+- **Pieces.** Each file's bytes are cut into pieces of 1 MiB (`blaze_store::BLOCK_MAX`), the
   last shorter, each a store entry keyed by `sha256(len, "nix file piece 1", len, bytes)`. The
   store packs a value of up to 1 MiB in a zstd block; a larger one would be kept as it is, so
   1 MiB is the largest piece that is compressed. Pieces are keyed by their bytes, so a file two
@@ -99,7 +99,7 @@ only its packs. The gateway needs no change: these are ordinary packs.
 
 ## From blaze's store to a directory: everyone
 
-`ra-jit closure materialize [--host HOST] [ROOT...]` walks the roots' closure in the store and
+`blaze-engine closure materialize [--host HOST] [ROOT...]` walks the roots' closure in the store and
 lays each store path out as `~/.blaze/nix/<hash>-<name>` (`BLAZE_HOME/nix`), printing each store
 path and its directory. With `BLAZE_REMOTE` set it first reads which pack of the project
 `nix-closure` holds which key, and the store fetches a pack when a key of it is first asked for.
@@ -118,7 +118,7 @@ paths in its programs and links point.
 
 ## The API the other lanes use
 
-In `crates/ra-jit/src/cargo/closure/mod.rs`:
+In `crates/blaze-engine/src/cargo/closure/mod.rs`:
 
 - `roots(host: &str) -> Vec<Root>`: pins.txt's roots for `x86_64-linux` or `aarch64-linux`,
   each its `attribute` (`openssl.dev`), its `StorePath` and its closure's size. `host()` is this
@@ -160,7 +160,7 @@ tree is the one whose NarHash cache.nixos.org signs. With an empty store and no 
 ## What is left
 
 - The mount namespace and the build-script runner (lane `nsroot`), and the per-crate table.
-- A CI job that runs `ra-jit closure fetch` for both hosts into a fresh store and pushes it as
+- A CI job that runs `blaze-engine closure fetch` for both hosts into a fresh store and pushes it as
   `nix-closure`, on each move of the pin.
 - A process takes keys it lacks from one remote project: the daemon pulls its own project, so
   for build scripts it runs, the closure's project is to be read beside it.

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""rustcbase.py: the first edits after a cold `cargo ra-jit build`, which the daemon splices into
+"""rustcbase.py: the first edits after a cold `blaze build`, which the daemon splices into
 the executable rustc linked (issue #11), against plain cargo.
 
     rustcbase.py [--work DIR] [SCENARIO...]
 
 Writes a workspace of two crates (a program and a library it calls) into WORK/ws. Each scenario
-starts from an empty target directory, BLAZE_HOME and store: `cargo ra-jit build`, then once
-the daemon is ready its edits one after the other, each built by `cargo ra-jit build` and by
+starts from an empty target directory, BLAZE_HOME and store: `blaze build`, then once
+the daemon is ready its edits one after the other, each built by `blaze build` and by
 `cargo build` into a target directory of its own. Both programs run without arguments and with
 `panic`; stdout, stderr and the exit status must be the same. Each edit also has the way it was
 built checked: `patch` when it was spliced into the executable it had (rustc's, or the daemon's
@@ -14,7 +14,7 @@ own once it built one), `full` when the daemon built the program in full first. 
 in full while the program is still what rustc linked is spliced into that whole (`whole`, issue
 #159), and a scenario's `full` asks for that there. A scenario's
 `wait` is how long it waits once ready, which lets the daemon build its own base meanwhile.
-The `cached-` scenarios have a program with a `#[ra_jit::cache]` function instead, whose
+The `cached-` scenarios have a program with a `#[blaze::cache]` function instead, whose
 results are kept in WORK/fn-cache.
 
 Exits 1 when an output differs, an edit was built another way than the scenario says, or a
@@ -152,7 +152,7 @@ FILES = {
 M = "app/src/main.rs"
 D = "dep/src/lib.rs"
 
-# A program with a `#[ra_jit::cache]` function (docs/fn-cache.md): rustc's copy of it caches
+# A program with a `#[blaze::cache]` function (docs/fn-cache.md): rustc's copy of it caches
 # nothing, ours does, and a patch of what it reaches must not find what the code before kept.
 CACHED_MAIN = """\
 #[inline(never)]
@@ -160,7 +160,7 @@ fn mix(x: u64) -> u64 {
     x.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
 }
 
-#[ra_jit::cache]
+#[blaze::cache]
 fn slow(rounds: u64) -> u64 {
     let mut acc: u64 = 1;
     for i in 0..rounds {
@@ -185,7 +185,7 @@ fn main() {
 CACHED_FILES = {
     **FILES,
     "app/Cargo.toml": FILES["app/Cargo.toml"]
-    + f'ra-jit-cache = {{ path = "{os.path.dirname(HERE)}/crates/ra-jit-cache" }}\n',
+    + f'blaze-cache = {{ path = "{os.path.dirname(HERE)}/crates/blaze-cache" }}\n',
     "app/src/main.rs": CACHED_MAIN,
 }
 
@@ -800,14 +800,14 @@ def main():
         os.makedirs(home, mode=0o700)
         env = dict(base, BLAZE_HOME=home, CARGO_TARGET_DIR=target, BLAZE_CACHE=store, **extra)
         began = time.monotonic()
-        r = run(["cargo", "ra-jit", "build"], ws, env)
+        r = run(["blaze", "build"], ws, env)
         if r.returncode:
             failed.append(f"{name}: cold build failed: {r.stderr[-1500:]}")
             print(f"{name}: cold build FAILED\n{r.stderr[-1500:]}", flush=True)
             continue
         built = time.monotonic() - began
         while True:
-            out = run(["cargo", "ra-jit", "status"], ws, env).stdout
+            out = run(["blaze", "status"], ws, env).stdout
             states = re.findall(rf"^    {re.escape(ws)}: (.*)$", out, re.M)
             if states and not any(s.startswith("loading") for s in states):
                 break
@@ -838,10 +838,10 @@ def main():
                     open(path, "w").write(text.replace(old, new))
                 seen = len(logs(home))
                 t = time.monotonic()
-                r = run(["cargo", "ra-jit", "build"], ws, env)
+                r = run(["blaze", "build"], ws, env)
                 took = time.monotonic() - t
                 if r.returncode:
-                    raise RuntimeError(f"ra-jit build {step} failed: {r.stderr[-1500:]}")
+                    raise RuntimeError(f"blaze build {step} failed: {r.stderr[-1500:]}")
                 time.sleep(0.2)
                 lines = logs(home)[seen:]
                 r = run(["cargo", "build"], ws, cargo_env)
@@ -858,7 +858,7 @@ def main():
                     print(f"      {it[:240]}", flush=True)
                 if not same:
                     failed.append(f"{name} edit {step}: output differs")
-                    print(f"    ra-jit: {ours}\n    cargo:  {theirs}", flush=True)
+                    print(f"    blaze: {ours}\n    cargo:  {theirs}", flush=True)
                 if want and how != want:
                     failed.append(f"{name} edit {step}: {how}, not {want}")
                     for it in lines[-60:]:
@@ -871,7 +871,7 @@ def main():
             failed.append(f"{name}: {e}")
             print(f"  FAILED: {e}", flush=True)
         finally:
-            run(["cargo", "ra-jit", "stop"], ws, env)
+            run(["blaze", "stop"], ws, env)
     print("\n" + ("\n".join(failed) if failed else f"all {len(names)} scenarios as expected"))
     sys.exit(1 if failed else 0)
 

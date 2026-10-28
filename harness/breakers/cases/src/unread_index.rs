@@ -1,6 +1,6 @@
 //! Found by the fuzzer (`fuzz/found/differs-panic-location-L2-154-c15.rs`): an element of an
 //! array or slice that is matched on by a pattern that reads nothing. The index is still
-//! checked, so `let _ = items[at]` panics when `at` is out of bounds. ra-jit made no code for
+//! checked, so `let _ = items[at]` panics when `at` is out of bounds. blaze made no code for
 //! a place that is not read, and the program went on.
 
 use std::hint::black_box;

@@ -14,7 +14,7 @@
 
 [package]
 edition = "2024"
-name = "ra-ap-rustc_type_ir"
+name = "rustc_type_ir"
 version = "0.0.0"
 build = false
 autolib = false
@@ -38,7 +38,7 @@ repository = "https://github.com/rust-lang/rust"
 nightly = []
 
 [lib]
-name = "ra_ap_rustc_type_ir"
+name = "rustc_type_ir"
 path = "src/lib.rs"
 
 [dependencies.arrayvec]
@@ -64,7 +64,7 @@ version = "2.0.0"
 path = "../../crates/rustc_abi"
 version = "0.0.0"
 default-features = false
-package = "ra-ap-rustc_abi"
+package = "rustc_abi"
 
 [dependencies.rustc_ast_ir]
 version = "0.166.0"

@@ -1,5 +1,5 @@
 {
-  "row": "`lto = true` in a program of one crate, ra-jit given the link line",
+  "row": "`lto = true` in a program of one crate, blaze given the link line",
   "package": "app",
   "crates": [
     "app"
@@ -7,7 +7,7 @@
   "cargo": [
     "--release"
   ],
-  "ra-jit": [
+  "blaze": [
     "--release"
   ],
   "link": [

@@ -1,7 +1,7 @@
 // Found by fuzz.py: seed told-rpx-57, case c20, edition 2021, backend llvm.
 // differs: died
 // Reduced in 72 builds. Again: fuzz.py check differs-died-told-rpx-57-c20.rs
-// ra-jit's program ended with status -11 in this case
+// blaze's program ended with status -11 in this case
 // 
 mod c20 {
     use super::*;

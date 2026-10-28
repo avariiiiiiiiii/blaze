@@ -434,7 +434,7 @@ fn pointerish(
 
 /// The type of a static's global: one without a size, which LLVM does not take to be at an
 /// address of its own.
-const STATIC: &str = "ra-jit.static";
+const STATIC: &str = "blaze.static";
 
 /// The source locations of the IR as lines of a file that is not there, for LLVM to say
 /// in its line table which instructions became which code, and the stack slots of named
@@ -465,9 +465,9 @@ impl<'ctx> Debug<'ctx> {
         let (builder, unit) = module.create_debug_info_builder(
             false,
             DWARFSourceLanguage::Rust,
-            "ra-jit",
+            "blaze",
             "",
-            "ra-jit",
+            "blaze",
             false,
             "",
             0,

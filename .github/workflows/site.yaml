@@ -103,7 +103,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: site
-          command: d1 migrations apply ra-jit-updates --remote
+          command: d1 migrations apply blaze-updates --remote
       - name: Deploy
         if: steps.credentials.outputs.present == 'true'
         uses: cloudflare/wrangler-action@v4

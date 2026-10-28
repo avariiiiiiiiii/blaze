@@ -1,4 +1,4 @@
-# Borrow checking for ra-jit: rustc's NLL, Polonius, and what to build
+# Borrow checking for blaze: rustc's NLL, Polonius, and what to build
 
 Date: 2026-10-20. Pinned rustc: nightly-2026-10-09, rust-lang/rust
 [`a30aa9064df6a504b6a323c6884a2f4cfbfff666`](https://github.com/rust-lang/rust/tree/a30aa9064df6a504b6a323c6884a2f4cfbfff666)
@@ -54,7 +54,7 @@ Fetched material is under `docs/upstream/borrowck/`, listed in its `SOURCE.md`.
 8. **rust-analyzer never had a real borrow checker** (no regions, no loans; it computed
    mutability and moves out of references), and upstream deleted it in
    [rust-lang/rust-analyzer#23043](https://github.com/rust-lang/rust-analyzer/pull/23043)
-   (2026-08-05), which ra-jit's vendored copy carries as commit `ed03b37400` (read).
+   (2026-08-05), which blaze's vendored copy carries as commit `ed03b37400` (read).
 9. **Recommendation**: implement rustc's borrowck structure (NLL region inference plus the alpha's
    loan liveness) on rust-analyzer's MIR, with the default mode equal to the pinned nightly's
    default and an NLL mode equal to `-Zpolonius=off`; do not implement the datalog analysis.
@@ -328,7 +328,7 @@ only live where a live region reaches it (read: section 2.2). Examples from the 
     the alpha, 1 accepted by the alpha and rejected by legacy
     ([table](../upstream/borrowck/rust-lang-rust/ui-polonius-revisions-table.md)).
 
-## 3. rust-analyzer's borrowck and ra-jit's state
+## 3. rust-analyzer's borrowck and blaze's state
 
 - rust-analyzer's `hir-ty/src/mir/borrowck.rs` (696 lines) called itself "an ad-hoc
   implementation, only useful for mutability analysis" (read:
@@ -343,15 +343,15 @@ only live where a live region reaches it (read: section 2.2). Examples from the 
   rustc gives E0596/E0594 for most "needs mut" cases and E0384 only for reassignment (read: section 1.4),
   so the codes did not line up.
 - Upstream removed it in [rust-lang/rust-analyzer#23043](https://github.com/rust-lang/rust-analyzer/pull/23043)
-  ("Our borrowck is both hopeless and not important", merged 2026-08-05) (reported). In ra-jit's
+  ("Our borrowck is both hopeless and not important", merged 2026-08-05) (reported). In blaze's
   history that is commit `ed03b3740084` (parent `6817dd3094`), reached through the
   `vendor/rust-analyzer/` subtree, deleting about 3,100 lines in 22 files (read: `git show --stat`).
-  ra-jit did not remove it; it inherited the removal.
-- ra-jit's documentation says there is no borrow checker and to keep running `cargo check`; a warm
+  blaze did not remove it; it inherited the removal.
+- blaze's documentation says there is no borrow checker and to keep running `cargo check`; a warm
   daemon ran a program using a `String` after a move that rustc rejects with E0382 (read:
   `README.md:108`, `docs/support.md:179-185`).
-- In this worktree another lane has uncommitted `crates/ra-jit/src/borrowck.rs`
-  (`ra-jit borrowck [--edition E]`, JSON diagnostics per file) and `harness/borrowck_ui.py`, which
+- In this worktree another lane has uncommitted `crates/blaze-engine/src/borrowck.rs`
+  (`blaze-engine borrowck [--edition E]`, JSON diagnostics per file) and `harness/borrowck_ui.py`, which
   scores against rustc's own UI tests in two modes, passing `-Zpolonius=next` for the primary score
   and `-Zpolonius=off` for NLL (read: `harness/borrowck_ui.py:1-30,244`; not committed, may change).
   Its `polonius_of` maps `-Zpolonius=no` to legacy, where rustc treats `no` as off; no test at
@@ -368,7 +368,7 @@ only live where a live region reaches it (read: section 2.2). Examples from the 
 ## 4. Recommendation
 
 **Target the pinned nightly exactly.** The reference for "correct" is rustc nightly-2026-10-09 on
-the same file: its default (the Polonius alpha with the next trait solver) for ra-jit's default
+the same file: its default (the Polonius alpha with the next trait solver) for blaze's default
 mode, and `-Zpolonius=off` for an NLL mode that matches beta and stable. A unit is right when the
 set of (error code, line) matches, as the harness scores it. Pass the flag explicitly when running
 rustc as the oracle; never rely on the default, which differs between nightly and stable builds.
@@ -376,7 +376,7 @@ rustc as the oracle; never rely on the default, which differs between nightly an
 Implications:
 
 - Matching exactly means also accepting what the alpha wrongly accepts (section 2.4's issues). That
-  is what `cargo ra-jit` users get from nightly rustc anyway; keep those cases as known
+  is what `blaze` users get from nightly rustc anyway; keep those cases as known
   divergences from soundness, and follow upstream fixes when the pin moves (unverified judgment).
 - Do not implement the datalog analysis: rustc is deleting it and it is not the target (read and
   reported: section 2.3). Treat `legacy` revisions as out of scope, as the harness does.

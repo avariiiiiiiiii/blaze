@@ -1,4 +1,4 @@
-//! `cargo blaze fmt`: rustfmt's `src/cargo-fmt/main.rs` at rust-lang/rust 12433c307 (MIT or
+//! `blaze fmt`: rustfmt's `src/cargo-fmt/main.rs` at rust-lang/rust 12433c307 (MIT or
 //! Apache-2.0). The workspace comes from `blaze-manifest` instead of `cargo metadata`, the
 //! arguments are read by hand instead of by clap, and rustfmt runs in this process through
 //! [`crate::cli::main`] instead of as a child.

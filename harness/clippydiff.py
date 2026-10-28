@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compares `cargo blaze clippy` with stock `cargo clippy` on the bench apps and a fixture.
+"""Compares `blaze clippy` with stock `cargo clippy` on the bench apps and a fixture.
 
 For each app it lints a copy with both, `--all-targets --message-format=json` (or the
 arguments `--args` gives, with `--message-format=json`), and compares

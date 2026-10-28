@@ -37,7 +37,7 @@ reads. Both are in the attached patch (13 lines).
 
 **How it was found.** rust-analyzer's `infer` and MIR queries have cycle handling. With
 `lru = 2048` on `infer`, `mir_body` and `runtime_mir_body` (and 1,024 on their closure
-queries) in [ra-jit](https://github.com/indexable-inc/ra-jit), a daemon that builds
+queries) in [blaze](https://github.com/indexable-inc/blaze), a daemon that builds
 rust-analyzer's MIR, nushell's cold build died: under lldb the throw was
 `Cancelled::throw` from `MemoHeader::previous_iteration` inside `infer`'s `execute`, reached
 from another query's `maybe_changed_after`. With the patch the same build and its edits finish,
@@ -45,4 +45,4 @@ and each program built behaves as cargo's.
 
 **Not covered.** A regression test: one would evict a memo of a cycle-handling query in one
 revision, deep-verify it in the next through a dependent, then fetch it. The patch was checked
-by ra-jit's own suites, not salsa's.
+by blaze's own suites, not salsa's.

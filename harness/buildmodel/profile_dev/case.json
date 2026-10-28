@@ -5,5 +5,5 @@
     "app"
   ],
   "cargo": [],
-  "ra-jit": []
+  "blaze": []
 }

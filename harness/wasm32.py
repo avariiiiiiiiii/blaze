@@ -7,7 +7,7 @@ target reaches everything the harness imports before it reads it:
 
   - corpus: `difftest.py corpus` for wasm32-wasip1 under wasmtime, against cargo's build;
   - stress: `stress.py` for wasm32-wasip1, the daemon's edits on a small std program;
-  - allrajit: `allrajit_wasm.py`, programs and libraries with nothing of rustc's (wasip1
+  - allblaze: `allblaze_wasm.py`, programs and libraries with nothing of rustc's (wasip1
     programs, a wasm32-unknown-unknown cdylib and a `#![no_std]` simd128 guest), their target
     their own.
 
@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHECKS = [
     ("corpus", "wasm32-wasip1", ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases"], 1800),
     ("stress", "wasm32-wasip1", ["stress.py"], 1800),
-    ("allrajit", None, ["allrajit_wasm.py"], 1800),
+    ("allblaze", None, ["allblaze_wasm.py"], 1800),
 ]
 
 

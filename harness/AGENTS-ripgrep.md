@@ -13,7 +13,7 @@
 | 6 | unit 4 added (closure) | patch | 409 | same |
 | 7 | unit 4 (closure) to version 1 | patch | 401 | same |
 | 8 | unit 5 added (async) | patch | 253 | same |
-| 9 | BROKEN: syntax error in crates/core/ra_jit_u3.rs | error | 56 | said so |
+| 9 | BROKEN: syntax error in crates/core/blaze_u3.rs | error | 56 | said so |
 | 10 | mended | patch | 268 | same |
 | 11 | unit 6 added (static) | patch | 279 | same |
 | 12 | unit 7 added (plain) | patch | 304 | same |
@@ -43,7 +43,7 @@
 | 36 | library function 25 to version 1 | patch | 346 | same |
 | 37 | unit 24 (generic) to version 1 | patch | 338 | same |
 | 38 | unit 7 (plain) to version 1 | patch | 285 | same |
-| 39 | BROKEN: unresolved name in crates/core/ra_jit_u24.rs | error | 71 | said so |
+| 39 | BROKEN: unresolved name in crates/core/blaze_u24.rs | error | 71 | said so |
 | 40 | mended | patch | 250 | same |
 | 41 | unit 26 added (closure) | patch | 396 | same |
 | 42 | library function 27 added | patch | 371 | same |

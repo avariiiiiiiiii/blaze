@@ -1,6 +1,6 @@
 //! library/std tests/num.rs, `test_pow`: a negative literal a macro took as an expression or
 //! as a literal is one operand where the macro puts it, so a method called on it is called on
-//! the negative number. ra-jit left it as a sign and a number, and the method took the number.
+//! the negative number. blaze left it as a sign and a number, and the method took the number.
 
 macro_rules! squared {
     ($num:expr) => {

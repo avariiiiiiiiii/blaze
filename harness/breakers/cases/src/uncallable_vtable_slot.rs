@@ -1,6 +1,6 @@
 //! tests/ui/where-clauses/obligation-error-propagation.rs: a trait method with a `where`
 //! clause of its own that the type does not meet can never be called, and rustc leaves its
-//! slot in the vtable empty. ra-jit compiled the method for the slot, found no `partial_cmp`
+//! slot in the vtable empty. blaze compiled the method for the slot, found no `partial_cmp`
 //! to call and refused the function that made the trait object.
 
 #[inline(never)]

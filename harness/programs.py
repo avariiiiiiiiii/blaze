@@ -2,7 +2,7 @@
 """programs.py: two programs of one workspace built by one daemon.
 
 The stress workspace gets a second binary. The daemon is started for the first; each step edits
-files and then asks for one program or both by `ra-jit sync SOCKET --crate ...`. Every program
+files and then asks for one program or both by `blaze sync SOCKET --crate ...`. Every program
 asked for is run and compared with what `cargo build` of the same source prints.
 """
 import os, shlex, shutil, subprocess, sys, tempfile, time
@@ -10,7 +10,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, RA_JIT, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -68,7 +68,7 @@ def splice(program):
 
 
 def main():
-    ws = tempfile.mkdtemp(prefix="ra-jit-programs-")
+    ws = tempfile.mkdtemp(prefix="blaze-programs-")
     shutil.copytree(os.path.join(HERE, "stress"), ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
     os.makedirs(os.path.join(ws, "tool/src"))
     open(os.path.join(ws, "tool/Cargo.toml"), "w").write(TOOL_TOML)
@@ -76,8 +76,8 @@ def main():
     manifest = os.path.join(ws, "Cargo.toml")
     members = open(manifest).read().replace('"app"]', '"app", "tool"]')
     open(manifest, "w").write(members)
-    work = tempfile.mkdtemp(prefix="ra-jit-programs-out-")
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = tempfile.mkdtemp(prefix="blaze-programs-out-")
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     reference = os.path.join(work, "reference")
     crates = ["sapp", "sbase", "smid", "stool"]
     programs = {}
@@ -86,13 +86,13 @@ def main():
         fx.rustc_build()
         obj, patch, binary = (os.path.join(work, f"{name}.{n}") for n in ("o", "patch.o", "bin"))
         link = list(fx.link_args)
-        link = linkline.with_output(linkline.ahead(link, [patch, obj], RA_JIT), binary)
+        link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link), "symbols": symbols}
     first = programs["sapp"]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
-        [RA_JIT, ws, *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
+        [BLAZE, ws, *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
          "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"]], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
@@ -118,7 +118,7 @@ def main():
             program = programs[name]
             began = time.time()
             reply = subprocess.run(
-                [RA_JIT, "sync", socket, "--crate", name, "--out", program["obj"], "--patch", program["patch"],
+                [BLAZE, "sync", socket, "--crate", name, "--out", program["obj"], "--patch", program["patch"],
                  "--link-cmd", program["link"], *splice(program), *program["symbols"]], capture_output=True, text=True, timeout=120)
             took = (time.time() - began) * 1000
             reply = (reply.stdout + reply.stderr).strip()

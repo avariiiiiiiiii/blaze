@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       # `nix flake update rust-overlay`, which toolchain_bump.py runs when nix is there.
       - uses: DeterminateSystems/nix-installer-action@v23
       - id: prepare
@@ -95,7 +95,7 @@ jobs:
         with:
           ref: toolchain/bump
       - uses: ./.github/actions/toolchain
-      - run: python3 harness/answers.py --write && cp crates/ra-jit/src/answers/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
+      - run: python3 harness/answers.py --write && cp crates/blaze-engine/src/answers/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
       - uses: actions/upload-artifact@v7
         with:
           name: answers-${{ matrix.platform }}
@@ -117,7 +117,7 @@ jobs:
         with:
           ref: toolchain/bump
           fetch-depth: 0
-          token: ${{ secrets.RA_JIT_BOT_TOKEN || github.token }}
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       - uses: actions/download-artifact@v8
         with:
           pattern: answers-*
@@ -159,7 +159,7 @@ jobs:
           llvm: run
       - uses: actions/download-artifact@v8
         with:
-          name: ra-jit-linux-x64
+          name: blaze-linux-x64
           path: ${{ runner.temp }}/new
           run-id: ${{ github.event.workflow_run.id || inputs.train }}
           github-token: ${{ github.token }}
@@ -177,7 +177,7 @@ jobs:
           echo "bump=$(pin "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v8
         with:
-          name: ra-jit-linux-x64
+          name: blaze-linux-x64
           path: ${{ runner.temp }}/base
           run-id: ${{ steps.base.outputs.run }}
           github-token: ${{ github.token }}
@@ -185,10 +185,10 @@ jobs:
           BASE_TOOLCHAIN: ${{ steps.base.outputs.toolchain }}
           BUMP_TOOLCHAIN: ${{ steps.base.outputs.bump }}
         run: |
-          for side in new base; do tar -xf "$RUNNER_TEMP/$side/ra-jit.tar" -C "$RUNNER_TEMP/$side"; done
+          for side in new base; do tar -xf "$RUNNER_TEMP/$side/blaze.tar" -C "$RUNNER_TEMP/$side"; done
           for tc in "$BUMP_TOOLCHAIN" "$BASE_TOOLCHAIN"; do rustup toolchain install "$tc" --profile minimal -c rust-src; done
-          python3 harness/stdcount.py --bin "$RUNNER_TEMP/new/ra-jit" --toolchain "$BUMP_TOOLCHAIN" \
-            --base "$RUNNER_TEMP/base/ra-jit" --base-toolchain "$BASE_TOOLCHAIN" --json "$RUNNER_TEMP/std.json" || true
+          python3 harness/stdcount.py --bin "$RUNNER_TEMP/new/blaze-engine" --toolchain "$BUMP_TOOLCHAIN" \
+            --base "$RUNNER_TEMP/base/blaze-engine" --base-toolchain "$BASE_TOOLCHAIN" --json "$RUNNER_TEMP/std.json" || true
       - uses: actions/upload-artifact@v7
         with:
           name: std-refusals

@@ -1,15 +1,15 @@
 //! The corpus's `fma_nans` turned MISMATCH on AArch64 once another case joined the corpus
 //! (#580), which moved `vfmaq_laneq_f64::<1>` and its kin out of what rustc's objects export,
-//! so ra-jit built them. rustc builds core's optimized MIR of each NEON fused multiply-add,
+//! so blaze built them. rustc builds core's optimized MIR of each NEON fused multiply-add,
 //! with `vfmaq_f64`, `simd_neg` and the splat of `c` built in, and LLVM chooses the
 //! instruction by that shape: `vfmaq_laneq_f64` is `fmla a, b, c.d[k]` (b first), `vfmsq_f64`
 //! is `fmls a, c, b` (which negates c, not b), `vfmsd_laneq_f64::<0>` is `fmsub` with c first.
-//! ra-jit built each of its calls, which keeps the other NaN of two, or flips the sign of the
+//! blaze built each of its calls, which keeps the other NaN of two, or flips the sign of the
 //! other one. Each form here on numbers, quiet and signalling NaNs, b's negative.
 //!
 //! The harness builds with `-C link-dead-code`, which keeps the `#[inline(always)]` splat of
 //! the `_n`, `_lane` and `_laneq` vector forms in one codegen unit of rustc's choosing: LLVM
-//! sees it only there, so ra-jit leaves those forms to rustc, and `splatted` with them.
+//! sees it only there, so blaze leaves those forms to rustc, and `splatted` with them.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -62,7 +62,7 @@ fn qd(it: f64, at: usize) -> float64x2_t {
     unsafe { transmute::<[f64; 2], float64x2_t>(lanes) }
 }
 
-/// The forms whose bodies take `c` whole or one lane of it, which ra-jit builds.
+/// The forms whose bodies take `c` whole or one lane of it, which blaze builds.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn direct(a: f32, b: f32, c: f32, x: f64, y: f64, z: f64) -> Vec<u64> {

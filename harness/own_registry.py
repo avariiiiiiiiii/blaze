@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""own_registry.py: `cargo blaze search`, `owner`, `yank`, `login` and `logout` against cargo's.
+"""own_registry.py: `blaze search`, `owner`, `yank`, `login` and `logout` against cargo's.
 cargo is the oracle; blaze never runs it outside this harness.
 
 usage: own_registry.py [--blaze BIN] [--out FILE] [--no-network]
@@ -7,7 +7,7 @@ usage: own_registry.py [--blaze BIN] [--out FILE] [--no-network]
 A made-up registry is served on 127.0.0.1 (a sparse index's `config.json` and the web API,
 with fixed `Date` and `Server` headers), as `mock` (with an API), `auth` (`auth-required`) and
 `noapi` (no API) in a `$CARGO_HOME/config.toml`. Each case runs `cargo ARGS` and
-`BIN cargo ARGS` (BIN: `ra-jit`, default `target/release/ra-jit`), each with a `$CARGO_HOME` of
+`BIN cargo ARGS` (BIN: `blaze`, default `target/release/blaze-engine`), each with a `$CARGO_HOME` of
 its own made from the same files, and compares the exit status, standard output and error (the
 homes and the port named alike), every request the registry got (method, path, `Authorization`,
 `Content-Type`, `Accept` and body), the bytes and mode of the credentials files left, and what a
@@ -328,7 +328,7 @@ def credentials(top):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "ra-jit"))
+    ap.add_argument("--blaze", default=os.path.join(ROOT, "target", "release", "blaze-engine"))
     ap.add_argument("--out")
     ap.add_argument("--no-network", action="store_true")
     opts = ap.parse_args()
@@ -350,7 +350,7 @@ def main():
             continue
         args = [a.replace("PORT", str(port)) for a in args]
         outs = {}
-        for who in ("cargo", "blaze"):
+        for who in ("blaze"):
             top = os.path.join(work, f"home-{who}")
             shutil.rmtree(top, ignore_errors=True)
             os.makedirs(top)

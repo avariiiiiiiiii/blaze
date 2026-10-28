@@ -9,7 +9,7 @@
     "--features",
     "fancy"
   ],
-  "ra-jit": [
+  "blaze": [
     "--features",
     "fancy"
   ]

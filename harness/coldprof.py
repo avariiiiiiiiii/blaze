@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""coldprof.py: where the time of a cold `cargo ra-jit build` goes until the daemon is ready.
+"""coldprof.py: where the time of a cold `blaze build` goes until the daemon is ready.
 
     coldprof.py PROJECT_DIR --work DIR [--store DIR] [--edit FILE:ANCHOR] [--after S] [--max-wait S]
 
-Runs `cargo ra-jit build` in PROJECT_DIR with an empty target directory and BLAZE_HOME, and
+Runs `blaze build` in PROJECT_DIR with an empty target directory and BLAZE_HOME, and
 the store DIR as it is (an empty one when it does not exist), and prints, by seconds since the
 command started: every line the daemon and its workers log, when the command returned, when
-the daemon said the checkout is ready, and twice a second the cores busy in ra-jit and in
+the daemon said the checkout is ready, and twice a second the cores busy in blaze and in
 cargo's processes. `--edit` then adds a statement after ANCHOR in FILE and times the
-`cargo ra-jit build` of that. The cores busy are read from /proc, on Linux alone.
+`blaze build` of that. The cores busy are read from /proc, on Linux alone.
 `--max-wait` makes it a check: it exits 1 when the daemon was ready more than S seconds
 after the command returned (a fraction of a second on just and ripgrep, some 3 s on nushell,
 where reading the program's symbols waits for cargo's last file).
@@ -35,9 +35,9 @@ def opt(name, default=None):
 
 
 def cpu_by_group():
-    """Seconds of CPU so far of the processes alive: ra-jit's, the rest of this user's, and
+    """Seconds of CPU so far of the processes alive: blaze's, the rest of this user's, and
     other users', which a timing taken beside is not one to trust."""
-    out = {"ra-jit": 0.0, "build": 0.0, "others": 0.0}
+    out = {"blaze": 0.0, "build": 0.0, "others": 0.0}
     if not os.path.isdir("/proc"):
         return out
     me = os.getuid()
@@ -52,8 +52,8 @@ def cpu_by_group():
         used = (int(fields[11]) + int(fields[12])) / TICK
         if uid != me:
             out["others"] += used
-        elif comm.startswith("ra-jit"):
-            out["ra-jit"] += used
+        elif comm.startswith("blaze"):
+            out["blaze"] += used
         else:
             out["build"] += used
     return out
@@ -110,20 +110,20 @@ def main():
             # A process that ended takes its time along: only what went up counts.
             busy = {k: max(0.0, now[k] - last[k]) / (t - at) for k in now}
             others.append(busy["others"])
-            note(f"  cpu: ra-jit {busy['ra-jit']:5.1f}  build {busy['build']:5.1f}  others {busy['others']:5.1f}")
+            note(f"  cpu: blaze {busy['blaze']:5.1f}  build {busy['build']:5.1f}  others {busy['others']:5.1f}")
             last, at = now, t
 
     threads = [threading.Thread(target=follow, daemon=True), threading.Thread(target=sample, daemon=True)]
     for t in threads:
         t.start()
     sampler = memory.Sampler(0.05).start() if "--memory" in sys.argv else None
-    _, run, _ = memory.run(["cargo", "ra-jit", "build"], cwd=project, env=env, sampler=sampler or memory.Sampler())
+    _, run, _ = memory.run(["blaze", "build"], cwd=project, env=env, sampler=sampler or memory.Sampler())
     note(f"=== command returned ({run.returncode})")
     if run.returncode:
         print(run.stderr[-2000:])
     built = time.monotonic() - began
     while run.returncode == 0:
-        out = subprocess.run(["cargo", "ra-jit", "status"], cwd=project, env=env, capture_output=True, text=True).stdout
+        out = subprocess.run(["blaze", "status"], cwd=project, env=env, capture_output=True, text=True).stdout
         states = re.findall(rf"^    {re.escape(project)}: (.*)$", out, re.M)
         if states and not any(s.startswith("loading") for s in states):
             note(f"=== status: {states}")
@@ -152,7 +152,7 @@ def main():
             open(path, "w").write(pristine.replace(anchor, anchor + "\n    let _ = std::hint::black_box(7u64);"))
             t = time.monotonic()
             note("=== edit")
-            r = subprocess.run(["cargo", "ra-jit", "build"], cwd=project, env=env, capture_output=True, text=True)
+            r = subprocess.run(["blaze", "build"], cwd=project, env=env, capture_output=True, text=True)
             edit = time.monotonic() - t
             note(f"=== edit built ({r.returncode}) in {edit:.2f}s")
         finally:
@@ -161,7 +161,7 @@ def main():
     done.set()
     if sampler:
         sampler.stop()
-    subprocess.run(["cargo", "ra-jit", "stop"], cwd=project, env=env, capture_output=True)
+    subprocess.run(["blaze", "stop"], cwd=project, env=env, capture_output=True)
     quiet = None
     for at, what in sorted(events, key=lambda e: e[0]):
         # Runs of the same cpu line are folded.

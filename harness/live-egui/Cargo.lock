@@ -254,7 +254,7 @@ name = "liveegui"
 version = "0.1.0"
 dependencies = [
  "egui",
- "ra-jit-live",
+ "blaze-live",
 ]
 
 [[package]]
@@ -363,7 +363,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ra-jit-live"
+name = "blaze-live"
 version = "0.1.0"
 
 [[package]]

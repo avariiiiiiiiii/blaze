@@ -10,7 +10,7 @@
 //! function's signature, an impl's header). Each item is a query of its own, as the borrow checker's bodies are;
 //! `docs/borrowck.md` in the repository describes what is checked.
 
-extern crate ra_ap_rustc_type_ir as rustc_type_ir;
+extern crate rustc_type_ir;
 
 mod outlives;
 

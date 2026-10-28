@@ -5,8 +5,8 @@ usage: edittimes.py WORKSPACE PACKAGE CRATE[,CRATE...] FILE FIND REPLACE [--runs
 
 The workspace is copied and one daemon is started on it for each way of linking: without
 `--splice`, where every edit runs the linker, and with it. Each run of each daemon swaps FIND
-and REPLACE in FILE, asks for a build with `ra-jit sync` and runs the program. Printed for
-every run: the time `ra-jit sync` took (compiling, and linking or splicing), what of it the
+and REPLACE in FILE, asks for a build with `blaze sync` and runs the program. Printed for
+every run: the time `blaze sync` took (compiling, and linking or splicing), what of it the
 link or the splice was by the daemon's log, and the time the program then took to run. Every
 run is printed, so that nothing is a median of unseen numbers.
 
@@ -18,14 +18,14 @@ import os, re, shlex, shutil, statistics, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 sys.path.insert(0, HERE)
-from difftest import Fixture, RA_JIT, RUNNER, sysroot_rlibs
+from difftest import Fixture, BLAZE, RUNNER, sysroot_rlibs
 
 UNITS = {"µs": 0.001, "ms": 1, "s": 1000}
 
 
 def measure(ws, package, crates, path, pair, runs, run_args, spliced):
-    work = tempfile.mkdtemp(prefix="ra-jit-edittimes-out-")
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = tempfile.mkdtemp(prefix="blaze-edittimes-out-")
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     fx = Fixture(ws, crates, ["-p", package])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"{package}.{n}") for n in ("o", "patch.o", "bin"))
@@ -38,7 +38,7 @@ def measure(ws, package, crates, path, pair, runs, run_args, spliced):
            *(["--splice", binary] if spliced else []), *symbols]
     out = open(log_path, "a")
     began = time.perf_counter()
-    daemon = subprocess.Popen([RA_JIT, ws, "--socket", socket, *ask], stderr=out, stdout=out)
+    daemon = subprocess.Popen([BLAZE, ws, "--socket", socket, *ask], stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
@@ -52,7 +52,7 @@ def measure(ws, package, crates, path, pair, runs, run_args, spliced):
         open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
         seen = len(open(log_path).read())
         began = time.perf_counter()
-        reply = subprocess.run([RA_JIT, "sync", socket], capture_output=True, text=True, timeout=600)
+        reply = subprocess.run([BLAZE, "sync", socket], capture_output=True, text=True, timeout=600)
         synced = time.perf_counter()
         ran = subprocess.run([*RUNNER, binary, *run_args], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
         done = time.perf_counter()
@@ -77,7 +77,7 @@ def main():
     args = args[:args.index("--")] if "--" in args else args
     runs = int(args[args.index("--runs") + 1]) if "--runs" in args else 11
     source, package, crates, path, find, replace = args[:6]
-    ws = tempfile.mkdtemp(prefix="ra-jit-edittimes-")
+    ws = tempfile.mkdtemp(prefix="blaze-edittimes-")
     shutil.copytree(source, ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target", ".git"))
     for spliced in (False, True):
         print("spliced" if spliced else "linked in full", flush=True)

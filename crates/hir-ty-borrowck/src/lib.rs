@@ -6,7 +6,7 @@
 //! points at; `docs/borrowck.md` in the repository describes what is checked and how.
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
-extern crate ra_ap_rustc_type_ir as rustc_type_ir;
+extern crate rustc_type_ir;
 
 mod bitset;
 mod cfg;

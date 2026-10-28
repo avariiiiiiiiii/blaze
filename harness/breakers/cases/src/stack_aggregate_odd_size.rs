@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`left: backend panic: StructArgument size is not properly aligned`):
 //! an `extern "C"` function whose struct argument no longer fits in registers, so that it is
 //! passed on the stack, where the struct's size is not a multiple of eight. The stack slot is
-//! a multiple of eight; ra-jit asked Cranelift for one of the struct's size, Cranelift refused
+//! a multiple of eight; blaze asked Cranelift for one of the struct's size, Cranelift refused
 //! it, and the function was left to rustc.
 
 use std::hint::black_box;

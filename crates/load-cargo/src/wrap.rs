@@ -1,4 +1,4 @@
-//! What a caller of this crate puts around each proc-macro expander it loads (ra-jit keeps
+//! What a caller of this crate puts around each proc-macro expander it loads (blaze keeps
 //! expansions across processes with it), and whether an expansion asked anything of the
 //! database while it ran, which an expansion that is kept must not have.
 

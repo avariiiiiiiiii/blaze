@@ -10,7 +10,7 @@ each edit got linked, spliced or in full, is read from the daemon's log.
 import os, re, shlex, statistics, subprocess, time
 
 import linkline
-from difftest import RA_JIT, sysroot_rlibs
+from difftest import BLAZE, sysroot_rlibs
 
 
 def peak_mb(pid):
@@ -27,7 +27,7 @@ def run(fx, ws, spec, result):
     if not edits:
         return True
     crates = fx.crates[0].split(",")
-    socket, log_path = os.path.join(fx.work, "ra-jit.sock"), os.path.join(fx.work, "daemon.log")
+    socket, log_path = os.path.join(fx.work, "blaze.sock"), os.path.join(fx.work, "daemon.log")
     obj, patch, binary = (os.path.join(fx.work, f"edits.{n}") for n in ("o", "patch.o", "bin"))
     link = list(fx.link_args)
     first = linkline.first_of_rustc(link)
@@ -43,7 +43,7 @@ def run(fx, ws, spec, result):
            "--link-cmd", shlex.join(link), "--splice", binary, *symbols]
     log = open(log_path, "a")
     began = time.monotonic()
-    daemon = subprocess.Popen([RA_JIT, fx.project, "--socket", socket, *ask, *fx.ra_jit_args], stderr=log, stdout=log)
+    daemon = subprocess.Popen([BLAZE, fx.project, "--socket", socket, *ask, *fx.blaze_args], stderr=log, stdout=log)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             result["edits"] = {"error": open(log_path).read()[-1500:]}
@@ -62,7 +62,7 @@ def run(fx, ws, spec, result):
             open(path, "w").write(text.replace(edit["old"], edit["new"], 1))
             seen = len(open(log_path).read())
             began = time.monotonic()
-            reply = subprocess.run([RA_JIT, "sync", socket], capture_output=True, text=True, timeout=1800)
+            reply = subprocess.run([BLAZE, "sync", socket], capture_output=True, text=True, timeout=1800)
             sync_ms = (time.monotonic() - began) * 1000
             reply = (reply.stdout + reply.stderr).strip()
             links = re.findall(r"^link: \S+ \((.*)\)$", open(log_path).read()[seen:], re.M)

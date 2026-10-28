@@ -39,7 +39,7 @@ const SELECTION: &str = "BLAZE_EMIT";
 const LLVM_LIMIT: usize = 10_000;
 
 /// Whether the build under way is of a whole program: one rustc built nothing of, whatever
-/// its `main` is (ra-jit's, or C's as bun's), in a process no edit follows. Its object is
+/// its `main` is (blaze's, or C's as bun's), in a process no edit follows. Its object is
 /// linked once and runs as it is, never edited nor compiled again as a tier, so LLVM is given
 /// every body, as large and with what handlers it has (see [`Backend::emit`]).
 static WHOLE_PROGRAM: AtomicBool = AtomicBool::new(false);
@@ -226,7 +226,7 @@ impl Backend {
             #[cfg(not(feature = "llvm"))]
             Backend::Llvm(_) => {}
         }
-        let _span = tracing::info_span!(target: "ra_jit", "cranelift").entered();
+        let _span = tracing::info_span!(target: "blaze", "cranelift").entered();
         let start = Instant::now();
         if let Some(frame) = recorder.frame_locals.take() {
             super::overlap::share(&mut context.func, &frame, &mut recorder.named);
@@ -502,15 +502,15 @@ impl Tally {
 
     /// Runs `work` as part of `step`.
     pub(super) fn step<T>(&self, step: Step, work: impl FnOnce() -> T) -> T {
-        // For ra-jit's trace: target `ra_jit` spans of 200 µs and longer.
+        // For blaze's trace: target `blaze` spans of 200 µs and longer.
         let _span = match step {
-            Step::Infer => tracing::info_span!(target: "ra_jit", "infer"),
-            Step::Mir => tracing::info_span!(target: "ra_jit", "mir"),
-            Step::Monomorphize => tracing::info_span!(target: "ra_jit", "monomorphize"),
-            Step::Translate => tracing::info_span!(target: "ra_jit", "translate"),
-            Step::Describe => tracing::info_span!(target: "ra_jit", "describe"),
-            Step::StoreRead => tracing::info_span!(target: "ra_jit", "store read"),
-            Step::StoreWrite => tracing::info_span!(target: "ra_jit", "store write"),
+            Step::Infer => tracing::info_span!(target: "blaze", "infer"),
+            Step::Mir => tracing::info_span!(target: "blaze", "mir"),
+            Step::Monomorphize => tracing::info_span!(target: "blaze", "monomorphize"),
+            Step::Translate => tracing::info_span!(target: "blaze", "translate"),
+            Step::Describe => tracing::info_span!(target: "blaze", "describe"),
+            Step::StoreRead => tracing::info_span!(target: "blaze", "store read"),
+            Step::StoreWrite => tracing::info_span!(target: "blaze", "store write"),
         }
         .entered();
         let start = Instant::now();

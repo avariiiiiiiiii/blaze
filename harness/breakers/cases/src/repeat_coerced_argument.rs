@@ -1,5 +1,5 @@
 //! tests/ui/coercion/trait-object-arrays-11205.rs: an array written `[value; N]` as the argument
-//! of a call that takes an array of trait objects. ra-jit did not look through the argument's
+//! of a call that takes an array of trait objects. blaze did not look through the argument's
 //! expected type to its element, found a mismatch, and left the function to rustc.
 
 trait Weight {

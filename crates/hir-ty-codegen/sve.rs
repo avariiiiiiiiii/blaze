@@ -6,8 +6,8 @@
 //! the bytes `str z` writes of a data vector (VL / 8 of them), those `str p` writes of a
 //! predicate (VL / 64), the vectors of a tuple one after another, each in a place sized for the
 //! largest vector length the architecture allows (2048 bits). Every place of a scalable type is
-//! such storage of ra-jit's own (a local, the copy of an argument, a return slot), so a copy of
-//! the whole of it is exact at any vector length. Between ra-jit's functions a scalable value is
+//! such storage of blaze's own (a local, the copy of an argument, a return slot), so a copy of
+//! the whole of it is exact at any vector length. Between blaze's functions a scalable value is
 //! passed and returned by reference. What reads one through a pointer, or passes one where
 //! foreign code expects rustc's convention (in Z and P registers), is refused.
 //!
@@ -398,7 +398,7 @@ fn text(registers: &Registers, body: &str, ret: Ret) -> String {
     for feature in FEATURES {
         writeln!(text, ".arch_extension {feature}").unwrap();
     }
-    writeln!(text, ".globl ra_jit_asm_block\nra_jit_asm_block:").unwrap();
+    writeln!(text, ".globl blaze_asm_block\nblaze_asm_block:").unwrap();
     text.push_str(&registers.loads);
     text.push_str(body);
     if let (Ret::Vector(shape), Some(address)) = (ret, registers.address) {

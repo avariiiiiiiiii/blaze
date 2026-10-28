@@ -2,7 +2,7 @@
 
 An experiment, off by default ([docs/cargo.md](../cargo.md#build-scripts-under-wasi-an-experiment-off-by-default)
 says how it works and how to turn it on). Every build script of the bench corpus was built for
-wasm32-wasip1 by ra-jit and run under Wasmtime beside its native run in the sandbox, and the two
+wasm32-wasip1 by blaze and run under Wasmtime beside its native run in the sandbox, and the two
 were compared. This says which ran unchanged and why each other one did not, so that whether it
 becomes the default can be decided on numbers.
 
@@ -55,19 +55,19 @@ each crate by category, `runs.json` has one entry per run, `<project>.json` what
   10 GiB tmpfs (zed's cargo home on the root disk).
 - Toolchain: rustup's nightly-2026-10-25 (aarch64-unknown-linux-gnu, with wasm32-wasip1), first
   on PATH inside `nix develop .#bench` (`.#bench-zed` for zed), `RUSTC` its absolute path.
-- ra-jit: `cargo build --release -p ra-jit --features wasi`, from these changes on main
+- blaze: `cargo build --release -p blaze-engine --features wasi`, from these changes on main
   fdc1c53f15, before they were moved onto a409606643: zed with them as they land, the other 11
   projects before the guest was given CARGO_MANIFEST_DIR as a preopen of its own, which changes
   nothing where the package's path has no links in it, as theirs had not. Each project ran in a
   systemd unit, without `HOME`, natively and under WASI alike.
 - Command, per project:
 
-      cd harness && python3 bswasi.py record PROJECT --ra-jit /root/bsw/target/release/ra-jit \
+      cd harness && python3 bswasi.py record PROJECT --blaze /root/bsw/target/release/blaze-engine \
           --work /root/bsw/work --out /root/bsw/results --jobs 6        # zed: --jobs 3
       python3 bswasi.py report --out /root/bsw/results
 
   `record` runs `cargo check -Zunstable-options --compile-time-deps --workspace --all-targets
-  --keep-going` through ra-jit's wrapper with an empty store, as harness/bscache.py does, and
+  --keep-going` through blaze's wrapper with an empty store, as harness/bscache.py does, and
   `BLAZE_BUILD_SCRIPTS=wasi-compare`, `BLAZE_SCRIPTS_BY_RUSTC=1`.
 - The projects and revisions are harness/bench.py's. bun is left out, as harness/scripts.py
   leaves it out: its workspace needs its own C and C++ build first (bunprep.py).
@@ -100,7 +100,7 @@ most were `#[cfg(target_env = "msvc")]` and `cfg!(windows)`, false natively and 
 | `CC`/`AR`/`CXX` not given; only cc-rs's report of them and its `rerun-if-env-changed` lines differ, OUT_DIR the same | 64 | 52 |
 | WASI has no permission bits: autocfg finds OUT_DIR "not a writable directory" | 31 | 16 |
 | runs a program a script under WASI may not | 17 | 17 |
-| ra-jit could not build it for wasm32-wasip1 | 13 | 13 |
+| blaze could not build it for wasm32-wasip1 | 13 | 13 |
 | an operation WASI's std does not support | 4 | 4 |
 | reads a file outside its package and OUT_DIR | 4 | 4 |
 | asks its working directory, `/` under WASI | 1 | 1 |
@@ -126,7 +126,7 @@ This is WASI's, not the runner's: only a change to autocfg (or to wasi-libc) hel
 tikv-jemalloc-sys (fd, biome); cargo: codspeed (biome); cmake: wasmtime-c-api-impl (zed);
 drat-trim and rate: varisat (cargo).
 
-**Not built (13).** ra-jit refused to build the script for wasm32-wasip1 and said why: a
+**Not built (13).** blaze refused to build the script for wasm32-wasip1 and said why: a
 function it cannot compile for wasm32 (aws-lc-sys 0.32.1, bat, biome_aria_metadata,
 encoding_rs, livekit_api, octocrab, oem_cp, pbjson-types, proto, wasm-bindgen, wasmtime,
 wasmtime-internal-fiber), or `env!("BUILD_TARGET")` in helix_loader, which helix-term's script
@@ -162,13 +162,13 @@ measured here (one VM, arm64).
 
 The run's key (bscache's Nix model: the module's bytes, the package's files, the scrubbed
 environment and arguments, the toolchain, each allowed tool as PATH finds it) has no host in
-it but what the tools are. The store's own keys still mix in the ra-jit build and the
+it but what the tools are. The store's own keys still mix in the blaze build and the
 toolchain's identity, whose `lib/` names are the host triple's, so a run kept on one kind of
 host is not found on another yet.
 
 ## Found on main
 
-In `nix develop .#bench` cargo gives build scripts `RUSTC=rustc`, a name, and the rustc ra-jit
+In `nix develop .#bench` cargo gives build scripts `RUSTC=rustc`, a name, and the rustc blaze
 answers scripts with (script_sandbox's `with_own_rustc`, as_rustc.rs) refuses it: "blaze can't
 answer `rustc --version` for a build script: `BLAZE_SCRIPT_RUSTC` does not name the
 toolchain's rustc". rustversion and every script that asks `rustc --version` fail natively,

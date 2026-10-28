@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """loadedits.py: a file written while a worker loads the workspace is built as written.
 
-usage: loadedits.py [--rounds N] [--keep]   (BLAZE_BIN names the ra-jit built; cargo-ra-jit
-                                             and ra-jit-rustc are found next to it)
+usage: loadedits.py [--rounds N] [--keep]   (BLAZE_BIN names the blaze built; blaze
+                                             and blaze-rustc are found next to it)
 
 A worker reads the workspace's files when it loads, and from then on builds a file again
 when its timestamp is no longer the one it took. A write after the read and before the
@@ -59,7 +59,7 @@ def run(cmd, ws, env, step):
 
 
 def states(ws, env):
-    out = run(["cargo", "ra-jit", "status"], ws, env, "status")
+    out = run(["blaze", "status"], ws, env, "status")
     return re.findall(rf"^    {re.escape(ws)}: (.*)$", out, re.M)
 
 
@@ -76,11 +76,11 @@ def main():
     parser.add_argument("--keep", action="store_true", help="keep the workspace and the daemon's logs")
     args = parser.parse_args()
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
-    if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
+    if not glob.glob(os.path.join(bin_dir, "blaze*")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
     # The daemon's sockets are under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start. Status names the workspace by its real path.
-    root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-loadedits-", dir=None if os.name == "nt" else "/tmp"))
+    root = os.path.realpath(tempfile.mkdtemp(prefix="blaze-loadedits-", dir=None if os.name == "nt" else "/tmp"))
     ws, home = os.path.join(root, "ws"), os.path.join(root, "h")
     for path, text in files(args.rounds).items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
@@ -94,7 +94,7 @@ def main():
     wrong = 0
     try:
         for n in range(args.rounds):
-            build = ["cargo", "ra-jit", "build", "--features", f"f{n}"]
+            build = ["blaze", "build", "--features", f"f{n}"]
             held = paused(home)
             run(build, ws, env, f"round {n}: the first build")
             began = time.monotonic()
@@ -125,7 +125,7 @@ def main():
             wrong += verdict != "ok"
             print(f"round {n}: {verdict}", flush=True)
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     print(f"{args.rounds - wrong} of {args.rounds} right; under {root}")
     if wrong:
         sys.exit(1)

@@ -30,7 +30,7 @@ struct Tally {
 }
 
 fn main() {
-    let live = match ra_jit_live::Live::start() {
+    let live = match blaze_live::Live::start() {
         Ok(live) => live,
         Err(why) => {
             println!("no live edits: {why}");

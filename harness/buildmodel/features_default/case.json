@@ -6,5 +6,5 @@
     "lib"
   ],
   "cargo": [],
-  "ra-jit": []
+  "blaze": []
 }

@@ -1,7 +1,7 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L8-231-c11.rs`): the order of drops when
 //! an operand panics and the aggregate or call is the tail of a block. Before the 2024
 //! edition the temporaries of a tail are those of the expression the block is in, so the
-//! operands, which belong to the tail, are dropped before them, as in a statement. ra-jit
+//! operands, which belong to the tail, are dropped before them, as in a statement. blaze
 //! only did that for statements and dropped the first operand last.
 
 use std::cell::RefCell;

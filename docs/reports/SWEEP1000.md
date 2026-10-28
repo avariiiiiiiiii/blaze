@@ -1,6 +1,6 @@
-# The test suites of 1100 crates.io crates through ra-jit
+# The test suites of 1100 crates.io crates through blaze
 
-Branch `ra-jit-sweep-2`: `ra-jit-collate` at `3d47ed59bf` with `ra-jit-sweep-1000` (`f4fca15318`)
+Branch `blaze-sweep-2`: `blaze-collate` at `3d47ed59bf` with `blaze-sweep-1000` (`f4fca15318`)
 merged in. Measured on one 8-core, 31 GB Linux x86-64 VM with rustc 1.99.0. This file is
 updated with each push; a section that says "in progress" has numbers from a sweep that is
 still running.
@@ -15,14 +15,14 @@ the LLVM pass of the sweep.
 The gate table below is for `bf8c5edbee`, the merge. The head adds the tracing-opentelemetry
 fix (`5af7f465bf`) and the harness change. On `5af7f465bf` the whole Cranelift gate passed
 again (20 stages, breakers 130 of 130), and so did the tests of `hir-ty`, `hir-def`,
-`parser`, `syntax` and `ra-jit`. The LLVM gate on it was stopped after its first nine stages
+`parser`, `syntax` and `blaze`. The LLVM gate on it was stopped after its first nine stages
 (difftest, programs, stress, breakers 130 of 130, unwinds, splices, asmedits, includes,
 worktrees), all of which passed; keys, fuzz, backends, debuginfo and the store harnesses
-were not run under LLVM on that commit. `ra-jit-collate-next` is not merged in.
+were not run under LLVM on that commit. `blaze-collate-next` is not merged in.
 
 The sweep was started again from the first crate with the binary of `5af7f465bf` and stopped
 at 43 of 1100 crates under Cranelift: 37 match, 6 untested, none differ, 2,475 tests,
-14,152 of 14,152 functions from ra-jit. No crate has been run under LLVM. The larger run
+14,152 of 14,152 functions from blaze. No crate has been run under LLVM. The larger run
 under "Totals" is of an older binary.
 
 What to do next, in order: finish the LLVM gate on the head; run the sweep to the end under
@@ -43,8 +43,8 @@ this one in versions and in order.
 ## The gate at the merge
 
 Every harness below was run under Cranelift and then under LLVM (`BLAZE_OPT=2 BLAZE_EMIT=fast`)
-on the merge with `ra-jit-collate` at `3d47ed59bf` (`bf8c5edbee`), one backend at a time, with the binary of
-`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm`.
+on the merge with `blaze-collate` at `3d47ed59bf` (`bf8c5edbee`), one backend at a time, with the binary of
+`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p blaze-engine --release --features llvm`.
 
 | harness | Cranelift | LLVM |
 |---|---|---|
@@ -68,25 +68,25 @@ on the merge with `ra-jit-collate` at `3d47ed59bf` (`bf8c5edbee`), one backend a
 | `storeshared.py` | pass, 180 builds | pass, 180 builds |
 | `storeguards.py` | all right | all right |
 | `selects.py` | 3 of 3 | 3 of 3 |
-| `cargo_ra_jit.py --small` | pass | (Cranelift leg only) |
+| `blaze_cli.py --small` | pass | (Cranelift leg only) |
 
 `cargo fmt --all -- --check` is clean and `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p ra-jit` passes.
+-p syntax -p blaze-engine` passes.
 
 Not run: `remote.py` (no minio on this machine) and `worktrees.py --join --together` and
-`--overlay`. `cargo_ra_jit.py --small` did not finish on the previous push (it sat idle at
+`--overlay`. `blaze_cli.py --small` did not finish on the previous push (it sat idle at
 ripgrep's cold build and was stopped); it passes on this one, in 196 seconds, and the stall
 has not been seen again or explained.
 
-Clippy (`cargo clippy -p ra-jit --all-targets -- --cap-lints warn`) was compared with
-`ra-jit-collate` at `f191c6e42a` on the previous push: the same 97 kinds of warning, three more
+Clippy (`cargo clippy -p blaze-engine --all-targets -- --cap-lints warn`) was compared with
+`blaze-collate` at `f191c6e42a` on the previous push: the same 97 kinds of warning, three more
 instances, two of which are fixed here. It was not compared again after the later merges.
 
-Where `ra-jit-collate` and this branch had fixed the same thing, one fix was kept:
+Where `blaze-collate` and this branch had fixed the same thing, one fix was kept:
 
 | what | kept | case |
 |---|---|---|
-| An alias that names the lifetime of a binder around it, in monomorphization | `ra-jit-collate`'s: normalize with placeholders and put the bound lifetimes back | `alias_under_binder` (collate's) and `alias_under_binder_projection` (this branch's, renamed) |
+| An alias that names the lifetime of a binder around it, in monomorphization | `blaze-collate`'s: normalize with placeholders and put the bound lifetimes back | `alias_under_binder` (collate's) and `alias_under_binder_projection` (this branch's, renamed) |
 | A variant reexported through a private import of its enum | this branch's: the visibility the enum is declared with, kept by the module scope | both `nameres` tests, `variant_alias_reexported` and `variant_reexported_through_private_enum_import` |
 | A tuple struct's constructor as a promotable aggregate | identical in both | `promoted_constructor` |
 
@@ -96,9 +96,9 @@ expansion error (this branch's). The file name under a stable name goes through 
 `file_name`.
 
 The open breakers are `raw_write_then_match`, `future_unwind_flags`,
-`fragment_edition_through_macro`, `assert_long_expression` and `assert_message`; ra-jit
+`fragment_edition_through_macro`, `assert_long_expression` and `assert_message`; blaze
 prints something else than rustc in each. `caller_in_constant` and `empty_array_by_impl` are
-left to rustc with a reason. `unreachable_arm_move` was fixed in `ra-jit-collate`.
+left to rustc with a reason. `unreachable_arm_move` was fixed in `blaze-collate`.
 
 ## Totals
 
@@ -113,7 +113,7 @@ It is run again from the first crate on this head, and LLVM after it.
 | untested | 126 |
 | timed out at 25 minutes | 1 (base64) |
 | tests run and compared | 36,880 |
-| functions from ra-jit | 130,580 of 130,612 |
+| functions from blaze | 130,580 of 130,612 |
 
 The 32 functions left to rustc:
 
@@ -130,13 +130,13 @@ The 8 that differed, by cause:
 
 | crate | what differed | cause | state |
 |---|---|---|---|
-| tracing-opentelemetry | `layer::tests::otel_context_propagation` failed under ra-jit only: a span id that should be zero was not | statics of one name from a macro reached through an import in a `#[test]` function were numbered in another order than rustc's, so a callsite got the metadata of another | fixed in `5af7f465bf`; cases `late_import_in_body`, `static_in_static` and `blanket/tests/late_import_in_test.rs`. All 50 tests print the same and every function is ra-jit's |
-| jobserver | `make-as-a-client` prints the path it runs from | ra-jit's binary is named `<rustc's>-ra-jit` | the harness now reads that name as rustc's; matches |
-| num_enum, proc-macro-crate | the text of a failed `assert!` over several lines (the tests run cargo on a manifest the published crate does not have, so they fail under both) | ra-jit prints the expression on one line, rustc as its pretty printer breaks it | open: breakers `assert_message` and `assert_long_expression` |
-| sysinfo | `check_refresh_process_update` fails under rustc and passes under ra-jit | the test counts processes of the machine; it matches when run again | not ra-jit |
-| hyper-timeout | `test_upload_timeout` | a timeout test; it matches when run again | not ra-jit |
-| openssl | a random MIME boundary and port numbers in what four failing tests print | differs between two runs of rustc's binary | not ra-jit |
-| semver-parser | a test that fails under both and prints how long it took | differs between two runs of rustc's binary | not ra-jit |
+| tracing-opentelemetry | `layer::tests::otel_context_propagation` failed under blaze only: a span id that should be zero was not | statics of one name from a macro reached through an import in a `#[test]` function were numbered in another order than rustc's, so a callsite got the metadata of another | fixed in `5af7f465bf`; cases `late_import_in_body`, `static_in_static` and `blanket/tests/late_import_in_test.rs`. All 50 tests print the same and every function is blaze's |
+| jobserver | `make-as-a-client` prints the path it runs from | blaze's binary is named `<rustc's>-blaze` | the harness now reads that name as rustc's; matches |
+| num_enum, proc-macro-crate | the text of a failed `assert!` over several lines (the tests run cargo on a manifest the published crate does not have, so they fail under both) | blaze prints the expression on one line, rustc as its pretty printer breaks it | open: breakers `assert_message` and `assert_long_expression` |
+| sysinfo | `check_refresh_process_update` fails under rustc and passes under blaze | the test counts processes of the machine; it matches when run again | not blaze |
+| hyper-timeout | `test_upload_timeout` | a timeout test; it matches when run again | not blaze |
+| openssl | a random MIME boundary and port numbers in what four failing tests print | differs between two runs of rustc's binary | not blaze |
+| semver-parser | a test that fails under both and prints how long it took | differs between two runs of rustc's binary | not blaze |
 
 `cratetest.py` now runs rustc's binary three more times when a crate differs. If those runs
 do not print the same, the crate is reported as `UNSTABLE` rather than as a mismatch, and
@@ -149,9 +149,9 @@ cargo either) and 42 have one in which no function of the crate is reached. toki
 ## How to rerun
 
 ```
-LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm
+LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p blaze-engine --release --features llvm
 cd harness
-BLAZE_BIN=$PWD/../target/release/ra-jit CLEAN=1 JOBS=3 BACKENDS="cranelift llvm" \
+BLAZE_BIN=$PWD/../target/release/blaze-engine CLEAN=1 JOBS=3 BACKENDS="cranelift llvm" \
     ./cratesweep.sh ~/sweep/out $(cat sweep1000.txt)
 ./sweepreport.py ~/sweep/out/cranelift
 ```

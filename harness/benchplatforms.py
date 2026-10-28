@@ -22,7 +22,7 @@ import json, os, sys
 # slug, name, the runner's labels, and where the work goes: a short path on macOS, where the
 # daemon's socket path has to fit in 104 bytes.
 PLATFORMS = [
-    dict(slug="macos-arm64", name="macOS arm64", labels=["self-hosted", "macOS", "ARM64", "bench-macos"], work="/tmp/ra-jit-bench"),
+    dict(slug="macos-arm64", name="macOS arm64", labels=["self-hosted", "macOS", "ARM64", "bench-macos"], work="/tmp/blaze-bench"),
     dict(slug="linux-aarch64", name="Linux aarch64", labels=["self-hosted", "linux", "ARM64", "bench-arm64"], work=""),
     dict(slug="linux-x86-64", name="Linux x86-64", labels=["self-hosted", "linux", "x64", "bench-x86"], work=""),
 ]

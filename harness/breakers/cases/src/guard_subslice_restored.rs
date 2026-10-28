@@ -1,6 +1,6 @@
 //! Found by the fuzzer (`fuzz/found/differs-checksum-L7-174-c9.rs`): an arm that binds the
 //! middle of an array by value (`[_, middle @ .., _] if guard`) and whose guard is false. The
-//! elements go back into the array for the arms that follow. ra-jit put them back and did
+//! elements go back into the array for the arms that follow. blaze put them back and did
 //! not note that they were there again, so the array was dropped without them: they were
 //! never dropped at all.
 

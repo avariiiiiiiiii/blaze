@@ -1,7 +1,7 @@
 # A front end more like Glancer
 
 2026-10-21. What Rust Glancer and matklad say, with sources, is in
-[research/glancer.md](research/glancer.md). This file is the plan: what ra-jit already has
+[research/glancer.md](research/glancer.md). This file is the plan: what blaze already has
 toward each of six ideas taken from them, where the time and memory actually go, and an
 ordered list of steps, each of which merges on its own. Valid MIR is never given up: every
 step either keeps the analysis rustc's semantics need or skips it only where a frozen copy
@@ -14,7 +14,7 @@ of the same result exists.
   wraps closures holds each of their types twice, and helix-parsec's combinators made one
   name of 665 MB. Hashing a type once its spelling passes 1 KB took helix to **109 s and
   18.4 GB**, with the same 158,768 functions compiled (step 1, below; issue #29).
-- What remains on a cold start is mostly ra-jit's own: on helix, a second round of 29 s
+- What remains on a cold start is mostly blaze's own: on helix, a second round of 29 s
   because one static started the build over; on both, about 76 s of thread time in
   translation. Glancer's ideas act first on loading and name resolution, which is 12 s of
   nushell's 50 s and 7 s of helix's 109 s on a cold start, and on inference and MIR only
@@ -34,7 +34,7 @@ of the same result exists.
 ## What was measured
 
 All on dev-aws-7 (c7i.16xlarge, 123 GB), the daemon pinned to 16 cores with `taskset`,
-Cranelift, an empty store, `harness/coldprof.py`, ra-jit at `5f26408566` (main on
+Cranelift, an empty store, `harness/coldprof.py`, blaze at `5f26408566` (main on
 2026-10-21) and the same with step 1. "ready" is wall time from the start of `cargo build`;
 "cargo" is cargo's own build, which the daemon overlaps. Steps are summed thread time.
 
@@ -50,7 +50,7 @@ translate 76.1 s, describe 6.2 s, store write 1.3 s (on main: store read 28.1 s,
 35.8 s). nushell with step 1: infer 32.0 s, MIR 27.9 s, monomorphize 15.4 s, translate
 76.1 s.
 
-From the committed benchmarks ([`docs/benchmarks/linux-x86_64.json`](https://github.com/indexable-inc/ra-jit/blob/b3e953eb13e8e4476a4673ab1c7dfbdff61880c6/docs/benchmarks/linux-x86_64.json), `2b2f2dcd5b`, same
+From the committed benchmarks ([`docs/benchmarks/linux-x86_64.json`](https://github.com/indexable-inc/blaze/blob/b3e953eb13e8e4476a4673ab1c7dfbdff61880c6/docs/benchmarks/linux-x86_64.json), `2b2f2dcd5b`, same
 machine type): ripgrep ready 12.5 s at 2.6 GB, load 0.9 s, resolve 0.5 s; bevy ready
 115.8 s at 8.5 GB, load 14.4 s, resolve 12.6 s; nushell load 7.2 s, resolve 5.0 s; helix load
 7.1 s, resolve 5.6 s. zed did not fit in 111 GB (#29).
@@ -59,7 +59,7 @@ machine type): ripgrep ready 12.5 s at 2.6 GB, load 0.9 s, resolve 0.5 s; bevy r
 is answered from what rustc linked, and the program edits patch (the own base) is built in
 the background once nothing has asked for a second:
 
-| | `cargo ra-jit build` returned | ready | RSS at ready | own base done | own base peak |
+| | `blaze build` returned | ready | RSS at ready | own base done | own base peak |
 |---|---:|---:|---:|---:|---:|
 | helix | 27.3 s | 29.4 s | 4.7 GB | 108.4 s | 19.1 GB (13.6 GB after) |
 | zed v1.24.4 | 160.3 s | 214 s | 14.6 GB | given up at 48.1 GB | 49.8 GB, flat after |
@@ -86,14 +86,14 @@ item}` and `cached::Entries::{get, usable}`. The longest printable strings in th
 were stable names: 665,474,913 bytes for one `helix-parsec` closure, and the largest packs
 (3.0 GB, 1.3 GB, 665 MB) whole multiples of it.
 
-## What ra-jit already has, item by item
+## What blaze already has, item by item
 
 1. **Frozen dependency artifacts.** Nothing of analysis is kept across runs. The store
-   (`crates/ra-jit-store`, [cache.md](cache.md)) keeps compiled code only, keyed
+   (`crates/blaze-store`, [cache.md](cache.md)) keeps compiled code only, keyed
    by stable names; `content.rs` names a crate of the checkout by its source; `remote.rs`
    shares packs through a directory or S3; `deps.rs` pushes and pulls cargo's dependency
    units. Those are the shareable, content-addressed half of item 1, for code. rustc
-   compiles every dependency; ra-jit analyses dependencies only as far as the instances it
+   compiles every dependency; blaze analyses dependencies only as far as the instances it
    compiles (generic or inlinable functions homed there, `home.rs`), but rust-analyzer loads
    and resolves every crate first.
 2. **The workspace's own state.** Nothing persisted. While cargo builds, a spare worker
@@ -107,15 +107,15 @@ were stable names: 665,474,913 bytes for one `helix-parsec` closure, and the lar
    directory and commits `20708cd2da` and `c8f58ac7d9` stop re-running scripts cargo already
    ran, so this half is mostly done. Proc macros: one proc-macro server process
    (`proc_macro_processes: 1`), and no cache of expansions.
-4. **Syntax trees.** rowan everywhere. The parse query keeps at most 128 trees, macro
+4. **Syntax trees.** syntax-tree everywhere. The parse query keeps at most 128 trees, macro
    expansions 512 and 1,024, bodies 512 and 4,096 (salsa `lru` attributes in the subtree),
-   but ra-jit's `body_syntax` held each anchor's green node, which kept whole files' trees
+   but blaze's `body_syntax` held each anchor's green node, which kept whole files' trees
    past that lru until #42's step (a)
    ([flat-syntax.md](flat-syntax.md#step-a-no-tree-outlives-its-query)). Since #42's steps
-   (b) and (c) the compiler's parses make flat trees (arrays) behind rowan's cursor.
+   (b) and (c) the compiler's parses make flat trees (arrays) behind syntax-tree's cursor.
 5. **Memory discipline.** No eviction of inference or MIR: `infer`, `mir_body` and
-   ra-jit's monomorphized MIR have no `lru`, and ra-jit drops nothing. Measuring is there:
-   with `BLAZE_MEMORY=<dir>`, `crates/ra-jit/src/memory.rs` reports resident memory after
+   blaze's monomorphized MIR have no `lru`, and blaze drops nothing. Measuring is there:
+   with `BLAZE_MEMORY=<dir>`, `crates/blaze-engine/src/memory.rs` reports resident memory after
    load, resolve, build, warm-up and each request answered (on macOS the physical footprint)
    and writes a table of every salsa ingredient (count,
    bytes of fields and of salsa's records; heap bytes only where an ingredient declares
@@ -125,7 +125,7 @@ were stable names: 665,474,913 bytes for one `helix-parsec` closure, and the lar
    give it to queries). rust-analyzer's own per-query report
    (`per_query_memory_usage` in `ide-db/src/apply_change.rs`) is commented out since its
    salsa migration.
-6. **LSP-shaped parts.** ra-jit has its own watcher (`inputs.rs` for the manifests and
+6. **LSP-shaped parts.** blaze has its own watcher (`inputs.rs` for the manifests and
    cargo config, `tree.rs` for sources, "watching N files"); line tables serve only panic
    locations and debug info. The client already sends a sync request per build.
 
@@ -140,17 +140,17 @@ interned type and of each crate, and a type whose spelling passes 1,024 bytes is
 distinct types, not with the tree they unfold to. Names under 1 KB are unchanged, so the
 entries of a store stay valid. `harness/deepnames.py` builds closures nested 20 deep: on
 main the store is 156 MB, with step 1 it is 0.2 MB, and a second daemon finds the 114 entries
-again. In `cargo_ra_jit.py helix`, the cold `cargo ra-jit run` takes 640.8 s on main and
+again. In `blaze_cli.py helix`, the cold `blaze run` takes 640.8 s on main and
 46.9 s with step 1 (dev-aws-7; both runs exit 1 where cargo's exits 0, a separate issue).
 
 ### Item 3: proc-macro expansion cache
 
 **Design.** A wrapper around each `ProcMacroExpander` the workspace loads, installed by
-ra-jit after `load_workspace` and before the crate graph is set. The key is a SHA-256 of
+blaze after `load_workspace` and before the crate graph is set. The key is a SHA-256 of
 the macro dylib's content hash, the macro's name and kind, the input token trees (and the
 attribute's) with spans replaced by their index in a table of the distinct spans of the
 input plus def, call and mixed site, the environment the expander is given, its current
-directory, and ra-jit's binary hash. The value is the output token tree with the same span
+directory, and blaze's binary hash. The value is the output token tree with the same span
 indices. An expansion is not stored when it errored, when its output has a span not in the
 table, or when the expander asked the server anything during it (`SourceText`,
 `LocalFilePath`, `FilePath`, `ByteRange`, `LineColumn`, `SpanSource`): those read outside
@@ -163,7 +163,7 @@ domain. Seeing the sub-requests needs a hook in load-cargo's `Expander`
 (`crates/load-cargo/src/lib.rs`, around line 703): a new module file
 in load-cargo declared with one line, which counts the callback's requests per expansion.
 
-**Payoff, measured (2026-10-21, dev-aws-7, 16 cores, `cargo ra-jit build` cold then warm on
+**Payoff, measured (2026-10-21, dev-aws-7, 16 cores, `blaze build` cold then warm on
 one store).** Expansion is a small part of a load. nushell's cold start expands 1677 macros
 in 3.20 s (summed over threads; 1520 derives take 2.95 s) of a 14.3 s load; helix's 1476 in
 3.40 s. On the warm start 1583 (nushell) and 1455 (helix) come from the store in about 0.6 s,
@@ -192,17 +192,17 @@ the check mode compares spans too.
 ### Item 5: memo eviction and per-phase memory
 
 **Design.** First the quick part: once a body's machine code is in the object, its
-`infer` and `mir_body` values and ra-jit's monomorphized MIR are not needed until an edit
+`infer` and `mir_body` values and blaze's monomorphized MIR are not needed until an edit
 reaches it. salsa's LRU drops a value and keeps the memo's revisions and dependencies
 (`evict_value_from_memo_for`, salsa 0.28.5 `function/memo.rs`), so an evicted memo is still
 validated by an edit and recomputed only when asked for again. Then the Glancer
-discipline where it fits: ra-jit already runs a phase across all crates (load, resolve,
+discipline where it fits: blaze already runs a phase across all crates (load, resolve,
 compile ahead, compile), and the `BLAZE_MEMORY` report after each phase says which phase
 leaves what behind; compaction and a phase arena come after those
 numbers, and only for what they show.
 
-**Where.** `lru = N` on the three queries is an attribute in upstream files; ra-jit's
-monomorphized MIR is ra-jit's own query.
+**Where.** `lru = N` on the three queries is an attribute in upstream files; blaze's
+monomorphized MIR is blaze's own query.
 
 **Payoff, measured (2026-10-21, dev-aws-7, 16 cores, `harness/heap.py` on jemalloc
 profiles).** Inference and MIR hold little of the peak; debug information holds most of it.
@@ -211,8 +211,8 @@ At helix's high-water mark (an interval dump, 15.4 GB live of a 17.9 GB peak) `m
 `described` query holds 5.8 GB, most of it copies of the type tables each memo makes
 (`Arc<[DebugType]>` and `Vec<Field>` cloned), and the DWARF writer's names (`Dwarf::named`)
 3.0 GB: together 62% of the peak. Once the build is over helix holds 6.4 GB live (`described`
-2.1 GB, item trees 1.3 GB, ra-jit's own structures 1.2 GB) and nushell 5.6 GB (`described`
-1.0 GB, ra-jit's own 1.1 GB, `mir_body` 0.5 GB, item trees 0.4 GB). With `BLAZE_DEBUGINFO=0`,
+2.1 GB, item trees 1.3 GB, blaze's own structures 1.2 GB) and nushell 5.6 GB (`described`
+1.0 GB, blaze's own 1.1 GB, `mir_body` 0.5 GB, item trees 0.4 GB). With `BLAZE_DEBUGINFO=0`,
 helix's warm start peaks at 8.6 GB instead of 17.0 GB and holds 5.9 GB once ready instead of
 11.9 GB; nushell's 10.5 and 7.2 GB instead of 14.0 and 10.3 GB; the stores are 0.25 and
 0.31 GB instead of 1.70 and 0.91 GB. Line tables alone (`lines`) leave what is held once
@@ -267,7 +267,7 @@ worker, the proc-macro server and the daemon. bun's add-a-function edit peaks at
 because it writes the whole object, debug information included, for 2 functions compiled.
 What the allocator kept was the other lever: mimalloc 3 asks for transparent huge pages,
 and nushell's worker held 2.5-2.9 GB more with it than with jemalloc after the same build and
-edits. ra-jit now allocates with jemalloc on Unix (mimalloc on Windows), edits within the
+edits. blaze now allocates with jemalloc on Unix (mimalloc on Windows), edits within the
 runs' spread (`bench.py`, two interleaved rounds, main → branch):
 
 | | ready | after its edits | most at an edit |
@@ -314,7 +314,7 @@ the one revision it is built in (#188,
 ### Item 1: frozen dependency artifacts
 
 **Design.** One artifact per dependency crate, content-addressed by its source hash, cfg,
-features, toolchain and ra-jit's binary hash, holding what other crates ask of it:
+features, toolchain and blaze's binary hash, holding what other crates ask of it:
 signatures, module exports, impls, layouts, and MIR only for generic, `#[inline]` and
 `const fn` items (the set rustc encodes, `should_encode_mir` in rustc 1.99.0). Its own
 format, mmapped, not `.rmeta`. A dependency whose source is edited (a path dependency, a
@@ -357,7 +357,7 @@ what is left of the warm start is mostly this item's.
 **Built (2026-10-23).** Three families are frozen for each crate whose source is the
 toolchain's, a registry's or a git checkout's and whose dependencies' are too: the `DefMap`
 (with the `LocalDefMap`), the `TraitImpls` and `InherentImpls`, and the lang items, each its own
-store entry under the crate's Merkle key (`crates/ra-jit/src/frozen.rs`; the encodings in
+store entry under the crate's Merkle key (`crates/blaze-engine/src/frozen.rs`; the encodings in
 `hir-def`'s `nameres/frozen.rs` and `hir-ty`'s `method_resolution/frozen.rs`). The bytes hold
 no salsa ids: a file is its crate's index and its path from the crate's root, a module of a
 block is its owner's body and the block's `AstId`, an interned id is its loc. A file outside the
@@ -366,7 +366,7 @@ bytes whose file changed are not read. So is the file each `include!` reads: a s
 of bevy read `crunchy`'s def map before the daemon had read the `OUT_DIR/lib.rs` it includes,
 and looking up its `macro_rules!` in the empty expansion panicked. `BLAZE_FROZEN=check` resolves and finds as well and fails
 the build on any difference, `verify` writes what was read and fails the same way; on ripgrep's
-153 parts and hello's 78 both find none. The entries go through `ra_jit_store::Store` and so
+153 parts and hello's 78 both find none. The entries go through `blaze_store::Store` and so
 travel through the remote with the packs. On dev-aws-8, pinned to one socket's 96 cores, hello's
 build with a warm remote resolves in 0.33 s of 2.2 s and takes 1.22 s of 3.02 s, 2.3 GB of 3.4 GB;
 ripgrep's resolves in 0.38 s of 2.4 s and takes 4.25 s, against cargo's cold 5.5 s.
@@ -385,14 +385,14 @@ for the time win (no memory win), at the cost of serde on hundreds of rust-analy
 
 ### Item 2: the workspace's own state
 
-**Design.** The cheap form first, which is ra-jit's and not salsa's: a manifest per build,
+**Design.** The cheap form first, which is blaze's and not salsa's: a manifest per build,
 keyed by the content of the checkout's crates, listing the stable names of every instance
 the build compiled and the roots it started from. A warm start whose crates have the same
 content looks the names up in the store and links, with no analysis; a mismatch falls back
 to the full build. Then salsa's state proper (memo values and dependency graph) for the
 crates of the checkout, so that a start after an edit revalidates instead of recomputing.
 
-**Where.** The manifest beside the store, in `crates/ra-jit-store`. Salsa state with
+**Where.** The manifest beside the store, in `crates/blaze-store`. Salsa state with
 cold-start-2.
 
 **Payoff.** The warm start: nushell found all 165,752 functions in the store and still
@@ -404,7 +404,7 @@ an empty one). The manifest skips all of it when nothing changed.
 cfg) would link the wrong program: it is keyed by everything the store key has, plus the
 crate graph.
 
-**Built (2026-10-27, `crates/ra-jit/src/manifest.rs`).** Not a list of names to look up but
+**Built (2026-10-27, `crates/blaze-engine/src/manifest.rs`).** Not a list of names to look up but
 the files themselves: a full build of a program keeps what it wrote (the object, its patch
 object; the standard library's archive and the executable are made again by the link) in the
 store, each file by its content, under a key of
@@ -415,19 +415,19 @@ store, each file by its content, under a key of
   the checkout's paths), the target, the standard library unit it links (by its bytes) and
   the variables that change what is compiled (`BLAZE_*` but the log's, the store's and the
   remote's; `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`,
-  `CARGO_TARGET_*`). The store adds the toolchain and ra-jit's own build.
+  `CARGO_TARGET_*`). The store adds the toolchain and blaze's own build.
 
 What only compiling finds out (variables `env!` and `option_env!` read of the process, files
 `include_bytes!` and `include_str!` read) is kept with the files and checked before they are
 used. A manifest is kept only when the key computed after the build is the one before it (a
 build that loaded more files than it started with keeps none). A start whose key matches
 writes the files and links, with nothing analysed or compiled. The manifest and its files are
-ordinary store entries, so `ra-jit cache push` and `pull` carry them.
+ordinary store entries, so `blaze-engine cache push` and `pull` carry them.
 
 `BLAZE_MANIFEST=check` builds in full anyway and fails the build when the program is not
 the manifest's; `off` neither reads nor writes one. Two builds of one checkout are not alike
 byte for byte: they lay functions out in the order threads finish and number what they name
-themselves (`ra-jit::<name>::<n>`) in that order, and the debug info follows. So `check`
+themselves (`blaze::<name>::<n>`) in that order, and the debug info follows. So `check`
 compares an object by what it defines: each loaded section's kind, size, bytes and
 relocations (a numbered or local target by the bytes of its section), the unwind table by
 what it covers, and the global symbols. On ripgrep it passes for a cold build against two
@@ -435,8 +435,8 @@ fresh machines' builds from the store, and a fresh machine with `RUSTFLAGS=--cfg
 `BLAZE_DEBUGINFO=0` misses and builds in full.
 
 Measured (`harness/freshwarm.py ripgrep`, arm64 ix VM, 32 vCPUs, 16 GB; a fresh machine is
-an empty home and store at the seed's paths, `ra-jit cache pull` from the remote the seed
-pushed to, then `cargo ra-jit build`):
+an empty home and store at the seed's paths, `blaze-engine cache pull` from the remote the seed
+pushed to, then `blaze build`):
 
 | fresh machine | pull | build, main | build, manifest | compiled with the manifest |
 | --- | --- | --- | --- | --- |
@@ -464,7 +464,7 @@ keeps an anchor's text and range instead and parses it again when asked: nushell
 falls to 676 MB and helix's to 436 MB, resident memory right after the first request is
 1.1 GB and 2.1 GB less, and ready time does not move. In cold time, building green trees and
 walking red ones are 16% of ripgrep's samples to the first request and 7% of nushell's. Steps
-(b) and (c), merged, put a flat tree behind rowan's cursor so that no lowering code changes:
+(b) and (c), merged, put a flat tree behind syntax-tree's cursor so that no lowering code changes:
 building trees falls from 12.1% of ripgrep's cold-start CPU to 1.9% and from 5.4% to 1.1% on
 nushell, trees as a whole take a quarter to a third less CPU, and ready time and resident
 memory do not move. What is left of syntax is lexing and parsing to events (3.6% on nushell),
@@ -480,9 +480,9 @@ the trigger for builds nobody asked for. Line tables stay: panics and debug info
 
 ## Steps, in order
 
-Each is a branch off main, merged after the gate (`cargo test --release -p ra-jit`, corpus
+Each is a branch off main, merged after the gate (`cargo test --release -p blaze-engine`, corpus
 `--mixed 8`, mixfutures `--mixed 16 --layouts`, `growth.py`, `movedlines.py`,
-`storefirst.py`, `cargo_ra_jit.py`, `borrowck_ui.py`, hir-ide failing only its known 18)
+`storefirst.py`, `blaze_cli.py`, `borrowck_ui.py`, hir-ide failing only its known 18)
 and cold-start time and RSS on helix and nushell before and after.
 
 1. Bounded names. Done with this file.
@@ -496,7 +496,7 @@ and cold-start time and RSS on helix and nushell before and after.
    rejection so a later daemon forwards its callers to rustc's copies (#37's first form) is
    not merged. Done: the instance is `Context::with`'s closure, and its static is declared by
    `thread_local!` in the body, which rust-analyzer expands twice (to items and to
-   statements, of the same text). ra-jit counted the static's place in the expansion sema
+   statements, of the same text). blaze counted the static's place in the expansion sema
    gave, which was not the one the static is in, so it never found rustc's symbol. The count
    now goes into the expansions the static is in, and helix's own base builds in one round.
 4. Proc-macro expansion cache (item 3), with its check mode.
@@ -515,7 +515,7 @@ stops.
 | Work | Issue | Lane |
 |---|---|---|
 | The restart round (step 3) | #37 | glancer, done as part of no-rustc step E (#85): the instance compiles, nothing is kept or forwarded to rustc |
-| Proc-macro expansion cache (item 3) | #38 | glancer, merged ([#110](https://github.com/indexable-inc/ra-jit/pull/110)) |
+| Proc-macro expansion cache (item 3) | #38 | glancer, merged ([#110](https://github.com/indexable-inc/blaze/pull/110)) |
 | `described` copies whole type closures (item 5) | #55 | glancer (share-types-4): types interned once, helix 11.3 → 6.4 GB after edits, bun's base fits |
 | The spare worker's memory (item 5) | #56 | spare, merged (8e01def1cf): 1.3 GB less after edits; a warm second project's cost is #99 |
 | salsa eviction of queries with cycle handling (item 5) | #57 | spare, closed unmerged: lru saves 0.35-0.5 GB on nushell but slows the signature edit 0.42 to 0.64-2.43 s |
@@ -523,16 +523,16 @@ stops.
 | Frozen dependency artifacts (item 1) | #40 | glancer, after #38 |
 | The workspace's own state (item 2) | #41 | glancer, after #40's 1a |
 | A flat syntax tree (item 4) | #42 | flat-syntax: done, steps (a), (b) and (c) merged |
-| ra-jit never runs rustc | #81 to #93 | no-rustc; steps A to M of `docs/no-rustc.md`, A to C ready to assign |
+| blaze never runs rustc | #81 to #93 | no-rustc; steps A to M of `docs/no-rustc.md`, A to C ready to assign |
 
-- **no-rustc.** Andrew's rule is that ra-jit must never run rustc. Since cold-start (#11)
+- **no-rustc.** Andrew's rule is that blaze must never run rustc. Since cold-start (#11)
   the time to ready is what rustc linked, so the warm start is cheap today because rustc
   built the program. Without rustc the daemon's own build is the ready path again, and the
-  cold start is the store and the remote serving what ra-jit built, the standard library
+  cold start is the store and the remote serving what blaze built, the standard library
   included (no-rustc's steps F, G and K, which the cold-start lane owns). That makes items
   1 and 2 (#40, #41) the cold and warm start's path: a frozen dependency and an unchanged
-  checkout are linked from what ra-jit built and kept, without analysis. Item 3's keys
-  name the macro's library by its content, so they hold when ra-jit builds that library
+  checkout are linked from what blaze built and kept, without analysis. Item 3's keys
+  name the macro's library by its content, so they hold when blaze builds that library
   (step J). #37 no longer keeps rejections to forward their callers to rustc's copies: the
   restart round is gone because the instance compiles (step E).
   `docs/no-rustc.md` says in which order rustc goes (its step K, #91, is the cold start). Items 1 and 2 are designed not to need rustc's
@@ -556,7 +556,7 @@ stops.
   cargo's 4.5 GB. The daemon holds 12.5 GB once ready and 25.7 GB after the first edit, and the
   edit that adds a function peaks at 33.5 GB against cargo's 3.3 GB. On macOS arm64
   (2026-10-21, `docs/research/bun.md`) it was 291 s to ready, 28 GB, near 40 GB at an edit.
-  2026-10-23, ra-jit `948d54e375` (the bun-perf lane), same machine: an added function is now
+  2026-10-23, blaze `948d54e375` (the bun-perf lane), same machine: an added function is now
   a patch, so its 33.5 GB peak is gone; every edit peaks at 27.3 GB at most. The daemon holds
   12.0 GB once ready and 27.2 GB from the first build on, then stays flat to 0.1 GB over 33
   builds: the growth is the background build of the program for edits to patch (every
@@ -575,9 +575,9 @@ stops.
   bun base is given up the same way and its signature edit is a full link (32.8 s, 33.6 GB);
   with the debug types shared it builds, at most 24.0 GB and 18.9 GB after, and the signature
   edit is a 6.3 s patch (item 5's measurements above; the Mac not run again).
-- **architecture split**: the store is the crate `crates/ra-jit-store`, and the code
+- **architecture split**: the store is the crate `crates/blaze-store`, and the code
   generator moves to a crate of its own. New store-side code (item 3's cache, item 1's
-  container, item 2's manifest) goes in or beside `ra-jit-store`, behind the store's
+  container, item 2's manifest) goes in or beside `blaze-store`, behind the store's
   interface, not into `hir-ty-codegen`'s module tree.
 
 ## Not checked

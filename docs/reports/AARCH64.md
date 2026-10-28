@@ -1,16 +1,16 @@
-# ra-jit on aarch64-unknown-linux-gnu
+# blaze on aarch64-unknown-linux-gnu
 
-Branch `ra-jit-aarch64-linux`, off `ra-jit-spike`. Everything here was done on a Linux x86-64
-machine (8 cores) as a cross target. ra-jit, cargo, rustc and the linker ran as x86-64
+Branch `blaze-aarch64-linux`, off `blaze-spike`. Everything here was done on a Linux x86-64
+machine (8 cores) as a cross target. blaze, cargo, rustc and the linker ran as x86-64
 programs; only the programs they produced are AArch64, and those ran under `qemu-aarch64`
 6.2 in user mode against the Ubuntu sysroot in `/usr/aarch64-linux-gnu`, linked by
 `aarch64-linux-gnu-gcc` 11.4 (GNU ld 2.38). Nothing was run on AArch64 hardware or on an
-AArch64 kernel. ra-jit never had to run as an AArch64 process, and I did not try to build it
+AArch64 kernel. blaze never had to run as an AArch64 process, and I did not try to build it
 as one.
 
 ## How the target is picked
 
-The target is an input: `ra-jit --target <triple>`, else `CARGO_BUILD_TARGET`, else the host.
+The target is an input: `blaze --target <triple>`, else `CARGO_BUILD_TARGET`, else the host.
 One process has one target, named before anything is compiled. `crates/hir-ty/src/mir/
 codegen/target.rs` turns the triple into a `Target` with four properties: architecture,
 object format, C calling convention and unwind format. The Cranelift ISA is built from it,
@@ -33,7 +33,7 @@ All of these were run. "x86-64" is the same tree, same build, on the host.
 
 | Harness | AArch64 (qemu) | x86-64 |
 |---|---|---|
-| `difftest.py corpus --bin runner --crate cases` | MATCH, 685 of 686 functions from ra-jit | MATCH, 684 of 685 |
+| `difftest.py corpus --bin runner --crate cases` | MATCH, 685 of 686 functions from blaze | MATCH, 684 of 685 |
 | `programs.py` | 22 of 22 | 22 of 22 |
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
 | `breakers.py` | 15 of 15 | 15 of 15 |
@@ -48,8 +48,8 @@ All of these were run. "x86-64" is the same tree, same build, on the host.
 | `BLAZE_SPLICE=1 stress.py` | 99 of 99 | 99 of 99 |
 | `BLAZE_SPLICE=1 unwinds.py` | 8 of 8 | 8 of 8 |
 
-The one corpus function not from ra-jit is the same on both (a `TypeId` rustc has no symbol
-for). The corpus counts are higher than the 679 of 680 on `ra-jit-spike` because I added
+The one corpus function not from blaze is the same on both (a `TypeId` rustc has no symbol
+for). The corpus counts are higher than the 679 of 680 on `blaze-spike` because I added
 cases: NEON fixtures on AArch64, and C ABI cases on both. The table is from one full run of
 everything on the final splice code; after it I added three more C ABI cases and reran only
 the corpus on both targets, which is the count shown. The other rows were not rerun after
@@ -61,7 +61,7 @@ What is behind those numbers:
 - Calling convention. AAPCS64 for `extern "C"`: small aggregates in one or two integer
   registers, homogeneous float aggregates in float registers, anything over 16 bytes by
   pointer, the result pointer in x8, 128-bit integers starting at an even register. The
-  corpus has rustc-built code calling ra-jit-built code and back for each of these,
+  corpus has rustc-built code calling blaze-built code and back for each of these,
   including an HFA that no longer fits the float registers, a five-float struct returned
   through x8, and 128-bit values in registers and on the stack.
 - Inline assembly. A second wrapper, `asm/aarch64.rs`, next to the x86-64 one. It is
@@ -132,9 +132,9 @@ others but were not run. None of these were in the list I was given.
 ## Edit to running
 
 Measured with the new `harness/edittimes.py`: one daemon without `--splice` and one with,
-the same one-line edit swapped in and out 11 times each, `ra-jit sync` timed, then the
+the same one-line edit swapped in and out 11 times each, `blaze sync` timed, then the
 program run. Medians are of the last 10. The compile and the link or splice are native
-x86-64 speed, since ra-jit and the linker are host programs. The run column is qemu and
+x86-64 speed, since blaze and the linker are host programs. The run column is qemu and
 says nothing about AArch64 hardware; it is there to show the program ran, and it is the
 same in both rows.
 
@@ -159,7 +159,7 @@ linker and CPU speeds. The run column does not carry over at all.
 ## What is left, most important first
 
 1. Run the lot on AArch64 hardware. Confirms the program header layout under a real
-   kernel, the busy-binary decline, and gives real timings. ra-jit as a native AArch64
+   kernel, the busy-binary decline, and gives real timings. blaze as a native AArch64
    process is untested too; `Target::host()` names the triple but nothing built it.
 2. BTI: build a `-z force-bti` executable in a test and see the decline. Then make the
    redirect a valid landing pad so those binaries can be spliced.
@@ -182,7 +182,7 @@ Everything below ran on an x86-64 host with the AArch64 programs under `qemu-aar
 mode, stable 1.99.0. Nothing ran on AArch64 hardware.
 
 Before any change, the Cranelift matrix on 530ce12b8f passed in full. The corpus was
-788/791 from ra-jit; the three left to rustc were `sum_all`, `forward` and `weigh` in
+788/791 from blaze; the three left to rustc were `sum_all`, `forward` and `weigh` in
 `stabilized.rs`, each with "a function that takes `...` for this target".
 
 **C variadic definitions.** `VariadicRegisters` now covers AAPCS64 as Linux has it as well
@@ -201,7 +201,7 @@ of at most 8 bytes, and `va_arg` of anything wider than 8 bytes.
 **Asm labels and naked functions.** `stabilized.rs` has a module `arm` with the AArch64
 equivalents of the x86 cases (`naked_functions`, `asm_goto`, `asm_cfg`,
 `target_feature_11`, `naked_more`, `asm_goto_more`). They passed without a change to
-`asm/aarch64.rs`. There was no `ra-jit-macos-variadic` branch to take cases from when I
+`asm/aarch64.rs`. There was no `blaze-macos-variadic` branch to take cases from when I
 looked.
 
 **LLVM.** The read-back of an AArch64 ELF object now goes the way the Mach-O one does:
@@ -241,9 +241,9 @@ data in the program through the GOT on this target, which costs a load on every 
 
 ## Round on 6d12f21c86: LLVM at 100%, the rest of the ABI, `sym`, and a native run
 
-Branch `ra-jit-aarch64-abi2`. Two kinds of run are reported here and they are kept apart:
+Branch `blaze-aarch64-abi2`. Two kinds of run are reported here and they are kept apart:
 the local ones are on an x86-64 host with `qemu-aarch64` user mode, as before, and the CI
-ones are on GitHub's `ubuntu-24.04-arm` runner, where ra-jit, rustc, the linker and the
+ones are on GitHub's `ubuntu-24.04-arm` runner, where blaze, rustc, the linker and the
 programs are all AArch64 processes on an AArch64 kernel. That is the first native run.
 
 ### What changed
@@ -326,7 +326,7 @@ feature and `RUSTC_BOOTSTRAP=1` the AArch64 corpus is 827/827 and matches under 
 producers, and `--mixed 6` matches with Cranelift. The 4 open cases of `keys.py` are the
 ones the harness lists as open on every platform.
 
-Native, on `ubuntu-24.04-arm` (the `ra-jit` workflow on this branch):
+Native, on `ubuntu-24.04-arm` (the `blaze` workflow on this branch):
 
 | Job | Result |
 |---|---|
@@ -346,7 +346,7 @@ Every count is the same. What differs:
   the one behaviour I had only inferred.
 - A real kernel loads the spliced executables. The program header layout I changed in the
   first round for qemu's loader had not been seen under one.
-- ra-jit itself as an AArch64 process, with either producer, had never been built or run.
+- blaze itself as an AArch64 process, with either producer, had never been built or run.
 - "a static of bytes" in `splices.py` is declined natively ("may be aligned to 8") and
   spliced under qemu with Cranelift. I do not think this is the machine: the same step
   goes one way or the other on x86-64 between the two producers in CI, and under qemu

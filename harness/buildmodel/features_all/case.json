@@ -9,7 +9,7 @@
   "cargo": [
     "--all-features"
   ],
-  "ra-jit": [
+  "blaze": [
     "--all-features"
   ]
 }

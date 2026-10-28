@@ -1,8 +1,8 @@
-# ra-jit's MIR against rustc's, and what production apps still need
+# blaze's MIR against rustc's, and what production apps still need
 
 2026-10-20. Claims are marked **read** (in source we read, or measured here, with the command),
 **reported** (someone says so, unchecked) or **unverified** (our inference). rustc is 1.99.0
-(`b940084d7`), the toolchain ra-jit pins; its pass sources are in
+(`b940084d7`), the toolchain blaze pins; its pass sources are in
 [docs/upstream/rustc-mir-transform/](../upstream/rustc-mir-transform/SOURCE.md).
 
 ## Which MIR to compare
@@ -15,39 +15,39 @@
   `emit_lifetime_markers`).
 - A debug build has rustc's UB checks: alignment and null checks before a dereference of a raw
   pointer, enum checks on transmutes (read, `check_alignment.rs`, `check_null.rs`,
-  `check_enums.rs`; on when `debug_assertions`). ra-jit has none (read, no such assert kinds in
+  `check_enums.rs`; on when `debug_assertions`). blaze has none (read, no such assert kinds in
   `hir-ty/src/mir`).
-- So ra-jit before this work (its runtime body, `BLAZE_MIR_OPT` unset) is compared with
-  rustc's level 1, ra-jit's level 1 with rustc's level 1, and ra-jit's level 2 with rustc's
+- So blaze before this work (its runtime body, `BLAZE_MIR_OPT` unset) is compared with
+  rustc's level 1, blaze's level 1 with rustc's level 1, and blaze's level 2 with rustc's
   `-Copt-level=2 -Zinline-mir=no` with debug assertions and overflow checks kept on, since
-  ra-jit compiles the dev profile. UB checks are left out on rustc's side unless asked
+  blaze compiles the dev profile. UB checks are left out on rustc's side unless asked
   (`--ub-checks`), or they would mask everything else in a function that has one.
 
 ## The harness
 
 `harness/mirparity.py` (read, it's ours): rustc's MIR through `cargo rustc -- -Zunpretty=mir`,
-ra-jit's through the new `ra-jit mir <dir> --crate <name> --level N`, which prints the bodies
-ra-jit's code generator compiles in rustc's format. Functions are paired by path and parameter
+blaze's through the new `blaze-engine mir <dir> --crate <name> --level N`, which prints the bodies
+blaze's code generator compiles in rustc's format. Functions are paired by path and parameter
 count, normalized (block and local numbering, path spelling, non-scalar constants) and compared
 at four strictnesses: `shape` (blocks and terminator kinds), `counts` (statements per block),
 `identical` (the match rate) and `typed` (also local types).
 
 ## Match rates on `harness/corpus` crate `cases` (read, measured 2026-10-20)
 
-1510 functions in rustc's MIR, 1115 in ra-jit's, 1070 paired; 931 were paired before impls
+1510 functions in rustc's MIR, 1115 in blaze's, 1070 paired; 931 were paired before impls
 written by derives were named at the derive's line, as rustc names them.
 
 | | shape | counts | identical | typed |
 | --- | --- | --- | --- | --- |
-| ra-jit, no optimizations, against rustc level 1 | 38.4% | 4.4% | 4.0% | 4.0% |
-| ra-jit level 1 against rustc level 1 | 55.7% | 39.8% | 21.5% | 20.7% |
-| ra-jit level 2 against rustc level 2 | 52.7% | 26.0% | 14.5% | 14.4% |
+| blaze, no optimizations, against rustc level 1 | 38.4% | 4.4% | 4.0% | 4.0% |
+| blaze level 1 against rustc level 1 | 55.7% | 39.8% | 21.5% | 20.7% |
+| blaze level 2 against rustc level 2 | 52.7% | 26.0% | 14.5% | 14.4% |
 
 Most of the level 1 gain is the passes; moving out of temporaries in lowering, as rustc does,
 took identical from 15.3% to 21.5% (read, the same runs before and after).
 
 ```sh
-cd harness && BLAZE_BIN=<release ra-jit> python3 mirparity.py corpus --crate cases --level 1
+cd harness && BLAZE_BIN=<release blaze> python3 mirparity.py corpus --crate cases --level 1
 python3 mirparity.py corpus --crate cases --level 2 --rustc-level 2
 ```
 
@@ -65,7 +65,7 @@ runs.
   collatz 490 ms to 421 at level 1 (-14%), fnv 284 to 222 (-22%); sieve, qsort, matmul,
   nbody, mandelbrot and words within the spread (-4% to +4%).
 - **Compile time.** Optimizing every body of corpus `cases` (1115) takes 24 to 71 ms at
-  level 1 and 33 to 191 ms at level 2, against 0.6 to 4 s to build them (`ra-jit mir --time`,
+  level 1 and 33 to 191 ms at level 2, against 0.6 to 4 s to build them (`blaze-engine mir --time`,
   the spread is the load). The kernels' cold compile: 103 ms with no passes, 104 at level 1,
   122 at level 2. An edit re-optimizes only the bodies it changed, as the passes are salsa
   queries; `movedlines.py`'s six edits took 10 to 27 ms with no passes, 10 to 18 at level 1 and 9 to 20 at level 2. `editbench.py` is
@@ -80,7 +80,7 @@ runs.
 ## What still differs, most frequent first (read, the harness's lists at level 1)
 
 1. **Matches are chains of tests.** rustc lowers a `match` on an enum to one `switchInt` with a
-   target per variant; ra-jit's lowering tests one variant at a time, re-reading the
+   target per variant; blaze's lowering tests one variant at a time, re-reading the
    discriminant (`switchInt(move _) -> [0: bb, 1: bb, otherwise: bb]` in 82 functions on
    rustc's side). Fix: lower matches through a decision tree as `rustc_mir_build` does, or a
    pass that merges a chain of switches on one discriminant (unverified which is less work).
@@ -88,12 +88,12 @@ runs.
    `switchInt(copy _) -> [0: bb, otherwise: bb]` and `[1: bb, otherwise: bb]` (202 and 181): a place expression is read into a temporary first, where
    rustc reads the place directly (`switchInt(copy _1)` for `if b`). Lowering, not passes.
 3. **Unwinding out of drops.** rustc's `drop(_) -> [return: bb, unwind terminate(cleanup)]`
-   and `unwind continue` against ra-jit's cleanup blocks (about 100 functions): rustc's
+   and `unwind continue` against blaze's cleanup blocks (about 100 functions): rustc's
    `AbortUnwindingCalls` and cleanup simplification.
 4. **Reborrows** `_ = &(*_)` (420 functions before optimization, out of the top differences
    at level 1): `InstSimplify` removes `&*` of a reference (read); rustc's
    `ReferencePropagation` (level 2) would remove more (unverified).
-5. **Pointer casts of fat pointers** `copy _.0 as *const` (61): how ra-jit lowers trait upcasts.
+5. **Pointer casts of fat pointers** `copy _.0 as *const` (61): how blaze lowers trait upcasts.
 6. **Derive bodies** rustc's `#[derive(PartialEq)]` and `Debug` expand differently from
    rust-analyzer's builtin derive expansion; most of the 440 unpaired rustc functions are
    derive helpers (`assert_fields_are_eq`) and trait items rust-analyzer does not lower.
@@ -101,7 +101,7 @@ runs.
 ## Passes: ported and not
 
 The table in [SOURCE.md](../upstream/rustc-mir-transform/SOURCE.md) has every pass of 1.99's
-pipeline and whether ra-jit ports it; `passes_not_ported(level)` in
+pipeline and whether blaze ports it; `passes_not_ported(level)` in
 `hir-ty/src/mir/optimize.rs` lists the rest at each level. Ported: everything rustc runs at
 level 1 except `RemoveZsts`, `UnreachableEnumBranching` and `ForceInline`; at level 2 also
 `UnreachablePropagation` and `DeadStoreElimination`. Not ported at level 2: `Inline`, `GVN`,
@@ -113,27 +113,27 @@ level 1 except `RemoveZsts`, `UnreachableEnumBranching` and `ForceInline`; at le
 
 Ranked by how likely each is to hurt a real app, then by cost. "Fixed" is in this branch.
 
-0. **A program ra-jit builds alone does nothing on macOS** (unknown cost, found here). When
-   ra-jit compiles every crate and puts its own C `main` in the object (`define_start` in
+0. **A program blaze builds alone does nothing on macOS** (unknown cost, found here). When
+   blaze compiles every crate and puts its own C `main` in the object (`define_start` in
    `hir-ty-codegen`), the linked `_main` on macOS arm64 is at the address of the allocator shim's
    `__rust_alloc`, a branch to `__rdl_alloc`, so the program returns at once with status 0
    and prints nothing (read: `nm` and `otool -tV` on `runbench.py`'s kernels build; a raw
    `write(2, ..)` as the first line of `main` never shows). Unmodified `main` too, Cranelift and
-   LLVM alike; `cargo ra-jit build`, `difftest.py` and `backends.py` keep rustc's `main` and are
+   LLVM alike; `blaze build`, `difftest.py` and `backends.py` keep rustc's `main` and are
    not affected; `runbench.py` builds this way. Linux not checked.
    It is why the README's runtime table has no macOS numbers.
    **Fixed on `whole-program-main`** (2026-10-20, read): the stand-in rustc builds for the
-   program defines a weak, code-free `_main`, and ra-jit's object was weakened as a patch is,
-   so ld64 was free to keep the stand-in's; ra-jit's `_main` now stays strong
+   program defines a weak, code-free `_main`, and blaze's object was weakened as a patch is,
+   so ld64 was free to keep the stand-in's; blaze's `_main` now stays strong
    (`weaken::ours`). The same builds also ignored a `#[global_allocator]` on macOS and on
    x86-64 Linux (read, `wholeprogram.py` against unmodified main on both): stand-ins declare
    none, so rustc's shim forwarded to `__rdl_alloc`. Linux's `main` was right, as ELF objects
    are not weakened.
 1. **Debug-build UB checks** (medium). A program that dereferences a misaligned or null raw
    pointer, or transmutes an invalid enum value, panics under rustc's debug build and carries on
-   under ra-jit (read, as above). Port `CheckAlignment`, `CheckNull` and `CheckEnums`, with
+   under blaze (read, as above). Port `CheckAlignment`, `CheckNull` and `CheckEnums`, with
    the three panics in codegen and the interpreter.
-2. **Cargo's `build-dir` and its new layout** (medium). ra-jit reads `<profile>/deps`,
+2. **Cargo's `build-dir` and its new layout** (medium). blaze reads `<profile>/deps`,
    `build` and `.fingerprint` and doesn't read `build-dir` (read, `deps.rs`,
    `cargo/state.rs`). With `build.build-dir` set, or once layout v2 is cargo's default
    (reported to be coming, rust-compiler-2026.md), it would not find dependencies (unverified).
@@ -141,12 +141,12 @@ Ranked by how likely each is to hurt a real app, then by cost. "Fixed" is in thi
    advice to keep `cargo check` running stays; Polonius changes what it says, not this.
 4. **Unwinding out of `nounwind` code** (medium). A panic that unwinds out of a drop during
    unwinding, or out of an `extern "C"` function, aborts under rustc
-   (`AbortUnwindingCalls`, `UnwindAction::Terminate`); ra-jit has it in some places only (read,
+   (`AbortUnwindingCalls`, `UnwindAction::Terminate`); blaze has it in some places only (read,
    `docs/mir-passes.md`, "Not done yet", and the harness's `unwind terminate` counts).
 5. **Code quality at level 2** (large). No MIR inlining, `GVN`, `ScalarReplacementOfAggregates`
    or `DestinationPropagation`, and matches as chains of tests: Cranelift does none of these
    itself (unverified). The LLVM tier is on LLVM 20 where rustc is on 23 (read, `docs/support.md`).
-6. **`-Zembed-metadata=no`** (small). ra-jit reads `.rmeta` files and skips `lib.rmeta` in
+6. **`-Zembed-metadata=no`** (small). blaze reads `.rmeta` files and skips `lib.rmeta` in
    rlibs, so it should work (read), but nothing tests it.
 7. **Fixed here:** a `match` arm guard's value was marked dead (`StorageDead`) before the switch
    that reads it; harmless while storage markers are stripped, a wrong branch once dead-store

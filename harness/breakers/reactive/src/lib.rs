@@ -1,4 +1,4 @@
-//! A dependency rustc builds, with the conversion trait of nsh-core's `ui::reactive` (ra-jit
+//! A dependency rustc builds, with the conversion trait of nsh-core's `ui::reactive` (blaze
 //! #224): a generic parameter, impls for concrete types and handles, and a blanket impl for
 //! closures whose return type converts into the parameter.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stalecopies.py: plain `cargo build` through `ra-jit enable` never runs code of before an edit
+"""stalecopies.py: plain `cargo build` through `blaze enable` never runs code of before an edit
 that rustc's copies still have (#386).
 
     stalecopies.py [--work DIR] [SCENARIO...]
@@ -15,7 +15,7 @@ import os, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-BIN = os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN") or os.path.join(HERE, "../target/release/ra-jit")))
+BIN = os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN") or os.path.join(HERE, "../target/release/blaze-engine")))
 
 ALLOCATOR = """\
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -49,7 +49,7 @@ LEFT = """\
 extern "C" fn mark() {}
 
 fn main() {
-    // An `asm!` with a `sym` operand is not compiled by ra-jit: `main` is left to rustc.
+    // An `asm!` with a `sym` operand is not compiled by blaze: `main` is left to rustc.
     unsafe { core::arch::asm!("/* {0} */", sym mark) };
     let k = 1usize;
     println!("{} {}", k, std::env::args().count() + 3);
@@ -117,15 +117,15 @@ def scenario(name, work):
     source, pattern = SCENARIOS[name]
     ws = Workspace(work, source)
     failed = []
-    r = ws.run(os.path.join(BIN, "ra-jit"), "enable")
+    r = ws.run(os.path.join(BIN, "blaze"), "enable")
     if r.returncode:
-        return [f"{name}: ra-jit enable failed: {r.stderr[-500:]}"]
+        return [f"{name}: blaze enable failed: {r.stderr[-500:]}"]
     try:
         ws.build()
         ws.warm()
         for k in (2, 3, 4):
             if name == "restart":
-                ws.run(os.path.join(BIN, "ra-jit"), "stop")
+                ws.run(os.path.join(BIN, "blaze"), "stop")
             ws.edit(pattern, k)
             how = ws.build()
             printed = ws.printed()
@@ -140,8 +140,8 @@ def scenario(name, work):
     except Exception as e:
         failed.append(f"{name}: {e}")
     finally:
-        ws.run(os.path.join(BIN, "ra-jit"), "stop")
-        ws.run(os.path.join(BIN, "ra-jit"), "disable")
+        ws.run(os.path.join(BIN, "blaze"), "stop")
+        ws.run(os.path.join(BIN, "blaze"), "disable")
     return failed
 
 

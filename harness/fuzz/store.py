@@ -49,7 +49,7 @@ def asm_changes(work, backend):
         rejected = project.reference([("c16", lines)], "2021")
         if rejected is not None:
             raise SystemExit(rejected)
-        findings, _ = project.ra_jit(backend)
+        findings, _ = project.blaze(backend)
         shutil.copyfile(os.path.join(project.fx.work, "fz.stderr"),
                         os.path.join(work, f"asm-{step}-{body}.stderr"))
         if findings:
@@ -67,7 +67,7 @@ def main():
     for backend in backends:
         if backend not in BACKENDS:
             parser.error(f"unknown backend: {backend}")
-    work = tempfile.mkdtemp(prefix="ra-jit-fuzz-store-")
+    work = tempfile.mkdtemp(prefix="blaze-fuzz-store-")
     print(f"work: {work}", flush=True)
     for backend in backends:
         own = os.path.join(work, backend)

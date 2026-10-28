@@ -2,13 +2,13 @@
 """nocompact.py: a program linked with `-no_compact_unwind` is spliced, and unwinds through the
 patch (macOS on AArch64, issue #33).
 
-usage: nocompact.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: nocompact.py    (BLAZE_BIN names the blaze built; blaze and blaze-rustc
                         are found next to it)
 
 Such a program has `__eh_frame` and no `__unwind_info`, and the unwinder looks for every
 frame in `__eh_frame`, to its end; bun links so. (What has only a compact entry, as most of
 std has on AArch64, then has no frame at all, and a panic aborts, cargo's build too.) The
-program is built with `cargo ra-jit build` until the daemon serves the build, then edited a
+program is built with `blaze build` until the daemon serves the build, then edited a
 few times: every edit after the first (which writes the whole object again) has to be
 spliced, print what the source says, and have the unwinder find the frame of the edited
 function where its symbol now is (`_Unwind_Find_FDE`). The daemon is run with
@@ -66,7 +66,7 @@ MANY = 1000
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["cargo", "ra-jit", "build"], cwd=ws, env=env, capture_output=True, text=True,
+    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
                          timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
@@ -83,11 +83,11 @@ def links(home):
 
 
 def address_of(program, name):
-    """Where the code of the function `name` is, as the executable was linked: ra-jit's symbol
-    of it (rustc's is a jump there). The daemon's own link names it `ra-jit.<crate id>.<path>`,
+    """Where the code of the function `name` is, as the executable was linked: blaze's symbol
+    of it (rustc's is a jump there). The daemon's own link names it `blaze.<crate id>.<path>`,
     and a splice moves that symbol to the new code."""
     listed = subprocess.run(["nm", program], capture_output=True, text=True).stdout
-    own = rf"_ra-jit(?:::{name}::\d+|\.[0-9a-f]+\.\S*::{name})"
+    own = rf"_blaze(?:::{name}::\d+|\.[0-9a-f]+\.\S*::{name})"
     found = re.findall(rf"^([0-9a-f]+) [tTsS] {own}$", listed, re.M)
     return "0x" + found[0] if found else None
 
@@ -129,9 +129,9 @@ def main():
         print("nocompact.py: only Apple's linker writes `__unwind_info`; nothing to do")
         return
     bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
-    if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
-    root = tempfile.mkdtemp(prefix="ra-jit-nocompact-", dir="/tmp")
+    if not os.path.exists(os.path.join(bin_dir, "blaze")):
+        raise SystemExit(f"no blaze beside {os.environ['BLAZE_BIN']}")
+    root = tempfile.mkdtemp(prefix="blaze-nocompact-", dir="/tmp")
     ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
@@ -175,7 +175,7 @@ def main():
         wrong += verdict != "ok"
         print(f"{f'{MANY} functions added':30} {verdict:12} {how[:110]}", flush=True)
     finally:
-        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     print(f"{EDITS + 2 - wrong} of {EDITS + 2} right; under {root}")
     if wrong:
         sys.exit(1)

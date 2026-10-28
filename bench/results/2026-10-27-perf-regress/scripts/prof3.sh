@@ -7,7 +7,7 @@ rev=$(git -C /root/perf/blaze rev-parse --short=10 "$1")
 bin=/root/perf/bin/$rev
 out=/root/perf/prof3/$rev${SUFFIX:-}; rm -rf "$out"; mkdir -p "$out"
 p=/root/perf/prof3-ws/$rev; rm -rf "$p"; mkdir -p "$p"
-cp -r /root/ra-jit-projects/ripgrep "$p/rg"; rm -rf "$p/rg/target" "$p/rg/.git"
+cp -r /root/blaze-projects/ripgrep "$p/rg"; rm -rf "$p/rg/target" "$p/rg/.git"
 wt=/root/perf/wt-prof
 [ -d $wt ] || git -C /root/perf/blaze worktree add -q --detach $wt "$rev"
 git -C $wt checkout -q --force --detach "$rev"
@@ -27,22 +27,22 @@ EOF
 edit() { python3 $p/edit.py $f; }
 undo() { cp $f.orig $f; }
 t() { local s=$(date +%s%N); "$@"; local e=$(date +%s%N); echo $(( (e - s) / 1000000 ))ms; }
-echo "== cold"; taskset -c 0-3 cargo ra-jit build > $out/cold.out 2> $out/cold.err; echo "exit $?"
-for i in $(seq 600); do cargo ra-jit status 2>&1 | grep -q "$p/rg: ready" && break; sleep 0.5; done
-cargo ra-jit status > $out/status.txt 2>&1
-for i in 1; do echo "noop $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null)"; done | tee $out/times.txt
-for i in 1 2; do if [ $((i % 2)) = 1 ]; then edit; else undo; fi; echo "body $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null)"; done | tee -a $out/times.txt
-pids=$(pgrep -f "^$bin/ra-jit" | tr '\n' ' ')
+echo "== cold"; taskset -c 0-3 blaze build > $out/cold.out 2> $out/cold.err; echo "exit $?"
+for i in $(seq 600); do blaze status 2>&1 | grep -q "$p/rg: ready" && break; sleep 0.5; done
+blaze status > $out/status.txt 2>&1
+for i in 1; do echo "noop $(t taskset -c 0-3 blaze build 2>/dev/null)"; done | tee $out/times.txt
+for i in 1 2; do if [ $((i % 2)) = 1 ]; then edit; else undo; fi; echo "body $(t taskset -c 0-3 blaze build 2>/dev/null)"; done | tee -a $out/times.txt
+pids=$(pgrep -f "^$bin/blaze-engine" | tr '\n' ' ')
 ps -o pid,args -p $pids | cut -c1-250 > $out/pids.txt
 sargs=""; for x in $pids; do sargs="$sargs -p $x"; done
 strace -f -tt -s 400 -e trace=execve,exit_group -o $out/daemon.strace $sargs &
 sp=$!; sleep 1
-edit; echo "strace-daemon body $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null)" | tee -a $out/times.txt
-undo; echo "strace-daemon body back $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null)" | tee -a $out/times.txt
-echo "strace-daemon noop $(t taskset -c 0-3 cargo ra-jit build 2>/dev/null)" | tee -a $out/times.txt
+edit; echo "strace-daemon body $(t taskset -c 0-3 blaze build 2>/dev/null)" | tee -a $out/times.txt
+undo; echo "strace-daemon body back $(t taskset -c 0-3 blaze build 2>/dev/null)" | tee -a $out/times.txt
+echo "strace-daemon noop $(t taskset -c 0-3 blaze build 2>/dev/null)" | tee -a $out/times.txt
 sleep 0.5; kill -INT $sp; wait $sp
 for w in $BLAZE_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log 2>/dev/null; done
 cp $BLAZE_HOME/*.log $out/ 2>/dev/null
 ls -la $BLAZE_HOME > $out/home-ls.txt
-cargo ra-jit stop >/dev/null 2>&1
+blaze stop >/dev/null 2>&1
 echo done

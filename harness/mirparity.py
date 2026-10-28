@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""How close the MIR ra-jit compiles is to rustc's, function by function.
+"""How close the MIR blaze compiles is to rustc's, function by function.
 
 usage: mirparity.py [<workspace>] [--crate <package>] [--level 0|1|2] [--rustc-level 1|2]
                     [--show N] [--json FILE]
 
 Both sides are written as rustc's `-Zunpretty=mir` writes MIR: rustc's by rustc itself,
-ra-jit's by `ra-jit mir`, which prints the bodies its code generator compiles at the MIR
+blaze's by `blaze-engine mir`, which prints the bodies its code generator compiles at the MIR
 optimization level `--level` (`BLAZE_MIR_OPT`). rustc's are its optimized MIR, which is what
 it generates code from: at `-Copt-level=0` that is its `-Zmir-opt-level=1`, the level a debug
 build gets, and with `--rustc-level 2` the MIR of `-Copt-level=2`, without inlining
-(`-Zinline-mir=no`), which ra-jit leaves to the code generator, and with the debug
-assertions and overflow checks of the debug build ra-jit compiles. rustc is asked for its MIR
+(`-Zinline-mir=no`), which blaze leaves to the code generator, and with the debug
+assertions and overflow checks of the debug build blaze compiles. rustc is asked for its MIR
 without the checks of pointers a debug build has (`-Zub-checks=no`) unless `--ub-checks`:
-ra-jit has none of them yet, and they would hide everything else in a function that has one.
+blaze has none of them yet, and they would hide everything else in a function that has one.
 
 A function of one is paired with the function of the other of the same path and number of
 parameters. Each pair is then compared at four strictnesses, each implying the one before:
@@ -27,14 +27,14 @@ and the share of pairs that pass each is printed. `identical` is the match rate.
 statements one side has in a function and the other has not are counted over all pairs, and
 the most frequent are listed with an example function, which is what to work on next.
 
-Exit status is 0 unless a side fails to build or to print. BLAZE_BIN names the ra-jit binary.
+Exit status is 0 unless a side fails to build or to print. BLAZE_BIN names the blaze binary.
 """
 import argparse, collections, json, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 
 
 def rustc_mir(workspace, package, level, ub_checks):
@@ -52,12 +52,12 @@ def rustc_mir(workspace, package, level, ub_checks):
     return out.stdout
 
 
-def ra_jit_mir(workspace, package, level):
+def blaze_mir(workspace, package, level):
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN)
-    cmd = [RA_JIT, "mir", workspace, "--crate", package.replace("-", "_"), "--level", str(level), "--time"]
+    cmd = [BLAZE, "mir", workspace, "--crate", package.replace("-", "_"), "--level", str(level), "--time"]
     out = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if out.returncode != 0:
-        sys.exit(f"ra-jit mir failed:\n{out.stderr[-4000:]}")
+        sys.exit(f"blaze-engine mir failed:\n{out.stderr[-4000:]}")
     timing = [line for line in out.stderr.splitlines() if line.startswith("mir: ")]
     return out.stdout, (timing[-1] if timing else "")
 
@@ -419,7 +419,7 @@ def show_diff(name, rblocks, oblocks):
             out.append(f"{label}{' (cleanup)' if cleanup else ''}:")
             out += ["    " + s for s in stmts] + ["    " + term]
         return out
-    print(f"\n--- rustc / +++ ra-jit: {name}")
+    print(f"\n--- rustc / +++ blaze: {name}")
     for line in difflib.unified_diff(text(rblocks), text(oblocks), lineterm="", n=1):
         if not line.startswith(("---", "+++")):
             print(line)
@@ -429,42 +429,42 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("workspace", nargs="?", default=os.path.join(HERE, "corpus"))
     ap.add_argument("--crate", default="cases")
-    ap.add_argument("--level", type=int, default=0, help="ra-jit's MIR optimization level")
+    ap.add_argument("--level", type=int, default=0, help="blaze's MIR optimization level")
     ap.add_argument("--rustc-level", type=int, default=1, help="rustc's -Zmir-opt-level: 1 or 2")
     ap.add_argument("--ub-checks", action="store_true",
-                    help="keep the checks of pointers rustc puts in a debug build, which ra-jit has not")
+                    help="keep the checks of pointers rustc puts in a debug build, which blaze has not")
     ap.add_argument("--show", type=int, default=0, help="print this many differing functions")
     ap.add_argument("--top", type=int, default=12, help="list this many kinds of difference")
     ap.add_argument("--json", help="write the numbers here")
     args = ap.parse_args()
     workspace = os.path.abspath(args.workspace)
     rustc = rustc_mir(workspace, args.crate, args.rustc_level, args.ub_checks)
-    ours, timing = ra_jit_mir(workspace, args.crate, args.level)
+    ours, timing = blaze_mir(workspace, args.crate, args.level)
     pairs, unpaired_rustc, unpaired_ours = compare(rustc, ours)
     levels, only_rustc, only_ours, example, failures = evaluate(pairs)
     n = len(pairs)
-    print(f"ra-jit level {args.level} against rustc -Zmir-opt-level={args.rustc_level}, crate {args.crate}")
-    print(f"functions: {len(functions(rustc))} of rustc's, {len(functions(ours))} of ra-jit's, {n} paired")
+    print(f"blaze level {args.level} against rustc -Zmir-opt-level={args.rustc_level}, crate {args.crate}")
+    print(f"functions: {len(functions(rustc))} of rustc's, {len(functions(ours))} of blaze's, {n} paired")
     if timing:
         print(timing)
     for level in ("shape", "counts", "identical", "typed"):
         print(f"  {level:<10} {levels[level]:>5} / {n}  {100 * levels[level] / max(n, 1):5.1f}%")
-    print(f"\nstatements rustc has and ra-jit has not, in how many functions (top {args.top}):")
+    print(f"\nstatements rustc has and blaze has not, in how many functions (top {args.top}):")
     for line, count in only_rustc.most_common(args.top):
         print(f"  {count:>5}  {line[:110]}   e.g. {example[('rustc', line)]}")
-    print(f"\nstatements ra-jit has and rustc has not (top {args.top}):")
+    print(f"\nstatements blaze has and rustc has not (top {args.top}):")
     for line, count in only_ours.most_common(args.top):
         print(f"  {count:>5}  {line[:110]}   e.g. {example[('ours', line)]}")
     if unpaired_rustc:
         print(f"\n{len(unpaired_rustc)} of rustc's functions not paired, e.g. {', '.join(unpaired_rustc[:6])}")
     if unpaired_ours:
-        print(f"{len(unpaired_ours)} of ra-jit's functions not paired, e.g. {', '.join(unpaired_ours[:6])}")
+        print(f"{len(unpaired_ours)} of blaze's functions not paired, e.g. {', '.join(unpaired_ours[:6])}")
     for name, rblocks, oblocks in failures[:args.show]:
         show_diff(name, rblocks, oblocks)
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"level": args.level, "rustc_level": args.rustc_level, "paired": n,
-                       "rustc_functions": len(functions(rustc)), "ra_jit_functions": len(functions(ours)),
+                       "rustc_functions": len(functions(rustc)), "blaze_functions": len(functions(ours)),
                        "levels": dict(levels), "timing": timing}, f, indent=1)
 
 

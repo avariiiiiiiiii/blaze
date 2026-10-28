@@ -1,13 +1,13 @@
-# A differential fuzzer for ra-jit
+# A differential fuzzer for blaze
 
 Every harness before this one runs programs that somebody wrote. This one makes programs up.
 `harness/fuzz/gen.py` writes valid, deterministic, terminating Rust programs from a seed, and
-`harness/fuzz/fuzz.py` builds each one with cargo and with ra-jit under both backends, runs the
-binaries and compares what they print. A case whose output differs, a function ra-jit leaves to
-rustc, or a ra-jit crash is a finding; the driver reduces it and writes it to
+`harness/fuzz/fuzz.py` builds each one with cargo and with blaze under both backends, runs the
+binaries and compares what they print. A case whose output differs, a function blaze leaves to
+rustc, or a blaze crash is a finding; the driver reduces it and writes it to
 `harness/fuzz/found/` with the seed that makes it again.
 
-Branch `ra-jit-fuzz`, from `ra-jit-collate` at 6d12f21c86, with `ra-jit-collate` at ce52276cf5
+Branch `blaze-fuzz`, from `blaze-collate` at 6d12f21c86, with `blaze-collate` at ce52276cf5
 merged in at the end of the first round (27920a4f69, see "The merge") and again at 3d47ed59bf
 in the second (60bc3d6cfa). Everything below was measured on The four-backend runs of the second round are not the long run that was asked for. L11
 (360 programs) ran before findings 17 and 19 were fixed and found them. L12 was stopped at 57
@@ -20,7 +20,7 @@ next thing to do is `fuzz.py run --seed L13 --first 60 --rounds 300 --cases 30 -
 cranelift,llvm,llvm-O0,llvm-full`.
 
 Linux x86-64 with Rust 1.99.0 and
-LLVM 20.1.8, with a release ra-jit built with `--features llvm`, except the section "AArch64
+LLVM 20.1.8, with a release blaze built with `--features llvm`, except the section "AArch64
 under qemu", which is the same machine building for `aarch64-unknown-linux-gnu` and running
 the binaries with `qemu-aarch64`. macOS, Windows and wasm were not run.
 
@@ -30,8 +30,8 @@ in every run ("The long runs"), scenes in the generator ("Scenes"), generated ed
 
 ## Result
 
-The fuzzer found twenty-one distinct problems in whole builds. Eighteen are fixed in ra-jit, two
-are worked around (6 and 20, which I believe are bugs in LLVM, not in ra-jit), and one is open.
+The fuzzer found twenty-one distinct problems in whole builds. Eighteen are fixed in blaze, two
+are worked around (6 and 20, which I believe are bugs in LLVM, not in blaze), and one is open.
 The generated edits found four more, in the daemon's incremental path, all fixed, and a fifth
 in the last run (E5) that is open and not looked into; they are
 in their own section. Each has a reduced case in `harness/breakers/`.
@@ -39,7 +39,7 @@ in their own section. Each has a reduced case in `harness/breakers/`.
 | # | What | Backends | Status | Breaker case |
 |---|---|---|---|---|
 | 1 | A panic's column was wrong for a parenthesised expression, for built-in indexing, and on a line with wide or zero-width characters | both | fixed, f1e4a5011f | `panic_columns`, `panic_column_width` |
-| 2 | An index out of bounds inside a larger statement was reported at the statement, or at `<ra-jit>:0:0` | both | fixed, 80ca599faf | `panic_index_operand` |
+| 2 | An index out of bounds inside a larger statement was reported at the statement, or at `<blaze>:0:0` | both | fixed, 80ca599faf | `panic_index_operand` |
 | 3 | `assert!` of a condition longer than a line prints the condition on one line; rustc breaks it over several | both | open | `assert_message` |
 | 4 | When an operand of an array, tuple, struct literal or call panicked, the operands already made were dropped in the wrong order relative to the statement's temporaries | both | fixed, dcb6b1fa7a | `unwind_operand_order` |
 | 5 | A function with a C-convention aggregate argument passed on the stack whose size is not a multiple of eight was left to rustc (Cranelift panicked) | cranelift | fixed, ca26ccf5d1 | `stack_aggregate_odd_size` |
@@ -61,7 +61,7 @@ in their own section. Each has a reduced case in `harness/breakers/`.
 | 21 | Finding 15 again: an arm that is only an or-pattern, behind an arm whose test also decides a later arm, hid that the later arm is never reached, and the array was dropped from the back | all four | fixed, e45ffdff69 | `unreachable_arm_move` |
 
 Numbers 4, 6, 7 and 9 to 21 are miscompiles: the program ran and did the wrong thing. Numbers 1 to 3
-are wrong panic text. Numbers 5 and 8 are functions ra-jit refused, with the reason stated, so the
+are wrong panic text. Numbers 5 and 8 are functions blaze refused, with the reason stated, so the
 program was still right.
 
 ## The long runs
@@ -72,11 +72,11 @@ fast emit. From L11 on a run has four (`--backends cranelift,llvm,llvm-O0,llvm-f
 two, `llvm-O0` (`BLAZE_OPT=0`, fast emit) and `llvm-full` (`BLAZE_OPT=2 BLAZE_EMIT=optimized`,
 LLVM's own instruction selection at `-O2`). Every backend builds the same programs, so the
 number compiled is the same for each; the two "Compiled" columns are then the first two. "Generated" counts the functions the generator
-wrote; "compiled" is the number of functions ra-jit's own report says it compiled, which also
+wrote; "compiled" is the number of functions blaze's own report says it compiled, which also
 has the prelude's functions and leaves out generic functions nobody calls. Each run used the
-ra-jit of the time, so the earlier ones show the bugs that were then fixed.
+blaze of the time, so the earlier ones show the bugs that were then fixed.
 
-| Run | Seed, rounds | ra-jit | Programs run | Functions generated | Compiled, Cranelift | Compiled, LLVM | Differences | Crashes | Left to rustc |
+| Run | Seed, rounds | blaze | Programs run | Functions generated | Compiled, Cranelift | Compiled, LLVM | Differences | Crashes | Left to rustc |
 |---|---|---|---:|---:|---:|---:|---|---:|---|
 | L1 | `L1`, 136 | with fixes 1, 2, 4 | 136 | 39,720 | 41,089 | 38,984 | Cranelift 4, LLVM 7 (all checksum; findings 6, 7) | 0 | Cranelift 12, `backend panic: StructArgument size is not properly aligned` (finding 5); LLVM 0 |
 | L2 | `L2`, 119 (stopped) | with fixes 1 to 7 | 119 | 35,230 | 34,195 | 34,195 | 0 | 0 | 1 per backend, `mir: UnresolvedUpvar` (finding 8) |
@@ -93,7 +93,7 @@ ra-jit of the time, so the earlier ones show the bugs that were then fixed.
 | L13 | `L13`, 60 (stopped), four backends | e45ffdff69 | 60 | 17,619 | 22,004 | 22,004 | 0 | 0 | 0 |
 
 L9 is the run on the last binary before the merge described below: 360 programs, none rejected,
-10,800 cases, 106,116 functions generated and 101,848 compiled by ra-jit under each backend, no
+10,800 cases, 106,116 functions generated and 101,848 compiled by blaze under each backend, no
 difference, no crash, nothing left to rustc. L5 and L6 were meant to be that run (106,065
 functions together, clean), and so were L7 and L8; each time a run that was otherwise clean
 turned up one to three more drop-order bugs, which were fixed before the next. So the
@@ -109,12 +109,12 @@ while the generator was being written) found the first findings, the `s1-` and `
 under `found/`; they are not counted here.
 
 Two of the 2,116 programs were not compared, both through faults of the generator and not of
-ra-jit, and both fixed:
+blaze, and both fixed:
 
 - `L4-51` was rejected by rustc (E0502): a closure borrowed a trait object and the argument
   next to it called a `&mut self` method of the same object. The argument of a call no longer
   changes what the closure before it borrows (a1f0466b5d); `fuzz.py repro L4-51` then builds,
-  301 functions generated, 299 compiled by ra-jit under each backend, no finding.
+  301 functions generated, 299 compiled by blaze under each backend, no finding.
 - `L6-176` built, but rustc's binary aborted: the program called `offset_from` on pointers to
   `()`, which panics for a zero-sized element, in a function that cannot unwind. The generator
   now leaves the distance out for such an element. With that, `fuzz.py repro L6-176` ran and
@@ -125,7 +125,7 @@ ra-jit, and both fixed:
 I read how the existing generators work before writing one. None of them was run here.
 
 - rustlantis generates MIR directly, as `#![feature(custom_mir)]` source. That needs a nightly
-  compiler, and it enters the compiler below the level ra-jit starts from: ra-jit lowers source
+  compiler, and it enters the compiler below the level blaze starts from: blaze lowers source
   through its own HIR and MIR, so a program written as MIR does not test that lowering, and
   1.99 stable rejects it.
 - rustsmith generates source programs, but from a small language. Going by its own description
@@ -263,7 +263,7 @@ the task gave:
 A function has a scene with a probability the program draws once, so some programs are full
 of them and some have none.
 
-The first sixteen programs with scenes (`--seed S1 --rounds 16`, ra-jit at 20d97d4d73) had 14
+The first sixteen programs with scenes (`--seed S1 --rounds 16`, blaze at 20d97d4d73) had 14
 differences under each backend, no crash and nothing left to rustc. All were findings 17 and
 18, both in unwinding with operands in flight; after those two fixes the same sixteen
 programs are clean. Coroutines other than `async` are not in stable Rust and are not
@@ -272,21 +272,21 @@ generated.
 ## The driver
 
     cd harness
-    export BLAZE_BIN=/path/to/release/ra-jit
+    export BLAZE_BIN=/path/to/release/blaze-engine
     python3 fuzz/fuzz.py smoke                              # 2 programs of 25 cases, fixed seed, for CI
     python3 fuzz/fuzz.py run --seed L2 --rounds 360 --jobs 8 --out DIR
     python3 fuzz/fuzz.py repro L2-1 c27                     # one program again, or some of its cases
-    python3 fuzz/fuzz.py check fuzz/found/*.rs              # every reduction against this ra-jit
+    python3 fuzz/fuzz.py check fuzz/found/*.rs              # every reduction against this blaze
     python3 fuzz/fuzz.py report DIR --coverage              # the counts of a run
 
 A round is one program: 30 cases by default, about 290 functions. It is one cargo project built
-through `Fixture` from `difftest.py`, once by cargo and once by ra-jit per backend
+through `Fixture` from `difftest.py`, once by cargo and once by blaze per backend
 (`--backends cranelift,llvm`; llvm runs with `BLAZE_OPT=2 BLAZE_EMIT=fast`), so a round costs
-one cargo build and two ra-jit builds. Rounds are split over `--jobs` worker processes; round N
+one cargo build and two blaze builds. Rounds are split over `--jobs` worker processes; round N
 of a seed is the same program whatever the number of jobs.
 
 A finding is one of: a case whose lines differ (told apart as checksum, panic location, panic
-message, whether it panics, or the program dying), a function that ra-jit's report lists as skipped, or a ra-jit build that did not finish.
+message, whether it panics, or the program dying), a function that blaze's report lists as skipped, or a blaze build that did not finish.
 A cause seen before in the same run is counted and not reduced again. Reduction is delta
 debugging in two steps: first over the cases of the program, then over the lines of the one
 case left, by brace-balanced units, keeping a candidate only when rustc still accepts it and the
@@ -294,16 +294,16 @@ same kind of finding with the same key still shows. `--reduce` bounds the second
 finding. The result goes to `fuzz/found/<kind>-<key>-<seed>-<case>.rs` with a header that names
 the seed, the edition, the backend and both outputs.
 
-The smoke run is in CI (`.github/workflows/ra-jit.yaml`, in the Linux harness job after `keys.py`,
+The smoke run is in CI (`.github/workflows/blaze.yaml`, in the Linux harness job after `keys.py`,
 per backend, on x86-64 only since nothing else was fuzzed). On this
 machine, with nothing else running, it took 57 s for both backends with the binary of 27a94f2770
 and 89 s with the merged one
-(`time python3 fuzz/fuzz.py smoke`): 475 functions generated, 505 compiled by ra-jit per
+(`time python3 fuzz/fuzz.py smoke`): 475 functions generated, 505 compiled by blaze per
 backend, no finding.
 
 ## The findings
 
-**1. Panic columns.** ra-jit took the column of a panic from the start of the expression
+**1. Panic columns.** blaze took the column of a panic from the start of the expression
 without its parentheses, reported built-in indexing at the bracket where rustc reports it at
 the start of the base, and counted columns in characters where rustc counts display width (a
 tab is four, a wide character two, a combining mark zero). The fix distinguishes built-in
@@ -312,27 +312,27 @@ uses. Reductions: `differs-panic-location-s1-2-c13.rs`.
 
 **2. Index out of bounds inside a statement.** When the index expression was an operand of a
 larger statement (an argument of `assert!`, the value of a `let` with a conversion around it),
-the panic was reported at the whole statement or at `<ra-jit>:0:0`. The bounds check now carries
+the panic was reported at the whole statement or at `<blaze>:0:0`. The bounds check now carries
 the span of the index expression. Reductions: `differs-panic-location-s2-2-c27.rs`,
 `s2-3-c10`, `s2-28-c1`, `s2-36-c24`, `s2-43-c12`.
 
 **3. `assert!` message (open).** The message of a failed `assert!` is the condition as
 rustc's pretty printer writes it back, and that printer breaks a condition longer than a line
-over several lines. ra-jit writes it on one line. Matching it needs `rustc_ast_pretty`, which
-is not a crate ra_jit can depend on, or a port of its line-breaking algorithm. The generator
+over several lines. blaze writes it on one line. Matching it needs `rustc_ast_pretty`, which
+is not a crate blaze can depend on, or a port of its line-breaking algorithm. The generator
 keeps `assert!` conditions short so that this does not drown other findings. The case is in
 `OPEN` in `breakers.py`.
 
 **4. Drop order when an operand panics.** In
 `let x = [Loud(1), sum(&Loud(20), &Loud(30)), Loud(3), none().unwrap()];` rustc drops, on the
 unwind, 3, 50, 1 and then 30, 20: the operands belong to the array expression, and the
-`&Loud(..)` temporaries live to the end of the statement. ra-jit dropped 1 last. The same
+`&Loud(..)` temporaries live to the end of the statement. blaze dropped 1 last. The same
 happened for tuples, struct literals and call arguments. In a block's tail expression both
-kinds of temporary are in one scope and the order is plain reverse creation, which ra-jit
+kinds of temporary are in one scope and the order is plain reverse creation, which blaze
 already did, so the fix applies to statements only. Reduction: `differs-checksum-s2-23-c24.rs`.
 
 **5. Odd-sized stack aggregate.** An `extern "C"` function whose aggregate argument no longer
-fits in registers gets it on the stack. ra-jit gave Cranelift the aggregate's exact size, and
+fits in registers gets it on the stack. blaze gave Cranelift the aggregate's exact size, and
 Cranelift asserts a multiple of eight, so the function was left to rustc with `backend panic:
 StructArgument size is not properly aligned`. The slot is now rounded up, as the System V ABI
 says. Reductions: the three `left-backend-panic-structargument-*.rs`. This one was hit 12
@@ -340,9 +340,9 @@ times in 136 programs.
 
 **6. LLVM's SLP vectorizer (worked around).**
 `[[-18i128; 5], [524287; 5], ...]` built under LLVM at `-O2` had rows whose later elements were
-never written. The IR ra-jit gives LLVM is right: `opt-20 -O2 -opt-bisect-limit` on the dumped
+never written. The IR blaze gives LLVM is right: `opt-20 -O2 -opt-bisect-limit` on the dumped
 module puts the change at the SLP vectorizer pass, which turns the stores into vector stores
-with poison lanes. This is LLVM 20.1.8 miscompiling valid IR. ra-jit now turns the SLP
+with poison lanes. This is LLVM 20.1.8 miscompiling valid IR. blaze now turns the SLP
 vectorizer off (`-vectorize-slp=false`); the loop vectorizer stays on. I did not measure what
 that costs in generated code speed, and I did not check whether a later LLVM has the bug.
 rustc 1.99 uses its own LLVM and did not show it on the same source. Reductions:
@@ -350,27 +350,27 @@ rustc 1.99 uses its own LLVM and did not show it on the same source. Reductions:
 
 2026-10-23: with the SLP vectorizer on again, `repeat_rows` and the four reductions match
 rustc on x86-64 and AArch64 at `-O2` and `-O3`, and so do 300 fresh programs on x86-64 at
-`-O2` (`fuzz.py run --seed slp1 --rounds 300 --backends llvm`). The IR ra-jit gives LLVM has changed since (copies
+`-O2` (`fuzz.py run --seed slp1 --rounds 300 --backends llvm`). The IR blaze gives LLVM has changed since (copies
 are `memcpy`s, the pipeline is ThinLTO's); LLVM 20.1.8 is the same. The pass is on again, as
 rustc runs it: nbody went from 1.21 to 0.98 times release on x86-64 and from 1.28 to 1.04 on
 AArch64.
 
 **7. Temporaries of an `if` branch's tail, before 2024.** Before the 2024 edition the
 temporaries of a block's tail expression live as long as those of the expression the block is
-in. ra-jit applied that to every block. A branch of an `if` is where rustc ends them anyway, so
+in. blaze applied that to every block. A branch of an `if` is where rustc ends them anyway, so
 in `seen(&if c { a } else { pick(&Loud(4), &Loud(6)).clone() })` rustc drops 6 and 4 before
-`seen` runs and ra-jit dropped them after. Each branch now has its own scope. Match arms, loop
+`seen` runs and blaze dropped them after. Each branch now has its own scope. Match arms, loop
 bodies and the right side of `&&`/`||` were checked by hand and were already right. The
 breakers crate is edition 2024, so the case lives in a new 2021 crate,
 `harness/breakers/edition2021`. Reductions: `differs-checksum-L1-12-c3.rs`, `L1-98-c28`.
 
 **8. Uncaptured match scrutinee.** In `|| match x.1 { (_, _) if g => a, _ => x.0 }` nothing
-reads `x.1`, so the closure captures `x.0` only. ra-jit's MIR still had a fake read of `x.1`,
+reads `x.1`, so the closure captures `x.0` only. blaze's MIR still had a fake read of `x.1`,
 found no capture to map it to and gave up on the closure and, through it, on its callers.
 Fake reads of places that are not captured are now removed; rustc does not emit them either.
 Reduction: `left-mir-unresolvedupvar-L2-1-c27.rs`.
 
-**9. Index of an element that is not read.** ra-jit checks an index where it computes the
+**9. Index of an element that is not read.** blaze checks an index where it computes the
 address of the element, and it made no code at all for a place that is matched on by a
 pattern that binds and tests nothing. So `let _ = items[at];`, `let (_, _) = items[at];` and
 `match items[at] { _ => .. }` went on with `at` out of bounds where rustc panics. Such a place
@@ -382,19 +382,19 @@ panic in the case was a different one).
 **10. `let ... else` temporaries.** When the pattern of `let PAT = EXPR else { .. };` does not
 match, rustc drops the value of `EXPR` and its temporaries, also the ones that would have
 lived to the end of the block (`let (Loud(1), b) = &(Loud(n), Loud(5)) else ..`), and then runs
-the `else`. ra-jit ran the `else` first and dropped them on the way out of it. They are now
+the `else`. blaze ran the `else` first and dropped them on the way out of it. They are now
 dropped where the `else` starts. Reductions: `differs-checksum-L2-354-c5.rs`, `L2-372-c9`,
 `L2-431-c24`.
 
 **11. Order in which an unmatched array is dropped.** rustc drops an array that has lost
 elements to a pattern from the back, and an array that is whole front to back, and it decides
 which at compile time: where a drop is, can an element have been moved out on some way there.
-ra-jit's MIR has no such analysis; it keeps flags at run time and used the from-the-back order
+blaze's MIR has no such analysis; it keeps flags at run time and used the from-the-back order
 for every drop of a local that some pattern in the function moves out of. So
 `let [a, Loud(7)] = [Loud(1), Loud(n)] else { .. }` with `n` not 7 dropped `n` and then 1. There
 is now a small forward analysis over the MIR (`MirBody::parted_at_block_ends`): a drop that no
 move out of a part of the local can reach drops the local as one value. That fixed `let else`
-and `match`. `if let` needed one more change: ra-jit lowered `if let` to a `bool` and a switch
+and `match`. `if let` needed one more change: blaze lowered `if let` to a `bool` and a switch
 on it, which put the matched and the unmatched way through one block and so lost what the
 analysis needs. An `if` whose whole condition is a `let` now goes straight from the pattern to
 its branches. A let chain (`if let A = x && c`) still goes through the `bool`. I tried one by hand (a
@@ -407,7 +407,7 @@ Reduction: `differs-checksum-L2-463-c8.rs`, and the three of finding 10.
 on the iterator around a `loop` and ends the temporaries of the whole thing where the loop
 ends. That only shows before the 2024 edition and when the loop is the tail of a block (a
 function body that ends in a `for` is one): the temporaries of any other tail are dropped
-after the block's locals, those of a `for` before. ra-jit treated the loop as any other tail.
+after the block's locals, those of a `for` before. blaze treated the loop as any other tail.
 The `match` a `for` is written as now has a scope of its own for its temporaries. It was found
 late because it needs a `for` in tail position whose iterable makes a temporary with a `Drop`,
 in a 2021 program, and it came out of `L6-176` only after the generator fault in that
@@ -417,7 +417,7 @@ program was fixed (see the long runs). Reduction: `differs-checksum-L6-176-c3.rs
 the expression an `if let` matches on are not the `if`'s: they live as long as the temporaries
 of the expression the `if` is in, so to the end of the statement, or past the block's locals
 when the `if let` is the tail of a block. Only what the pattern binds ends with the branch.
-ra-jit dropped all of it at the end of the branch, the 2024 rule. Before 2024 the scrutinee's
+blaze dropped all of it at the end of the branch, the 2024 rule. Before 2024 the scrutinee's
 temporaries are now handed to the scope around the `if`. `L7` hit this in six programs (rounds
 50, 81, 87, 171, 274 and 290). Reductions: `differs-checksum-L7-50-c6.rs`, `L7-87-c6`,
 `L7-81-c9`, `L7-171-c9`.
@@ -425,7 +425,7 @@ temporaries are now handed to the scope around the `if`. `L7` hit this in six pr
 **14. A subslice put back after a failed guard.** In
 `match array { [_, middle @ .., Loud(3..=40)] if on => .., _ => .. }` rustc moves the middle
 elements into `middle` before it runs the guard, and when the guard is false moves them back
-so the next arms see the array whole. ra-jit did both moves, but its note of which elements of
+so the next arms see the array whole. blaze did both moves, but its note of which elements of
 the array are gone was only cleared for an assignment to a field or one element, not to a
 subslice. The elements were back and still marked as moved, so the array was dropped without
 them and their destructors never ran. An assignment to a subslice now clears the note for
@@ -440,7 +440,7 @@ backends. `L7` hit it in one program (round 174). Reduction:
 the second arm can never be taken: the first takes every array that ends in a `Char`. rustc
 builds one tree of tests for all the arms, the second arm's bindings end up in a block no
 edge leads to, and its drop analysis sees an array nothing is moved out of and drops it front
-to back. ra-jit tries the arms one after the other, so its MIR has a path through the second
+to back. blaze tries the arms one after the other, so its MIR has a path through the second
 arm's move, and the array was dropped as one that may have lost elements: from the back.
 
 What decides is not whether a value can reach the arm but whether rustc's tree has an edge
@@ -458,7 +458,7 @@ first candidate, sort the candidates the outcome says something about into its b
 leave the rest for after, expand or-patterns where rustc does, and stop at a candidate that
 matches without a guard. It builds nothing; it only says which arms are reached. That is
 the part of rustc's roughly 4,000 lines of match lowering that decides reachability, and
-it was contained. ra-jit still lowers the arms one after the other; the bindings of an arm
+it was contained. blaze still lowers the arms one after the other; the bindings of an arm
 the tree does not reach go into a block listed in `MirBody::unreached`, and the analysis of
 what may be moved out where a drop is does not enter those blocks. If the simulation is
 wrong about an arm, the cost is the order of a drop: every part is still dropped once, by
@@ -480,7 +480,7 @@ nearest expression that ends temporaries, and each scope is dropped in the rever
 order its values were made. So the operands go first (`3, 50, 1, 30, 20`) everywhere except
 where the expression itself ends its temporaries, which is the body of a closure without
 braces and, from the 2024 edition, the tail of a block; there everything is in one scope
-(`3, 50, 30, 20, 1`). ra-jit now keeps the set of those expressions and applies the fix of
+(`3, 50, 30, 20, 1`). blaze now keeps the set of those expressions and applies the fix of
 finding 4 to every other aggregate or call. Reduction: `differs-checksum-L8-231-c11.rs`.
 
 **17. Operands of an aggregate inside an aggregate.** Found by the first run of the widened
@@ -489,7 +489,7 @@ generator (`S1-1`, and `L11-133` under all four backends). In
     (Noisy(27), Duo { a: Noisy(39), b: trip(armed, Noisy(15)) })
 
 when `trip` panics rustc drops `39` and then `27`: the inner literal's operands are newer.
-ra-jit dropped `27` first. The lowering that puts operands in front of temporaries (findings 4
+blaze dropped `27` first. The lowering that puts operands in front of temporaries (findings 4
 and 16) ran once for the inner literal and again for the outer one, and the second pass
 counted the inner operands as temporaries of the outer and moved them. It now remembers
 which locals are operands and keeps them in the order they were made. Reductions:
@@ -501,10 +501,10 @@ which locals are operands and keeps them in the order they were made. Reductions
     let _v = { let _local = Noisy(57); (Noisy(58), trip(armed, Noisy(47))) };
 
 when `trip` panics rustc drops `58`, then `57`. Before 2024 the temporaries of a block's tail
-outlive the block's locals, and ra-jit handed everything the tail made to the enclosing scope,
+outlive the block's locals, and blaze handed everything the tail made to the enclosing scope,
 its operands too, so `57` went first. Only the temporaries are handed over now; the operands
 stay in the block. I checked rustc's order with this program under both editions: it is
-`58, 57` in both, and ra-jit was already right in 2024. Reduction:
+`58, 57` in both, and blaze was already right in 2024. Reduction:
 `differs-checksum-S1-2-c7.rs`.
 
 **19. Nested loops.** `L11-165`, under all four backends, with the generator as it was before
@@ -518,7 +518,7 @@ the scenes. In
     }
 
 when `trip` panics rustc drops `held`, then `item`, then the rest of the vector: the scopes
-end from the inside out. To order the drops of a landing pad ra-jit ranked the locals by which
+end from the inside out. To order the drops of a landing pad blaze ranked the locals by which
 blocks could reach which, and inside a loop that says nothing, because the body of the inner
 loop and its exit each lead to the other through the outer loop; the iterator came out first.
 The lowering now writes down the order in which scopes end as it closes them
@@ -538,7 +538,7 @@ register allocator; after the `-O2` passes several drop flags are live in regist
 the call that unwinds, the selector's copy of the exception selector register is dead and
 deleted while the register stays a live-in of the landing pad, and the allocator hands that
 register to a drop flag without reloading it. The landing pad then reads the selector value
-as a flag and frees a vector that was never made. ra-jit now turns the global selector off for
+as a flag and frees a vector that was never made. blaze now turns the global selector off for
 AArch64, so fast emit uses SelectionDAG's fast path there, as it does on x86-64. This is a
 workaround, and what it costs in compile time on AArch64 was not measured. Reduction:
 `differs-died-A1-17-c23.rs`.
@@ -551,7 +551,7 @@ was
     [Loud::C('A'..='Z', _), m @ .., _] => 3,
 
 and the third arm, which would move the middle out, can never be reached. rustc's tree has
-no edge to it and drops the array front to back; ra-jit dropped it from the back. The
+no edge to it and drops the array front to back; blaze dropped it from the back. The
 simulation of finding 15 took the first arm's range test, and sorted the first and third arm
 into its branch, but the second arm starts with an or-pattern, which no test sorts, so the
 third arm was held back behind it and tested again later, by itself. rustc does not do that:
@@ -567,7 +567,7 @@ Reduction: `differs-checksum-L12-18-c0.rs`.
 
 `fuzz.py check fuzz/found/*.rs` with the binary of e45ffdff69: all 38 files give the same
 output as rustc under both backends, with no function left to rustc
-(`BLAZE_BIN=ra-jit python3 fuzz/fuzz.py check fuzz/found/*.rs`, 76 lines of `same`).
+(`BLAZE_BIN=blaze python3 fuzz/fuzz.py check fuzz/found/*.rs`, 76 lines of `same`).
 
 ## Generated edits
 
@@ -600,7 +600,7 @@ fuzz smoke. `edits.py check` runs the sequences under `found/edits/` again.
 The runs, each with `python3 fuzz/edits.py run --seed S --rounds N --cases 6 --steps 12
 --backends cranelift,llvm`, counts per backend from `edits.py report DIR`:
 
-| Run | ra-jit | Programs | Edits shown | Wrong output | Refused | Died | Spliced | Linked in full | No link needed |
+| Run | blaze | Programs | Edits shown | Wrong output | Refused | Died | Spliced | Linked in full | No link needed |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | E1, 12 rounds of 16 steps | before the fixes | 12 | not kept | 0 | several | 1 | | | |
 | E2, 16 rounds | ea6387473d less the third fix | 16 | 144 | 0 | 3 | 0 | 75 | 66 | 3 |
@@ -617,21 +617,21 @@ saying no, or dying. Four causes, all fixed, each with a sequence under `found/e
   the file has now.
 - **A refusal with `Duplicate definition of identifier`** (`block-namesake.rs`). An edit made
   a second block in a function with a nested function of the same name as the first block's.
-  rustc tells them apart by a number ra-jit cannot know without rustc, and ra-jit gave both
+  rustc tells them apart by a number blaze cannot know without rustc, and blaze gave both
   the first one's symbol.
 - **The same through a type** (`derived-namesake.rs`). Two blocks of one function each with a
   type of the same name and a method or derive on it, three times in E2. Both are fixed by
   one rule: a path that two functions of a body share has no rustc symbol, and such
-  functions get ra-jit's own.
+  functions get blaze's own.
 - **A refusal with `unsupported: intrinsic powif32`** (`intrinsic-new.rs`), all seven refusals
-  of E3. ra-jit did not know `powi`. A whole build seldom shows it, because ra_jit calls the copy of
+  of E3. blaze did not know `powi`. A whole build seldom shows it, because blaze calls the copy of
   `f64::powi` that rustc's build of the crate has when there is one; an edit that brings the
   first `powi` into the program has no such copy to call. Whole builds showed it twice in
   the 57 programs of L12 (`L12-20`, `L12-46`), as a function left to rustc with that reason, so the program
   was still right; I take it rustc had inlined `powi` there and left no copy, and did not
-  check; reduction `left-intrinsic-powif32-L12-20-c25.rs`. ra-jit now compiles the intrinsic (a call
+  check; reduction `left-intrinsic-powif32-L12-20-c25.rs`. blaze now compiles the intrinsic (a call
   to compiler-builtins' `__powisf2`/`__powidf2`, which is what rustc's is on these targets).
-  The same can be true of anything else in `std` that ra-jit cannot compile and takes from
+  The same can be true of anything else in `std` that blaze cannot compile and takes from
   rustc's object, and only an edit shows it; whole-build runs count such a function as
   compiled.
 
@@ -643,10 +643,10 @@ location of a panic raised inside `core` ("attempt to exponentiate with overflow
 `core/src/num/mod.rs`). cargo's binary prints the path of the installed `rust-src`
 (`~/.rustup/toolchains/.../library/core/src/num/mod.rs:1290:5`) and the daemon's binary
 after the edit prints `/rustc/<commit>/library/core/src/num/mod.rs:1290:5`. My guess, not
-checked: after the edit ra-jit compiled an instance of the integer `pow` itself and named
+checked: after the edit blaze compiled an instance of the integer `pow` itself and named
 the file the way `core`'s metadata does, where rustc maps that path to the local sources
 when they are installed. If so it is a difference in panic text only, it should also show
-in a whole build on a machine with `rust-src` whenever ra-jit compiles a `core` function
+in a whole build on a machine with `rust-src` whenever blaze compiles a `core` function
 with a location itself, and the fix is to apply rustc's mapping of `/rustc/<commit>` to the
 sysroot's sources. The first sequence is kept as `found/edits-open/std-panic-path.rs` (294
 lines, not reduced further; it is outside `found/edits/` so that `edits.py check` stays
@@ -664,10 +664,10 @@ too short to jump from, and 3 times a static grew. None of those is wrong; they 
 
 `BLAZE_TARGET=aarch64-unknown-linux-gnu python3 fuzz/fuzz.py ...` builds both sides for
 AArch64 with the `aarch64-linux-gnu-gcc` linker and runs the binaries with `qemu-aarch64`, as
-`buildmodel.py` does; ra-jit itself runs on x86-64 and cross-compiles. The smoke run there
+`buildmodel.py` does; blaze itself runs on x86-64 and cross-compiles. The smoke run there
 (2 programs, 477 functions generated, 676 compiled under each backend) found nothing.
 
-| Run | ra-jit | Programs | Functions generated | Compiled per backend | Cranelift | LLVM `-O2` fast | LLVM `-O0` | LLVM `-O2` full |
+| Run | blaze | Programs | Functions generated | Compiled per backend | Cranelift | LLVM `-O2` fast | LLVM `-O0` | LLVM `-O2` full |
 |---|---|---:|---:|---:|---|---|---|---|
 | A1, 24 rounds | ea6387473d | 24 | 7,049 | 8,515 | 0 | 3 died (finding 20) | 0 | 0 |
 | A2, 20 of 24 rounds (stopped) | 4602a6909f | 20 | 5,694 | 7,355 | 0 | 0 | 0 | 0 |
@@ -688,7 +688,7 @@ only target-specific finding in 44 AArch64 programs is finding 20.
 
 ## The merge
 
-`ra-jit-collate` moved to ce52276cf5 while this was running, and I merged it in (27920a4f69).
+`blaze-collate` moved to ce52276cf5 while this was running, and I merged it in (27920a4f69).
 It conflicted where it mattered: the same weeks' work on rustc's own test suites had fixed
 drop order in the same functions, differently. Both sides had a fix for the temporaries of an
 `if let` before 2024, for `let ... else`, and for the order an array is dropped in after a
@@ -699,7 +699,7 @@ pattern gave its elements back. What I kept:
   `lower_let_else`. The other side's `end_of_branch`, `forget_branch`, `outlive_if_let` and
   `lower_let_else` are gone; its breaker cases for them (`if_let_outlives`, `let_else_drops`,
   `tail_tuple_drops`, `guard_let_drops`, `repeat_moved`) pass with this branch's code.
-- From `ra-jit-collate`, in `mir/codegen.rs`: the analysis of which fields may be moved out
+- From `blaze-collate`, in `mir/codegen.rs`: the analysis of which fields may be moved out
   where a drop is (`moved_where_blocks_end`), the stack argument modes (which include the fix
   of finding 5), and scope ends as the place of drops. This branch's
   `MirBody::parted_at_block_ends` answered nearly the same question and was still there
@@ -711,7 +711,7 @@ pattern gave its elements back. What I kept:
 Measured on the merged binary: the required harnesses below, `fuzz.py check` (29 of the 30
 files the same, the one of finding 15 differs, as before the merge), the smoke run (no
 finding), and one more run, shorter than the others: `--seed L10 --rounds 60`, 60 programs,
-none rejected, 1,800 cases, 17,297 functions generated, 16,734 compiled by ra-jit under each
+none rejected, 1,800 cases, 17,297 functions generated, 16,734 compiled by blaze under each
 backend, no difference, no crash, nothing left to rustc. So the 100,000 functions per backend
 without a finding were run on 27a94f2770, the head before the merge, and the merged head has
 the gate, the reductions and 17,000 functions behind it.
@@ -734,18 +734,18 @@ results were the same under both:
 | `python3 includes.py` | 9 of 9 right |
 | `python3 worktrees.py` | 62 of 62 right |
 
-The table is as of e45ffdff69 (finding 21 fixed, `ra-jit-collate` 3d47ed59bf merged), run
+The table is as of e45ffdff69 (finding 21 fixed, `blaze-collate` 3d47ed59bf merged), run
 again under both backends; on the first merge commit the breakers were 58 of 58 right with
 7 open, the rest the same. The 6
 open of `breakers.py` are finding 3 of this report, three that
-`ra-jit-collate` lists as open and two it lists as left to rustc. Before the merge, on
+`blaze-collate` lists as open and two it lists as left to rustc. Before the merge, on
 27a94f2770, the same nine passed under both backends with 40 of 40 breakers right and 2 open.
 
 `cargo fmt --all -- --check` is clean. `cargo test --release -p hir-ty -p hir-def -p parser -p
-syntax -p ra-jit` on e45ffdff69: 513, 40, 330, 71 and 56 tests passed in the test binaries
+syntax -p blaze-engine` on e45ffdff69: 513, 40, 330, 71 and 56 tests passed in the test binaries
 that have tests, 0 failed, 1 ignored.
 
-The other harnesses `ra-jit-collate` has in CI now (`keys.py`, `backends.py`, `debuginfo.py`,
+The other harnesses `blaze-collate` has in CI now (`keys.py`, `backends.py`, `debuginfo.py`,
 `buildmodel.py`, the `store*.py` ones, `remote.py`) are not in the required list and I did
 not run them on the merged head.
 
@@ -756,7 +756,7 @@ Stopped mid-way when the work was wound down; in order of what I would do next:
 - The difference E5 found in generated edits (the path in a panic location inside `core`,
   see "Generated edits") is open and its cause is a guess.
 - The four-backend long run on the head is 60 programs (L13), not 360.
-- `ra-jit-collate-next` is not merged into this branch; `ra-jit-collate` at 3d47ed59bf is.
+- `blaze-collate-next` is not merged into this branch; `blaze-collate` at 3d47ed59bf is.
   The gate was last run on e45ffdff69 and passed under both backends.
 - A2 was not run again on the head, and no AArch64 run has the `powi` fix.
 - There is no table of how often each scene was generated in a run; `fuzz.py run
@@ -764,7 +764,7 @@ Stopped mid-way when the work was wound down; in order of what I would do next:
 
 - Finding 3, the `assert!` message, is open for the reason above.
 - Finding 6 no longer shows with the SLP vectorizer on (2026-10-23), with no change to LLVM:
-  what in ra-jit's IR it depended on is not known, and AArch64 has not had a long run with it.
+  what in blaze's IR it depended on is not known, and AArch64 has not had a long run with it.
 - Finding 20 is a workaround too, and its diagnosis is mine from the assembly; nobody who
   knows LLVM's fast register allocator has looked at it. Its cost on AArch64 was not measured.
 - macOS and Windows were not run. The ABI classes the generator aims at are the System V and

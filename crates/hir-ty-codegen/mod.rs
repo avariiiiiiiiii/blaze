@@ -1,12 +1,12 @@
-//! ra-jit spike: lower RA MIR to native code with Cranelift.
+//! blaze spike: lower RA MIR to native code with Cranelift.
 //!
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
-extern crate ra_ap_rustc_abi as rustc_abi;
+extern crate rustc_abi;
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate ra_ap_rustc_index as rustc_index;
-extern crate ra_ap_rustc_type_ir as rustc_type_ir;
+extern crate rustc_type_ir;
 
 use std::{borrow::Cow, fmt, sync::LazyLock};
 
@@ -145,17 +145,17 @@ use self::places::{row_location, source_location};
 mod promote;
 mod settled;
 mod stable;
-use ra_jit_store as store;
+use blaze_store as store;
 pub use stable::{block_place, function_place, lower_declared, static_place};
 mod target;
 pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
 pub mod tier;
 
 pub use patch::{OutOfDate, Stale, StaleSteps};
-/// For `crates/ra-jit-bench` alone.
+/// For `crates/blaze-bench` alone.
 #[doc(hidden)]
 pub mod bench {
-    use ra_jit_store::KEY;
+    use blaze_store::KEY;
 
     /// The key of the entry for `name`, as a build asks for it: one that tells a debugger of
     /// its variables when `debug`.
@@ -184,7 +184,7 @@ pub enum CodegenError {
     /// rustc built the function under a symbol private to its object, so its copy stays the
     /// one that code of that object calls, and goes on using rustc's statics.
     Private,
-    /// What ra-jit can't do and no other path may stand in for: the build stops with this
+    /// What blaze can't do and no other path may stand in for: the build stops with this
     /// error, naming what and where. Never left to rustc, never a build in full instead.
     Refused(String),
 }
@@ -249,13 +249,13 @@ pub const CARGO_HOME: &str = "/cargo";
 /// What the name of a static a patch defines anew starts with, which is the same in every
 /// patch after for the same static and value: a running program keeps the copy the first gave
 /// it (`docs/live.md#types`).
-pub const LASTING_STATIC: &str = "ra_jit::static::lasting::";
+pub const LASTING_STATIC: &str = "blaze::static::lasting::";
 
 /// What the name of a data object of a patch starts with that says the patch left the base's
 /// copy of a static behind, the rest of the name being that copy's: the patch has one of its
 /// own, and everything that refers to it (`patch::Base::moved`), so nothing that runs refers to
 /// the base's.
-pub const MOVED_STATIC: &str = "ra_jit::static::moved::";
+pub const MOVED_STATIC: &str = "blaze::static::moved::";
 
 /// `path` with the directory `to` in place of the directory `from` it is under.
 pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
@@ -358,7 +358,7 @@ pub trait SymbolResolver {
         false
     }
     /// Whether what the program is linked with has the symbol: rustc's build, or an object
-    /// ra-jit built before, which an entry of the store may name.
+    /// blaze built before, which an entry of the store may name.
     fn provides(&self, symbol: &str) -> bool {
         self.defines(symbol)
     }
@@ -2841,7 +2841,7 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
 /// The code of a non-generic function.
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
-    let _span = tracing::info_span!(target: "ra_jit", "compiled_root").entered();
+    let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     tier::for_build(|| root_code(db, func, false)).map(Produced::code)
 }
 
@@ -2868,7 +2868,7 @@ fn as_its_crate_compiles(
         // The standard library is built without the checks. rustc compiles an `#[inline]`
         // function of it in each crate that calls it, where what it calls that takes the
         // checks from its caller (`#[rustc_inherit_overflow_checks]`) has that crate's:
-        // the copy ra-jit's build of the standard library exports has none.
+        // the copy blaze's build of the standard library exports has none.
         None => {
             !instance.checked
                 || !symbols.nothing_of_rustc()
@@ -2878,9 +2878,9 @@ fn as_its_crate_compiles(
 }
 
 /// Whether rustc's callers of the symbol of `func` pass it scalable vectors in SVE registers,
-/// where ra-jit's pass them by reference: ra-jit's code for it is a copy of its own, never
+/// where blaze's pass them by reference: blaze's code for it is a copy of its own, never
 /// put in the object under the symbol. Only where nothing of rustc's is linked are all the
-/// callers ra-jit's.
+/// callers blaze's.
 fn rustcs_callers_pass_scalable(
     db: &dyn HirDatabase,
     symbols: &dyn SymbolResolver,
@@ -3034,7 +3034,7 @@ fn compiled_instance<'db>(
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
-    let _span = tracing::info_span!(target: "ra_jit", "compiled_instance").entered();
+    let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
     tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
 }
 
@@ -3531,7 +3531,7 @@ fn coroutine_layout_line<'db>(
 }
 
 /// Whether a future and everything that makes, polls or drops it have to come from one
-/// compiler. They need not: ra-jit lays a future out as rustc does, from the same MIR
+/// compiler. They need not: blaze lays a future out as rustc does, from the same MIR
 /// (`docs/mir-passes.md` of the fork). `BLAZE_SPLIT_FUTURES=1` keeps them apart as before,
 /// a temporary way back until mixing is verified (`harness/mixfutures`).
 // FIXME: delete with what it guards once mixed futures are verified on den-native.
@@ -4534,9 +4534,9 @@ pub fn linked_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     (lang == intern::sym::eh_personality).then(|| unwind::PERSONALITY.to_owned())
 }
 
-/// How the message of a stand-in for a function ra-jit could not compile starts
+/// How the message of a stand-in for a function blaze could not compile starts
 /// ([`ObjectCodegen::define_refused`]): what is left of them once linked is what is reachable.
-pub const STAND_IN_SAYS: &str = "ra-jit could not compile ";
+pub const STAND_IN_SAYS: &str = "blaze could not compile ";
 
 /// The section of an object, and of what it is linked into, that holds the messages of its
 /// stand-ins and nothing else, each a line that starts with [`STAND_IN_SAYS`]: what a link
@@ -4546,10 +4546,10 @@ pub const STAND_IN_SAYS: &str = "ra-jit could not compile ";
 /// linker takes them out symbol by symbol from the one section, as it has room for few.
 pub fn stand_in_section(format: object::BinaryFormat) -> (&'static str, &'static str) {
     match format {
-        object::BinaryFormat::MachO => ("__TEXT", "__ra_jit_stand"),
+        object::BinaryFormat::MachO => ("__TEXT", "__blaze_stand"),
         // An image's section name has room for 8 bytes.
         object::BinaryFormat::Coff | object::BinaryFormat::Pe => ("", ".rjstand"),
-        _ => ("", ".ra_jit.stand_in"),
+        _ => ("", ".blaze.stand_in"),
     }
 }
 
@@ -4577,7 +4577,7 @@ fn write_object(product: cranelift_object::ObjectProduct) -> Result<Vec<u8>> {
 fn unnamed_file() -> Option<std::fs::File> {
     static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = format!("ra-jit-object-{}-{made}", std::process::id());
+    let name = format!("blaze-object-{}-{made}", std::process::id());
     let path = std::env::temp_dir().join(name);
     let file = std::fs::File::options().read(true).write(true).create_new(true).open(&path).ok()?;
     // Windows removes a file that is open once it is closed.
@@ -4619,17 +4619,17 @@ fn place_stand_ins(
 /// is asked for the name rather than for the attributes of all its functions.
 #[salsa::tracked(returns(copy))]
 fn declares_global_allocator(db: &dyn HirDatabase, krate: Crate) -> bool {
-    global_allocator_export(db, krate, "__ra_jit_global_alloc").is_some()
+    global_allocator_export(db, krate, "__blaze_global_alloc").is_some()
 }
 
 /// The entries of the global allocator that `alloc` calls by name, with the function the
 /// `#[global_allocator]`'s expansion exports for each: what rustc's shim calls, and what ours
 /// goes to instead. The number of pointer-sized arguments, and whether one is returned.
 const ALLOCATOR_ENTRIES: [(&str, &str, usize, bool); 4] = [
-    ("__rust_alloc", "__ra_jit_global_alloc", 2, true),
-    ("__rust_dealloc", "__ra_jit_global_dealloc", 3, false),
-    ("__rust_realloc", "__ra_jit_global_realloc", 4, true),
-    ("__rust_alloc_zeroed", "__ra_jit_global_alloc_zeroed", 2, true),
+    ("__rust_alloc", "__blaze_global_alloc", 2, true),
+    ("__rust_dealloc", "__blaze_global_dealloc", 3, false),
+    ("__rust_realloc", "__blaze_global_realloc", 4, true),
+    ("__rust_alloc_zeroed", "__blaze_global_alloc_zeroed", 2, true),
 ];
 
 /// The function of `krate` the `#[global_allocator]`'s expansion exports as `exported`.
@@ -5223,7 +5223,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // Apple's linker takes out symbols, and has room for 255 sections.
         let sections = backend::sections_of_their_own()
             && isa.triple().binary_format == target_lexicon::BinaryFormat::Elf;
-        let mut builder = ObjectBuilder::new(isa, "ra-jit", default_libcall_names())?;
+        let mut builder = ObjectBuilder::new(isa, "blaze", default_libcall_names())?;
         // A wasm object is written from this one, a segment per piece of data aligned as its
         // section is: a section shared by several has the largest alignment of them.
         let data_sections = sections || Target::current().writes_wasm_objects();
@@ -6523,7 +6523,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if body.is_some_and(|it| it != entry.code.signature()) {
             return Ok(self.kept.unfound("an entry of another signature"));
         }
-        let symbol = format!("ra_jit::{}::n{}", entry.label, self.found.len());
+        let symbol = format!("blaze::{}::n{}", entry.label, self.found.len());
         let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
         let id = self
             .module
@@ -6798,7 +6798,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let triple = self.module.isa().triple().to_string();
         let assembled = asm::assemble(&triple, text).map_err(CodegenError::Unsupported)?;
-        let name = format!("ra_jit::asm::{}", self.assemblies.len());
+        let name = format!("blaze::asm::{}", self.assemblies.len());
         let id = self
             .module
             .declare_function(&name, Linkage::Local, sig)
@@ -7086,7 +7086,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let numbered = own.is_none();
             let name = match own {
                 Some(name) => name,
-                None => self.own_data_name("ra_jit::static::"),
+                None => self.own_data_name("blaze::static::"),
             };
             let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
             self.declare_named_data(&name, linkage, compiled.writable, thread_local, numbered)?
@@ -7165,7 +7165,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// A `core::panic::Location`, of no place in particular when the place is not known.
     fn define_location(&mut self, found: Option<(String, u32, u32)>) -> Result<DataId> {
-        let (file, line, col) = found.unwrap_or_else(|| ("<ra-jit>".to_owned(), 0u32, 0u32));
+        let (file, line, col) = found.unwrap_or_else(|| ("<blaze>".to_owned(), 0u32, 0u32));
         let mut bytes = vec![0u8; 2 * word() + 8];
         bytes[word()..2 * word()].copy_from_slice(&(file.len() as u64).to_le_bytes()[..word()]);
         bytes[2 * word()..2 * word() + 4].copy_from_slice(&line.to_le_bytes());
@@ -7210,9 +7210,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             && (self.own_statics.crates.contains(&func.krate(self.db))
                 || !futures_kept_apart()
                 || !returns_async_block(self.db, func))
-            // rustc's copy takes and gives scalable vectors in SVE registers, ra-jit's code by
+            // rustc's copy takes and gives scalable vectors in SVE registers, blaze's code by
             // reference: it calls a copy of its own. With nothing of rustc's linked the copy is
-            // ra-jit's.
+            // blaze's.
             && (self.symbols.nothing_of_rustc()
                 || !sve::passes_scalable(self.db, func, Some(args), env))
         {
@@ -7290,7 +7290,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let id = self
                 .module
                 .declare_function(
-                    &format!("ra_jit::type_id::{}", self.instances.len()),
+                    &format!("blaze::type_id::{}", self.instances.len()),
                     Linkage::Local,
                     sig,
                 )
@@ -7359,7 +7359,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         // A patch is linked with its base, whose names these must not take.
         let env = &self.homes.home(self.db, instance, env);
-        let prefix = if self.base.is_some() { "ra-jit.patch" } else { "ra-jit" };
+        let prefix = if self.base.is_some() { "blaze.patch" } else { "blaze" };
         let symbol = format!("{prefix}::{name}::{}", self.instances.len());
         let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
         let id = self
@@ -7581,7 +7581,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(&id) = self.type_id_shims.get(&hash) {
             return Ok(id);
         }
-        let name = format!("ra_jit::type_id::h{}", self.type_id_shims.len());
+        let name = format!("blaze::type_id::h{}", self.type_id_shims.len());
         let id = self
             .module
             .declare_function(&name, Linkage::Local, sig)
@@ -7684,7 +7684,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn declare_local_data(&mut self, writable: bool) -> Result<DataId> {
-        let name = self.own_data_name(".Lra-jit.const.");
+        let name = self.own_data_name(".Lblaze.const.");
         self.declare_named_data(&name, Linkage::Local, writable, false, true)
     }
 
@@ -8423,7 +8423,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(PassMode::Ignore);
         }
         // rustc passes a scalable vector in Z and P registers, which Cranelift has no type
-        // for: between ra-jit's own functions it goes by reference. Where foreign code would
+        // for: between blaze's own functions it goes by reference. Where foreign code would
         // pass it, `fn_abi` and `callee` refuse.
         if let BackendRepr::SimdScalableVector { .. } = layout.backend_repr {
             return Ok(PassMode::Indirect);
@@ -10436,7 +10436,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if self.scalable(prev.ty)?.is_some() && !matches!(proj, ProjectionElem::Deref) {
                 unsupported!("a projection into the scalable vector {:?}", prev.ty);
             }
-            // A scalable value is only ever in ra-jit's storage, sized for the largest vector
+            // A scalable value is only ever in blaze's storage, sized for the largest vector
             // length; through a raw pointer it is anywhere, and rustc reads exactly one vector
             // length of it there.
             if let (ProjectionElem::Deref, TyKind::RawPtr(..)) = (proj, prev.ty.kind())
@@ -17534,7 +17534,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             }
             // Clears the upper halves of the vector registers, in which no value is kept from
-            // one of ra-jit's instructions to the next.
+            // one of blaze's instructions to the next.
             ("x86.avx.vzeroupper", []) => {}
             // A hint to the cache, which the program behaves the same without.
             ("prefetch.p0", [_address, _write, _locality, _cache]) => {}

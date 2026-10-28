@@ -1,6 +1,6 @@
 //! A table of closures that capture nothing, coerced to `fn` and borrowed in a generic
 //! function: rustc promotes it to a constant, as minijinja's `type_erase!` builds
-//! `DynObject`'s vtable. ra-jit took it as a temporary, so the reference outlived the frame
+//! `DynObject`'s vtable. blaze took it as a temporary, so the reference outlived the frame
 //! (the borrow checker said E0515, and without it the call through the table jumped to 0).
 
 struct Table {

@@ -1,6 +1,6 @@
 //! eza's `SortField::value_variants`: `&[Self::Name(SortCase::AaBbCc), ..]` is a borrow
 //! that outlives the function, since a tuple variant made of constants is a constant.
-//! ra-jit promoted a unit variant and a record literal but not a tuple constructor, built
+//! blaze promoted a unit variant and a record literal but not a tuple constructor, built
 //! the array in the frame and returned its address, and clap matched on what the next
 //! call left there.
 

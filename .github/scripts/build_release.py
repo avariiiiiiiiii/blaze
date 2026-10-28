@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Build ra-jit the one way it ships: the `dist` profile, optimized with a profile of its own
+"""Build blaze the one way it ships: the `dist` profile, optimized with a profile of its own
 work (PGO). The release workflow, the flake's `daemon` and `cargo install` from a checkout all
 build it with this.
 
   build_release.py --target T [--profdata FILE] [--features F] [--out DIR [--server]]
-                                                  # the build, into target/T/dist; DIR gets every binary of ra-jit,
+                                                  # the build, into target/T/dist; DIR gets every binary of blaze,
                                                   # and with --server blaze's proc-macro server
   build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
   build_release.py --pin DIR                      # pgo/profiles.json names the profiles in DIR
   build_release.py --target T --show              # the command the build runs, for any other driver
-  build_release.py --server-beside RA_JIT         # blaze's proc-macro server beside a ra-jit already built (CI)
+  build_release.py --server-beside BLAZE         # blaze's proc-macro server beside a blaze already built (CI)
 
-The build is `cargo build -p ra-jit --profile dist --locked --target T --features llvm` with
+The build is `cargo build -p blaze-engine --profile dist --locked --target T --features llvm` with
 `RUSTFLAGS=-Cprofile-use=<profile>`. The `llvm` feature is part of every build of it, the
 training's included, so that every user gets the LLVM tiers (docs/tiers.md): LLVM is linked in
 statically from the build crates/hir-ty-codegen/llvm.json pins, which `LLVM_SYS_231_PREFIX`
@@ -25,7 +25,7 @@ build has no network).
 A profile is trained by `--train`, in three steps:
 
   1. the same build instrumented (`-Cprofile-generate`), into target/pgo-instrumented;
-  2. that ra-jit run on edits of projects the README's benchmarks do not measure (fd, bat,
+  2. that blaze run on edits of projects the README's benchmarks do not measure (fd, bat,
      just and hyperfine, at the commits harness/bench.py pins: a cold start and every kind of
      edit, twice, through harness/abbench.py --train);
   3. what it counted merged with the toolchain's llvm-profdata (`rustup component add
@@ -38,18 +38,18 @@ matches and says so; the pgo workflow trains new profiles when that grows.
 Against `cargo build --release` on Linux (docs/reports/RELEASE-BUILD.md): the cold start 14%
 shorter on nushell and ripgrep, an edit of a function 8% shorter on nushell, the same memory.
 
-A killed process writes no counters: `cargo ra-jit stop` kills the workers, so abbench ends a
+A killed process writes no counters: `blaze stop` kills the workers, so abbench ends a
 training session by ending the daemon, after which each worker sees its input close and exits
 by itself. The `cc` crate passes `-Cprofile-generate`/`-Cprofile-use` on to the C compiler;
-on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented ra-jit
+on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented blaze
 crashes at start (rust-lang/rust#163640), so the C code (mimalloc, ring) is built without
 them. macOS and Linux; stdlib only.
 
-With `--server` the ra-jit just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
+With `--server` the blaze just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
 docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
-proc-macro libraries ra-jit links, found beside ra-jit (`BLAZE_PROC_MACRO_SERVER=1`). It is
-built whole by ra-jit (`--exe`), over the standard library ra-jit compiles, so it speaks the
-bridge of the libraries that ra-jit compiles; its own serde derives are expanded by the
+proc-macro libraries blaze links, found beside blaze (`BLAZE_PROC_MACRO_SERVER=1`). It is
+built whole by blaze (`--exe`), over the standard library blaze compiles, so it speaks the
+bridge of the libraries that blaze compiles; its own serde derives are expanded by the
 toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
 Not on Windows, whose release blaze does not build yet.
 
@@ -99,7 +99,7 @@ STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
 # workspace's crates. LLVM finds a function of the
 # profile by its symbol, so a build whose hash is not the profile's finds next to nothing in it
 # (the crates that did not change below, none of the workspace's), and says nothing.
-CRATE = re.compile(rb"Cs([0-9A-Za-z]+)_6ra_jit")
+CRATE = re.compile(rb"Cs([0-9A-Za-z]+)_6blaze")
 # The newest glibc a Linux binary of a release may ask for (install.sh's `glibc_floor`), and
 # how a binary names the versions it asks for (in its dynamic string table).
 GLIBC = (2, 34)
@@ -124,10 +124,10 @@ def sha256(path):
 
 
 def recipe(target, rustflags, cflags, features=None, llvm="<LLVM_SYS_231_PREFIX>"):
-    """The environment and command of the build for `target`: `cargo build -p ra-jit --profile
+    """The environment and command of the build for `target`: `cargo build -p blaze-engine --profile
     dist --features llvm` with `rustflags`, `cflags` for the C code that crates build with `cc`,
     and the LLVM prefix `llvm`. No wrapper
-    of rustc: one around the workspace's crates (`ra-jit enable`'s, nixpkgs' cargo-auditable)
+    of rustc: one around the workspace's crates (`blaze enable`'s, nixpkgs' cargo-auditable)
     changes their symbols, and the profile no longer finds them. Cargo hashes the empty
     `RUSTC_WORKSPACE_WRAPPER` too, unlike an unset one, so every build sets it, the training's
     included, whatever cargo's configuration says. Nor incremental, which a developer's
@@ -138,7 +138,7 @@ def recipe(target, rustflags, cflags, features=None, llvm="<LLVM_SYS_231_PREFIX>
            "CARGO_INCREMENTAL": "0", LLVM_PREFIX: str(llvm)}
     for name in ("CFLAGS", "CXXFLAGS"):
         env[f"{name}_{triple}"] = " ".join(filter(None, [os.environ.get(f"{name}_{triple}"), cflags]))
-    return env, ["cargo", "build", "-p", "ra-jit", "--profile", "dist", "--locked", "--target", target,
+    return env, ["cargo", "build", "-p", "blaze-engine", "--profile", "dist", "--locked", "--target", target,
                  "--features", ",".join(["llvm", *filter(None, [features])])]
 
 
@@ -154,7 +154,7 @@ def llvm_prefix(target):
 
 
 def build(target, target_dir, rustflags, cflags, features=None):
-    """The build into `target_dir`; the result is the binaries it built (every one of ra-jit's:
+    """The build into `target_dir`; the result is the binaries it built (every one of blaze's:
     what ships is all of them) and how many functions LLVM found changed since the profile."""
     own, argv = recipe(target, rustflags, cflags, features, llvm_prefix(target))
     own["CARGO_TARGET_DIR"] = str(target_dir)
@@ -186,7 +186,7 @@ def build(target, target_dir, rustflags, cflags, features=None):
 
 
 def crate_hash(binaries):
-    """The crate hash of ra-jit, read from the symbols of the binary."""
+    """The crate hash of blaze, read from the symbols of the binary."""
     binary = next(b for b in binaries if b.stem == "blaze-engine")
     found = collections.Counter(CRATE.findall(binary.read_bytes()))
     return found.most_common(1)[0][0].decode() if found else None
@@ -199,7 +199,7 @@ def pins():
 def pinned(target):
     table = pins()
     if table["toolchain"] != TOOLCHAIN:
-        sys.exit(f"error: build_release: {PINS} has profiles of Rust {table['toolchain']}, ra-jit builds with {TOOLCHAIN}: "
+        sys.exit(f"error: build_release: {PINS} has profiles of Rust {table['toolchain']}, blaze builds with {TOOLCHAIN}: "
                  "run the pgo workflow")
     pin = table["targets"].get(target)
     if not pin:
@@ -241,7 +241,7 @@ def train(target, out):
     work = Path(tempfile.mkdtemp(prefix="rjpgo-", dir="/tmp"))
     raw = work / "raw"
     raw.mkdir()
-    # On AArch64 a direct call reaches 128 MiB, and the instrumented ra-jit's code is larger. GNU ld
+    # On AArch64 a direct call reaches 128 MiB, and the instrumented blaze's code is larger. GNU ld
     # then fails its calls into libgcc and the profiling runtime (R_AARCH64_CALL26 truncated);
     # lld puts a range-extension thunk in front of them (pgo.yaml installs it on that runner).
     rustflags = f"-Cprofile-generate={raw}"
@@ -250,7 +250,7 @@ def train(target, out):
     built, _ = build(target, ROOT / "target" / "pgo-instrumented", rustflags, "-fno-profile-generate")
     binaries, crate = built[0].parent, crate_hash(built)
 
-    # Each process of the instrumented ra-jit writes its counters to a file of its own as it exits.
+    # Each process of the instrumented blaze writes its counters to a file of its own as it exits.
     env = dict(os.environ, LLVM_PROFILE_FILE=str(raw / "%p.profraw"))
     env.pop("RUST_BACKTRACE", None)
     run([sys.executable, "abbench.py", "--bin", f"train={binaries}", "fd", "bat", "just", "hyperfine",
@@ -263,7 +263,7 @@ def train(target, out):
             sys.exit(f"error: build_release: programs of {binaries} still run 5 minutes after the training")
         time.sleep(1)
 
-    merged = work / "ra-jit.profdata"
+    merged = work / "blaze.profdata"
     run([profdata, "merge", "-o", merged, *sorted(raw.glob("*.profraw"))])
     shown = subprocess.run([profdata, "show", merged], capture_output=True, text=True, check=True).stdout
     total = int(re.search(r"^Total count: (\d+)", shown, re.M)[1])
@@ -273,7 +273,7 @@ def train(target, out):
 
     digest = sha256(merged)
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
-    name = f"ra-jit-{TOOLCHAIN}-{target}-{digest[:16]}.profdata"
+    name = f"blaze-{TOOLCHAIN}-{target}-{digest[:16]}.profdata"
     out.mkdir(parents=True, exist_ok=True)
     shutil.move(merged, out / name)
     (out / f"{target}.json").write_text(json.dumps(
@@ -298,8 +298,8 @@ def pin(dirs):
     PINS.write_text(json.dumps(table, indent=2) + "\n")
 
 
-def proc_macro_server(ra_jit, out):
-    """blaze's proc-macro server, built and linked by `ra-jit` into `out`, from a store of its
+def proc_macro_server(blaze, out):
+    """blaze's proc-macro server, built and linked by `blaze` into `out`, from a store of its
     own; the path of the executable."""
     exe = out / SERVER_BIN
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
@@ -307,11 +307,11 @@ def proc_macro_server(ra_jit, out):
                    BLAZE_STD_FROM="off", RUST_BACKTRACE="0")
         start = time.monotonic()
         # `proc_macro` is not in the standard library's unit: the program that links it has it.
-        run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
+        run([str(blaze), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
              "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env)
     said = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True,
                           env=dict(os.environ, RUST_ANALYZER_INTERNALS_DO_NOT_USE="this is unstable"))
-    print(f"build_release: {said.stdout.strip()} as {exe}, built by ra-jit in {time.monotonic() - start:.1f} s",
+    print(f"build_release: {said.stdout.strip()} as {exe}, built by blaze in {time.monotonic() - start:.1f} s",
           flush=True)
     return exe
 
@@ -405,10 +405,10 @@ def main():
     parser.add_argument("--train", type=Path, metavar="DIR", help="train a new profile into DIR")
     parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
     parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
-    parser.add_argument("--features", help="cargo features of ra-jit besides `llvm`, which every build has")
-    parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that ra-jit")
-    parser.add_argument("--server-beside", type=Path, metavar="RA_JIT",
-                        help="only build blaze's proc-macro server, with RA_JIT, beside it (CI's build of ra-jit)")
+    parser.add_argument("--features", help="cargo features of blaze besides `llvm`, which every build has")
+    parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that blaze")
+    parser.add_argument("--server-beside", type=Path, metavar="BLAZE",
+                        help="only build blaze's proc-macro server, with BLAZE, beside it (CI's build of blaze)")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
     parser.add_argument("--nix", action="store_true",
@@ -417,8 +417,8 @@ def main():
     if args.pin:
         return pin(args.pin)
     if args.server_beside:
-        ra_jit = args.server_beside.resolve()
-        proc_macro_server(ra_jit, ra_jit.parent)
+        blaze = args.server_beside.resolve()
+        proc_macro_server(blaze, blaze.parent)
         return
     if not args.target:
         parser.error("--target is required")
@@ -437,7 +437,7 @@ def main():
     if pins()["toolchain"] != TOOLCHAIN and not args.strict:
         # The toolchain moved and the pgo workflow has not trained on it yet (it runs when
         # harness/toolchain changes on main): a build that is not a release goes without PGO.
-        print(f"warning: build_release: {PINS} has profiles of Rust {pins()['toolchain']}, ra-jit builds with "
+        print(f"warning: build_release: {PINS} has profiles of Rust {pins()['toolchain']}, blaze builds with "
               f"{TOOLCHAIN}: built without PGO until the pgo workflow trains on {TOOLCHAIN}", file=sys.stderr, flush=True)
         binaries, _ = build(args.target, target_dir, "", "", args.features)
         ship(args, binaries)
@@ -448,7 +448,7 @@ def main():
     binaries, stale = build(args.target, target_dir, f"-Cprofile-use={path}", "-fno-profile-use", args.features)
     crate = crate_hash(binaries)
     if crate != chosen.get("crate"):
-        said = (f"build_release: this build's crates are not the ones the profile was trained on (ra-jit is crate "
+        said = (f"build_release: this build's crates are not the ones the profile was trained on (blaze is crate "
                 f"{crate}, the profile's is {chosen.get('crate')}): Cargo.lock, the toolchain, the features or cargo's "
                 "settings differ, and the profile finds almost none of the workspace's functions. The pgo workflow trains "
                 "a profile of these crates.")

@@ -85,7 +85,7 @@ jobs:
           grep -F "there is no blaze release 0.0.0-none" out.txt
 
   # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
-  # the glibc a release asks for, with blaze's proc-macro server beside ra-jit. The profile may
+  # the glibc a release asks for, with blaze's proc-macro server beside blaze. The profile may
   # be of older crates (no --strict); build_release.py refuses a binary that asks for a glibc
   # newer than RHEL 9's.
   archive:
@@ -162,7 +162,7 @@ jobs:
           ended=$(date +%s.%N)
           cat err.txt out.txt
           grep -Fx "Hello, world!" out.txt
-          if grep -e "ra-jit: bug:" -e "the daemon has no part" err.txt; then
+          if grep -e "blaze: bug:" -e "the daemon has no part" err.txt; then
             echo "::error::the build was not blaze's"; exit 1
           fi
           echo "${{ matrix.system }}, from install.sh to Hello, world!: $(echo "$ended - $began" | awk '{ printf "%.1f s", $1 - $3 }')" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -171,8 +171,8 @@ jobs:
             if command -v "$tool"; then echo "::error::$tool is on PATH after installing"; exit 1; fi
           done
           blaze stop
-      # A derive from crates.io: the daemon's load links it with ra-jit and expands it with the
-      # server beside ra-jit, on this system's glibc; an edit after is the daemon's.
+      # A derive from crates.io: the daemon's load links it with blaze and expands it with the
+      # server beside blaze, on this system's glibc; an edit after is the daemon's.
       - name: proc macros, by blaze's server
         shell: sh
         run: |
@@ -190,7 +190,7 @@ jobs:
           BLAZE_PROC_MACRO_SERVER=1 blaze run > out.txt 2>> err.txt || { cat err.txt; exit 1; }
           cat err.txt out.txt
           grep -Fx "derived 2" out.txt
-          if grep -e "ra-jit: bug:" -e "the daemon has no part" -e "did not make the proc macro" -e "no proc-macro server" err.txt; then
+          if grep -e "blaze: bug:" -e "the daemon has no part" -e "did not make the proc macro" -e "no proc-macro server" err.txt; then
             echo "::error::the proc macros were not blaze's"; exit 1
           fi
           blaze stop

@@ -40,7 +40,7 @@ blaze build   # like cargo build
 The first build loads your project and compiles every crate of it, with no cargo build and no
 rustc. Then change a function and build again: it's back in milliseconds, and the `Finished` line
 says `[blaze]`. The other cargo commands (`fmt`, `clippy`, `doc`, `tree` and the rest) are blaze's
-own too, and run no cargo. Where cargo is installed, `cargo blaze run` is the same as `blaze run`.
+own too, and run no cargo. Where cargo is installed, `blaze run` is the same as `blaze run`.
 
 ## How fast
 
@@ -49,7 +49,7 @@ own too, and run no cargo. Where cargo is installed, `cargo blaze run` is the sa
   [live edits](docs/usage.md#change-a-running-program).
 
 <!-- benchpick:start -->
-| Edit one function, then build (Linux x86-64) | `cargo build` | `cargo blaze build` |
+| Edit one function, then build (Linux x86-64) | `cargo build` | `blaze build` |
 |---|---:|---:|
 | ripgrep | 508 ms | **56 ms** (9.1× faster) |
 | nushell | 1.25 s | **236 ms** (5.3× faster) |
@@ -143,5 +143,5 @@ blaze stands on the shoulders of giants. Thank you to the people who built:
 
 None of these projects endorses blaze.
 
-blaze was called ra-jit until 2026-10-24; `cargo ra-jit` still works. Made at [ix](https://ix.dev)
+blaze was called blaze until 2026-10-24; `blaze` still works. Made at [ix](https://ix.dev)
 for den's native app. MIT or Apache-2.0.

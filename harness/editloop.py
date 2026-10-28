@@ -16,7 +16,7 @@ import argparse, os, shlex, statistics, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, RA_JIT, sysroot_rlibs, AHEAD, TARGET_ARGS, command
+from difftest import Fixture, BLAZE, sysroot_rlibs, AHEAD, TARGET_ARGS, command
 
 
 def main():
@@ -28,8 +28,8 @@ def main():
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
     ws, source = os.path.abspath(args.workspace), os.path.join(args.workspace, args.file)
-    work = tempfile.mkdtemp(prefix="ra-jit-editloop-")
-    socket, log_path = os.path.join(work, "ra-jit.sock"), os.path.join(work, "daemon.log")
+    work = tempfile.mkdtemp(prefix="blaze-editloop-")
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     obj, patch, binary = (os.path.join(work, f"program.{n}") for n in ("o", "patch.o", "bin"))
 
     fx = Fixture(ws, [args.crate], ["-p", args.crate])
@@ -51,7 +51,7 @@ def main():
               *(["--splice", binary] if os.environ.get("BLAZE_SPLICE") else []), *symbols]
     out = open(log_path, "a")
     began = time.time()
-    daemon = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--crate", args.crate, "--socket", socket, *target],
+    daemon = subprocess.Popen([BLAZE, ws, *TARGET_ARGS, "--crate", args.crate, "--socket", socket, *target],
                               stderr=out, stdout=out)
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
@@ -72,7 +72,7 @@ def main():
             text = original.replace(args.old, args.new, 1) if step % 2 == 0 else original
             open(source, "w").write(text)
             time.sleep(0.02)
-            took, reply = timed([RA_JIT, "sync", socket, "--crate", args.crate, *target])
+            took, reply = timed([BLAZE, "sync", socket, "--crate", args.crate, *target])
             reply = (reply.stdout + reply.stderr).strip()
             columns["sync"].append(took)
             line = f"  edit {step:2}  sync {took:6.0f} ms"

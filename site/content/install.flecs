@@ -15,7 +15,7 @@ site {
     Command curl("curl -fsSL https://ix.dev/blaze | sh") {
       Silent
     }
-    P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[ra-jit]` (blaze's engine), which means blaze built it, not cargo. What to do next: [Usage](/usage).") {
+    P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[blaze]` (blaze's engine), which means blaze built it, not cargo. What to do next: [Usage](/usage).") {
       Say: {"[curious] Then go to one of your projects and type blaze run. Change a function and run it again. The finished line now says R A jit, that's blaze's engine, which means blaze built it, not cargo. [short pause] From there, the usage page says what to do next."}
     }
     Code first(lang: "bash", text: "blaze run")
@@ -33,13 +33,13 @@ site {
     }
 
     Section installer(title: "What the installer does") {
-      Say: {"[calm] What the installer does. It downloads the build for your machine from blaze's GitHub releases, checks it against the published checksums, puts blaze and cargo blaze in your cargo bin directory, and has blaze fetch its Rust. It asks nothing. [short pause] Run it again to upgrade. Releases are dated, and a new one goes out whenever main is green and has changed."}
-      P what("It downloads the build for your machine from the [releases](https://github.com/indexable-inc/blaze/releases), checks it against the published checksums, puts `blaze`, `cargo-blaze` and the programs they run in `~/.cargo/bin`, and has blaze download its Rust. It asks nothing. Run it again to upgrade.")
-      P versions("Releases are dated, `0.YYYYMMDD.N`, and one is published whenever main is green and has changed. To install a given release, end the line with `| sh -s -- --version 0.YYYYMMDD.N`; `--help` says what else it takes. `cargo blaze <command>` is the same as `blaze <command>`.")
+      Say: {"[calm] What the installer does. It downloads the build for your machine from blaze's GitHub releases, checks it against the published checksums, puts blaze and blaze in your cargo bin directory, and has blaze fetch its Rust. It asks nothing. [short pause] Run it again to upgrade. Releases are dated, and a new one goes out whenever main is green and has changed."}
+      P what("It downloads the build for your machine from the [releases](https://github.com/indexable-inc/blaze/releases), checks it against the published checksums, puts `blaze`, `blaze` and the programs they run in `~/.cargo/bin`, and has blaze download its Rust. It asks nothing. Run it again to upgrade.")
+      P versions("Releases are dated, `0.YYYYMMDD.N`, and one is published whenever main is green and has changed. To install a given release, end the line with `| sh -s -- --version 0.YYYYMMDD.N`; `--help` says what else it takes. `blaze <command>` is the same as `blaze <command>`.")
     }
 
     Section nix(title: "With Nix") {
-      Say: {"[matter-of-fact] And with Nix: install it into your profile from the GitHub flake, or try it without installing anything with nix run, which is the same as cargo blaze build. Nix compiles blaze from source; there's no binary cache yet."}
+      Say: {"[matter-of-fact] And with Nix: install it into your profile from the GitHub flake, or try it without installing anything with nix run, which is the same as blaze build. Nix compiles blaze from source; there's no binary cache yet."}
       Code profile(lang: "bash", text: `nix profile install github:indexable-inc/blaze
         nix run github:indexable-inc/blaze -- build   # try it without installing`)
       Dim cache("Nix compiles blaze from source; there is no binary cache yet. In a flake, take `blaze.packages.\$\{system}.blaze` from the input `github:indexable-inc/blaze`.")

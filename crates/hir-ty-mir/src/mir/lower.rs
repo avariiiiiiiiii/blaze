@@ -5,12 +5,11 @@ use std::{borrow::Cow, iter, mem};
 use arrayvec::ArrayVec;
 use base_db::Crate;
 use hir_def::{
-    AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, GenericParamId, HasModule,
-    ItemContainerId, LocalFieldId, Lookup, TraitId,
+    AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
+    LocalFieldId, Lookup,
     expr_store::{
         Body, ExpressionStore, HygieneId,
         body::{Param, body_syntax},
-        path::Path,
     },
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
@@ -31,12 +30,11 @@ use rustc_type_ir::{
     CoroutineArgs, CoroutineArgsParts, TypeVisitableExt,
     inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
 };
-use salsa::SalsaValue;
 use span::Edition;
 
 use crate::{
-    Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, ParamEnvAndCrate,
-    consteval::{ConstEvalError, try_const_usize},
+    Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, LoweringMode, ParamEnvAndCrate,
+    consteval::try_const_usize,
     db::{
         AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase, InternedClosure, InternedClosureId,
         InternedCoroutineId,
@@ -50,8 +48,6 @@ use crate::{
         },
     },
     inhabitedness::is_ty_uninhabited_from,
-    layout::LayoutError,
-    lower::LoweringMode,
     method_resolution::CandidateId,
     mir::{
         AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
@@ -61,13 +57,13 @@ use crate::{
         Terminator, TerminatorKind, Ty, UnOp, VariantId, return_slot,
     },
     next_solver::{
-        Const, DbInterner, ParamConst, ParamEnv, Region, StoredEarlyBinder, StoredGenericArgs,
-        StoredTy, TyKind, TypingMode, UnevaluatedConst,
+        Const, DbInterner, ParamConst, ParamEnv, Region, StoredEarlyBinder, TyKind, TypingMode,
+        UnevaluatedConst,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
 
-use super::{MirLowerError, OperandKind, Place, is_by_move_coroutine};
+use super::{MirLowerError, OperandKind, Place};
 
 mod as_place;
 mod deref_pattern;
@@ -225,7 +221,6 @@ struct MirLowerCtx<'a, 'db> {
     infcx: InferCtxt<'db>,
 }
 
-
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
 struct DropScopeToken;
 impl DropScopeToken {
@@ -276,7 +271,6 @@ macro_rules! implementation_error {
         return Err(MirLowerError::ImplementationError(format!($it)));
     }};
 }
-
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
@@ -4423,7 +4417,6 @@ pub fn mir_body_for_coroutine_by_move_query<'db>(
 ) -> Result<'db, MirBody<'db>> {
     lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
 }
-
 
 fn mir_body_for_coroutine_cycle_result<'db>(
     _db: &'db dyn HirDatabase,

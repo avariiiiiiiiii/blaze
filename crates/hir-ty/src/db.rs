@@ -647,7 +647,7 @@ pub struct AnonConstLoc {
     pub ty: StoredEarlyBinder<StoredTy>,
     /// Whether to allow using generic params from the owner.
     /// true for array repeats, false for everything else.
-    pub(crate) allow_using_generic_params: bool,
+    pub allow_using_generic_params: bool,
 }
 
 #[salsa::interned(debug, revisions = usize::MAX, constructor = new_)]
@@ -658,11 +658,7 @@ pub struct AnonConstId {
 }
 
 impl<'db> AnonConstId<'db> {
-    pub(crate) fn new(
-        db: &'db dyn SourceDatabase,
-        loc: AnonConstLoc,
-        token: TrackedStructToken,
-    ) -> Self {
+    pub fn new(db: &'db dyn SourceDatabase, loc: AnonConstLoc, token: TrackedStructToken) -> Self {
         _ = token;
         AnonConstId::new_(db, loc)
     }

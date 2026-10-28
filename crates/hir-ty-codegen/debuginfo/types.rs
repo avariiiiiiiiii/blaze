@@ -28,6 +28,7 @@ use intern::{Interned, Symbol};
 use super::super::vtable::{HEADER, VtableLayout};
 use super::set::{self, Made, Own};
 use super::{Aggregate, DebugType, Field, Tag, TypeIndex, TypeSet, Variant};
+use hir_ty_mir::mir::type_name::rustc_debug_name;
 use hir_ty::{
     InferenceResult, ParamEnvAndCrate,
     closure_analysis::ProjectionKind,
@@ -39,7 +40,6 @@ use hir_ty::{
     layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
     mir::is_by_move_coroutine,
-    mir::type_name::rustc_debug_name,
     next_solver::{
         DbInterner, GenericArgs, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},

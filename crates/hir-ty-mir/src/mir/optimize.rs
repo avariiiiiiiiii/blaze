@@ -35,13 +35,12 @@ use crate::{
 use crate::next_solver::StoredGenericArgs;
 
 use super::{
-    BasicBlock, BasicBlockId, LocalId, MirBody, MirLowerError, OperandKind, PlaceElem,
+    BasicBlock, BasicBlockId, LocalId, MirBody, MirLowerError, MirOptLevel, OperandKind, PlaceElem,
     ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     monomorphization::monomorphized, transform::Ctx,
 };
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
-
 
 /// The passes of rustc's pipeline at `level` that this module does not run, in rustc's order.
 /// `harness/mirparity.py` prints them next to what it measured.

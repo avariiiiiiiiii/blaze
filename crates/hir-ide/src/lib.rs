@@ -17,6 +17,7 @@ pub mod mir_pretty;
 #[doc(hidden)]
 pub mod __private {
     pub use hir_def;
+    pub use hir_ty_mir;
     pub use salsa;
 }
 
@@ -30,6 +31,8 @@ use hir_ty::{db::HirDatabase, next_solver::Const};
 use syntax::ast::{ConstArg, make};
 
 pub use hir_ty::*;
+/// hir-ty's `mir` with the passes over it.
+pub use hir_ty_mir::mir;
 
 use crate::display::HirDisplay;
 

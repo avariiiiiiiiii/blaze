@@ -2,16 +2,20 @@
 
 use std::{fmt::Display, iter};
 
+use base_db::target::TargetLoadError;
+use either::Either;
 use hir_def::{
-    FieldId, LocalFieldId, StaticId, UnionId, VariantId,
-    hir::{BindingId, Expr, ExprId, Ordering, PatId},
+    ExpressionStoreOwnerId, FieldId, FunctionId, GenericParamId, LocalFieldId, StaticId, TraitId,
+    UnionId, VariantId,
+    expr_store::{ExpressionStore, path::Path},
+    hir::{BindingId, ClosureKind, CoroutineSource, Expr, ExprId, Ordering, PatId},
 };
+use hir_expand::name::Name;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
-use macros::{TypeFoldable, TypeVisitable};
-use rustc_ast_ir::Mutability;
+use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
-    GenericTypeVisitable,
+    CoroutineArgs, GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
 use salsa::SalsaValue;
@@ -20,8 +24,10 @@ use stdx::impl_from;
 
 use crate::{
     CallableDefId, InferBodyId, InferenceResult, MemoryMap,
-    db::{HirDatabase, InternedClosureId},
+    consteval::ConstEvalError,
+    db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     infer::PointerCast,
+    layout::LayoutError,
     next_solver::{
         Allocation, AllocationData, DbInterner, ErrorGuaranteed, GenericArgs, ParamEnv,
         StoredAllocation, StoredConst, StoredGenericArgs, StoredTy, Ty, TyKind,
@@ -31,54 +37,15 @@ use crate::{
     },
 };
 
-mod eval;
 mod held;
-pub mod location;
-mod lower;
-mod monomorphization;
-mod optimize;
-pub mod overflow;
-mod pretty;
-mod storage;
 pub mod target;
-mod transform;
-pub mod type_name;
 
-pub use eval::{Evaluator, interpret_mir, render_const_using_debug_impl};
 pub use held::{HeldLocals, YieldPoint};
-pub use lower::is_builtin_index;
-pub use lower::{
-    inline_const_at, lower_body_to_mir,
-    lower_to_mir_with_store, mir_body_for_closure_query, mir_body_for_coroutine_by_move_query,
-    mir_body_for_coroutine_query, mir_body_query, promoted_mir_body_query, set_mir_capacity,
-};
-pub use monomorphization::monomorphized;
-pub use monomorphization::opaque_of_impl;
-pub use monomorphization::{
-    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
-    monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,
-    monomorphized_promoted_mir_body_query,
-};
-pub use optimize::{
-    monomorphized_optimized_mir_body_for_closure_query,
-    monomorphized_optimized_mir_body_query, optimized_mir_body_for_closure_query,
-    optimized_mir_body_query, passes_not_ported, set_interpreter_mir_opt_level,
-};
-pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
-pub use storage::StorageConflicts;
-pub use transform::{
-    monomorphized_runtime_mir_body_for_closure_query,
-    monomorphized_runtime_mir_body_for_coroutine_by_move_query,
-    monomorphized_runtime_mir_body_for_coroutine_query, monomorphized_runtime_mir_body_query,
-    runtime_mir_body_for_closure_query, runtime_mir_body_for_coroutine_by_move_query,
-    runtime_mir_body_for_coroutine_query, runtime_mir_body_query, runtime_promoted_mir_body_query,
-    set_runtime_mir_capacity,
-};
 
 pub type BasicBlockId = Idx<BasicBlock>;
 pub type LocalId = Idx<Local>;
 
-fn return_slot() -> LocalId {
+pub fn return_slot() -> LocalId {
     LocalId::from_raw(RawIdx::from(0))
 }
 
@@ -109,7 +76,7 @@ pub struct Local {
 pub struct Operand {
     pub kind: OperandKind,
     // FIXME : This should actually just be of type `MirSpan`.
-    span: Option<MirSpan>,
+    pub span: Option<MirSpan>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -142,7 +109,7 @@ pub enum OperandKind {
 }
 
 impl<'db> Operand {
-    fn from_concrete_const(data: Box<[u8]>, memory_map: MemoryMap<'db>, ty: Ty<'db>) -> Self {
+    pub fn from_concrete_const(data: Box<[u8]>, memory_map: MemoryMap<'db>, ty: Ty<'db>) -> Self {
         Operand {
             kind: OperandKind::Allocation {
                 allocation: Allocation::new(AllocationData { ty, memory: data, memory_map })
@@ -152,15 +119,15 @@ impl<'db> Operand {
         }
     }
 
-    fn from_bytes(data: Box<[u8]>, ty: Ty<'db>) -> Self {
+    pub fn from_bytes(data: Box<[u8]>, ty: Ty<'db>) -> Self {
         Operand::from_concrete_const(data, MemoryMap::default(), ty)
     }
 
-    fn const_zst(ty: Ty<'db>) -> Operand {
+    pub fn const_zst(ty: Ty<'db>) -> Operand {
         Self::from_bytes(Box::default(), ty)
     }
 
-    fn from_fn(
+    pub fn from_fn(
         db: &'db dyn HirDatabase,
         func_id: hir_def::FunctionId,
         generic_args: GenericArgs<'db>,
@@ -292,7 +259,7 @@ impl StoredPlace {
 }
 
 impl<'db> Place<'db> {
-    fn project(&self, projection: PlaceElem) -> Place<'db> {
+    pub fn project(&self, projection: PlaceElem) -> Place<'db> {
         Place { local: self.local, projection: self.projection.project(projection) }
     }
 
@@ -336,7 +303,7 @@ pub enum AggregateKind {
 pub struct SwitchTargets {
     /// Possible values. The locations to branch to in each case
     /// are found in the corresponding indices from the `targets` vector.
-    values: SmallVec<[u128; 1]>,
+    pub values: SmallVec<[u128; 1]>,
 
     /// Possible branch sites. The last element of this vector is used
     /// for the otherwise branch, so targets.len() == values.len() + 1
@@ -350,7 +317,7 @@ pub struct SwitchTargets {
     //
     // However we’ve decided to keep this as-is until we figure a case
     // where some other approach seems to be strictly better than other.
-    targets: SmallVec<[BasicBlockId; 2]>,
+    pub targets: SmallVec<[BasicBlockId; 2]>,
 }
 
 impl SwitchTargets {
@@ -730,21 +697,21 @@ pub enum MutBorrowKind {
 }
 
 impl BorrowKind {
-    fn from_hir_mutability(m: hir_def::type_ref::Mutability) -> Self {
+    pub fn from_hir_mutability(m: hir_def::type_ref::Mutability) -> Self {
         match m {
             hir_def::type_ref::Mutability::Shared => BorrowKind::Shared,
             hir_def::type_ref::Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
         }
     }
 
-    fn from_rustc_mutability(m: rustc_ast_ir::Mutability) -> Self {
+    pub fn from_rustc_mutability(m: rustc_ast_ir::Mutability) -> Self {
         match m {
             rustc_ast_ir::Mutability::Not => BorrowKind::Shared,
             rustc_ast_ir::Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
         }
     }
 
-    fn from_hir(bk: crate::infer::closure::analysis::BorrowKind) -> Self {
+    pub fn from_hir(bk: crate::infer::closure::analysis::BorrowKind) -> Self {
         match bk {
             crate::closure_analysis::BorrowKind::Immutable => Self::Shared,
             crate::closure_analysis::BorrowKind::UniqueImmutable => {
@@ -833,7 +800,7 @@ impl BinOp {
         )
     }
 
-    fn run_compare<T: PartialEq + PartialOrd>(&self, l: T, r: T) -> bool {
+    pub fn run_compare<T: PartialEq + PartialOrd>(&self, l: T, r: T) -> bool {
         match self {
             BinOp::Ge => l >= r,
             BinOp::Gt => l > r,
@@ -1119,7 +1086,7 @@ pub enum AsmOperand {
     Sym(Operand),
 }
 impl StatementKind {
-    fn with_span(self, span: MirSpan) -> Statement {
+    pub fn with_span(self, span: MirSpan) -> Statement {
         Statement { kind: self, span }
     }
 }
@@ -1184,7 +1151,7 @@ impl StatementKind {
         }
     }
 
-    pub(crate) fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
+    pub fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
         match self {
             StatementKind::Assign(_, rvalue) => rvalue.for_each_operand_mut(f),
             StatementKind::InlineAsm(asm) => {
@@ -1262,7 +1229,7 @@ impl Rvalue {
 }
 
 impl TerminatorKind {
-    pub(crate) fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
+    pub fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
         match self {
             TerminatorKind::SwitchInt { discr: it, .. }
             | TerminatorKind::Yield { value: it, .. }
@@ -1348,7 +1315,7 @@ impl TerminatorKind {
         }
     }
 
-    pub(crate) fn unwind_mut(&mut self) -> Option<&mut Option<BasicBlockId>> {
+    pub fn unwind_mut(&mut self) -> Option<&mut Option<BasicBlockId>> {
         match self {
             TerminatorKind::Drop { unwind, .. }
             | TerminatorKind::DropAndReplace { unwind, .. }
@@ -1612,7 +1579,7 @@ impl<'db> MirBody<'db> {
     /// MIR building does: lowering writes `Copy` for each, and whether a use of a place moves
     /// out of it depends on its type alone.
     /// `copy` is what is known already of which types are `Copy`.
-    pub(crate) fn mark_moves(
+    pub fn mark_moves(
         &mut self,
         infcx: &InferCtxt<'db>,
         env: ParamEnv<'db>,
@@ -1641,7 +1608,7 @@ impl<'db> MirBody<'db> {
 }
 
 impl MirBody<'_> {
-    fn shrink_to_fit(&mut self) {
+    pub fn shrink_to_fit(&mut self) {
         let MirBody {
             basic_blocks,
             locals,

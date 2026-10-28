@@ -56,7 +56,6 @@ use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use triomphe::Arc;
 
 use hir_def::lang_item::LangItems;
-use hir_ty::mir::is_by_move_coroutine;
 use hir_ty::{
     InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, PointerCast,
     consteval::try_const_usize,
@@ -73,6 +72,7 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
     utils::detect_variant_from_bytes,
 };
+use hir_ty_mir::mir::is_by_move_coroutine;
 
 use self::debuginfo::{DebugContext, FunctionDebug, LineRow, SlotPlaces, VariableDebug};
 use self::fragment::{
@@ -81,11 +81,11 @@ use self::fragment::{
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
-pub use hir_ty::mir::location::name_sources;
-use hir_ty::mir::{
-    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirOptLevel,
-    MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-    StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
+pub use hir_ty_mir::mir::location::name_sources;
+use hir_ty_mir::mir::{
+    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, FrameStorage, LocalId, MirBody,
+    MirOptLevel, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue,
+    StatementKind, StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
     location::{
         ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
         location_of, written_call, written_range,
@@ -2921,7 +2921,7 @@ fn debug_closure<'db>(
         return None;
     };
     let args = instance.args.as_ref();
-    hir_ty::mir::type_name::rustc_debug_closure(db, func, args.as_slice(), expr)
+    hir_ty_mir::mir::type_name::rustc_debug_closure(db, func, args.as_slice(), expr)
 }
 
 /// What a backtrace of a rustc build calls the instance, as far as that is reproduced:
@@ -2931,13 +2931,13 @@ fn backtrace_name(db: &dyn HirDatabase, instance: &Instance) -> String {
     let ty = || args.as_slice().first().and_then(|arg| arg.ty());
     let of_closure = |owner: InferBodyId<'_>, expr| match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
-            hir_ty::mir::type_name::rustc_closure_name(db, func, args.as_slice(), expr)
+            hir_ty_mir::mir::type_name::rustc_closure_name(db, func, args.as_slice(), expr)
         }
         _ => None,
     };
     let name = match instance.def {
         InstanceDef::Fn(func) => {
-            hir_ty::mir::type_name::rustc_function_name(db, func, args.as_slice())
+            hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice())
         }
         InstanceDef::Closure(id) => {
             let at = InternedClosureId::from_id(id).loc(db);
@@ -2948,7 +2948,7 @@ fn backtrace_name(db: &dyn HirDatabase, instance: &Instance) -> String {
             of_closure(at.owner, at.expr)
         }
         InstanceDef::DropGlue => ty()
-            .and_then(|ty| hir_ty::mir::type_name::rustc_symbol_type(db, ty))
+            .and_then(|ty| hir_ty_mir::mir::type_name::rustc_symbol_type(db, ty))
             .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
         InstanceDef::CallOnceShim
         | InstanceDef::VtableShim(_)
@@ -3335,7 +3335,7 @@ impl Variadic {
 
 /// The MIR optimization level the environment asks for with `BLAZE_MIR_OPT`: 0, the default,
 /// compiles the runtime body; 1 and 2 that body after rustc's MIR passes at its
-/// `-Zmir-opt-level` 1 and 2 (`hir_ty::mir::MirOptLevel`).
+/// `-Zmir-opt-level` 1 and 2 (`hir_ty_mir::mir::MirOptLevel`).
 pub fn mir_opt_level() -> MirOptLevel {
     static LEVEL: LazyLock<MirOptLevel> = LazyLock::new(|| {
         let Some(asked) = std::env::var_os(MIR_OPT) else { return MirOptLevel::Off };
@@ -3363,7 +3363,7 @@ pub fn rustc_links_dead_code(links: bool) {
 fn compiled_mir_body<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
-) -> std::result::Result<&'db MirBody<'db>, hir_ty::mir::MirLowerError<'db>> {
+) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
     match mir_opt_level() {
         MirOptLevel::Off => db.runtime_mir_body(def),
         level => db.optimized_mir_body(def, level),
@@ -3373,7 +3373,7 @@ fn compiled_mir_body<'db>(
 fn compiled_mir_body_for_closure<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
-) -> std::result::Result<&'db MirBody<'db>, hir_ty::mir::MirLowerError<'db>> {
+) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
     match mir_opt_level() {
         MirOptLevel::Off => db.runtime_mir_body_for_closure(closure),
         level => db.optimized_mir_body_for_closure(closure, level),
@@ -8040,7 +8040,7 @@ struct FunctionCx<'cx, 'db> {
 struct SuspendedState {
     addr: Value,
     ty: Type,
-    held: hir_ty::mir::HeldLocals,
+    held: hir_ty_mir::mir::HeldLocals,
 }
 
 /// `args` with every lifetime but a bound one erased: lifetimes change nothing about the
@@ -8127,7 +8127,7 @@ fn returned_local(body: &MirBody<'_>) -> LocalId {
     body.coroutine.map_or(return_slot(), |it| it.poll)
 }
 
-/// The local a body returns in, as `hir_ty::mir`'s own private `return_slot`.
+/// The local a body returns in, as `hir_ty_mir::mir`'s own private `return_slot`.
 fn return_slot() -> LocalId {
     LocalId::from_raw(la_arena::RawIdx::from(0))
 }
@@ -10202,7 +10202,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// arms such a switch never takes either, and they may not even type check for this `T`.
     fn switch_bits(
         &mut self,
-        block: &hir_ty::mir::BasicBlock,
+        block: &hir_ty_mir::mir::BasicBlock,
         discr: &Operand,
         off: &FxHashSet<LocalId>,
     ) -> Option<u128> {
@@ -11356,8 +11356,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// exception) in `.rdata` with image-relative offsets, and gives its address. Its operands
     /// are that address (out), `exception_cleanup`, `TYPE_DESCRIPTOR`, the size of `Exception`
     /// and `exception_copy`.
-    fn is_seh_throw_info(&self, block: &hir_ty::mir::InlineAsm) -> bool {
-        use hir_ty::mir::AsmOperand::{Const, Reg, Sym};
+    fn is_seh_throw_info(&self, block: &hir_ty_mir::mir::InlineAsm) -> bool {
+        use hir_ty_mir::mir::AsmOperand::{Const, Reg, Sym};
         self.cg.target.object_format == ObjectFormat::Coff
             && !block.naked
             && matches!(
@@ -11370,8 +11370,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// assembled block cannot have (Cranelift has no such relocation), so they are written
     /// when the exception is thrown, to a static of the object: the runtime reads it again
     /// when the exception is caught or dropped, after this frame is gone.
-    fn seh_throw_info(&mut self, block: &hir_ty::mir::InlineAsm, size: i128) -> Result<()> {
-        use hir_ty::mir::AsmOperand;
+    fn seh_throw_info(&mut self, block: &hir_ty_mir::mir::InlineAsm, size: i128) -> Result<()> {
+        use hir_ty_mir::mir::AsmOperand;
         let [
             AsmOperand::Reg { output: Some(output), .. },
             AsmOperand::Sym(cleanup),
@@ -11447,8 +11447,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Calls the function that an `asm!` block is assembled as: see [`asm`].
-    fn inline_asm(&mut self, block: &hir_ty::mir::InlineAsm) -> Result<()> {
-        use hir_ty::mir::AsmOperand;
+    fn inline_asm(&mut self, block: &hir_ty_mir::mir::InlineAsm) -> Result<()> {
+        use hir_ty_mir::mir::AsmOperand;
         let seh = self.is_seh_throw_info(block);
         let mut operands = Vec::with_capacity(block.operands.len());
         let mut syms = Vec::with_capacity(block.operands.len());
@@ -14992,7 +14992,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             ("type_name", []) => {
                 let ty = generic_args.type_at(0);
-                let Some(name) = hir_ty::mir::type_name::rustc_type_name(self.cg.db, ty) else {
+                let Some(name) = hir_ty_mir::mir::type_name::rustc_type_name(self.cg.db, ty) else {
                     unsupported!("`type_name` of `{ty:?}`");
                 };
                 let len = self.builder.ins().iconst(ptr(), name.len() as i64);
@@ -18054,7 +18054,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         ty: Ty<'db>,
         layout: &Layout,
     ) -> Result<()> {
-        let Some(hir_ty::mir::CoroutineLocals { context, .. }) = body.coroutine else {
+        let Some(hir_ty_mir::mir::CoroutineLocals { context, .. }) = body.coroutine else {
             unsupported!("async body without a context");
         };
         let context = self.builder.ins().load(ptr(), MEM, self.locals[context].addr, 0);
@@ -18115,7 +18115,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Where the body is written to end, which is where rustc has an `async` block dropped.
     fn returns_at(body: &MirBody<'db>) -> MirSpan {
         let returns = body.basic_blocks.iter().find_map(|(_, block)| match &block.terminator {
-            Some(hir_ty::mir::Terminator { kind: TerminatorKind::Return, span }) => Some(*span),
+            Some(hir_ty_mir::mir::Terminator { kind: TerminatorKind::Return, span }) => Some(*span),
             _ => None,
         });
         returns.unwrap_or(MirSpan::Unknown)

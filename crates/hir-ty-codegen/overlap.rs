@@ -8,7 +8,7 @@
 //! Run on the function as [`promote`](super::promote) leaves it, just before Cranelift or
 //! LLVM: a local's slot that nothing addresses any more takes no room at all, and the rest are
 //! put together greedily, the largest first, into one slot per group of locals of which no two
-//! conflict ([`MirBody::frame_storage_conflicts`](hir_ty::mir::MirBody::frame_storage_conflicts)).
+//! conflict ([`FrameStorage::frame_storage_conflicts`](hir_ty_mir::mir::FrameStorage::frame_storage_conflicts)).
 
 use cranelift_codegen::ir::{self, InstructionData};
 use rustc_hash::FxHashMap;
@@ -23,7 +23,7 @@ pub(super) struct FrameLocals {
     /// By index in `slots`.
     pub(super) conflicts: BitMatrix<usize, usize>,
     /// Where in `slots` a local kept in a register puts the slot it gets when it needs one.
-    pub(super) lazy: FxHashMap<hir_ty::mir::LocalId, usize>,
+    pub(super) lazy: FxHashMap<hir_ty_mir::mir::LocalId, usize>,
 }
 
 /// Shares the slots of `frame` between locals that never hold storage at once, and has

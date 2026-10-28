@@ -29,7 +29,6 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
-
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 pub enum ConstEvalError<'db> {
     MirLowerError(MirLowerError<'db>),

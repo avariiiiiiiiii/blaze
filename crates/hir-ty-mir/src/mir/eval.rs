@@ -7,7 +7,7 @@ use std::{
     ops::Range,
 };
 
-use base_db::{Crate, target::TargetLoadError};
+use base_db::Crate;
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -21,7 +21,6 @@ use hir_def::{
 };
 use hir_expand::{InFile, mod_path::path};
 use la_arena::ArenaMap;
-use macros::GenericTypeVisitable;
 use rustc_abi::{Size, TargetDataLayout};
 use rustc_apfloat::{
     Float, FloatConvert,
@@ -33,7 +32,6 @@ use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind, Region as _, SliceLike, Ty as _},
 };
-use salsa::SalsaValue;
 use span::FileId;
 use stdx::never;
 use syntax::{SyntaxNodePtr, TextRange};
@@ -48,7 +46,7 @@ use crate::{
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         AliasTy, Allocation, AllocationData, Const, ConstKind, DbInterner, ErrorGuaranteed,
-        GenericArgs, Region, StoredTy, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
+        GenericArgs, Region, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
@@ -56,12 +54,12 @@ use crate::{
     utils::detect_variant_from_bytes,
 };
 
-use super::{IsSigned, MirEvalError, VTableMap, pad16};
 use super::{
-    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError,
-    MirPhase, MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue,
-    StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
+    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirPhase, MirSpan,
+    Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
+    TerminatorKind, UnOp, return_slot,
 };
+use super::{IsSigned, MirEvalError, VTableMap, pad16};
 
 mod shim;
 
@@ -131,7 +129,6 @@ impl<'db> VTableOfBytes<'db> for VTableMap<'db> {
         self.ty(id)
     }
 }
-
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TlsData {
@@ -402,7 +399,6 @@ impl Address {
         self.map(|it| it + offset)
     }
 }
-
 
 type Result<'db, T> = std::result::Result<T, MirEvalError<'db>>;
 
@@ -3791,7 +3787,6 @@ pub fn render_const_using_debug_impl<'db>(
         .unwrap_or(0);
     Ok(std::string::String::from_utf8_lossy(evaluator.read_memory(addr, size)?).into_owned())
 }
-
 
 macro_rules! for_each_int_type {
     ($call_macro:path, $args:tt) => {

@@ -21,7 +21,7 @@ extern crate self as hir_ty;
 
 pub mod builtin_derive;
 pub mod generics;
-mod infer;
+pub mod infer;
 pub mod inhabitedness;
 mod lower;
 pub mod next_solver;
@@ -100,6 +100,7 @@ pub use lower::{
     elided_lifetimes, with_elided_regions,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
+pub use opaques::rpit_hidden_types;
 pub use target_feature::TargetFeatures;
 pub use traits::{ParamEnvAndCrate, check_orphan_rules};
 pub use utils::{
@@ -131,24 +132,24 @@ pub enum MemoryMap<'db> {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
 pub struct ComplexMemoryMap<'db> {
-    memory: IndexMap<usize, Box<[u8]>, FxBuildHasher>,
-    vtable: VTableMap<'db>,
+    pub memory: IndexMap<usize, Box<[u8]>, FxBuildHasher>,
+    pub vtable: VTableMap<'db>,
     /// The address ranges that are the memory of a static, as start and size.
-    statics: Vec<StaticMemory>,
+    pub statics: Vec<StaticMemory>,
     /// What the address of a piece of `memory` was a multiple of where it was made, for
     /// those where that is known.
     aligns: IndexMap<usize, usize, FxBuildHasher>,
     /// The types of the `TypeId`s the constant may hold, by the ids the evaluation gave them:
     /// those are not rustc's hashes, which whoever emits the constant puts in their place.
     /// `None` for the id of a field reflection made.
-    type_ids: Vec<Option<Ty<'db>>>,
+    pub type_ids: Vec<Option<Ty<'db>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StaticMemory {
-    start: usize,
-    size: usize,
-    id: hir_def::StaticId,
+pub struct StaticMemory {
+    pub start: usize,
+    pub size: usize,
+    pub id: hir_def::StaticId,
 }
 
 impl<V> rustc_type_ir::GenericTypeVisitable<V> for StaticMemory {
@@ -156,7 +157,7 @@ impl<V> rustc_type_ir::GenericTypeVisitable<V> for StaticMemory {
 }
 
 impl ComplexMemoryMap<'_> {
-    fn insert(&mut self, addr: usize, val: Box<[u8]>) {
+    pub fn insert(&mut self, addr: usize, val: Box<[u8]>) {
         match self.memory.entry(addr) {
             Entry::Occupied(mut e) => {
                 if e.get().len() < val.len() {
@@ -169,7 +170,7 @@ impl ComplexMemoryMap<'_> {
         }
     }
 
-    fn note_align(&mut self, addr: usize, align: usize) {
+    pub fn note_align(&mut self, addr: usize, align: usize) {
         self.aligns.insert(addr, align);
     }
 }
@@ -225,14 +226,14 @@ impl<'db> MemoryMap<'db> {
         matches!(self, MemoryMap::Complex(map) if !map.type_ids.is_empty())
     }
 
-    fn simple(v: Box<[u8]>) -> Self {
+    pub fn simple(v: Box<[u8]>) -> Self {
         MemoryMap::Simple(v)
     }
 
     /// This functions convert each address by a function `f` which gets the byte intervals and assign an address
     /// to them. It is useful when you want to load a constant with a memory map in a new memory. You can pass an
     /// allocator function as `f` and it will return a mapping of old addresses to new addresses.
-    fn transform_addresses(
+    pub fn transform_addresses(
         &self,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
     ) -> Result<FxHashMap<usize, usize>, MirEvalError<'db>> {

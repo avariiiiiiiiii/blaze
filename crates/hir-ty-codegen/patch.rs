@@ -17,7 +17,7 @@ use hir_def::{
     DefWithBodyId, FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature,
 };
 use hir_expand::{FileRange, HirFileId};
-use hir_ty::mir::location::line_and_column;
+use hir_ty_mir::mir::location::line_and_column;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use span::ErasedFileAstId;
 

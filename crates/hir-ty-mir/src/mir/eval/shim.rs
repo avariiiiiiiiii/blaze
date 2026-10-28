@@ -16,8 +16,8 @@ use crate::{
     mir::eval::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
-        MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, TypeIdOf, VariantId, from_bytes,
-        not_supported, pad16, try_const_usize,
+        MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, TypeIdOf, VTableOfBytes, VariantId,
+        from_bytes, not_supported, pad16, try_const_usize,
     },
     next_solver::Region,
 };

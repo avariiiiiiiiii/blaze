@@ -222,6 +222,20 @@ function toast(m: Msg, mention: boolean): void {
 	fade(t, TOAST_MS);
 }
 
+/** A pop-up that someone arrived on the site (client/lib/presence.ts): not when muted; a click goes where they are. */
+export function arrived(f: HTMLElement, who: string, where: string, href: string | null): void {
+	if (muted()) return;
+	const t = el(href ? 'a' : 'div', 'chat-toast chat-arrived');
+	if (t instanceof HTMLAnchorElement && href) t.href = href;
+	const words = el('span', 'chat-toast-words');
+	words.append(el('b', '', `${who} joined`), el('span', '', where));
+	t.append(f, words);
+	toasts.prepend(t);
+	const msgs = [...toasts.children].filter((x) => !x.classList.contains('chat-notice'));
+	for (const x of msgs.slice(3)) x.remove();
+	fade(t, TOAST_MS);
+}
+
 function fade(t: Element, ms: number): void {
 	setTimeout(() => {
 		t.classList.add('out');

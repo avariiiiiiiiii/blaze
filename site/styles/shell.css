@@ -330,6 +330,10 @@ body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typin
 /* Pop-ups for messages while the chat is shut, at the bottom right. */
 .chat-toasts { position: fixed; z-index: 46; right: clamp(8px, 1vw, 14px); bottom: 14px; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 24px)); pointer-events: none; }
 .chat-toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 0; border-radius: 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 12px 32px rgb(0 0 0 / 0.3); color: var(--ink-2); font: inherit; font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; pointer-events: auto; animation: toast-in 0.2s ease-out; }
+a.chat-toast { text-decoration: none; }
+.tl-list .devices { display: inline-flex; gap: 2px; color: var(--ink-3); }
+.tl-list .device { display: inline-grid; width: 14px; height: 14px; }
+.tl-list .device svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
 .chat-toast:hover { background: var(--bg-3); }
 .chat-toast .face { width: 26px; height: 26px; }
 .chat-toast-words { min-width: 0; }

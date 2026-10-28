@@ -31,7 +31,7 @@ import * as update from './update';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { country: string | null; since?: number; pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; since?: number; devices?: string[]; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -44,6 +44,9 @@ const BASE = (() => {
 })();
 const SVG = 'http://www.w3.org/2000/svg';
 const ROW_FACES = 3;
+/** Only someone whose visit began this recently is new (a reload or a reconnect keeps their start: worker/presence.ts). */
+const ARRIVAL_MS = 20_000;
+const ARRIVAL_GAP_MS = 4000;
 const BAR_FACES = 5;
 
 let you: You | null = null;
@@ -136,6 +139,22 @@ function stack(list: Person[], max: number, path: string): HTMLElement {
 function titleOf(path: string): string {
 	const a = document.querySelector<HTMLAnchorElement>(`.navlist a.row[href="${CSS.escape(href(path))}"]`);
 	return a?.title || a?.dataset.tip || a?.textContent?.trim() || path;
+}
+
+/** Who was here at the last list, null before the first: a key new since then, who came just now, gets a pop-up. */
+let known: Set<string> | null = null;
+let lastArrival = 0;
+function announce(): void {
+	const now = Date.now();
+	const fresh = known === null ? [] : people.filter((p) => !known!.has(p.key) && p.key !== you?.key && now - (p.since ?? 0) < ARRIVAL_MS);
+	known = new Set(people.map((p) => p.key));
+	// A crowd arriving at once is one pop-up, not a stack.
+	if (!fresh.length || now - lastArrival < ARRIVAL_GAP_MS) return;
+	lastArrival = now;
+	const p = fresh[0];
+	const page = p.pages[0]?.path;
+	const more = fresh.length > 1 ? ` and ${fresh.length - 1} more` : '';
+	chat.arrived(face(p), `${name(p)}${more}`, page ? `on ${titleOf(page)}` : 'on the site', page ? href(page) : null);
 }
 
 // ---- The top line -------------------------------------------------------------------------------------------------
@@ -246,6 +265,27 @@ function flag(cc: string): HTMLElement {
 	return f;
 }
 
+/** What they read on, as a small outline: each kind of device they have a tab on. */
+const DEVICES: Record<string, [string, string]> = {
+	computer: ['On a computer', '<rect x="3" y="3.5" width="10" height="7" rx="1"/><path d="M1.5 12.5h13"/>'],
+	phone: ['On a phone', '<rect x="5" y="1.5" width="6" height="13" rx="1.5"/><path d="M7.3 12.5h1.4"/>'],
+	tablet: ['On a tablet', '<rect x="3" y="1.5" width="10" height="13" rx="1.5"/><path d="M7.3 12.5h1.4"/>'],
+};
+function devices(p: Person): HTMLElement | null {
+	const kinds = (p.devices ?? []).filter((d) => DEVICES[d]);
+	if (!kinds.length) return null;
+	const s = el('span', 'devices');
+	for (const d of kinds) {
+		const [label, paths] = DEVICES[d];
+		const i = el('span', 'device');
+		i.innerHTML = `<svg viewBox="0 0 16 16" aria-hidden="true">${paths}</svg>`;
+		tipOn(i, label);
+		i.setAttribute('aria-label', label);
+		s.append(i);
+	}
+	return s;
+}
+
 /** How long since `t`, short: now, 5m, 2h, 3d. */
 function ago(t: number): string {
 	const m = Math.floor((Date.now() - t) / 60_000);
@@ -276,6 +316,8 @@ function drawList(): void {
 		av.append(face(p, !active), dot);
 		li.append(av, who);
 		if (p.country) li.append(flag(p.country));
+		const dev = devices(p);
+		if (dev) li.append(dev);
 		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
 		// The page in front of them, the rest of their tabs as +N (named in its tooltip).
 		const where = el('span', 'where');
@@ -474,6 +516,7 @@ function connect(): void {
 			const h = m as { people?: Person[]; total?: number };
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
+			announce();
 			chat.setOnline(total);
 			chat.setPeople(people);
 		} else return;

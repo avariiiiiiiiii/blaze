@@ -23,6 +23,7 @@ mod manifest;
 mod memory;
 mod mirdump;
 mod outline;
+mod pin;
 mod plan;
 mod process;
 mod remote;
@@ -39,6 +40,7 @@ mod tier;
 mod trace;
 mod tree;
 mod unstable;
+mod versions;
 mod weaken;
 mod whole;
 
@@ -8156,6 +8158,7 @@ pub fn main() -> anyhow::Result<()> {
             return remote::command(std::env::args().skip(2));
         }
         Some("std") => return shipped::command(std::env::args().skip(2)),
+        Some("version-fetch") => return versions::command(std::env::args().skip(2)),
         #[cfg(unix)]
         Some("closure") => {
             end_with_reader();

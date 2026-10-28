@@ -106,12 +106,14 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
             }
         },
         Asked::Lock(args) => fetches::command(&args)?,
+        Asked::Pin(args) => crate::versions::pin(&args)?,
         Asked::Help => {
             println!("{HELP}");
             0
         }
         Asked::Version => {
             println!("{}", crate::version());
+            println!("{}", crate::versions::why_this_one());
             0
         }
     };
@@ -135,6 +137,9 @@ usage: blaze <command> [cargo's flags]    (or blaze <command>)
                      if it has none (`--path`: its directory)
   lock --fetches     records what build scripts download, by sha256, in Cargo.fetches.lock
                      (`--target <triple>`, the host's by default); a build hands it to them
+  pin                this blaze's version in the workspace's Cargo.toml, under
+                     `[workspace.metadata.blaze]`: `blaze` there runs this release, fetched
+                     once where it is missing
   cache              what the `#[blaze::cache]` functions kept, by function
   cache clear        forgets it; `--stale`, all but what each function's code computed
 

@@ -166,6 +166,8 @@ impl Build {
                 self.finished = Some(Finished { ok: *ok, summary: summary.clone(), at_ns: at });
                 Change::Finished
             }
+            // The build graph's records, not drawn yet (docs/driver.md, "Events").
+            Event::Node { .. } | Event::Moved { .. } | Event::Critical { .. } => Change::Nothing,
         }
     }
 

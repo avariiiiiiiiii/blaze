@@ -37,6 +37,74 @@ pub enum Event {
     Said { level: Level, text: String },
     /// The build is done.
     Finished { ok: bool, summary: Summary },
+    /// A node of the build's graph (docs/driver.md), said once, before it first moves: what it
+    /// is and the nodes it waits for.
+    Node { id: u32, kind: NodeKind, name: String, deps: Vec<u32> },
+    /// A node of the graph is now in `state`.
+    Moved { id: u32, state: NodeState },
+    /// What held the build up: each node of it is the one the next waited for last, from the
+    /// first to the one that finished last.
+    Critical { path: Vec<u32> },
+}
+
+/// What a node of the build's graph does (docs/driver.md, "The graph").
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NodeKind {
+    /// Reading the manifests and the lock file.
+    Manifest,
+    /// A package's source.
+    Fetch,
+    /// Compiling a build script.
+    Script,
+    /// Running a build script.
+    ScriptRun,
+    /// A proc macro's library, built and loaded.
+    Macro,
+    /// The standard library.
+    Std,
+    /// A crate's names (its def map).
+    Names,
+    /// A crate's bodies: inference, borrow checking, MIR.
+    Bodies,
+    /// A unit of functions compiled or taken from the store.
+    Codegen,
+    /// Writing compiled functions to the store.
+    Store,
+    /// Linking a program.
+    Link,
+    /// Running a test executable.
+    Test,
+}
+
+/// Where a node of the build's graph is. A node only moves down this list, from `Waiting`
+/// to one of the last four.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NodeState {
+    /// A node it waits for is not done.
+    Waiting,
+    /// Everything it waits for is done; it waits for a thread.
+    Ready,
+    Running,
+    /// Done, by doing its work.
+    Built,
+    /// Done, by taking what the store had: this machine's, or the remote's.
+    Cached { remote: bool },
+    Failed { why: String },
+    /// Never run: `because` failed, and it waited for it, or the build stopped there.
+    Skipped { because: u32 },
+}
+
+impl NodeState {
+    /// Whether the node is done, well or not: it moves no more.
+    pub fn settled(&self) -> bool {
+        matches!(
+            self,
+            NodeState::Built
+                | NodeState::Cached { .. }
+                | NodeState::Failed { .. }
+                | NodeState::Skipped { .. }
+        )
+    }
 }
 
 /// The steps of a build, in the order they come.

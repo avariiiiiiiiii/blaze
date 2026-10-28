@@ -21,6 +21,7 @@ run when it is a rough edge a user would trip on:
     transcript in `experience/` has it (a new message is looked at before it is accepted);
   - a build slower than cargo's of the same step, by more than `SLACK` (cold, no-op, edit);
   - a second no-op build that prints other than the first;
+  - a cold build that shows a terminal nothing for more than `SILENT` seconds (it looks stuck);
   - an edit whose run does not print the edited output;
   - a blaze process left after `blaze stop`.
 
@@ -31,7 +32,7 @@ to the byte; `--update` writes it. Results: `$TMPDIR/experience/<project>/report
 Linux and macOS. `pyo3` needs python3; `sys` needs pkg-config, OpenSSL's headers and zlib's;
 `wasm32` needs the wasm32-unknown-unknown target of blaze's toolchain.
 """
-import argparse, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time
+import argparse, glob, json, os, pty, re, select, shutil, signal, subprocess, sys, tempfile, threading, time, tty
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN = os.path.join(HERE, "experience")
@@ -40,6 +41,8 @@ TIMEOUT = 3600
 # blaze's client starting.
 SLACK = 1.10
 SLACK_ABS = 0.15
+# The longest a terminal may be shown nothing while a build goes on: longer looks stuck.
+SILENT = 1.5
 
 
 def toml(name, deps="", extra=""):
@@ -254,7 +257,9 @@ DEAD_NAMES = re.compile(r"ra[-_]jit|RA_JIT|cargo[- ]blaze")  # rename: old name
 
 # cargo's progress lines, whose order a parallel build does not fix.
 PROGRESS = re.compile(r"^\s*(Compiling|Checking|Downloading|Downloaded|Updating|Locking|Adding|Fresh|"
-                      r"Blocking|Building|Packaging|Unpacking|Fetching|Documenting|Removed|Updated)\b")
+                      r"Blocking|Building|Packaging|Unpacking|Fetching|Documenting|Removed|Updated|"
+                      # blaze's own, of what its daemon is at, each shown only if it lasts a moment.
+                      r"Loading|Resolving|Linking)\b")
 OWN = re.compile(r"^\s*(Finished|Running|Executable|Doc-tests|running \d+ tests?|test result:|test \S+ \.\.\.|"
                  r"warning: .*generated \d+ warning)")
 
@@ -270,16 +275,59 @@ def normalized(text, where):
     return "\n".join(lines)
 
 
+def on_terminal(argv, cwd, env, timeout):
+    """Runs argv with standard error a terminal, as a user's is: its exit, standard output,
+    standard error with what was written over taken out, and the longest time it wrote nothing."""
+    master, slave = pty.openpty()
+    tty.setraw(slave)
+    start = time.monotonic()
+    p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=slave)
+    os.close(slave)
+    out = []
+    reader = threading.Thread(target=lambda: out.append(p.stdout.read()))
+    reader.start()
+    raw, last, silent = b"", start, 0.0
+    while True:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:  # Linux: every process that had it closed it
+                chunk = b""
+            if not chunk:
+                break
+            now = time.monotonic()
+            silent, last = max(silent, now - last), now
+            raw += chunk
+        elif p.poll() is not None or time.monotonic() - start > timeout:
+            break
+    timed_out = p.poll() is None
+    if timed_out:
+        p.kill()
+    code = "timeout" if timed_out else p.wait()
+    silent = max(silent, time.monotonic() - last)
+    os.close(master)
+    reader.join()
+    err = raw.decode(errors="replace")
+    err = re.sub(r"\x1b\[[0-9;]*m", "", err)
+    err = re.sub(r"\r[^\r\n]*\x1b\[K", "", err).replace("\x1b[K", "").replace("\r", "")
+    return code, (out[0] if out else b"").decode(errors="replace"), err, silent
+
+
 class Step:
-    def __init__(self, name, argv, cwd, env, timeout=TIMEOUT):
+    def __init__(self, name, argv, cwd, env, timeout=TIMEOUT, terminal=False):
         start = time.monotonic()
-        try:
-            done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
-            self.code, self.out, self.err = done.returncode, done.stdout, done.stderr
-        except subprocess.TimeoutExpired as e:
-            self.code, self.out, self.err = "timeout", e.stdout or "", (e.stderr or "") + f"\n(timed out after {timeout} s)"
-            if isinstance(self.out, bytes):
-                self.out, self.err = self.out.decode(errors="replace"), self.err.decode(errors="replace")
+        self.silent = None
+        if terminal:
+            self.code, self.out, self.err, self.silent = on_terminal(argv, cwd, env, timeout)
+        else:
+            try:
+                done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+                self.code, self.out, self.err = done.returncode, done.stdout, done.stderr
+            except subprocess.TimeoutExpired as e:
+                self.code, self.out, self.err = "timeout", e.stdout or "", (e.stderr or "") + f"\n(timed out after {timeout} s)"
+                if isinstance(self.out, bytes):
+                    self.out, self.err = self.out.decode(errors="replace"), self.err.decode(errors="replace")
         self.secs = time.monotonic() - start
         self.name, self.argv = name, argv
 
@@ -372,7 +420,7 @@ def flow(name, spec, work, env):
         done = subprocess.run([sys.executable, "-c", spec["python"]], cwd=root, capture_output=True, text=True)
         return done.stdout.strip() or done.stderr.strip()
 
-    cold = blaze("build (cold)", "build", *target)
+    cold = blaze("build (cold)", "build", *target, terminal=True)
     c_cold = cargo("build (cold)", "build", *target)
     noop = blaze("build (no-op)", "build", *target)
     noop2 = blaze("build (no-op again)", "build", *target)
@@ -430,6 +478,8 @@ def flow(name, spec, work, env):
         compiled = lambda step: sorted(l.split()[1] for l in step.err.splitlines() if l.strip().startswith("Compiling "))
         if compiled(ours) and not compiled(theirs) and ours.code == 0:
             rough.append((ours.name, f"says Compiling {', '.join(compiled(ours))}, where cargo compiles nothing", "P1"))
+    if cold.silent is not None and cold.silent > SILENT:
+        rough.append((cold.name, f"a terminal is shown nothing for {cold.silent:.1f} s", "P1"))
     if normalized(noop.err, where) != normalized(noop2.err, where):
         rough.append(("build (no-op again)", "prints other than the first no-op", "P2"))
     return steps, rough, where, [theirs for _, theirs in pairs]

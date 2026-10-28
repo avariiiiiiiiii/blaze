@@ -26,6 +26,12 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Changed
 
+- Wasm proc macros expand in a session per calling crate only when they keep state (#908).
+  The guest's allocator counts live bytes, and an expansion that leaves some behind marks its
+  module stateful in the store. A module none of whose expansions did (serde_derive,
+  thiserror and most derives) goes back to a fresh instance per expansion: its expansions are
+  kept, and crates that call it are frozen again. A module not seen yet expands in a session
+  until a build has run it.
 - `blaze test` keeps a hermetic test's pass by its code, with no opt-in (#836): a test whose
   reachable code reaches no file, environment variable, socket, other process, foreign code,
   inline assembly, unbounded indirect call, writable shared static or code blaze can't compile

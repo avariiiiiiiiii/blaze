@@ -4877,6 +4877,7 @@ fn link_executable(
         Ok(exports)
     });
     let exports = exports.transpose()?;
+    blaze_macro_wasm::flush();
     let took = link::executable(
         db,
         &program,
@@ -8765,6 +8766,7 @@ fn run_holding(
     write_harnesses(&mut db, texts);
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
     frozen::store(&db, &served)?;
+    blaze_macro_wasm::flush();
     for said in [blaze_expand::report(), blaze_macro_wasm::report()].into_iter().flatten() {
         eprintln!("{said}");
     }

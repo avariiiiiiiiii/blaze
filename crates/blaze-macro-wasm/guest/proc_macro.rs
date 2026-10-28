@@ -61,8 +61,55 @@ mod sys {
         pub fn output(ptr: *const u8, len: usize);
         /// What a panic said, before the module traps.
         pub fn panicked(ptr: *const u8, len: usize);
+        /// That the expansion left `bytes` of what it allocated live when it returned.
+        pub fn retained(bytes: usize);
     }
 }
+
+/// The module's allocator: the standard library's, counting the bytes live, so that the host
+/// learns whether an expansion left anything behind for a later one (`__blaze::expand1`).
+struct Counted;
+
+static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn live() -> usize {
+    LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+unsafe impl std::alloc::GlobalAlloc for Counted {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let at = unsafe { std::alloc::System.alloc(layout) };
+        if !at.is_null() {
+            LIVE.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        at
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !at.is_null() {
+            LIVE.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        at
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+        LIVE.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let at = unsafe { std::alloc::System.realloc(ptr, layout, size) };
+        if !at.is_null() {
+            LIVE.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            LIVE.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        at
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counted = Counted;
 
 fn taken(len: i32) -> Option<Vec<u8>> {
     let len = usize::try_from(len).ok()?;
@@ -1316,11 +1363,26 @@ pub mod __blaze {
         unsafe { sys::output(out.as_ptr(), out.len()) };
     }
 
+    /// What is live before an expansion, less the room its input was written into, which it
+    /// frees: what is live after it beyond that, it left for a later one.
+    fn before() -> usize {
+        live() - ROOM.with(|room| room.borrow().iter().map(Vec::capacity).sum::<usize>())
+    }
+
+    fn after(before: usize) {
+        ROOM.with(|room| room.borrow_mut().clear());
+        let left = live().saturating_sub(before);
+        if left != 0 {
+            unsafe { sys::retained(left) };
+        }
+    }
+
     /// A derive or a function-like macro.
     pub fn expand1(f: fn(TokenStream) -> TokenStream, ptr: *const u8, len: usize) {
         hook();
+        let before = before();
         give(f(input(ptr, len)));
-        ROOM.with(|room| room.borrow_mut().clear());
+        after(before);
     }
 
     /// An attribute.
@@ -1332,8 +1394,9 @@ pub mod __blaze {
         len: usize,
     ) {
         hook();
+        let before = before();
         give(f(input(attr, attr_len), input(ptr, len)));
-        ROOM.with(|room| room.borrow_mut().clear());
+        after(before);
     }
 
     /// The list of macros, a line each: kind (0 derive, 1 attribute, 2 function-like), name

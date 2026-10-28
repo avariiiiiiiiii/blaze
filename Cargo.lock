@@ -677,6 +677,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-bench"
+version = "0.20261027.0"
+dependencies = [
+ "blaze-store",
+ "hir-ty-codegen",
+ "tango-bench",
+]
+
+[[package]]
 name = "blaze-build-script"
 version = "0.20261027.0"
 dependencies = [
@@ -687,6 +696,19 @@ dependencies = [
  "serde_derive",
  "serde_json",
 ]
+
+[[package]]
+name = "blaze-cache"
+version = "0.1.0"
+dependencies = [
+ "blaze-cache-macros",
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "blaze-cache-macros"
+version = "0.1.0"
 
 [[package]]
 name = "blaze-doc"
@@ -709,6 +731,120 @@ dependencies = [
  "syntax",
  "test-fixture",
  "vfs",
+]
+
+[[package]]
+name = "blaze-engine"
+version = "0.20261027.0"
+dependencies = [
+ "anyhow",
+ "ar_archive_writer",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "base64",
+ "blaze-build-script",
+ "blaze-cache",
+ "blaze-doc",
+ "blaze-expand",
+ "blaze-fmt",
+ "blaze-lints",
+ "blaze-live",
+ "blaze-macro-wasm",
+ "blaze-manifest",
+ "blaze-metadata",
+ "blaze-new",
+ "blaze-registry",
+ "blaze-resolve",
+ "blaze-store",
+ "blaze-tree",
+ "blaze-units",
+ "blaze-wasi",
+ "cargo-platform",
+ "cargo-util-schemas",
+ "cargo_metadata",
+ "cfg",
+ "dunce",
+ "ed25519-dalek",
+ "find-msvc-tools",
+ "futures-util",
+ "getrandom 0.3.4",
+ "gimli 0.33.0",
+ "hir",
+ "hir-def",
+ "hir-ty",
+ "hir-ty-borrowck",
+ "hir-ty-codegen",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ide-db",
+ "ide-diagnostics",
+ "intern",
+ "libc",
+ "load-cargo",
+ "lzma-rust2",
+ "memchr",
+ "memmap2",
+ "mimalloc",
+ "object 0.37.3",
+ "paths",
+ "pdb",
+ "proc-macro-api",
+ "project-model",
+ "pulldown-cmark",
+ "rustc-demangle",
+ "rustc-hash 2.1.2",
+ "rustls",
+ "salsa",
+ "same-file",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "sha2 0.10.9",
+ "shlex",
+ "syntax",
+ "tar",
+ "tempfile",
+ "test-fixture",
+ "thorin-dwp",
+ "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
+ "tikv-jemallocator",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "toolchain",
+ "tracing",
+ "triomphe",
+ "typed-arena",
+ "uds_windows",
+ "url",
+ "vfs",
+ "wasm-encoder 0.244.0",
+ "wasmparser 0.236.1",
+ "windows-sys 0.61.2",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "blaze-expand"
+version = "0.20261027.0"
+dependencies = [
+ "base-db",
+ "blaze-store",
+ "hir-expand",
+ "load-cargo",
+ "paths",
+ "postcard",
+ "proc-macro-api",
+ "rustc-hash 2.1.2",
+ "sha2 0.10.9",
+ "span",
+ "tt",
 ]
 
 [[package]]
@@ -737,6 +873,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-fuzz"
+version = "0.20261027.0"
+
+[[package]]
 name = "blaze-lints"
 version = "0.20261027.0"
 dependencies = [
@@ -754,6 +894,29 @@ dependencies = [
  "syntax",
  "test-fixture",
  "toml",
+]
+
+[[package]]
+name = "blaze-live"
+version = "0.1.0"
+
+[[package]]
+name = "blaze-macro-wasm"
+version = "0.20261027.0"
+dependencies = [
+ "base-db",
+ "blaze-store",
+ "hir-expand",
+ "intern",
+ "load-cargo",
+ "paths",
+ "proc-macro-api",
+ "ra-ap-rustc_lexer",
+ "rustc-hash 2.1.2",
+ "sha2 0.10.9",
+ "span",
+ "tt",
+ "wasmtime",
 ]
 
 [[package]]
@@ -815,6 +978,7 @@ dependencies = [
  "blaze-manifest",
  "blaze-resolve",
  "blaze-source",
+ "blaze-store",
  "cargo-platform",
  "filetime",
  "flate2",
@@ -824,7 +988,6 @@ dependencies = [
  "hyper-util",
  "libc",
  "percent-encoding",
- "blaze-store",
  "rustc-hash 2.1.2",
  "semver",
  "serde",
@@ -865,6 +1028,20 @@ dependencies = [
  "semver",
  "serde",
  "url",
+]
+
+[[package]]
+name = "blaze-store"
+version = "0.20261027.0"
+dependencies = [
+ "blaze-fuzz",
+ "crc32fast",
+ "libc",
+ "memmap2",
+ "rustc-hash 2.1.2",
+ "sha2 0.10.9",
+ "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]
@@ -2099,8 +2276,8 @@ dependencies = [
  "intern",
  "itertools 0.15.0",
  "la-arena",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_type_ir",
  "salsa",
  "serde_json",
  "smallvec",
@@ -2135,9 +2312,9 @@ dependencies = [
  "intern",
  "itertools 0.15.0",
  "la-arena",
- "rustc_abi",
  "ra-ap-rustc_parse_format",
  "rustc-hash 2.1.2",
+ "rustc_abi",
  "rustc_apfloat",
  "salsa",
  "smallvec",
@@ -2196,12 +2373,12 @@ dependencies = [
  "la-arena",
  "macros",
  "project-model",
- "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_pattern_analysis",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_abi",
  "rustc_apfloat",
+ "rustc_type_ir",
  "salsa",
  "smallvec",
  "span",
@@ -2233,13 +2410,13 @@ dependencies = [
  "la-arena",
  "macros",
  "oorandom",
- "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
+ "rustc-hash 2.1.2",
+ "rustc_abi",
+ "rustc_apfloat",
  "rustc_next_trait_solver",
  "rustc_type_ir",
- "rustc-hash 2.1.2",
- "rustc_apfloat",
  "salsa",
  "serde",
  "serde_derive",
@@ -2266,8 +2443,8 @@ dependencies = [
  "hir-ty-wfcheck",
  "la-arena",
  "ra-ap-rustc_ast_ir",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_type_ir",
  "salsa",
  "smallvec",
  "syntax",
@@ -2278,6 +2455,8 @@ name = "hir-ty-codegen"
 version = "0.20261027.0"
 dependencies = [
  "base-db",
+ "blaze-fuzz",
+ "blaze-store",
  "cfg",
  "cranelift-codegen",
  "cranelift-frontend",
@@ -2293,15 +2472,13 @@ dependencies = [
  "la-arena",
  "object 0.37.3",
  "postcard",
- "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
- "rustc_type_ir",
- "blaze-fuzz",
- "blaze-store",
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rustc-stable-hash",
+ "rustc_abi",
+ "rustc_type_ir",
  "salsa",
  "serde",
  "serde_derive",
@@ -2321,8 +2498,8 @@ version = "0.0.0"
 dependencies = [
  "hir-def",
  "hir-ty",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_type_ir",
  "salsa",
 ]
 
@@ -3674,16 +3851,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "rustc_abi"
-version = "0.166.0"
-dependencies = [
- "bitflags 2.12.1",
- "ra-ap-rustc_hashes",
- "ra-ap-rustc_index",
- "tracing",
-]
-
-[[package]]
 name = "ra-ap-rustc_ast_ir"
 version = "0.166.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3730,17 +3897,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustc_next_trait_solver"
-version = "0.166.0"
-dependencies = [
- "derive-where",
- "ra-ap-rustc_index",
- "rustc_type_ir",
- "ra-ap-rustc_type_ir_macros",
- "tracing",
-]
-
-[[package]]
 name = "ra-ap-rustc_parse_format"
 version = "0.166.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3764,25 +3920,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustc_type_ir"
-version = "0.166.0"
-dependencies = [
- "arrayvec",
- "bitflags 2.12.1",
- "derive-where",
- "ena",
- "indexmap",
- "rustc_abi",
- "ra-ap-rustc_ast_ir",
- "ra-ap-rustc_index",
- "ra-ap-rustc_type_ir_macros",
- "rustc-hash 2.1.2",
- "smallvec",
- "thin-vec",
- "tracing",
-]
-
-[[package]]
 name = "ra-ap-rustc_type_ir_macros"
 version = "0.166.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3792,183 +3929,6 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
-]
-
-[[package]]
-name = "blaze-engine"
-version = "0.20261027.0"
-dependencies = [
- "anyhow",
- "ar_archive_writer",
- "aws-config",
- "aws-sdk-s3",
- "aws-smithy-http-client",
- "base64",
- "blaze-build-script",
- "blaze-doc",
- "blaze-fmt",
- "blaze-lints",
- "blaze-manifest",
- "blaze-metadata",
- "blaze-new",
- "blaze-registry",
- "blaze-resolve",
- "blaze-tree",
- "blaze-units",
- "blaze-wasi",
- "cargo-platform",
- "cargo-util-schemas",
- "cargo_metadata",
- "cfg",
- "dunce",
- "ed25519-dalek",
- "find-msvc-tools",
- "futures-util",
- "getrandom 0.3.4",
- "gimli 0.33.0",
- "hir",
- "hir-def",
- "hir-ty",
- "hir-ty-borrowck",
- "hir-ty-codegen",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "ide-db",
- "ide-diagnostics",
- "intern",
- "libc",
- "load-cargo",
- "lzma-rust2",
- "memchr",
- "memmap2",
- "mimalloc",
- "object 0.37.3",
- "paths",
- "pdb",
- "proc-macro-api",
- "project-model",
- "pulldown-cmark",
- "blaze-cache",
- "blaze-expand",
- "blaze-live",
- "blaze-macro-wasm",
- "blaze-store",
- "rustc-demangle",
- "rustc-hash 2.1.2",
- "rustls",
- "salsa",
- "same-file",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "sha2 0.10.9",
- "shlex",
- "syntax",
- "tar",
- "tempfile",
- "test-fixture",
- "thorin-dwp",
- "tikv-jemalloc-ctl",
- "tikv-jemalloc-sys",
- "tikv-jemallocator",
- "tokio",
- "toml",
- "toml_edit",
- "toolchain",
- "tracing",
- "triomphe",
- "typed-arena",
- "uds_windows",
- "url",
- "vfs",
- "wasm-encoder 0.244.0",
- "wasmparser 0.236.1",
- "windows-sys 0.61.2",
- "zip",
- "zstd",
-]
-
-[[package]]
-name = "blaze-bench"
-version = "0.20261027.0"
-dependencies = [
- "hir-ty-codegen",
- "blaze-store",
- "tango-bench",
-]
-
-[[package]]
-name = "blaze-cache"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "blaze-cache-macros",
- "serde",
-]
-
-[[package]]
-name = "blaze-cache-macros"
-version = "0.1.0"
-
-[[package]]
-name = "blaze-expand"
-version = "0.20261027.0"
-dependencies = [
- "base-db",
- "hir-expand",
- "load-cargo",
- "paths",
- "postcard",
- "proc-macro-api",
- "blaze-store",
- "rustc-hash 2.1.2",
- "sha2 0.10.9",
- "span",
- "tt",
-]
-
-[[package]]
-name = "blaze-fuzz"
-version = "0.20261027.0"
-
-[[package]]
-name = "blaze-live"
-version = "0.1.0"
-
-[[package]]
-name = "blaze-macro-wasm"
-version = "0.20261027.0"
-dependencies = [
- "base-db",
- "hir-expand",
- "intern",
- "load-cargo",
- "paths",
- "proc-macro-api",
- "ra-ap-rustc_lexer",
- "blaze-store",
- "rustc-hash 2.1.2",
- "sha2 0.10.9",
- "span",
- "tt",
- "wasmtime",
-]
-
-[[package]]
-name = "blaze-store"
-version = "0.20261027.0"
-dependencies = [
- "crc32fast",
- "libc",
- "memmap2",
- "blaze-fuzz",
- "rustc-hash 2.1.2",
- "sha2 0.10.9",
- "windows-sys 0.61.2",
- "zstd",
 ]
 
 [[package]]
@@ -4092,18 +4052,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "syntax-tree"
-version = "0.17.0"
-dependencies = [
- "countme",
- "hashbrown 0.14.5",
- "memoffset 0.9.1",
- "rustc-hash 1.1.0",
- "serde",
- "text-size",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4134,6 +4082,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
 
 [[package]]
+name = "rustc_abi"
+version = "0.0.0"
+dependencies = [
+ "bitflags 2.12.1",
+ "ra-ap-rustc_hashes",
+ "ra-ap-rustc_index",
+ "tracing",
+]
+
+[[package]]
 name = "rustc_apfloat"
 version = "0.2.3+llvm-462a31f5a5ab"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4141,6 +4099,36 @@ checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
 dependencies = [
  "bitflags 2.12.1",
  "smallvec",
+]
+
+[[package]]
+name = "rustc_next_trait_solver"
+version = "0.0.0"
+dependencies = [
+ "derive-where",
+ "ra-ap-rustc_index",
+ "ra-ap-rustc_type_ir_macros",
+ "rustc_type_ir",
+ "tracing",
+]
+
+[[package]]
+name = "rustc_type_ir"
+version = "0.0.0"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.12.1",
+ "derive-where",
+ "ena",
+ "indexmap",
+ "ra-ap-rustc_ast_ir",
+ "ra-ap-rustc_index",
+ "ra-ap-rustc_type_ir_macros",
+ "rustc-hash 2.1.2",
+ "rustc_abi",
+ "smallvec",
+ "thin-vec",
+ "tracing",
 ]
 
 [[package]]
@@ -4691,13 +4679,13 @@ dependencies = [
  "parser",
  "ra-ap-rustc_lexer",
  "rayon",
- "syntax-tree",
  "rustc-hash 2.1.2",
  "rustc-literal-escaper",
  "rustc_apfloat",
  "smallvec",
  "smol_str",
  "stdx",
+ "syntax-tree",
  "test-utils",
  "tracing",
  "triomphe",
@@ -4716,6 +4704,18 @@ dependencies = [
  "syntax",
  "test-utils",
  "tt",
+]
+
+[[package]]
+name = "syntax-tree"
+version = "0.0.0"
+dependencies = [
+ "countme",
+ "hashbrown 0.14.5",
+ "memoffset 0.9.1",
+ "rustc-hash 1.1.0",
+ "serde",
+ "text-size",
 ]
 
 [[package]]

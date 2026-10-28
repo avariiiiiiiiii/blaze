@@ -11,11 +11,11 @@ AGENTS.md).
    or a cargo that runs them, and there is no "fall back to cargo" path. Each place that still does
    is a bug with a `no-rustc` issue, to be removed, never extended or added to. See
    [docs/no-rustc.md](docs/no-rustc.md).
-2. **blaze-builds-blaze**: Build and test blaze with blaze, locally and in CI: `blaze build`,
-   `blaze test`, never `cargo build`/`cargo test` with rustc, and never sccache. Blaze's own
-   store (local, and the shared remote CI fills) is the one cache. Where blaze can't yet build or
-   test itself, that is the bug to fix, not a reason to call rustc; rustc stays only in the release
-   build until blaze builds that too. See [docs/contributing.md](docs/contributing.md).
+2. **blaze-builds-blaze**: Build and test blaze with blaze, locally and in CI: `blaze build`, `blaze
+   test`, never `cargo build`/`cargo test` with rustc, and never sccache. Blaze's own store (local,
+   and the shared remote CI fills) is the one cache. Where blaze can't yet build or test itself,
+   that is the bug to fix, not a reason to call rustc; rustc stays only in the release build until
+   blaze builds that too. See [docs/contributing.md](docs/contributing.md).
    Why: "never use sccache never use rustc" and "we should make sure we get blaze to fully build
    itself! basically blaze sucks until then" (Andrew, 2026-10-26).
 3. **no-fallback**: No fallback, ever; fail fast with a clear error. When blaze can't do something (an
@@ -36,8 +36,8 @@ AGENTS.md).
    The one allowed difference is sandboxing: build scripts and proc macros run sandboxed (#147). One
    that needs more than the sandbox allows is the only exception, and is made to work rather than
    refused where possible. See [docs/no-rustc.md](docs/no-rustc.md).
-   Why: Owning every layer is what makes blaze fast. Sandboxing has been on by default since
-   2026-10-26 (https://github.com/indexable-inc/blaze/issues/147).
+   Why: Owning every layer is what makes blaze fast. Sandboxing has been on by default since 2026-10-26
+   (https://github.com/indexable-inc/blaze/issues/147).
 5. **own-nightly**: blaze is its own toolchain: build every project with blaze's own pinned nightly
    (`harness/toolchain`), named and versioned as blaze's, whatever the project pins. Don't follow
    the project's toolchain, support stable or several rustc versions, or pin stable. The pin is the
@@ -55,11 +55,11 @@ AGENTS.md).
    `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in
    it (`macro_sandbox.rs`). Sandboxed tests are an experiment a workspace opts into (`experimental =
    ["sandboxed-tests"]` under the root manifest's `[workspace.metadata.blaze]`, or a package's
-   `tests = true` under `[package.metadata.blaze.sandbox]`): there `blaze test` runs each
-   test executable in one sandbox (Linux namespaces and seccomp, macOS Seatbelt and the interposer)
-   under `all` and `affected` alike, and elsewhere tests run as cargo runs them, every time, never
-   kept as passed. Where a sandbox is due and none can be made it stops, rather than run outside.
-   The only ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`,
+   `tests = true` under `[package.metadata.blaze.sandbox]`): there `blaze test` runs each test
+   executable in one sandbox (Linux namespaces and seccomp, macOS Seatbelt and the interposer) under
+   `all` and `affected` alike, and elsewhere tests run as cargo runs them, every time, never kept as
+   passed. Where a sandbox is due and none can be made it stops, rather than run outside. The only
+   ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`,
    `unsandboxed-tests`, `build-script = false`), the root manifest's
    `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`) and
    `BLAZE_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by

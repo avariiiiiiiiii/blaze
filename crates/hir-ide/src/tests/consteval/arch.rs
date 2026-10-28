@@ -8,6 +8,7 @@ use super::*;
 fn crc32() {
     check_number(
         r#"
+        //- minicore: index, slice
         extern "C" {
             #[link_name = "llvm.x86.sse42.crc32.32.8"]
             fn crc32_32_8(crc: u32, v: u8) -> u32;
@@ -68,6 +69,7 @@ fn crc32() {
 fn clmul() {
     check_number(
         r#"
+        //- minicore: index, slice
         extern "C" {
             #[link_name = "llvm.x86.pclmulqdq"]
             fn pclmulqdq(a: [u64; 2], b: [u64; 2], imm8: u8) -> [u64; 2];
@@ -104,6 +106,7 @@ fn clmul() {
 fn pshufb() {
     check_number(
         r#"
+        //- minicore: index, slice
         extern "C" {
             #[link_name = "llvm.x86.ssse3.pshuf.b.128"]
             fn pshufb(a: [u8; 16], b: [u8; 16]) -> [u8; 16];
@@ -129,6 +132,7 @@ fn pshufb() {
 fn aes() {
     check_number(
         r#"
+        //- minicore: index, slice
         extern "C" {
             #[link_name = "llvm.x86.aesni.aesenc"]
             fn aesenc(a: [u8; 16], k: [u8; 16]) -> [u8; 16];
@@ -319,6 +323,7 @@ fn sha256_x86() {
     check_number(
         &format!(
             r#"
+        //- minicore: index, slice
         {SHA256}
         extern "C" {{
             #[link_name = "llvm.x86.sha256rnds2"]
@@ -366,6 +371,7 @@ fn sha256_aarch64() {
     check_number(
         &format!(
             r#"
+        //- minicore: index, slice
         {SHA256}
         extern "C" {{
             #[link_name = "llvm.aarch64.crypto.sha256h"]
@@ -437,6 +443,7 @@ fn sha1_x86() {
     check_number(
         &format!(
             r#"
+        //- minicore: index, slice
         {SHA1}
         extern "C" {{
             #[link_name = "llvm.x86.sha1rnds4"]
@@ -495,6 +502,7 @@ fn sha1_aarch64() {
     check_number(
         &format!(
             r#"
+        //- minicore: index, slice
         {SHA1}
         extern "C" {{
             #[link_name = "llvm.aarch64.crypto.sha1c"]
@@ -559,6 +567,7 @@ fn sha1_aarch64() {
 fn unknown_llvm_intrinsic() {
     check_fail(
         r#"
+        //- minicore: index, slice
         extern "C" {
             #[link_name = "llvm.x86.rdrand.32"]
             fn rdrand32() -> (u32, i32);

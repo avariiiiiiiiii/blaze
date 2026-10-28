@@ -22,6 +22,7 @@ mod lower;
 mod monomorphization;
 mod optimize;
 pub mod overflow;
+pub mod purity;
 mod pretty;
 mod storage;
 mod transform;

@@ -74,7 +74,7 @@ pub fn const_context(db: &dyn HirDatabase, def: DefWithBodyId) -> Option<ConstCo
 }
 
 /// Whether `func` is a trait's method or one of an `impl` of a trait.
-fn of_a_trait(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub(crate) fn of_a_trait(db: &dyn HirDatabase, func: FunctionId) -> bool {
     match func.lookup(db).container {
         ItemContainerId::TraitId(_) => true,
         ItemContainerId::ImplId(it) => ImplSignature::of(db, it).target_trait.is_some(),

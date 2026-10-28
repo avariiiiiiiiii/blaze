@@ -601,6 +601,7 @@ fn semantic_diagnostics_asked(
             AnyDiagnostic::BorrowckError(d) => handlers::borrowck::borrowck_error(&ctx, &d),
             AnyDiagnostic::BorrowckSkipped(d) => handlers::borrowck::borrowck_skipped(&ctx, &d),
             AnyDiagnostic::ConstCheckError(d) => handlers::const_check::const_check_error(&ctx, &d),
+            AnyDiagnostic::ConstImpure(d) => handlers::const_check::const_impure(&ctx, &d),
             AnyDiagnostic::ExplicitDropMethodUse(d) => handlers::explicit_drop_method_use::explicit_drop_method_use(&ctx, &d),
             AnyDiagnostic::YieldOutsideCoroutine(d) => handlers::yield_outside_coroutine::yield_outside_coroutine(&ctx, &d),
             AnyDiagnostic::ReturnOutsideFunction(d) => handlers::return_outside_function::return_outside_function(&ctx, &d),

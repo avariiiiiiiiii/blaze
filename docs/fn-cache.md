@@ -86,6 +86,23 @@ It is refused when anything it reaches:
 The functions those are told by are always compiled as calls, never built into their caller,
 so the walk sees them.
 
+A `const fn` is pure by being one, for the most part: the const checker holds it to calling
+only `const fn`s, taking no address as a number and running no assembly (`blaze check` gives
+rustc's errors for those). What it can still do at run time is read a static that changes or
+go through a raw pointer, and so can a `const fn` it calls. One query, `const_purity`
+(`crates/hir-ty-mir/src/mir/purity.rs`), says whether a `const fn` does, why and where, and the
+walk does not go past one that doesn't and has no generic arguments: what a generic one calls
+by a trait can be a non-const `impl` at run time. `blaze check` warns of a `const fn` that does,
+with where:
+
+```
+warning[const-impure]: const fn reads or writes mutable state: `CALLS` is `AtomicU64`, which is not `Freeze`
+warning[const-impure]: const fn reaches `count`, which reads or writes mutable state: `COUNT` is a `static mut`
+```
+
+A `const fn`'s arguments are held to the rule below as any function's are: one that can
+change behind a shared reference is refused, `const` or not.
+
 The functions of `core` and `alloc` that aren't generic are called as rustc built them, so their
 code is not hashed: the toolchain in the key stands for it. What they do is looked through
 instead, in their MIR and that of the `core` and `alloc` they call, directly or through others,

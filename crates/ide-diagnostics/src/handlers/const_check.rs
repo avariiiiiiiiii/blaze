@@ -16,6 +16,16 @@ pub(crate) fn const_check_error(
     Diagnostic::new_with_syntax_node_ptr(ctx, code, d.message.clone(), d.node).stable()
 }
 
+// Diagnostic: const-impure
+//
+// A `const fn` whose result at run time depends on more than its arguments: it reads or
+// writes a static that changes (a `static mut`, one that is not `Freeze`, a thread-local or a
+// foreign static), or a `const fn` it calls does. `#[blaze::cache]` can't keep such a result.
+pub(crate) fn const_impure(ctx: &DiagnosticsContext<'_, '_>, d: &hir::ConstImpure) -> Diagnostic {
+    let code = DiagnosticCode::Ra("const-impure", crate::Severity::Warning);
+    Diagnostic::new_with_syntax_node_ptr(ctx, code, d.message.clone(), d.node).stable()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tests::check_diagnostics;
@@ -97,6 +107,35 @@ fn runtime(p: *const u8, f: fn() -> u32) -> usize {
     f();
     p as usize
 }
+"#,
+        );
+    }
+
+    #[test]
+    fn const_fns_that_read_mutable_state() {
+        check_diagnostics(
+            r#"
+//- minicore: cell, sync
+use core::cell::UnsafeCell;
+static mut COUNT: u32 = 0;
+struct Counter(UnsafeCell<u32>);
+unsafe impl Sync for Counter {}
+static CALLS: Counter = Counter(UnsafeCell::new(0));
+static PLAIN: u32 = 1;
+const fn count() -> u32 {
+    unsafe { COUNT }
+           //^^^^^ warn: const fn reads or writes mutable state: `COUNT` is a `static mut`
+}
+const fn indirect() -> u32 {
+    count()
+  //^^^^^^^ warn: const fn reaches `count`, which reads or writes mutable state: `COUNT` is a `static mut`
+}
+const fn calls() -> &'static Counter {
+    &CALLS
+  //^^^^^^ warn: const fn reads or writes mutable state: `CALLS` is `Counter`, which is not `Freeze`
+}
+const fn plain() -> u32 { PLAIN }
+fn runtime() -> u32 { unsafe { COUNT } }
 "#,
         );
     }

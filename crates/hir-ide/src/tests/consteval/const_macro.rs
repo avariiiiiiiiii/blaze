@@ -140,7 +140,8 @@ const GOAL: usize = <Point as Named>::LEN;
                 });
         assert_eq!(output, "impl Named for Point { const LEN: usize = 5; }");
         let goal = eval_goal(&db, file_id).unwrap_or_else(|e| {
-            panic!("evaluating GOAL: {}", pretty_print_err(e, &db));
+            let main = *base_db::all_crates(&db).last().expect("the main crate");
+            panic!("evaluating GOAL: {}\n{}", pretty_print_err(e, &db), derives(&db, main));
         });
         assert_eq!(goal.memory[..], 5usize.to_le_bytes()[..goal.memory.len()]);
     });
@@ -148,4 +149,25 @@ const GOAL: usize = <Point as Named>::LEN;
 
 fn expander_of(root: span::FileId) -> ConstMacroExpander {
     ConstMacroExpander { root, name: Symbol::intern("Named"), kind: ProcMacroKind::CustomDerive }
+}
+
+/// What the derives of `krate` expanded to, and why they did not, for a failure to say.
+fn derives(db: &TestDB, krate: base_db::Crate) -> String {
+    let def_map = hir_def::nameres::crate_def_map(db, krate);
+    let mut out = format!("def map diagnostics: {:?}\n", def_map.diagnostics());
+    for (_, module) in def_map.modules(db) {
+        for (_, invocations) in module.scope(db).derive_macro_invocs() {
+            for (_, _, calls) in invocations {
+                for call in calls.iter().flatten() {
+                    let either::Either::Left(call) = call else { continue };
+                    let expansion = call.parse_macro_expansion(db);
+                    out += &format!("derive expanded to: {}\n", expansion.value.0.syntax_node());
+                    if let Some(err) = &expansion.err {
+                        out += &format!("derive failed: {}\n", err.render_to_string(db).message);
+                    }
+                }
+            }
+        }
+    }
+    out
 }

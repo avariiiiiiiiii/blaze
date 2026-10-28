@@ -28,24 +28,24 @@ use anyhow::Context as _;
 use super::{own_script, sandboxed, script_sandbox};
 
 /// The variable that runs build scripts under WASI: `wasi`, `wasi-compare` or `native`.
-pub(crate) const VAR: &str = "BLAZE_BUILD_SCRIPTS";
+pub const VAR: &str = "BLAZE_BUILD_SCRIPTS";
 
 /// The key of [`sandboxed::WORKSPACE_TABLE`] that lists the packages whose scripts run under
 /// WASI.
-pub(crate) const LISTED: &str = "wasi-build-scripts";
+pub const LISTED: &str = "wasi-build-scripts";
 
 /// The directory beside `OUT_DIR` where `wasi-compare` sets aside what the module did.
 #[cfg_attr(not(feature = "wasi"), allow(dead_code))]
-pub(crate) const ASIDE: &str = "blaze-wasi";
+pub const ASIDE: &str = "blaze-wasi";
 
 /// The file beside `OUT_DIR` with a line of JSON for each command the module asked the host to
 /// run: the program, the one that ran, its arguments, where, and how it ended or why it was
 /// refused.
 #[cfg_attr(not(feature = "wasi"), allow(dead_code))]
-pub(crate) const TOOLS: &str = "blaze-wasi-tools.jsonl";
+pub const TOOLS: &str = "blaze-wasi-tools.jsonl";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Mode {
+pub enum Mode {
     /// The module runs for cargo.
     Wasi,
     /// The module runs and is set aside, and the script runs for cargo.
@@ -55,11 +55,7 @@ pub(crate) enum Mode {
 /// How the build script of `package`, in `cwd`, is built and run under WASI: as [`VAR`] says,
 /// else as the workspace's [`LISTED`] does, `None` when it is not. `out_dir` is where cargo
 /// builds or runs it, which finds the workspace of a package from a registry.
-pub(crate) fn mode(
-    package: &str,
-    cwd: &Path,
-    out_dir: Option<&Path>,
-) -> anyhow::Result<Option<Mode>> {
+pub fn mode(package: &str, cwd: &Path, out_dir: Option<&Path>) -> anyhow::Result<Option<Mode>> {
     let (mode, why) = match std::env::var(VAR).as_deref() {
         Err(_) | Ok("" | "native") => (None, String::new()),
         Ok("wasi") => (Some(Mode::Wasi), format!("{VAR}=wasi")),
@@ -105,7 +101,7 @@ fn listed(package: &str, cwd: &Path, out_dir: Option<&Path>) -> anyhow::Result<O
 }
 
 /// Where the module of the script rustc links at `exe` is.
-pub(crate) fn module_of(exe: &Path) -> PathBuf {
+pub fn module_of(exe: &Path) -> PathBuf {
     let mut name = exe.as_os_str().to_owned();
     name.push(".wasm");
     PathBuf::from(name)
@@ -123,7 +119,7 @@ fn not_built_of(module: &Path) -> PathBuf {
 /// `dir`. Under `wasi-compare` a module not built is written down for the run to set aside;
 /// otherwise it is an error.
 #[expect(clippy::too_many_arguments)]
-pub(crate) fn compile(
+pub fn compile(
     mode: Mode,
     package: &str,
     args: &[String],
@@ -154,7 +150,7 @@ pub(crate) fn compile(
 /// "Environment variables Cargo sets for build scripts"), the package's (`CARGO_PKG_*`) with
 /// them: all a script under WASI is given.
 #[cfg_attr(not(feature = "wasi"), allow(dead_code))]
-pub(crate) fn documented(name: &str) -> bool {
+pub fn documented(name: &str) -> bool {
     const NAMES: [&str; 18] = [
         "CARGO",
         "CARGO_MANIFEST_DIR",
@@ -202,7 +198,7 @@ const TOOLS_ALLOWED: [&str; 13] = [
 /// Whether `program`, as a script names it, is one it may run under WASI, `rustc` being the
 /// `RUSTC` it was given.
 #[cfg_attr(not(feature = "wasi"), allow(dead_code))]
-pub(crate) fn allowed(program: &str, rustc: Option<&str>) -> bool {
+pub fn allowed(program: &str, rustc: Option<&str>) -> bool {
     if Some(program) == rustc {
         return true;
     }
@@ -222,11 +218,11 @@ pub(crate) fn allowed(program: &str, rustc: Option<&str>) -> bool {
 }
 
 #[cfg(feature = "wasi")]
-pub(crate) use running::as_cargo_does;
+pub use running::as_cargo_does;
 
 /// [`as_cargo_does`] of a blaze without Wasmtime: [`mode`] refuses first.
 #[cfg(not(feature = "wasi"))]
-pub(crate) fn as_cargo_does(
+pub fn as_cargo_does(
     _: &script_sandbox::Script<'_>,
     _: &script_sandbox::Plan,
     _: Mode,
@@ -292,7 +288,7 @@ mod running {
     /// (`Mode::Compare`), in place of what `plan` says of the native script. Under `Mode::Wasi`
     /// it ends the process as the run ended; under `Mode::Compare` it returns, the native script
     /// to run next.
-    pub(crate) fn as_cargo_does(
+    pub fn as_cargo_does(
         script: &Script<'_>,
         plan: &Plan,
         mode: Mode,

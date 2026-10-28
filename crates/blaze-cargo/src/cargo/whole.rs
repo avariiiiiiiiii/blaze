@@ -91,7 +91,7 @@ fn too_new(asked: &Invocation, metadata: &Metadata) -> Option<String> {
 /// `build` and `run`: builds the programs of `asked` whole and runs the one `run` asks for.
 /// A build of no program, of libraries alone, is the daemon's check of them: blaze writes no
 /// library for cargo, which builds nothing.
-pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
+pub fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if let Some(why) = refused(asked) {
         say::error(&why);
         return Ok(FAILED);
@@ -155,7 +155,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
 /// does. The unit tests of the libraries and binaries are built by a worker that loads the
 /// workspace with `cfg(test)`, the integration tests and the programs beside them by one
 /// that loads it without. The doc tests are still made through cargo, after.
-pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
+pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
     if let Some(why) = refused(asked) {
         say::error(&why);
         return Ok(FAILED);
@@ -662,7 +662,7 @@ fn worker_log(project: &Path) -> Option<PathBuf> {
 
 /// `name` with the `[0123456789abcdef]` after each crate's name, and the `blaze.<hash>.` of
 /// a symbol, taken out.
-pub(crate) fn without_hashes(name: &str) -> String {
+pub fn without_hashes(name: &str) -> String {
     let is_hash = |it: &str| it.len() == 16 && it.bytes().all(|it| it.is_ascii_hexdigit());
     let mut name = name.to_owned();
     while let Some(at) = name.find("blaze.")

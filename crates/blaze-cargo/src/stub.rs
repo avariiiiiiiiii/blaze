@@ -11,7 +11,7 @@ use std::{ffi::OsString, path::Path, process::Command};
 use anyhow::Context as _;
 
 /// The flags of rustc that cargo passes with their value as the next argument.
-pub(crate) const VALUED: &[&str] = &[
+pub const VALUED: &[&str] = &[
     "-C",
     "-L",
     "-Z",
@@ -46,7 +46,7 @@ core::arch::global_asm!(".globl _main", ".weak_definition _main", "_main:");
 "#;
 
 /// Runs rustc as cargo asked, or on what stands in for a crate of the workspace.
-pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
+pub fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let rustc = args.next().context("cargo names rustc first")?;
     let mut args: Vec<OsString> = args.collect();
     if let Some((source, text)) = stand_in(&args) {
@@ -99,7 +99,7 @@ fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
 
 /// Whether rustc is asked for a program and nothing else. `None` when it is asked for
 /// neither that nor a Rust library alone: nothing stands in for the crate then.
-pub(crate) fn is_program<S: AsRef<str>>(args: &[S]) -> Option<bool> {
+pub fn is_program<S: AsRef<str>>(args: &[S]) -> Option<bool> {
     let kinds = args.windows(2).filter(|it| it[0].as_ref() == "--crate-type");
     match *kinds.map(|it| it[1].as_ref()).collect::<Vec<_>>() {
         ["bin"] => Some(true),
@@ -145,7 +145,7 @@ mod __blaze_global_allocator_{n} {
 "#;
 
 /// The functions of blaze's that the forwarding allocator calls.
-pub(crate) const ALLOCATOR_FUNCTIONS: &[&str] = &[
+pub const ALLOCATOR_FUNCTIONS: &[&str] = &[
     "__blaze_global_alloc",
     "__blaze_global_dealloc",
     "__blaze_global_realloc",
@@ -193,7 +193,7 @@ fn weak_traps(names: &[&str]) -> String {
 /// The source that stands in for the crate rustc is given `args` for: it names the
 /// libraries the crate is linked against and has no code, but for a `#[global_allocator]` of
 /// the crate's `source`, which has to be one of the stand-in's for rustc to call it.
-pub(crate) fn text_of<S: AsRef<str>>(args: &[S], program: bool, source: &Path) -> String {
+pub fn text_of<S: AsRef<str>>(args: &[S], program: bool, source: &Path) -> String {
     let mut text = String::from("#![allow(warnings)]\n");
     if program {
         text.push_str("#![no_main]\n");

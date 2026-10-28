@@ -240,7 +240,7 @@ impl Drop for Scratch {
 
 /// Runs `program` sandboxed as `spec` says, or with `None` makes the sandbox and runs nothing
 /// in it. What it ends with: its status, or 128 and the signal that ended it.
-pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
+pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     let library = library()?;
     let scratch = Scratch::new(spec.overlays.len())?;
     let dir = scratch.dir.to_string_lossy().into_owned();

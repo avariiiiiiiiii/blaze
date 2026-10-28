@@ -161,7 +161,7 @@ From [docs/machines](https://ix.dev/docs/machines), [docs/snapshots](https://ix.
   down to `BLAZE_CACHE_MAX`, by default a tenth of the free disk between 256 MB and 32 GB, after
   sealing, merging small packs and removing temporaries (`crates/blaze-store/src/lib.rs`,
   **read**). `blaze-engine cache gc` runs it; `blaze-engine cache gc --remote` takes old lines off remote
-  manifests and removes unlisted objects (`crates/blaze-engine/src/remote/collect.rs`, **read**).
+  manifests and removes unlisted objects (`crates/blaze-cargo/src/remote/collect.rs`, **read**).
   Neither knows what is live.
 
 ## The design

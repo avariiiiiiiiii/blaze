@@ -39,17 +39,17 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// How many pieces of a file are held between the download and its unpacking.
 const AHEAD: usize = 256;
 
-pub(crate) struct Release {
+pub struct Release {
     /// The toolchain as rustup names it, `nightly-2026-10-25`: what blaze's directory of it and
     /// its messages are called.
-    pub(crate) version: &'static str,
+    pub version: &'static str,
     /// The channel its files are named with on the Rust project's site, `nightly`.
     channel: &'static str,
     date: &'static str,
     /// What its `rustc --version` says after `rustc `: `1.101.0-nightly (12433c307 2026-10-24)`.
     /// Pins without it are refused; the daemon reads it on every host ([`rustc_version`]).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) rustc: &'static str,
+    pub rustc: &'static str,
     host: &'static str,
     manifest: Pin,
     components: Vec<Component>,
@@ -88,7 +88,7 @@ impl Component {
 impl Release {
     /// The release blaze builds with, with the files of this host; `None` on a host the Rust
     /// project builds no toolchain for that blaze has pinned.
-    pub(crate) fn ours() -> Option<Release> {
+    pub fn ours() -> Option<Release> {
         Release::read(PINS, host()?)
     }
 
@@ -126,13 +126,13 @@ impl Release {
     }
 
     /// What the download comes to, in megabytes as people count them.
-    pub(crate) fn megabytes(&self) -> u64 {
+    pub fn megabytes(&self) -> u64 {
         let bytes: u64 = self.components.iter().map(|it| it.pin.bytes).sum();
         (bytes + self.manifest.bytes + 500_000) / 1_000_000
     }
 
     /// Where blaze keeps this release.
-    pub(crate) fn dir(&self) -> Option<PathBuf> {
+    pub fn dir(&self) -> Option<PathBuf> {
         Some(home()?.join("toolchains").join(format!("{}-{}", self.version, self.host)))
     }
 }
@@ -140,7 +140,7 @@ impl Release {
 /// What the rustc of the toolchain blaze builds with says it is after `rustc `, on every host:
 /// `1.101.0-nightly (12433c307 2026-10-24)`. A nightly's release number is shared by every
 /// nightly of six weeks, so a rustc is told for blaze's by this whole line.
-pub(crate) fn rustc_version() -> &'static str {
+pub fn rustc_version() -> &'static str {
     PINS.lines()
         .find_map(|it| it.strip_prefix("rustc "))
         .map(str::trim)
@@ -149,7 +149,7 @@ pub(crate) fn rustc_version() -> &'static str {
 
 /// The commit of rust-lang/rust the toolchain blaze builds with was built from: what a
 /// nightly's channel manifest names only by the short hash in its version.
-pub(crate) fn commit() -> &'static str {
+pub fn commit() -> &'static str {
     PINS.lines()
         .find_map(|it| it.strip_prefix("commit "))
         .map(str::trim)
@@ -157,7 +157,7 @@ pub(crate) fn commit() -> &'static str {
 }
 
 /// The host's tuple, as the Rust project names its builds.
-pub(crate) fn host() -> Option<&'static str> {
+pub fn host() -> Option<&'static str> {
     Some(match (std::env::consts::ARCH, std::env::consts::OS) {
         ("aarch64", "macos") => "aarch64-apple-darwin",
         ("x86_64", "linux") if cfg!(target_env = "gnu") => "x86_64-unknown-linux-gnu",
@@ -168,7 +168,7 @@ pub(crate) fn host() -> Option<&'static str> {
 }
 
 /// blaze's own directory: `BLAZE_HOME`, else `.blaze` in the user's home.
-pub(crate) fn home() -> Option<PathBuf> {
+pub fn home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
         return Some(PathBuf::from(home));
     }
@@ -192,7 +192,7 @@ fn whole(dir: &Path) -> bool {
 /// Whether `dir` is a whole toolchain with every component `release` pins: one downloaded
 /// before a component was pinned (the standard library of `wasm32-wasip1`, which proc macros
 /// are built for) is downloaded again.
-pub(crate) fn complete(release: &Release, dir: &Path) -> bool {
+pub fn complete(release: &Release, dir: &Path) -> bool {
     let Ok(has) = std::fs::read_to_string(dir.join("lib/rustlib/components")) else {
         return false;
     };
@@ -202,7 +202,7 @@ pub(crate) fn complete(release: &Release, dir: &Path) -> bool {
 
 /// Downloads `release` into `dir` unless it is there. Processes that ask at once download it
 /// once: the others wait for the first. `Err` says what failed and what to do.
-pub(crate) fn fetch(release: &Release, dir: &Path) -> Result<(), String> {
+pub fn fetch(release: &Release, dir: &Path) -> Result<(), String> {
     fetch_from(release, dir, || Source::named(release.date))
 }
 

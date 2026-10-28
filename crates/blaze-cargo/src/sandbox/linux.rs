@@ -233,7 +233,7 @@ fn c(path: &Path) -> CString {
 
 /// Runs `program` sandboxed as `spec` says, or with `None` makes the sandbox and runs
 /// nothing in it. What it ends with, as [`super::backend`] says.
-pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
+pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     if let Some(view) = &spec.view {
         check_view(spec, view)?;
     }

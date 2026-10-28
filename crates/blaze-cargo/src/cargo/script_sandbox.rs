@@ -56,7 +56,7 @@ use anyhow::Context as _;
 #[cfg(unix)]
 use super::hermetic;
 #[cfg(unix)]
-pub(crate) use super::hermetic::InView;
+pub use super::hermetic::InView;
 use super::sandboxed;
 use crate::sandbox::{self, Line, Reached, Spec};
 
@@ -64,30 +64,30 @@ use crate::sandbox::{self, Line, Reached, Spec};
 /// the closure is Linux's.
 #[cfg(not(unix))]
 #[derive(Clone, Debug)]
-pub(crate) enum InView {}
+pub enum InView {}
 
 /// The file beside a script's `OUT_DIR` with what its last run of cargo's read, when that is
 /// what decides whether it runs again ([`reads_unchanged`]): a first line [`READS_HEAD`], then
 /// what [`sandboxed::stat`] and [`sandboxed::digest`] said of each path, and the path, by tabs.
-pub(crate) const READS: &str = "blaze-reads";
+pub const READS: &str = "blaze-reads";
 
 const READS_HEAD: &str = "blaze build script reads 1";
 
 /// One run of a build script.
-pub(crate) struct Script<'a> {
+pub struct Script<'a> {
     /// The script rustc or blaze linked.
-    pub(crate) real: &'a Path,
-    pub(crate) args: &'a [OsString],
+    pub real: &'a Path,
+    pub args: &'a [OsString],
     /// Its package's directory, where cargo runs it.
-    pub(crate) cwd: &'a Path,
+    pub cwd: &'a Path,
     /// All of its environment, as cargo gave it, with `OUT_DIR` where it writes.
-    pub(crate) env: &'a [(String, String)],
-    pub(crate) out_dir: &'a Path,
+    pub env: &'a [(String, String)],
+    pub out_dir: &'a Path,
     /// A directory of the caller's for the sandbox's spec and record: written here, outside.
-    pub(crate) scratch: &'a Path,
+    pub scratch: &'a Path,
     /// The variables of `env` a run of it said it reads (`rerun-if-env-changed`), given to it
     /// in the sandbox whatever [`given`] says.
-    pub(crate) declared: &'a [String],
+    pub declared: &'a [String],
 }
 
 impl Script<'_> {
@@ -101,15 +101,15 @@ impl Script<'_> {
 }
 
 /// How a run went.
-pub(crate) struct Ran {
-    pub(crate) output: Output,
+pub struct Ran {
+    pub output: Output,
     /// Each path it read that is an input, when it ran sandboxed and the record is whole.
-    pub(crate) reads: Option<Vec<String>>,
+    pub reads: Option<Vec<String>>,
 }
 
 /// Where a script runs.
 #[derive(Clone)]
-pub(crate) enum Plan {
+pub enum Plan {
     /// Outside, why, and the environment it runs with ([`with_own_rustc`]).
     Outside(String, Vec<(String, String)>),
     Sandboxed {
@@ -126,7 +126,7 @@ pub(crate) enum Plan {
 
 impl Plan {
     /// All of the environment the script runs with.
-    pub(crate) fn env(&self) -> &[(String, String)] {
+    pub fn env(&self) -> &[(String, String)] {
         match self {
             Plan::Outside(_, env) => env,
             Plan::Sandboxed { spec, .. } => &spec.env,
@@ -190,7 +190,7 @@ fn on_in(env: &[(String, String)]) -> bool {
 /// The variable that names to a run the root of the workspace being built, set by the
 /// daemon's load (`compile_time.rs`): a path dependency that is a workspace of its own is
 /// still the build's, whose root manifest says how its script runs. The script is not given it.
-pub(crate) const ROOT: &str = "BLAZE_BUILD_ROOT";
+pub const ROOT: &str = "BLAZE_BUILD_ROOT";
 
 /// The workspace a script's run is part of: the one [`ROOT`] names; else the one around its
 /// package, for a package not below cargo's home; else the one around the target directory
@@ -219,14 +219,14 @@ fn workspace_of(script: &Script<'_>) -> anyhow::Result<Option<PathBuf>> {
 }
 
 /// The target directory `out_dir` is in: what is above its `build` directory's profile.
-pub(crate) fn target_of(out_dir: &Path) -> Option<&Path> {
+pub fn target_of(out_dir: &Path) -> Option<&Path> {
     let build = out_dir.ancestors().find(|it| it.file_name().is_some_and(|it| it == "build"))?;
     build.parent()?.parent()
 }
 
 /// Where `script` runs: outside when sandboxes are off or its package is taken out, else the
 /// sandbox's spec. `Err` is a manifest that says it wrongly.
-pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
+pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let package = script.package();
     let mut env = with_own_rustc(script.env, script.scratch)?;
     env.retain(|it| it.0 != ROOT);
@@ -361,12 +361,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
 /// `plan`, a script's, for a program the script runs under WASI (`wasi_script.rs`): the same
 /// sandbox, with `env`, in `cwd`, its spec and record in `scratch`.
 #[cfg_attr(not(feature = "wasi"), allow(dead_code))]
-pub(crate) fn for_tool(
-    plan: &Plan,
-    env: Vec<(String, String)>,
-    cwd: &Path,
-    scratch: &Path,
-) -> Plan {
+pub fn for_tool(plan: &Plan, env: Vec<(String, String)>, cwd: &Path, scratch: &Path) -> Plan {
     match plan {
         Plan::Outside(why, _) => Plan::Outside(why.clone(), env),
         Plan::Sandboxed { spec, root_manifest, link_dirs, .. } => Plan::Sandboxed {
@@ -389,7 +384,7 @@ pub(crate) fn for_tool(
 /// tools' and their flags, by any target (`CC`, `CC_<target>`, `TARGET_CC`), pkg-config's and
 /// CMake's, the SDKs' of Apple's platforms, Nix's compiler wrappers', the jobserver, and what
 /// a test is given ([`sandboxed::KEPT`]).
-pub(crate) fn given(name: &str) -> bool {
+pub fn given(name: &str) -> bool {
     const PREFIXES: [&str; 10] = [
         "CARGO_",
         "DEP_",
@@ -477,7 +472,7 @@ pub(crate) fn given(name: &str) -> bool {
 /// own rustc stands for ([`OWN_RUSTC_FOR`]) it is not missing. A run in
 /// its closure is given the closure's C toolchain and pkg-config in place of the machine's,
 /// so those of [`given`] it was not given are not missing.
-pub(crate) fn not_given(stdout: &[u8], env: &[(String, String)], plan: &Plan) -> Vec<String> {
+pub fn not_given(stdout: &[u8], env: &[(String, String)], plan: &Plan) -> Vec<String> {
     let Plan::Sandboxed { spec, in_view, .. } = plan else { return Vec::new() };
     let had = |name: &str, env: &[(String, String)]| env.iter().any(|it| it.0 == name);
     let mut names: Vec<String> = String::from_utf8_lossy(stdout)
@@ -532,7 +527,7 @@ fn user_cache() -> Option<PathBuf> {
 /// Runs `script` as `plan` says, with `stdin`, its outputs kept. A failed run in the sandbox
 /// has a note after what it printed to stderr, naming the package, what the sandbox refused
 /// it and how to take it out; a sandbox that could not be made, why and how to fix it.
-pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Result<Ran> {
+pub fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Result<Ran> {
     let (spec, root_manifest, in_view) = match plan {
         Plan::Outside(why, env) => {
             if std::env::var_os("BLAZE_STATS").is_some() {
@@ -676,7 +671,7 @@ fn inputs(lines: &[Line], script: &Script<'_>, spec: &Spec) -> Vec<String> {
 /// Writes down beside `out_dir` what the run of cargo's that wrote it read, `reads`, for
 /// [`reads_unchanged`]; or that nothing is known, with `None`, which is what a run that named
 /// what it reads, or ran outside or with a record that is not whole, leaves.
-pub(crate) fn keep_reads(out_dir: &Path, reads: Option<&[String]>) {
+pub fn keep_reads(out_dir: &Path, reads: Option<&[String]>) {
     let Some(run_dir) = out_dir.parent() else { return };
     let file = run_dir.join(READS);
     let Some(reads) = reads else {
@@ -697,7 +692,7 @@ pub(crate) fn keep_reads(out_dir: &Path, reads: Option<&[String]>) {
 /// Whether the run that wrote `out_dir` read, in the sandbox, nothing that is not as it was
 /// then, by what [`keep_reads`] wrote down: a run now would print and write the same. False
 /// when nothing was written down: what it read is not known.
-pub(crate) fn reads_unchanged(out_dir: &Path) -> bool {
+pub fn reads_unchanged(out_dir: &Path) -> bool {
     let Some(file) = out_dir.parent().map(|it| it.join(READS)) else { return false };
     let Ok(text) = std::fs::read_to_string(file) else { return false };
     let mut lines = text.lines();
@@ -717,7 +712,7 @@ pub(crate) fn reads_unchanged(out_dir: &Path) -> bool {
 
 /// Whether a script that printed `stdout` said what it reads: a file or a variable cargo runs
 /// it again for. One that said neither is run again for any file of its package.
-pub(crate) fn says_what_it_reads(stdout: &[u8]) -> bool {
+pub fn says_what_it_reads(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout).lines().any(|line| {
         let Some(line) = line.strip_prefix("cargo:") else { return false };
         let line = line.strip_prefix(':').unwrap_or(line);

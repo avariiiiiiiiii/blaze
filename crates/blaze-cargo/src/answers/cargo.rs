@@ -105,7 +105,7 @@ fn print(global: &[String], rest: &[&String]) -> Result<Question, String> {
 
 /// What cargo run as `command` prints of what it is asked, with blaze's answers, or `None`
 /// when it is no question of these. A failure is cargo's: status 101 and the error.
-pub(crate) fn answer(command: &Command) -> Option<io::Result<Output>> {
+pub fn answer(command: &Command) -> Option<io::Result<Output>> {
     let args: Option<Vec<String>> =
         command.get_args().map(|it| it.to_str().map(str::to_owned)).collect();
     let asked = match question(&args?)? {
@@ -135,7 +135,7 @@ pub(crate) fn answer(command: &Command) -> Option<io::Result<Output>> {
 /// `command` (a cargo, of whoever asks, in the directory of the build), as cargo's
 /// `TargetInfo` has them: `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, the `[target]` tables that
 /// match the triple and its `cfg` under those flags, or `build.rustflags`.
-pub(crate) fn rustflags(command: &Command, triple: &str) -> anyhow::Result<Vec<String>> {
+pub fn rustflags(command: &Command, triple: &str) -> anyhow::Result<Vec<String>> {
     let asker = Asker::of(command);
     let config = asker.config()?;
     let kind = CompileKind::Target(triple.to_owned());

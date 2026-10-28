@@ -27,7 +27,7 @@ use super::{directives, keyed, own_script, sandboxed, script_sandbox, wasi_scrip
 use super::{hermetic, script_sandbox::InView};
 
 /// The variable that names the script itself to `blaze-engine build-script`.
-pub(crate) const REAL: &str = "BLAZE_BUILD_SCRIPT";
+pub const REAL: &str = "BLAZE_BUILD_SCRIPT";
 
 /// The file next to a script's `OUT_DIR` that says how cargo ran it.
 const RAN: &str = "blaze-ran.json";
@@ -46,7 +46,7 @@ struct Ran {
 
 /// Has cargo run the script rustc linked at `linked` through `blaze-engine build-script`.
 #[cfg(unix)]
-pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
+pub fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     let real = real_of(linked);
     std::fs::rename(linked, &real)?;
@@ -70,7 +70,7 @@ pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
 /// another volume, cargo runs the script itself and a change it reruns for is cargo's to
 /// build.
 #[cfg(windows)]
-pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
+pub fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
     let real = real_of(linked);
     std::fs::rename(linked, &real)?;
     if std::fs::hard_link(std::env::current_exe()?, linked).is_err() {
@@ -82,7 +82,7 @@ pub(crate) fn stand_in_front(linked: &Path) -> anyhow::Result<()> {
 /// The script this executable stands in front of, when it runs under the name of one:
 /// the name rustc linked it under, or the one cargo gives it in the same directory.
 #[cfg(windows)]
-pub(crate) fn stood_in_front_of() -> Option<PathBuf> {
+pub fn stood_in_front_of() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let name = exe.file_stem()?.to_str()?;
     if !name.starts_with("build_script_") && !name.starts_with("build-script-") {
@@ -99,7 +99,7 @@ fn real_of(linked: &Path) -> PathBuf {
 }
 
 /// `blaze-engine build-script`: writes down how cargo runs the script and becomes it.
-pub(crate) fn command(args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
+pub fn command(args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let real = PathBuf::from(std::env::var_os(REAL).context("no build script is named")?);
     run_as_cargo_does(real, args)
 }
@@ -114,7 +114,7 @@ pub(crate) fn command(args: impl Iterator<Item = OsString>) -> anyhow::Result<()
 /// saw it read, with the files of `rerun-if-changed`, and what each has. A run outside the
 /// sandbox is not kept: what it read is not known. With [`keyed::CHECK`] a run the store has
 /// is run again, and one that prints or writes something else is an error.
-pub(crate) fn run_as_cargo_does(
+pub fn run_as_cargo_does(
     real: PathBuf,
     args: impl Iterator<Item = OsString>,
 ) -> anyhow::Result<()> {
@@ -433,7 +433,7 @@ fn watched(stdout: &[u8], cwd: &Path) -> Vec<String> {
 /// prints and writes is told by the script, which its key has. 4 since a run is kept by what
 /// the sandbox saw it read ([`keyed`]), 5 since what one printed is checked before it is kept
 /// ([`directives`]).
-pub(super) const RUNS: &str = "build script runs 5";
+pub const RUNS: &str = "build script runs 5";
 
 /// The kind of the key of a run that saw its closure alone ([`view_key`]).
 #[cfg(unix)]
@@ -445,7 +445,7 @@ const IN_VIEW: &str = "build script runs in their closure 1";
 /// prints or writes either: a run that the sandbox refused something fails, and a failed run
 /// is not kept. Nor does where blaze keeps its store, its traces and its statistics, or
 /// whether it checks the store's runs.
-pub(super) const UNREAD: [&str; 13] = [
+pub const UNREAD: [&str; 13] = [
     "CARGO_MAKEFLAGS",
     "MAKEFLAGS",
     "MFLAGS",
@@ -514,7 +514,7 @@ fn run_key(
 }
 
 /// The toolchain a run's `RUSTC` answers for: blaze's release, whatever the run was given.
-pub(super) fn sysroot_of() -> Option<PathBuf> {
+pub fn sysroot_of() -> Option<PathBuf> {
     super::toolchain::sysroot()
 }
 
@@ -546,13 +546,13 @@ fn kept_reads(
 /// what the store keeps: the target directory its `OUT_DIR` is below, up to cargo's `build`
 /// directory, and its package's directory, where cargo runs it. No path holds a NUL.
 #[derive(Debug)]
-pub(crate) struct Places(Vec<(Vec<u8>, &'static [u8])>);
+pub struct Places(Vec<(Vec<u8>, &'static [u8])>);
 
 impl Places {
     const TARGET: &[u8] = b"\0TARGET\0";
     const PACKAGE: &[u8] = b"\0PACKAGE\0";
 
-    pub(super) fn of(env: &[(String, String)]) -> Places {
+    pub fn of(env: &[(String, String)]) -> Places {
         let var = |name: &str| {
             let value = env.iter().find(|it| it.0 == name)?.1.trim_end_matches(['/', '\\']);
             (!value.is_empty()).then_some(value)
@@ -573,7 +573,7 @@ impl Places {
     }
 
     /// `bytes` with what stands for each place in place of it.
-    pub(super) fn unplace(&self, bytes: &[u8]) -> Vec<u8> {
+    pub fn unplace(&self, bytes: &[u8]) -> Vec<u8> {
         let mut bytes = bytes.to_vec();
         for (place, mark) in &self.0 {
             bytes = replaced(&bytes, place, mark);
@@ -623,9 +623,9 @@ fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 
 /// What a run of a build script printed and left in its `OUT_DIR`.
 #[derive(Debug, PartialEq)]
-pub(crate) struct Kept {
-    pub(super) stdout: Vec<u8>,
-    pub(super) stderr: Vec<u8>,
+pub struct Kept {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
     /// Each file below `OUT_DIR`, by its path there, whether it is executable, and its bytes.
     files: Vec<(String, bool, Vec<u8>)>,
 }
@@ -633,7 +633,7 @@ pub(crate) struct Kept {
 impl Kept {
     /// The run that printed `stdout` and `stderr` and wrote `out_dir`. `None` when it left too
     /// much, or a file there can't be read.
-    pub(super) fn of(stdout: &[u8], stderr: &[u8], out_dir: &Path) -> Option<Kept> {
+    pub fn of(stdout: &[u8], stderr: &[u8], out_dir: &Path) -> Option<Kept> {
         let mut files = Vec::new();
         let mut size = stdout.len() + stderr.len();
         let mut pending = vec![out_dir.to_owned()];
@@ -662,7 +662,7 @@ impl Kept {
     /// directory to stand for. `None` when a file that is no text names a place, whose bytes
     /// a place of another length would break, or when something it holds could not be told
     /// from what stands for one.
-    pub(super) fn unplaced(&self, places: &Places) -> Option<Kept> {
+    pub fn unplaced(&self, places: &Places) -> Option<Kept> {
         let texts = [&self.stdout, &self.stderr].into_iter();
         let files = self.files.iter().map(|it| &it.2);
         let names = self.files.iter().map(|it| it.0.as_bytes());
@@ -686,7 +686,7 @@ impl Kept {
     }
 
     /// What [`Kept::unplaced`] made of a run, with the places of this one.
-    pub(super) fn placed(self, places: &Places) -> Kept {
+    pub fn placed(self, places: &Places) -> Kept {
         let files = self.files.into_iter().map(|(name, executable, bytes)| {
             let bytes = if places.marked(&bytes) { places.place(&bytes) } else { bytes };
             (name, executable, bytes)
@@ -699,7 +699,7 @@ impl Kept {
     }
 
     /// Writes the files it left into `out_dir`, as a run would.
-    pub(super) fn restore(&self, out_dir: &Path) -> anyhow::Result<()> {
+    pub fn restore(&self, out_dir: &Path) -> anyhow::Result<()> {
         for (name, executable, bytes) in &self.files {
             let path = out_dir.join(name);
             if let Some(dir) = path.parent() {
@@ -713,7 +713,7 @@ impl Kept {
         Ok(())
     }
 
-    pub(super) fn bytes(&self) -> Vec<u8> {
+    pub fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut put = |bytes: &[u8]| {
             out.extend((bytes.len() as u64).to_le_bytes());
@@ -731,7 +731,7 @@ impl Kept {
         out
     }
 
-    pub(super) fn read(bytes: &[u8]) -> Option<Kept> {
+    pub fn read(bytes: &[u8]) -> Option<Kept> {
         let rest = &mut &*bytes;
         let count = |it: &[u8]| Some(u64::from_le_bytes(it.try_into().ok()?) as usize);
         let text = |it: &[u8]| String::from_utf8(it.to_vec()).ok();
@@ -758,24 +758,24 @@ fn take<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
 }
 
 #[cfg(unix)]
-pub(crate) fn is_executable(metadata: &std::fs::Metadata) -> bool {
+pub fn is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-pub(crate) fn is_executable(_: &std::fs::Metadata) -> bool {
+pub fn is_executable(_: &std::fs::Metadata) -> bool {
     false
 }
 
 #[cfg(unix)]
-pub(crate) fn make_executable(path: &Path) -> std::io::Result<()> {
+pub fn make_executable(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
 }
 
 #[cfg(not(unix))]
-pub(crate) fn make_executable(_: &Path) -> std::io::Result<()> {
+pub fn make_executable(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -792,7 +792,7 @@ fn become_it(script: &mut Command) -> anyhow::Result<()> {
 /// The file cargo kept what the script that wrote `out_dir` printed in, beside it: `output`
 /// in cargo's first layout of its build directory, `run/stdout` in the second
 /// (`build/<package>/<hash>/out`, the default of nightly cargo since 2026).
-pub(crate) fn printed(out_dir: &Path) -> Option<PathBuf> {
+pub fn printed(out_dir: &Path) -> Option<PathBuf> {
     let run_dir = out_dir.parent()?;
     let second = run_dir.join("run").join("stdout");
     Some(if second.exists() { second } else { run_dir.join("output") })
@@ -801,20 +801,20 @@ pub(crate) fn printed(out_dir: &Path) -> Option<PathBuf> {
 /// Whether `path` can be in a script's `OUT_DIR`: below `build/<unit>/out` in cargo's first
 /// layout or `build/<package>/<hash>/out` in its second, where the objects of a library are
 /// too.
-pub(crate) fn in_out_dir(path: &Path) -> bool {
+pub fn in_out_dir(path: &Path) -> bool {
     let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
     names.windows(3).any(|it| it[0] == "build" && it[2] == "out")
         || names.windows(4).any(|it| it[0] == "build" && it[3] == "out")
 }
 
 /// Whether a script can be run again as cargo ran it into `out_dir`.
-pub(crate) fn can_rerun(out_dir: &Path) -> bool {
+pub fn can_rerun(out_dir: &Path) -> bool {
     out_dir.parent().is_some_and(|it| it.join(RAN).exists())
 }
 
 /// The directory cargo ran the script that wrote `out_dir` in, which is its package's, when
 /// it was written down.
-pub(crate) fn ran_in(out_dir: &Path) -> Option<PathBuf> {
+pub fn ran_in(out_dir: &Path) -> Option<PathBuf> {
     let ran = std::fs::read(out_dir.parent()?.join(RAN)).ok()?;
     serde_json::from_slice::<Ran>(&ran).ok().map(|it| it.cwd)
 }
@@ -823,7 +823,7 @@ pub(crate) fn ran_in(out_dir: &Path) -> Option<PathBuf> {
 /// read for it (`.d` beside it, named from `workspace`, where cargo runs rustc) is newer than
 /// it, and it read no variable while compiled but cargo's own, as cargo set them to run it:
 /// cargo compiles it again when one changes.
-pub(crate) fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> bool {
+pub fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> bool {
     let Some(run_dir) = out_dir.parent() else { return false };
     let Ok(ran) = std::fs::read(run_dir.join(RAN)) else { return false };
     let Ok(ran) = serde_json::from_slice::<Ran>(&ran) else { return false };
@@ -858,7 +858,7 @@ pub(crate) fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> b
 /// compiles the package again when a file there is newer than it was. `Ok` when the script
 /// printed and wrote what it did then; `Err` is what is different, which a script that
 /// writes the name of its directory into a file always is.
-pub(crate) fn rerun_is_same(out_dir: &Path) -> Result<(), String> {
+pub fn rerun_is_same(out_dir: &Path) -> Result<(), String> {
     // A file written as the script reads it can have a time a little before now: the
     // kernel stamps files with a clock that lags by up to a tick.
     let began = SystemTime::now() - 2 * file_clock_tick();
@@ -897,7 +897,7 @@ fn file_clock_tick() -> Duration {
 /// Whether the script that wrote `out_dir` was run again by [`rerun_is_same`], and printed
 /// and wrote what it had, after `newest`: when nothing it reads is newer, a run now is the
 /// same again.
-pub(crate) fn checked_after(out_dir: &Path, newest: SystemTime) -> bool {
+pub fn checked_after(out_dir: &Path, newest: SystemTime) -> bool {
     let checked = out_dir.parent().map(|it| it.join(CHECKED));
     let checked = checked.and_then(|it| std::fs::metadata(it).and_then(|it| it.modified()).ok());
     checked.is_some_and(|it| newest < it)
@@ -905,7 +905,7 @@ pub(crate) fn checked_after(out_dir: &Path, newest: SystemTime) -> bool {
 
 /// Whether the run of a script that wrote `out_dir` printed and wrote what the run that wrote
 /// `other` did, but for the name of its directory.
-pub(crate) fn same_run(out_dir: &Path, other: &Path) -> bool {
+pub fn same_run(out_dir: &Path, other: &Path) -> bool {
     let printed = |dir: &Path| std::fs::read(printed(dir)?).ok();
     let (Some(ours), Some(theirs)) = (printed(out_dir), printed(other)) else { return false };
     let (Some(named), Some(names)) = (other.to_str(), out_dir.to_str()) else { return false };
@@ -920,7 +920,7 @@ pub(crate) fn same_run(out_dir: &Path, other: &Path) -> bool {
 /// A script that said nothing of what it reads, whose run cargo's sandbox saw read only what
 /// is as it was ([`script_sandbox::reads_unchanged`]), is not run: a run now would read the
 /// same and so print and write the same.
-pub(crate) fn rerun_matches(out_dir: &Path, other: &Path) -> Result<(), String> {
+pub fn rerun_matches(out_dir: &Path, other: &Path) -> Result<(), String> {
     if script_sandbox::reads_unchanged(out_dir) && (out_dir == other || same_run(out_dir, other)) {
         return Ok(());
     }

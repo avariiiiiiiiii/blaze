@@ -16,10 +16,10 @@ use std::{
     process::{Command, ExitStatus, Output},
 };
 
-mod cargo;
-mod own;
+pub mod cargo;
+pub mod own;
 
-pub(crate) use cargo::{answer as cargo_answer, rustflags as cargo_rustflags};
+pub use cargo::{answer as cargo_answer, rustflags as cargo_rustflags};
 
 /// What rustc can be asked to print without compiling, whatever the input is.
 const ABOUT_RUSTC: [&str; 20] = [
@@ -67,11 +67,11 @@ const WRAPPER: &str = "RUSTC_WRAPPER";
 
 /// The variable that tells blaze as cargo's wrapper only to answer questions, and to leave
 /// what cargo compiles as it would be without blaze.
-pub(crate) const ONLY_ASKS: &str = "BLAZE_ONLY_ASKS";
+pub const ONLY_ASKS: &str = "BLAZE_ONLY_ASKS";
 
 /// Whether rustc run with `args` compiles nothing and says only what its release, the
 /// arguments and standard input decide.
-pub(crate) fn is_question(args: &[OsString]) -> bool {
+pub fn is_question(args: &[OsString]) -> bool {
     let Some(args) = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>() else {
         return false;
     };
@@ -121,7 +121,7 @@ pub(crate) fn is_question(args: &[OsString]) -> bool {
 
 /// What blaze answers to what `command` asks rustc, given `stdin`, with the variables
 /// `command` has; `None` when it has no answer. Nothing runs.
-pub(crate) fn own_answer(command: &Command, stdin: &[u8]) -> Option<Vec<u8>> {
+pub fn own_answer(command: &Command, stdin: &[u8]) -> Option<Vec<u8>> {
     let var = |name: &str| var_of(command, name);
     let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
     answered_as(command.get_program(), &args, stdin, &var)
@@ -129,12 +129,12 @@ pub(crate) fn own_answer(command: &Command, stdin: &[u8]) -> Option<Vec<u8>> {
 
 /// What blaze answers to rustc asked `args` with `stdin`, in this process's environment;
 /// `None` when it has no answer. Nothing runs.
-pub(crate) fn ours(args: &[OsString], stdin: &[u8]) -> Option<Vec<u8>> {
+pub fn ours(args: &[OsString], stdin: &[u8]) -> Option<Vec<u8>> {
     own::answer(args, stdin, &|name| std::env::var_os(name))
 }
 
 /// [`ours`] of text arguments, as text, failing with the question blaze has no answer to.
-pub(crate) fn ours_said(args: &[&str]) -> anyhow::Result<String> {
+pub fn ours_said(args: &[&str]) -> anyhow::Result<String> {
     let asked: Vec<OsString> = args.iter().map(OsString::from).collect();
     let answer = ours(&asked, &[]).ok_or_else(|| no_answer(&asked))?;
     Ok(String::from_utf8_lossy(&answer).trim().to_owned())
@@ -164,7 +164,7 @@ fn no_answer(args: &[OsString]) -> anyhow::Error {
 
 /// rustc's answer to what `command` asks it, given `stdin`, as blaze answers it. `command`
 /// asks a question ([`is_question`]); one blaze has no answer to is an error, and nothing runs.
-pub(crate) fn answer(command: &Command, stdin: &[u8]) -> io::Result<Output> {
+pub fn answer(command: &Command, stdin: &[u8]) -> io::Result<Output> {
     match own_answer(command, stdin) {
         Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
         None => {
@@ -177,7 +177,7 @@ pub(crate) fn answer(command: &Command, stdin: &[u8]) -> io::Result<Output> {
 /// What rust-analyzer runs to learn of the toolchain, answered here when it asks rustc.
 /// A cargo it runs only to ask is given blaze as the workspace's wrapper, which answers
 /// what cargo asks rustc in turn.
-pub(crate) fn ask(command: &mut Command) -> Option<io::Result<Output>> {
+pub fn ask(command: &mut Command) -> Option<io::Result<Output>> {
     let program = Path::new(command.get_program()).file_stem()?.to_str()?.to_owned();
     match program.as_str() {
         "cargo" => {
@@ -201,7 +201,7 @@ pub(crate) fn ask(command: &mut Command) -> Option<io::Result<Output>> {
 /// build is not blaze's (rust-analyzer's `cargo check` of build scripts, `blaze
 /// check`), which compiles as it would without blaze. It is `RUSTC_WRAPPER`, not the
 /// workspace's: cargo runs the print of `cargo rustc --print` through that one alone.
-pub(crate) fn ready_cargo(command: &mut Command) {
+pub fn ready_cargo(command: &mut Command) {
     let named = [WRAPPER, "CARGO_BUILD_RUSTC_WRAPPER"].iter().any(|name| {
         command.get_envs().any(|(it, value)| it == *name && value.is_some())
             || std::env::var_os(name).is_some_and(|it| !it.is_empty())
@@ -216,7 +216,7 @@ pub(crate) fn ready_cargo(command: &mut Command) {
 
 /// Answers the question cargo asked the wrapper, and ends as rustc would have. `None` when
 /// it is no question.
-pub(crate) fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>> {
+pub fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>> {
     if !is_question(args) {
         return None;
     }

@@ -33,7 +33,7 @@ const CLIPPYS: &[&str] =
     &["--no-deps", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", "--broken-code"];
 
 /// `blaze clippy <rest>`; returns the status to exit with.
-pub(crate) fn command(rest: &[String]) -> anyhow::Result<i32> {
+pub fn command(rest: &[String]) -> anyhow::Result<i32> {
     let (ours, clippy_args) = match rest.iter().position(|it| it == "--") {
         Some(at) => (&rest[..at], &rest[at + 1..]),
         None => (rest, &[][..]),

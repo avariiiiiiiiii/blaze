@@ -7,7 +7,7 @@ arguments and variables cargo and rust-analyzer ask with (docs/no-rustc.md, step
     answers.py           compare blaze's answers with rustc's; a difference fails
     answers.py --write   write what rustc answers into blaze's data, after a toolchain bump
 
-blaze's answers are crates/blaze-engine/src/answers/rustc.json, of the toolchain in harness/toolchain.
+blaze's answers are crates/blaze-cargo/src/answers/rustc.json, of the toolchain in harness/toolchain.
 Another toolchain is asked once per question and its answers are kept, as before. The target specs
 depend on the host rustc was built for (x86-64 Linux's links with its own lld): --write keeps
 those of the other hosts and writes this host's, so it is run on each host CI has (Linux
@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-DATA = os.path.join(ROOT, "crates/blaze-engine/src/answers", "rustc.json")
+DATA = os.path.join(ROOT, "crates/blaze-cargo/src/answers", "rustc.json")
 TARGETS = [
     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin",

@@ -10,9 +10,9 @@
 //! when it has one with `rust-src`, else blaze's own copy (`own.rs`), downloaded the first time
 //! neither is there.
 
-mod own;
+pub mod own;
 
-pub(crate) use own::home;
+pub use own::home;
 
 use std::{
     path::{Path, PathBuf},
@@ -20,46 +20,46 @@ use std::{
 };
 
 /// The toolchain blaze compiles, as rustup names it: `nightly-2026-10-25`.
-pub(crate) const OURS: &str = include_str!("../../../../harness/toolchain");
+pub const OURS: &str = include_str!("../../../../harness/toolchain");
 
 /// blaze's toolchain as blaze names it in what it prints: `blaze-2026-10-25`, after the date of
 /// the Rust nightly it is (`harness/toolchain`), so it moves with every bump. rustup knows the
 /// toolchain by the nightly's name, not this one.
-pub(crate) fn name() -> String {
+pub fn name() -> String {
     let ours = OURS.trim();
     format!("blaze-{}", ours.strip_prefix("nightly-").unwrap_or(ours))
 }
 
 /// What that toolchain's rustc says it is after `rustc `: `1.101.0-nightly (12433c307 2026-10-24)`.
-pub(crate) fn ours_says() -> &'static str {
+pub fn ours_says() -> &'static str {
     own::rustc_version()
 }
 
 /// That rustc's release, as `rustc -vV` says it: `1.101.0-nightly`.
-pub(crate) fn ours_release() -> &'static str {
+pub fn ours_release() -> &'static str {
     ours_says().split_once(' ').map_or(ours_says(), |(release, _)| release)
 }
 
 /// The commit that toolchain was built from.
-pub(crate) fn ours_commit() -> &'static str {
+pub fn ours_commit() -> &'static str {
     own::commit()
 }
 
 /// The host's tuple, as the Rust project names its builds: what blaze answers `rustc -vV`'s
 /// `host:` with. `None` on a host blaze ships no toolchain for.
-pub(crate) fn host() -> Option<&'static str> {
+pub fn host() -> Option<&'static str> {
     own::host()
 }
 
 /// Where the files of blaze's release are.
-pub(crate) enum Chosen {
+pub enum Chosen {
     Rustup(PathBuf),
     Own(PathBuf),
 }
 
 impl Chosen {
     /// Where the toolchain is: its sysroot.
-    pub(crate) fn dir(&self) -> &Path {
+    pub fn dir(&self) -> &Path {
         match self {
             Chosen::Rustup(dir) | Chosen::Own(dir) => dir,
         }
@@ -81,7 +81,7 @@ impl std::fmt::Display for Chosen {
 
 /// The files of blaze's release, found with nothing run: rustup's copy with the source of the
 /// standard library, else blaze's own when it is whole. `None` when neither is there.
-pub(crate) fn found() -> Option<Chosen> {
+pub fn found() -> Option<Chosen> {
     if let Some(dir) = FOUND.get() {
         return Some(chosen_at(dir.clone()));
     }
@@ -106,7 +106,7 @@ static FOUND: OnceLock<PathBuf> = OnceLock::new();
 
 /// Tells this process where blaze's release is, as the blaze that started it found it: a
 /// build script's sandbox may not see where rustup and blaze keep toolchains.
-pub(crate) fn known_at(sysroot: PathBuf) {
+pub fn known_at(sysroot: PathBuf) {
     let _ = FOUND.set(sysroot);
 }
 
@@ -116,7 +116,7 @@ fn chosen_at(dir: PathBuf) -> Chosen {
 }
 
 /// The sysroot of blaze's release: what blaze answers `rustc --print sysroot` with.
-pub(crate) fn sysroot() -> Option<PathBuf> {
+pub fn sysroot() -> Option<PathBuf> {
     found().map(|it| it.dir().to_owned())
 }
 
@@ -126,7 +126,7 @@ pub(crate) fn sysroot() -> Option<PathBuf> {
 /// the user's shell, whatever the user set them to or a toolchain file names. `Err` is why
 /// the command can't be built, said for the user to act on. Before any thread starts: it sets
 /// the environment.
-pub(crate) fn settle() -> Result<Chosen, String> {
+pub fn settle() -> Result<Chosen, String> {
     let ours = OURS.trim();
     let chosen = match found() {
         Some(chosen) => chosen,
@@ -175,7 +175,7 @@ fn use_toolchain(dir: &Path) {
 
 /// The `rust-toolchain` or `rust-toolchain.toml` nearest `dir`, which rustup would follow and
 /// blaze does not.
-pub(crate) fn toolchain_file(dir: &Path) -> Option<PathBuf> {
+pub fn toolchain_file(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
         .flat_map(|it| ["rust-toolchain", "rust-toolchain.toml"].map(|name| it.join(name)))
         .find(|it| it.is_file())
@@ -183,7 +183,7 @@ pub(crate) fn toolchain_file(dir: &Path) -> Option<PathBuf> {
 
 /// Says, under `-v`, that the toolchain file nearest `dir` is not followed: one line, since
 /// nothing about the build depends on it.
-pub(crate) fn say_toolchain_file(dir: &Path, verbose: bool) {
+pub fn say_toolchain_file(dir: &Path, verbose: bool) {
     if let Some(file) = toolchain_file(dir).filter(|_| verbose) {
         eprintln!(
             "blaze: {} is ignored: blaze builds with its own Rust, {} ({})",
@@ -196,7 +196,7 @@ pub(crate) fn say_toolchain_file(dir: &Path, verbose: bool) {
 
 /// Why this blaze can't build `packages`: the first whose `rust-version` is newer than the
 /// Rust blaze ships. A nightly counts as its release, as cargo counts it.
-pub(crate) fn too_new(packages: &[&cargo_metadata::Package]) -> Option<String> {
+pub fn too_new(packages: &[&cargo_metadata::Package]) -> Option<String> {
     let package = packages.iter().find(|it| {
         it.rust_version.as_ref().is_some_and(|it| newer_than_ours(it.major, it.minor, it.patch))
     })?;
@@ -220,7 +220,7 @@ fn newer_than_ours(major: u64, minor: u64, patch: u64) -> bool {
 
 /// The `rust-lld` that rustc links MSVC programs with when a target says so, as the
 /// repository's `.cargo/config.toml` does: rustc finds it in the toolchain, not on the PATH.
-pub(crate) fn rust_lld() -> PathBuf {
+pub fn rust_lld() -> PathBuf {
     let host = hir_ty_codegen::Target::host();
     let lld = format!("rust-lld{}", std::env::consts::EXE_SUFFIX);
     sysroot().unwrap_or_default().join("lib/rustlib").join(host).join("bin").join(lld)

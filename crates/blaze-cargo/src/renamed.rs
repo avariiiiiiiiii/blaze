@@ -7,13 +7,13 @@ const OLD: &str = "RA_JIT_";
 /// The names of the wrapper cargo ran rustc through before the rename, now `blaze-rustc`.
 /// The program cargo ran as `cargo blaze`, which `blaze enable` linked `cargo fmt` and
 /// `cargo clippy` to before `blaze` was the only command.
-pub(crate) const OLD_LAUNCHER: &str = "cargo-blaze";
-pub(crate) const OLD_WRAPPERS: [&str; 2] = ["ra-jit-rustc", "ra-jit-rustc-first"];
+pub const OLD_LAUNCHER: &str = "cargo-blaze";
+pub const OLD_WRAPPERS: [&str; 2] = ["ra-jit-rustc", "ra-jit-rustc-first"];
 
 /// Ends this process when a setting is named as it was before the rename, with a line for
 /// each saying what it is called now: a setting blaze does not read would change nothing
 /// without a word.
-pub(crate) fn refuse_old_settings() {
+pub fn refuse_old_settings() {
     let mut old: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.to_str().filter(|it| it.starts_with(OLD)).map(str::to_owned))
         .collect();
@@ -63,7 +63,7 @@ fn bytes_under(dir: &std::path::Path) -> u64 {
 /// On the first command under the new name, before the daemon's directory `home` is made:
 /// a line for each directory of blaze from before the rename that is still there, with its
 /// size, saying it can be deleted.
-pub(crate) fn say_old_dirs(home: &std::path::Path) {
+pub fn say_old_dirs(home: &std::path::Path) {
     if home.exists() {
         return;
     }

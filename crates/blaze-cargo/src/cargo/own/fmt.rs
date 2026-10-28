@@ -3,7 +3,7 @@
 //! workspace's targets, with cargo-fmt's options, `--check` diffs and exit codes.
 
 /// `args` are those after `fmt`. Returns the status to exit with.
-pub(super) fn command(args: &[String]) -> i32 {
+pub fn command(args: &[String]) -> i32 {
     if names_files(args) {
         blaze_fmt::cli::main(args.to_vec())
     } else {

@@ -27,60 +27,60 @@ use super::{
 
 /// The state of one build of a checkout: one command with one set of flags.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct State {
+pub struct State {
     /// The version of the blaze that wrote it. Another one reads nothing of it.
     version: String,
-    pub(crate) key: String,
-    pub(crate) root: PathBuf,
+    pub key: String,
+    pub root: PathBuf,
     /// When the cargo build this is the state of started.
     built_at: u128,
     /// The profile, as cargo's `Finished` line names it.
-    pub(crate) profile: String,
-    pub(crate) programs: Vec<Program>,
+    pub profile: String,
+    pub programs: Vec<Program>,
     guards: Vec<Guard>,
     /// What the daemon is asked for: the programs that are not unit tests, and the ones
     /// that are.
-    pub(crate) checkouts: Vec<Checkout>,
+    pub checkouts: Vec<Checkout>,
     /// Why every build of this is cargo's, when blaze has no part in it.
-    pub(crate) refusal: Option<String>,
+    pub refusal: Option<String>,
     /// Whether a library that was built has doc tests.
-    pub(crate) doc_tests: bool,
-    pub(crate) counts: Counts,
+    pub doc_tests: bool,
+    pub counts: Counts,
     /// The `[env]` of cargo's configuration, which cargo sets for what it runs.
     #[serde(default)]
-    pub(crate) configured: Vec<Configured>,
+    pub configured: Vec<Configured>,
 }
 
 /// A variable of the `[env]` tables of cargo's configuration. Cargo sets it for a program it
 /// runs where the environment has none, or always when it is `force`d.
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct Configured {
-    pub(crate) name: String,
-    pub(crate) value: String,
-    pub(crate) force: bool,
+pub struct Configured {
+    pub name: String,
+    pub value: String,
+    pub force: bool,
 }
 
 /// How many builds the daemon served and how many went to cargo, by the reason.
 #[derive(Serialize, Deserialize, Default)]
-pub(crate) struct Counts {
-    pub(crate) served: u64,
-    pub(crate) cargo: BTreeMap<String, u64>,
+pub struct Counts {
+    pub served: u64,
+    pub cargo: BTreeMap<String, u64>,
 }
 
 /// An executable cargo built.
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct Program {
-    pub(crate) name: String,
-    pub(crate) kind: Kind,
-    pub(crate) package: String,
+pub struct Program {
+    pub name: String,
+    pub kind: Kind,
+    pub package: String,
     /// Whether it is built as a test: `cargo test` runs it.
-    pub(crate) test: bool,
+    pub test: bool,
     /// The root file of the target.
-    pub(crate) source: PathBuf,
+    pub source: PathBuf,
     /// The directory of the package, which a test runs in.
-    pub(crate) package_dir: PathBuf,
+    pub package_dir: PathBuf,
     /// Where cargo has the executable.
-    pub(crate) executable: PathBuf,
+    pub executable: PathBuf,
     /// The other names cargo has for the executable: the file rustc wrote, when
     /// `executable` is cargo's hard link to it. A cargo that finds the two apart links
     /// them again, under whoever is running the program.
@@ -93,25 +93,25 @@ pub(crate) struct Program {
     #[serde(default)]
     unit: Option<PathBuf>,
     /// Where it is among the programs of its checkout in `checkouts`.
-    pub(crate) asked_as: Option<(usize, usize)>,
+    pub asked_as: Option<(usize, usize)>,
     /// Why the daemon is never asked for it, when it is not.
     left_to_cargo: Option<String>,
     /// The source files of the workspace it is compiled from, its libraries' too. While
     /// none is written, the executable cargo built is the program.
     inputs: Vec<PathBuf>,
     /// What cargo sets for the program when it runs it.
-    pub(crate) env: Vec<(String, String)>,
+    pub env: Vec<(String, String)>,
     /// Whether it is its package's `default-run`: what `cargo run` runs when it names no
     /// program.
     #[serde(default)]
-    pub(crate) default_run: bool,
+    pub default_run: bool,
 }
 
 impl Program {
     /// A test the daemon built whole, the program `asked_as` of its checkouts, which runs in
     /// `package_dir` with `env`.
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn of_whole(
+    pub fn of_whole(
         name: String,
         kind: Kind,
         package: String,
@@ -142,7 +142,7 @@ impl Program {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum Kind {
+pub enum Kind {
     Lib,
     Bin,
     Example,
@@ -363,7 +363,7 @@ fn newer_in(dir: &Path, since: u128) -> Option<PathBuf> {
 }
 
 /// What cargo said while it built.
-pub(crate) struct Built {
+pub struct Built {
     /// When cargo started.
     started: u128,
     artifacts: Vec<Artifact>,
@@ -376,7 +376,7 @@ pub(crate) struct Built {
 /// What the checker of `blaze check` with the flags of `asked` loads: the workspace
 /// as a build of those flags has it, with the crates of every package of it. A flag that
 /// picks the tests checks them as `cargo check --tests` does, with `cfg(test)`.
-pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
+pub fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
     if let Some(why) = other_toolchain() {
         anyhow::bail!(why);
     }
@@ -413,7 +413,7 @@ impl Built {
     /// Runs cargo on what `asked` builds, with blaze as the wrapper of the workspace's
     /// crates. Progress and diagnostics are cargo's own. `Err` is cargo's exit status when
     /// it failed.
-    pub(crate) fn by_cargo(asked: &Invocation) -> anyhow::Result<Result<Built, i32>> {
+    pub fn by_cargo(asked: &Invocation) -> anyhow::Result<Result<Built, i32>> {
         let started = stamp_now();
         let mut cargo = Command::new(cargo_path());
         match asked.subcommand {
@@ -457,7 +457,7 @@ impl Built {
 impl State {
     /// The file in the record of a unit that names the builds its program is in, a key a
     /// line.
-    pub(crate) const STATES: &str = "states";
+    pub const STATES: &str = "states";
 
     fn path(key: &str) -> anyhow::Result<PathBuf> {
         Ok(daemon::home()?.join("states").join(format!("{key}.json")))
@@ -466,7 +466,7 @@ impl State {
     /// The state of the build `key`. One another build of blaze wrote, or whose programs
     /// cargo built are no longer in the target directory, is forgotten: nothing of it is
     /// what this build would have been. What it kept of cargo's stays ([`State::give_back`]).
-    pub(crate) fn read(key: &str) -> Option<State> {
+    pub fn read(key: &str) -> Option<State> {
         State::read_at(&State::path(key).ok()?, &daemon::version())
     }
 
@@ -484,14 +484,14 @@ impl State {
 
     /// The states that have the program rustc linked from the unit recorded in `unit`, by
     /// their keys: the builds of the checkout that share the unit.
-    pub(crate) fn of_unit(unit: &Path) -> Vec<String> {
+    pub fn of_unit(unit: &Path) -> Vec<String> {
         let keys = std::fs::read_to_string(unit.join(State::STATES)).unwrap_or_default();
         keys.lines().map(str::to_owned).collect()
     }
 
     /// Forgets the builds `keys`: rustc has linked a program of theirs again, and what
     /// they kept of cargo's is not what cargo has now.
-    pub(crate) fn forget<'a>(keys: impl IntoIterator<Item = &'a String>) {
+    pub fn forget<'a>(keys: impl IntoIterator<Item = &'a String>) {
         for key in keys {
             for path in [State::path(key), State::kept_path(key)].into_iter().flatten() {
                 let _ = std::fs::remove_file(path);
@@ -502,7 +502,7 @@ impl State {
     /// The program linked from the unit recorded in `unit`, the checkout it is asked for
     /// in, and where it is among that checkout's programs. `Err` is why the daemon is not
     /// asked for it.
-    pub(crate) fn asked_for(&self, unit: &Path) -> Result<(&Checkout, usize), String> {
+    pub fn asked_for(&self, unit: &Path) -> Result<(&Checkout, usize), String> {
         let program = self.of_unit_dir(unit).ok_or("the build no longer has the program")?;
         match (program.asked_as, &program.left_to_cargo) {
             (Some((checkout, at)), _) => Ok((&self.checkouts[checkout], at)),
@@ -516,14 +516,14 @@ impl State {
 
     /// Has `binary` be what cargo has of the program linked from the unit recorded in
     /// `unit`: cargo was given it where it had rustc's, for the source as it is now.
-    pub(crate) fn cargo_has(&self, unit: &Path, binary: &Path) -> std::io::Result<()> {
+    pub fn cargo_has(&self, unit: &Path, binary: &Path) -> std::io::Result<()> {
         match self.of_unit_dir(unit) {
             Some(program) => place(binary, &program.cargos),
             None => Ok(()),
         }
     }
 
-    pub(crate) fn write(&self) -> anyhow::Result<()> {
+    pub fn write(&self) -> anyhow::Result<()> {
         let path = State::path(&self.key)?;
         std::fs::create_dir_all(path.parent().context("a state without a directory")?)?;
         let new = path.with_extension(format!("{}.new", std::process::id()));
@@ -545,7 +545,7 @@ impl State {
     }
 
     /// Every state this blaze wrote for the user.
-    pub(crate) fn all() -> Vec<State> {
+    pub fn all() -> Vec<State> {
         let dir = daemon::home().map(|it| it.join("states"));
         let entries = dir.ok().and_then(|it| std::fs::read_dir(it).ok()).into_iter().flatten();
         let keys = entries.flatten().filter_map(|it| {
@@ -557,13 +557,13 @@ impl State {
     }
 
     /// Why the next build is cargo's: something cargo acts on changed since it built.
-    pub(crate) fn broken_guard(&mut self) -> Option<String> {
+    pub fn broken_guard(&mut self) -> Option<String> {
         self.guards.iter_mut().find_map(|it| it.broken(self.built_at))
     }
 
     /// Why the next build is cargo's: a program the daemon is never asked for has new
     /// source.
-    pub(crate) fn stale_cargos(&self) -> Option<String> {
+    pub fn stale_cargos(&self) -> Option<String> {
         self.left_to_cargo().find_map(|(program, why)| {
             let file = program.newer_input(self.built_at)?;
             Some(format!("`{}`: {why}, and {} changed", program.name, file.display()))
@@ -571,7 +571,7 @@ impl State {
     }
 
     /// Counts a build that went to cargo.
-    pub(crate) fn count_cargo(&mut self, reason: &str) {
+    pub fn count_cargo(&mut self, reason: &str) {
         *self.counts.cargo.entry(reason.to_owned()).or_default() += 1;
     }
 
@@ -583,7 +583,7 @@ impl State {
 
     /// Puts the executables rustc linked back where cargo has them, for cargo to find what
     /// it built. One whose link is gone is deleted, and cargo links it again.
-    pub(crate) fn give_back(key: &str) {
+    pub fn give_back(key: &str) {
         let kept = State::kept_path(key).ok().and_then(|it| std::fs::read(it).ok());
         let kept: Vec<(PathBuf, PathBuf)> =
             kept.and_then(|it| serde_json::from_slice(&it).ok()).unwrap_or_default();
@@ -606,7 +606,7 @@ impl State {
     /// written. `answers` is what the daemon said of each program of each checkout. `Ok`
     /// are the programs that stay cargo's and why; `Err` is why cargo builds, when a
     /// program the daemon did not build has new source. Under `held`, which is this build's.
-    pub(crate) fn settle(
+    pub fn settle(
         &self,
         answers: &[Vec<Result<(), String>>],
         _held: &Held,
@@ -656,7 +656,7 @@ impl State {
     /// The directory the daemon builds `program` in, when it is asked for it.
     /// What a whole build of the tests `programs` by the daemon's `checkouts` leaves for their
     /// run: nothing of it is cargo's.
-    pub(crate) fn of_whole(
+    pub fn of_whole(
         key: String,
         root: PathBuf,
         profile: String,
@@ -680,25 +680,25 @@ impl State {
         }
     }
 
-    pub(crate) fn plan_dir(&self, program: &Program) -> Option<&Path> {
+    pub fn plan_dir(&self, program: &Program) -> Option<&Path> {
         let (checkout, at) = program.asked_as?;
         self.checkouts.get(checkout)?.programs.get(at)?.object.parent()
     }
 
     /// Cargo's locks on the build directories of the programs, held until the programs this
     /// command runs have started.
-    pub(crate) fn hold(&self) -> Held {
+    pub fn hold(&self) -> Held {
         Held { _locks: build_locks(self.programs.iter().map(|it| &*it.executable)) }
     }
 
     /// The programs cargo built that the daemon is never asked for, and why.
-    pub(crate) fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
+    pub fn left_to_cargo(&self) -> impl Iterator<Item = (&Program, &str)> {
         self.programs.iter().filter_map(|it| Some((it, it.left_to_cargo.as_deref()?)))
     }
 
     /// The state after cargo built `asked` in `cwd`: what it built, what the daemon can
     /// build of it, and what the next build has to check.
-    pub(crate) fn after(
+    pub fn after(
         asked: &Invocation,
         cwd: &Path,
         key: &str,
@@ -930,7 +930,7 @@ fn build_locks<'a>(executables: impl Iterator<Item = &'a Path>) -> Vec<std::fs::
 }
 
 /// Cargo's locks on build directories, held while this is.
-pub(crate) struct Held {
+pub struct Held {
     _locks: Vec<std::fs::File>,
 }
 
@@ -985,7 +985,7 @@ fn packed(binary: &Path, object: &Path, rustcs: &Path) -> Result<PathBuf, String
 /// for whoever runs it. On macOS a copy, which is a clone and as quick: there a program
 /// started from a hard link just made can be killed as it starts, which is why cargo
 /// copies there too (rust-lang/cargo#7821).
-pub(crate) fn place(from: &Path, to: &Path) -> std::io::Result<()> {
+pub fn place(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut new = to.as_os_str().to_owned();
     new.push(format!(".{}.new", std::process::id()));
     let _ = std::fs::remove_file(&new);
@@ -1005,7 +1005,7 @@ pub(crate) fn place(from: &Path, to: &Path) -> std::io::Result<()> {
 /// `from` later reaches it. Plain cargo starts the program at `to` with no word to the daemon,
 /// which writes its own executable in place for the next start, and on Linux a program started
 /// while its file is open for writing is refused ("text file busy").
-pub(crate) fn place_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+pub fn place_copy(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut new = to.as_os_str().to_owned();
     new.push(format!(".{}.new", std::process::id()));
     let new = PathBuf::from(new);
@@ -1019,7 +1019,7 @@ pub(crate) fn place_copy(from: &Path, to: &Path) -> std::io::Result<()> {
 /// same units: cargo keys the crates of the workspace by their wrapper, and one run
 /// without it builds each program again and puts its own where this build's is, under a
 /// program that is running.
-pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
+pub fn as_built(command: &mut Command) -> std::io::Result<()> {
     command.env(switch::VARIABLE, switch::wrapper_path()?).env(wrapper::DRIVEN, "1");
     // The project's own wrapper still runs rustc, from inside blaze's, as cargo finds it from
     // the directory it runs in.
@@ -1036,7 +1036,7 @@ pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
 /// the packages outside the workspace (docs/no-rustc.md, step I), unless the user has a
 /// wrapper there. Cargo keys no unit by this wrapper, so the builds of plain cargo are still
 /// this one's.
-pub(crate) fn every_crate(command: &mut Command) -> std::io::Result<()> {
+pub fn every_crate(command: &mut Command) -> std::io::Result<()> {
     let dir =
         command.get_current_dir().map_or_else(std::env::current_dir, |it| Ok(it.to_owned()))?;
     if !switch::user_wraps(&dir) {
@@ -1046,15 +1046,15 @@ pub(crate) fn every_crate(command: &mut Command) -> std::io::Result<()> {
 }
 
 /// The cargo to run: the one that ran this command, or the one on the path.
-pub(crate) fn cargo_path() -> PathBuf {
+pub fn cargo_path() -> PathBuf {
     std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from)
 }
 
-pub(super) fn metadata(asked: &Invocation) -> Metadata {
+pub fn metadata(asked: &Invocation) -> Metadata {
     super::metadata::no_deps(asked.flags.manifest_path.as_deref(), &asked.flags.config)
 }
 
-pub(super) fn package_dir(package: &Package) -> PathBuf {
+pub fn package_dir(package: &Package) -> PathBuf {
     package.manifest_path.parent().map(|it| it.as_std_path().to_owned()).unwrap_or_default()
 }
 
@@ -1117,7 +1117,7 @@ fn other_toolchain() -> Option<String> {
 /// What the checkouts of one repository share: the repository's own directory, which is
 /// `.git` in the first checkout and is named by the `.git` file of a worktree. A directory
 /// that is no checkout is its own.
-pub(super) fn repository(root: &Path) -> PathBuf {
+pub fn repository(root: &Path) -> PathBuf {
     // git names the directory its own way, on Windows with other separators than the
     // checkout's path has: both are spelled as the file system spells them.
     let spelled = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
@@ -1145,7 +1145,7 @@ const LIBRARY_PATH: &str = if cfg!(windows) {
 
 /// Where the toolchain cargo builds with has the libraries of the host, `libstd` as a
 /// dynamic library among them. `None` when rustc does not say.
-pub(super) fn sysroot_libraries() -> Option<PathBuf> {
+pub fn sysroot_libraries() -> Option<PathBuf> {
     let said = crate::answers::ours_said(&["--print=target-libdir"]).ok()?;
     (!said.is_empty()).then(|| PathBuf::from(said))
 }
@@ -1155,7 +1155,7 @@ pub(super) fn sysroot_libraries() -> Option<PathBuf> {
 /// it looked already. A test of a proc macro is linked with the toolchain's `libstd`. The
 /// dependencies are `deps` in cargo's first layout and, in its second, the directory of each
 /// unit that is a `dylib` ([`super::layout::dylib_dirs`]).
-pub(super) fn library_path(executable: &Path, sysroot: Option<&Path>) -> Option<(String, String)> {
+pub fn library_path(executable: &Path, sysroot: Option<&Path>) -> Option<(String, String)> {
     let inside = |it: &&Path| it.file_name().is_some_and(|it| it == "deps" || it == "examples");
     let dir = executable.parent()?;
     let unit = super::layout::unit_dir(dir);
@@ -1195,7 +1195,7 @@ fn programs_named(kind: Kind, unit: Option<&Record>) -> Vec<(String, String)> {
 }
 
 /// The variables cargo sets for a program of `package` when it runs it.
-pub(super) fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> {
+pub fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> {
     let version = &package.version;
     let text = |it: &Option<String>| it.clone().unwrap_or_default();
     let mut env = vec![
@@ -1237,7 +1237,7 @@ pub(super) fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String
 /// directory of each directory up from it, the nearest first, then from cargo's home. Of two
 /// files in one directory cargo reads `config`, not `config.toml`. A `relative` value is a
 /// path from the directory its `.cargo` is in.
-pub(super) fn configured_env(cwd: &Path) -> Vec<Configured> {
+pub fn configured_env(cwd: &Path) -> Vec<Configured> {
     let in_dir = |dir: &Path| {
         ["config", "config.toml"].map(|it| dir.join(it)).into_iter().find(|it| it.is_file())
     };
@@ -1417,7 +1417,7 @@ fn rerun_guards(package: &Package, script: &BuildScript) -> Vec<Guard> {
 /// `lib test`) of `package`, as rustc writes them and cargo ends the build: with the line
 /// naming what did not compile, and the note of the toolchain blaze built with in place of the
 /// project's.
-pub(crate) fn turned_down(said: &crate::errors::Said, package: &str, target: &str) -> String {
+pub fn turned_down(said: &crate::errors::Said, package: &str, target: &str) -> String {
     let errors = match said.count() {
         0 | 1 => "1 previous error".to_owned(),
         n => format!("{n} previous errors"),

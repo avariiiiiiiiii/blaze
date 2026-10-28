@@ -20,9 +20,9 @@ const KEPT: &str = "blaze-kept";
 
 /// A link `enable` made.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Link {
+pub struct Link {
     /// `cargo-<command>` in cargo's home.
-    pub(crate) path: PathBuf,
+    pub path: PathBuf,
     /// Where the file that was there is kept, when there was one.
     kept: Option<PathBuf>,
     /// Whether `enable` made the directory the link is in, which `disable` then removes.
@@ -55,11 +55,7 @@ fn old(path: &Path) -> bool {
 
 /// Links each command that is blaze's own and not in `have` to `blaze`, in cargo's home
 /// `home`, adding each to `made` as it is made. Returns what to tell the user.
-pub(crate) fn make(
-    home: &Path,
-    have: &[Link],
-    made: &mut Vec<Link>,
-) -> anyhow::Result<Vec<String>> {
+pub fn make(home: &Path, have: &[Link], made: &mut Vec<Link>) -> anyhow::Result<Vec<String>> {
     let names: Vec<_> = COMMANDS
         .into_iter()
         .filter(|it| own::named(it).is_some_and(|it| it.status == Status::Own))
@@ -153,7 +149,7 @@ fn link(_: &Path, _: &Path) -> std::io::Result<()> {
 
 /// Puts back what `make` replaced. A link replaced since, as `rustup update` puts its proxy
 /// back, is left as it is, and the file kept for it goes.
-pub(crate) fn undo(links: &[Link]) -> anyhow::Result<Vec<String>> {
+pub fn undo(links: &[Link]) -> anyhow::Result<Vec<String>> {
     let mut lines = Vec::new();
     for Link { path, kept, .. } in links {
         let name = command(path);
@@ -188,7 +184,7 @@ pub(crate) fn undo(links: &[Link]) -> anyhow::Result<Vec<String>> {
 }
 
 /// The lines of `status` about the commands blaze links: whose each one is.
-pub(crate) fn status(home: &Path, links: &[Link]) -> Vec<String> {
+pub fn status(home: &Path, links: &[Link]) -> Vec<String> {
     let mut lines = Vec::new();
     for name in COMMANDS {
         if !own::named(name).is_some_and(|it| it.status == Status::Own) {

@@ -65,7 +65,7 @@ const IGNORED: &[(&str, bool)] = &[
 ];
 
 /// `cargo config <COMMAND>`, `args` being what follows `config`.
-pub(super) fn command(args: &[String]) -> anyhow::Result<i32> {
+pub fn command(args: &[String]) -> anyhow::Result<i32> {
     let mut words = Vec::new();
     let mut unstable = false;
     let mut at = args.iter();

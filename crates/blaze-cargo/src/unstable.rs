@@ -17,7 +17,7 @@
 
 /// What blaze does with one `-Z` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Treatment {
+pub enum Treatment {
     Ignored(&'static str),
     Modelled(&'static str),
     Refused(&'static str),
@@ -308,16 +308,16 @@ const UNKNOWN: &str = "blaze does not know the flag";
 
 /// One `-Z` flag as given: its name with `_` spelled `-`, as rustc reads both, and its value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Flag<'a> {
-    pub(crate) name: String,
-    pub(crate) value: Option<&'a str>,
+pub struct Flag<'a> {
+    pub name: String,
+    pub value: Option<&'a str>,
     /// As it was given, after the `-Z`.
-    pub(crate) given: &'a str,
+    pub given: &'a str,
 }
 
 impl Flag<'_> {
     /// What blaze does with it.
-    pub(crate) fn treatment(&self) -> Treatment {
+    pub fn treatment(&self) -> Treatment {
         let row = TABLE.binary_search_by(|(name, _)| name.cmp(&self.name.as_str()));
         match row.map(|at| TABLE[at].1) {
             Err(_) => Treatment::Refused(UNKNOWN),
@@ -332,7 +332,7 @@ impl Flag<'_> {
     }
 
     /// Why blaze does not build code with it, naming it, when it does not.
-    pub(crate) fn refusal(&self) -> Option<String> {
+    pub fn refusal(&self) -> Option<String> {
         match self.treatment() {
             Treatment::Refused(why) => Some(format!("-Z {}: {why}", self.given)),
             Treatment::Ignored(_) | Treatment::Modelled(_) => None,
@@ -351,9 +351,7 @@ fn off(value: Option<&str>) -> Option<bool> {
 
 /// The `-Z` flags among the words of a rustc command line, spelled `-Z name=value`,
 /// `-Zname=value`, `-Z name` or `-Zname`.
-pub(crate) fn flags<'a, S: AsRef<str> + 'a>(
-    words: impl IntoIterator<Item = &'a S>,
-) -> Vec<Flag<'a>> {
+pub fn flags<'a, S: AsRef<str> + 'a>(words: impl IntoIterator<Item = &'a S>) -> Vec<Flag<'a>> {
     let mut words = words.into_iter().map(AsRef::as_ref);
     let mut found = Vec::new();
     while let Some(word) = words.next() {
@@ -371,7 +369,7 @@ pub(crate) fn flags<'a, S: AsRef<str> + 'a>(
 }
 
 /// The flag `given` is, after its `-Z`.
-pub(crate) fn flag(given: &str) -> Flag<'_> {
+pub fn flag(given: &str) -> Flag<'_> {
     let (name, value) = match given.split_once('=') {
         Some((name, value)) => (name, Some(value)),
         None => (given, None),
@@ -381,9 +379,7 @@ pub(crate) fn flag(given: &str) -> Flag<'_> {
 
 /// Why blaze does not build code with the flags of a rustc command line, naming the first
 /// flag it refuses, when it does not.
-pub(crate) fn refusal<'a, S: AsRef<str> + 'a>(
-    words: impl IntoIterator<Item = &'a S>,
-) -> Option<String> {
+pub fn refusal<'a, S: AsRef<str> + 'a>(words: impl IntoIterator<Item = &'a S>) -> Option<String> {
     flags(words).iter().find_map(Flag::refusal)
 }
 

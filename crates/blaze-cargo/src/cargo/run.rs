@@ -158,7 +158,7 @@ fn without_colors(text: &str) -> String {
 
 /// Starts `command` once the daemon is not writing its program (`splice::unwritten`): one
 /// started while the file is open for writing is refused ("text file busy").
-pub(crate) fn started(command: &mut Command) -> std::io::Result<std::process::Child> {
+pub fn started(command: &mut Command) -> std::io::Result<std::process::Child> {
     let program = std::path::PathBuf::from(command.get_program());
     started_running(command, &program)
 }
@@ -178,7 +178,7 @@ fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std
 /// cargo's exit status. Under `BLAZE_TESTS=affected` each runs only the tests that have not
 /// passed with what they are a function of as it is now, as the store keeps them
 /// ([`results`]); `verify` runs those too and says whether they passed again ([`affected`]).
-pub(crate) fn tests(
+pub fn tests(
     asked: &Invocation,
     state: &State,
     cwd: &Path,
@@ -623,7 +623,7 @@ fn shown_path(path: &Path, cwd: &Path) -> String {
 
 /// What this command ends with after a process that ended with `status`: its code, or
 /// the code a shell gives one a signal ended.
-pub(crate) fn exit_code(status: ExitStatus) -> i32 {
+pub fn exit_code(status: ExitStatus) -> i32 {
     #[cfg(unix)]
     if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
         return 128 + signal;

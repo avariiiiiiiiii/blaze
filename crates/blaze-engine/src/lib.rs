@@ -3,16 +3,20 @@
 
 #![allow(clippy::print_stderr, reason = "a command line program: stderr is where it speaks")]
 
-mod answers;
+// The cargo drop-in and what it stands on are blaze-cargo's; here they are the engine's modules
+// as they were, `crate::cargo::...`.
+use blaze_cargo::{
+    RUN_TOOL_TARGET, Told, answers, cargo, dep_info, deps, end_with_reader, errors, lock, memory,
+    plan, process, refused_error, remote, renamed, replace, sandbox, socket, stub, trace, tree,
+    version, weaken,
+};
+
 mod as_rustc;
 mod borrowck;
-mod cargo;
 mod check;
 mod content;
-mod dep_info;
-mod deps;
+mod doc;
 mod doctest;
-mod errors;
 mod frozen;
 mod inputs;
 mod link;
@@ -20,28 +24,16 @@ mod live;
 mod macro_list;
 mod macro_sandbox;
 mod manifest;
-mod memory;
 mod mirdump;
 mod outline;
 mod pin;
-mod plan;
-mod process;
-mod remote;
-mod renamed;
-mod sandbox;
 mod shipped;
-mod socket;
 mod splice;
 mod splicer;
-mod stub;
 mod symbols;
 mod test_harness;
 mod tier;
-mod trace;
-mod tree;
-mod unstable;
 mod versions;
-mod weaken;
 mod whole;
 
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
@@ -4004,9 +3996,6 @@ fn write_harnesses(db: &mut RootDatabase, texts: Vec<(vfs::FileId, String)>) -> 
     texts.into_iter().map(|it| it.0).collect()
 }
 
-/// The target of a build script whose commands run on the host (`--run-tool`).
-pub(crate) const RUN_TOOL_TARGET: &str = "wasm32-wasip1";
-
 /// Gives the standard library of a build with `--run-tool` blaze's `std::process` for
 /// wasm32-wasip1 build scripts ([`blaze_wasi::STD_PROCESS`]) in place of the toolchain's
 /// unsupported one. Refused when the toolchain's file is not the one blaze's was written
@@ -5466,31 +5455,6 @@ fn build(
     Ok(Some(build))
 }
 
-/// How many of the functions blaze could not compile an error names.
-const REFUSED_SHOWN: usize = 16;
-/// What the first line of [`refused_error`] says, which the daemon's client finds it by.
-pub(crate) const REFUSED_SAYS: &str = "blaze could not compile";
-
-/// Why a program with nothing of rustc's is not built: the functions it reaches that blaze
-/// could not compile, `reached` of them, each `name: why`, the first [`REFUSED_SHOWN`] named.
-/// Nothing else compiles them (AGENTS.md, no fallback), and a link without them would fail on
-/// what they leave undefined or keep a stand-in that aborts.
-fn refused_error(program: &str, reached: usize, said: impl Iterator<Item = String>) -> String {
-    let mut text = format!(
-        "`{program}` reaches {reached} function{} {REFUSED_SAYS}, and a build with nothing of \
-         rustc's has nothing else to compile {}, so it is not built:",
-        if reached == 1 { "" } else { "s" },
-        if reached == 1 { "it" } else { "them" },
-    );
-    for line in said.take(REFUSED_SHOWN) {
-        text += &format!("\n  {line}");
-    }
-    if reached > REFUSED_SHOWN {
-        text += &format!("\n  and {} more", reached - REFUSED_SHOWN);
-    }
-    text
-}
-
 /// Where the standard library's unit at `unit` lists the functions it refused that are
 /// exported by name ([`Build::refused_exports`]), a line each, `symbol\tname: why`. A program
 /// that declares one in an `extern` block and calls it, when nothing in the library calls it,
@@ -5656,13 +5620,6 @@ fn report(build: &Build) {
     for (reason, (count, example)) in reasons {
         eprintln!("  {count:>5}  {reason}  (e.g. {example})");
     }
-}
-
-/// The lock, also after a thread panicked with it: a build that is interrupted or that
-/// panics unwinds, and what a lock here guards is whole between any two statements, so the
-/// requests after it go on with what is there.
-pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The executables that edits are spliced into, by where each is. One program has as many as
@@ -6391,15 +6348,6 @@ fn selected(args: &Args) -> Vec<String> {
         selected.extend(["--config".to_owned(), config.clone()]);
     }
     selected
-}
-
-/// Has `bytes` be the file at `path`. A file that was there is left as it is for whoever has
-/// it open or under another name: the object of a program can be that of another one too.
-fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut new = path.as_os_str().to_owned();
-    new.push(format!(".{}.new", std::process::id()));
-    std::fs::write(&new, bytes)?;
-    std::fs::rename(&new, path)
 }
 
 /// What cargo said of every crate when the checkouts were last loaded.
@@ -8093,33 +8041,18 @@ usage: blaze <command>
 
 `blaze build|run|test|check` takes cargo's flags. The guide: https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md";
 
-/// Has a command that prints for a reader end quietly when the reader stops reading,
-/// instead of failing on the closed pipe. Not for a process that writes to sockets.
-pub(crate) fn end_with_reader() {
-    #[cfg(unix)]
-    // SAFETY: restores the default action of a signal, before any thread is started.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-}
-
-/// `blaze 0.20261026.0 (fb82b09)`: the crate's version (`0.YYYYMMDD.N`, the release train's,
-/// docs/harness.md "CI"), and the commit, which build.rs takes from `BLAZE_GIT_SHA` (the
-/// release workflow and the flake set it) or the checkout's HEAD.
-pub(crate) fn version() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    match option_env!("BLAZE_GIT_SHA") {
-        Some(sha) if !sha.is_empty() => format!("blaze {version} ({sha})"),
-        _ => format!("blaze {version}"),
-    }
-}
-
 /// The program `blaze-engine`, whose `src/main.rs` is only this.
 pub fn main() -> anyhow::Result<()> {
     // Before anything that could start a thread: the sandbox forks.
     if std::env::args_os().nth(1).is_some_and(|it| it == sandbox::COMMAND) {
         sandbox::command(std::env::args_os().skip(2));
     }
+    blaze_cargo::engine::set(blaze_cargo::engine::Engine {
+        doc: doc::command,
+        stand_ins: link::stand_ins,
+        pin: versions::pin,
+        why_this_one: versions::why_this_one,
+    });
     trace::began();
     renamed::refuse_old_settings();
     if let Some(sources) = option_env!("BLAZE_SOURCES") {
@@ -8543,18 +8476,6 @@ impl Held {
         eprintln!("spare: workspace added in {:.1?}", start.elapsed());
         Some(self)
     }
-}
-
-/// What a worker that was started before its build was known is told on its standard input.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct Told {
-    pub(crate) args: Vec<String>,
-    pub(crate) env: std::collections::BTreeMap<String, String>,
-    pub(crate) cwd: PathBuf,
-    /// The build is one cargo has only started: these are the workspace and its crates, and
-    /// what cargo wrote is in the arguments of the line that follows.
-    #[serde(default)]
-    pub(crate) ahead: bool,
 }
 
 /// A line a worker told a build ahead of cargo's reads while cargo runs.

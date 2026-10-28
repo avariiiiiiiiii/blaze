@@ -11,7 +11,7 @@ use crate::errors::{Diagnostic, RustcDiagnostic, Said};
 
 /// What the values of `--message-format` ask for.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) enum Format {
+pub enum Format {
     #[default]
     Human,
     Short,
@@ -27,7 +27,7 @@ pub(crate) enum Format {
 
 impl Format {
     /// The format `values` ask for, read as cargo reads them, or cargo's error for them.
-    pub(crate) fn of(values: &[String]) -> Result<Format, String> {
+    pub fn of(values: &[String]) -> Result<Format, String> {
         fn two() -> String {
             "cannot specify two kinds of `message-format` arguments".to_owned()
         }
@@ -55,13 +55,13 @@ impl Format {
         Ok(format.unwrap_or_default())
     }
 
-    pub(crate) fn is_json(self) -> bool {
+    pub fn is_json(self) -> bool {
         matches!(self, Format::Json { .. })
     }
 }
 
 /// Says that the check found nothing wrong, as cargo ends a build: in JSON, that it finished.
-pub(crate) fn passed(format: Format) {
+pub fn passed(format: Format) {
     if format.is_json() {
         println!(r#"{{"reason":"build-finished","success":true}}"#);
     }
@@ -70,7 +70,7 @@ pub(crate) fn passed(format: Format) {
 /// Writes `said`, the errors of a check, as `format` asks, and ends as cargo ends a build
 /// rustc turned down: with a line for each crate that has an error, on stderr.
 /// `metadata` is the workspace's, which says what package and target each error is of.
-pub(crate) fn turned_down(format: Format, said: &[Said], metadata: &Metadata) {
+pub fn turned_down(format: Format, said: &[Said], metadata: &Metadata) {
     let units = Units::of(metadata);
     let mut failed: Vec<(usize, Vec<&Diagnostic>)> = Vec::new();
     for said in said {

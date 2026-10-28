@@ -25,13 +25,13 @@
 //! a pack to the size its list gives it, anything else to `BLAZE_REMOTE_MAX`, and what is
 //! longer is refused with nothing of it kept.
 
-mod collect;
-mod gateway;
-mod https;
-mod keeper;
-mod s3;
-mod signed;
-mod transfer;
+pub mod collect;
+pub mod gateway;
+pub mod https;
+pub mod keeper;
+pub mod s3;
+pub mod signed;
+pub mod transfer;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -55,11 +55,11 @@ use tokio::{io::AsyncSeekExt, runtime::Runtime};
 use url::Url;
 
 use gateway::Gateway;
-pub(crate) use https::{Https, next as https_next};
+pub use https::{Https, next as https_next};
 use s3::{S3, Written};
 use signed::{NotRewritten, Trust, Turns, Unremembered};
 use transfer::{Body, Object, TooLong, Version};
-pub(crate) use transfer::{Digest, Fetched, Room, Traffic};
+pub use transfer::{Digest, Fetched, Room, Traffic};
 
 /// How often a list is read again and written again after another machine wrote first.
 const LIST_WRITES: usize = 8;
@@ -70,14 +70,14 @@ const REUSE_FOR: Duration = Duration::from_secs(60 * 60);
 
 /// The most that is read of a list. A line of one is under 200 bytes, so this is a list
 /// of some hundred thousand packs or units.
-pub(crate) const LIST_MAX: u64 = 16 << 20;
+pub const LIST_MAX: u64 = 16 << 20;
 
 /// The most that is taken of one object that is neither a list nor a pack, unless
 /// `BLAZE_REMOTE_MAX` says: the archive of a unit, and the keys of the packs a daemon
 /// fetches from when asked.
 const OBJECT_MAX: u64 = 512 << 20;
 
-pub(crate) struct Remote {
+pub struct Remote {
     place: Place,
     traffic: Arc<Traffic>,
     /// How long a request may go without an answer, or a body without a byte.
@@ -105,7 +105,7 @@ impl Remote {
     /// an answer (30), `BLAZE_REMOTE_READONLY` to never write, `BLAZE_REMOTE_MAX` bytes of
     /// one object, and the keys of `signed.rs`. The turns of its lists are remembered in
     /// `kept_in`, the directory that what is fetched goes to.
-    pub(crate) async fn open(spec: &str, kept_in: &Path) -> anyhow::Result<Remote> {
+    pub async fn open(spec: &str, kept_in: &Path) -> anyhow::Result<Remote> {
         let number = |name: &str, default: u64| match std::env::var(name) {
             Ok(value) => value.parse().with_context(|| format!("{name} is not a number")),
             Err(_) => Ok(default),
@@ -145,18 +145,18 @@ impl Remote {
     /// The remote with its lists taken as they are, signed or not, and written unsigned:
     /// for the standard library a release ships (`shipped.rs`), which is as trusted as the
     /// release, or as the remote the user named for it.
-    pub(crate) fn as_release(mut self) -> Remote {
+    pub fn as_release(mut self) -> Remote {
         self.trust = Trust::of_release();
         self
     }
 
     /// The most that is taken of one object that says nothing of its size.
-    pub(crate) fn object_max(&self) -> u64 {
+    pub fn object_max(&self) -> u64 {
         self.object_max
     }
 
     /// An error when this machine is not to write to the remote, saying why.
-    pub(crate) fn may_write(&self) -> anyhow::Result<()> {
+    pub fn may_write(&self) -> anyhow::Result<()> {
         if self.read_only {
             bail!("BLAZE_REMOTE_READONLY is set: nothing is sent");
         }
@@ -379,7 +379,7 @@ impl Remote {
 
     /// The lines of the list `name`, for a machine that takes what it names. No list is
     /// no lines. A signed list older than one this machine took before is an error.
-    pub(crate) async fn read_list(&self, name: &str) -> anyhow::Result<Option<String>> {
+    pub async fn read_list(&self, name: &str) -> anyhow::Result<Option<String>> {
         let Some((bytes, _)) = self.read_small(name, LIST_MAX).await? else { return Ok(None) };
         let text = String::from_utf8(bytes).with_context(|| format!("`{name}` is not text"))?;
         let taken = match self.trust.open(name, &text) {
@@ -394,7 +394,7 @@ impl Remote {
 
     /// The lines of the list `name`, for a machine that is about to add to it: what it
     /// would write the list back with. A list it would not sign under is an error.
-    pub(crate) async fn read_list_to_extend(&self, name: &str) -> anyhow::Result<Option<String>> {
+    pub async fn read_list_to_extend(&self, name: &str) -> anyhow::Result<Option<String>> {
         let Some((bytes, _)) = self.read_small(name, LIST_MAX).await? else { return Ok(None) };
         let text = String::from_utf8(bytes).with_context(|| format!("`{name}` is not text"))?;
         Ok(Some(self.trust.open_to_extend(name, &text)?.lines.to_owned()))
@@ -415,13 +415,13 @@ impl Remote {
     }
 
     /// Forgets the turns this machine took of the lists of this remote.
-    pub(crate) fn forget_turns(&self) -> std::io::Result<bool> {
+    pub fn forget_turns(&self) -> std::io::Result<bool> {
         self.turns.forget()
     }
 
     /// Replaces the lines of the list `name` by what `extend` makes of them, again if
     /// another machine wrote in between: no write undoes another.
-    pub(crate) async fn extend_list(
+    pub async fn extend_list(
         &self,
         name: &str,
         extend: impl Fn(&str) -> String,
@@ -495,11 +495,7 @@ impl Remote {
     }
 
     /// Sends an object whose name is the hash of its bytes, unless it is there.
-    pub(crate) async fn send_named_by_hash(
-        &self,
-        name: &str,
-        bytes: Vec<u8>,
-    ) -> anyhow::Result<()> {
+    pub async fn send_named_by_hash(&self, name: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
         if !self.holds(name, bytes.len() as u64).await? {
             // Whoever else writes it writes the same bytes.
             self.write_small(name, bytes, None).await?;
@@ -508,11 +504,11 @@ impl Remote {
     }
 
     /// How many requests are made of the remote at a time.
-    pub(crate) fn jobs(&self) -> usize {
+    pub fn jobs(&self) -> usize {
         self.traffic.jobs()
     }
 
-    pub(crate) fn traffic(&self) -> &Traffic {
+    pub fn traffic(&self) -> &Traffic {
         &self.traffic
     }
 }
@@ -606,17 +602,17 @@ fn write_if_unchanged(to: &Path, bytes: &[u8], read_at: Option<&str>) -> anyhow:
 
 /// How the transfers of one push or pull ended.
 #[derive(Default)]
-pub(crate) struct Tally {
-    pub(crate) done: usize,
-    pub(crate) bytes: u64,
+pub struct Tally {
+    pub done: usize,
+    pub bytes: u64,
     /// Left to another process that was fetching the same thing.
-    pub(crate) elsewhere: usize,
-    pub(crate) failed: Vec<anyhow::Error>,
+    pub elsewhere: usize,
+    pub failed: Vec<anyhow::Error>,
 }
 
 impl Tally {
     /// Runs `work` on every item, a few at a time. One that fails does not stop the others.
-    pub(crate) async fn of<T, F>(
+    pub async fn of<T, F>(
         items: impl IntoIterator<Item = T>,
         jobs: usize,
         work: impl FnMut(T) -> F,
@@ -641,7 +637,7 @@ impl Tally {
 
     /// `said` when everything went through, and an error that says how much did not
     /// otherwise, after each failure on a line of its own.
-    pub(crate) fn settle(self, said: String, traffic: &Traffic) -> anyhow::Result<String> {
+    pub fn settle(self, said: String, traffic: &Traffic) -> anyhow::Result<String> {
         if self.failed.is_empty() {
             return Ok(said);
         }
@@ -828,7 +824,7 @@ async fn claim(store: &Path, adopt: bool) -> anyhow::Result<StoreDir> {
 }
 
 /// Sends the sealed packs the project's manifest lacks, and lists the ones that arrived.
-pub(crate) async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
+pub async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
     remote.may_write()?;
     let local = local_packs(&claim(store, true).await?)?;
     let listed = match Manifest::fetch_to_extend(remote, project).await {
@@ -937,14 +933,14 @@ async fn keep_under(dir: StoreDir, limit: Option<u64>) -> anyhow::Result<String>
 }
 
 /// Whether the remote lists any pack of `project`.
-pub(crate) async fn lists(remote: &Remote, project: &str) -> anyhow::Result<bool> {
+pub async fn lists(remote: &Remote, project: &str) -> anyhow::Result<bool> {
     Ok(Manifest::fetch(remote, project).await?.is_some_and(|it| !it.0.is_empty()))
 }
 
 /// Fetches the packs of the project's manifest that are not in the local store, as far as
 /// they fit under `BLAZE_CACHE_MAX`. A pack of another format than this build reads is left
 /// where it is, and one that is longer than the manifest says is rejected.
-pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
+pub async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
     let limit = limit_for(store).map_err(anyhow::Error::msg)?;
     let dir = claim(store, false).await?;
     let local = local_packs(&dir)?;
@@ -988,7 +984,7 @@ const USAGE: &str = "usage: blaze cache push|pull REMOTE [PROJECT]\n       \
                      blaze cache forget REMOTE";
 
 /// `blaze-engine cache VERB`, on the store of the user's builds.
-pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+pub fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let Some(verb) = args.next() else { bail!(USAGE) };
     if verb == "keygen" {
         return signed::keygen(Path::new(&args.next().context(USAGE)?));
@@ -1034,7 +1030,7 @@ fn transfer_command(
 /// Whether a remote that fails fails what it was used for: `BLAZE_REMOTE_REQUIRED=1`, which
 /// CI sets so that a cache that stopped working is not a slowdown nobody sees. Without it the
 /// failure is said on every build's `Finished` line and the build goes on.
-pub(crate) fn required() -> bool {
+pub fn required() -> bool {
     std::env::var_os("BLAZE_REMOTE_REQUIRED").is_some_and(|it| it != "0" && !it.is_empty())
 }
 
@@ -1062,7 +1058,7 @@ fn note_down(store: &Path, place: &str, failed: Option<&anyhow::Error>) {
 }
 
 /// What the build's `Finished` line says of the remote: how it failed last, if it did.
-pub(crate) fn noted_down() -> Option<String> {
+pub fn noted_down() -> Option<String> {
     let store = crate::cargo::daemon::store()?;
     let said = std::fs::read_to_string(store.join(DOWN)).ok()?;
     Some(said.trim().to_owned()).filter(|it| !it.is_empty())
@@ -1200,7 +1196,7 @@ fn verify(store: &Path) -> anyhow::Result<()> {
 }
 
 /// The name of a project, `default` when none is given, as the name of an object.
-pub(crate) fn project_name(given: Option<String>) -> anyhow::Result<String> {
+pub fn project_name(given: Option<String>) -> anyhow::Result<String> {
     let project = given.unwrap_or_else(|| "default".to_owned());
     if project.is_empty() || project.contains(['/', '\\']) || project.starts_with('.') {
         bail!("`{project}` is not the name of a project");
@@ -1210,14 +1206,14 @@ pub(crate) fn project_name(given: Option<String>) -> anyhow::Result<String> {
 
 /// The runtime the transfers of this process run on. The compiler's threads are not its
 /// workers: they wait on it from outside.
-pub(crate) fn runtime() -> anyhow::Result<Runtime> {
+pub fn runtime() -> anyhow::Result<Runtime> {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     Ok(runtime.worker_threads(2).thread_name("blaze-remote").enable_all().build()?)
 }
 
 /// The remote the daemon keeps its store in step with: `BLAZE_REMOTE`, and the project
 /// `BLAZE_PROJECT` names in it.
-pub(crate) struct Shared {
+pub struct Shared {
     store: PathBuf,
     remote: Arc<Remote>,
     project: String,
@@ -1233,7 +1229,7 @@ impl Shared {
     /// `None` without a store or a remote, or with `BLAZE_REMOTE=off`. A remote that
     /// cannot be reached is not an error to the build, unless [`required`]: it compiles
     /// what it would have fetched, and its `Finished` line says so.
-    pub(crate) fn from_env() -> anyhow::Result<Option<Shared>> {
+    pub fn from_env() -> anyhow::Result<Option<Shared>> {
         let Some(store) = std::env::var_os("BLAZE_CACHE").map(PathBuf::from) else {
             return Ok(None);
         };
@@ -1267,7 +1263,7 @@ impl Shared {
     /// shared by all, as `blaze-engine closure materialize` takes the store paths it is asked for.
     /// A remote that cannot be opened is an error; one that fails later is said, and what
     /// it would have brought is missing from the store.
-    pub(crate) fn lazily(store: &Path, spec: &str, project: &str) -> anyhow::Result<Shared> {
+    pub fn lazily(store: &Path, spec: &str, project: &str) -> anyhow::Result<Shared> {
         let runtime = runtime()?;
         let remote = Arc::new(runtime.block_on(Remote::open(spec, store))?);
         Ok(Shared {
@@ -1285,7 +1281,7 @@ impl Shared {
     /// tells which pack holds which key, leaving each pack to the first build that asks.
     /// From here on the store asks this remote for the keys it lacks. An error only when
     /// [`required`].
-    pub(crate) fn pull(&self) -> anyhow::Result<()> {
+    pub fn pull(&self) -> anyhow::Result<()> {
         // An outage during one build is over by the next, or is found again.
         self.remote.traffic.try_again();
         let start = Instant::now();
@@ -1319,7 +1315,7 @@ impl Shared {
     }
 
     /// An error only when [`required`].
-    pub(crate) fn push(&self) -> anyhow::Result<()> {
+    pub fn push(&self) -> anyhow::Result<()> {
         if self.remote.may_write().is_err() {
             return Ok(());
         }
@@ -1367,7 +1363,7 @@ struct Arriving {
 }
 
 /// The packs of a manifest that are not here yet, and which of them holds each key.
-struct Lazy {
+pub struct Lazy {
     store: PathBuf,
     remote: Arc<Remote>,
     runtime: Arc<Runtime>,
@@ -1493,18 +1489,13 @@ impl Lazy {
 impl Remote {
     /// The directory `dir` as a remote, with what is taken of its lists remembered in
     /// `kept_in`.
-    pub(crate) fn in_dir(dir: &Path, kept_in: &Path, trust: Trust, object_max: u64) -> Remote {
+    pub fn in_dir(dir: &Path, kept_in: &Path, trust: Trust, object_max: u64) -> Remote {
         let traffic = Arc::new(Traffic::new(8));
         Remote::in_place(Place::Dir(dir.to_owned()), traffic, kept_in, trust, object_max)
     }
 
     /// The gateway tenant `spec` names as a remote, reached with `token`.
-    pub(crate) fn at_gateway(
-        spec: &str,
-        token: Option<&str>,
-        kept_in: &Path,
-        trust: Trust,
-    ) -> Remote {
+    pub fn at_gateway(spec: &str, token: Option<&str>, kept_in: &Path, trust: Trust) -> Remote {
         let (traffic, patience) = (Arc::new(Traffic::new(8)), Duration::from_secs(5));
         let gateway =
             Gateway::with_token(spec, token.map(str::to_owned), patience, traffic.clone());
@@ -1533,40 +1524,40 @@ impl Remote {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
 
-    pub(crate) fn scratch(name: &str) -> PathBuf {
+    pub fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-remote-{name}-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         dir
     }
 
     /// Writes an object of a directory remote.
-    pub(crate) fn put(remote: &Path, name: &str, bytes: &[u8]) {
+    pub fn put(remote: &Path, name: &str, bytes: &[u8]) {
         let to = remote.join(name);
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
         std::fs::write(to, bytes).unwrap();
     }
 
     /// The keys of a machine that names none and was told to take what is there.
-    pub(crate) fn taking_unsigned() -> Trust {
+    pub fn taking_unsigned() -> Trust {
         Trust::of(None, &[], true)
     }
 
     /// A remote in a new directory whose lists nobody signs and this machine takes.
-    pub(crate) fn unsigned(name: &str, object_max: u64) -> (Remote, PathBuf) {
+    pub fn unsigned(name: &str, object_max: u64) -> (Remote, PathBuf) {
         let dir = scratch(name);
         (Remote::in_dir(&dir, &dir.join("kept"), taking_unsigned(), object_max), dir)
     }
 
-    pub(crate) fn wait<T>(work: impl Future<Output = T>) -> T {
+    pub fn wait<T>(work: impl Future<Output = T>) -> T {
         runtime().unwrap().block_on(work)
     }
 
     /// `seed` and `runs` changes of it, the same ones in every run: bytes cut, flipped,
     /// put in and taken out.
-    pub(crate) fn changed(seed: &[u8], runs: usize) -> impl Iterator<Item = Vec<u8>> {
+    pub fn changed(seed: &[u8], runs: usize) -> impl Iterator<Item = Vec<u8>> {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = move |bound: usize| {
             state ^= state << 13;
@@ -1596,7 +1587,7 @@ pub(crate) mod tests {
     }
 
     /// How many bytes the files below `dir` hold.
-    pub(crate) fn held(dir: &Path) -> u64 {
+    pub fn held(dir: &Path) -> u64 {
         let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
         entries
             .flatten()

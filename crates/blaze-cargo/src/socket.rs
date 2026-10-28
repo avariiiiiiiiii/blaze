@@ -21,23 +21,23 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use uds_windows::{UnixListener, UnixStream};
 
 #[cfg(windows)]
-mod windows;
+pub mod windows;
 
 /// The longest request: a build names every file rustc linked and every source it read.
-pub(crate) const LONGEST_REQUEST: u64 = 16 << 20;
+pub const LONGEST_REQUEST: u64 = 16 << 20;
 
 /// How long a client has to send its request once it is connected.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a client has to take a reply once there is one: a client that asks and never
 /// reads does not keep the thread that answers it.
-pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most connections served at a time, each by a thread. One more is closed unheard.
-pub(crate) const MOST_CONNECTIONS: usize = 256;
+pub const MOST_CONNECTIONS: usize = 256;
 
 /// A socket this process alone serves, for as long as this is kept.
-pub(crate) struct Served {
+pub struct Served {
     listener: UnixListener,
     open: Arc<AtomicUsize>,
     most: usize,
@@ -54,7 +54,7 @@ impl Drop for Served {
 }
 
 /// One of the connections a socket serves at a time, until it is dropped.
-pub(crate) struct Open(Arc<AtomicUsize>);
+pub struct Open(Arc<AtomicUsize>);
 
 impl Drop for Open {
     fn drop(&mut self) {
@@ -64,7 +64,7 @@ impl Drop for Open {
 
 /// Why a socket is not served by this process.
 #[derive(Debug)]
-pub(crate) enum NotServed {
+pub enum NotServed {
     /// Another process holds the lock and serves it.
     Taken,
     Failed(io::Error),
@@ -84,7 +84,7 @@ impl Served {
     /// The socket is made in a directory of its own that only the user can enter and is
     /// moved to `socket` once only the user can connect to it: at no time is it somewhere
     /// others reach with the mode the umask gave it, whatever directory `socket` is in.
-    pub(crate) fn bind(socket: &Path) -> Result<Served, NotServed> {
+    pub fn bind(socket: &Path) -> Result<Served, NotServed> {
         let lock = private_file(OpenOptions::new().write(true).create(true), &lock_of(socket))?;
         if lock.try_lock().is_err() {
             return Err(NotServed::Taken);
@@ -106,7 +106,7 @@ impl Served {
     /// The connections made to the socket, one after another, each with its place among
     /// the ones served at a time. One made when there are as many as that is closed, and
     /// said so on the standard error.
-    pub(crate) fn incoming(&self) -> impl Iterator<Item = (UnixStream, Open)> {
+    pub fn incoming(&self) -> impl Iterator<Item = (UnixStream, Open)> {
         self.listener.incoming().flatten().filter_map(|stream| {
             if self.open.fetch_add(1, Ordering::Relaxed) < self.most {
                 return Some((stream, Open(self.open.clone())));
@@ -121,7 +121,7 @@ impl Served {
 /// Connects to the socket at `socket` when the process that serves it is the user's. A
 /// socket can be anywhere a command line says, and what is sent to it is the request and
 /// the variables of this process: not for another user who listens there first.
-pub(crate) fn connect(socket: &Path) -> io::Result<UnixStream> {
+pub fn connect(socket: &Path) -> io::Result<UnixStream> {
     let stream = UnixStream::connect(socket).map_err(|error| too_long(socket, error))?;
     check_peer(&stream)?;
     Ok(stream)
@@ -146,7 +146,7 @@ fn too_long(path: &Path, error: io::Error) -> io::Error {
 /// has the paths of projects and what their builds print. A link is not followed: in a
 /// directory others write to, it could name any file of the user's.
 #[cfg(unix)]
-pub(crate) fn private_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+pub fn private_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let file = options.mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
     // One that was there keeps the mode it had.
@@ -155,7 +155,7 @@ pub(crate) fn private_file(options: &mut OpenOptions, path: &Path) -> io::Result
 }
 
 #[cfg(windows)]
-pub(crate) fn private_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+pub fn private_file(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
@@ -178,7 +178,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// a directory of theirs in the place of this one after it is checked. Root's are trusted,
 /// and so is the group of a directory the user owns.
 #[cfg(unix)]
-pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
+pub fn private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
     let made = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
     made?;
@@ -224,7 +224,7 @@ fn not_swapped_under(dir: &Path) -> io::Result<()> {
 /// The same by owner and access control list. A directory made here is closed to whom
 /// its parent is open to; one that was there is refused if its list lets others in.
 #[cfg(windows)]
-pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
+pub fn private_dir(dir: &Path) -> io::Result<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -306,14 +306,14 @@ use windows::check_peer;
 
 /// Reads the one line a client sends, without its end: of the user, within the time and
 /// the length a request may take.
-pub(crate) fn read_request(stream: &UnixStream) -> io::Result<String> {
+pub fn read_request(stream: &UnixStream) -> io::Result<String> {
     let [request] = read_lines_within(stream, LONGEST_REQUEST, REQUEST_TIMEOUT)?;
     Ok(request)
 }
 
 /// Reads the two lines a client of a worker sends, as [`read_request`] does one: the
 /// request, and the variables of the client's process.
-pub(crate) fn read_request_and_env(stream: &UnixStream) -> io::Result<[String; 2]> {
+pub fn read_request_and_env(stream: &UnixStream) -> io::Result<[String; 2]> {
     read_lines_within(stream, LONGEST_REQUEST, REQUEST_TIMEOUT)
 }
 

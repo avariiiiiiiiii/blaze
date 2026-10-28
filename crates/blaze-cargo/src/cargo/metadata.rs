@@ -12,7 +12,7 @@ use cargo_metadata::Metadata;
 /// The workspace found from the current directory, or from `manifest_path`, with cargo's
 /// `--config` arguments `config`. A workspace cargo refuses ends the command as cargo ends:
 /// its message, status 101.
-pub(crate) fn no_deps(manifest_path: Option<&Path>, config: &[String]) -> Metadata {
+pub fn no_deps(manifest_path: Option<&Path>, config: &[String]) -> Metadata {
     let cwd = std::env::current_dir().unwrap_or_default();
     let config = Config::from_process().and_then(|mut process| {
         process.start("metadata", config)?;
@@ -39,7 +39,7 @@ fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata
 /// reading and resolution, the graph that of the build, its features unified over the other
 /// members only as `resolver.feature-unification` says. `BLAZE_OWN_RESOLVE=0` leaves both to
 /// cargo.
-pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::OwnMetadata> {
+pub fn own(selection: &crate::plan::Selection) -> Option<project_model::OwnMetadata> {
     if std::env::var_os("BLAZE_OWN_RESOLVE").is_some_and(|it| it == "0") {
         return None;
     }
@@ -198,7 +198,7 @@ fn library_read(
 /// `target` or the host's: what cargo's unit graph has. The plan is kept in `kept_in` and
 /// used again while what it was made of is unchanged ([`Plan::made_of`]): resolving the
 /// workspace is most of what the client of a no-op build does.
-pub(crate) fn programs(
+pub fn programs(
     selection: &crate::plan::Selection,
     cwd: &Path,
     manifest: Option<&Path>,
@@ -371,7 +371,7 @@ fn resolved_programs(
 /// for it, made by blaze-units from blaze's own resolution with no cargo run. `triple` and
 /// `cfg` are the platform built for; `env` the variables of whoever asks, where they are not
 /// this process's. A build blaze-units cannot make the graph of is an error naming why.
-pub(crate) fn units(
+pub fn units(
     selection: &crate::plan::Selection,
     cwd: &Path,
     manifest: Option<&Path>,
@@ -491,7 +491,7 @@ fn filter(targets: &[String]) -> blaze_units::Filter {
 /// in `cwd` (of the package of `manifest`, when there is one), for the triple `selection`
 /// names or the host's: the targets the check picks, each checked as a test or not, and what
 /// they depend on.
-pub(crate) fn checked(
+pub fn checked(
     selection: &crate::plan::Selection,
     targets: &[String],
     cwd: &Path,
@@ -562,7 +562,7 @@ fn platform_cfg(atom: &cfg::CfgAtom) -> Option<cargo_platform::Cfg> {
 }
 
 /// `err` as cargo prints it.
-pub(super) fn refused(err: &anyhow::Error, cwd: &Path) {
+pub fn refused(err: &anyhow::Error, cwd: &Path) {
     if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
         eprintln!("{}", diagnostic.render(cwd));
         return;

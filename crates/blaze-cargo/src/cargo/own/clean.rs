@@ -17,7 +17,7 @@ use crate::cargo::say;
 const ABORT_NOTE: &str =
     "cleaning has been aborted to prevent accidental deletion of unrelated files";
 
-pub(super) fn command(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn command(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [
         switch(&["--doc"]),
         valued(&["-p", "--package"]),

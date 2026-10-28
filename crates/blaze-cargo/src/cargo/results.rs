@@ -42,14 +42,14 @@ const RESULTS: &str = "test results 1";
 const SETS: u8 = 4;
 
 /// Names where results kept by this command come from, in place of what CI says of the run.
-pub(crate) const FROM: &str = "BLAZE_TESTS_FROM";
+pub const FROM: &str = "BLAZE_TESTS_FROM";
 
-pub(crate) type Key = [u8; 32];
+pub type Key = [u8; 32];
 
 /// How much of a path a test saw: only what a `stat` says, or what is in it too. A path seen
 /// both ways was seen whole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Seen {
+pub enum Seen {
     Looked,
     Whole,
 }
@@ -64,11 +64,11 @@ impl Seen {
 }
 
 /// The paths a test read, each with how much of it it saw.
-pub(crate) type Reads = BTreeMap<String, Seen>;
+pub type Reads = BTreeMap<String, Seen>;
 
 /// What the store has of a test.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Found {
+pub enum Found {
     /// It passed under the key, as the run `from` said.
     Passed { from: String },
     /// It passed and failed under the key: it runs.
@@ -79,7 +79,7 @@ pub(crate) enum Found {
 }
 
 /// The store's test results, and what this command found of the paths tests read.
-pub(crate) struct Results {
+pub struct Results {
     store: &'static blaze_store::Store,
     from: String,
     inputs: HashMap<(String, Seen), String>,
@@ -88,20 +88,20 @@ pub(crate) struct Results {
 impl Results {
     /// The results of the store this command uses, `None` when it uses none
     /// (`BLAZE_CACHE=off`).
-    pub(crate) fn open() -> Option<Results> {
+    pub fn open() -> Option<Results> {
         blaze_store::compiles_against(RESULTS);
         let store = blaze_store::Store::global_or(super::daemon::store().as_deref())?;
         Some(Results { store, from: from(), inputs: HashMap::new() })
     }
 
     /// The first key of the test `name`: `identity` is all that is known of it before it runs.
-    pub(crate) fn first(identity: &str, name: &str) -> Key {
+    pub fn first(identity: &str, name: &str) -> Key {
         keyed(&[RESULTS.as_bytes(), b"first", identity.as_bytes(), name.as_bytes()])
     }
 
     /// What the store has of the test with the first key `first`, which reaches the world
     /// outside its code when `reaches`.
-    pub(crate) fn find(&mut self, first: &Key, reaches: bool) -> Found {
+    pub fn find(&mut self, first: &Key, reaches: bool) -> Found {
         if !reaches {
             return self.found(&pure(first));
         }
@@ -145,7 +145,7 @@ impl Results {
     /// Keeps what a run of the test with the first key `first` ended with: `reads` are the
     /// paths it read when it reaches the world outside its code, `None` when it reaches none.
     /// Whether it is flaky: it ended otherwise under the same key before.
-    pub(crate) fn keep(&mut self, first: &Key, reads: Option<&Reads>, passed: bool) -> bool {
+    pub fn keep(&mut self, first: &Key, reads: Option<&Reads>, passed: bool) -> bool {
         let key = match reads {
             None => pure(first),
             Some(reads) => self.second(first, reads),
@@ -220,19 +220,19 @@ impl Results {
     }
 
     /// Writes what was kept to the store's files.
-    pub(crate) fn flush(&self) {
+    pub fn flush(&self) {
         self.store.flush();
     }
 
     /// Seals what was kept, for the next command and a push to a remote to have.
-    pub(crate) fn seal(&self) {
+    pub fn seal(&self) {
         self.store.seal();
     }
 }
 
 /// The paths a test of a run in the sandbox read, by the run's `record`: those its thread read
 /// and those read where no test was known. `None` when what it read is not all known.
-pub(crate) fn reads_of(record: &[Line], name: &str) -> Option<Reads> {
+pub fn reads_of(record: &[Line], name: &str) -> Option<Reads> {
     let its = |it: &&Line| it.test.is_empty() || it.test == name;
     let mut reads = Reads::new();
     for line in record.iter().filter(its) {
@@ -292,7 +292,7 @@ fn input(path: &Path, seen: Seen) -> String {
 
 /// What stands for the programs `paths` (an integration test's `CARGO_BIN_EXE_<name>`) in a
 /// test's first key: their bytes, read once by a command.
-pub(crate) fn programs(paths: &[&Path]) -> String {
+pub fn programs(paths: &[&Path]) -> String {
     static KNOWN: std::sync::Mutex<BTreeMap<std::path::PathBuf, String>> =
         std::sync::Mutex::new(BTreeMap::new());
     let mut known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -29,14 +29,14 @@ const POLL: Duration = Duration::from_millis(5);
 
 /// Whether a daemon is started when none listens.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Start {
+pub enum Start {
     IfMissing,
     Never,
 }
 
 /// Sends `request` to the daemon. `None` when there is none and none was to be started;
 /// `Reply::Restart` when the one there is is of another version and none was to be started.
-pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply>> {
+pub fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply>> {
     let home = home()?;
     let socket = socket_in(&home);
     // A daemon of another version exits for a client that starts its own, and for one that
@@ -99,7 +99,7 @@ fn left(socket: &Path) -> bool {
 
 /// Waits for a daemon that is exiting to be gone: it exits once it has answered, and its
 /// socket goes with it.
-pub(crate) fn gone(socket: &Path) {
+pub fn gone(socket: &Path) {
     let asked = Instant::now();
     while connect(socket).is_ok() && asked.elapsed() < PATIENCE {
         std::thread::sleep(POLL);
@@ -151,7 +151,7 @@ fn on_its_own(daemon: &mut Command) -> impl Drop + use<> {
 }
 
 /// Why no daemon answered: there is none, or one ended without taking its socket with it.
-pub(crate) fn why_none() -> String {
+pub fn why_none() -> String {
     let left = home().map(|it| (socket_in(&it), it.join("daemon.log")));
     match left {
         Ok((socket, log)) if socket.exists() => format!(

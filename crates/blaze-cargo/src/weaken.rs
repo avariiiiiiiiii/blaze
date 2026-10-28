@@ -30,14 +30,14 @@ use object::{
 
 /// The directory of the copies, in the one the files are in. Named anew when the copies
 /// change, so that none of an older blaze is taken for one of this.
-pub(crate) const DIR: &str = "blaze-weak-2";
+pub const DIR: &str = "blaze-weak-2";
 
 /// The directories of copies older blazes wrote, which this one deletes.
 const OLD_DIRS: [&str; 1] = ["blaze-weak"];
 
 /// Writes the copy of each file and prints where it is, in the order given. With `--shared`
 /// first, the copy is the one an ELF link takes ([`shared`]), or the file itself.
-pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let mut args = args.peekable();
     let made: fn(&Path) -> anyhow::Result<PathBuf> =
         if args.next_if(|it| it == "--shared").is_some() { shared } else { copy_of };
@@ -49,7 +49,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
 
 /// Writes the copy of `file`, unless the one there is of the file as it is, and says where
 /// it is.
-pub(crate) fn copy_of(file: &Path) -> anyhow::Result<PathBuf> {
+pub fn copy_of(file: &Path) -> anyhow::Result<PathBuf> {
     let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
         anyhow::bail!("{} names no file", file.display());
     };
@@ -104,7 +104,7 @@ enum Made {
 
 /// Makes the definitions of a Mach-O object weak, and its statics private to the program;
 /// an object of another format stays as it is.
-pub(crate) fn definitions(data: &mut [u8]) {
+pub fn definitions(data: &mut [u8]) {
     weaken_but(data, |_| Made::Private);
     share_statics(data);
 }
@@ -151,7 +151,7 @@ fn share_statics(data: &mut [u8]) {
 /// private to an object is one no other object can refer to. Hidden, the name stays the
 /// program's own; global, two definitions of one name are the linker's first-stays rule, as
 /// for every other name of rustc's, of which a static has one.
-pub(crate) fn shared(file: &Path) -> anyhow::Result<PathBuf> {
+pub fn shared(file: &Path) -> anyhow::Result<PathBuf> {
     let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
         anyhow::bail!("{} names no file", file.display());
     };
@@ -431,7 +431,7 @@ fn sections_written(data: &[u8]) -> Vec<bool> {
 /// A name of C's (`#[no_mangle]`, `#[export_name]`) is weak and not private: a program can
 /// export it (bun's `-exported_symbols_list` names its `napi_*` for the addons it loads), and
 /// Apple's linker exports no private one. The names of Rust's and of blaze's are private.
-pub(crate) fn ours(data: &mut [u8]) {
+pub fn ours(data: &mut [u8]) {
     // Kept, no name is made anything: the object, gigabytes of a large program's, is not
     // copied to be read.
     let mut has_main = false;

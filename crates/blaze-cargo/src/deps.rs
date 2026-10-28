@@ -57,7 +57,7 @@ fn unpacked_max() -> anyhow::Result<Option<u64>> {
 }
 
 /// The archives the lines of a list of units name.
-pub(crate) fn archives(lines: &str) -> impl Iterator<Item = Digest> {
+pub fn archives(lines: &str) -> impl Iterator<Item = Digest> {
     Listed::parse(lines).0.into_values()
 }
 
@@ -373,7 +373,7 @@ fn turns_kept_in(dir: &Path) -> PathBuf {
 }
 
 /// `blaze-engine deps push|pull REMOTE DIR [PROJECT]`, in the directory of `Cargo.lock`.
-pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+pub fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     const USAGE: &str = "usage: blaze-engine deps push|pull REMOTE DIR [PROJECT]";
     let (Some(verb), Some(remote), Some(dir)) = (args.next(), args.next(), args.next()) else {
         bail!(USAGE);

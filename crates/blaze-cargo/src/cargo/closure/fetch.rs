@@ -39,25 +39,25 @@ const ASKED: usize = 32;
 
 /// What a fetch did.
 #[derive(Debug, Default)]
-pub(crate) struct Fetched {
+pub struct Fetched {
     /// The store paths of the closure.
-    pub(crate) paths: usize,
+    pub paths: usize,
     /// Of them, those the store had.
-    pub(crate) had: usize,
+    pub had: usize,
     /// What the NARs downloaded came to, as they were sent and unpacked.
-    pub(crate) file_bytes: u64,
-    pub(crate) nar_bytes: u64,
+    pub file_bytes: u64,
+    pub nar_bytes: u64,
 }
 
 /// Where narinfos and NARs come from: the cache, or what `BLAZE_NIX_CACHE` names, an address
 /// or a directory laid out as a cache is (`<hash>.narinfo`, `nar/<file>`).
-pub(crate) enum Source {
+pub enum Source {
     Web { infos: Https, nars: Https },
     Dir(PathBuf),
 }
 
 impl Source {
-    pub(crate) fn from_env() -> anyhow::Result<Source> {
+    pub fn from_env() -> anyhow::Result<Source> {
         let given = std::env::var("BLAZE_NIX_CACHE").ok().filter(|it| !it.is_empty());
         if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
             return Ok(Source::Dir(PathBuf::from(dir)));
@@ -156,7 +156,7 @@ struct Resolved {
 
 /// Takes the closure of `roots` into `store`: what the store has is kept, the rest downloaded
 /// from `source`, each narinfo taken only if signed by one of `keys`.
-pub(crate) fn fetch(
+pub fn fetch(
     store: &Store,
     roots: &[StorePath],
     source: &Source,

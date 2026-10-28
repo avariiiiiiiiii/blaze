@@ -18,7 +18,7 @@ const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
 /// linker makes chains for a deployment target of macOS 12 or later, as nix's shell sets, and
 /// `cc` gives a line that names none the version of the Mac it runs on. The links of
 /// [`crate::link`] ask for it too.
-pub(crate) const NO_FIXUP_CHAINS: &str = "-Wl,-no_fixup_chains";
+pub const NO_FIXUP_CHAINS: &str = "-Wl,-no_fixup_chains";
 
 /// The room Apple's linker is told to leave after the load commands when nothing says more,
 /// so that a splice has room there for its two segments and for the unwind table, which
@@ -72,47 +72,47 @@ const LIBRARY: [&str; 3] = ["core", "alloc", "std"];
 
 /// A program as the daemon builds it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct Plan {
+pub struct Plan {
     /// The root files of the crates of the workspace that blaze compiles, the program's own
     /// first.
-    pub(crate) crates: Vec<PathBuf>,
+    pub crates: Vec<PathBuf>,
     /// The object with all of blaze's code for the program.
-    pub(crate) object: PathBuf,
+    pub object: PathBuf,
     /// The object with what an edit changed.
-    pub(crate) patch: PathBuf,
+    pub patch: PathBuf,
     /// The executable the daemon links and splices.
-    pub(crate) binary: PathBuf,
+    pub binary: PathBuf,
     /// The executable rustc linked, which the daemon's first edits are patches of.
     #[serde(default)]
-    pub(crate) rustc_binary: Option<PathBuf>,
+    pub rustc_binary: Option<PathBuf>,
     /// The command that links `binary`, for a shell.
-    pub(crate) link_cmd: String,
-    pub(crate) symbol_files: Vec<PathBuf>,
+    pub link_cmd: String,
+    pub symbol_files: Vec<PathBuf>,
     /// Whether the program's own crate is compiled with `cfg(test)` and is not a test target:
     /// the unit tests of a library or a binary.
-    pub(crate) unit_test: bool,
+    pub unit_test: bool,
     /// The source of the libraries of the workspace a unit test is linked with as rustc built
     /// them, without `cfg(test)`: a change to their tests alone leaves rustc's copy as it is.
-    pub(crate) linked_as_built: Vec<PathBuf>,
+    pub linked_as_built: Vec<PathBuf>,
     /// The copies of rustc's output the plan names, which have to stay.
-    pub(crate) copies: Vec<PathBuf>,
+    pub copies: Vec<PathBuf>,
     /// The package rustc wrote of what a debugger reads of the program it linked, when the
     /// profile keeps that in one (`split-debuginfo = "packed"`).
     #[serde(default)]
-    pub(crate) package: Option<PathBuf>,
+    pub package: Option<PathBuf>,
     /// The newest record the plan was made from.
-    pub(crate) stamp: u128,
+    pub stamp: u128,
     /// Whether the program is built whole by the daemon, every crate of it compiled and
     /// `binary` linked by blaze, with nothing of rustc's (docs/no-rustc.md, step K).
     #[serde(default)]
-    pub(crate) whole: bool,
+    pub whole: bool,
     /// Whether `binary` is a shared library, a `cdylib`, which exports the functions and
     /// statics its crate names with `#[no_mangle]` or `#[export_name]` (#262). It is built
     /// again on what the worker has loaded and linked again each time, not patched: a patch
     /// spliced into it would not export a function an edit adds or the new value of an
     /// exported static, and the splice reads no Mach-O library.
     #[serde(default)]
-    pub(crate) shared: bool,
+    pub shared: bool,
 }
 
 /// The library of the workspace among `records` that wrote the file a link line names. The
@@ -129,7 +129,7 @@ fn member_that_wrote<'a>(records: &'a [Record], file: &Path) -> Option<&'a Recor
 impl Plan {
     /// Plans the program `unit` built, with the daemon's files for it in `dir`. `records` are
     /// the units of the workspace. `Err` is why the program is left to cargo.
-    pub(crate) fn of(
+    pub fn of(
         unit: &Record,
         records: &[Record],
         dir: &Path,
@@ -244,11 +244,11 @@ fn calls_by_symbol(unit: &Record) -> bool {
 /// when it does: [`harness_alone`]. A program's own file is never named so, as rustc takes no
 /// `.` in a crate's name: a whole build links a program of tests in the same directory, and
 /// one of an integration test `tests/tests.rs` is named `tests`.
-pub(crate) const TESTS: &str = "tests.harness";
+pub const TESTS: &str = "tests.harness";
 
 /// The file in a program of tests' directory that says `blaze test` runs only the
 /// tests an edit reaches, for the daemon to write [`REACH`] at each build of it.
-pub(crate) const REACH_WANTED: &str = "tests-reach-wanted";
+pub const REACH_WANTED: &str = "tests-reach-wanted";
 
 /// What the daemon wrote of each test of the program at its last build, one a line: a hash of
 /// what decides how the test ends, a tab and libtest's name of it; or `-`, the name, a tab,
@@ -256,7 +256,7 @@ pub(crate) const REACH_WANTED: &str = "tests-reach-wanted";
 /// test, joined by ` -> `; or `*`, a tab and why every test is. A test that reaches the world
 /// outside the program has `~` before its hash, then why and the calls as `-` has them: what
 /// it read there, which a sandbox records, decides the rest. Written whole, or not there.
-pub(crate) const REACH: &str = "tests-reach";
+pub const REACH: &str = "tests-reach";
 
 /// Why the tests of `unit` are only right as rustc built them under rustc's harness, if they
 /// are. rustc's harness, where it stays in a test executable, calls the tests and their
@@ -301,7 +301,7 @@ fn unsupported(unit: &Record) -> Option<String> {
 
 /// The line rustc ran the linker with: the variables it set, the driver, the arguments.
 #[derive(Clone)]
-pub(crate) struct LinkLine {
+pub struct LinkLine {
     /// What the line starts with to run the driver without some variables: `env -u NAME`.
     without: Vec<String>,
     env: Vec<(String, String)>,
@@ -337,7 +337,7 @@ impl Flavor {
 
 impl LinkLine {
     /// `None` for a line that is of no linker the daemon knows.
-    pub(crate) fn parse(line: &str) -> Option<LinkLine> {
+    pub fn parse(line: &str) -> Option<LinkLine> {
         let words = shlex::split(line.lines().find(|it| it.contains('"'))?)?;
         let unsets = match words.first().map(String::as_str) {
             Some("env") => words[1..].chunks(2).take_while(|it| it[0] == "-u").count(),
@@ -398,7 +398,7 @@ impl LinkLine {
     }
 
     /// What rustc built that is linked, and the standard library's crates next to it.
-    pub(crate) fn rustc_files(&self) -> Vec<PathBuf> {
+    pub fn rustc_files(&self) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> =
             self.args.iter().filter(|it| is_rustc_file(it)).map(PathBuf::from).collect();
         let library = files.iter().find_map(|it| {
@@ -423,7 +423,7 @@ impl LinkLine {
     /// built, with its arguments in the file at `response`: a line with all of them is longer
     /// than a process may be given. Next to it is the file of the line that takes out the
     /// code nothing reaches, as rustc's does ([`reached_only`]).
-    pub(crate) fn command(
+    pub fn command(
         mut self,
         ahead: &[&Path],
         binary: &Path,
@@ -597,7 +597,7 @@ fn is_rustc_file(arg: &str) -> bool {
 /// program has to keep (the panic runtime, the allocator's shims, `#[used]` statics). A
 /// linker that reads each archive once, as GNU ld does, needs it to take the panic runtime,
 /// which comes before the standard library that calls it.
-pub(crate) fn is_symbols(arg: &str) -> bool {
+pub fn is_symbols(arg: &str) -> bool {
     arg.ends_with("symbols.o")
 }
 
@@ -612,7 +612,7 @@ fn reached_file(response: &Path) -> PathBuf {
 /// some of it uses what nothing defines, as zed's `webrtc` does what X11's `libXtst` would,
 /// which rustc's line never asks for. The executable is linked without that code then, and
 /// an edit that calls into what was taken out is linked in full.
-pub(crate) fn reached_only(cmd: &str) -> Option<String> {
+pub fn reached_only(cmd: &str) -> Option<String> {
     let args = shlex::split(cmd)?;
     let (response, reached) = args.iter().find_map(|it| {
         let response = Path::new(it.strip_prefix('@')?);
@@ -633,21 +633,21 @@ pub(crate) fn reached_only(cmd: &str) -> Option<String> {
 /// The file the link of the Apple executable at `binary` reads the room after its load
 /// commands from: a response file of the one argument that asks for it. The daemon makes it
 /// more when a link leaves a splice too little, and the links after start from it.
-pub(crate) fn headerpad_file(binary: &Path) -> PathBuf {
+pub fn headerpad_file(binary: &Path) -> PathBuf {
     let mut file = binary.as_os_str().to_owned();
     file.push(".headerpad");
     PathBuf::from(file)
 }
 
 /// The room the link of the executable at `binary` asks for, when it reads it from a file.
-pub(crate) fn headerpad_of(binary: &Path) -> Option<u64> {
+pub fn headerpad_of(binary: &Path) -> Option<u64> {
     headerpad_in(std::fs::read_to_string(headerpad_file(binary)).ok()?.trim())
 }
 
 /// The last argument of a link of the Apple executable at `binary`, which has it read the room
 /// from [`headerpad_file`]: what the line `asked` for, or [`HEADERPAD`], and no less than the
 /// file says already.
-pub(crate) fn headerpad_read(binary: &Path, asked: Option<u64>) -> std::io::Result<String> {
+pub fn headerpad_read(binary: &Path, asked: Option<u64>) -> std::io::Result<String> {
     let kept = headerpad_of(binary);
     let pad = asked.unwrap_or(HEADERPAD).max(kept.unwrap_or(0));
     if kept != Some(pad) {
@@ -660,7 +660,7 @@ pub(crate) fn headerpad_read(binary: &Path, asked: Option<u64>) -> std::io::Resu
 /// [`headerpad_read`] wrote it: the room the words before it ask for, its own or a response
 /// file's. A worker makes its command once, and a clean of the target directory while it
 /// runs takes the file from under it (#721).
-pub(crate) fn headerpad_again(cmd: &str) -> std::io::Result<()> {
+pub fn headerpad_again(cmd: &str) -> std::io::Result<()> {
     if !cmd.contains(".headerpad") {
         return Ok(());
     }
@@ -695,7 +695,7 @@ pub(crate) fn headerpad_again(cmd: &str) -> std::io::Result<()> {
 /// slot of each function of another library (which ld64 makes of each lazy one when
 /// everything is bound at load), and fixups in tables. The daemon's own links leave these out
 /// of the line.
-pub(crate) fn rustc_link_args() -> [String; 3] {
+pub fn rustc_link_args() -> [String; 3] {
     [
         format!("{HEADERPAD_FLAG}{RUSTC_HEADERPAD:#x}"),
         "-Wl,-bind_at_load".to_owned(),
@@ -706,24 +706,24 @@ pub(crate) fn rustc_link_args() -> [String; 3] {
 /// What rustc's link of a program for Linux is told besides what cargo asked, and the daemon's
 /// links with it: a GNU build ID, by which a program that takes edits while it runs is known
 /// (`blaze-live`). Not every C compiler has the linker write one (NixOS's does not).
-pub(crate) const BUILD_ID: &str = "-Wl,--build-id";
+pub const BUILD_ID: &str = "-Wl,--build-id";
 
 /// What rustc's link of a program for Linux is told to keep of compiler-builtins, for what
 /// the daemon compiles to call there: the functions of [`hir_ty_codegen::BUILTINS`], which
 /// the linker leaves out when rustc's code calls none of them. A name the target has no
 /// function of is no error.
-pub(crate) fn kept_builtins() -> String {
+pub fn kept_builtins() -> String {
     let kept: Vec<String> =
         hir_ty_codegen::BUILTINS.iter().map(|it| format!("--undefined={it}")).collect();
     format!("{TO_THE_LINKER}{}", kept.join(","))
 }
 
-pub(crate) fn write_headerpad(binary: &Path, pad: u64) -> std::io::Result<()> {
+pub fn write_headerpad(binary: &Path, pad: u64) -> std::io::Result<()> {
     std::fs::write(headerpad_file(binary), format!("{HEADERPAD_FLAG}{pad:#x}\n"))
 }
 
 /// The room an argument of the driver asks Apple's linker for, which reads it in hexadecimal.
-pub(crate) fn headerpad_in(arg: &str) -> Option<u64> {
+pub fn headerpad_in(arg: &str) -> Option<u64> {
     let digits = arg.strip_prefix(HEADERPAD_FLAG)?;
     let digits = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits);
     u64::from_str_radix(digits, 16).ok()

@@ -41,7 +41,7 @@ impl blaze_new::Shell for Said {
 }
 
 /// `cargo new <PATH>`, or with `init` `cargo init [PATH]`.
-pub(super) fn command(name: &str, args: Args<'_>) -> anyhow::Result<i32> {
+pub fn command(name: &str, args: Args<'_>) -> anyhow::Result<i32> {
     let init = name == "init";
     let flags = [
         valued(&["--vcs"]),

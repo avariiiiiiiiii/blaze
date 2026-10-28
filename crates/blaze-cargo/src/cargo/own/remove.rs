@@ -98,7 +98,7 @@ fn usage_line(typed: &[String], left_out: Option<&str>) -> String {
 }
 
 /// `cargo remove [OPTIONS] <DEP_ID>...`.
-pub(super) fn command(typed: &[String]) -> anyhow::Result<i32> {
+pub fn command(typed: &[String]) -> anyhow::Result<i32> {
     let flags = typed.iter().position(|it| it == "--").unwrap_or(typed.len());
     let bare = |at: usize| {
         let next = typed.get(at + 1);

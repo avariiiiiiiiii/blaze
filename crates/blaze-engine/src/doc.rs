@@ -16,7 +16,7 @@ use hir::Crate;
 use ide_db::RootDatabase;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::args::{Args, Flag, switch, valued};
+use crate::cargo::own::args::{Args, Flag, switch, valued};
 use crate::{
     cargo::{metadata, say, state::package_dir},
     plan::Selection,

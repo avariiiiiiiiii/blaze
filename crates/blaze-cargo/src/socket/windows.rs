@@ -118,7 +118,7 @@ fn failed(status: u32) -> io::Result<()> {
 }
 
 /// Whether `path` is this user's by its owner, as [`the_users_alone`] reads it.
-pub(super) fn owned_by_user(path: &Path) -> io::Result<bool> {
+pub fn owned_by_user(path: &Path) -> io::Result<bool> {
     let (mut owner, mut descriptor) = (ptr::null_mut(), ptr::null_mut());
     // SAFETY: the path ends with a zero, and the descriptor that `owner` points into is freed
     // after its last use.
@@ -144,7 +144,7 @@ pub(super) fn owned_by_user(path: &Path) -> io::Result<bool> {
 /// The rights of the owner, whoever that is, are this user's once the owner is.
 /// What an administrator makes is owned by the group of administrators, which is the
 /// owner of the token then.
-pub(super) fn the_users_alone(path: &Path) -> io::Result<()> {
+pub fn the_users_alone(path: &Path) -> io::Result<()> {
     let (mut owner, mut descriptor) = (ptr::null_mut(), ptr::null_mut());
     let mut list: *mut ACL = ptr::null_mut();
     // SAFETY: the path ends with a zero, and the descriptor that `owner` and `list` point
@@ -206,7 +206,7 @@ pub(super) fn the_users_alone(path: &Path) -> io::Result<()> {
 
 /// Leaves `path` open to this user, the system and the administrators, and to nobody its
 /// parent is open to. What is made later in one that is a directory inherits that.
-pub(super) fn only_the_user_opens(path: &Path) -> io::Result<()> {
+pub fn only_the_user_opens(path: &Path) -> io::Result<()> {
     let user = Sid::of(&own_token()?, TokenUser)?.written()?;
     let inherited = if path.is_dir() { "OICI" } else { "" };
     let list =
@@ -252,7 +252,7 @@ pub(super) fn only_the_user_opens(path: &Path) -> io::Result<()> {
 /// Turns away a peer that is another user: the socket tells the process at the other end,
 /// and its token the user. A process of another user that this one may not open is turned
 /// away by that.
-pub(super) fn check_peer(stream: &UnixStream) -> io::Result<()> {
+pub fn check_peer(stream: &UnixStream) -> io::Result<()> {
     let (mut process, mut len) = (0u32, 0u32);
     // SAFETY: the socket is open, and `process` is the four bytes the call writes.
     let failed = unsafe {

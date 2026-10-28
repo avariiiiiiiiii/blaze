@@ -18,7 +18,7 @@ use triomphe::Arc;
 use vfs::{AbsPathBuf, FileId, Vfs, VfsPath, file_set::FileSet};
 
 /// The directories of the source files that can change.
-pub(crate) struct Tree {
+pub struct Tree {
     vfs: Vfs,
     directories: FxHashMap<PathBuf, Directory>,
     /// The files an `include!` named that could not be read, with their timestamp then (`None`
@@ -40,12 +40,12 @@ struct Directory {
 
 /// Files that joined or left the source roots.
 #[derive(Default)]
-pub(crate) struct Moved {
-    pub(crate) added: Vec<(FileId, PathBuf)>,
+pub struct Moved {
+    pub added: Vec<(FileId, PathBuf)>,
 }
 
 impl Tree {
-    pub(crate) fn new(db: &RootDatabase, vfs: Vfs, watched: &[(FileId, &Path)]) -> Tree {
+    pub fn new(db: &RootDatabase, vfs: Vfs, watched: &[(FileId, &Path)]) -> Tree {
         let mut tree =
             Tree { vfs, directories: FxHashMap::default(), unread: FxHashMap::default() };
         tree.watch(db, watched);
@@ -53,7 +53,7 @@ impl Tree {
     }
 
     /// Looks for new files next to `watched` too.
-    pub(crate) fn watch(&mut self, db: &RootDatabase, watched: &[(FileId, &Path)]) {
+    pub fn watch(&mut self, db: &RootDatabase, watched: &[(FileId, &Path)]) {
         for &(file, path) in watched {
             let root = db.file_source_root(file).source_root_id(db);
             if db.source_root(root).source_root(db).is_library {
@@ -66,7 +66,7 @@ impl Tree {
     }
 
     /// Has the directories under `base` listed again: they are read from somewhere else now.
-    pub(crate) fn relist(&mut self, base: &Path) {
+    pub fn relist(&mut self, base: &Path) {
         for (path, dir) in &mut self.directories {
             if path.starts_with(base) {
                 dir.listed = None;
@@ -74,21 +74,21 @@ impl Tree {
         }
     }
 
-    pub(crate) fn vfs(&mut self) -> &mut Vfs {
+    pub fn vfs(&mut self) -> &mut Vfs {
         &mut self.vfs
     }
 
     /// The source files that are new since the last look. Each is in its source root once
     /// this returns, with no text in it yet.
     /// Whether [`Tree::added`] has directories to list again.
-    pub(crate) fn relisted(&self, db: &RootDatabase) -> bool {
+    pub fn relisted(&self, db: &RootDatabase) -> bool {
         self.directories.iter().any(|(path, dir)| {
             let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
             now.is_some() && now != dir.listed
         })
     }
 
-    pub(crate) fn added(&mut self, db: &mut RootDatabase) -> Moved {
+    pub fn added(&mut self, db: &mut RootDatabase) -> Moved {
         let mut stale: Vec<PathBuf> = self
             .directories
             .iter()
@@ -163,7 +163,7 @@ impl Tree {
     /// in the source root of the file that names them, with their text.
     /// Whether [`Tree::included`] has files to add: a file that is not on disk, as that of a
     /// module still to be written, is none.
-    pub(crate) fn includes_more(&self, db: &RootDatabase) -> bool {
+    pub fn includes_more(&self, db: &RootDatabase) -> bool {
         db.included_sources().into_iter().any(|(path, root)| {
             let source_root = db.source_root(root).source_root(db);
             let known = self.vfs.file_id(&VfsPath::from(path.clone()));
@@ -174,7 +174,7 @@ impl Tree {
         })
     }
 
-    pub(crate) fn included(&mut self, db: &mut RootDatabase) -> Vec<(FileId, PathBuf)> {
+    pub fn included(&mut self, db: &mut RootDatabase) -> Vec<(FileId, PathBuf)> {
         let mut added = Vec::new();
         let mut joined: FxHashMap<SourceRootId, Vec<(FileId, VfsPath)>> = FxHashMap::default();
         for (path, root) in db.included_sources() {
@@ -208,7 +208,7 @@ impl Tree {
 
     /// Takes files that are gone out of their source roots, so that a path no longer leads
     /// to them.
-    pub(crate) fn remove(&mut self, db: &mut RootDatabase, files: &[FileId]) {
+    pub fn remove(&mut self, db: &mut RootDatabase, files: &[FileId]) {
         let mut left: FxHashMap<SourceRootId, FxHashSet<FileId>> = FxHashMap::default();
         for &file in files {
             let root = db.file_source_root(file).source_root_id(db);

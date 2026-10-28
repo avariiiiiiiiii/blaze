@@ -5,13 +5,13 @@
 use std::{ffi::OsString, path::PathBuf};
 
 /// A cargo that is running, as the system describes it.
-pub(crate) struct Cargo {
-    pub(crate) pid: u32,
-    pub(crate) executable: PathBuf,
+pub struct Cargo {
+    pub pid: u32,
+    pub executable: PathBuf,
     /// Its arguments, without its own name.
-    pub(crate) args: Vec<String>,
-    pub(crate) cwd: PathBuf,
-    pub(crate) env: Vec<(OsString, OsString)>,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Vec<(OsString, OsString)>,
 }
 
 /// How many processes up from the wrapper cargo is looked for: there are the wrappers the
@@ -20,7 +20,7 @@ const FARTHEST: usize = 8;
 
 impl Cargo {
     /// The nearest process above this one that is cargo. `Err` is why none is known.
-    pub(crate) fn above() -> Result<Cargo, String> {
+    pub fn above() -> Result<Cargo, String> {
         let mut pid = std::process::id();
         for _ in 0..FARTHEST {
             pid = system::parent(pid).ok_or("the process that runs rustc is not cargo")?;
@@ -116,7 +116,7 @@ mod system {
     }
 
     /// The process that started `pid`, when `pid` runs.
-    pub(super) fn parent(pid: u32) -> Option<u32> {
+    pub fn parent(pid: u32) -> Option<u32> {
         let info: libc::proc_bsdinfo = info(pid, libc::PROC_PIDTBSDINFO)?;
         // A process that ended and is not reaped yet.
         (info.pbi_status != libc::SZOMB).then_some(info.pbi_ppid)
@@ -168,7 +168,7 @@ mod system {
         (args.len() == count).then_some((args, env))
     }
 
-    pub(super) fn described(pid: u32) -> Option<Cargo> {
+    pub fn described(pid: u32) -> Option<Cargo> {
         let (args, env) = words(pid)?;
         let env = env.into_iter().filter_map(|it| {
             let bytes = it.into_vec();
@@ -197,11 +197,11 @@ mod system {
 mod system {
     use super::Cargo;
 
-    pub(super) fn parent(_pid: u32) -> Option<u32> {
+    pub fn parent(_pid: u32) -> Option<u32> {
         None
     }
 
-    pub(super) fn described(_pid: u32) -> Option<Cargo> {
+    pub fn described(_pid: u32) -> Option<Cargo> {
         None
     }
 }

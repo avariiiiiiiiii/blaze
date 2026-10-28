@@ -48,7 +48,7 @@ use crate::remote::{self, Https, Traffic};
 use crate::sandbox::{Line, Reached};
 
 /// The file beside `Cargo.lock` with what build scripts download.
-pub(crate) const FILE: &str = "Cargo.fetches.lock";
+pub const FILE: &str = "Cargo.fetches.lock";
 
 /// The format of [`FILE`].
 const VERSION: u32 = 1;
@@ -63,13 +63,13 @@ const WRITTEN: &str = "blaze-fetches";
 const PATIENCE: Duration = Duration::from_secs(60);
 
 /// How a crate's build script is given what it would download.
-pub(crate) struct Override {
+pub struct Override {
     /// The package whose build script it is.
-    pub(crate) package: &'static str,
-    pub(crate) give: Give,
+    pub package: &'static str,
+    pub give: Give,
 }
 
-pub(crate) enum Give {
+pub enum Give {
     /// A value of a variable that has the script download nothing.
     Value { var: &'static str, value: &'static str },
     /// A download, named by the variable the script reads a local copy from.
@@ -85,7 +85,7 @@ pub(crate) enum Give {
 
 /// What the variable names.
 #[derive(Clone, Copy)]
-pub(crate) enum Hand {
+pub enum Hand {
     /// The file downloaded.
     File,
     /// What the archive downloaded holds, unpacked below `into` (where `{target}` is the
@@ -95,22 +95,22 @@ pub(crate) enum Hand {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Archive {
+pub enum Archive {
     Zip,
     /// A tar in a raw LZMA2 stream of a 64 MiB dictionary, as ort's CDN serves it.
     TarLzma2,
 }
 
 /// A package, as an override works out its download.
-pub(crate) struct Of<'a> {
-    pub(crate) version: &'a str,
-    pub(crate) target: &'a str,
+pub struct Of<'a> {
+    pub version: &'a str,
+    pub target: &'a str,
     /// Which of the override's features are on, sorted.
-    pub(crate) features: &'a [String],
+    pub features: &'a [String],
     /// The package's directory.
-    pub(crate) source: &'a Path,
+    pub source: &'a Path,
     /// The directory of a dependency of the package, by its name.
-    pub(crate) dependency: &'a dyn Fn(&str) -> Option<PathBuf>,
+    pub dependency: &'a dyn Fn(&str) -> Option<PathBuf>,
 }
 
 impl Of<'_> {
@@ -119,15 +119,15 @@ impl Of<'_> {
     }
 }
 
-pub(crate) struct Download {
-    pub(crate) url: String,
+pub struct Download {
+    pub url: String,
     /// Below the unpacked download, what the variable names: empty for the directory itself.
-    pub(crate) names: String,
+    pub names: String,
 }
 
 /// The crates blaze hands a download, crate2nix's `defaultCrateOverrides` for build scripts.
 /// Each cites the source of the crate it read, at the version given.
-pub(crate) const OVERRIDES: &[Override] = &[
+pub const OVERRIDES: &[Override] = &[
     // rusty_v8 (`v8` 152.2.0): with `RUSTY_V8_ARCHIVE` set it reads that file and downloads
     // nothing (build.rs:1559), gzipped or not (build.rs:1656). The address is
     // `DEFAULT_ARTIFACT_BASE` (build.rs:793) `/v{version}/` and `static_lib_name` of
@@ -314,33 +314,33 @@ fn between<'a>(text: &'a str, before: &str, after: &str) -> Option<&'a str> {
 /// One download of [`FILE`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Entry {
-    pub(crate) package: String,
-    pub(crate) version: String,
+pub struct Entry {
+    pub package: String,
+    pub version: String,
     /// What `Cargo.lock` pins the package by: its checksum, or its source where it has none.
-    pub(crate) locked: String,
-    pub(crate) target: String,
+    pub locked: String,
+    pub target: String,
     /// The package's features that pick the download that are on, sorted.
     #[serde(default)]
-    pub(crate) features: Vec<String>,
+    pub features: Vec<String>,
     /// The variable the build script is given it by.
-    pub(crate) var: String,
-    pub(crate) url: String,
-    pub(crate) sha256: String,
-    pub(crate) size: u64,
+    pub var: String,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
     /// What the variable names below the unpacked download, when not the directory itself.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) names: String,
+    pub names: String,
 }
 
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct Lock {
+pub struct Lock {
     /// Sorted.
-    pub(crate) fetches: Vec<Entry>,
+    pub fetches: Vec<Entry>,
     /// The `[[system]]` tables: what the system libraries of build scripts resolve to (a
     /// crate's nixpkgs attributes and their store paths, by target). Their fields are the
     /// system resolver's; `blaze lock --fetches` writes them back as it read them.
-    pub(crate) system: Vec<toml::Table>,
+    pub system: Vec<toml::Table>,
 }
 
 #[derive(Deserialize)]
@@ -354,7 +354,7 @@ struct Written {
 }
 
 impl Lock {
-    pub(crate) fn read(text: &str) -> anyhow::Result<Lock> {
+    pub fn read(text: &str) -> anyhow::Result<Lock> {
         let written: Written = toml::from_str(text)?;
         if written.version != VERSION {
             anyhow::bail!(
@@ -369,7 +369,7 @@ impl Lock {
     }
 
     /// The text of [`FILE`]: each entry in order, each field in order.
-    pub(crate) fn text(&self) -> String {
+    pub fn text(&self) -> String {
         let quoted = |it: &str| toml::Value::String(it.to_owned()).to_string();
         let mut text = format!(
             "# Written by `{COMMAND}`: what build scripts download, each by its sha256. A build\n\
@@ -423,23 +423,23 @@ impl Lock {
 
 /// A package of `Cargo.lock`.
 #[derive(Clone, Debug, Deserialize)]
-pub(crate) struct Locked {
-    pub(crate) name: String,
-    pub(crate) version: String,
-    pub(crate) source: Option<String>,
-    pub(crate) checksum: Option<String>,
+pub struct Locked {
+    pub name: String,
+    pub version: String,
+    pub source: Option<String>,
+    pub checksum: Option<String>,
 }
 
 impl Locked {
     /// What it is pinned by: its checksum, its source where it has none (git), and `path`
     /// for a package of the checkout.
-    pub(crate) fn pin(&self) -> String {
+    pub fn pin(&self) -> String {
         self.checksum.clone().or_else(|| self.source.clone()).unwrap_or_else(|| "path".to_owned())
     }
 }
 
 /// The packages of the `Cargo.lock` at `path`.
-pub(crate) fn cargo_lock(path: &Path) -> anyhow::Result<Vec<Locked>> {
+pub fn cargo_lock(path: &Path) -> anyhow::Result<Vec<Locked>> {
     #[derive(Deserialize)]
     struct File {
         #[serde(default)]
@@ -485,16 +485,16 @@ fn locked_at<'a>(
 /// What a build script is given in place of downloading: its variables, and what it is to
 /// read.
 #[derive(Debug, Default)]
-pub(crate) struct Handed {
-    pub(crate) env: Vec<(String, String)>,
-    pub(crate) readable: Vec<PathBuf>,
+pub struct Handed {
+    pub env: Vec<(String, String)>,
+    pub readable: Vec<PathBuf>,
 }
 
 /// What the build script cargo runs with `env`, writing `out_dir`, of the workspace at
 /// `root`, is given in place of what it would download, by [`OVERRIDES`]. A variable of an
 /// override the workspace gives scripts itself (`build-script-env`, `given`) is left as it is.
 /// `Err` names the package and what to run when [`FILE`] has no download of it for this build.
-pub(crate) fn hand(
+pub fn hand(
     env: &[(String, String)],
     out_dir: &Path,
     root: Option<&Path>,
@@ -723,13 +723,13 @@ fn download(url: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// A package of the workspace's resolve for a target, as [`lock`] reads it.
-pub(crate) struct Resolved {
-    pub(crate) locked: Locked,
-    pub(crate) source: PathBuf,
+pub struct Resolved {
+    pub locked: Locked,
+    pub source: PathBuf,
     /// The features on.
-    pub(crate) features: Vec<String>,
+    pub features: Vec<String>,
     /// The directory of each dependency, by its name.
-    pub(crate) dependencies: BTreeMap<String, PathBuf>,
+    pub dependencies: BTreeMap<String, PathBuf>,
 }
 
 /// The entries of [`FILE`] for `resolved`, the packages of each target's resolve by target:
@@ -831,7 +831,7 @@ fn lock(
 /// `blaze lock --fetches [--target <triple>]... [--manifest-path <path>]`: writes [`FILE`]
 /// for the workspace's `Cargo.lock`, downloading what it does not have. Returns the status to
 /// exit with.
-pub(crate) fn command(args: &[String]) -> anyhow::Result<i32> {
+pub fn command(args: &[String]) -> anyhow::Result<i32> {
     let usage = "usage: blaze lock --fetches [--target <TRIPLE>]... [--manifest-path <PATH>]";
     let (mut fetches, mut targets, mut manifest_path) = (false, Vec::new(), None);
     let mut words = args.iter();
@@ -976,7 +976,7 @@ fn resolve(
 /// What a build script that failed having been refused the network (`lines`, its record)
 /// is told of downloads: that blaze has no override for `package`, which addresses it tried
 /// and what an override would be; or, for a package [`OVERRIDES`] has, that it still tried.
-pub(crate) fn no_override_note(
+pub fn no_override_note(
     package: &str,
     lines: &[Line],
     stdout: &[u8],
@@ -1012,7 +1012,7 @@ pub(crate) fn no_override_note(
     if OVERRIDES.iter().any(|it| it.package == package) {
         return Some(format!(
             "the build script of `{package}` tried the network ({tried}) though blaze's override \
-             of it (crates/blaze-engine/src/cargo/fetches.rs) gave it what it downloads: the override \
+             of it (crates/blaze-cargo/src/cargo/fetches.rs) gave it what it downloads: the override \
              is not what this version of it reads"
         ));
     }
@@ -1034,7 +1034,7 @@ pub(crate) fn no_override_note(
     Some(format!(
         "the build script of `{package}` tried the network ({tried}), which a build never has, and \
          blaze has no override that hands `{package}` a locked download. One goes in `OVERRIDES` \
-         of crates/blaze-engine/src/cargo/fetches.rs: `Override {{ package: \"{package}\", give: \
+         of crates/blaze-cargo/src/cargo/fetches.rs: `Override {{ package: \"{package}\", give: \
          Give::Fetch {{ var: \"{var}\", features: &[], download: <its address for a version and \
          target>, hand: Hand::File }} }}`, `{var}` being the variable its build script reads a \
          local copy from; if it reads none, it needs a patch to read a local file"

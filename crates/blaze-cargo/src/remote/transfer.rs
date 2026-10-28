@@ -32,16 +32,16 @@ const CHUNK: usize = 1 << 16;
 
 /// The SHA-256 of an object, which is its name on the remote.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct Digest([u8; 32]);
+pub struct Digest([u8; 32]);
 
 impl Digest {
-    pub(crate) fn of(bytes: &[u8]) -> Digest {
+    pub fn of(bytes: &[u8]) -> Digest {
         Digest(Sha256::digest(bytes).into())
     }
 
     /// The digest written as 64 hex digits, and nothing else: a name that parses is safe
     /// as the name of a file.
-    pub(crate) fn parse(hex: &str) -> Option<Digest> {
+    pub fn parse(hex: &str) -> Option<Digest> {
         let mut digest = [0; 32];
         if hex.len() != 64 || !hex.is_ascii() {
             return None;
@@ -66,11 +66,11 @@ impl fmt::Display for Digest {
 }
 
 /// What a small object was when it was read, for a write that must not undo another's.
-pub(crate) struct Version(pub(super) Option<String>);
+pub struct Version(pub Option<String>);
 
 /// The line to the remote that the transfers of a process share: how many requests are on
 /// it at a time, and what went over it.
-pub(crate) struct Traffic {
+pub struct Traffic {
     gate: Semaphore,
     jobs: usize,
     /// Set when the remote stopped answering, so that what is still waiting does not each
@@ -78,20 +78,20 @@ pub(crate) struct Traffic {
     down: AtomicBool,
     why_down: Mutex<String>,
     /// Calls of the service, and the attempts they took.
-    pub(super) operations: AtomicU64,
-    pub(super) requests: AtomicU64,
+    pub operations: AtomicU64,
+    pub requests: AtomicU64,
     /// Transfers taken up again after they broke off.
-    pub(super) resumed: AtomicU64,
-    pub(super) received: AtomicU64,
-    pub(super) sent: AtomicU64,
+    pub resumed: AtomicU64,
+    pub received: AtomicU64,
+    pub sent: AtomicU64,
     /// Objects that were not what their name says.
-    pub(super) rejected: AtomicU64,
+    pub rejected: AtomicU64,
     /// Objects that came or went whole.
-    pub(super) moved: AtomicU64,
+    pub moved: AtomicU64,
 }
 
 impl Traffic {
-    pub(crate) fn new(jobs: usize) -> Traffic {
+    pub fn new(jobs: usize) -> Traffic {
         let jobs = jobs.max(1);
         Traffic {
             gate: Semaphore::new(jobs),
@@ -110,7 +110,7 @@ impl Traffic {
 
     /// One line of what a push or pull moved and how fast: the objects, the bytes that went
     /// the way of `verb`, the seconds and MiB/s.
-    pub(crate) fn summary(&self, verb: &str, took: Duration) -> String {
+    pub fn summary(&self, verb: &str, took: Duration) -> String {
         let count = |it: &AtomicU64| it.load(Ordering::Relaxed);
         let bytes = match verb {
             "push" => count(&self.sent),
@@ -124,12 +124,12 @@ impl Traffic {
         )
     }
 
-    pub(super) fn jobs(&self) -> usize {
+    pub fn jobs(&self) -> usize {
         self.jobs
     }
 
     /// A place on the line, held for as long as a request and its body take.
-    pub(super) async fn permit(&self) -> anyhow::Result<SemaphorePermit<'_>> {
+    pub async fn permit(&self) -> anyhow::Result<SemaphorePermit<'_>> {
         let permit = self.gate.acquire().await?;
         if self.down.load(Ordering::Relaxed) {
             let why = self.why_down.lock().map(|it| it.clone()).unwrap_or_default();
@@ -147,11 +147,11 @@ impl Traffic {
     }
 
     /// Has the remote tried again after it was taken to be down.
-    pub(super) fn try_again(&self) {
+    pub fn try_again(&self) {
         self.down.store(false, Ordering::Relaxed);
     }
 
-    pub(crate) fn rejected(&self) -> u64 {
+    pub fn rejected(&self) -> u64 {
         self.rejected.load(Ordering::Relaxed)
     }
 }
@@ -174,20 +174,20 @@ impl fmt::Display for Traffic {
 }
 
 /// How much may still be written of what a remote sends, when what it sends does not say.
-pub(crate) struct Room {
+pub struct Room {
     left: Option<AtomicU64>,
     of: u64,
 }
 
 impl Room {
     /// Room for `most` bytes, or for any number of them.
-    pub(crate) fn of(most: Option<u64>) -> Room {
+    pub fn of(most: Option<u64>) -> Room {
         Room { left: most.map(AtomicU64::new), of: most.unwrap_or(u64::MAX) }
     }
 
     /// Takes room for `bytes` that are about to be written: an error when there is not
     /// that much left, before any of them is.
-    pub(crate) fn take(&self, bytes: u64) -> anyhow::Result<()> {
+    pub fn take(&self, bytes: u64) -> anyhow::Result<()> {
         let Some(left) = &self.left else { return Ok(()) };
         let took =
             left.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(bytes));
@@ -202,9 +202,9 @@ impl Room {
 
 /// An object that is longer than what is taken of one.
 #[derive(Debug)]
-pub(crate) struct TooLong {
-    pub(super) name: String,
-    pub(super) most: u64,
+pub struct TooLong {
+    pub name: String,
+    pub most: u64,
 }
 
 impl fmt::Display for TooLong {
@@ -220,7 +220,7 @@ impl fmt::Display for TooLong {
 impl std::error::Error for TooLong {}
 
 /// The bytes of an object from some offset on, as they arrive.
-pub(super) enum Body {
+pub enum Body {
     File(File),
     S3(ByteStream),
     Http(hyper::body::Incoming),
@@ -229,7 +229,7 @@ pub(super) enum Body {
 }
 
 impl Body {
-    pub(super) async fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+    pub async fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
         match self {
             Body::File(file) => {
                 let mut chunk = vec![0; CHUNK];
@@ -246,7 +246,7 @@ impl Body {
 
 /// A failure that waiting does not cure: the service said no, a list names what is not
 /// there, an object is longer than is taken, or a file of this machine could not be written.
-pub(super) fn is_final(error: &anyhow::Error) -> bool {
+pub fn is_final(error: &anyhow::Error) -> bool {
     error.is::<Refused>()
         || error.is::<Missing>()
         || error.is::<TooLong>()
@@ -256,7 +256,7 @@ pub(super) fn is_final(error: &anyhow::Error) -> bool {
 impl super::Remote {
     /// Makes a request of the remote until it is answered, with the waits a broken transfer
     /// is taken up after, for as long as waiting may cure what went wrong.
-    pub(super) async fn patiently<T, F>(&self, mut request: impl FnMut() -> F) -> anyhow::Result<T>
+    pub async fn patiently<T, F>(&self, mut request: impl FnMut() -> F) -> anyhow::Result<T>
     where
         F: Future<Output = anyhow::Result<T>>,
     {
@@ -280,7 +280,7 @@ impl super::Remote {
 }
 
 /// How a fetch ended, when it did not fail.
-pub(crate) enum Fetched {
+pub enum Fetched {
     /// The file is there, and this many bytes came over the line for it.
     Whole(u64),
     /// Another process is fetching the same file.
@@ -467,7 +467,7 @@ impl super::Remote {
     /// a growing wait in between, and by the next process after this one is stopped. Bytes
     /// that are not what was asked for are thrown away and the object is counted as
     /// rejected. A failure that waiting does not cure leaves nothing behind.
-    pub(crate) async fn fetch_file(
+    pub async fn fetch_file(
         &self,
         name: &str,
         want: &Digest,
@@ -483,7 +483,7 @@ impl super::Remote {
     /// and `most` are those of the object. The object is checked before it is unpacked and
     /// the file after, so the name of a file vouches for it however it travelled, and
     /// neither is longer than it was listed as.
-    pub(crate) async fn fetch_coded(
+    pub async fn fetch_coded(
         &self,
         name: &str,
         want: &Digest,
@@ -632,14 +632,14 @@ const RANGE: u64 = 8 << 20;
 
 /// An object that a list names and the remote does not have.
 #[derive(Debug)]
-pub(crate) struct Missing(pub(super) String);
+pub struct Missing(pub String);
 
 /// An object of a remote, as a listing has it.
-pub(crate) struct Object {
-    pub(super) name: String,
-    pub(super) len: u64,
+pub struct Object {
+    pub name: String,
+    pub len: u64,
     /// When it was last written, by the clock of whatever holds it.
-    pub(super) written: SystemTime,
+    pub written: SystemTime,
 }
 
 impl fmt::Display for Missing {
@@ -652,7 +652,7 @@ impl std::error::Error for Missing {}
 
 /// A request the service answered with a no that asking again does not change.
 #[derive(Debug)]
-pub(super) struct Refused(pub(super) String);
+pub struct Refused(pub String);
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

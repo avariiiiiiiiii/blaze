@@ -11,18 +11,18 @@
 
 /// What a dep-info file says.
 #[derive(Default, Debug, PartialEq)]
-pub(crate) struct DepInfo {
+pub struct DepInfo {
     /// The files of the first rule, in its order: rustc gives every target the same ones,
     /// and names the root of the crate first.
-    pub(crate) files: Vec<String>,
+    pub files: Vec<String>,
     /// The variables read, with the value each had, `None` for one that was not set.
-    pub(crate) env: Vec<(String, Option<String>)>,
+    pub env: Vec<(String, Option<String>)>,
 }
 
 impl DepInfo {
     /// Reads the text of a dep-info file. What a file cut short has of its last path is not a
     /// path.
-    pub(crate) fn parse(text: &str) -> DepInfo {
+    pub fn parse(text: &str) -> DepInfo {
         let mut info = DepInfo::default();
         let mut ruled = false;
         for line in text.lines() {
@@ -72,12 +72,12 @@ fn files_of(rule: &str) -> Vec<String> {
 }
 
 /// `path` as a file of a rule: as rustc writes it.
-pub(crate) fn escaped(path: &str) -> String {
+pub fn escaped(path: &str) -> String {
     path.replace(' ', "\\ ")
 }
 
 /// A variable's name or value as rustc writes it after `# env-dep:`.
-pub(crate) fn escaped_variable(text: &str) -> String {
+pub fn escaped_variable(text: &str) -> String {
     text.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r")
 }
 

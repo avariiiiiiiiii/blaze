@@ -47,14 +47,14 @@ const SCRIPT: &str = "build_script_build";
 
 /// The hook that builds a load's build scripts and proc macros for the build `selection`
 /// names.
-pub(crate) fn own(selection: &Selection) -> OwnBuildScripts {
+pub fn own(selection: &Selection) -> OwnBuildScripts {
     let selection = selection.clone();
     OwnBuildScripts(Arc::new(move |cargo, asked| build(cargo, asked, &selection)))
 }
 
 /// Builds and runs the build scripts and proc macros of the build `selection` names of
 /// `cargo`: what each package's script printed and where it wrote, and its proc macro.
-pub(crate) fn build(
+pub fn build(
     cargo: &CargoWorkspace,
     asked: &OwnBuildAsked<'_>,
     selection: &Selection,

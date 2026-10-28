@@ -3,20 +3,19 @@
 //! none is handed to cargo, nor is a cargo plugin run. `docs/cargo.md`, "Every subcommand",
 //! is the table of what each one is.
 
-mod args;
-mod clean;
-mod clippy;
-mod config;
-mod doc;
-mod fmt;
-pub(super) mod manifest;
-mod new;
-mod registry;
-mod remove;
-mod report;
-mod tree;
-mod uninstall;
-mod vendor;
+pub mod args;
+pub mod clean;
+pub mod clippy;
+pub mod config;
+pub mod fmt;
+pub mod manifest;
+pub mod new;
+pub mod registry;
+pub mod remove;
+pub mod report;
+pub mod tree;
+pub mod uninstall;
+pub mod vendor;
 
 use args::Args;
 
@@ -26,7 +25,7 @@ const TABLE: &str =
 
 /// What blaze has of a subcommand of cargo's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Status {
+pub enum Status {
     /// A build, run, test or check, which `cargo/mod.rs` answers.
     Build,
     /// blaze's own.
@@ -36,11 +35,11 @@ pub(crate) enum Status {
 }
 
 /// A subcommand of cargo's, with the names cargo also takes for it.
-pub(crate) struct Subcommand {
-    pub(crate) name: &'static str,
-    pub(crate) aliases: &'static [&'static str],
-    pub(crate) status: Status,
-    pub(crate) about: &'static str,
+pub struct Subcommand {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    pub status: Status,
+    pub about: &'static str,
 }
 
 const fn sub(name: &'static str, status: Status, about: &'static str) -> Subcommand {
@@ -67,7 +66,7 @@ const INFO: Status = Status::Not("blaze's `cargo info` is not written yet");
 
 /// Every subcommand of the pinned nightly's cargo, and `fmt` and `clippy`, which rustup ships
 /// beside it.
-pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
+pub const SUBCOMMANDS: &[Subcommand] = &[
     aka("build", &["b"], Status::Build, "compile the workspace's programs"),
     aka("check", &["c"], Status::Build, "what a build would say of the source, building nothing"),
     aka("run", &["r"], Status::Build, "build and run a program"),
@@ -111,13 +110,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
 ];
 
 /// The subcommand `name` is, by its name or an alias.
-pub(crate) fn named(name: &str) -> Option<&'static Subcommand> {
+pub fn named(name: &str) -> Option<&'static Subcommand> {
     SUBCOMMANDS.iter().find(|it| it.name == name || it.aliases.contains(&name))
 }
 
 /// `blaze <args>` for what is not a build: `args` starts with the subcommand. Returns
 /// the status to exit with.
-pub(crate) fn command(args: Vec<String>) -> anyhow::Result<i32> {
+pub fn command(args: Vec<String>) -> anyhow::Result<i32> {
     let Some((name, rest)) = args.split_first() else { return Ok(0) };
     super::say::color(color_of(rest).as_deref());
     if name == "--list" {
@@ -137,7 +136,7 @@ pub(crate) fn command(args: Vec<String>) -> anyhow::Result<i32> {
         "metadata" => manifest::metadata(Args::new(rest)),
         "locate-project" => manifest::locate_project(Args::new(rest)),
         "verify-project" => manifest::verify_project(Args::new(rest)),
-        "doc" => doc::command(rest),
+        "doc" => (crate::engine::get().doc)(rest),
         "tree" => tree::command(Args::new(rest)),
         "pkgid" => manifest::pkgid(Args::new(rest)),
         "read-manifest" => manifest::read_manifest(Args::new(rest)),
@@ -211,7 +210,7 @@ fn list() {
 
 /// `args` with cargo's flags typed before the subcommand moved after it, where every
 /// subcommand reads them: `blaze -v fmt` is `blaze fmt -v`.
-pub(crate) fn subcommand_first(args: Vec<String>) -> Vec<String> {
+pub fn subcommand_first(args: Vec<String>) -> Vec<String> {
     const VALUED: &[&str] = &["--color", "--config", "-Z", "-C", "--explain"];
     let mut ahead = Vec::new();
     let mut words = args.into_iter();

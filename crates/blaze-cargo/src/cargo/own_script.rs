@@ -20,14 +20,14 @@ use serde_json::{Value, json};
 use super::{keyed, units::Record};
 
 /// The variable that has rustc compile the build scripts, as the harness's reference builds do.
-pub(crate) const BY_RUSTC: &str = "BLAZE_SCRIPTS_BY_RUSTC";
+pub const BY_RUSTC: &str = "BLAZE_SCRIPTS_BY_RUSTC";
 
 /// The name of the script's crate in the description: the one blaze is asked to build.
 const SCRIPT: &str = "build_script_build";
 
 /// The variables cargo sets for rustc that a crate's source reads with `env!`: those of its
 /// package and the `OUT_DIR` of its build script.
-pub(crate) fn read_by_crates(name: &str) -> bool {
+pub fn read_by_crates(name: &str) -> bool {
     name.starts_with("CARGO_PKG_")
         || name.starts_with("CARGO_MANIFEST_")
         || matches!(name, "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "OUT_DIR" | "CARGO")
@@ -39,7 +39,7 @@ pub(crate) fn read_by_crates(name: &str) -> bool {
 /// own output names, beside its `OUT_DIR`: `output` in cargo's layout of `target`, `run/stdout`
 /// in its build-dir layout. `mime_guess` reads `MIME_TYPES_GENERATED_PATH` so; without it a
 /// proc macro that links it (`rust-embed-impl`) was not built.
-pub(crate) fn crate_env() -> BTreeMap<String, String> {
+pub fn crate_env() -> BTreeMap<String, String> {
     crate_env_of(std::env::vars().collect())
 }
 
@@ -74,40 +74,40 @@ fn script_set_names(output: &str) -> Vec<String> {
 
 /// The cfgs rustc compiles a crate with beside the target's, given `args`: `--cfg`, and
 /// `debug_assertions` unless it optimizes or is told not to.
-pub(crate) fn cfg_of(args: &[String]) -> Vec<String> {
+pub fn cfg_of(args: &[String]) -> Vec<String> {
     Asked { args, cwd: Path::new("/") }.cfg()
 }
 
 /// A crate of the description, as rustc was told to compile it.
-pub(crate) struct Described {
-    pub(crate) name: String,
-    pub(crate) root: PathBuf,
-    pub(crate) edition: String,
-    pub(crate) cfg: Vec<String>,
-    pub(crate) env: BTreeMap<String, String>,
+pub struct Described {
+    pub name: String,
+    pub root: PathBuf,
+    pub edition: String,
+    pub cfg: Vec<String>,
+    pub env: BTreeMap<String, String>,
     /// The name each library is linked under and where it is in the description.
-    pub(crate) deps: Vec<(String, usize)>,
+    pub deps: Vec<(String, usize)>,
     /// The library compiled of a proc macro, which a proc-macro server expands with.
-    pub(crate) proc_macro: Option<PathBuf>,
+    pub proc_macro: Option<PathBuf>,
     /// Whether the crate is a proc macro the build compiles.
-    pub(crate) compiled_macro: bool,
+    pub compiled_macro: bool,
     /// The dep-info of the library rustc compiled of it, and the directory its paths are from.
-    pub(crate) inputs: Option<(PathBuf, PathBuf)>,
+    pub inputs: Option<(PathBuf, PathBuf)>,
 }
 
 /// What a build makes of the first crate of its description.
-pub(crate) struct Made<'a> {
+pub struct Made<'a> {
     /// The crate's name in the description, which blaze is asked to build.
-    pub(crate) name: &'a str,
+    pub name: &'a str,
     /// Whether the crate is a proc macro, linked as a shared library with its list of macros.
-    pub(crate) proc_macro: bool,
+    pub proc_macro: bool,
     /// Whether it is built for wasm32-wasip1 with blaze's `std::process`, to run under WASI
     /// (`wasi_script.rs`), not for the host.
-    pub(crate) wasi: bool,
+    pub wasi: bool,
     /// Whether it is built as a WebAssembly module, for a proc macro blaze runs itself.
-    pub(crate) wasm: bool,
-    pub(crate) exe: PathBuf,
-    pub(crate) dep_info: PathBuf,
+    pub wasm: bool,
+    pub exe: PathBuf,
+    pub dep_info: PathBuf,
 }
 
 /// The arguments of one run of rustc, as cargo gave them for a crate.
@@ -175,7 +175,7 @@ impl Asked<'_> {
 /// with its dep-info beside it, as rustc would have, describing it in `dir`. `rustc` is the
 /// compiler cargo named, whose toolchain has the standard library's source. `Err` is why rustc
 /// is to compile it.
-pub(crate) fn compile(
+pub fn compile(
     args: &[String],
     cwd: &Path,
     source: &Path,
@@ -196,7 +196,7 @@ pub(crate) fn compile(
 /// [`compile`] for wasm32-wasip1 into `module`, with blaze's `std::process`, to run under
 /// WASI (`wasi_script.rs`). The libraries it links are described from their records as for
 /// [`compile`]: what their own build scripts printed was printed for the host.
-pub(crate) fn compile_wasi(
+pub fn compile_wasi(
     args: &[String],
     cwd: &Path,
     source: &Path,
@@ -215,7 +215,7 @@ pub(crate) fn compile_wasi(
 }
 
 /// [`compile`] of the crate cargo asked rustc for, made as `made` says.
-pub(crate) fn compile_as(
+pub fn compile_as(
     args: &[String],
     cwd: &Path,
     source: &Path,
@@ -230,7 +230,7 @@ pub(crate) fn compile_as(
 
 /// [`compile_as`] of the crate rustc compiled as `record` says, over the standard library of
 /// `sysroot`, with the variables cargo set for it then.
-pub(crate) fn compile_record(
+pub fn compile_record(
     sysroot: &Path,
     record: &Record,
     made: &Made<'_>,
@@ -245,7 +245,7 @@ pub(crate) fn compile_record(
 /// Builds the first crate of `described`, a `rust-project.json` over the standard library of
 /// `sysroot`, as `made` says, in `dir`: the store's build of the same description when every
 /// file it read is as it was.
-pub(crate) fn compile_described(
+pub fn compile_described(
     sysroot: &Path,
     described: &str,
     made: &Made<'_>,
@@ -296,7 +296,7 @@ fn compile_in(
 /// Builds the first of `crates`, over the standard library of `sysroot`, as `made` says,
 /// describing them in `dir` ([`built`]). `Err` is why it was not built, or a variable its source
 /// read that `rustc_had` says otherwise.
-pub(crate) fn build_described(
+pub fn build_described(
     sysroot: &Path,
     crates: &[Described],
     made: &Made<'_>,
@@ -317,10 +317,10 @@ const BUILDS: &str = "build script and proc macro builds 1";
 /// of its build ([`keyed`]) and the digest of the executable, by a space. A run of the script
 /// is keyed by it (`script.rs`), not by the executable, whose bytes depend on what the store
 /// had when it was linked.
-pub(crate) const MADE_OF: &str = "made-of";
+pub const MADE_OF: &str = "made-of";
 
 /// The file beside `exe` that says what it was built from ([`MADE_OF`]).
-pub(crate) fn made_of_file(exe: &Path) -> PathBuf {
+pub fn made_of_file(exe: &Path) -> PathBuf {
     let mut name = exe.as_os_str().to_owned();
     name.push(".");
     name.push(MADE_OF);
@@ -329,13 +329,13 @@ pub(crate) fn made_of_file(exe: &Path) -> PathBuf {
 
 /// What the build blaze linked at `named` was made of, as [`MADE_OF`] says, when the file is
 /// there and `exe`, where the executable is now, is the one it was written for.
-pub(crate) fn made_of(named: &Path, exe: &Path) -> Option<String> {
+pub fn made_of(named: &Path, exe: &Path) -> Option<String> {
     let text = std::fs::read_to_string(made_of_file(named)).ok()?;
     let (key, digest) = text.trim_end().split_once(' ')?;
     (super::keyed::digest(exe.to_str()?) == digest).then(|| key.to_owned())
 }
 
-pub(crate) fn store() -> Option<&'static blaze_store::Store> {
+pub fn store() -> Option<&'static blaze_store::Store> {
     blaze_store::compiles_against(BUILDS);
     blaze_store::Store::global_or(super::daemon::store().as_deref())
 }
@@ -512,7 +512,7 @@ fn links_proc_macro(crates: &[Described]) -> bool {
 }
 
 /// The `rust-project.json` of `crates` over the standard library of `sysroot`.
-pub(crate) fn description(sysroot: &Path, crates: &[Described]) -> String {
+pub fn description(sysroot: &Path, crates: &[Described]) -> String {
     json!({
         "sysroot": sysroot,
         "sysroot_src": sysroot.join("lib/rustlib/src/rust/library"),
@@ -624,7 +624,7 @@ fn once(done: &Path, make: impl FnOnce() -> Result<(), String>) -> Result<(), St
 /// the store `store`: what the store then has is what any build script's build takes from
 /// it before its own crates, the standard library's unit and the frozen maps of its crates.
 /// With `shipped` it fetches the standard library as builds do.
-pub(crate) fn build_nothing(
+pub fn build_nothing(
     sysroot: &Path,
     dir: &Path,
     store: &Path,

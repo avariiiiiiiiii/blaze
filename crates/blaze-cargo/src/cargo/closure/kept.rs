@@ -28,7 +28,7 @@ const PIECE: &[u8] = b"nix file piece 1";
 
 /// A file is kept in pieces of this many bytes, the last one shorter: the most the store packs
 /// compressed in one value.
-pub(crate) const PIECE_MAX: usize = blaze_store::BLOCK_MAX;
+pub const PIECE_MAX: usize = blaze_store::BLOCK_MAX;
 
 /// How many bytes of pieces are read from the store at once when a path is laid out.
 const BATCH: u64 = 64 << 20;
@@ -42,7 +42,7 @@ fn key(fields: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-pub(crate) fn manifest_key(path: &StorePath) -> [u8; 32] {
+pub fn manifest_key(path: &StorePath) -> [u8; 32] {
     key(&[MANIFEST, path.path.as_bytes(), &path.nar_hash.0])
 }
 
@@ -51,31 +51,31 @@ fn piece_key(bytes: &[u8]) -> [u8; 32] {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     Directory,
     File { executable: bool, size: u64, pieces: Vec<[u8; 32]> },
     Symlink { target: Vec<u8> },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Entry {
+pub struct Entry {
     /// From the root, by names joined with `/`: empty for the root.
-    pub(crate) path: Vec<u8>,
-    pub(crate) kind: Kind,
+    pub path: Vec<u8>,
+    pub kind: Kind,
 }
 
 /// What the store keeps of a store path besides its files' bytes.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Manifest {
-    pub(crate) of: StorePath,
+pub struct Manifest {
+    pub of: StorePath,
     /// The store paths it refers to, itself too where it does.
-    pub(crate) references: Vec<StorePath>,
+    pub references: Vec<StorePath>,
     /// In the order of its NAR: a directory before what is in it.
-    pub(crate) entries: Vec<Entry>,
+    pub entries: Vec<Entry>,
 }
 
 impl Manifest {
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let bytes = |out: &mut Vec<u8>, bytes: &[u8]| {
             out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -112,7 +112,7 @@ impl Manifest {
         out
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Option<Manifest> {
+    pub fn decode(bytes: &[u8]) -> Option<Manifest> {
         let mut at = Decoding { bytes };
         if at.bytes()? != MANIFEST {
             return None;
@@ -171,20 +171,20 @@ impl<'a> Decoding<'a> {
 /// Puts what a NAR holds into the store as it is read: each file's pieces as they come, and
 /// the list of its entries for the manifest, which is added once the NAR is known to be the one
 /// signed ([`Keeping::finish`]).
-pub(crate) struct Keeping<'a> {
+pub struct Keeping<'a> {
     store: &'a Store,
     entries: Vec<Entry>,
     /// Every key added, to see that the store kept them all.
-    pub(crate) added: Vec<[u8; 32]>,
+    pub added: Vec<[u8; 32]>,
 }
 
 impl<'a> Keeping<'a> {
-    pub(crate) fn new(store: &'a Store) -> Keeping<'a> {
+    pub fn new(store: &'a Store) -> Keeping<'a> {
         Keeping { store, entries: Vec::new(), added: Vec::new() }
     }
 
     /// Adds the manifest of `of`, whose NAR this read, and which refers to `references`.
-    pub(crate) fn finish(mut self, of: StorePath, references: Vec<StorePath>) -> Vec<[u8; 32]> {
+    pub fn finish(mut self, of: StorePath, references: Vec<StorePath>) -> Vec<[u8; 32]> {
         let key = manifest_key(&of);
         let manifest = Manifest { of, references, entries: self.entries };
         self.store.insert_lasting(&key, &manifest.encode());
@@ -232,8 +232,8 @@ impl Sink for Keeping<'_> {
 
 /// A store path blaze's store has no copy of.
 #[derive(Debug)]
-pub(crate) struct Missing {
-    pub(crate) path: String,
+pub struct Missing {
+    pub path: String,
 }
 
 impl std::fmt::Display for Missing {
@@ -253,7 +253,7 @@ impl std::fmt::Display for Missing {
 impl std::error::Error for Missing {}
 
 /// The manifest of `path`, from the store or through it from its remote.
-pub(crate) fn manifest(store: &Store, path: &StorePath) -> anyhow::Result<Manifest> {
+pub fn manifest(store: &Store, path: &StorePath) -> anyhow::Result<Manifest> {
     let bytes = store
         .get_lasting(&manifest_key(path))
         .ok_or_else(|| Missing { path: path.path.clone() })?;
@@ -270,7 +270,7 @@ pub(crate) fn manifest(store: &Store, path: &StorePath) -> anyhow::Result<Manife
 }
 
 /// Every store path `roots` refer to, themselves too, each once and sorted, from the store.
-pub(crate) fn closure_of(store: &Store, roots: &[StorePath]) -> anyhow::Result<Vec<StorePath>> {
+pub fn closure_of(store: &Store, roots: &[StorePath]) -> anyhow::Result<Vec<StorePath>> {
     let mut seen = std::collections::BTreeMap::new();
     let mut todo: Vec<StorePath> = roots.to_vec();
     while let Some(path) = todo.pop() {
@@ -288,7 +288,7 @@ pub(crate) fn closure_of(store: &Store, roots: &[StorePath]) -> anyhow::Result<V
 /// where. It is written beside that, checked to be the NAR that was signed, made read-only and
 /// only then moved into place, so what is there is whole. Processes that ask at once lay it
 /// out once.
-pub(crate) fn materialize(store: &Store, path: &StorePath, into: &Path) -> anyhow::Result<PathBuf> {
+pub fn materialize(store: &Store, path: &StorePath, into: &Path) -> anyhow::Result<PathBuf> {
     let base = base_name(&path.path)?;
     let dir = into.join(base);
     if dir.symlink_metadata().is_ok() {
@@ -418,7 +418,7 @@ fn dated() -> SystemTime {
 }
 
 /// Removes the tree at `path`, read-only as a laid-out one is, if it is there.
-pub(crate) fn remove(path: &Path) -> io::Result<()> {
+pub fn remove(path: &Path) -> io::Result<()> {
     let Ok(meta) = path.symlink_metadata() else { return Ok(()) };
     if meta.is_dir() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;

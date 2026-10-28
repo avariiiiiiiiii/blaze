@@ -3,6 +3,8 @@
 //! each request on its socket is answered with what rust-analyzer finds in the crates of the
 //! workspace, as a build says its errors. No rustc checks the source.
 
+pub(crate) use blaze_cargo::check::{LINT, RELOAD};
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,15 +22,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::Vfs;
 
 use crate::{Args, Parts, Sources, Watched, WatchedFile};
-
-/// What a checker answers when the workspace changed in a way only loading it again takes
-/// in: a source file came or went, a manifest changed, or the source of a build script or a
-/// proc macro did, which run as they were built.
-pub(crate) const RELOAD: &str = "reload";
-
-/// What a lint request starts with, before its [`blaze_lints::serve::Ask`]; its answer starts
-/// with it too, before the [`blaze_lints::serve::Answer`].
-pub(crate) const LINT: &str = "lint\t";
 
 /// Loads the workspace of `args` and answers the check requests on its socket.
 pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
@@ -138,12 +131,6 @@ impl Picked {
         let test = test && kind == TargetKind::Lib { is_proc_macro: false };
         Picked { root, kind, test }
     }
-}
-
-/// The line a checker is asked with: the flags of the check that pick targets, then
-/// `request`.
-pub(crate) fn request(targets: &[String], request: &str) -> String {
-    format!("{}\t{request}", serde_json::to_string(targets).unwrap_or_default())
 }
 
 /// The targets of the workspace of `project` that `cargo check` of `selection` with the

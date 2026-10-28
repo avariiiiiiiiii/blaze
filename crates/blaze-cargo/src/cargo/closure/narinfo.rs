@@ -8,17 +8,16 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 /// The key cache.nixos.org signs with, as nix's `trusted-public-keys` names it.
-pub(crate) const CACHE_NIXOS_ORG: &str =
-    "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+pub const CACHE_NIXOS_ORG: &str = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
 
 /// Where every store path of nixpkgs is, and so the only place one can be.
-pub(crate) const STORE: &str = "/nix/store/";
+pub const STORE: &str = "/nix/store/";
 
 /// nix's base32: its own alphabet, with no `e`, `o`, `t` or `u`, and the bytes taken from the
 /// last one, so that the first digit written is of the hash's last bits.
 const ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
-pub(crate) fn base32(bytes: &[u8]) -> String {
+pub fn base32(bytes: &[u8]) -> String {
     let len = (bytes.len() * 8).div_ceil(5);
     (0..len)
         .rev()
@@ -32,7 +31,7 @@ pub(crate) fn base32(bytes: &[u8]) -> String {
 }
 
 /// The `N` bytes `text` writes in nix's base32, or `None` if it writes no `N` bytes.
-pub(crate) fn from_base32<const N: usize>(text: &str) -> Option<[u8; N]> {
+pub fn from_base32<const N: usize>(text: &str) -> Option<[u8; N]> {
     if text.len() != (N * 8).div_ceil(5) {
         return None;
     }
@@ -53,11 +52,11 @@ pub(crate) fn from_base32<const N: usize>(text: &str) -> Option<[u8; N]> {
 
 /// A sha256, the one hash a NAR or a file of a cache is named by.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct Sha256(pub(crate) [u8; 32]);
+pub struct Sha256(pub [u8; 32]);
 
 impl Sha256 {
     /// `sha256:` and the hash in nix's base32 or in hex, as a narinfo writes it.
-    pub(crate) fn parse(text: &str) -> anyhow::Result<Sha256> {
+    pub fn parse(text: &str) -> anyhow::Result<Sha256> {
         let hash =
             text.strip_prefix("sha256:").with_context(|| format!("`{text}` is no sha256"))?;
         let hex = || -> Option<[u8; 32]> {
@@ -73,7 +72,7 @@ impl Sha256 {
     }
 
     #[cfg(test)]
-    pub(crate) fn of(bytes: &[u8]) -> Sha256 {
+    pub fn of(bytes: &[u8]) -> Sha256 {
         use sha2::Digest as _;
         Sha256(sha2::Sha256::digest(bytes).into())
     }
@@ -94,7 +93,7 @@ impl fmt::Debug for Sha256 {
 
 /// How the file of a NAR is compressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Compression {
+pub enum Compression {
     Xz,
     Zstd,
     None,
@@ -102,25 +101,25 @@ pub(crate) enum Compression {
 
 /// A `.narinfo`, with only what blaze reads of it.
 #[derive(Debug)]
-pub(crate) struct NarInfo {
+pub struct NarInfo {
     /// The whole path: `/nix/store/<hash>-<name>`.
-    pub(crate) store_path: String,
+    pub store_path: String,
     /// The file of the NAR, relative to the cache: `nar/<hash>.nar.zst`.
-    pub(crate) url: String,
-    pub(crate) compression: Compression,
+    pub url: String,
+    pub compression: Compression,
     /// Of the file, compressed, when the cache says.
-    pub(crate) file_hash: Option<Sha256>,
-    pub(crate) file_size: Option<u64>,
-    pub(crate) nar_hash: Sha256,
-    pub(crate) nar_size: u64,
+    pub file_hash: Option<Sha256>,
+    pub file_size: Option<u64>,
+    pub nar_hash: Sha256,
+    pub nar_size: u64,
     /// The whole paths, in nix's order: sorted, as a set of store paths is.
-    pub(crate) references: Vec<String>,
+    pub references: Vec<String>,
     /// Each `Sig:` line: the name of the key and the signature.
     sigs: Vec<(String, String)>,
 }
 
 impl NarInfo {
-    pub(crate) fn parse(text: &str) -> anyhow::Result<NarInfo> {
+    pub fn parse(text: &str) -> anyhow::Result<NarInfo> {
         let mut fields = std::collections::HashMap::new();
         let mut sigs = Vec::new();
         for line in text.lines().filter(|it| !it.is_empty()) {
@@ -165,7 +164,7 @@ impl NarInfo {
     }
 
     /// What the cache signs: nix's fingerprint of the path, its NAR and its references.
-    pub(crate) fn fingerprint(&self) -> String {
+    pub fn fingerprint(&self) -> String {
         format!(
             "1;{};{};{};{}",
             self.store_path,
@@ -176,7 +175,7 @@ impl NarInfo {
     }
 
     /// Whether one of its signatures is by `key` (`name:base64`) and holds for what it says.
-    pub(crate) fn check(&self, key: &str) -> anyhow::Result<()> {
+    pub fn check(&self, key: &str) -> anyhow::Result<()> {
         let (name, public) = key.split_once(':').context("a key is `name:base64`")?;
         let public: [u8; 32] = base64::engine::general_purpose::STANDARD
             .decode(public)
@@ -204,7 +203,7 @@ impl NarInfo {
 
 /// `<hash>-<name>` of the path `/nix/store/<hash>-<name>`, checked to be one: a 32-digit base32
 /// hash, then a name of the characters nix allows, which never makes it leave a directory.
-pub(crate) fn base_name(path: &str) -> anyhow::Result<&str> {
+pub fn base_name(path: &str) -> anyhow::Result<&str> {
     let not = || format!("`{path}` is not a store path");
     let base = path.strip_prefix(STORE).with_context(not)?;
     let (hash, name) = base.split_at_checked(32).with_context(not)?;

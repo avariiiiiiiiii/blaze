@@ -19,7 +19,7 @@ use super::args::{Args, Read, valued};
 use super::manifest::{config, failed, read_or_refuse_taking};
 
 /// `cargo uninstall [SPEC]... [--bin NAME]... [--root DIR]`.
-pub(super) fn command(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn command(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [valued(&["--root"]), valued(&["-p", "--package"]), valued(&["--bin"])];
     let usage = "blaze uninstall [OPTIONS] [SPEC]...";
     let read = match read_or_refuse_taking(&args, &flags, usage, usize::MAX) {

@@ -1,7 +1,7 @@
 # The closure build scripts run with
 
 2026-10-27. Status: fetching, keeping and laying out the closure is built
-(`crates/blaze-engine/src/cargo/closure/`). The mount namespace that shows a build script only this
+(`crates/blaze-cargo/src/cargo/closure/`). The mount namespace that shows a build script only this
 closure, its package and its `OUT_DIR`, and the table of which crate needs which library, are
 other lanes' work and not built yet.
 
@@ -24,7 +24,7 @@ binary: blaze reads the cache's format itself.
 
 ## What is pinned
 
-`crates/blaze-engine/src/cargo/closure/pins.txt`, written by `python3 harness/closure_pins.py
+`crates/blaze-cargo/src/cargo/closure/pins.txt`, written by `python3 harness/closure_pins.py
 --write` (in an ix VM, where nix is: the script runs `nix eval` on the pinned revision to name
 each root's store path, and reads each path's NarHash and closure from cache.nixos.org's
 `.narinfo` files; it is a tool for moving the pin, not a part of blaze). It names:
@@ -118,7 +118,7 @@ paths in its programs and links point.
 
 ## The API the other lanes use
 
-In `crates/blaze-engine/src/cargo/closure/mod.rs`:
+In `crates/blaze-cargo/src/cargo/closure/mod.rs`:
 
 - `roots(host: &str) -> Vec<Root>`: pins.txt's roots for `x86_64-linux` or `aarch64-linux`,
   each its `attribute` (`openssl.dev`), its `StorePath` and its closure's size. `host()` is this

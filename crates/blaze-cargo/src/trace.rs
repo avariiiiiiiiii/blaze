@@ -25,36 +25,36 @@ use serde_derive::{Deserialize, Serialize};
 /// One span: what it was, the process and thread, when it began (microseconds since the
 /// Unix epoch) and how long it took.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub(crate) struct Span {
+pub struct Span {
     #[serde(rename = "n")]
-    pub(crate) name: String,
+    pub name: String,
     #[serde(rename = "p")]
-    pub(crate) pid: u32,
+    pub pid: u32,
     #[serde(rename = "t")]
-    pub(crate) tid: u64,
+    pub tid: u64,
     #[serde(rename = "h", default, skip_serializing_if = "String::is_empty")]
-    pub(crate) thread: String,
+    pub thread: String,
     #[serde(rename = "s")]
-    pub(crate) start_us: u64,
+    pub start_us: u64,
     #[serde(rename = "d")]
-    pub(crate) dur_us: u64,
+    pub dur_us: u64,
     #[serde(rename = "l", default, skip_serializing_if = "Option::is_none")]
-    pub(crate) level: Option<u8>,
+    pub level: Option<u8>,
 }
 
-pub(crate) const CLIENT: u8 = 0;
-pub(crate) const DAEMON: u8 = 1;
-pub(crate) const ASKED: u8 = 2;
-pub(crate) const WORKER: u8 = 3;
+pub const CLIENT: u8 = 0;
+pub const DAEMON: u8 = 1;
+pub const ASKED: u8 = 2;
+pub const WORKER: u8 = 3;
 
 /// Microseconds since the Unix epoch of `at`: the wall clock now, less how long ago it was.
-pub(crate) fn epoch_us(at: Instant) -> u64 {
+pub fn epoch_us(at: Instant) -> u64 {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     now.saturating_sub(at.elapsed()).as_micros() as u64
 }
 
 /// When this process began, as near as it can tell: the first call, which `main` makes.
-pub(crate) fn began() -> Instant {
+pub fn began() -> Instant {
     static BEGAN: OnceLock<Instant> = OnceLock::new();
     *BEGAN.get_or_init(Instant::now)
 }
@@ -75,12 +75,7 @@ fn tid() -> u64 {
 }
 
 /// The span from `start` to `end` on this thread.
-pub(crate) fn span(
-    name: impl Into<String>,
-    level: Option<u8>,
-    start: Instant,
-    end: Instant,
-) -> Span {
+pub fn span(name: impl Into<String>, level: Option<u8>, start: Instant, end: Instant) -> Span {
     let thread = std::thread::current().name().unwrap_or_default().to_owned();
     Span {
         name: name.into(),
@@ -101,11 +96,11 @@ fn noted() -> std::sync::MutexGuard<'static, Vec<Span>> {
 }
 
 /// Notes a step from `start` to now.
-pub(crate) fn note(name: &str, level: u8, start: Instant) {
+pub fn note(name: &str, level: u8, start: Instant) {
     noted().push(span(name, Some(level), start, Instant::now()));
 }
 
-pub(crate) fn note_all(spans: impl IntoIterator<Item = Span>) {
+pub fn note_all(spans: impl IntoIterator<Item = Span>) {
     noted().extend(spans);
 }
 
@@ -113,7 +108,7 @@ pub(crate) fn note_all(spans: impl IntoIterator<Item = Span>) {
 const SPANS: &str = " spans=";
 
 /// The answer `line` with `spans` after it, for the daemon to hand on.
-pub(crate) fn with_spans(line: String, spans: &[Span]) -> String {
+pub fn with_spans(line: String, spans: &[Span]) -> String {
     match serde_json::to_string(spans) {
         Ok(json) => format!("{line}{SPANS}{json}"),
         Err(_) => line,
@@ -121,7 +116,7 @@ pub(crate) fn with_spans(line: String, spans: &[Span]) -> String {
 }
 
 /// A worker's answer and the spans it sent.
-pub(crate) fn split(line: &str) -> (&str, Vec<Span>) {
+pub fn split(line: &str) -> (&str, Vec<Span>) {
     match line.find(SPANS) {
         Some(at) => {
             let spans = serde_json::from_str(&line[at + SPANS.len()..]).unwrap_or_default();
@@ -132,18 +127,18 @@ pub(crate) fn split(line: &str) -> (&str, Vec<Span>) {
 }
 
 /// The answer without its spans, for a person or an editor.
-pub(crate) fn without_spans(line: &str) -> &str {
+pub fn without_spans(line: &str) -> &str {
     line.find(SPANS).map_or(line, |at| &line[..at])
 }
 
 /// When the worker last read a request.
 static ARRIVED: Mutex<Option<Instant>> = Mutex::new(None);
 
-pub(crate) fn arrived() {
+pub fn arrived() {
     *ARRIVED.lock().unwrap_or_else(|it| it.into_inner()) = Some(Instant::now());
 }
 
-pub(crate) fn last_arrival() -> Option<Instant> {
+pub fn last_arrival() -> Option<Instant> {
     *ARRIVED.lock().unwrap_or_else(|it| it.into_inner())
 }
 
@@ -156,7 +151,7 @@ static DETAIL: Mutex<Vec<Span>> = Mutex::new(Vec::new());
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 
 /// The detail spans that ended since `since`, taken; older ones are dropped.
-pub(crate) fn take_detail(since: Instant) -> Vec<Span> {
+pub fn take_detail(since: Instant) -> Vec<Span> {
     let since = epoch_us(since);
     let mut taken = std::mem::take(&mut *DETAIL.lock().unwrap_or_else(|it| it.into_inner()));
     DROPPED.store(0, Ordering::Relaxed);
@@ -167,7 +162,7 @@ pub(crate) fn take_detail(since: Instant) -> Vec<Span> {
 /// Records the spans of rust-analyzer's queries (the `*_query` spans of the queries that
 /// ran) and of code generation (target `blaze`), each as long as [`SHORTEST_US`] or longer.
 /// Every other callsite is told it is never wanted, so it costs what a disabled one does.
-pub(crate) fn install() {
+pub fn install() {
     _ = tracing::subscriber::set_global_default(Recorder);
 }
 
@@ -264,7 +259,7 @@ impl tracing::Subscriber for Recorder {
 /// Where the time from `start_us` to `end_us` went: each moment is the deepest step's under
 /// way then, and a moment no step has is unaccounted. In the order the steps first had
 /// time; the rows add up to the whole.
-pub(crate) fn breakdown(spans: &[Span], start_us: u64, end_us: u64) -> Vec<(String, u64)> {
+pub fn breakdown(spans: &[Span], start_us: u64, end_us: u64) -> Vec<(String, u64)> {
     let steps: Vec<&Span> = spans.iter().filter(|it| it.level.is_some()).collect();
     let mut cuts: Vec<u64> = vec![start_us, end_us];
     for it in &steps {
@@ -298,7 +293,7 @@ pub(crate) fn breakdown(spans: &[Span], start_us: u64, end_us: u64) -> Vec<(Stri
 
 /// What the client says at the end of a build the daemon made, with all the spans of it:
 /// a line and a table with `BLAZE_STATS`, a Chrome trace with `BLAZE_TRACE`.
-pub(crate) fn finish() {
+pub fn finish() {
     let stats = std::env::var_os("BLAZE_STATS").is_some();
     let trace = std::env::var_os("BLAZE_TRACE").filter(|it| !it.is_empty());
     if !stats && trace.is_none() {
@@ -321,7 +316,7 @@ pub(crate) fn finish() {
 }
 
 /// `blaze time: 402.1 ms: check 285.5 (71%), ...` and the table of [`breakdown`].
-pub(crate) fn table(spans: &[Span], start: u64, end: u64) -> String {
+pub fn table(spans: &[Span], start: u64, end: u64) -> String {
     let rows = breakdown(spans, start, end);
     let total = (end - start).max(1);
     let ms = |us: u64| us as f64 / 1000.0;

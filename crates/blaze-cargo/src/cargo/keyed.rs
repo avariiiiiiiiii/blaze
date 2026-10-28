@@ -28,11 +28,11 @@ const VAR: &str = "$";
 const KIND: &str = "?";
 
 /// The variable that has every entry found made again and compared ([`check`]).
-pub(crate) const CHECK: &str = "BLAZE_BSCACHE";
+pub const CHECK: &str = "BLAZE_BSCACHE";
 
 /// Whether [`CHECK`] is `check`: an entry found is not used but made again, and what it made
 /// compared with the entry. A difference is fatal.
-pub(crate) fn check() -> bool {
+pub fn check() -> bool {
     std::env::var(CHECK).is_ok_and(|it| it == "check")
 }
 
@@ -41,16 +41,16 @@ pub(crate) fn check() -> bool {
 const TRACE: &str = "BLAZE_KEY_TRACE";
 
 /// A key of fields, each its length and its bytes, and them as text when [`TRACE`] is set.
-pub(crate) struct Key(Sha256, Option<Vec<u8>>);
+pub struct Key(Sha256, Option<Vec<u8>>);
 
 impl Key {
-    pub(crate) fn new(kind: &str) -> Key {
+    pub fn new(kind: &str) -> Key {
         let mut key = Key(Sha256::new(), std::env::var_os(TRACE).map(|_| Vec::new()));
         key.field(kind.as_bytes());
         key
     }
 
-    pub(crate) fn field(&mut self, bytes: &[u8]) -> &mut Key {
+    pub fn field(&mut self, bytes: &[u8]) -> &mut Key {
         self.0.update((bytes.len() as u64).to_le_bytes());
         self.0.update(bytes);
         if let Some(trace) = &mut self.1 {
@@ -60,7 +60,7 @@ impl Key {
         self
     }
 
-    pub(crate) fn done(self) -> [u8; 32] {
+    pub fn done(self) -> [u8; 32] {
         let key: [u8; 32] = self.0.finalize().into();
         if let (Some(trace), Some(dir)) = (self.1, std::env::var_os(TRACE)) {
             let dir = Path::new(&dir);
@@ -74,7 +74,7 @@ impl Key {
 /// What is at `path` now, for a second key: as [`super::sandboxed::digest`] says, but for a
 /// path in Nix's store, whose contents never change once there: that it is there is enough;
 /// and for a [`kind`], what kind of file it is.
-pub(crate) fn digest(path: &str) -> String {
+pub fn digest(path: &str) -> String {
     if let Some(path) = path.strip_prefix(KIND) {
         return match std::fs::metadata(path) {
             Ok(meta) if meta.is_dir() => "d".to_owned(),
@@ -100,24 +100,24 @@ pub(crate) fn digest(path: &str) -> String {
 /// The read of `path` as a read set has it when only what kind of file is there counts: a
 /// directory a program looked for or walked through on its way to others, whose names are not
 /// what it read.
-pub(crate) fn kind(path: &str) -> String {
+pub fn kind(path: &str) -> String {
     format!("{KIND}{path}")
 }
 
 /// What a read set has of a read, `path` or its [`kind`], as a path.
-pub(crate) fn path_of(read: &str) -> &str {
+pub fn path_of(read: &str) -> &str {
     read.strip_prefix(KIND).unwrap_or(read)
 }
 
 /// The read of the variable `name`, as a read set has it.
-pub(crate) fn var(name: &str) -> String {
+pub fn var(name: &str) -> String {
     format!("{VAR}{name}")
 }
 
 /// The identity of the toolchain at `sysroot`: its rustup channel manifest, which names the
 /// release and commit, and the names in its `lib`, whose `librustc_driver-<hash>` names its
 /// build where there is no manifest (Nix's).
-pub(crate) fn toolchain(sysroot: &Path) -> String {
+pub fn toolchain(sysroot: &Path) -> String {
     let manifest = sysroot.join("lib/rustlib/multirust-channel-manifest.toml");
     let manifest = super::sandboxed::digest(&manifest);
     let lib = super::sandboxed::digest(&sysroot.join("lib"));
@@ -158,7 +158,7 @@ fn set_of(bytes: &[u8]) -> Option<Vec<String>> {
 
 /// The entry under `first` whose read set has, each path, what `now` says it has: with the
 /// read set. `None` when none does.
-pub(crate) fn find(
+pub fn find(
     store: &blaze_store::Store,
     first: &[u8; 32],
     now: &dyn Fn(&str) -> String,
@@ -175,7 +175,7 @@ pub(crate) fn find(
 /// Keeps `value` under `first` and `reads`, a making of it that read them and found in them
 /// what `now` says, with `reads` in a slot under `first` unless one has it already. Sorted,
 /// each once, `reads` is what [`find`] gives back.
-pub(crate) fn keep(
+pub fn keep(
     store: &blaze_store::Store,
     first: &[u8; 32],
     reads: &[String],

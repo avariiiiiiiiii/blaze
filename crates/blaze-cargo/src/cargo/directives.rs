@@ -49,7 +49,7 @@ const RESERVED: [&str; 17] = [
 /// The system's directories of libraries, which the linker searches anyway: naming one adds
 /// nothing a script could not link already. The Nix store is the closure a script's tools
 /// come from; Homebrew's prefixes and Apple's SDKs are where a Mac's libraries are.
-pub(crate) const SYSTEM: [&str; 11] = [
+pub const SYSTEM: [&str; 11] = [
     "/usr/lib",
     "/usr/lib64",
     "/usr/local/lib",
@@ -65,7 +65,7 @@ pub(crate) const SYSTEM: [&str; 11] = [
 
 /// The link arguments a script may give, whole: what changes how the output is linked, never
 /// which program links it or what it loads.
-pub(crate) const LINK_ARGS: [&str; 14] = [
+pub const LINK_ARGS: [&str; 14] = [
     "-pthread",
     "-rdynamic",
     "-nostartfiles",
@@ -92,11 +92,11 @@ const LINK_ARG_PREFIXES: [&str; 5] = [
 ];
 
 /// Where a script ran, which decides what its directives may name.
-pub(crate) struct Ran<'a> {
-    pub(crate) package_dir: &'a Path,
-    pub(crate) out_dir: &'a Path,
+pub struct Ran<'a> {
+    pub package_dir: &'a Path,
+    pub out_dir: &'a Path,
     /// The system directories the workspace allows besides [`SYSTEM`].
-    pub(crate) link_dirs: &'a [PathBuf],
+    pub link_dirs: &'a [PathBuf],
 }
 
 impl Ran<'_> {
@@ -176,7 +176,7 @@ fn allowed_args() -> String {
 /// build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`,
 /// `CARGO_MANIFEST_LINKS`) is not one: a crate has it only when its script forwards it, as
 /// rav1e's does. Nor is `CARGO_COMMIT_HASH`, which cargo's build sets for cargo.
-pub(crate) fn given_by_cargo(name: &str) -> bool {
+pub fn given_by_cargo(name: &str) -> bool {
     const NAMES: [&str; 13] = [
         "CARGO",
         "CARGO_MANIFEST_DIR",
@@ -205,7 +205,7 @@ fn search_dir(value: &str) -> &str {
 }
 
 /// Each line of `stdout` a run `ran` printed that its rules refuse, with why.
-pub(crate) fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
+pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(stdout).lines() {
         let line = line.trim();
@@ -260,7 +260,7 @@ pub(crate) fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
 }
 
 /// What a build that a script of `package` broke the rules of is told.
-pub(crate) fn refused_error(package: &str, refused: &[(String, String)]) -> String {
+pub fn refused_error(package: &str, refused: &[(String, String)]) -> String {
     let lines: Vec<String> =
         refused.iter().map(|(line, why)| format!("  `{line}`: {why}")).collect();
     format!(

@@ -122,7 +122,7 @@ about the target, that holds only when `RUSTC` and `RUSTDOC` name blaze and blaz
 all of it:
 
 - **`blaze build`, `run`, `test` and `check`.** blaze plans the build itself:
-  `crates/blaze-engine/src/plan.rs` already works out the units, with the features and profile
+  `crates/blaze-cargo/src/plan.rs` already works out the units, with the features and profile
   settings of each. It compiles and links them without starting `cargo build`. Where blaze
   needs cargo's resolution (`cargo metadata`), it runs cargo with `RUSTC` naming blaze.
 - **Plain cargo after `blaze enable`.** Cargo's configuration names blaze as `build.rustc`,
@@ -160,7 +160,7 @@ equal to cargo's by `harness/resolve.py`; with them K needs no cargo to plan a b
 `harness/resolve.py sysroot`), a workspace load's questions of the toolchain and configuration
 (`cargo --version`, `cargo config get` in TOML for rust-analyzer and the rustflags `plan.rs`
 reads, `cargo rustc --print cfg` and `target-spec-json`) are blaze's
-(`crates/blaze-engine/src/answers/cargo.rs` over blaze-manifest, `resolve.py toolchain`), and
+(`crates/blaze-cargo/src/answers/cargo.rs` over blaze-manifest, `resolve.py toolchain`), and
 `plan.rs` plans each load from blaze-units' graph with no `cargo build --unit-graph`
 (`resolve.py units`); and a load's build scripts and proc macros are built and run by blaze
 over that graph, with no `cargo check --compile-time-deps` (`cargo/compile_time.rs`,
@@ -518,7 +518,7 @@ rustc's on every target blaze knows.
 
 Done in part (the `no-rustc-abc` lane, [#100](https://github.com/indexable-inc/blaze/pull/100)):
 the answers are rustc's, asked once per toolchain and kept, not blaze's own.
-`crates/blaze-engine/src/answers.rs` keeps each answer to `-vV`, `--version` and the `--print` kinds
+`crates/blaze-cargo/src/answers.rs` keeps each answer to `-vV`, `--version` and the `--print` kinds
 that read no source (cfg, target-spec-json, sysroot, target-libdir, cargo's file-names probe and
 the rest) under blaze's cache, by the rustc it is of (its canonical path, length and time), the
 arguments, the variables rustc reads for them and the input, and gives it again byte for byte;
@@ -533,7 +533,7 @@ the fixture's cold build and 17 on ripgrep's, which answering from blaze's own t
 `cargo check --compile-time-deps`'s probes (I) and plain `cargo check`'s (D).
 
 Done (the `no-rustc-hl` lane, 2026-10-23): blaze answers from its own data, and even the first
-ask runs no rustc. `crates/blaze-engine/src/answers/rustc.json` has what the pinned rustc says of
+ask runs no rustc. `crates/blaze-cargo/src/answers/rustc.json` has what the pinned rustc says of
 itself (`-vV`) and of each of twelve targets (Linux GNU and musl, macOS and Windows on x86-64 and
 AArch64, wasm32 unknown, WASI 1 and 2): its cfgs, those unstable features add, the default panic
 strategy, the names of each kind of crate's file, the split-debuginfo kinds and the target spec
@@ -859,7 +859,7 @@ the daemon's own run. Risk: a probe answered differently from rustc turns a feat
 silently; the harness compares every script's output with what it prints under rustc.
 
 First part done (the `no-rustc-l2` lane, 2026-10-23): when cargo asks rustc for a build script,
-blaze compiles and links it, and cargo runs it as it would rustc's. `crates/blaze-engine/src/cargo/own_script.rs`
+blaze compiles and links it, and cargo runs it as it would rustc's. `crates/blaze-cargo/src/cargo/own_script.rs`
 describes the script and every library it links as a `rust-project.json` (each crate's root,
 edition, `--cfg`s, `debug_assertions` as rustc sets it, the variables of `env!` cargo set, and
 its `--extern`s), from cargo's arguments and the wrapper's records of those libraries, and runs
@@ -1129,7 +1129,7 @@ Where J stands (2026-10-24):
 - In a load (2026-10-25, the `blaze-j1` lane, behind `BLAZE_PROC_MACRO_SERVER`, which names
   the server): rust-analyzer's `cargo check --compile-time-deps` into blaze's own target
   directory (`--own-target`) asks the wrapper for each proc macro, and blaze links it there
-  (`crates/blaze-engine/src/cargo/own_macro.rs`), as `own_script.rs` does a build script, with the
+  (`crates/blaze-cargo/src/cargo/own_macro.rs`), as `own_script.rs` does a build script, with the
   dep-info cargo reads; the load expands what blaze listed with that server
   (`load_cargo::listed`), and a build script that links one is expanded with it (J0). A
   library blaze links names libc, as rustc's does. A crate rustc compiles there that links

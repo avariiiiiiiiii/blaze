@@ -54,7 +54,7 @@ const COMMENT: &str = "This file only protects against accidental modifications.
                        security mechanism and does not protect against malicious changes.";
 
 /// `cargo vendor [OPTIONS] [path]`.
-pub(super) fn command(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn command(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [
         switch(&["--no-delete"]),
         valued(&["-s", "--sync"]),

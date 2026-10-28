@@ -61,7 +61,7 @@ fn memory_max() -> Result<Option<u64>, String> {
 }
 
 /// The setting of when the daemon has a spare worker.
-pub(crate) const SPARE: &str = "BLAZE_SPARE";
+pub const SPARE: &str = "BLAZE_SPARE";
 
 /// When the daemon has a spare worker, from `BLAZE_SPARE`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,25 +126,25 @@ const LAST_LINES: usize = 12;
 
 /// The variable that has a worker end when its standard input does, which is when the
 /// daemon that started it is gone.
-pub(crate) const ENDS_WITH_INPUT: &str = "BLAZE_ENDS_WITH_INPUT";
+pub const ENDS_WITH_INPUT: &str = "BLAZE_ENDS_WITH_INPUT";
 
 /// Where a worker that listens at `socket` leaves the errors it found in the source as it
 /// loaded the workspace, in JSON, before it ends.
-pub(crate) fn errors_beside(socket: &Path) -> PathBuf {
+pub fn errors_beside(socket: &Path) -> PathBuf {
     socket.with_file_name("errors")
 }
 
 /// A request with the version of the client that sends it.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Envelope {
-    pub(crate) version: String,
+pub struct Envelope {
+    pub version: String,
     /// Whether the client starts a daemon of its own version when this one is of another.
-    pub(crate) replaces: bool,
-    pub(crate) request: Request,
+    pub replaces: bool,
+    pub request: Request,
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) enum Request {
+pub enum Request {
     /// Load a checkout that cargo has just built, for the builds to come.
     Warm(Checkout),
     /// Load a checkout cargo has just built what stands in for the crates of, and answer
@@ -163,7 +163,7 @@ pub(crate) enum Request {
 impl Request {
     /// The request, with the variables of this command its build's scripts are given
     /// ([`WorkerConfig::command_env`]): set as it is sent, so that no state on disk keeps them.
-    pub(crate) fn of_this_command(mut self) -> Request {
+    pub fn of_this_command(mut self) -> Request {
         if let Request::Warm(it) | Request::Build(it) = &mut self {
             it.config.command_env = super::cli::command_env();
         }
@@ -175,7 +175,7 @@ impl Request {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) enum Reply {
+pub enum Reply {
     /// The daemon is of another version. It exits when the client said it replaces it.
     Restart {
         version: String,
@@ -208,7 +208,7 @@ pub(crate) enum Reply {
 
 /// Why the worker did not build a program.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) enum NotBuilt {
+pub enum NotBuilt {
     /// The source has errors: the build fails with them.
     Error(crate::errors::Said),
     /// The daemon failed.
@@ -218,7 +218,7 @@ pub(crate) enum NotBuilt {
 }
 
 impl NotBuilt {
-    pub(crate) fn why(self) -> String {
+    pub fn why(self) -> String {
         match self {
             NotBuilt::Error(said) => said.to_string(),
             NotBuilt::Failed(why) | NotBuilt::Cargos(why) => why,
@@ -238,61 +238,61 @@ impl NotBuilt {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct Status {
-    pub(crate) pid: u32,
-    pub(crate) version: String,
-    pub(crate) idle_secs: Option<u64>,
+pub struct Status {
+    pub pid: u32,
+    pub version: String,
+    pub idle_secs: Option<u64>,
     /// The most the workers may hold together, in bytes.
     #[serde(default)]
-    pub(crate) memory_max: Option<u64>,
-    pub(crate) workers: Vec<WorkerStatus>,
+    pub memory_max: Option<u64>,
+    pub workers: Vec<WorkerStatus>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct WorkerStatus {
-    pub(crate) pid: u32,
-    pub(crate) project: PathBuf,
-    pub(crate) log: PathBuf,
+pub struct WorkerStatus {
+    pub pid: u32,
+    pub project: PathBuf,
+    pub log: PathBuf,
     /// The bytes it holds, where the system tells.
     #[serde(default)]
-    pub(crate) bytes: Option<u64>,
+    pub bytes: Option<u64>,
     /// Each checkout the worker holds and how warm it is.
-    pub(crate) checkouts: Vec<(PathBuf, String)>,
+    pub checkouts: Vec<(PathBuf, String)>,
 }
 
 /// What a worker is loaded with. Two builds with the same one share a worker.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct WorkerConfig {
+pub struct WorkerConfig {
     /// What the checkouts of one repository have in common: the directory of its `.git`.
-    pub(crate) repository: PathBuf,
+    pub repository: PathBuf,
     /// The directory of the package being built, from the root of the checkout.
-    pub(crate) project: PathBuf,
-    pub(crate) cfg_test: bool,
+    pub project: PathBuf,
+    pub cfg_test: bool,
     /// Which build the worker stands in for, as the daemon's own plan of it has it.
-    pub(crate) selection: crate::plan::Selection,
+    pub selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
-    pub(crate) env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
     /// The rest of the variables of the command ([`super::cli::command_env`]), which its build
     /// scripts are given of as cargo's are. Not what picks the worker ([`Self::id`]): one
     /// loads the workspace again when a variable a script reads is another.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) command_env: BTreeMap<String, String>,
+    pub command_env: BTreeMap<String, String>,
     /// Whether its programs are built whole, with nothing of rustc's ([`Plan::whole`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) whole: bool,
+    pub whole: bool,
 }
 
 impl WorkerConfig {
     /// 16 hex digits: it names the worker's directory, and the path of the socket in it has
     /// to fit the 104 bytes macOS has for one, with the daemon's directory before it.
-    pub(crate) fn id(&self) -> String {
+    pub fn id(&self) -> String {
         let picks = WorkerConfig { command_env: BTreeMap::new(), ..self.clone() };
         let text = serde_json::to_vec(&picks).unwrap_or_default();
         Sha256::digest(text).iter().take(8).map(|it| format!("{it:02x}")).collect()
     }
 
     /// Every variable of the build: [`Self::env`] over [`Self::command_env`].
-    pub(crate) fn builds_env(&self) -> BTreeMap<String, String> {
+    pub fn builds_env(&self) -> BTreeMap<String, String> {
         let mut env = self.command_env.clone();
         env.extend(self.env.clone());
         env
@@ -329,49 +329,49 @@ impl WorkerConfig {
 
 /// What is known of a build before cargo has built anything of it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct Ahead {
-    pub(crate) config: WorkerConfig,
+pub struct Ahead {
+    pub config: WorkerConfig,
     /// The root of the checkout.
-    pub(crate) root: PathBuf,
+    pub root: PathBuf,
     /// Where the source of each crate the daemon compiles starts.
-    pub(crate) crates: Vec<PathBuf>,
+    pub crates: Vec<PathBuf>,
     /// The flags of a check that pick targets (`--tests`, `--bin NAME`, ...), each with its
     /// value. What is loaded does not turn on them, so they are not the checker's
     /// [`WorkerConfig`]: they are told it with each request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) targets: Vec<String>,
+    pub targets: Vec<String>,
 }
 
 /// A checkout as cargo last built it, and the programs of it the daemon is asked for.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct Checkout {
+pub struct Checkout {
     /// The build this is: the checkout, the command and its flags.
-    pub(crate) key: String,
+    pub key: String,
     /// The newest of rustc's output the programs are linked against. A worker that loaded
     /// the checkout with another one starts again, unless it is `kept`.
-    pub(crate) generation: u128,
+    pub generation: u128,
     /// Whether cargo built only programs the daemon did not, given the daemon's executables
     /// of the others, whose plans are the ones the worker built them by: a running worker
     /// loads the checkout again in place, keeping what it built of those, rather than start
     /// again and link every program anew under the programs running them.
     #[serde(default)]
-    pub(crate) kept: bool,
+    pub kept: bool,
     /// When cargo started, as a stamp: source newer than this is not what rustc compiled.
-    pub(crate) built_at: u128,
-    pub(crate) config: WorkerConfig,
+    pub built_at: u128,
+    pub config: WorkerConfig,
     /// The root of the checkout.
-    pub(crate) root: PathBuf,
-    pub(crate) programs: Vec<Plan>,
+    pub root: PathBuf,
+    pub programs: Vec<Plan>,
     /// The source files rustc read. Only a request to warm names them.
-    pub(crate) sources: Vec<PathBuf>,
+    pub sources: Vec<PathBuf>,
     /// The variables `env!` reads in the checkout: the ones cargo set to say where its
     /// programs are, and in a request under them the ones of the process that asks.
     #[serde(default)]
-    pub(crate) env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
     /// The file of what cargo said of the build scripts it ran and the proc macros it
     /// built, which a worker loads the checkout with.
     #[serde(default)]
-    pub(crate) scripts: Option<PathBuf>,
+    pub scripts: Option<PathBuf>,
 }
 
 impl Checkout {
@@ -1051,7 +1051,7 @@ struct Daemon {
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
-pub(crate) fn home() -> anyhow::Result<PathBuf> {
+pub fn home() -> anyhow::Result<PathBuf> {
     if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
         return Ok(PathBuf::from(home));
     }
@@ -1065,7 +1065,7 @@ pub(crate) fn home() -> anyhow::Result<PathBuf> {
 /// The disk store of the user's builds: the directory `BLAZE_CACHE` names, none when it
 /// says `off`, and without it `blaze/store` in the user's cache directory. Unlike `home`
 /// it is not in `XDG_RUNTIME_DIR`, which does not outlive the session.
-pub(crate) fn store() -> Option<PathBuf> {
+pub fn store() -> Option<PathBuf> {
     if let Some(named) = std::env::var_os("BLAZE_CACHE") {
         return (!blaze_store::is_off(&named)).then(|| PathBuf::from(named));
     }
@@ -1075,7 +1075,7 @@ pub(crate) fn store() -> Option<PathBuf> {
     Some(caches.join("blaze/store"))
 }
 
-pub(crate) fn socket_in(home: &Path) -> PathBuf {
+pub fn socket_in(home: &Path) -> PathBuf {
     home.join("daemon.sock")
 }
 
@@ -1084,7 +1084,7 @@ pub(crate) fn socket_in(home: &Path) -> PathBuf {
 /// executable is told by where it is as well as by its size and time: every build in the nix
 /// store has the same time, and two builds of a small change can have the same size, but no
 /// two have the same path.
-pub(crate) fn version() -> String {
+pub fn version() -> String {
     let executable = std::env::current_exe().and_then(std::fs::canonicalize);
     let place: String = executable.as_ref().map_or_else(
         |_| String::new(),
@@ -1107,7 +1107,7 @@ pub(crate) fn version() -> String {
 /// 2. the thread that stops idle workers and ends the daemon when it is idle itself;
 /// 3. per worker, the process, and a thread that waits for it to load and has it build
 ///    its programs once.
-pub(crate) fn serve() -> anyhow::Result<()> {
+pub fn serve() -> anyhow::Result<()> {
     let home = home()?;
     private_dir(&home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let memory_max = memory_max().map_err(anyhow::Error::msg)?;
@@ -1594,7 +1594,7 @@ fn last_words(log: &Path) -> String {
 /// The last error a worker's log has, with what caused it, each cause on a line of its own:
 /// the outermost error says what blaze was doing, and the innermost why it could not, which
 /// is what the user acts on.
-pub(crate) fn last_error(log: &str) -> Option<String> {
+pub fn last_error(log: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let at = lines.iter().rposition(|it| it.starts_with("Error"))?;
     let mut said = lines[at].strip_prefix("Error: ").unwrap_or(lines[at]).to_owned();

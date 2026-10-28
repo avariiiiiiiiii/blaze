@@ -19,7 +19,7 @@
 use std::path::Path;
 
 /// The variable cargo reads `unstable.build-dir-new-layout` from: which layout it builds in.
-pub(crate) const NEW_LAYOUT: &str = "CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT";
+pub const NEW_LAYOUT: &str = "CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT";
 
 /// The key of cargo's configuration, and of `-Z`, that [`NEW_LAYOUT`] stands for.
 const NEW_LAYOUT_KEY: &str = "build-dir-new-layout";
@@ -30,7 +30,7 @@ const NEW_LAYOUT_KEY: &str = "build-dir-new-layout";
 /// that finds its package's programs from its own path (`current_exe()`'s grandparent) finds
 /// them only from `deps`, where blaze's own build puts it too, and the user's stable cargo
 /// shares what blaze's cargo built.
-pub(crate) fn first_unless_chosen(cwd: &Path, config: &[String], unstable: &[String]) {
+pub fn first_unless_chosen(cwd: &Path, config: &[String], unstable: &[String]) {
     if !chosen(cwd, std::env::vars(), config, unstable) {
         // SAFETY: before any thread is started.
         unsafe { std::env::set_var(NEW_LAYOUT, "false") };
@@ -65,27 +65,27 @@ const OF_UNIT: [&str; 3] = ["out", "fingerprint", "run"];
 
 /// A unit's directory in the second layout: `<profile>/build/<package>/<hash>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UnitDir<'a> {
-    pub(crate) dir: &'a Path,
-    pub(crate) package: &'a str,
-    pub(crate) hash: &'a str,
+pub struct UnitDir<'a> {
+    pub dir: &'a Path,
+    pub package: &'a str,
+    pub hash: &'a str,
 }
 
 impl<'a> UnitDir<'a> {
     /// The profile's directory, `target/debug`, the unit is built for.
-    pub(crate) fn profile(&self) -> Option<&'a Path> {
+    pub fn profile(&self) -> Option<&'a Path> {
         self.dir.parent()?.parent()?.parent()
     }
 }
 
 /// Whether `text` is a hash cargo names a unit by: sixteen hexadecimal digits.
-pub(crate) fn is_unit_hash(text: &str) -> bool {
+pub fn is_unit_hash(text: &str) -> bool {
     text.len() == 16 && text.bytes().all(|it| it.is_ascii_hexdigit())
 }
 
 /// The unit directory of the second layout that `path` is, or is below one of the
 /// directories of (`out`, `fingerprint`, `run`).
-pub(crate) fn unit_dir(path: &Path) -> Option<UnitDir<'_>> {
+pub fn unit_dir(path: &Path) -> Option<UnitDir<'_>> {
     let mut below: Option<&Path> = None;
     for dir in path.ancestors() {
         let is_unit = below.is_none_or(|below| {
@@ -115,7 +115,7 @@ fn as_unit_dir(dir: &Path) -> Option<UnitDir<'_>> {
 /// file or directory cargo has rustc write to, is in, in either layout. `None` for one of the
 /// profile's own directory, where cargo puts the programs it is asked for: that directory is
 /// its parent.
-pub(crate) fn profile_of(path: &Path) -> Option<&Path> {
+pub fn profile_of(path: &Path) -> Option<&Path> {
     if let Some(unit) = unit_dir(path) {
         return unit.profile();
     }
@@ -130,7 +130,7 @@ pub(crate) fn profile_of(path: &Path) -> Option<&Path> {
 /// The second layout names a program or a build script after its crate alone, and every
 /// package's build script is `build_script_build`: the hash of its directory tells them
 /// apart.
-pub(crate) fn unit_name(crate_name: &str, extra_filename: &str, out_dir: &Path) -> String {
+pub fn unit_name(crate_name: &str, extra_filename: &str, out_dir: &Path) -> String {
     match (extra_filename.is_empty(), unit_dir(out_dir)) {
         (true, Some(unit)) => format!("{crate_name}-{}", unit.hash),
         _ => format!("{crate_name}{extra_filename}"),
@@ -139,7 +139,7 @@ pub(crate) fn unit_name(crate_name: &str, extra_filename: &str, out_dir: &Path) 
 
 /// The name the unit that wrote the file of `stem` (`lib<stem>.rlib`, `<stem>.d`, without
 /// the `lib`) in `dir` is kept by, as [`unit_name`] gives it.
-pub(crate) fn unit_of_file(stem: &str, dir: &Path) -> String {
+pub fn unit_of_file(stem: &str, dir: &Path) -> String {
     match unit_dir(dir) {
         Some(unit) if !stem.ends_with(&format!("-{}", unit.hash)) => {
             format!("{stem}-{}", unit.hash)
@@ -152,7 +152,7 @@ pub(crate) fn unit_of_file(stem: &str, dir: &Path) -> String {
 /// with no hash in its name: a `dylib` (or `cdylib`), which a program cargo runs loads from
 /// there. A proc macro's library has the hash of its unit in its name, and is the compiler's
 /// to load. The first layout keeps them all in `deps`.
-pub(crate) fn dylib_dirs(profile: &Path) -> Vec<std::path::PathBuf> {
+pub fn dylib_dirs(profile: &Path) -> Vec<std::path::PathBuf> {
     let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
     let read = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten();
     let mut dirs = Vec::new();

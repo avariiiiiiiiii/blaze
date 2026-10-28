@@ -24,7 +24,7 @@ use super::{
 };
 use crate::sandbox::Line;
 
-pub(crate) const VAR: &str = "BLAZE_TESTS";
+pub const VAR: &str = "BLAZE_TESTS";
 
 /// The most bytes of names a program of tests is given to pick its tests by; past it, it runs
 /// them all.
@@ -32,18 +32,18 @@ const NAMES_AT_MOST: usize = 64 << 10;
 
 /// Whether this command runs only the tests that have not passed as they are now, or checks
 /// that those that did pass again ([`verifying`]).
-pub(crate) fn on() -> bool {
+pub fn on() -> bool {
     std::env::var(VAR).is_ok_and(|it| it == "affected" || it == "verify")
 }
 
 /// Whether this command runs every test and checks that those that passed before pass again.
-pub(crate) fn verifying() -> bool {
+pub fn verifying() -> bool {
     std::env::var(VAR).is_ok_and(|it| it == "verify")
 }
 
 /// Has the daemon write [`plan::REACH`] at its builds of the programs of tests of `state`
 /// while only the tests an edit reached are run, and stop when every test is.
-pub(crate) fn ask(state: &State) {
+pub fn ask(state: &State) {
     let on = on();
     for program in state.programs.iter().filter(|it| it.test) {
         let Some(dir) = state.plan_dir(program) else { continue };
@@ -61,7 +61,7 @@ pub(crate) fn ask(state: &State) {
 }
 
 /// What of a program of tests this command runs.
-pub(crate) enum Pick {
+pub enum Pick {
     /// What the command asks, every test unless it names some: nothing is known of what an
     /// edit reached, or the command picks the tests itself.
     Asked,
@@ -85,39 +85,39 @@ pub(crate) enum Pick {
 }
 
 /// A test that is run every time, and why.
-pub(crate) struct Always {
-    pub(crate) name: String,
-    pub(crate) why: String,
+pub struct Always {
+    pub name: String,
+    pub why: String,
     /// The calls that take the test to what it reaches, from the test on, joined by ` -> `.
-    pub(crate) path: Option<String>,
+    pub path: Option<String>,
     /// Whether it runs outside the sandbox, taken out by its package or the command.
-    pub(crate) outside: bool,
+    pub outside: bool,
 }
 
 /// The first key of each test of a program that may be kept, and whether it reaches the world
 /// outside its code.
-pub(crate) struct Keys(BTreeMap<String, (Key, bool)>);
+pub struct Keys(BTreeMap<String, (Key, bool)>);
 
 /// What a run of a program of tests ended with, for [`Keys::settle`].
-pub(crate) struct Ended<'a> {
+pub struct Ended<'a> {
     /// The tests it was asked to run, all `total` of them when `None`.
-    pub(crate) ran: Option<&'a [String]>,
-    pub(crate) total: usize,
+    pub ran: Option<&'a [String]>,
+    pub total: usize,
     /// Whether it failed.
-    pub(crate) failed: bool,
+    pub failed: bool,
     /// The tests libtest's summary said failed, or the sandbox failed, when that is known.
-    pub(crate) failures: Option<&'a [String]>,
+    pub failures: Option<&'a [String]>,
     /// How many tests libtest's summaries counted (passed, failed and ignored).
-    pub(crate) counted: Option<usize>,
+    pub counted: Option<usize>,
     /// What the sandbox recorded of the run.
-    pub(crate) record: Option<&'a [Line]>,
+    pub record: Option<&'a [Line]>,
 }
 
 impl Keys {
     /// Keeps in `results` how the tests of a run `ended`: those that passed, and those that
     /// failed, for a flaky test to be told. Nothing when it is not known which tests ran and
     /// how each ended. The names of the tests found flaky.
-    pub(crate) fn settle(&self, results: &mut Results, ended: &Ended<'_>) -> Vec<String> {
+    pub fn settle(&self, results: &mut Results, ended: &Ended<'_>) -> Vec<String> {
         let ran: Vec<&String> = match ended.ran {
             Some(names) => names.iter().collect(),
             None => self.0.keys().collect(),
@@ -157,7 +157,7 @@ impl Keys {
 /// tests run sandboxed, and why they run outside otherwise: a test outside is not hermetic,
 /// and runs every time, as do those of `outside`, which the manifest `manifest` takes out.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn pick(
+pub fn pick(
     asked: &Invocation,
     state: &State,
     test: &Program,
@@ -252,7 +252,7 @@ pub(crate) fn pick(
 /// code: the features, profile, targets, configuration and unstable flags it builds with, the
 /// machine, and the harness's flags that change how a test runs (all but those that only change
 /// what is shown).
-pub(crate) fn run_identity(asked: &Invocation) -> String {
+pub fn run_identity(asked: &Invocation) -> String {
     let flags = &asked.flags;
     let mut features = flags.features.clone();
     features.sort();
@@ -287,7 +287,7 @@ pub(crate) fn run_identity(asked: &Invocation) -> String {
 /// Whether what follows `--` leaves the tests to the program to pick and says nothing of how
 /// a test ends: what only shows the run otherwise. One that runs the ignored tests, or lists
 /// them, runs as asked.
-pub(crate) fn plain(trailing: &[String]) -> bool {
+pub fn plain(trailing: &[String]) -> bool {
     let mut args = trailing.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {

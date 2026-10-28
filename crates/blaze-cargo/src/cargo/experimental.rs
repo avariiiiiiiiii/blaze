@@ -14,29 +14,29 @@ use std::{
 use anyhow::Context as _;
 
 /// The key, in `[workspace.metadata.blaze]`, that lists the experiments a workspace opts into.
-pub(crate) const KEY: &str = "experimental";
+pub const KEY: &str = "experimental";
 
 /// Every test of the workspace runs in a sandbox, and under `BLAZE_TESTS=affected` a pass is
 /// kept by what the test read ([`super::sandboxed`]).
-pub(crate) const SANDBOXED_TESTS: &str = "sandboxed-tests";
+pub const SANDBOXED_TESTS: &str = "sandboxed-tests";
 
 /// The experiments there are.
-pub(crate) const KNOWN: &[&str] = &[SANDBOXED_TESTS];
+pub const KNOWN: &[&str] = &[SANDBOXED_TESTS];
 
 /// The experiments a workspace's root manifest opts into.
 #[derive(Default, Debug)]
-pub(crate) struct Experiments {
-    pub(crate) manifest: PathBuf,
-    pub(crate) on: BTreeSet<String>,
+pub struct Experiments {
+    pub manifest: PathBuf,
+    pub on: BTreeSet<String>,
 }
 
 impl Experiments {
-    pub(crate) fn has(&self, name: &str) -> bool {
+    pub fn has(&self, name: &str) -> bool {
         self.on.contains(name)
     }
 
     /// The line that opts the workspace into `name`, and where it goes.
-    pub(crate) fn how_to(&self, name: &str) -> String {
+    pub fn how_to(&self, name: &str) -> String {
         format!(
             "`{KEY} = [\"{name}\"]` under `[workspace.metadata.blaze]` in {}",
             self.manifest.display()
@@ -47,7 +47,7 @@ impl Experiments {
 /// What the root manifest of the workspace at `root` lists in [`KEY`]: nothing when it has no
 /// manifest or does not say. A name not [`KNOWN`], or a value that is not a list of strings, is
 /// an error.
-pub(crate) fn of(root: &Path) -> anyhow::Result<Experiments> {
+pub fn of(root: &Path) -> anyhow::Result<Experiments> {
     let manifest = root.join("Cargo.toml");
     let mut out = Experiments { manifest: manifest.clone(), on: BTreeSet::new() };
     let Ok(text) = std::fs::read_to_string(&manifest) else { return Ok(out) };

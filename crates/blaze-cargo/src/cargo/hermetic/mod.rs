@@ -23,16 +23,16 @@ const LIBS: &str = include_str!("libs.toml");
 /// The variable that has build scripts run in their closure alone (`on`), until the remote
 /// cache has the closure for everyone ([`closure::PROJECT`]): then it is how every script runs
 /// on Linux.
-pub(crate) const VAR: &str = "BLAZE_SCRIPT_VIEW";
+pub const VAR: &str = "BLAZE_SCRIPT_VIEW";
 
 /// The table of the workspace's root manifest that gives crates their system libraries,
 /// before blaze's own table.
-pub(crate) const SYSTEM_DEPS: &str = "[workspace.metadata.blaze.system-deps]";
+pub const SYSTEM_DEPS: &str = "[workspace.metadata.blaze.system-deps]";
 
 /// What every build script is given of the closure, whatever its crate: the C and C++
 /// compilers, their linker and archiver, the target's libc and kernel headers, pkg-config, and the
 /// tools a `configure` or a `Makefile` runs. By the root `closure/pins.txt` pins.
-pub(crate) const TOOLCHAIN: [&str; 15] = [
+pub const TOOLCHAIN: [&str; 15] = [
     "clang",
     "lld",
     "llvmPackages.bintools",
@@ -51,35 +51,35 @@ pub(crate) const TOOLCHAIN: [&str; 15] = [
 ];
 
 /// Whether a run with `env` is to see its closure alone, as [`VAR`] says.
-pub(crate) fn wanted(env: &[(String, String)]) -> bool {
+pub fn wanted(env: &[(String, String)]) -> bool {
     env.iter().any(|(name, value)| name == VAR && matches!(value.as_str(), "on" | "1"))
 }
 
 /// A run that sees its closure alone: the closure, what of its package it does not see, and the
 /// `OUT_DIR`s of other packages it reads, all of which its key is of ([`key_of`]).
 #[derive(Clone, Debug)]
-pub(crate) struct InView {
-    pub(crate) closure: Closure,
-    pub(crate) hidden: Vec<PathBuf>,
-    pub(crate) deps: Vec<PathBuf>,
+pub struct InView {
+    pub closure: Closure,
+    pub hidden: Vec<PathBuf>,
+    pub deps: Vec<PathBuf>,
 }
 
 /// What a crate's build script runs with: the roots it was given, by attribute, and every
 /// store path of their closure, each with where blaze laid it out.
 #[derive(Clone, Debug)]
-pub(crate) struct Closure {
+pub struct Closure {
     /// The roots, the toolchain's first, each by attribute and store path.
-    pub(crate) roots: Vec<(String, String)>,
+    pub roots: Vec<(String, String)>,
     /// The attributes of the crate's own libraries, from the workspace or blaze's table.
-    pub(crate) libs: Vec<String>,
-    pub(crate) paths: Vec<(StorePath, PathBuf)>,
+    pub libs: Vec<String>,
+    pub paths: Vec<(StorePath, PathBuf)>,
 }
 
 /// The closure of the build script of the crate `name` at `version`, laid out: the toolchain
 /// and the crate's libraries ([`libs_for`] with the workspace's `overrides`). `Err` names what
 /// is missing: a host pins.txt has nothing for, a library it does not pin, a path neither the
 /// store nor the remote has.
-pub(crate) fn closure_for(
+pub fn closure_for(
     name: &str,
     version: &str,
     overrides: &BTreeMap<String, Vec<String>>,
@@ -97,7 +97,7 @@ pub(crate) fn closure_for(
         let Some(root) = pinned.iter().find(|it| it.attribute == attribute) else {
             anyhow::bail!(
                 "the build script of `{name}` is to be given `{attribute}`, which blaze does not \
-                 pin for {host} (crates/blaze-engine/src/cargo/closure/pins.txt, written by \
+                 pin for {host} (crates/blaze-cargo/src/cargo/closure/pins.txt, written by \
                  harness/closure_pins.py)"
             );
         };
@@ -154,7 +154,7 @@ fn held_by_one(what: &str) -> anyhow::Result<std::fs::File> {
 /// The crates `[workspace.metadata.blaze.system-deps]` of the root manifest at `manifest` gives
 /// libraries, each its roots: nothing when there is none. Anything but a list of roots is not
 /// built yet and an error that says so.
-pub(crate) fn system_deps(manifest: &Path) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+pub fn system_deps(manifest: &Path) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
     let Ok(text) = std::fs::read_to_string(manifest) else { return Ok(BTreeMap::new()) };
     let value: toml::Table =
         toml::from_str(&text).with_context(|| format!("reading {}", manifest.display()))?;
@@ -220,7 +220,7 @@ fn kept_in_view(name: &str) -> bool {
 /// is given them: `PATH` of the roots' `bin`, the compilers, pkg-config and where it finds the
 /// libraries' `.pc` files, their headers and libraries for the compiler wrapper, and Nix's home
 /// and temporary directory.
-pub(crate) fn env_in(
+pub fn env_in(
     env: &[(String, String)],
     also: &std::collections::BTreeSet<String>,
     closure: &Closure,
@@ -313,7 +313,7 @@ pub(crate) fn env_in(
 /// the packages its `DEP_` variables name), and the closure at `/nix/store`. Each is where it
 /// is on the machine but the closure. A hidden directory is a skeleton of the directories
 /// below it that are bound, made in `scratch`.
-pub(crate) fn view(
+pub fn view(
     package: &Path,
     out_dir: &Path,
     read: &[PathBuf],
@@ -372,7 +372,7 @@ fn hidden_in(package: &Path, out_dir: &Path) -> Vec<PathBuf> {
 
 /// Where cargo keeps the package in `dir` when it is a registry's or a git dependency's: the
 /// cargo home above its `registry/src` or `git/checkouts`.
-pub(crate) fn cargo_home_of(dir: &Path) -> Option<PathBuf> {
+pub fn cargo_home_of(dir: &Path) -> Option<PathBuf> {
     dir.ancestors().find_map(|it| {
         let parent = it.parent()?;
         let name = it.file_name()?;
@@ -384,7 +384,7 @@ pub(crate) fn cargo_home_of(dir: &Path) -> Option<PathBuf> {
 
 /// The directories of `env`'s `DEP_` variables that are `OUT_DIR`s of other packages' runs:
 /// what the run reads of them, which it is keyed by.
-pub(crate) fn dep_out_dirs(env: &[(String, String)]) -> Vec<PathBuf> {
+pub fn dep_out_dirs(env: &[(String, String)]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for (name, value) in env {
         if !name.starts_with("DEP_") {
@@ -415,7 +415,7 @@ pub(crate) fn dep_out_dirs(env: &[(String, String)]) -> Vec<PathBuf> {
 /// Adds to `key` what a run in `closure` is made of besides its script, its arguments and its
 /// environment: its package's source ([`package_identity`]), each store path of the closure by
 /// its NarHash, and what each `OUT_DIR` of `deps` holds, by its path as `unplace` names it.
-pub(crate) fn key_of(
+pub fn key_of(
     key: &mut super::keyed::Key,
     package: &Path,
     hidden: &[PathBuf],
@@ -441,7 +441,7 @@ pub(crate) fn key_of(
 /// closure that a `rustc-link-search` or `rustc-flags` line names is where blaze laid it out,
 /// for the link, which runs outside the run's namespace, where `/nix/store` may not be. The
 /// store keeps the run as it printed it.
-pub(crate) fn for_cargo(stdout: &[u8]) -> Vec<u8> {
+pub fn for_cargo(stdout: &[u8]) -> Vec<u8> {
     let Some(dir) = closure::dir() else { return stdout.to_vec() };
     let Some(dir) = dir.to_str() else { return stdout.to_vec() };
     let text = String::from_utf8_lossy(stdout);
@@ -459,12 +459,7 @@ pub(crate) fn for_cargo(stdout: &[u8]) -> Vec<u8> {
 
 /// What a run in its closure that failed with `stderr` is told: what it ran with, what it
 /// looked for that was not there, as its tools said, and where to give it more.
-pub(crate) fn failed_note(
-    name: &str,
-    closure: &Closure,
-    stderr: &[u8],
-    root: Option<&Path>,
-) -> String {
+pub fn failed_note(name: &str, closure: &Closure, stderr: &[u8], root: Option<&Path>) -> String {
     let text = String::from_utf8_lossy(stderr);
     let looked: Vec<&str> = text
         .lines()
@@ -517,7 +512,7 @@ pub(crate) fn failed_note(
     format!(
         "{failed}{looked}; a library it needs is given by `{name} = [\"<attr>.out\", \
          \"<attr>.dev\"]` under {SYSTEM_DEPS} in {root}, or by a line for `{name}` in blaze's \
-         crates/blaze-engine/src/cargo/hermetic/libs.toml"
+         crates/blaze-cargo/src/cargo/hermetic/libs.toml"
     )
 }
 
@@ -532,7 +527,7 @@ struct Entry {
 /// The system libraries the build script of the crate `name` at `version` is given: the
 /// workspace's own entry (`build-script-libs`, `overrides`) when it has one, else the shipped
 /// table's for that version, else none. `Err` is a table that says it wrongly.
-pub(crate) fn libs_for(
+pub fn libs_for(
     name: &str,
     version: &str,
     overrides: &BTreeMap<String, Vec<String>>,
@@ -561,7 +556,7 @@ pub(crate) fn libs_for(
 /// `Cargo.lock`'s checksum is of); a git dependency's by its checkout, which cargo names by
 /// the commit and never changes; any other by every file below `dir` but those in `hidden`,
 /// which its run does not see. `cargo_home` is where cargo keeps the first two.
-pub(crate) fn package_identity(
+pub fn package_identity(
     dir: &Path,
     cargo_home: Option<&Path>,
     hidden: &[PathBuf],

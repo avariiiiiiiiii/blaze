@@ -7,43 +7,43 @@ use syntax::TextRange;
 
 /// The errors of a verdict on the source, in the order they are written.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Said(pub(crate) Vec<Diagnostic>);
+pub struct Said(pub Vec<Diagnostic>);
 
 /// An error, and where it is when it is of one place.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Diagnostic {
+pub struct Diagnostic {
     /// rustc's, as `E0308`, for the ones that have one.
-    pub(crate) code: Option<String>,
-    pub(crate) message: String,
-    pub(crate) span: Option<Span>,
+    pub code: Option<String>,
+    pub message: String,
+    pub span: Option<Span>,
 }
 
 /// A range of a file as rustc's JSON has it: bytes from 0, lines and columns from 1, a
 /// column counting chars.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Span {
+pub struct Span {
     /// As the error shows it: from the root of the workspace when the file is below it.
-    pub(crate) file_name: String,
-    pub(crate) byte_start: usize,
-    pub(crate) byte_end: usize,
-    pub(crate) line_start: usize,
-    pub(crate) line_end: usize,
-    pub(crate) column_start: usize,
-    pub(crate) column_end: usize,
+    pub file_name: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub column_start: usize,
+    pub column_end: usize,
     /// Each line the range is on, and the columns of it on that line.
-    pub(crate) text: Vec<Line>,
+    pub text: Vec<Line>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Line {
-    pub(crate) text: String,
-    pub(crate) highlight_start: usize,
-    pub(crate) highlight_end: usize,
+pub struct Line {
+    pub text: String,
+    pub highlight_start: usize,
+    pub highlight_end: usize,
 }
 
 /// An error at `range` of `text`, the file shown as `path`. `code` is rustc's, as `E0308`,
 /// for the ones that have one.
-pub(crate) fn at(
+pub fn at(
     code: Option<&str>,
     message: &str,
     path: &str,
@@ -81,7 +81,7 @@ pub(crate) fn at(
 }
 
 /// An error that is of no one place.
-pub(crate) fn of_none(message: &str) -> Diagnostic {
+pub fn of_none(message: &str) -> Diagnostic {
     Diagnostic { code: None, message: message.to_owned(), span: None }
 }
 
@@ -93,7 +93,7 @@ fn position(text: &str, at: usize) -> (usize, usize) {
 
 impl Diagnostic {
     /// As rustc writes it, with the first line of where it is and that marked.
-    pub(crate) fn rendered(&self) -> String {
+    pub fn rendered(&self) -> String {
         let header = self.header();
         let Some(span) = &self.span else { return header };
         let Some(line) = span.text.first() else { return header };
@@ -117,7 +117,7 @@ impl Diagnostic {
     }
 
     /// As rustc writes it to a terminal, in colour: `--message-format=json-diagnostic-rendered-ansi`.
-    pub(crate) fn rendered_ansi(&self) -> String {
+    pub fn rendered_ansi(&self) -> String {
         const BOLD: &str = "\x1b[1m";
         const RED: &str = "\x1b[1m\x1b[91m";
         const BLUE: &str = "\x1b[1m\x1b[94m";
@@ -149,7 +149,7 @@ impl Diagnostic {
     }
 
     /// As rustc's `--error-format=short` writes it.
-    pub(crate) fn short(&self) -> String {
+    pub fn short(&self) -> String {
         match &self.span {
             Some(span) => format!(
                 "{}:{}:{}: {}",
@@ -171,7 +171,7 @@ impl Diagnostic {
 
     /// What rustc's `--error-format=json` writes of it, with `rendered` as the text of it
     /// the format asks for.
-    pub(crate) fn rustc_json(&self, rendered: String) -> RustcDiagnostic {
+    pub fn rustc_json(&self, rendered: String) -> RustcDiagnostic {
         let spans = self.span.iter().map(|span| RustcSpan {
             file_name: span.file_name.clone(),
             byte_start: span.byte_start,
@@ -201,54 +201,54 @@ impl Diagnostic {
 
 /// A diagnostic as rustc's JSON has it, its fields in rustc's order.
 #[derive(Serialize, Debug, PartialEq)]
-pub(crate) struct RustcDiagnostic {
+pub struct RustcDiagnostic {
     #[serde(rename = "$message_type")]
-    pub(crate) message_type: &'static str,
-    pub(crate) message: String,
-    pub(crate) code: Option<RustcCode>,
-    pub(crate) level: &'static str,
-    pub(crate) spans: Vec<RustcSpan>,
-    pub(crate) children: Vec<RustcDiagnostic>,
-    pub(crate) rendered: Option<String>,
+    pub message_type: &'static str,
+    pub message: String,
+    pub code: Option<RustcCode>,
+    pub level: &'static str,
+    pub spans: Vec<RustcSpan>,
+    pub children: Vec<RustcDiagnostic>,
+    pub rendered: Option<String>,
 }
 
 /// A code and the text `rustc --explain` has of it, which only rustc has.
 #[derive(Serialize, Debug, PartialEq)]
-pub(crate) struct RustcCode {
-    pub(crate) code: String,
-    pub(crate) explanation: Option<String>,
+pub struct RustcCode {
+    pub code: String,
+    pub explanation: Option<String>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
-pub(crate) struct RustcSpan {
-    pub(crate) file_name: String,
-    pub(crate) byte_start: usize,
-    pub(crate) byte_end: usize,
-    pub(crate) line_start: usize,
-    pub(crate) line_end: usize,
-    pub(crate) column_start: usize,
-    pub(crate) column_end: usize,
-    pub(crate) is_primary: bool,
-    pub(crate) text: Vec<Line>,
-    pub(crate) label: Option<String>,
-    pub(crate) suggested_replacement: Option<String>,
-    pub(crate) suggestion_applicability: Option<String>,
-    pub(crate) expansion: Option<()>,
+pub struct RustcSpan {
+    pub file_name: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub column_start: usize,
+    pub column_end: usize,
+    pub is_primary: bool,
+    pub text: Vec<Line>,
+    pub label: Option<String>,
+    pub suggested_replacement: Option<String>,
+    pub suggestion_applicability: Option<String>,
+    pub expansion: Option<()>,
 }
 
 impl Said {
-    pub(crate) fn one(diagnostic: Diagnostic) -> Said {
+    pub fn one(diagnostic: Diagnostic) -> Said {
         Said(vec![diagnostic])
     }
 
     /// How many errors it has.
-    pub(crate) fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.0.len()
     }
 
     /// What rustc says of a crate it turned down after its errors, under cargo: where to read
     /// of their codes.
-    pub(crate) fn notes(&self) -> Vec<String> {
+    pub fn notes(&self) -> Vec<String> {
         let mut codes: Vec<&str> = self.0.iter().filter_map(|it| it.code.as_deref()).collect();
         codes.sort_unstable();
         codes.dedup();
@@ -268,7 +268,7 @@ impl Said {
 
     /// The line a worker answers with: the errors as rustc writes them, which a client that
     /// reads no more shows, and then them as they are.
-    pub(crate) fn reply(&self) -> String {
+    pub fn reply(&self) -> String {
         let mut line = "error: ".to_owned();
         blaze_live::format::escape(&self.to_string(), &mut line);
         line.push_str(AS_THEY_ARE);
@@ -278,7 +278,7 @@ impl Said {
 
     /// What [`Said::reply`] wrote after `error: `, or the text of a reply of no more than
     /// that.
-    pub(crate) fn of_reply(after: &str) -> Said {
+    pub fn of_reply(after: &str) -> Said {
         let (text, as_they_are) = match after.split_once(AS_THEY_ARE) {
             Some((text, json)) => (text, serde_json::from_str(json).ok()),
             None => (after, None),
@@ -290,7 +290,7 @@ impl Said {
     }
 
     /// The text of a reply, for a client that reads no more.
-    pub(crate) fn text_of_reply(line: &str) -> &str {
+    pub fn text_of_reply(line: &str) -> &str {
         line.split_once(AS_THEY_ARE).map_or(line, |(text, _)| text)
     }
 }

@@ -39,7 +39,7 @@ import ci
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PIN = os.path.join(HERE, "toolchain")
-PINS = os.path.join(ROOT, "crates/blaze-engine/src/cargo/toolchain/pins.txt")
+PINS = os.path.join(ROOT, "crates/blaze-cargo/src/cargo/toolchain/pins.txt")
 DIST = "https://static.rust-lang.org/dist"
 RUST = "https://github.com/rust-lang/rust"
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "blaze-bump")
@@ -338,7 +338,7 @@ async def bump(date):
     print(f"""
 blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`
-    (with that host's release build of blaze), then commit crates/blaze-engine/src/answers/rustc.json;
+    (with that host's release build of blaze), then commit crates/blaze-cargo/src/answers/rustc.json;
   - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
   - `python3 harness/toolchain_bump.py --checks` in an ix VM, under Cranelift and under LLVM
     (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);

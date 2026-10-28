@@ -469,7 +469,7 @@ fn ended(done: anyhow::Result<()>) -> anyhow::Result<i32> {
 }
 
 /// `cargo search [QUERY]...`.
-pub(super) fn search(typed: &[String]) -> anyhow::Result<i32> {
+pub fn search(typed: &[String]) -> anyhow::Result<i32> {
     let flags = [valued(&["--limit"]), valued(&["--index"]), valued(&["--registry"])];
     let read = match SEARCH.read(typed, &flags) {
         Ok(read) => read,
@@ -584,7 +584,7 @@ fn current_package(run: &Run) -> anyhow::Result<String> {
 }
 
 /// `cargo owner [CRATE]`.
-pub(super) fn owner(typed: &[String]) -> anyhow::Result<i32> {
+pub fn owner(typed: &[String]) -> anyhow::Result<i32> {
     let flags = [
         valued(&["-a", "--add"]),
         valued(&["-r", "--remove"]),
@@ -654,7 +654,7 @@ pub(super) fn owner(typed: &[String]) -> anyhow::Result<i32> {
 }
 
 /// `cargo yank [CRATE] --version <VERSION> [--undo]`.
-pub(super) fn yank(typed: &[String]) -> anyhow::Result<i32> {
+pub fn yank(typed: &[String]) -> anyhow::Result<i32> {
     let flags = [
         valued(&["--version", "--vers"]),
         switch(&["--undo"]),
@@ -734,7 +734,7 @@ fn resolve_crate(
 
 /// `cargo login [-- [args]...]`, with the token from standard input (or, deprecated, the
 /// one word given).
-pub(super) fn login(typed: &[String]) -> anyhow::Result<i32> {
+pub fn login(typed: &[String]) -> anyhow::Result<i32> {
     let flags = [valued(&["--registry"])];
     let (before, provider_args) = match typed.iter().position(|it| it == "--") {
         Some(at) => (&typed[..at], &typed[at + 1..]),
@@ -783,7 +783,7 @@ pub(super) fn login(typed: &[String]) -> anyhow::Result<i32> {
 }
 
 /// `cargo logout`.
-pub(super) fn logout(typed: &[String]) -> anyhow::Result<i32> {
+pub fn logout(typed: &[String]) -> anyhow::Result<i32> {
     let flags = [valued(&["--registry"])];
     let read = match LOGOUT.read(typed, &flags) {
         Ok(read) => read,

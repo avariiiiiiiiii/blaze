@@ -21,35 +21,35 @@ const LTO_ACCEPTED: &str = "lto: accepted, no cross-function optimization";
 /// Which build of a package the daemon stands in for, as the flags of `cargo build` say it.
 /// `blaze` and the engine both say a build with this.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Selection {
+pub struct Selection {
     /// The name of the profile: `dev` unless `--release` or `--profile` says otherwise.
-    pub(crate) profile: String,
-    pub(crate) features: Vec<String>,
-    pub(crate) no_default_features: bool,
-    pub(crate) all_features: bool,
+    pub profile: String,
+    pub features: Vec<String>,
+    pub no_default_features: bool,
+    pub all_features: bool,
     /// The packages asked for with `-p`: none is what `cargo build` builds where it is run.
-    pub(crate) packages: Vec<String>,
+    pub packages: Vec<String>,
     /// Whether every member of the workspace is built.
-    pub(crate) workspace: bool,
+    pub workspace: bool,
     /// The members `--exclude` leaves out of the workspace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) excludes: Vec<String>,
+    pub excludes: Vec<String>,
     /// The values of `-Z`, which cargo is run with as it was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) unstable: Vec<String>,
+    pub unstable: Vec<String>,
     /// The triple built for, when it is not the host.
-    pub(crate) target: Option<String>,
+    pub target: Option<String>,
     /// Whether tests, examples and benchmarks are built, and so what they depend on.
-    pub(crate) dev_deps: bool,
+    pub dev_deps: bool,
     /// The `--config` values given, which can change a profile or what is built as much as
     /// the configuration files can.
     #[serde(default)]
-    pub(crate) config: Vec<String>,
+    pub config: Vec<String>,
     /// Where the build was asked for, when not in the package's directory: the manifest given
     /// with `--manifest-path`, or the directory cargo looked for one from. What `--workspace`,
     /// `-p` and no package at all select is decided there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) asked_in: Option<PathBuf>,
+    pub asked_in: Option<PathBuf>,
 }
 
 impl Default for Selection {
@@ -74,7 +74,7 @@ impl Default for Selection {
 impl Selection {
     /// The selection as flags, which `cargo build` and `blaze` both read. Whether tests are
     /// built is not among them: cargo and blaze name that differently.
-    pub(crate) fn flags(&self) -> Vec<String> {
+    pub fn flags(&self) -> Vec<String> {
         let mut flags = vec!["--profile".to_owned(), self.profile.clone()];
         if let Some(target) = &self.target {
             flags.extend(["--target".to_owned(), target.clone()]);
@@ -109,23 +109,23 @@ impl Selection {
 
 /// How a package is built for the target.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Built {
-    pub(crate) features: BTreeSet<String>,
-    pub(crate) profile: Profile,
+pub struct Built {
+    pub features: BTreeSet<String>,
+    pub profile: Profile,
     /// Whether the package is one cargo was asked to build, not one those depend on.
-    pub(crate) primary: bool,
+    pub primary: bool,
     /// Whether the package is built into the program, not only for what runs while building.
-    pub(crate) for_target: bool,
+    pub for_target: bool,
 }
 
 /// What a build is for and who asks for it.
-pub(crate) struct Asked<'a> {
+pub struct Asked<'a> {
     /// The triple built for.
-    pub(crate) triple: &'a str,
+    pub triple: &'a str,
     /// What `rustc --print cfg` says of the triple.
-    pub(crate) cfg: &'a [CfgAtom],
+    pub cfg: &'a [CfgAtom],
     /// The variables of the process that asks, where they are not those of this one.
-    pub(crate) env: &'a FxHashMap<String, Option<String>>,
+    pub env: &'a FxHashMap<String, Option<String>>,
 }
 
 /// cargo, run in `dir` with `env` for the variables of whoever asks.
@@ -146,22 +146,22 @@ impl Asked<'_> {
 
 /// The settings of a profile that change what a program does.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub(crate) struct Profile {
+pub struct Profile {
     /// `dev`, `release`, `test`, `bench` or a custom profile's name.
     #[serde(default)]
-    pub(crate) name: String,
-    pub(crate) opt_level: String,
+    pub name: String,
+    pub opt_level: String,
     lto: String,
-    pub(crate) debug_assertions: bool,
-    pub(crate) overflow_checks: bool,
-    pub(crate) panic: PanicStrategy,
+    pub debug_assertions: bool,
+    pub overflow_checks: bool,
+    pub panic: PanicStrategy,
     debuginfo: DebugLevel,
     split_debuginfo: Option<String>,
     strip: Strip,
     /// The profile's own `rustflags` (cargo's `-Z profile-rustflags`), which come after the
     /// others.
     #[serde(default)]
-    pub(crate) rustflags: Vec<String>,
+    pub rustflags: Vec<String>,
 }
 
 /// A `debug` setting as cargo passes it on: a level by its number or by its name.
@@ -189,16 +189,16 @@ enum Stripped {
 
 /// What a build tells a debugger of its code, and where that is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Described {
-    pub(crate) level: Level,
-    pub(crate) kept: Kept,
+pub struct Described {
+    pub level: Level,
+    pub kept: Kept,
     /// Whether every function keeps its frame pointer (`-C force-frame-pointers`), for a
     /// profiler or the program's own backtraces to walk the frames by.
-    pub(crate) frame_pointers: bool,
+    pub frame_pointers: bool,
 }
 
 impl Described {
-    pub(crate) const NOTHING: Described =
+    pub const NOTHING: Described =
         Described { level: Level::Nothing, kept: Kept::Linked, frame_pointers: false };
 
     /// The most either tells, kept the furthest from the program either keeps it.
@@ -213,7 +213,7 @@ impl Described {
 
 /// How much a build tells a debugger of its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Level {
+pub enum Level {
     Nothing,
     /// Which line each instruction is of, and the functions.
     Lines,
@@ -224,7 +224,7 @@ pub(crate) enum Level {
 /// Where what a debugger reads of the code is kept (`split-debuginfo`). The lines are with
 /// the program always.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Kept {
+pub enum Kept {
     /// In the program, which the linker copies it into.
     Linked,
     /// In the objects the program was linked from, which the program names.
@@ -235,7 +235,7 @@ pub(crate) enum Kept {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum PanicStrategy {
+pub enum PanicStrategy {
     Unwind,
     Abort,
     ImmediateAbort,
@@ -252,7 +252,7 @@ impl PanicStrategy {
 
 impl Profile {
     /// Whether the profile asks for any debug info: what cargo tells a build script in `DEBUG`.
-    pub(crate) fn debuginfo(&self) -> bool {
+    pub fn debuginfo(&self) -> bool {
         !matches!(&self.debuginfo, DebugLevel::Number(0))
             && !matches!(&self.debuginfo, DebugLevel::Named(it) if it == "none")
     }
@@ -284,7 +284,7 @@ impl Profile {
 
     /// What the profile has a debugger told. Where the profile asks for it to be kept apart
     /// from the program, which blaze does not do, that is the reason not to build.
-    pub(crate) fn described(&self) -> anyhow::Result<Described> {
+    pub fn described(&self) -> anyhow::Result<Described> {
         let level = match &self.debuginfo {
             DebugLevel::Number(0) => Level::Nothing,
             DebugLevel::Number(1) => Level::Lines,
@@ -329,7 +329,7 @@ impl Profile {
     }
 
     /// What the profile changes of the cfg `rustc --print cfg -O` reports.
-    pub(crate) fn cfg(&self) -> CfgDiff {
+    pub fn cfg(&self) -> CfgDiff {
         let flag = |name: Symbol| CfgAtom::Flag(name);
         let panic = |strategy: PanicStrategy| CfgAtom::KeyValue {
             key: sym::panic,
@@ -440,7 +440,7 @@ impl Flags {
 }
 
 /// The packages of a build by their id, each as it is built for the target.
-pub(crate) struct Plan {
+pub struct Plan {
     packages: FxHashMap<String, Built>,
     lto: bool,
     frame_pointers: bool,
@@ -451,29 +451,25 @@ pub(crate) struct Plan {
 
 /// What a plan says of a program as a whole.
 #[derive(Clone)]
-pub(crate) struct Whole {
+pub struct Whole {
     /// What the build has a debugger told of the code.
-    pub(crate) debug: Described,
+    pub debug: Described,
     /// Whether rustc links it from bitcode, with `lto`.
-    pub(crate) lto: bool,
+    pub lto: bool,
     /// Whether rustc keeps every function, `#[inline(always)]` ones too, as one copy in one
     /// codegen unit (`-C link-dead-code`), where LLVM inlines it only into that unit's code.
-    pub(crate) links_dead_code: bool,
+    pub links_dead_code: bool,
     /// Whether `--cap-lints` or `--force-warn` is among the flags, so that a lint the source
     /// denies may not fail rustc's build.
-    pub(crate) lints_capped: bool,
+    pub lints_capped: bool,
     /// What the flags give the linker (`-C link-arg`, `-C link-args`), which the daemon's own
     /// link passes as rustc's does.
-    pub(crate) link_args: Vec<String>,
+    pub link_args: Vec<String>,
 }
 
 impl Plan {
     /// The units of the build `selection` names of the package of `manifest`.
-    pub(crate) fn of(
-        manifest: &Path,
-        selection: &Selection,
-        asked: &Asked<'_>,
-    ) -> anyhow::Result<Plan> {
+    pub fn of(manifest: &Path, selection: &Selection, asked: &Asked<'_>) -> anyhow::Result<Plan> {
         // The unit graph says which features and which profile each package of one build has.
         let graph = UnitGraph::asked(manifest, selection, asked)?;
         let (dir, _) = asked_where(manifest, selection);
@@ -482,7 +478,7 @@ impl Plan {
 
     /// What the build has a debugger told of the packages cargo was asked to build: the
     /// most any of them asks for, which is one answer for all the code blaze writes.
-    pub(crate) fn described(&self) -> anyhow::Result<Described> {
+    pub fn described(&self) -> anyhow::Result<Described> {
         let mut described = Described::NOTHING;
         for built in self.packages.values().filter(|it| it.primary) {
             described = described.or(built.profile.described()?);
@@ -491,7 +487,7 @@ impl Plan {
     }
 
     /// What the plan says of the programs cargo was asked to build.
-    pub(crate) fn whole(&self) -> anyhow::Result<Whole> {
+    pub fn whole(&self) -> anyhow::Result<Whole> {
         let debug = Described { frame_pointers: self.frame_pointers, ..self.described()? };
         let link_args = self.link_args.clone();
         Ok(Whole {
@@ -504,12 +500,12 @@ impl Plan {
     }
 
     /// How the package cargo calls `id` is built, when the build has it.
-    pub(crate) fn package(&self, id: &str) -> Option<&Built> {
+    pub fn package(&self, id: &str) -> Option<&Built> {
         self.packages.get(&package_named(id))
     }
 
     /// The profile of the packages cargo was asked to build, for the target.
-    pub(crate) fn target_profile(&self) -> Option<&Profile> {
+    pub fn target_profile(&self) -> Option<&Profile> {
         self.packages.values().find(|it| it.primary && it.for_target).map(|it| &it.profile)
     }
 }
@@ -517,7 +513,7 @@ impl Plan {
 /// The one name of a package for the two ways cargo spells its id: `source#name@version`,
 /// and `name version (source)` as the unit graph of an older cargo does, with the
 /// commit of a git source after it.
-pub(crate) fn package_named(id: &str) -> String {
+pub fn package_named(id: &str) -> String {
     let old = id.strip_suffix(')').and_then(|it| it.split_once(" ("));
     if let Some((name_version, source)) = old
         && let Some((name, version)) = name_version.split_once(' ')
@@ -541,35 +537,35 @@ pub(crate) fn package_named(id: &str) -> String {
 /// features and the units it depends on. The build scripts and proc macros of a load are
 /// built and run from it (`cargo/compile_time.rs`).
 #[derive(Deserialize)]
-pub(crate) struct UnitGraph {
-    pub(crate) units: Vec<Unit>,
-    pub(crate) roots: Vec<usize>,
+pub struct UnitGraph {
+    pub units: Vec<Unit>,
+    pub roots: Vec<usize>,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct Unit {
-    pub(crate) pkg_id: String,
-    pub(crate) target: UnitTarget,
-    pub(crate) profile: Profile,
+pub struct Unit {
+    pub pkg_id: String,
+    pub target: UnitTarget,
+    pub profile: Profile,
     /// The triple the unit is built for, `None` for the host.
     #[serde(default)]
-    pub(crate) platform: Option<String>,
+    pub platform: Option<String>,
     /// `build`, `check`, `test`, `run-custom-build`, ...
     #[serde(default)]
-    pub(crate) mode: String,
-    pub(crate) features: Vec<String>,
-    pub(crate) dependencies: Vec<UnitDependency>,
+    pub mode: String,
+    pub features: Vec<String>,
+    pub dependencies: Vec<UnitDependency>,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct UnitTarget {
-    pub(crate) kind: Vec<String>,
+pub struct UnitTarget {
+    pub kind: Vec<String>,
     #[serde(default)]
-    pub(crate) name: String,
+    pub name: String,
     #[serde(default)]
-    pub(crate) src_path: PathBuf,
+    pub src_path: PathBuf,
     #[serde(default = "edition_2015")]
-    pub(crate) edition: String,
+    pub edition: String,
 }
 
 fn edition_2015() -> String {
@@ -577,28 +573,28 @@ fn edition_2015() -> String {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct UnitDependency {
-    pub(crate) index: usize,
+pub struct UnitDependency {
+    pub index: usize,
     /// The name the unit links it under.
     #[serde(default)]
-    pub(crate) extern_crate_name: String,
+    pub extern_crate_name: String,
 }
 
 impl Unit {
     /// Whether the unit runs while building: a build script or a proc macro. What it depends
     /// on is built for the host, with features and a profile of its own.
-    pub(crate) fn runs_on_host(&self) -> bool {
+    pub fn runs_on_host(&self) -> bool {
         self.target.kind.iter().any(|it| it == "custom-build" || it == "proc-macro")
     }
 
-    pub(crate) fn is_library(&self) -> bool {
+    pub fn is_library(&self) -> bool {
         self.target.kind.iter().any(|it| it.ends_with("lib"))
     }
 }
 
 /// Where the build `selection` names of the package of `manifest` is asked for: the directory,
 /// and the manifest when one is named.
-pub(crate) fn asked_where<'a>(
+pub fn asked_where<'a>(
     manifest: &'a Path,
     selection: &'a Selection,
 ) -> (&'a Path, Option<&'a Path>) {
@@ -619,12 +615,12 @@ std::thread_local! {
 
 /// The load of a workspace on this thread, while it lives: the unit graphs asked for in it
 /// are made once. A load after it makes them again, as the manifests may have changed since.
-pub(crate) struct Load {
+pub struct Load {
     outer: Option<Told>,
 }
 
 impl Load {
-    pub(crate) fn start() -> Load {
+    pub fn start() -> Load {
         Load { outer: TOLD.with(|it| it.replace(Some(Told::default()))) }
     }
 }
@@ -638,7 +634,7 @@ impl Drop for Load {
 impl UnitGraph {
     /// The units of the build `selection` names of the package of `manifest`, for what
     /// `asked` says: what the load under way was told already when it asked the same.
-    pub(crate) fn asked(
+    pub fn asked(
         manifest: &Path,
         selection: &Selection,
         asked: &Asked<'_>,
@@ -677,7 +673,7 @@ impl UnitGraph {
 
     /// The units that end up in the program: those the roots reach without going through one
     /// that runs on the host.
-    pub(crate) fn for_target(&self) -> FxHashSet<usize> {
+    pub fn for_target(&self) -> FxHashSet<usize> {
         let mut reached = FxHashSet::default();
         let mut queue: Vec<usize> =
             self.roots.iter().copied().filter(|&it| it < self.units.len()).collect();

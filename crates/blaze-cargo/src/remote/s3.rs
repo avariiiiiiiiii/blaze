@@ -37,7 +37,7 @@ const PART: u64 = 8 << 20;
 /// An upload is given up when it is slower than this for the whole of an attempt.
 const SLOWEST_UPLOAD: u64 = 64 << 10;
 
-pub(crate) struct S3 {
+pub struct S3 {
     client: Client,
     bucket: String,
     /// With a `/` at its end, or empty.
@@ -48,7 +48,7 @@ pub(crate) struct S3 {
 }
 
 /// What the answer to a conditional write was.
-pub(crate) enum Written {
+pub enum Written {
     Done,
     /// Somebody else wrote since the version was read.
     Lost,
@@ -59,11 +59,7 @@ impl S3 {
     /// What the address leaves out is what the AWS tools read: `AWS_ENDPOINT_URL`,
     /// `AWS_REGION`, `AWS_PROFILE` and the shared config files. A service at an endpoint of
     /// its own is addressed by path unless told otherwise, as most that are not AWS need.
-    pub(crate) async fn open(
-        spec: &Url,
-        patience: Duration,
-        traffic: Arc<Traffic>,
-    ) -> anyhow::Result<S3> {
+    pub async fn open(spec: &Url, patience: Duration, traffic: Arc<Traffic>) -> anyhow::Result<S3> {
         let bucket = spec.host_str().context("the address names no bucket")?.to_owned();
         let prefix = match spec.path().trim_matches('/') {
             "" => String::new(),
@@ -107,7 +103,7 @@ impl S3 {
 
     /// The bucket and the prefix, which is what the lists of this remote are remembered
     /// under: the same bucket reached another way is the same remote.
-    pub(crate) fn place(&self) -> String {
+    pub fn place(&self) -> String {
         format!("s3://{}/{}", self.bucket, self.prefix)
     }
 
@@ -117,11 +113,7 @@ impl S3 {
 
     /// The object under `name` from `offset` on, or `None` when there is no such object.
     /// `offset` at or past its end is an object with nothing left.
-    pub(crate) async fn read_from(
-        &self,
-        name: &str,
-        offset: u64,
-    ) -> anyhow::Result<Option<ByteStream>> {
+    pub async fn read_from(&self, name: &str, offset: u64) -> anyhow::Result<Option<ByteStream>> {
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
         let mut request = self.client.get_object().bucket(&self.bucket).key(self.key(name));
         if offset != 0 {
@@ -137,7 +129,7 @@ impl S3 {
 
     /// The whole of a small object and the version it was read at, when it is at most
     /// `most` bytes. How long the service says it is is not believed: the bytes are counted.
-    pub(crate) async fn read_small(
+    pub async fn read_small(
         &self,
         name: &str,
         most: u64,
@@ -162,7 +154,7 @@ impl S3 {
     }
 
     /// The object under `name` as a listing would have it, if there is one.
-    pub(crate) async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
+    pub async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
         match self.client.head_object().bucket(&self.bucket).key(self.key(name)).send().await {
             Ok(found) => Ok(Some(Object {
@@ -176,7 +168,7 @@ impl S3 {
     }
 
     /// The objects whose names start with `prefix`.
-    pub(crate) async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
+    pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Object>> {
         let (mut objects, mut next) = (Vec::new(), None);
         loop {
             self.traffic.operations.fetch_add(1, Ordering::Relaxed);
@@ -198,7 +190,7 @@ impl S3 {
     }
 
     /// Removes the object under `name`. One that is not there is removed.
-    pub(crate) async fn delete(&self, name: &str) -> anyhow::Result<()> {
+    pub async fn delete(&self, name: &str) -> anyhow::Result<()> {
         self.traffic.operations.fetch_add(1, Ordering::Relaxed);
         let sent =
             self.client.delete_object().bucket(&self.bucket).key(self.key(name)).send().await;
@@ -207,7 +199,7 @@ impl S3 {
 
     /// Writes a small object if the one there is still the version that was read: `None`
     /// when none was there.
-    pub(crate) async fn write_small(
+    pub async fn write_small(
         &self,
         name: &str,
         bytes: &[u8],
@@ -233,7 +225,7 @@ impl S3 {
 
     /// Puts the file under `name`, all of it or nothing: an object appears when its last
     /// byte is there.
-    pub(crate) async fn send_file(&self, name: &str, file: &Path, len: u64) -> anyhow::Result<()> {
+    pub async fn send_file(&self, name: &str, file: &Path, len: u64) -> anyhow::Result<()> {
         if len < MULTIPART_AT {
             self.send_whole(name, file, len).await
         } else {

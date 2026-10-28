@@ -159,7 +159,7 @@ fn sysroot() -> Option<PathBuf> {
 /// What `cargo --version` says after `cargo ` for the toolchain at `sysroot`, from rustup's
 /// channel manifest there: the release of its rustc (cargo's `CFG_RELEASE`) with the commit
 /// and date of its cargo.
-pub(super) fn cargo_version(sysroot: &Path) -> Option<String> {
+pub fn cargo_version(sysroot: &Path) -> Option<String> {
     let manifest = sysroot.join("lib/rustlib/multirust-channel-manifest.toml");
     let manifest = std::fs::read_to_string(manifest).ok()?;
     let version = |package: &str| {
@@ -387,7 +387,7 @@ fn is_plain_cfg(cfg: &str) -> bool {
 
 /// What rustc of blaze's release prints for `args` with `stdin`, with the variables `var`
 /// reads; `None` for what this does not answer.
-pub(super) fn answer(
+pub fn answer(
     args: &[OsString],
     stdin: &[u8],
     var: &dyn Fn(&str) -> Option<OsString>,

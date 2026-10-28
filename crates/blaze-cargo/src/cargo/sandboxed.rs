@@ -43,16 +43,16 @@ use crate::{
     sandbox::{self, Line, Reached, Spec},
 };
 
-pub(crate) const VAR: &str = sandbox::VAR;
+pub const VAR: &str = sandbox::VAR;
 
 /// Names of more variables of the environment a test keeps under `BLAZE_TESTS=affected`, by
 /// commas.
-pub(crate) const PASS: &str = "BLAZE_TEST_ENV";
+pub const PASS: &str = "BLAZE_TEST_ENV";
 
 /// The variables of the environment a test keeps under `BLAZE_TESTS=affected` besides those
 /// cargo and blaze set for it: what finds programs and the toolchain, who and where the user
 /// is, the locale, and what decides how a failure is shown.
-pub(crate) const KEPT: &[&str] = &[
+pub const KEPT: &[&str] = &[
     "PATH",
     "HOME",
     "USER",
@@ -73,44 +73,44 @@ pub(crate) const KEPT: &[&str] = &[
 ];
 
 /// The table of a package's manifest that takes its tests into the sandbox or out of it.
-pub(crate) const TABLE: &str = "[package.metadata.blaze.sandbox]";
+pub const TABLE: &str = "[package.metadata.blaze.sandbox]";
 
 /// Whether this command may run tests sandboxed, those that are opted in: unless
 /// `BLAZE_SANDBOX` is `off`, as [`sandbox::on`] decides for build
 /// scripts and proc macros too.
-pub(crate) fn on() -> bool {
+pub fn on() -> bool {
     sandbox::on()
 }
 
 /// What a package says of its tests and the sandbox, in [`TABLE`].
 #[derive(Default)]
-pub(crate) struct OptOut {
-    pub(crate) manifest: PathBuf,
+pub struct OptOut {
+    pub manifest: PathBuf,
     /// `tests = false`: every test of the package runs outside.
-    pub(crate) all: bool,
+    pub all: bool,
     /// `tests = true`: every test of the package runs sandboxed, but those `unsandboxed-tests`
     /// names, whether or not its workspace opts in.
-    pub(crate) opted_in: bool,
+    pub opted_in: bool,
     /// `unsandboxed-tests`: the tests, by libtest's names, that run outside.
-    pub(crate) tests: BTreeSet<String>,
+    pub tests: BTreeSet<String>,
     /// `build-script = false`: its build script runs outside, when the package is a member of
     /// the workspace being built (a dependency can't take itself out).
-    pub(crate) build_script_outside: bool,
+    pub build_script_outside: bool,
     /// What the root manifest of the package's workspace opts into; nothing in what
     /// [`opt_out`] reads.
-    pub(crate) experiments: Experiments,
+    pub experiments: Experiments,
 }
 
 impl OptOut {
     /// Whether the package's tests run sandboxed, when the command runs any so ([`on`]).
-    pub(crate) fn sandboxed(&self) -> bool {
+    pub fn sandboxed(&self) -> bool {
         !self.all && (self.opted_in || self.experiments.has(experimental::SANDBOXED_TESTS))
     }
 }
 
 /// What the manifest of the package in `package_dir` and the root manifest of its workspace
 /// say of its tests and the sandbox.
-pub(crate) fn of_tests(package_dir: &Path) -> anyhow::Result<OptOut> {
+pub fn of_tests(package_dir: &Path) -> anyhow::Result<OptOut> {
     let mut out = opt_out(package_dir)?;
     let root = workspace_root(package_dir)?.unwrap_or_else(|| package_dir.to_owned());
     out.experiments = experimental::of(&root)?;
@@ -119,7 +119,7 @@ pub(crate) fn of_tests(package_dir: &Path) -> anyhow::Result<OptOut> {
 
 /// What the manifest of the package in `package_dir` says of its tests and the sandbox. A
 /// table that says it otherwise than as [`TABLE`]'s keys are is an error.
-pub(crate) fn opt_out(package_dir: &Path) -> anyhow::Result<OptOut> {
+pub fn opt_out(package_dir: &Path) -> anyhow::Result<OptOut> {
     let manifest = package_dir.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
@@ -163,33 +163,33 @@ pub(crate) fn opt_out(package_dir: &Path) -> anyhow::Result<OptOut> {
 
 /// The table of the workspace's root manifest that takes packages' build scripts and proc
 /// macros out of the sandbox: the only place a dependency from a registry can be named.
-pub(crate) const WORKSPACE_TABLE: &str = "[workspace.metadata.blaze.sandbox]";
+pub const WORKSPACE_TABLE: &str = "[workspace.metadata.blaze.sandbox]";
 
 /// What the workspace's root manifest says of build scripts, proc macros and the sandbox, in
 /// [`WORKSPACE_TABLE`].
 #[derive(Default, Debug)]
-pub(crate) struct WorkspaceOptOut {
-    pub(crate) manifest: PathBuf,
+pub struct WorkspaceOptOut {
+    pub manifest: PathBuf,
     /// `unsandboxed-build-scripts`: the packages, by name, whose build scripts run outside.
-    pub(crate) build_scripts: BTreeSet<String>,
+    pub build_scripts: BTreeSet<String>,
     /// `unsandboxed-proc-macros`: the packages, by name, whose proc macros are expanded by a
     /// server outside.
-    pub(crate) proc_macros: BTreeSet<String>,
+    pub proc_macros: BTreeSet<String>,
     /// `build-script-env`: variables of the environment given to every build script in the
     /// sandbox besides those it is always given (`script_sandbox.rs`).
-    pub(crate) build_script_env: BTreeSet<String>,
+    pub build_script_env: BTreeSet<String>,
     /// `build-script-link-dirs`: directories of the system a build script in the sandbox may
     /// name in `rustc-link-search` besides those it always may (`directives.rs`).
-    pub(crate) build_script_link_dirs: BTreeSet<String>,
+    pub build_script_link_dirs: BTreeSet<String>,
     /// `wasi-build-scripts`: the packages, by name (`"*"`, all), whose build scripts run under
     /// WASI, an experiment (`wasi_script.rs`).
-    pub(crate) wasi_build_scripts: BTreeSet<String>,
+    pub wasi_build_scripts: BTreeSet<String>,
 }
 
 impl WorkspaceOptOut {
     /// Whether the proc macro of the crate `name` (a package's name with `-` as `_`, as the
     /// crate is named) is expanded outside.
-    pub(crate) fn macro_outside(&self, name: &str) -> bool {
+    pub fn macro_outside(&self, name: &str) -> bool {
         self.proc_macros.iter().any(|it| it.replace('-', "_") == name.replace('-', "_"))
     }
 }
@@ -197,7 +197,7 @@ impl WorkspaceOptOut {
 /// What the root manifest of the workspace at `root` says in [`WORKSPACE_TABLE`]: nothing when
 /// it has no such table or no manifest. A table that says it otherwise than as its keys are
 /// is an error.
-pub(crate) fn workspace_opt_out(root: &Path) -> anyhow::Result<WorkspaceOptOut> {
+pub fn workspace_opt_out(root: &Path) -> anyhow::Result<WorkspaceOptOut> {
     let manifest = root.join("Cargo.toml");
     let mut out = WorkspaceOptOut { manifest: manifest.clone(), ..WorkspaceOptOut::default() };
     let Ok(text) = std::fs::read_to_string(&manifest) else { return Ok(out) };
@@ -237,7 +237,7 @@ pub(crate) fn workspace_opt_out(root: &Path) -> anyhow::Result<WorkspaceOptOut> 
 /// The root of the workspace `dir` is in, as cargo finds it: the nearest directory at or above
 /// it whose manifest has a `[workspace]` table, `None` when there is none. A manifest on the
 /// way that can't be read or parsed is an error, as cargo makes it one.
-pub(crate) fn workspace_root(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+pub fn workspace_root(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     for it in dir.ancestors() {
         let manifest = it.join("Cargo.toml");
         let text = match std::fs::read_to_string(&manifest) {
@@ -259,7 +259,7 @@ pub(crate) fn workspace_root(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// The environment the test `command` runs would have, cut down to what a test keeps under
 /// `BLAZE_TESTS=affected`: what the command sets itself, and of the rest only [`KEPT`] and
 /// what [`PASS`] names.
-pub(crate) fn env(command: &Command) -> Vec<(String, String)> {
+pub fn env(command: &Command) -> Vec<(String, String)> {
     let passed = std::env::var(PASS).unwrap_or_default();
     let kept = |name: &str| {
         KEPT.contains(&name)
@@ -270,7 +270,7 @@ pub(crate) fn env(command: &Command) -> Vec<(String, String)> {
 }
 
 /// The whole environment the test `command` runs would have.
-pub(crate) fn whole_env(command: &Command) -> Vec<(String, String)> {
+pub fn whole_env(command: &Command) -> Vec<(String, String)> {
     with_command(command, |_| true)
 }
 
@@ -290,7 +290,7 @@ fn with_command(command: &Command, kept: impl Fn(&str) -> bool) -> Vec<(String, 
 }
 
 /// What stands for the environment `env` in a sandboxed test's identity.
-pub(crate) fn identity_of(env: &[(String, String)]) -> String {
+pub fn identity_of(env: &[(String, String)]) -> String {
     let mut hash = Sha256::new();
     for (name, value) in env {
         hash.update(name.as_bytes());
@@ -316,20 +316,20 @@ fn cargo_home(env: &[(String, String)]) -> Option<PathBuf> {
 }
 
 /// Where this command keeps the specs and records of its sandboxes, removed when it is done.
-pub(crate) struct Scratch {
+pub struct Scratch {
     dir: PathBuf,
     made: usize,
 }
 
 impl Scratch {
-    pub(crate) fn new() -> Scratch {
+    pub fn new() -> Scratch {
         let dir = std::env::temp_dir().join(format!("blaze-tests-{}", std::process::id()));
         Scratch { dir, made: 0 }
     }
 
     /// The sandbox of a run of `test` with the environment `env`, recording reads when
     /// `reads`.
-    pub(crate) fn sandbox(
+    pub fn sandbox(
         &mut self,
         state: &State,
         test: &Program,
@@ -379,21 +379,21 @@ impl Drop for Scratch {
 }
 
 /// The sandbox of one run of a test executable.
-pub(crate) struct Sandbox {
+pub struct Sandbox {
     spec_file: PathBuf,
     record: PathBuf,
 }
 
 impl Sandbox {
     /// The command that runs `program` in it.
-    pub(crate) fn command(&self, program: &Path) -> anyhow::Result<Command> {
+    pub fn command(&self, program: &Path) -> anyhow::Result<Command> {
         let mut command = Command::new(std::env::current_exe().context("finding blaze itself")?);
         command.arg(sandbox::COMMAND).arg(&self.spec_file).arg("--").arg(program);
         Ok(command)
     }
 
     /// What it recorded, once the run has ended; `None` when it wrote nothing.
-    pub(crate) fn record(&self) -> Option<Vec<Line>> {
+    pub fn record(&self) -> Option<Vec<Line>> {
         sandbox::read_record(&self.record)
     }
 }
@@ -401,17 +401,17 @@ impl Sandbox {
 /// What the sandbox denied the tests of a run: each of them fails for it. A test is hermetic,
 /// its end a function of its code and what it read; one that wrote outside its own directories
 /// or reached the network may end as nothing it read says.
-pub(crate) struct Denied {
+pub struct Denied {
     /// The tests denied something, by name.
-    pub(crate) tests: BTreeSet<String>,
+    pub tests: BTreeSet<String>,
     /// Whether something was denied where no test was known (a thread of its own, a process a
     /// test started): every test of the run fails.
-    pub(crate) unknown: bool,
+    pub unknown: bool,
 }
 
 /// What the sandbox denied the tests of the run of `shown` that recorded `lines`, each said
 /// with how to take the test out of the sandbox. `opt_out` is the test's package's.
-pub(crate) fn denied(lines: &[Line], shown: &str, opt_out: &OptOut) -> Denied {
+pub fn denied(lines: &[Line], shown: &str, opt_out: &OptOut) -> Denied {
     let mut by_test: BTreeMap<&str, Vec<&Line>> = BTreeMap::new();
     for line in lines.iter().filter(|it| matches!(it.reached, Reached::Write | Reached::Net)) {
         by_test.entry(line.test.as_str()).or_default().push(line);
@@ -449,7 +449,7 @@ pub(crate) fn denied(lines: &[Line], shown: &str, opt_out: &OptOut) -> Denied {
 }
 
 /// `writing `a` and `b` (the machine is read-only in a sandbox) and connecting to `c` (...)`.
-pub(crate) fn what_was_refused(them: &[&Line]) -> String {
+pub fn what_was_refused(them: &[&Line]) -> String {
     const SHOWN: usize = 3;
     let listed = |reached: Reached| {
         let all: Vec<String> = them
@@ -478,7 +478,7 @@ pub(crate) fn what_was_refused(them: &[&Line]) -> String {
 
 /// What is quick to tell of what is at `path`: whether it is there, its size and its last
 /// change. Where that is the same, what is there is taken to be.
-pub(crate) fn stat(path: &Path) -> String {
+pub fn stat(path: &Path) -> String {
     let Ok(meta) = std::fs::metadata(path) else { return "-".to_owned() };
     let at = meta.modified().ok().and_then(|it| it.duration_since(std::time::UNIX_EPOCH).ok());
     #[cfg(unix)]
@@ -490,7 +490,7 @@ pub(crate) fn stat(path: &Path) -> String {
 
 /// What is at `path`: nothing, a file's bytes, a directory's names, or something else (a
 /// device, a socket), by a hash.
-pub(crate) fn digest(path: &Path) -> String {
+pub fn digest(path: &Path) -> String {
     let Ok(meta) = std::fs::metadata(path) else { return "-".to_owned() };
     let mut hash = Sha256::new();
     if meta.is_dir() {

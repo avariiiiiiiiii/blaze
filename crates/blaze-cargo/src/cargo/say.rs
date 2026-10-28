@@ -18,7 +18,7 @@ const NEVER: u8 = 2;
 
 /// Has the lines colored as `when` says, cargo's `--color`, or else as `CARGO_TERM_COLOR`
 /// does: `always`, `never`, or `auto`, when standard error is a terminal.
-pub(crate) fn color(when: Option<&str>) {
+pub fn color(when: Option<&str>) {
     let when = when.map(str::to_owned).or_else(|| std::env::var("CARGO_TERM_COLOR").ok());
     let when = match when.as_deref() {
         Some("always") => ALWAYS,
@@ -29,7 +29,7 @@ pub(crate) fn color(when: Option<&str>) {
 }
 
 /// Whether the lines are colored.
-pub(crate) fn colored() -> bool {
+pub fn colored() -> bool {
     match COLOR.load(Ordering::Relaxed) {
         ALWAYS => true,
         NEVER => false,
@@ -39,7 +39,7 @@ pub(crate) fn colored() -> bool {
 
 /// Whether what goes to standard output is colored: as [`colored`], with standard output's
 /// terminal for `auto`.
-pub(crate) fn colored_out() -> bool {
+pub fn colored_out() -> bool {
     match COLOR.load(Ordering::Relaxed) {
         ALWAYS => true,
         NEVER => false,
@@ -55,7 +55,7 @@ fn painted(color: &str, word: &str) -> String {
 }
 
 /// `     Running target/debug/app`, unless the build is quiet.
-pub(crate) fn status(quiet: bool, word: &str, rest: &str) {
+pub fn status(quiet: bool, word: &str, rest: &str) {
     if !quiet {
         eprintln!("{} {rest}", painted(GREEN, &format!("{word:>12}")));
     }
@@ -63,28 +63,28 @@ pub(crate) fn status(quiet: bool, word: &str, rest: &str) {
 
 /// Why cargo does what the daemon would have. Never quiet: a build that went another way
 /// than asked says so.
-pub(crate) fn fallback(reason: &str, then: &str) {
+pub fn fallback(reason: &str, then: &str) {
     eprintln!("{} {reason}; {then}", painted(YELLOW, "blaze:"));
 }
 
-pub(crate) fn error(text: &str) {
+pub fn error(text: &str) {
     eprintln!("{}: {text}", painted(RED, "error"));
 }
 
 /// [`error`] with no newline after it, as cargo ends a few of clap's.
-pub(crate) fn error_unended(text: &str) {
+pub fn error_unended(text: &str) {
     eprint!("{}: {text}", painted(RED, "error"));
 }
 
-pub(crate) fn warning(text: &str) {
+pub fn warning(text: &str) {
     eprintln!("{}: {text}", painted(YELLOW, "warning"));
 }
 
-pub(crate) fn note(text: &str) {
+pub fn note(text: &str) {
     eprintln!("{}: {text}", painted(BOLD, "note"));
 }
 
 /// A note as cargo's shell says one (`Shell::note`), green, which a diagnostic's is not.
-pub(crate) fn shell_note(text: &str) {
+pub fn shell_note(text: &str) {
     eprintln!("{}: {text}", painted(GREEN, "note"));
 }

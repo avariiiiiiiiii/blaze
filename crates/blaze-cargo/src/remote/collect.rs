@@ -27,19 +27,19 @@ use super::{
 const NAMED: [&str; 3] = ["packs/", "keys/", "units/"];
 
 /// How long an object is given.
-pub(super) struct Ages {
+pub struct Ages {
     /// How long after it was written an object no list names is removed.
-    pub(super) unlisted: Duration,
+    pub unlisted: Duration,
     /// How long after it was written a pack is taken off the manifests, if at all.
-    pub(super) listed: Option<Duration>,
+    pub listed: Option<Duration>,
     /// Whether to only say what would be done.
-    pub(super) dry: bool,
+    pub dry: bool,
 }
 
 impl Ages {
     /// The least an unlisted object can be given: see the module.
     const LEAST: Duration = Duration::from_secs(2 * REUSE_FOR.as_secs());
-    pub(super) const UNLISTED: Duration = Duration::from_secs(24 * 60 * 60);
+    pub const UNLISTED: Duration = Duration::from_secs(24 * 60 * 60);
 
     fn check(&self) -> anyhow::Result<()> {
         if self.unlisted < Ages::LEAST {
@@ -55,7 +55,7 @@ impl Ages {
 }
 
 /// A time span as `90s`, `30m`, `12h` or `7d`.
-pub(super) fn parse_age(text: &str) -> Option<Duration> {
+pub fn parse_age(text: &str) -> Option<Duration> {
     let (count, unit) = text.split_at(text.len().checked_sub(1)?);
     let unit = match unit {
         "s" => 1,
@@ -83,7 +83,7 @@ struct Collected {
 }
 
 /// Collects the remote: see the module.
-pub(super) async fn collect(remote: &Remote, ages: &Ages) -> anyhow::Result<String> {
+pub async fn collect(remote: &Remote, ages: &Ages) -> anyhow::Result<String> {
     remote.may_write()?;
     ages.check()?;
     let mut collected = Collected::default();

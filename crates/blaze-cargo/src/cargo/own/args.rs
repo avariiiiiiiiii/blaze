@@ -2,16 +2,16 @@
 //! `--flag=value`, `-Fvalue`, and the flags every cargo command takes.
 
 /// A flag a subcommand takes, by each of its names, and whether it takes a value.
-pub(super) struct Flag {
-    pub(super) names: &'static [&'static str],
-    pub(super) valued: bool,
+pub struct Flag {
+    pub names: &'static [&'static str],
+    pub valued: bool,
 }
 
-pub(super) const fn switch(names: &'static [&'static str]) -> Flag {
+pub const fn switch(names: &'static [&'static str]) -> Flag {
     Flag { names, valued: false }
 }
 
-pub(super) const fn valued(names: &'static [&'static str]) -> Flag {
+pub const fn valued(names: &'static [&'static str]) -> Flag {
     Flag { names, valued: true }
 }
 
@@ -29,26 +29,26 @@ const GLOBAL: &[Flag] = &[
 ];
 
 /// What was typed after the subcommand.
-pub(super) struct Args<'a> {
+pub struct Args<'a> {
     typed: &'a [String],
 }
 
 /// The flags read, by the first of each flag's names, and the other words.
 #[derive(Debug, Default)]
-pub(super) struct Read {
+pub struct Read {
     flags: Vec<(&'static str, Option<String>)>,
     /// The words that are no flags, and every word after `--`.
-    pub(super) positional: Vec<String>,
+    pub positional: Vec<String>,
 }
 
 impl<'a> Args<'a> {
-    pub(super) fn new(typed: &'a [String]) -> Args<'a> {
+    pub fn new(typed: &'a [String]) -> Args<'a> {
         Args { typed }
     }
 
     /// The flags of `flags` and cargo's global ones, or the line cargo refuses the command
     /// line with.
-    pub(super) fn read(&self, flags: &[Flag]) -> Result<Read, String> {
+    pub fn read(&self, flags: &[Flag]) -> Result<Read, String> {
         let known = |name: &str| flags.iter().chain(GLOBAL).find(|it| it.names.contains(&name));
         let mut read = Read::default();
         let mut words = self.typed.iter();
@@ -106,23 +106,23 @@ impl Flag {
 
 impl Read {
     /// Whether the flag of which `name` is the long name was given.
-    pub(super) fn has(&self, name: &str) -> bool {
+    pub fn has(&self, name: &str) -> bool {
         self.flags.iter().any(|(it, _)| *it == name)
     }
 
     /// The values of the flag of which `name` is the long name, in the order given.
-    pub(super) fn values(&self, name: &str) -> Vec<String> {
+    pub fn values(&self, name: &str) -> Vec<String> {
         let given = self.flags.iter().filter(|(it, _)| *it == name);
         given.filter_map(|(_, value)| value.clone()).collect()
     }
 
     /// The last value of the flag of which `name` is the long name.
-    pub(super) fn value(&self, name: &str) -> Option<String> {
+    pub fn value(&self, name: &str) -> Option<String> {
         self.values(name).pop()
     }
 
     /// `--features`' values split as cargo splits them, by commas and spaces.
-    pub(super) fn features(&self) -> Vec<String> {
+    pub fn features(&self) -> Vec<String> {
         let values = self.values("--features");
         let split = values.iter().flat_map(|it| it.split([',', ' ']));
         split.filter(|it| !it.is_empty()).map(str::to_owned).collect()

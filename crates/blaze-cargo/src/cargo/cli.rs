@@ -157,7 +157,7 @@ fn blazes(name: &str) -> bool {
 /// inherits: of [`WORKER_ENV`], those of [`WORKER_ENV_EXACT`], and every other one that is not
 /// blaze's own. A build script reads the command's environment, as cargo's does, and a
 /// variable it says it reads (`rerun-if-env-changed`) the command left unset is unset.
-pub(crate) fn not_the_builds(env: &BTreeMap<String, String>) -> Vec<String> {
+pub fn not_the_builds(env: &BTreeMap<String, String>) -> Vec<String> {
     taken_away(std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()), env)
 }
 
@@ -173,7 +173,7 @@ fn taken_away(names: impl Iterator<Item = String>, env: &BTreeMap<String, String
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Subcommand {
+pub enum Subcommand {
     Build,
     Run,
     Test,
@@ -195,7 +195,7 @@ impl Subcommand {
 
 /// What the user asked for.
 #[derive(Debug, PartialEq)]
-pub(crate) enum Asked {
+pub enum Asked {
     Build(Box<Invocation>),
     /// A subcommand that is not a build, with its arguments: blaze's own, or one it has not
     /// written yet, which fails saying so (`own`). None is cargo's.
@@ -224,56 +224,56 @@ pub(crate) enum Asked {
 /// A build command and its arguments, split into what is cargo's to read and what is the
 /// program's.
 #[derive(Debug, PartialEq)]
-pub(crate) struct Invocation {
-    pub(crate) subcommand: Subcommand,
+pub struct Invocation {
+    pub subcommand: Subcommand,
     /// Everything after the subcommand, as typed.
-    pub(crate) typed: Vec<String>,
+    pub typed: Vec<String>,
     /// The flags that say what to build.
-    pub(crate) build_args: Vec<String>,
+    pub build_args: Vec<String>,
     /// The words before `--` that are no flags: arguments of the program for `run`, the
     /// names of the tests to run for `test`.
-    pub(crate) positional: Vec<String>,
+    pub positional: Vec<String>,
     /// What follows `--`, for the program or the test executables.
-    pub(crate) trailing: Vec<String>,
-    pub(crate) flags: Flags,
+    pub trailing: Vec<String>,
+    pub flags: Flags,
 }
 
 /// The flags blaze reads.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct Flags {
-    pub(crate) manifest_path: Option<PathBuf>,
-    pub(crate) packages: Vec<String>,
-    pub(crate) workspace: bool,
+pub struct Flags {
+    pub manifest_path: Option<PathBuf>,
+    pub packages: Vec<String>,
+    pub workspace: bool,
     /// The packages `--exclude` leaves out of `--workspace`.
-    pub(crate) excludes: Vec<String>,
-    pub(crate) features: Vec<String>,
-    pub(crate) all_features: bool,
-    pub(crate) no_default_features: bool,
-    pub(crate) profile: Option<String>,
-    pub(crate) config: Vec<String>,
-    pub(crate) targets: Vec<String>,
-    pub(crate) bin: Option<String>,
-    pub(crate) example: Option<String>,
+    pub excludes: Vec<String>,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub profile: Option<String>,
+    pub config: Vec<String>,
+    pub targets: Vec<String>,
+    pub bin: Option<String>,
+    pub example: Option<String>,
     /// The values of `--message-format`, as typed.
-    pub(crate) message_format: Vec<String>,
+    pub message_format: Vec<String>,
     /// `--build-plan` or `--unit-graph`: what cargo would do, which only cargo says.
-    pub(crate) cargos_plan: bool,
+    pub cargos_plan: bool,
     /// The values of `-Z`.
-    pub(crate) unstable: Vec<String>,
-    pub(crate) quiet: bool,
-    pub(crate) verbose: bool,
-    pub(crate) no_run: bool,
-    pub(crate) no_fail_fast: bool,
-    pub(crate) doc: bool,
+    pub unstable: Vec<String>,
+    pub quiet: bool,
+    pub verbose: bool,
+    pub no_run: bool,
+    pub no_fail_fast: bool,
+    pub doc: bool,
     /// Whether a flag picks targets, so that `cargo test` runs no doc tests.
-    pub(crate) selects_targets: bool,
+    pub selects_targets: bool,
     /// Whether a flag picks a target that has the dev-dependencies.
-    pub(crate) dev_targets: bool,
+    pub dev_targets: bool,
 }
 
 impl Asked {
     /// From the arguments after `blaze`.
-    pub(crate) fn parse(args: Vec<String>) -> Asked {
+    pub fn parse(args: Vec<String>) -> Asked {
         let Some((first, rest)) = args.split_first() else {
             return Asked::Help;
         };
@@ -298,7 +298,7 @@ impl Asked {
 /// ahead of the subcommand as well as after it, and they are read as if they were after.
 /// `None` when the command is not one that builds programs blaze has a part in, or is one
 /// with a directory to change to first.
-pub(crate) fn of_cargo(args: &[String]) -> Option<Invocation> {
+pub fn of_cargo(args: &[String]) -> Option<Invocation> {
     let mut ahead = Vec::new();
     let mut words = args.iter();
     let subcommand = loop {
@@ -359,13 +359,13 @@ impl Invocation {
 
     /// What the program or a test executable is run with: `cargo run a -- b` runs the
     /// program with `a b`, and `cargo test a -- b` the tests named like `a`, with `b`.
-    pub(crate) fn program_args(&self) -> impl Iterator<Item = &String> {
+    pub fn program_args(&self) -> impl Iterator<Item = &String> {
         self.positional.iter().chain(&self.trailing)
     }
 
     /// Which build of the checkout this is: a hash of what cargo is asked to build, where,
     /// and with what in the environment.
-    pub(crate) fn key(&self, cwd: &Path) -> String {
+    pub fn key(&self, cwd: &Path) -> String {
         let mut hash = Sha256::new();
         // `run` builds what `build` does.
         let builds = if self.subcommand == Subcommand::Test { "test" } else { "build" };
@@ -392,7 +392,7 @@ impl Invocation {
     }
 
     /// Why this command is cargo's alone, when it is clear before anything is built.
-    pub(crate) fn only_cargo(&self) -> Option<String> {
+    pub fn only_cargo(&self) -> Option<String> {
         let surroundings = match () {
             _ if another_wrapper() => "RUSTC_WORKSPACE_WRAPPER is set to another wrapper",
             _ if !wrapper_installed() => "`blaze-rustc` is not installed next to `blaze`",
@@ -421,7 +421,7 @@ impl Invocation {
     /// The first flag typed that picks targets of a kind, tests or benches: `--bin` and
     /// `--example` name a program, `--lib` picks none or, of `cargo test`, the library's unit
     /// tests, and `--test` names an integration test there.
-    pub(crate) fn kinds_of_targets(&self) -> Option<&str> {
+    pub fn kinds_of_targets(&self) -> Option<&str> {
         let one: &[&str] = match self.subcommand {
             Subcommand::Test => &["--lib", "--bin", "--example", "--test"],
             _ => &["--lib", "--bin", "--example"],
@@ -431,7 +431,7 @@ impl Invocation {
     }
 
     /// The values typed for `flag`, as `flag value` or `flag=value`.
-    pub(crate) fn values_of(&self, flag: &str) -> Vec<&str> {
+    pub fn values_of(&self, flag: &str) -> Vec<&str> {
         let mut values = Vec::new();
         let mut words = self.build_args.iter();
         while let Some(word) = words.next() {
@@ -445,12 +445,12 @@ impl Invocation {
     }
 
     /// Why blaze does not link programs for the target of the build.
-    pub(crate) fn target_not_linked(&self) -> Option<String> {
+    pub fn target_not_linked(&self) -> Option<String> {
         self.target().and_then(|it| unsupported_target(&it))
     }
 
     /// The flags typed that pick targets, `--bin NAME` and the like with their values.
-    pub(crate) fn target_flags(&self) -> Vec<String> {
+    pub fn target_flags(&self) -> Vec<String> {
         let mut flags = Vec::new();
         let mut words = self.build_args.iter();
         while let Some(word) = words.next() {
@@ -465,19 +465,19 @@ impl Invocation {
     }
 
     /// Whether `flag` was typed.
-    pub(crate) fn typed(&self, flag: &str) -> bool {
+    pub fn typed(&self, flag: &str) -> bool {
         self.build_args.iter().any(|it| it == flag)
     }
 
     /// The profile, as cargo's `Finished` line names it.
-    pub(crate) fn profile(&self) -> &str {
+    pub fn profile(&self) -> &str {
         let of_command = if self.subcommand == Subcommand::Test { "test" } else { "dev" };
         self.flags.profile.as_deref().unwrap_or(of_command)
     }
 
     /// Which build of the package the command is, as the daemon plans it. With no package
     /// named it is the one of the directory the worker is started in.
-    pub(crate) fn selection(&self) -> Selection {
+    pub fn selection(&self) -> Selection {
         Selection {
             profile: self.flags.profile.clone().unwrap_or_else(|| "dev".to_owned()),
             features: self.flags.features.clone(),
@@ -495,7 +495,7 @@ impl Invocation {
     }
 
     /// The triple cargo builds for, when it is told one.
-    pub(crate) fn target(&self) -> Option<String> {
+    pub fn target(&self) -> Option<String> {
         let told = std::env::var("CARGO_BUILD_TARGET").ok().filter(|it| !it.is_empty());
         self.flags.targets.first().cloned().or(told)
     }
@@ -567,12 +567,12 @@ fn unsupported_target(triple: &str) -> Option<String> {
 }
 
 /// The variables of this process that are part of which build it is.
-pub(crate) fn build_env() -> BTreeMap<String, String> {
+pub fn build_env() -> BTreeMap<String, String> {
     env_named(BUILD_ENV)
 }
 
 /// The variables of this process that a worker for its builds runs with.
-pub(crate) fn worker_env() -> BTreeMap<String, String> {
+pub fn worker_env() -> BTreeMap<String, String> {
     let mut env = env_named(WORKER_ENV);
     env.extend(std::env::vars().filter(|(name, _)| target_rustflags(name)));
     env
@@ -581,7 +581,7 @@ pub(crate) fn worker_env() -> BTreeMap<String, String> {
 /// The variables of this process its build scripts may be given that [`worker_env`] leaves
 /// out: what a script says it reads or the root manifest's `build-script-env` names is the
 /// command's, not that of whoever started the daemon. Not blaze's own.
-pub(crate) fn command_env() -> BTreeMap<String, String> {
+pub fn command_env() -> BTreeMap<String, String> {
     std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .filter(|(name, _)| !worker_named(name) && !blazes(name))

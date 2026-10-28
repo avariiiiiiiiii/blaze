@@ -4,7 +4,7 @@
 //! it, and `disable` puts it back. `cargo fmt` and `cargo clippy`, which cargo does not build
 //! in, are linked to blaze's ([`links`]).
 
-mod links;
+pub mod links;
 
 use std::path::{Path, PathBuf};
 
@@ -17,31 +17,31 @@ const TABLE: &str = "build";
 const KEY: &str = "rustc-workspace-wrapper";
 
 /// The names cargo reads its configuration from in `.cargo` of a directory.
-pub(crate) const CONFIGS: [&str; 2] = [".cargo/config.toml", ".cargo/config"];
+pub const CONFIGS: [&str; 2] = [".cargo/config.toml", ".cargo/config"];
 
 /// The variable that names the wrapper for one command, ahead of any configuration.
-pub(crate) const VARIABLE: &str = "RUSTC_WORKSPACE_WRAPPER";
+pub const VARIABLE: &str = "RUSTC_WORKSPACE_WRAPPER";
 
 /// What `enable` did, for `disable` to undo and for the wrapper to run what was there.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Enabled {
+pub struct Enabled {
     /// The configuration file that was written.
-    pub(crate) config: PathBuf,
+    pub config: PathBuf,
     /// The file as it was, when there was one.
     before: Option<String>,
     /// The file as `enable` wrote it.
     written: String,
     /// The wrapper the user had there, which blaze runs rustc through.
-    pub(crate) chained: Option<String>,
+    pub chained: Option<String>,
     /// The wrapper cargo is told now.
-    pub(crate) wrapper: PathBuf,
+    pub wrapper: PathBuf,
     /// The commands linked to blaze's.
     #[serde(default)]
     links: Vec<links::Link>,
 }
 
 /// Cargo's home directory, as cargo finds it.
-pub(crate) fn cargo_home() -> Option<PathBuf> {
+pub fn cargo_home() -> Option<PathBuf> {
     let set = std::env::var_os("CARGO_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
     let home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     set.or_else(|| Some(Path::new(&home()?).join(".cargo")))
@@ -49,21 +49,21 @@ pub(crate) fn cargo_home() -> Option<PathBuf> {
 
 /// The configuration files of cargo's home: the one cargo reads now and the one it read
 /// before it had the extension.
-pub(crate) fn home_configs() -> Vec<PathBuf> {
+pub fn home_configs() -> Vec<PathBuf> {
     cargo_home()
         .map(|it| ["config.toml", "config"].map(|name| it.join(name)).to_vec())
         .unwrap_or_default()
 }
 
 /// The wrapper that stands in for rustc: `blaze-rustc`, installed next to this blaze.
-pub(crate) fn wrapper_path() -> std::io::Result<PathBuf> {
+pub fn wrapper_path() -> std::io::Result<PathBuf> {
     let this = std::env::current_exe()?;
     Ok(this.with_file_name(format!("blaze-rustc{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// Whether `path` is the wrapper, under its name or one it had before the rename: a cargo
 /// configuration `enable` wrote then names one, which is never chained to.
-pub(crate) fn is_wrapper(path: &Path) -> bool {
+pub fn is_wrapper(path: &Path) -> bool {
     let stem = path.file_stem().and_then(|it| it.to_str());
     stem.is_some_and(|it| it == "blaze-rustc" || crate::renamed::OLD_WRAPPERS.contains(&it))
 }
@@ -74,7 +74,7 @@ impl Enabled {
     }
 
     /// What `enable` did, when blaze is enabled.
-    pub(crate) fn read() -> Option<Enabled> {
+    pub fn read() -> Option<Enabled> {
         let text = std::fs::read_to_string(Enabled::path().ok()?).ok()?;
         serde_json::from_str(&text).ok()
     }
@@ -88,7 +88,7 @@ impl Enabled {
 }
 
 /// `blaze enable`: has cargo run rustc through blaze in every workspace of the user.
-pub(crate) fn enable() -> anyhow::Result<i32> {
+pub fn enable() -> anyhow::Result<i32> {
     let wrapper = wrapper_path()?;
     anyhow::ensure!(
         wrapper.exists(),
@@ -160,7 +160,7 @@ pub(crate) fn enable() -> anyhow::Result<i32> {
 /// `blaze disable`: puts cargo's configuration back as it was before `enable`. A file
 /// nobody wrote since is the same file again, byte for byte; in one that was edited the
 /// one key is put back.
-pub(crate) fn disable() -> anyhow::Result<i32> {
+pub fn disable() -> anyhow::Result<i32> {
     let Some(enabled) = Enabled::read() else {
         println!("blaze is not enabled");
         return Ok(0);
@@ -191,7 +191,7 @@ pub(crate) fn disable() -> anyhow::Result<i32> {
 
 /// The lines of `blaze status` about plain cargo: whether it builds through blaze, and
 /// what in `cwd` has it not.
-pub(crate) fn status(cwd: &Path) -> Vec<String> {
+pub fn status(cwd: &Path) -> Vec<String> {
     let Some(enabled) = Enabled::read() else {
         return vec!["plain cargo: not through blaze (`blaze enable` turns it on)".to_owned()];
     };
@@ -233,7 +233,7 @@ fn around(dir: &Path) -> Option<String> {
 
 /// The variable `blaze` names the workspace's own `rustc-workspace-wrapper` in, for
 /// blaze's wrapper to run rustc through: the one it puts in that wrapper's place.
-pub(crate) const CHAINED: &str = "BLAZE_CHAINED_WRAPPER";
+pub const CHAINED: &str = "BLAZE_CHAINED_WRAPPER";
 
 /// The variables cargo reads the workspace's wrapper from, ahead of every configuration
 /// file: its own, then the one that stands for the key of its configuration.
@@ -242,7 +242,7 @@ const WRAPPER_VARIABLES: [&str; 2] = [VARIABLE, "CARGO_BUILD_RUSTC_WORKSPACE_WRA
 /// The `rustc-workspace-wrapper` cargo would run in `dir`, which `blaze` overrides
 /// with its own. An empty one is the project saying rustc runs through no wrapper, as cargo
 /// reads it; `None` is that it names none, or names blaze's, and leaves it to `blaze enable`.
-pub(crate) fn project_wrapper(dir: &Path) -> Option<std::ffi::OsString> {
+pub fn project_wrapper(dir: &Path) -> Option<std::ffi::OsString> {
     let set = WRAPPER_VARIABLES.iter().find_map(|it| std::env::var(it).ok());
     wrapper_for(dir, set, &home_configs())
 }
@@ -273,7 +273,7 @@ fn wrapper_for(dir: &Path, set: Option<String>, home: &[PathBuf]) -> Option<std:
 }
 
 /// Whether the user has cargo run every rustc through a wrapper of their own in `dir`.
-pub(crate) fn user_wraps(dir: &Path) -> bool {
+pub fn user_wraps(dir: &Path) -> bool {
     let set = std::env::var_os("CARGO_BUILD_RUSTC_WRAPPER").is_some_and(|it| !it.is_empty());
     set || around(dir).is_some()
 }

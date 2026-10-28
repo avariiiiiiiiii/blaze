@@ -30,22 +30,22 @@ use super::{
 /// The variable that names the proc-macro server that reads the list of macros of a library
 /// blaze linked: a path, `1` for the one a release ships beside blaze ([`SHIPPED`]), which
 /// is also what is used when it is not set and that server is there, or `0` for none.
-pub(crate) const SERVER: &str = "BLAZE_PROC_MACRO_SERVER";
+pub const SERVER: &str = "BLAZE_PROC_MACRO_SERVER";
 
 /// The server's executable a release has beside blaze's (`.github/scripts/build_release.py`).
-pub(crate) const SHIPPED: &str = "blaze-proc-macro-srv";
+pub const SHIPPED: &str = "blaze-proc-macro-srv";
 
 /// The variable that has proc macros expanded natively, `0` or `off`, rather than built as
 /// WebAssembly modules and run by blaze, which is what is done when it is unset.
-pub(crate) const WASM: &str = "BLAZE_PROC_MACRO_WASM";
+pub const WASM: &str = "BLAZE_PROC_MACRO_WASM";
 
 /// The target a proc macro's module is built for.
-pub(crate) const WASM_TARGET: &str = "wasm32-wasip1";
+pub const WASM_TARGET: &str = "wasm32-wasip1";
 
 /// The cfgs a module is built with beyond its description ([`host_side_cfg`]), which key its
 /// build: neither a module a blaze of other cfgs built nor the expansions kept of it are taken
 /// for this one's.
-pub(crate) const MODULE_CFG: &str = "crates that link proc_macro are told no target_os or family";
+pub const MODULE_CFG: &str = "crates that link proc_macro are told no target_os or family";
 
 /// What the crates that link `proc_macro` in the build of a proc macro's module from the
 /// `rust-project.json` at `project` are not told of [`WASM_TARGET`]: its `target_os` and its
@@ -55,7 +55,7 @@ pub(crate) const MODULE_CFG: &str = "crates that link proc_macro are told no tar
 /// then had none of the derives declared with it (#828). Every other crate is told the
 /// target, by which libc, getrandom and wasi choose what the module's standard library is.
 /// `None` when the project is not a proc macro's.
-pub(crate) fn host_side_cfg(project: &Path) -> Result<Option<project_model::CfgOverrides>, String> {
+pub fn host_side_cfg(project: &Path) -> Result<Option<project_model::CfgOverrides>, String> {
     let text = std::fs::read_to_string(project)
         .map_err(|it| format!("reading {}: {it}", project.display()))?;
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|it| it.to_string())?;
@@ -86,7 +86,7 @@ pub(crate) fn host_side_cfg(project: &Path) -> Result<Option<project_model::CfgO
 /// comes with rustup's `wasm32-wasip1` target: rustup adds it when it is not there, once per
 /// process. Builds that start together add it once: two rustups that download one component
 /// at a time each take the other's file away. `Err` says why there is none.
-pub(crate) fn wasm_target(sysroot: &Path) -> Result<(), String> {
+pub fn wasm_target(sysroot: &Path) -> Result<(), String> {
     static ADDED: std::sync::Mutex<Vec<(PathBuf, Result<(), String>)>> =
         std::sync::Mutex::new(Vec::new());
     let libc = sysroot.join("lib/rustlib").join(WASM_TARGET).join("lib/self-contained");
@@ -128,7 +128,7 @@ pub(crate) fn wasm_target(sysroot: &Path) -> Result<(), String> {
 }
 
 /// Whether proc macros are built as WebAssembly modules ([`WASM`]): not when [`turned_off`].
-pub(crate) fn wasm() -> bool {
+pub fn wasm() -> bool {
     let off =
         matches!(std::env::var_os(WASM).as_deref().and_then(OsStr::to_str), Some("0" | "off"));
     !off && !turned_off()
@@ -136,11 +136,11 @@ pub(crate) fn wasm() -> bool {
 
 /// The key, in `[workspace.metadata.blaze]` of a workspace's root manifest, that lists the
 /// packages whose proc macros are expanded natively, not as WebAssembly.
-pub(crate) const NATIVE_KEY: &str = "native-proc-macros";
+pub const NATIVE_KEY: &str = "native-proc-macros";
 
 /// The packages, by crate name (`-` as `_`), the root manifest of the workspace at `root`
 /// names in [`NATIVE_KEY`]: none when it has no manifest or does not say.
-pub(crate) fn native_proc_macros(root: &Path) -> Result<Vec<String>, String> {
+pub fn native_proc_macros(root: &Path) -> Result<Vec<String>, String> {
     let manifest = root.join("Cargo.toml");
     let Ok(text) = std::fs::read_to_string(&manifest) else { return Ok(Vec::new()) };
     let wrong = |what: &str| {
@@ -158,7 +158,7 @@ pub(crate) fn native_proc_macros(root: &Path) -> Result<Vec<String>, String> {
 
 /// Whether the proc macro of crate `name` that cargo asked rustc for runs as WebAssembly: when
 /// the workspace cargo runs rustc in does not run it natively ([`NATIVE_KEY`]).
-pub(crate) fn runs_as_wasm(name: &str) -> anyhow::Result<bool> {
+pub fn runs_as_wasm(name: &str) -> anyhow::Result<bool> {
     let cwd = std::env::current_dir()?;
     let root = sandboxed::workspace_root(&cwd)?.unwrap_or(cwd);
     let native = native_proc_macros(&root).map_err(anyhow::Error::msg)?;
@@ -166,32 +166,32 @@ pub(crate) fn runs_as_wasm(name: &str) -> anyhow::Result<bool> {
 }
 
 /// The variable blaze sets for the cargo of a load into its own target directory.
-pub(crate) const OWN_TARGET: &str = "BLAZE_OWN_TARGET";
+pub const OWN_TARGET: &str = "BLAZE_OWN_TARGET";
 
 /// Whether [`SERVER`] turns blaze's proc macros off, `0` or `off`, as the harness's reference
 /// builds do: a load's cargo is then told so, and rustc builds what it asks for.
-pub(crate) fn turned_off() -> bool {
+pub fn turned_off() -> bool {
     matches!(std::env::var_os(SERVER).as_deref().and_then(OsStr::to_str), Some("0" | "off"))
 }
 
 /// The directory in cargo's target directory of a load's own target directory when blaze
 /// links the proc macros, where libraries are only described: cargo is given empty files for
 /// them (`wrapper.rs`, `described_only`).
-pub(crate) const OWN_DIR: &str = "rust-analyzer";
+pub const OWN_DIR: &str = "rust-analyzer";
 
 /// The same when [`turned_off`], where rustc builds every unit. Cargo does not fingerprint
 /// [`SERVER`], so in one directory it would take the empty files of a load with blaze's proc
 /// macros for rustc's libraries, and rustc then fails reading them (E0786, #460).
-pub(crate) const BY_RUSTC_DIR: &str = "rust-analyzer-rustc";
+pub const BY_RUSTC_DIR: &str = "rust-analyzer-rustc";
 
 /// The load's own target directory in cargo's, for the mode [`SERVER`] says now.
-pub(crate) fn own_dir() -> &'static str {
+pub fn own_dir() -> &'static str {
     if turned_off() { BY_RUSTC_DIR } else { OWN_DIR }
 }
 
 /// What a load whose proc macro blaze has no server for is told: where the server was
 /// looked for, and the two ways through.
-pub(crate) fn missing_server() -> String {
+pub fn missing_server() -> String {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| {
@@ -212,7 +212,7 @@ pub(crate) fn missing_server() -> String {
 /// the current directory: `None` when it says none, or no server is beside blaze when it
 /// says `1` or nothing. A load names it to its cargo, or takes the variable away, so the
 /// wrapper links a proc macro only for a server there is.
-pub(crate) fn server() -> Option<&'static Path> {
+pub fn server() -> Option<&'static Path> {
     static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOUND.get_or_init(find).as_deref()
 }
@@ -239,7 +239,7 @@ fn find() -> Option<PathBuf> {
 
 /// `blaze proc-macro-library <sysroot> <library>`: makes blaze's library of the proc macro
 /// rustc compiled at `<library>` and prints where it is ([`libraries_of`]).
-pub(crate) const COMMAND: &str = "proc-macro-library";
+pub const COMMAND: &str = "proc-macro-library";
 
 /// The directory, in the record of a proc macro rustc compiled, of blaze's library of it.
 const OWN: &str = "blaze";
@@ -254,7 +254,7 @@ const AT_ONCE: usize = 4;
 /// the macro when it cannot be one, but for a package the workspace runs natively
 /// ([`NATIVE_KEY`]), which is `None`, expanded with rustc's library. Otherwise blaze's
 /// library for [`server`], or `None` for one blaze could not make, which is said.
-pub(crate) fn libraries_of(
+pub fn libraries_of(
     sysroot: Option<&Path>,
     workspace: &Path,
     libraries: &[Compiled],
@@ -353,15 +353,15 @@ pub(crate) fn libraries_of(
 
 /// A proc macro rustc compiled: its crate's name, its library, and the `rust-project.json`
 /// of the crate and what it depends on, which its module is built from.
-pub(crate) struct Compiled {
-    pub(crate) name: String,
-    pub(crate) library: PathBuf,
-    pub(crate) description: Option<String>,
+pub struct Compiled {
+    pub name: String,
+    pub library: PathBuf,
+    pub description: Option<String>,
 }
 
 /// Why the load fails when the proc macro of crate `name` in the workspace at `workspace`
 /// cannot be built or run as a WebAssembly module, and the ways out.
-pub(crate) fn refusal(name: &str, why: &str, workspace: &Path) -> String {
+pub fn refusal(name: &str, why: &str, workspace: &Path) -> String {
     let root = sandboxed::workspace_root(workspace).ok().flatten();
     let root = root.as_deref().unwrap_or(workspace);
     format!(
@@ -396,7 +396,7 @@ fn described_at(library: &Path, description: &str) -> Result<PathBuf, String> {
 
 /// [`COMMAND`]. It prints nothing for a library rustc compiled in a build that did not go
 /// through the wrapper, which recorded nothing of it.
-pub(crate) fn command(args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result<()> {
+pub fn command(args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result<()> {
     let mut args = args.peekable();
     let described = match args.next_if(|it| it == WASM_FLAG) {
         Some(_) => Some(PathBuf::from(args.next().context("a description after --wasm")?)),
@@ -475,7 +475,7 @@ fn library_of(sysroot: &Path, library: &Path) -> Result<Option<PathBuf>, String>
 /// What blaze makes of the proc macro `record` is of: its library, or with `wasm` its module,
 /// where rustc would have put the library, and the dep-info cargo reads. `None` when cargo
 /// names no place for them.
-pub(crate) fn made(record: &Record, wasm: bool) -> Option<Made<'_>> {
+pub fn made(record: &Record, wasm: bool) -> Option<Made<'_>> {
     let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
     let name = record.crate_name.as_str();
     let extra = record.codegen("extra-filename").unwrap_or_default();

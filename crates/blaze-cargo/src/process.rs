@@ -11,14 +11,14 @@ use ide_db::{
 const BETWEEN: char = '\u{1f}';
 
 /// The variables of this process. One that is not Unicode is one `env!` can't read either.
-pub(crate) fn own() -> Env {
+pub fn own() -> Env {
     std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect()
 }
 
 /// `env` on one line with no tab in it.
-pub(crate) fn encode(env: &Env) -> String {
+pub fn encode(env: &Env) -> String {
     let mut line = String::new();
     for (key, value) in Vec::from(env.clone()) {
         if !line.is_empty() {
@@ -32,7 +32,7 @@ pub(crate) fn encode(env: &Env) -> String {
 }
 
 /// What [`encode`] made `line` from. The name of a variable has no `=` in it.
-pub(crate) fn decode(line: &str) -> Env {
+pub fn decode(line: &str) -> Env {
     line.split(BETWEEN)
         .filter_map(|it| it.split_once('='))
         .map(|(key, value)| (unescape(key), unescape(value)))
@@ -67,13 +67,13 @@ fn unescape(text: &str) -> String {
 }
 
 /// Whether builds are for a process with other variables than `env`.
-pub(crate) fn differs(db: &RootDatabase, env: &Env) -> bool {
+pub fn differs(db: &RootDatabase, env: &Env) -> bool {
     ProcessEnv::try_get(db).is_none_or(|it| it.vars(db) != env)
 }
 
 /// Has builds from here on be for a process with the variables `env`. The result is the crates
 /// that have asked for a variable which is another now.
-pub(crate) fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
+pub fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
     let mut reading: Vec<Crate> = db
         .env_read()
         .into_iter()

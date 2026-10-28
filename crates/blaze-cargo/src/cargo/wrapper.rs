@@ -34,13 +34,13 @@ use crate::{
 
 /// The variable `blaze` sets for the cargo it runs: the wrapper records what rustc
 /// builds and leaves the rest to the command that drives cargo.
-pub(crate) const DRIVEN: &str = "BLAZE_CARGO_DRIVES";
+pub const DRIVEN: &str = "BLAZE_CARGO_DRIVES";
 
 /// The variable that says cargo runs every crate's rustc through this wrapper, and the
 /// workspace's through it twice.
-pub(crate) const EVERY_CRATE: &str = "BLAZE_EVERY_CRATE";
+pub const EVERY_CRATE: &str = "BLAZE_EVERY_CRATE";
 /// The file in the record of a unit that says rustc built what stands in for the crate.
-pub(crate) const STANDS_IN: &str = "stands-in";
+pub const STANDS_IN: &str = "stands-in";
 
 /// What the variables that name the programs of a build start with.
 const PROGRAM_OF: &str = "CARGO_BIN_EXE_";
@@ -49,7 +49,7 @@ const SCRATCH: &str = "CARGO_TARGET_TMPDIR";
 
 /// Whether the variable is one cargo sets to say where a program of the build is, or its
 /// tests' directory.
-pub(crate) fn names_a_place(name: &str) -> bool {
+pub fn names_a_place(name: &str) -> bool {
     name.starts_with(PROGRAM_OF) || name == SCRATCH
 }
 
@@ -67,7 +67,7 @@ const INCREMENTAL: &str = "incremental";
 const CHECKS: &str = "blaze-check";
 
 /// Builds what cargo asked rustc for and ends as rustc would have.
-pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
+pub fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let mut rustc = args.next().context("cargo names rustc first")?;
     // A cargo that asks through blaze as both wrappers names it twice.
     let mut twice = None;
@@ -320,7 +320,7 @@ fn loaded_later() -> Result<(), String> {
 }
 
 /// The build of the cargo `cargo` is loaded, or is not going to be.
-pub(crate) fn settled(cargo: u32) {
+pub fn settled(cargo: u32) {
     if let Ok(home) = daemon::home() {
         let _ = std::fs::remove_file(home.join(SETTLING).join(cargo.to_string()));
     }
@@ -340,7 +340,7 @@ fn tally(who: &str, what: &str) {
 }
 
 /// The lines of `blaze status` that count the programs plain cargo asked for.
-pub(crate) fn tallied() -> Vec<String> {
+pub fn tallied() -> Vec<String> {
     let log = daemon::home().ok().and_then(|it| std::fs::read_to_string(it.join(TALLY)).ok());
     let Some(log) = log else { return Vec::new() };
     let mut reasons = std::collections::BTreeMap::<&str, u64>::new();
@@ -704,7 +704,7 @@ impl Unit {
 
 /// Adds to `files` every Rust file below `dir` but those of a package nested in it (a
 /// directory with a manifest that is not `manifest`), of a hidden directory or of `target`.
-pub(crate) fn rust_files(
+pub fn rust_files(
     dir: &Path,
     manifest: Option<&Path>,
     files: &mut Vec<PathBuf>,

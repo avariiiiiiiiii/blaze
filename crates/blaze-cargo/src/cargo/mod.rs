@@ -1,42 +1,42 @@
 //! `blaze build|run|test|check`: cargo's commands, with the daemon building what
 //! changed since cargo last built. `docs/cargo.md` is the design.
 
-pub(crate) mod daemon;
-pub(crate) mod keyed;
-pub(crate) mod wrapper;
+pub mod daemon;
+pub mod keyed;
+pub mod wrapper;
 
-mod affected;
-mod ancestor;
-pub(crate) mod cli;
-mod client;
+pub mod affected;
+pub mod ancestor;
+pub mod cli;
+pub mod client;
 #[cfg(unix)]
-pub(crate) mod closure;
-pub(crate) mod compile_time;
-mod directives;
-mod experimental;
-pub(crate) mod fetches;
+pub mod closure;
+pub mod compile_time;
+pub mod directives;
+pub mod experimental;
+pub mod fetches;
 #[cfg(unix)]
-mod hermetic;
-pub(crate) mod layout;
-mod messages;
-pub(crate) mod metadata;
-mod own;
-pub(crate) mod own_macro;
-pub(crate) mod own_script;
-mod package;
-pub(crate) mod plan;
-mod results;
-pub(crate) mod run;
-pub(crate) mod sandboxed;
-pub(crate) mod say;
-pub(crate) mod script;
-pub(crate) mod script_sandbox;
-mod state;
-pub(crate) mod switch;
-pub(crate) mod toolchain;
-mod units;
-pub(crate) mod wasi_script;
-pub(crate) mod whole;
+pub mod hermetic;
+pub mod layout;
+pub mod messages;
+pub mod metadata;
+pub mod own;
+pub mod own_macro;
+pub mod own_script;
+pub mod package;
+pub mod plan;
+pub mod results;
+pub mod run;
+pub mod sandboxed;
+pub mod say;
+pub mod script;
+pub mod script_sandbox;
+pub mod state;
+pub mod switch;
+pub mod toolchain;
+pub mod units;
+pub mod wasi_script;
+pub mod whole;
 
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -46,11 +46,11 @@ use cli::{Asked, Invocation, Subcommand};
 use client::Start;
 use daemon::{Checkout, NotBuilt, Reply, Request};
 use state::{Built, Counts, Held, State};
-pub(crate) use toolchain::{ours_commit, ours_says};
-pub(crate) use units::Record;
+pub use toolchain::{ours_commit, ours_says};
+pub use units::Record;
 
 /// `blaze-engine cargo ...`: runs the command and ends with the status cargo would end with.
-pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
     if let [word, cargo, rest @ ..] = args.as_slice()
         && word == SETTLE
@@ -106,14 +106,14 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
             }
         },
         Asked::Lock(args) => fetches::command(&args)?,
-        Asked::Pin(args) => crate::versions::pin(&args)?,
+        Asked::Pin(args) => (crate::engine::get().pin)(&args)?,
         Asked::Help => {
             println!("{HELP}");
             0
         }
         Asked::Version => {
             println!("{}", crate::version());
-            println!("{}", crate::versions::why_this_one());
+            println!("{}", (crate::engine::get().why_this_one)());
             0
         }
     };
@@ -148,7 +148,7 @@ command of cargo's is blaze's own, or fails saying blaze has none yet: none is h
 (`blaze --list`). The guide: https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md";
 
 /// What a wrapper runs blaze with once rustc has linked a program under plain cargo.
-pub(super) const SETTLE: &str = "settle";
+pub const SETTLE: &str = "settle";
 
 /// Has the daemon load the build `typed` is the cargo command of, which the cargo `cargo`
 /// is running: once that cargo has exited, the build is asked of cargo again, which has
@@ -387,7 +387,7 @@ fn by_daemon(mut state: State) -> Result<(State, Held), NotServed> {
 /// Has the daemon build the programs of `checkout`, loading it first when it has not: of
 /// each, `Ok` or why the daemon did not build it. `Err` is why none is built: the daemon
 /// failed, or the source has an error.
-pub(super) fn built(checkout: &Checkout) -> Result<Vec<Result<(), String>>, NotBuilt> {
+pub fn built(checkout: &Checkout) -> Result<Vec<Result<(), String>>, NotBuilt> {
     if checkout.programs.is_empty() {
         return Ok(Vec::new());
     }

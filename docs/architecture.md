@@ -1,7 +1,9 @@
 # How blaze works
 
 This is a map of the code for someone who wants to read or change it. Paths are those of the
-published tree: `crates/blaze-engine` is the daemon, `crates/hir-ty-codegen` is the code generator
+published tree: `crates/blaze-engine` is the worker, which compiles and links, over `crates/blaze-cargo`,
+the cargo drop-in (commands, the daemon and its client, plans, the sandbox and the remote store, which
+call up into the engine only through `blaze_cargo::engine`); `crates/hir-ty-codegen` is the code generator
 (a crate over `hir-ty`'s MIR, see [contributing.md](contributing.md)), and the front end is
 the crates derived from rust-analyzer (`hir-def`, `hir-ty`, `syntax`, `parser` and the rest), with
 the borrow checker as its crate `hir-ty-borrowck` ([borrowck.md](borrowck.md)).
@@ -52,7 +54,7 @@ reason (`refused` in `cargo/whole.rs`), and hands nothing to cargo.
                                                         │                │
                                                         └── more workers └── one database
 
-The **client** (`crates/blaze-engine/src/cargo/`, entry in `mod.rs`) is what `blaze` runs.
+The **client** (`crates/blaze-cargo/src/cargo/`, entry in `mod.rs`) is what `blaze` runs.
 It parses the command line (`cli.rs`), decides whether the daemon can serve it (`state.rs`),
 and asks the daemon; `build`, `run` and `test` are whole builds (`whole.rs`) and run no cargo.
 
@@ -247,7 +249,7 @@ locking, integrity checks and size limits are in [cache.md](cache.md).
 
 ## The remote store
 
-`crates/blaze-engine/src/remote.rs` and `remote/` keep a local store in step with a directory or
+`crates/blaze-cargo/src/remote.rs` and `remote/` keep a local store in step with a directory or
 an S3 bucket. Because packs are immutable and named by their hash, a remote is a set of
 pack files, a key list per pack, and a manifest per project. `transfer.rs` moves one object
 so that the local file is either complete or absent; `s3.rs` is the bucket through the AWS
@@ -277,7 +279,7 @@ build beside it never changes a file under it.
 
 From those records `cargo/plan.rs` works out what the daemon is asked to build a program
 from: its workspace crates, the files to read symbols from, and rustc's link line with the
-daemon's objects ahead of rustc's. `crates/blaze-engine/src/plan.rs` computes the units of a build
+daemon's objects ahead of rustc's. `crates/blaze-cargo/src/plan.rs` computes the units of a build
 with the features and profile settings of each, which `cargo metadata` does not give per
 build.
 

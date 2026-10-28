@@ -25,37 +25,37 @@ const UNUSED_FOR: Duration = Duration::from_secs(3600);
 
 /// One run of rustc on a crate of the workspace that succeeded.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct Record {
+pub struct Record {
     /// The crate's name and cargo's hash of the unit, as in the names of its files.
-    pub(crate) id: String,
-    pub(crate) crate_name: String,
+    pub id: String,
+    pub crate_name: String,
     /// The directory rustc ran in, which the paths in its arguments are relative to.
-    pub(crate) cwd: PathBuf,
+    pub cwd: PathBuf,
     /// The arguments cargo passed, without the ones the wrapper added.
-    pub(crate) args: Vec<String>,
+    pub args: Vec<String>,
     /// The root file of the crate.
-    pub(crate) source: PathBuf,
+    pub source: PathBuf,
     /// When rustc was done, in nanoseconds since the epoch. Later records have later stamps.
-    pub(crate) stamp: u128,
+    pub stamp: u128,
     /// The files rustc wrote that a later build writes again, each with the copy of it.
-    pub(crate) copies: Vec<Copied>,
+    pub copies: Vec<Copied>,
     /// The copy of the line rustc ran the linker with, for a crate that is linked.
-    pub(crate) link_line: Option<PathBuf>,
+    pub link_line: Option<PathBuf>,
     /// The variables cargo set for the unit that say where the build puts its programs:
     /// `CARGO_BIN_EXE_<name>`, which `env!` reads in an integration test.
     #[serde(default)]
-    pub(crate) env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
     /// The variables cargo set for rustc that the crate's source can read with `env!`
     /// ([`super::own_script::read_by_crates`]), for blaze to compile it as rustc did.
     #[serde(default)]
-    pub(crate) crate_env: BTreeMap<String, String>,
+    pub crate_env: BTreeMap<String, String>,
 }
 
 /// A file rustc wrote and the copy the daemon reads in its place.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct Copied {
-    pub(crate) original: PathBuf,
-    pub(crate) copy: PathBuf,
+pub struct Copied {
+    pub original: PathBuf,
+    pub copy: PathBuf,
 }
 
 impl Record {
@@ -63,20 +63,20 @@ impl Record {
     /// profile, which `deps`, `examples` and `build` are in, in either of cargo's layouts
     /// ([`super::layout`]). A file cargo links from one of those to the profile's directory
     /// is found the same way.
-    pub(crate) fn dir_for(out_dir: &Path) -> PathBuf {
+    pub fn dir_for(out_dir: &Path) -> PathBuf {
         super::layout::profile_of(out_dir).unwrap_or(out_dir).join(RECORDS)
     }
 
     /// The name of the unit of crate `crate_name` that rustc writes to `out_dir` with
     /// `-C extra-filename=extra`, which its record is kept by: `<crate>-<hash>` in both of
     /// cargo's layouts.
-    pub(crate) fn id_of(crate_name: &str, extra: &str, out_dir: &Path) -> String {
+    pub fn id_of(crate_name: &str, extra: &str, out_dir: &Path) -> String {
         super::layout::unit_name(crate_name, extra, out_dir)
     }
 
     /// The name of the unit that wrote `file`, named `<prefix><stem><suffix>`, as
     /// [`Record::id_of`] gives it.
-    pub(crate) fn id_of_file(file: &Path, prefix: &str, suffix: &str) -> Option<String> {
+    pub fn id_of_file(file: &Path, prefix: &str, suffix: &str) -> Option<String> {
         let name = file.file_name()?.to_str()?;
         let stem = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
         Some(super::layout::unit_of_file(stem, file.parent()?))
@@ -84,7 +84,7 @@ impl Record {
 
     /// The copy the record of the unit that wrote `library` (`lib<crate><extra>.rlib`, as
     /// its unit is named) has of it, which is what the daemon reads in its place.
-    pub(crate) fn kept_copy(library: &Path) -> Option<PathBuf> {
+    pub fn kept_copy(library: &Path) -> Option<PathBuf> {
         let unit = Record::id_of_file(library, "lib", ".rlib")?;
         let record = Record::dir_for(library.parent()?).join(unit).join("record.json");
         let record: Record = serde_json::from_str(&std::fs::read_to_string(record).ok()?).ok()?;
@@ -92,20 +92,20 @@ impl Record {
     }
 
     /// The record among `records` of the unit that wrote `artifact`.
-    pub(crate) fn of_artifact<'a>(records: &'a [Record], artifact: &Path) -> Option<&'a Record> {
+    pub fn of_artifact<'a>(records: &'a [Record], artifact: &Path) -> Option<&'a Record> {
         records.iter().find(|record| record.wrote(artifact))
     }
 
     /// Whether `artifact` is a file the unit wrote, as cargo names it: its hard link to the
     /// file, or its copy of it, which is what cargo makes of an executable on macOS.
-    pub(crate) fn wrote(&self, artifact: &Path) -> bool {
+    pub fn wrote(&self, artifact: &Path) -> bool {
         let outputs = self.outputs();
         outputs.iter().any(|it| same_file::is_same_file(it, artifact).unwrap_or(false))
             || outputs.iter().any(|it| is_copy(it, artifact))
     }
 
     /// Every record in `dir`.
-    pub(crate) fn all(dir: &Path) -> anyhow::Result<Vec<Record>> {
+    pub fn all(dir: &Path) -> anyhow::Result<Vec<Record>> {
         let Ok(entries) = std::fs::read_dir(dir) else { return Ok(Vec::new()) };
         let mut records = Vec::new();
         for entry in entries {
@@ -119,7 +119,7 @@ impl Record {
     }
 
     /// Writes the record where the next reader finds it whole.
-    pub(crate) fn write(&self, dir: &Path) -> anyhow::Result<()> {
+    pub fn write(&self, dir: &Path) -> anyhow::Result<()> {
         let unit = dir.join(&self.id);
         std::fs::create_dir_all(&unit)?;
         let new = unit.join(format!("record.{}.new", std::process::id()));
@@ -132,7 +132,7 @@ impl Record {
     /// [`Record::all`] does not read it: only a build script blaze compiles reads it, to
     /// compile the library from source as rustc did, or to expand with the proc macro
     /// ([`Record::described`]).
-    pub(crate) fn write_described(&self, dir: &Path) -> anyhow::Result<()> {
+    pub fn write_described(&self, dir: &Path) -> anyhow::Result<()> {
         let unit = dir.join(&self.id);
         std::fs::create_dir_all(&unit)?;
         let new = unit.join(format!("{DESCRIBED}.{}.new", std::process::id()));
@@ -142,7 +142,7 @@ impl Record {
     }
 
     /// The record of the unit `id` in `dir`, of the workspace or described.
-    pub(crate) fn described(dir: &Path, id: &str) -> Option<Record> {
+    pub fn described(dir: &Path, id: &str) -> Option<Record> {
         let unit = dir.join(id);
         let text = std::fs::read_to_string(unit.join("record.json"))
             .or_else(|_| std::fs::read_to_string(unit.join(DESCRIBED)))
@@ -153,7 +153,7 @@ impl Record {
     /// The record of the unit `id` that wrote a file to `out_dir`, and the directory of records
     /// it is in: there, or in cargo's target directory when `out_dir` is in blaze's own and
     /// the unit was one it was seeded with (`seed_own_target`), which cargo built.
-    pub(crate) fn described_or_seeded(out_dir: &Path, id: &str) -> Option<(Record, PathBuf)> {
+    pub fn described_or_seeded(out_dir: &Path, id: &str) -> Option<(Record, PathBuf)> {
         let parts: Vec<_> = out_dir.components().collect();
         let own = |it: &std::path::Component<'_>| {
             [super::own_macro::OWN_DIR, super::own_macro::BY_RUSTC_DIR]
@@ -180,7 +180,7 @@ impl Record {
     }
 
     /// The value of `-C name=value`, however cargo spelled it.
-    pub(crate) fn codegen(&self, name: &str) -> Option<&str> {
+    pub fn codegen(&self, name: &str) -> Option<&str> {
         let joined = self.args.iter().filter_map(|it| it.strip_prefix("-C"));
         let split = self.values("-C");
         joined.chain(split).filter(|it| !it.is_empty()).find_map(|it| {
@@ -189,7 +189,7 @@ impl Record {
         })
     }
 
-    pub(crate) fn out_dir(&self) -> Option<PathBuf> {
+    pub fn out_dir(&self) -> Option<PathBuf> {
         self.value("--out-dir").map(|it| self.cwd.join(it))
     }
 
@@ -197,12 +197,12 @@ impl Record {
         self.codegen("extra-filename").unwrap_or_default()
     }
 
-    pub(crate) fn is_test(&self) -> bool {
+    pub fn is_test(&self) -> bool {
         self.args.iter().any(|it| it == "--test")
     }
 
     /// Whether what rustc built of the crate has no code: the daemon compiles all of it.
-    pub(crate) fn stands_in(&self) -> bool {
+    pub fn stands_in(&self) -> bool {
         let dir = self.out_dir().map(|it| Record::dir_for(&it).join(&self.id));
         dir.is_none_or(|it| it.join(super::wrapper::STANDS_IN).exists())
     }
@@ -212,29 +212,29 @@ impl Record {
     }
 
     /// Whether rustc links an executable from the crate.
-    pub(crate) fn is_linked(&self) -> bool {
+    pub fn is_linked(&self) -> bool {
         self.is_test() || self.crate_types() == ["bin"]
     }
 
-    pub(crate) fn is_rlib(&self) -> bool {
+    pub fn is_rlib(&self) -> bool {
         !self.is_test() && self.crate_types().iter().any(|it| matches!(*it, "lib" | "rlib"))
     }
 
-    pub(crate) fn is_build_script(&self) -> bool {
+    pub fn is_build_script(&self) -> bool {
         self.crate_name.starts_with("build_script_")
     }
 
-    pub(crate) fn is_proc_macro(&self) -> bool {
+    pub fn is_proc_macro(&self) -> bool {
         self.crate_types().contains(&"proc-macro")
     }
 
     /// Whether the crate runs during the build: a build script or a proc macro.
-    pub(crate) fn runs_in_build(&self) -> bool {
+    pub fn runs_in_build(&self) -> bool {
         self.is_build_script() || self.is_proc_macro()
     }
 
     /// The files of this unit that another unit or the user is given.
-    pub(crate) fn outputs(&self) -> Vec<PathBuf> {
+    pub fn outputs(&self) -> Vec<PathBuf> {
         let Some(out_dir) = self.out_dir() else { return Vec::new() };
         let (name, extra) = (&self.crate_name, self.extra_filename());
         let mut outputs = Vec::new();
@@ -252,7 +252,7 @@ impl Record {
     }
 
     /// The files of other units this one was compiled against: what `--extern` names.
-    pub(crate) fn externs(&self) -> impl Iterator<Item = PathBuf> + '_ {
+    pub fn externs(&self) -> impl Iterator<Item = PathBuf> + '_ {
         self.values("--extern")
             .filter_map(|it| it.split_once('='))
             .map(|(_, path)| self.cwd.join(path))
@@ -260,7 +260,7 @@ impl Record {
 
     /// The source files rustc read and the environment variables it asked for, from the
     /// dep-info cargo had it write.
-    pub(crate) fn inputs(&self) -> Inputs {
+    pub fn inputs(&self) -> Inputs {
         let path = self
             .out_dir()
             .map(|it| it.join(format!("{}{}.d", self.crate_name, self.extra_filename())));
@@ -270,7 +270,7 @@ impl Record {
 
     /// Cargo's own copies of the unit's dep-info, in its fingerprint directory: a source
     /// written after one of them is a change to cargo, which builds the unit again.
-    pub(crate) fn cargo_dep_info(&self) -> Vec<PathBuf> {
+    pub fn cargo_dep_info(&self) -> Vec<PathBuf> {
         let files = self
             .fingerprints()
             .into_iter()
@@ -283,7 +283,7 @@ impl Record {
 
     /// When cargo last ran rustc for the unit, by the file it writes to its fingerprint
     /// directory just before: a source written after it is a change to cargo.
-    pub(crate) fn cargo_ran_at(&self) -> Option<SystemTime> {
+    pub fn cargo_ran_at(&self) -> Option<SystemTime> {
         let stamps = self.fingerprints().into_iter().map(|it| it.join("invoked.timestamp"));
         stamps.filter_map(|it| std::fs::metadata(it).and_then(|it| it.modified()).ok()).min()
     }
@@ -305,7 +305,7 @@ impl Record {
     }
 
     /// The copy of `original`, when it is a file of this unit.
-    pub(crate) fn copy_of(&self, original: &Path) -> Option<&Path> {
+    pub fn copy_of(&self, original: &Path) -> Option<&Path> {
         let named = self.copies.iter().find(|it| it.original == original);
         // A target directory reached through a link has two names for the file, which may
         // have been moved to its copy: its directory is still there.
@@ -321,9 +321,9 @@ impl Record {
 
 /// What a crate was compiled from besides its arguments.
 #[derive(Default, Debug, PartialEq)]
-pub(crate) struct Inputs {
-    pub(crate) files: Vec<PathBuf>,
-    pub(crate) env: Vec<(String, Option<String>)>,
+pub struct Inputs {
+    pub files: Vec<PathBuf>,
+    pub env: Vec<(String, Option<String>)>,
 }
 
 impl Inputs {
@@ -338,17 +338,17 @@ impl Inputs {
 }
 
 /// Now, as a stamp.
-pub(crate) fn stamp_now() -> u128 {
+pub fn stamp_now() -> u128 {
     stamp_of(SystemTime::now())
 }
 
-pub(crate) fn stamp_of(time: SystemTime) -> u128 {
+pub fn stamp_of(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH).map_or(0, |it| it.as_nanos())
 }
 
 /// Deletes the copies in `dir` that no record names and none of `used` is in, once they are
 /// old enough that no build under way is about to name them.
-pub(crate) fn collect_garbage(dir: &Path, used: &[PathBuf]) -> anyhow::Result<()> {
+pub fn collect_garbage(dir: &Path, used: &[PathBuf]) -> anyhow::Result<()> {
     let now = stamp_now();
     for record in Record::all(dir)? {
         let unit = dir.join(&record.id);
@@ -378,7 +378,7 @@ fn is_copy(one: &Path, other: &Path) -> bool {
 
 /// The variables cargo set for the units of `used` to name the places of the build. One
 /// request has one of each, so two units told different places are cargo's to build.
-pub(crate) fn places_named(used: &[Record]) -> Result<BTreeMap<String, String>, String> {
+pub fn places_named(used: &[Record]) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
     for (name, value) in used.iter().flat_map(|it| &it.env) {
         if env.insert(name.clone(), value.clone()).is_some_and(|was| was != *value) {

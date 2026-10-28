@@ -30,7 +30,7 @@ const SIGNED: &str = "signed";
 
 /// The keys of this machine: `BLAZE_REMOTE_SIGN` names the file of the key it signs with,
 /// `BLAZE_REMOTE_TRUST` lists the public keys it takes lists from, with commas between.
-pub(crate) struct Trust {
+pub struct Trust {
     signer: Option<SigningKey>,
     trusted: Vec<VerifyingKey>,
     /// Whether a machine that names no keys takes lists: `BLAZE_REMOTE_UNSIGNED=1`.
@@ -39,7 +39,7 @@ pub(crate) struct Trust {
 
 /// A signed list that a machine with no key was about to write back.
 #[derive(Debug)]
-pub(crate) struct NotRewritten(String);
+pub struct NotRewritten(String);
 
 impl std::fmt::Display for NotRewritten {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,14 +50,14 @@ impl std::fmt::Display for NotRewritten {
 impl std::error::Error for NotRewritten {}
 
 /// A list as a machine took it.
-pub(crate) struct Opened<'a> {
-    pub(crate) lines: &'a str,
+pub struct Opened<'a> {
+    pub lines: &'a str,
     /// The turn it was signed at, when a signature was what it was taken for.
-    pub(crate) turn: Option<u64>,
+    pub turn: Option<u64>,
 }
 
 impl Trust {
-    pub(crate) fn from_env() -> anyhow::Result<Trust> {
+    pub fn from_env() -> anyhow::Result<Trust> {
         let signer = match std::env::var_os("BLAZE_REMOTE_SIGN") {
             Some(file) => Some(read_key(Path::new(&file))?),
             None => None,
@@ -73,18 +73,18 @@ impl Trust {
 
     /// What takes any list and signs none, whatever the environment says: for a remote that
     /// is as trusted as the program itself, its own release.
-    pub(crate) fn of_release() -> Trust {
+    pub fn of_release() -> Trust {
         Trust { signer: None, trusted: Vec::new(), unsigned: true }
     }
 
     /// Whether lists are checked at all.
-    pub(crate) fn checks(&self) -> bool {
+    pub fn checks(&self) -> bool {
         !self.trusted.is_empty()
     }
 
     /// Why this machine may not write lists, if it may not: other machines that trust as
     /// this one does would take nothing from an unsigned list.
-    pub(crate) fn cannot_sign(&self) -> Option<&'static str> {
+    pub fn cannot_sign(&self) -> Option<&'static str> {
         (self.checks() && self.signer.is_none())
             .then_some("BLAZE_REMOTE_TRUST is set and BLAZE_REMOTE_SIGN is not")
     }
@@ -92,7 +92,7 @@ impl Trust {
     /// Why this machine may not write the list in `text` back, if it may not: the list is
     /// signed and the machine has no key, so what it wrote would be a list with no
     /// signature where the machines that trust the signer look for one.
-    pub(crate) fn cannot_rewrite(&self, name: &str, text: &str) -> Result<(), NotRewritten> {
+    pub fn cannot_rewrite(&self, name: &str, text: &str) -> Result<(), NotRewritten> {
         if self.signer.is_some() || split(text).1.is_empty() {
             return Ok(());
         }
@@ -107,7 +107,7 @@ impl Trust {
     /// highest this machine knows the list to have had, and no less than the time: a list
     /// started again from nothing, or signed by a key that never saw the last one, still
     /// comes after what the machines that read it remember.
-    pub(crate) fn seal(&self, name: &str, body: &str, after: u64) -> (String, Option<u64>) {
+    pub fn seal(&self, name: &str, body: &str, after: u64) -> (String, Option<u64>) {
         let Some(signer) = &self.signer else { return (body.to_owned(), None) };
         let turn = after.saturating_add(1).max(seconds_now());
         (sealed_at(signer, name, body, turn), Some(turn))
@@ -118,7 +118,7 @@ impl Trust {
     /// with none every list is, unless the machine was told to take them. A machine that
     /// signs takes only what it or a key it trusts signed, whatever it was told: what it
     /// takes it will send again under its own name.
-    pub(crate) fn open<'a>(&self, name: &str, text: &'a str) -> anyhow::Result<Opened<'a>> {
+    pub fn open<'a>(&self, name: &str, text: &'a str) -> anyhow::Result<Opened<'a>> {
         if self.checks() || self.signer.is_some() {
             return self.verify(name, text);
         }
@@ -135,11 +135,7 @@ impl Trust {
     /// The lines of the list, for a machine that adds to it and writes it back. One that
     /// signs puts its name to every line, so it takes none it would not have trusted. One
     /// that does not sign takes nothing from the list by adding to it.
-    pub(crate) fn open_to_extend<'a>(
-        &self,
-        name: &str,
-        text: &'a str,
-    ) -> anyhow::Result<Opened<'a>> {
+    pub fn open_to_extend<'a>(&self, name: &str, text: &'a str) -> anyhow::Result<Opened<'a>> {
         if self.signer.is_some() || self.checks() {
             self.verify(name, text)
         } else {
@@ -195,14 +191,14 @@ fn seconds_now() -> u64 {
 /// turn is as old as any other. A machine that remembers nothing takes what it is given:
 /// the first list it sees may be an old one.
 #[derive(Clone)]
-pub(crate) struct Turns {
+pub struct Turns {
     dir: PathBuf,
 }
 
 /// The memory of turns could not be read or written. It is not taken for no memory: what
 /// keeps an old list out is not something damage takes away quietly.
 #[derive(Debug)]
-pub(crate) struct Unremembered(String);
+pub struct Unremembered(String);
 
 impl std::fmt::Display for Unremembered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -214,7 +210,7 @@ impl std::error::Error for Unremembered {}
 
 impl Turns {
     /// The memory kept in `kept_in` of the remote `remote` names.
-    pub(crate) fn of(kept_in: &Path, remote: &str) -> Turns {
+    pub fn of(kept_in: &Path, remote: &str) -> Turns {
         let remote = hex(&Sha256::digest(format!("blaze turns 1\n{remote}")));
         Turns { dir: kept_in.join("turns").join(remote) }
     }
@@ -224,7 +220,7 @@ impl Turns {
     }
 
     /// The highest turn taken of the list `name`, if any was.
-    pub(crate) fn remembered(&self, name: &str) -> Result<Option<u64>, Unremembered> {
+    pub fn remembered(&self, name: &str) -> Result<Option<u64>, Unremembered> {
         let file = self.file(name);
         let unread = |why: &dyn std::fmt::Display| {
             Unremembered(format!(
@@ -246,7 +242,7 @@ impl Turns {
     /// Takes the list `name` at `turn`: an error when a later one was taken before, and
     /// remembered when it is the latest. Two processes that take lists at once do so one
     /// after the other.
-    pub(crate) fn take(&self, name: &str, turn: u64) -> anyhow::Result<()> {
+    pub fn take(&self, name: &str, turn: u64) -> anyhow::Result<()> {
         let unwritten = |e: std::io::Error| {
             let dir = self.dir.display();
             Unremembered(format!("the turn of `{name}` cannot be remembered in {dir} ({e})"))
@@ -266,7 +262,7 @@ impl Turns {
     }
 
     /// Forgets every turn of this remote, and says whether there was any.
-    pub(crate) fn forget(&self) -> std::io::Result<bool> {
+    pub fn forget(&self) -> std::io::Result<bool> {
         match std::fs::remove_dir_all(&self.dir) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -295,7 +291,7 @@ fn split(text: &str) -> (&str, &str) {
 }
 
 /// `blaze-engine cache keygen FILE`: writes a new key to sign with and prints the public one.
-pub(crate) fn keygen(file: &Path) -> anyhow::Result<()> {
+pub fn keygen(file: &Path) -> anyhow::Result<()> {
     let mut seed = [0; 32];
     getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("no random bytes: {e}"))?;
     let mut options = std::fs::OpenOptions::new();
@@ -336,7 +332,7 @@ fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
 #[cfg(test)]
 impl Trust {
     /// A machine whose keys are made of the bytes given.
-    pub(crate) fn of(signer: Option<u8>, trusted: &[u8], unsigned: bool) -> Trust {
+    pub fn of(signer: Option<u8>, trusted: &[u8], unsigned: bool) -> Trust {
         let key = |seed: u8| SigningKey::from_bytes(&[seed; 32]);
         Trust {
             signer: signer.map(key),

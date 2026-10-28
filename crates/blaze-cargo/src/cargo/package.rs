@@ -9,7 +9,7 @@ use thorin::{DwarfPackage, MissingReferencedObjectBehaviour, Session};
 use typed_arena::Arena;
 
 /// Where a build keeps the package of a program.
-pub(crate) fn beside(executable: &Path) -> PathBuf {
+pub fn beside(executable: &Path) -> PathBuf {
     executable.with_extension("dwp")
 }
 
@@ -17,7 +17,7 @@ pub(crate) fn beside(executable: &Path) -> PathBuf {
 /// executable names, and those of `rustcs`, the package rustc wrote for the program it linked.
 /// The objects rustc kept the entries of may be gone once it has packed them, so its package
 /// is read first and an object is read for what is not in it.
-pub(crate) fn pack(executable: &Path, rustcs: &Path, package: &Path) -> anyhow::Result<()> {
+pub fn pack(executable: &Path, rustcs: &Path, package: &Path) -> anyhow::Result<()> {
     let files = Files { data: Arena::new(), relocations: Arena::new() };
     let mut packed = DwarfPackage::new(&files);
     if rustcs.exists() {
@@ -35,7 +35,7 @@ pub(crate) fn pack(executable: &Path, rustcs: &Path, package: &Path) -> anyhow::
 }
 
 /// Whether the package at `package` was written after everything it is made from.
-pub(crate) fn is_current(package: &Path, from: &[&Path]) -> bool {
+pub fn is_current(package: &Path, from: &[&Path]) -> bool {
     let written = |path: &Path| std::fs::metadata(path).and_then(|it| it.modified()).ok();
     let Some(packed) = written(package) else { return false };
     from.iter().all(|it| written(it).is_none_or(|it| it <= packed))

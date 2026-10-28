@@ -29,7 +29,7 @@ const DEPTH_MAX: usize = 256;
 
 /// What a NAR holds, told as it is read. A path is the entry's names from the root joined by
 /// `/`, and empty for the root itself.
-pub(crate) trait Sink {
+pub trait Sink {
     fn directory(&mut self, path: &[u8]) -> anyhow::Result<()>;
     /// `contents` has the file's `size` bytes; what the sink leaves of them is skipped.
     fn file(
@@ -44,7 +44,7 @@ pub(crate) trait Sink {
 
 /// Reads the NAR `from` to its end, telling `sink` what it holds. Nothing after the NAR is
 /// read: the caller says whether anything is there.
-pub(crate) fn read(from: impl Read, sink: &mut impl Sink) -> anyhow::Result<()> {
+pub fn read(from: impl Read, sink: &mut impl Sink) -> anyhow::Result<()> {
     let mut nar = Strings { from };
     nar.expect(MAGIC).context("it is not a NAR")?;
     node(&mut nar, sink, &mut Vec::new(), 0)
@@ -177,18 +177,18 @@ impl<R: Read> Strings<R> {
 }
 
 /// What bytes come to, sha256 and count, as they are read or written.
-pub(crate) struct Hashing<T> {
-    pub(crate) inner: T,
+pub struct Hashing<T> {
+    pub inner: T,
     hasher: sha2::Sha256,
-    pub(crate) len: u64,
+    pub len: u64,
 }
 
 impl<T> Hashing<T> {
-    pub(crate) fn new(inner: T) -> Hashing<T> {
+    pub fn new(inner: T) -> Hashing<T> {
         Hashing { inner, hasher: sha2::Sha256::new(), len: 0 }
     }
 
-    pub(crate) fn hash(&self) -> Sha256 {
+    pub fn hash(&self) -> Sha256 {
         Sha256(self.hasher.clone().finalize().into())
     }
 }
@@ -216,14 +216,14 @@ impl<T: Write> Write for Hashing<T> {
 }
 
 /// The sha256 and size of the NAR of the tree at `path`, as `nix-store --dump` would write it.
-pub(crate) fn hash_of(path: &Path) -> io::Result<(Sha256, u64)> {
+pub fn hash_of(path: &Path) -> io::Result<(Sha256, u64)> {
     let mut out = Hashing::new(io::sink());
     write(path, &mut io::BufWriter::with_capacity(1 << 20, &mut out))?;
     Ok((out.hash(), out.len))
 }
 
 /// Writes the NAR of the tree at `path`: a program is a file its owner may run, as nix has it.
-pub(crate) fn write(path: &Path, to: &mut impl Write) -> io::Result<()> {
+pub fn write(path: &Path, to: &mut impl Write) -> io::Result<()> {
     string(to, MAGIC.as_bytes())?;
     write_node(path, to)?;
     to.flush()
@@ -279,7 +279,7 @@ fn string(to: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use std::{
         os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
         path::PathBuf,
@@ -289,7 +289,7 @@ pub(crate) mod tests {
     use crate::cargo::closure::narinfo::NarInfo;
 
     /// A NAR laid out on disk, as nix lays one out in its store.
-    pub(crate) struct Unpack(pub(crate) PathBuf);
+    pub struct Unpack(pub PathBuf);
 
     impl Unpack {
         fn at(&self, path: &[u8]) -> PathBuf {
@@ -324,7 +324,7 @@ pub(crate) mod tests {
     }
 
     /// The NAR of the real store path the test narinfo is of.
-    pub(crate) fn real() -> (NarInfo, Vec<u8>) {
+    pub fn real() -> (NarInfo, Vec<u8>) {
         let info = NarInfo::parse(include_str!("testdata/pkg-config-wrapper.narinfo")).unwrap();
         let zst = include_bytes!("testdata/pkg-config-wrapper.nar.zst");
         (info, zstd::decode_all(&zst[..]).unwrap())

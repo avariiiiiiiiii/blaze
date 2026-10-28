@@ -29,18 +29,18 @@ const REDIRECTS: usize = 5;
 
 /// How long a connection may take to be made. A network that is down or drops what is sent
 /// is told from a slow answer this soon, not after the patience of a request.
-pub(crate) const CONNECT_WITHIN: Duration = Duration::from_secs(2);
+pub const CONNECT_WITHIN: Duration = Duration::from_secs(2);
 
 /// The connector of a client to an HTTP(S) remote: [`CONNECT_WITHIN`], or `patience` when
 /// that is shorter.
-pub(crate) fn connector(patience: Duration) -> HttpConnector {
+pub fn connector(patience: Duration) -> HttpConnector {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_connect_timeout(Some(CONNECT_WITHIN.min(patience)));
     http
 }
 
-pub(crate) struct Https {
+pub struct Https {
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     /// With no `/` at its end.
     base: String,
@@ -49,11 +49,7 @@ pub(crate) struct Https {
 }
 
 impl Https {
-    pub(crate) fn open(
-        spec: &Url,
-        patience: Duration,
-        traffic: Arc<Traffic>,
-    ) -> anyhow::Result<Https> {
+    pub fn open(spec: &Url, patience: Duration, traffic: Arc<Traffic>) -> anyhow::Result<Https> {
         let roots = HttpsConnectorBuilder::new()
             .with_native_roots()
             .context("the machine's certificates cannot be read")?;
@@ -63,7 +59,7 @@ impl Https {
         Ok(Https { client, base, patience, traffic })
     }
 
-    pub(crate) fn place(&self) -> String {
+    pub fn place(&self) -> String {
         self.base.clone()
     }
 
@@ -111,15 +107,11 @@ impl Https {
         Err(Refused(format!("{address}: more than {REDIRECTS} redirects")).into())
     }
 
-    pub(crate) async fn read_from(
-        &self,
-        name: &str,
-        offset: u64,
-    ) -> anyhow::Result<Option<Incoming>> {
+    pub async fn read_from(&self, name: &str, offset: u64) -> anyhow::Result<Option<Incoming>> {
         Ok(self.ask(Method::GET, name, offset).await?.map(hyper::Response::into_body))
     }
 
-    pub(crate) async fn read_small(
+    pub async fn read_small(
         &self,
         name: &str,
         most: u64,
@@ -136,7 +128,7 @@ impl Https {
         Ok(Some((bytes, Version(None))))
     }
 
-    pub(crate) async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
+    pub async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
         let Some(answer) = self.ask(Method::HEAD, name, 0).await? else { return Ok(None) };
         let len = answer.headers().get(header::CONTENT_LENGTH).and_then(|it| it.to_str().ok());
         let len = len.and_then(|it| it.parse().ok()).unwrap_or(0);
@@ -145,7 +137,7 @@ impl Https {
 }
 
 /// The next bytes of an answer's body, or `None` at its end.
-pub(crate) async fn next(body: &mut Incoming) -> anyhow::Result<Option<Vec<u8>>> {
+pub async fn next(body: &mut Incoming) -> anyhow::Result<Option<Vec<u8>>> {
     while let Some(frame) = body.frame().await {
         if let Ok(data) = frame?.into_data() {
             return Ok(Some(data.to_vec()));

@@ -14,25 +14,25 @@ use std::{
 use ide_db::{RootDatabase, base_db::salsa};
 
 /// The directory `BLAZE_MEMORY` names, when it is set.
-pub(crate) fn report_dir() -> Option<PathBuf> {
+pub fn report_dir() -> Option<PathBuf> {
     std::env::var_os("BLAZE_MEMORY").map(PathBuf::from)
 }
 
 /// Megabytes of memory the process holds, as [`held_by`] counts it.
-pub(crate) fn resident() -> Option<u64> {
+pub fn resident() -> Option<u64> {
     Some(held_by(std::process::id())? >> 20)
 }
 
 /// Bytes of memory a process holds: its resident set, where `/proc` says it.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn held_by(pid: u32) -> Option<u64> {
+pub fn held_by(pid: u32) -> Option<u64> {
     kilobytes(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?, "VmRSS:")
 }
 
 /// Bytes of memory a process of this user owns: its physical footprint, which is what
 /// Activity Monitor shows, and which still counts pages macOS has compressed.
 #[cfg(target_os = "macos")]
-pub(crate) fn held_by(pid: u32) -> Option<u64> {
+pub fn held_by(pid: u32) -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
     let pid = libc::c_int::try_from(pid).ok()?;
     // SAFETY: `info` has room for the `RUSAGE_INFO_V4` record the call writes.
@@ -45,7 +45,7 @@ pub(crate) fn held_by(pid: u32) -> Option<u64> {
 /// the process allows: a container's, a CI job's or a systemd unit's, which the kernel holds
 /// the process to however much the machine has.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn of_the_machine() -> Option<u64> {
+pub fn of_the_machine() -> Option<u64> {
     let total = kilobytes(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")?;
     let groups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let allowed = allowed_by(&groups, |file| {
@@ -91,7 +91,7 @@ fn allowed_by(groups: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64
 
 /// Bytes of memory the machine has.
 #[cfg(target_os = "macos")]
-pub(crate) fn of_the_machine() -> Option<u64> {
+pub fn of_the_machine() -> Option<u64> {
     let mut bytes: u64 = 0;
     let mut size = size_of::<u64>();
     // SAFETY: `hw.memsize` is a 64-bit integer, and `bytes` and `size` say where it goes.
@@ -115,7 +115,7 @@ fn kilobytes(text: &str, name: &str) -> Option<u64> {
 }
 
 /// Bytes allocated and not freed, when the allocator counts them.
-pub(crate) fn live() -> Option<u64> {
+pub fn live() -> Option<u64> {
     #[cfg(unix)]
     {
         tikv_jemalloc_ctl::epoch::advance().ok()?;
@@ -127,7 +127,7 @@ pub(crate) fn live() -> Option<u64> {
 
 /// Gives the system back the pages of what was freed, which jemalloc keeps for ten seconds
 /// to reuse otherwise.
-pub(crate) fn give_back() {
+pub fn give_back() {
     #[cfg(unix)]
     // SAFETY: `arena.<i>.purge` reads and writes nothing, and 4096 (`MALLCTL_ARENAS_ALL`)
     // is every arena.
@@ -144,7 +144,7 @@ pub(crate) fn give_back() {
 }
 
 /// Reports what the process holds now that `step` is done.
-pub(crate) fn checkpoint(step: &str) {
+pub fn checkpoint(step: &str) {
     if report_dir().is_none() {
         return;
     }
@@ -153,7 +153,7 @@ pub(crate) fn checkpoint(step: &str) {
 }
 
 /// Writes what the daemon holds now that `step` is done to the directory `BLAZE_MEMORY` names.
-pub(crate) fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
+pub fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
     checkpoint(step);
     let Some(dir) = report_dir() else { return Ok(()) };
     std::fs::create_dir_all(&dir)?;
@@ -163,7 +163,7 @@ pub(crate) fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
 }
 
 /// [`report`] once the daemon has answered a request, as `request-N`, N counting from 1.
-pub(crate) fn served(db: &mut RootDatabase) -> anyhow::Result<()> {
+pub fn served(db: &mut RootDatabase) -> anyhow::Result<()> {
     static SERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if report_dir().is_none() {
         return Ok(());

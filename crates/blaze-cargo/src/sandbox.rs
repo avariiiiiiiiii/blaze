@@ -27,72 +27,72 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub mod macos;
 
 /// The subcommand of `blaze` that runs a program in a sandbox.
-pub(crate) const COMMAND: &str = "sandbox";
+pub const COMMAND: &str = "sandbox";
 
 /// What a test harness looks up, on the thread of a test, just before the test with the
 /// test's name after it and just after it with nothing after it (`access(MARK + name, F_OK)`):
 /// the sandbox takes the calls of that thread in between to be the test's. Never a path of
 /// the record. Outside a sandbox it is one failed `access` a test.
-pub(crate) const MARK: &str = "/.blaze-test/";
+pub const MARK: &str = "/.blaze-test/";
 
 /// The status a sandbox that could not be made ends with, as `env` ends when it can't run
 /// what it is given.
-pub(crate) const COULD_NOT: i32 = 125;
+pub const COULD_NOT: i32 = 125;
 
 /// The variable that turns sandboxes off (`off` or `0`), for tests, build scripts and
 /// proc-macro servers alike.
-pub(crate) const VAR: &str = "BLAZE_SANDBOX";
+pub const VAR: &str = "BLAZE_SANDBOX";
 
 /// Whether sandboxes are on, with `var` looking a variable up: unless [`VAR`] is `off` or
 /// `0`. The one rule tests, build scripts and proc-macro servers decide by.
-pub(crate) fn on_with(var: impl Fn(&str) -> Option<String>) -> bool {
+pub fn on_with(var: impl Fn(&str) -> Option<String>) -> bool {
     let value = var(VAR);
     !matches!(value.as_deref(), Some("off" | "0"))
 }
 
 /// Whether sandboxes are on for this process, as [`on_with`] says of its environment.
-pub(crate) fn on() -> bool {
+pub fn on() -> bool {
     on_with(|name| std::env::var(name).ok())
 }
 
 /// What a program is run with.
 #[derive(Serialize, Deserialize, Default, Clone)]
-pub(crate) struct Spec {
+pub struct Spec {
     /// The directory it starts in.
-    pub(crate) cwd: PathBuf,
+    pub cwd: PathBuf,
     /// All of its environment. A sandbox may add variables of its own, which no identity is
     /// made of.
-    pub(crate) env: Vec<(String, String)>,
+    pub env: Vec<(String, String)>,
     /// Directories it sees as they are and may change, its changes seen by it alone and gone
     /// when it ends.
-    pub(crate) overlays: Vec<PathBuf>,
+    pub overlays: Vec<PathBuf>,
     /// Directories it writes for real.
     #[serde(default)]
-    pub(crate) writable: Vec<PathBuf>,
+    pub writable: Vec<PathBuf>,
     /// Directories it sees as they are and may not write, though they are below one of the
     /// sandbox's empty directories (a workspace or target directory under `/tmp`): the rest of
     /// the machine is seen read-only anyway.
     #[serde(default)]
-    pub(crate) readable: Vec<PathBuf>,
+    pub readable: Vec<PathBuf>,
     /// The file written as it ends with what it reached outside ([`Line`]), or nothing.
-    pub(crate) record: Option<PathBuf>,
+    pub record: Option<PathBuf>,
     /// Whether the record has the paths it read, which costs: every call that names a path
     /// goes through the sandbox. What was refused it is recorded either way.
     #[serde(default)]
-    pub(crate) record_reads: bool,
+    pub record_reads: bool,
     /// Paths that are not inputs of what runs: the program itself, whose code is known.
-    pub(crate) not_inputs: Vec<PathBuf>,
+    pub not_inputs: Vec<PathBuf>,
     /// The file system it sees in place of the machine's, when it is given one: then it sees
     /// nothing of the machine's but what the view binds, and the overlays, the writable and
     /// the readable directories are empty (what it sees is the view's binds alone).
     #[serde(default)]
-    pub(crate) view: Option<View>,
+    pub view: Option<View>,
 }
 
 /// A file system of a program's own, as Nix gives a build: what it binds, each where the
@@ -128,43 +128,43 @@ pub(crate) struct Spec {
 /// };
 /// ```
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct View {
+pub struct View {
     /// What it sees, in any order: one inside another is bound after it. Two never bind the
     /// same path, and none is `/` or below `/proc` or `/dev`, which are the view's own.
-    pub(crate) binds: Vec<Bind>,
+    pub binds: Vec<Bind>,
 }
 
 /// A directory or a file of the machine's, seen in a [`View`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Bind {
+pub struct Bind {
     /// Where the program sees it: a whole path, with no `..`. Inside another bind it is a
     /// path that is there already, of the same kind (nothing is made in what is bound).
-    pub(crate) inside: PathBuf,
+    pub inside: PathBuf,
     /// What it is on the machine, with the links on its way followed. One that is not there
     /// is an error, before anything runs.
-    pub(crate) outside: PathBuf,
+    pub outside: PathBuf,
     /// Whether the program writes it for real; otherwise it is read-only, with what is below
     /// it.
     #[serde(default)]
-    pub(crate) writable: bool,
+    pub writable: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl Bind {
     /// `outside`, seen read-only at `inside`.
-    pub(crate) fn read(inside: impl Into<PathBuf>, outside: impl Into<PathBuf>) -> Bind {
+    pub fn read(inside: impl Into<PathBuf>, outside: impl Into<PathBuf>) -> Bind {
         Bind { inside: inside.into(), outside: outside.into(), writable: false }
     }
 
     /// `outside`, written for real at `inside`.
-    pub(crate) fn write(inside: impl Into<PathBuf>, outside: impl Into<PathBuf>) -> Bind {
+    pub fn write(inside: impl Into<PathBuf>, outside: impl Into<PathBuf>) -> Bind {
         Bind { inside: inside.into(), outside: outside.into(), writable: true }
     }
 }
 
 /// What a line of a record says was reached.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum Reached {
+pub enum Reached {
     /// `R`: a path opened, listed or run.
     Read,
     /// `L`: a path only looked at (`stat`, `access`, `chdir`, `readlink`): what it is, whether
@@ -208,14 +208,14 @@ impl Reached {
 /// after its tests): what has an empty test is taken to be every test's of the run. A record
 /// has each line once, in order.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) struct Line {
-    pub(crate) reached: Reached,
-    pub(crate) test: String,
-    pub(crate) what: String,
+pub struct Line {
+    pub reached: Reached,
+    pub test: String,
+    pub what: String,
 }
 
 /// The lines of the record `file`, `None` when there is none or it is not a record.
-pub(crate) fn read_record(file: &Path) -> Option<Vec<Line>> {
+pub fn read_record(file: &Path) -> Option<Vec<Line>> {
     let text = std::fs::read_to_string(file).ok()?;
     text.lines()
         .map(|line| {
@@ -228,7 +228,7 @@ pub(crate) fn read_record(file: &Path) -> Option<Vec<Line>> {
 }
 
 /// What a sandbox notes as its program runs, and writes to [`Spec::record`] when it ends.
-pub(crate) struct Recorder {
+pub struct Recorder {
     lines: BTreeSet<Line>,
     /// The test each thread runs, by the thread's id, as [`MARK`] said.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -250,7 +250,7 @@ pub(crate) struct Recorder {
 
 impl Recorder {
     /// For `spec`, in a sandbox whose own directories are `own`.
-    pub(crate) fn new(spec: &Spec, own: &[&str]) -> Recorder {
+    pub fn new(spec: &Spec, own: &[&str]) -> Recorder {
         let tidied = |it: &Vec<PathBuf>| it.iter().map(|it| tidy(it)).collect::<Vec<_>>();
         let overlays = tidied(&spec.overlays);
         let mut written = overlays.clone();
@@ -283,7 +283,7 @@ impl Recorder {
     /// `test` (empty when it is not known) reached `what`, as `reached` says: for a sandbox
     /// that knows the test of a call itself, not by its thread. A read is kept only when reads
     /// are recorded and it is an input, as [`Recorder::read`] keeps it.
-    pub(crate) fn reached(&mut self, reached: Reached, test: String, what: &str) {
+    pub fn reached(&mut self, reached: Reached, test: String, what: &str) {
         let read = matches!(reached, Reached::Read | Reached::Looked);
         if read && !(self.reads && self.input(what)) {
             return;
@@ -306,7 +306,7 @@ impl Recorder {
     }
 
     /// Writes the record to `file`, whole or not at all.
-    pub(crate) fn write(&self, file: &Path) {
+    pub fn write(&self, file: &Path) {
         let mut text = String::new();
         for line in &self.lines {
             text.push(line.reached.letter());
@@ -328,13 +328,13 @@ impl Recorder {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Recorder {
     /// Whether the reads are recorded.
-    pub(crate) fn reads(&self) -> bool {
+    pub fn reads(&self) -> bool {
         self.reads
     }
 
     /// Takes `path`, as the program named it, as [`MARK`] when it is: `thread` runs the test
     /// after it, or none. Whether it was.
-    pub(crate) fn marked(&mut self, thread: u64, path: &[u8]) -> bool {
+    pub fn marked(&mut self, thread: u64, path: &[u8]) -> bool {
         let Some(name) = path.strip_prefix(MARK.as_bytes()) else { return false };
         match name.is_empty() {
             true => _ = self.threads.remove(&thread),
@@ -348,19 +348,19 @@ impl Recorder {
     }
 
     /// `thread` read `path`, made whole: recorded when reads are and it is an input.
-    pub(crate) fn read(&mut self, thread: u64, path: &str) {
+    pub fn read(&mut self, thread: u64, path: &str) {
         self.reached(Reached::Read, self.test(thread), path);
     }
 
     /// `thread` looked at `path`, made whole, without opening it: recorded as [`Self::read`]
     /// records a read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn looked(&mut self, thread: u64, path: &str) {
+    pub fn looked(&mut self, thread: u64, path: &str) {
         self.reached(Reached::Looked, self.test(thread), path);
     }
 
     /// Whether a write to `path` is the program's to make.
-    pub(crate) fn may_write(&self, path: &str) -> bool {
+    pub fn may_write(&self, path: &str) -> bool {
         self.written.iter().any(|it| under(path, it) && !self.only_read(path, it))
     }
 
@@ -375,23 +375,23 @@ impl Recorder {
     /// is the program's to make: one in the overlays, the writable directories or the
     /// sandbox's empty ones, which only the program's sockets can be in; not one of the
     /// kernel's views or the machine's `/dev`, which the sandbox sees as they are.
-    pub(crate) fn may_connect(&self, path: &str) -> bool {
+    pub fn may_connect(&self, path: &str) -> bool {
         let seen_as_is = ["/proc", "/sys", "/dev"].iter().any(|it| under(path, it));
         self.may_write(path) && (!seen_as_is || under(path, "/dev/shm"))
     }
 
     /// The sandbox refused `thread` a write to `path`.
-    pub(crate) fn refused_write(&mut self, thread: u64, path: &str) {
+    pub fn refused_write(&mut self, thread: u64, path: &str) {
         self.reached(Reached::Write, self.test(thread), path);
     }
 
     /// The sandbox refused `thread` the network at `address`.
-    pub(crate) fn refused_net(&mut self, thread: u64, address: &str) {
+    pub fn refused_net(&mut self, thread: u64, address: &str) {
         self.reached(Reached::Net, self.test(thread), address);
     }
 
     /// The record is not whole for what `thread` did, and why.
-    pub(crate) fn incomplete(&mut self, thread: u64, why: &str) {
+    pub fn incomplete(&mut self, thread: u64, why: &str) {
         self.reached(Reached::Incomplete, self.test(thread), why);
     }
 }
@@ -416,7 +416,7 @@ extern "C" fn pass_on(signal: libc::c_int) {
 /// The handlers are made the first time: a process that forks after keeps them until it runs
 /// a program, and passes nothing on.
 #[cfg(unix)]
-pub(crate) fn pass_signals_to(group: libc::pid_t) {
+pub fn pass_signals_to(group: libc::pid_t) {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     GROUP.store(group, std::sync::atomic::Ordering::Relaxed);
     INSTALLED.call_once(|| {
@@ -439,7 +439,7 @@ fn under(path: &str, dir: &str) -> bool {
 
 /// `blaze sandbox SPEC -- PROGRAM ARGS...`, or `blaze sandbox --probe`: runs the program and
 /// ends as it ended. Runs before anything else in the process, which is one thread: it forks.
-pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> ! {
+pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
     let first = args.next();
     if first.as_deref() == Some("--probe".as_ref()) {
         std::process::exit(match probe() {
@@ -491,7 +491,7 @@ fn backend(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
 
 /// Whether programs can be run in a sandbox here, and why not when they can't: the probe
 /// makes one around nothing, in a process of its own, once per process that asks.
-pub(crate) fn available() -> Result<(), String> {
+pub fn available() -> Result<(), String> {
     static AVAILABLE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     AVAILABLE
         .get_or_init(|| {
@@ -542,7 +542,7 @@ fn probe() -> Result<(), String> {
 /// the variable (systemd-nspawn, Podman, LXC), or `/proc/1/cgroup` naming a runtime (cgroup v1
 /// Docker, Kubernetes, containerd). `None` outside one, as far as it can be told.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn container(root: &Path, container: Option<&str>) -> Option<String> {
+pub fn container(root: &Path, container: Option<&str>) -> Option<String> {
     for file in [".dockerenv", "run/.containerenv"] {
         if root.join(file).exists() {
             return Some(format!("/{file}"));
@@ -562,7 +562,7 @@ pub(crate) fn container(root: &Path, container: Option<&str>) -> Option<String> 
 /// ([`container`]): the container's seccomp profile (Docker's default) is what refuses it, and
 /// the ways on: a profile that allows it, or no sandbox at all.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn container_hint(known: &str) -> String {
+pub fn container_hint(known: &str) -> String {
     format!(
         "; this runs in a container ({known}), and its seccomp profile (Docker's default) refuses \
          `unshare(CLONE_NEWUSER)`: run the container with `--security-opt seccomp=unconfined` \

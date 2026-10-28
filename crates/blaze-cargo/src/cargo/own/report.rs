@@ -76,7 +76,7 @@ struct OnDiskReport {
 }
 
 /// `cargo report <COMMAND>`.
-pub(super) fn command(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn command(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [
         valued(&["--id"]),
         valued(&["-p", "--package"]),

@@ -39,7 +39,7 @@ use super::{
 /// The variable the token is read from when the address names none.
 const TOKEN_VAR: &str = "BLAZE_REMOTE_TOKEN";
 /// The most one PUT carries; a larger object goes up in parts.
-pub(crate) const PUT_MAX: u64 = 90 << 20;
+pub const PUT_MAX: u64 = 90 << 20;
 /// The size of a part: the gateway takes none above [`PUT_MAX`] or below 5 MiB but the last.
 const PART: u64 = 64 << 20;
 /// How many parts of one object are in flight: each is held in memory while it goes.
@@ -53,7 +53,7 @@ const SLOWEST_UPLOAD: u64 = 64 << 10;
 /// The most of an error's body that is read and shown.
 const REASON_MAX: usize = 300;
 
-pub(crate) struct Gateway {
+pub struct Gateway {
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     spec: Spec,
     token: Option<String>,
@@ -63,16 +63,16 @@ pub(crate) struct Gateway {
 
 /// What a `blaze+` address says.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Spec {
+pub struct Spec {
     /// `https://<gateway>/t/<tenant>/v3`, with no `/` at its end and no query.
-    pub(crate) base: String,
-    pub(crate) tenant: String,
+    pub base: String,
+    pub tenant: String,
     /// The variable the token is read from.
-    pub(crate) token_var: String,
+    pub token_var: String,
 }
 
 impl Spec {
-    pub(crate) fn parse(spec: &str) -> anyhow::Result<Spec> {
+    pub fn parse(spec: &str) -> anyhow::Result<Spec> {
         let plain =
             spec.strip_prefix("blaze+").context("a gateway's address starts with blaze+")?;
         let url = Url::parse(plain).context("the address of the gateway is not a URL")?;
@@ -104,13 +104,13 @@ impl Spec {
 
 /// One request of the API, before it is sent.
 #[derive(Debug)]
-pub(crate) struct Ask {
-    pub(crate) method: Method,
-    pub(crate) op: &'static str,
-    pub(crate) name: String,
+pub struct Ask {
+    pub method: Method,
+    pub op: &'static str,
+    pub name: String,
     /// What follows `?`, if anything.
-    pub(crate) query: Option<String>,
-    pub(crate) headers: Vec<(header::HeaderName, String)>,
+    pub query: Option<String>,
+    pub headers: Vec<(header::HeaderName, String)>,
 }
 
 impl Ask {
@@ -128,7 +128,7 @@ impl Ask {
         self
     }
 
-    pub(crate) fn get(name: &str, from: u64, to: Option<u64>) -> Ask {
+    pub fn get(name: &str, from: u64, to: Option<u64>) -> Ask {
         let ask = Ask::new(Method::GET, "read", name);
         match (from, to) {
             (0, None) => ask,
@@ -137,14 +137,14 @@ impl Ask {
         }
     }
 
-    pub(crate) fn head(name: &str) -> Ask {
+    pub fn head(name: &str) -> Ask {
         Ask::new(Method::HEAD, "read", name)
     }
 
     /// A PUT of a whole object: `read_at` is the ETag it must still have, and `None` that
     /// there must be nothing there. An object whose name is not the hash of its bytes says
     /// what they hash to.
-    pub(crate) fn put(name: &str, bytes: &[u8], read_at: Option<&str>) -> Ask {
+    pub fn put(name: &str, bytes: &[u8], read_at: Option<&str>) -> Ask {
         let ask = Ask::new(Method::PUT, "write", name);
         let ask = match read_at {
             Some(tag) => ask.header(header::IF_MATCH, tag),
@@ -162,20 +162,20 @@ impl Ask {
         }
     }
 
-    pub(crate) fn start_upload(name: &str) -> Ask {
+    pub fn start_upload(name: &str) -> Ask {
         Ask::new(Method::POST, "write", name).query("uploads".to_owned())
     }
 
-    pub(crate) fn put_part(name: &str, upload: &str, part: u64) -> Ask {
+    pub fn put_part(name: &str, upload: &str, part: u64) -> Ask {
         Ask::new(Method::PUT, "write", name).query(format!("upload={}&part={part}", escape(upload)))
     }
 
-    pub(crate) fn complete(name: &str, upload: &str, digest: Digest) -> Ask {
+    pub fn complete(name: &str, upload: &str, digest: Digest) -> Ask {
         let ask = Ask::new(Method::POST, "write", name).query(format!("upload={}", escape(upload)));
         ask.header(header::CONTENT_TYPE, "application/json").sha256_if_packed(|| digest)
     }
 
-    pub(crate) fn abort(name: &str, upload: &str) -> Ask {
+    pub fn abort(name: &str, upload: &str) -> Ask {
         Ask::new(Method::DELETE, "write", name).query(format!("upload={}", escape(upload)))
     }
 
@@ -193,7 +193,7 @@ fn escape(text: &str) -> String {
 
 /// What an answer means to the client.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Judged {
+pub enum Judged {
     /// The object, or what was written.
     Done,
     /// Nothing is there, or nothing this machine may know of.
@@ -213,7 +213,7 @@ pub(crate) enum Judged {
 /// What the answer `status` with `headers` to `ask` means. `reason` is the start of the
 /// answer's body, which the gateway's errors say why in. `token_var` is where the token
 /// was looked for, and `had_token` whether one was there.
-pub(crate) fn judge(
+pub fn judge(
     ask: &Ask,
     spec: &Spec,
     had_token: bool,
@@ -278,17 +278,13 @@ struct Started {
 }
 
 impl Gateway {
-    pub(crate) fn open(
-        spec: &str,
-        patience: Duration,
-        traffic: Arc<Traffic>,
-    ) -> anyhow::Result<Gateway> {
+    pub fn open(spec: &str, patience: Duration, traffic: Arc<Traffic>) -> anyhow::Result<Gateway> {
         let parsed = Spec::parse(spec)?;
         let token = std::env::var(&parsed.token_var).ok().filter(|it| !it.is_empty());
         Gateway::with_token(spec, token, patience, traffic)
     }
 
-    pub(crate) fn with_token(
+    pub fn with_token(
         spec: &str,
         token: Option<String>,
         patience: Duration,
@@ -304,12 +300,12 @@ impl Gateway {
         Ok(Gateway { client, spec, token, patience, traffic })
     }
 
-    pub(crate) fn place(&self) -> String {
+    pub fn place(&self) -> String {
         self.spec.base.clone()
     }
 
     /// Why nothing is written, when this machine has no token to write with.
-    pub(crate) fn cannot_write(&self) -> Option<String> {
+    pub fn cannot_write(&self) -> Option<String> {
         self.token.is_none().then(|| {
             format!("{} is not set: nothing is sent to {}", self.spec.token_var, self.spec.base)
         })
@@ -359,7 +355,7 @@ impl Gateway {
     }
 
     /// The object under `name` from `offset` on, or `None` when there is nothing under it.
-    pub(crate) async fn read_from(&self, name: &str, offset: u64) -> anyhow::Result<Option<Body>> {
+    pub async fn read_from(&self, name: &str, offset: u64) -> anyhow::Result<Option<Body>> {
         let answer = self.send(&Ask::get(name, offset, None), Bytes::new()).await?;
         match answer.judged {
             Judged::Absent => Ok(None),
@@ -370,7 +366,7 @@ impl Gateway {
 
     /// The bytes `from..=to` of the object `name` and how long the object is, or `None`
     /// when there is nothing under it. A range past its end is no bytes.
-    pub(crate) async fn range(
+    pub async fn range(
         &self,
         name: &str,
         from: u64,
@@ -402,7 +398,7 @@ impl Gateway {
         Ok(Some((bytes, total)))
     }
 
-    pub(crate) async fn read_small(
+    pub async fn read_small(
         &self,
         name: &str,
         most: u64,
@@ -428,7 +424,7 @@ impl Gateway {
         Ok(Some((bytes, version)))
     }
 
-    pub(crate) async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
+    pub async fn found(&self, name: &str) -> anyhow::Result<Option<Object>> {
         let answer = self.send(&Ask::head(name), Bytes::new()).await?;
         if answer.judged == Judged::Absent {
             return Ok(None);
@@ -449,7 +445,7 @@ impl Gateway {
     /// Writes an object if what is there is still the version that was read: `None` when
     /// nothing was there. One longer than a PUT carries goes up in parts, unconditionally:
     /// only a pack or a unit is that long, and its name is the hash of its bytes.
-    pub(crate) async fn write_small(
+    pub async fn write_small(
         &self,
         name: &str,
         bytes: &[u8],
@@ -480,7 +476,7 @@ impl Gateway {
 
     /// Puts the file under `name`, all of it or nothing. An object that is there already
     /// is the same bytes, as its name is their hash.
-    pub(crate) async fn send_file(&self, name: &str, file: &Path, len: u64) -> anyhow::Result<()> {
+    pub async fn send_file(&self, name: &str, file: &Path, len: u64) -> anyhow::Result<()> {
         if len <= PUT_MAX {
             let bytes = Bytes::from(tokio::fs::read(file).await?);
             let ask = Ask::put(name, &bytes, None);

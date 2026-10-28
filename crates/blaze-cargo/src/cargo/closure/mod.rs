@@ -10,23 +10,23 @@
 //! its NarHash, where a build script's namespace mounts it at `/nix/store/<hash>-<name>` so that
 //! the paths nixpkgs wrote into its programs resolve.
 
-mod fetch;
-mod kept;
-mod nar;
-mod narinfo;
+pub mod fetch;
+pub mod kept;
+pub mod nar;
+pub mod narinfo;
 
 use std::{path::PathBuf, sync::Mutex, time::Instant};
 
 use anyhow::{Context as _, bail};
 use blaze_store::Store;
 
-pub(crate) use narinfo::Sha256;
+pub use narinfo::Sha256;
 
 /// The nixpkgs revision and the roots of each host: written by `harness/closure_pins.py`.
 const PINS: &str = include_str!("pins.txt");
 
 /// The project of blaze's remote cache the closure is kept in, for every project to take from.
-pub(crate) const PROJECT: &str = "nix-closure";
+pub const PROJECT: &str = "nix-closure";
 
 /// What the store is told the toolchain is when nothing else told it first. The closure's
 /// entries are lasting ones, the same for every toolchain, so it only has to be something.
@@ -37,26 +37,26 @@ const LAYING_OUT: usize = 4;
 
 /// A store path, with what its NAR comes to: what names its entries in blaze's store.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct StorePath {
+pub struct StorePath {
     /// The whole path, `/nix/store/<hash>-<name>`.
-    pub(crate) path: String,
-    pub(crate) nar_hash: Sha256,
-    pub(crate) nar_size: u64,
+    pub path: String,
+    pub nar_hash: Sha256,
+    pub nar_size: u64,
 }
 
 /// A store path pins.txt names, by the nixpkgs attribute it is the output of.
 #[derive(Clone, Debug)]
-pub(crate) struct Root {
+pub struct Root {
     /// `openssl.dev`, `clang`.
-    pub(crate) attribute: &'static str,
-    pub(crate) path: StorePath,
+    pub attribute: &'static str,
+    pub path: StorePath,
     /// What its closure, itself included, comes to as NARs.
-    pub(crate) closure_bytes: u64,
-    pub(crate) closure_paths: u64,
+    pub closure_bytes: u64,
+    pub closure_paths: u64,
 }
 
 /// The nixpkgs commit the roots are of.
-pub(crate) fn nixpkgs() -> &'static str {
+pub fn nixpkgs() -> &'static str {
     PINS.lines()
         .find_map(|it| it.strip_prefix("nixpkgs "))
         .map(str::trim)
@@ -64,7 +64,7 @@ pub(crate) fn nixpkgs() -> &'static str {
 }
 
 /// This machine as nixpkgs names a system, where pins.txt has roots for it.
-pub(crate) fn host() -> Option<&'static str> {
+pub fn host() -> Option<&'static str> {
     Some(match (std::env::consts::ARCH, std::env::consts::OS) {
         ("x86_64", "linux") => "x86_64-linux",
         ("aarch64", "linux") => "aarch64-linux",
@@ -73,7 +73,7 @@ pub(crate) fn host() -> Option<&'static str> {
 }
 
 /// The roots pins.txt has for `host` (`aarch64-linux`), in its order; none for another.
-pub(crate) fn roots(host: &str) -> Vec<Root> {
+pub fn roots(host: &str) -> Vec<Root> {
     read_roots(PINS, host).expect("pins.txt is as harness/closure_pins.py writes it")
 }
 
@@ -102,7 +102,7 @@ fn read_roots(pins: &'static str, host: &str) -> anyhow::Result<Vec<Root>> {
 }
 
 /// Where blaze lays out the store paths it materializes: `~/.blaze/nix`.
-pub(crate) fn dir() -> Option<PathBuf> {
+pub fn dir() -> Option<PathBuf> {
     Some(super::toolchain::home()?.join("nix"))
 }
 
@@ -114,7 +114,7 @@ fn store() -> anyhow::Result<&'static Store> {
 }
 
 /// Has blaze's store see what other processes put in it since this one opened it.
-pub(crate) fn refresh() -> anyhow::Result<()> {
+pub fn refresh() -> anyhow::Result<()> {
     store()?.refresh();
     Ok(())
 }
@@ -122,14 +122,14 @@ pub(crate) fn refresh() -> anyhow::Result<()> {
 /// Every store path `roots` refer to, themselves included, each once and sorted by path, from
 /// blaze's store and the remote it takes what it lacks from: each with its NarHash, which is
 /// what a key of what runs with them has to name.
-pub(crate) fn closure_of(roots: &[StorePath]) -> anyhow::Result<Vec<StorePath>> {
+pub fn closure_of(roots: &[StorePath]) -> anyhow::Result<Vec<StorePath>> {
     kept::closure_of(store()?, roots)
 }
 
 /// Lays out `path` from blaze's store, unless it is laid out, and returns where:
 /// `~/.blaze/nix/<hash>-<name>`, read-only, its NAR the one its NarHash names. A path the
 /// store lacks and no remote brings is an error that says CI fills the remote with it.
-pub(crate) fn materialize(path: &StorePath) -> anyhow::Result<PathBuf> {
+pub fn materialize(path: &StorePath) -> anyhow::Result<PathBuf> {
     let into = dir().context("blaze has no directory: neither BLAZE_HOME nor HOME is set")?;
     kept::materialize(store()?, path, &into)
 }
@@ -144,7 +144,7 @@ const USAGE: &str = "usage: blaze-engine closure fetch|materialize [--host <host
   root of the host. The host is this machine's (x86_64-linux, aarch64-linux) unless given.";
 
 /// `blaze-engine closure fetch|materialize [--host <host>] [<root>...]`.
-pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let mut args = args;
     let verb = args.next().context(USAGE)?;
     let mut host = None;

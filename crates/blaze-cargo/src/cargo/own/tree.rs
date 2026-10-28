@@ -24,7 +24,7 @@ const EDGES: &[&str] = &[
     "no-proc-macro",
 ];
 
-pub(super) fn command(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn command(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [
         switch(&["-a", "--all"]),
         switch(&["--no-dev-dependencies"]),

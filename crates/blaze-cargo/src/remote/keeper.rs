@@ -26,7 +26,7 @@ const LOOK_EVERY: Duration = Duration::from_secs(5);
 const LAST_PUSH: Duration = Duration::from_secs(60);
 
 /// `BLAZE_REMOTE_PUSH_EVERY`: a count and `s`, `m`, `h` or `d`, or `off`.
-pub(super) fn push_every_from_env() -> anyhow::Result<Option<Duration>> {
+pub fn push_every_from_env() -> anyhow::Result<Option<Duration>> {
     match std::env::var("BLAZE_REMOTE_PUSH_EVERY") {
         Err(_) => Ok(Some(PUSH_EVERY)),
         Ok(text) if text == "off" => Ok(None),
@@ -50,7 +50,7 @@ enum Step {
 
 /// What the store asks when it lacks a key, and what is known of the remote to answer it.
 #[derive(Default)]
-pub(super) struct Asked {
+pub struct Asked {
     /// The packs that are fetched when a key of theirs is asked for, with
     /// `BLAZE_REMOTE_LAZY`.
     lazy: RwLock<Option<Arc<Lazy>>>,
@@ -62,7 +62,7 @@ pub(super) struct Asked {
 }
 
 impl Asked {
-    pub(super) fn fetch_from(&self, lazy: Lazy) {
+    pub fn fetch_from(&self, lazy: Lazy) {
         if let Ok(mut now) = self.lazy.write() {
             *now = Some(Arc::new(lazy));
         }
@@ -74,14 +74,14 @@ impl Asked {
     }
 
     /// Notes what the manifest is, and says whether that is not what it was.
-    pub(super) fn see(&self, manifest: Option<Digest>) -> bool {
+    pub fn see(&self, manifest: Option<Digest>) -> bool {
         let Ok(mut seen) = self.seen.lock() else { return false };
         std::mem::replace(&mut *seen, manifest) != manifest
     }
 
     /// Whether the pack that holds `key` is in the store now. A key that stays lacking has
     /// the task look at the manifest, once for all that are lacking by then.
-    pub(super) fn fetch(&self, key: &[u8; 32]) -> bool {
+    pub fn fetch(&self, key: &[u8; 32]) -> bool {
         let lazy = self.lazy.read().ok().and_then(|it| it.clone());
         if lazy.is_some_and(|it| it.fetch(key)) {
             return true;
@@ -98,7 +98,7 @@ impl Asked {
 impl Shared {
     /// Starts the task: see the module. The first push is at once, for what the build
     /// before this added.
-    pub(crate) fn keep(self) {
+    pub fn keep(self) {
         let (steps, coming) = unbounded_channel();
         // What the first build lacked, it lacked after the pull before it.
         self.asked.lacked.store(false, Ordering::Relaxed);

@@ -11,17 +11,17 @@ use blaze_manifest::{Config, Context, Workspace};
 use super::args::{Args, Read, switch, valued};
 
 /// The status cargo ends with when it refuses its command line.
-pub(super) const USAGE: i32 = 1;
+pub const USAGE: i32 = 1;
 
 /// The configuration of a `cargo <command>` run in this process, with its `--config`s.
-pub(super) fn config(command: &str, read: &Read) -> anyhow::Result<Config> {
+pub fn config(command: &str, read: &Read) -> anyhow::Result<Config> {
     let mut config = Config::from_process()?;
     config.start(command, &read.values("--config"))?;
     Ok(config)
 }
 
 /// The flags read, or the status of the refusal, said as cargo says it.
-pub(super) fn read_or_refuse(
+pub fn read_or_refuse(
     args: &Args<'_>,
     flags: &[super::args::Flag],
     usage: &str,
@@ -30,7 +30,7 @@ pub(super) fn read_or_refuse(
 }
 
 /// [`read_or_refuse`] for a command that takes up to `positionals` words that are no flags.
-pub(super) fn read_or_refuse_taking(
+pub fn read_or_refuse_taking(
     args: &Args<'_>,
     flags: &[super::args::Flag],
     usage: &str,
@@ -57,14 +57,14 @@ pub(super) fn read_or_refuse_taking(
 }
 
 /// Ends a subcommand that failed with `err`, as cargo ends: its message, status 101.
-pub(super) fn failed(err: &anyhow::Error) -> i32 {
+pub fn failed(err: &anyhow::Error) -> i32 {
     super::super::metadata::refused(err, &std::env::current_dir().unwrap_or_default());
     super::super::FAILED
 }
 
 /// `cargo metadata`: the workspace and, unless `--no-deps`, every package of its resolve,
 /// read, fetched and resolved by blaze.
-pub(super) fn metadata(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn metadata(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [
         valued(&["--format-version"]),
         switch(&["--no-deps"]),
@@ -158,14 +158,14 @@ fn own_rustc(args: &[&str]) -> anyhow::Result<Option<String>> {
 }
 
 /// The host's triple, as blaze answers `rustc -vV` itself.
-pub(in crate::cargo) fn host_triple() -> anyhow::Result<String> {
+pub fn host_triple() -> anyhow::Result<String> {
     let told = own_rustc(&["-vV"])?.context("blaze does not know the host's triple")?;
     let host = told.lines().find_map(|it| it.strip_prefix("host: "));
     Ok(host.context("rustc names no host")?.to_owned())
 }
 
 /// The `cfg` of `triple`, as blaze answers `rustc --print cfg --target <triple>` itself.
-pub(in crate::cargo) fn target_cfg(triple: &str) -> anyhow::Result<Vec<cargo_platform::Cfg>> {
+pub fn target_cfg(triple: &str) -> anyhow::Result<Vec<cargo_platform::Cfg>> {
     let Some(printed) = own_rustc(&["--print", "cfg", "--target", triple])? else {
         anyhow::bail!("blaze does not know the target `{triple}`");
     };
@@ -178,7 +178,7 @@ pub(in crate::cargo) fn target_cfg(triple: &str) -> anyhow::Result<Vec<cargo_pla
 
 /// `cargo locate-project`: the manifest of the package of the working directory (or
 /// `--manifest-path`), or with `--workspace` its workspace's.
-pub(super) fn locate_project(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn locate_project(args: Args<'_>) -> anyhow::Result<i32> {
     let flags =
         [switch(&["--workspace"]), valued(&["--message-format"]), valued(&["--manifest-path"])];
     let usage = "blaze locate-project [--workspace] [--message-format <FMT>] \
@@ -216,7 +216,7 @@ pub(super) fn locate_project(args: Args<'_>) -> anyhow::Result<i32> {
 }
 
 /// `cargo verify-project`: whether the workspace of the manifest reads, as JSON.
-pub(super) fn verify_project(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn verify_project(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [valued(&["--manifest-path"])];
     let read = match read_or_refuse(&args, &flags, "blaze verify-project [--manifest-path <PATH>]")
     {
@@ -242,7 +242,7 @@ pub(super) fn verify_project(args: Args<'_>) -> anyhow::Result<i32> {
 }
 
 /// `cargo read-manifest`: the package of the manifest, as `cargo metadata --no-deps` prints it.
-pub(super) fn read_manifest(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn read_manifest(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [valued(&["-m", "--manifest-path"])];
     let usage = "blaze read-manifest [--manifest-path <PATH>]";
     let read = match read_or_refuse(&args, &flags, usage) {
@@ -273,7 +273,7 @@ pub(super) fn read_manifest(args: Args<'_>) -> anyhow::Result<i32> {
 
 /// `cargo pkgid`: the full spec of the package `SPEC` (or `-p`) names in the lock file, or of
 /// the package of the working directory.
-pub(super) fn pkgid(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn pkgid(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [valued(&["-p", "--package"]), valued(&["--manifest-path"])];
     let usage = "blaze pkgid [--package <SPEC>] [--manifest-path <PATH>] [SPEC]";
     let read = match read_or_refuse_taking(&args, &flags, usage, 1) {
@@ -328,7 +328,7 @@ pub(super) fn pkgid(args: Args<'_>) -> anyhow::Result<i32> {
 
 /// `cargo fetch`: every package the lock file names, fetched where cargo keeps them, for every
 /// platform (`--target` fetches no fewer).
-pub(super) fn fetch(args: Args<'_>) -> anyhow::Result<i32> {
+pub fn fetch(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [valued(&["--target"]), valued(&["--manifest-path"])];
     let usage = "blaze fetch [--target <TRIPLE>] [--manifest-path <PATH>]";
     let read = match read_or_refuse(&args, &flags, usage) {

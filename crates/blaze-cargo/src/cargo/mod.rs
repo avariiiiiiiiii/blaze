@@ -64,6 +64,7 @@ pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         std::process::exit(FAILED);
     }
     if let Asked::Build(asked) = &asked {
+        say::quiet(asked.flags.quiet);
         let cwd = std::env::current_dir()?;
         layout::first_unless_chosen(&cwd, &asked.flags.config, &asked.flags.unstable);
     }

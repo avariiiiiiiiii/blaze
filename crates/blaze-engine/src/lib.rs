@@ -7,8 +7,8 @@
 // as they were, `crate::cargo::...`.
 use blaze_cargo::{
     RUN_TOOL_TARGET, Told, answers, cargo, dep_info, deps, end_with_reader, errors, lock, memory,
-    plan, process, refused_error, remote, renamed, replace, sandbox, socket, stub, trace, tree,
-    version, weaken,
+    plan, process, progress, refused_error, remote, renamed, replace, sandbox, socket, stub, trace,
+    tree, version, weaken,
 };
 
 mod as_rustc;
@@ -4750,6 +4750,7 @@ fn std_unit_at(
         debug,
         ..args.clone()
     };
+    progress::phase("Compiling", "the standard library (once, kept in the store)");
     let built = build_unheld(db, table, &of_unit, &mut Rejections::default(), listed)
         .with_context(|| {
             let names: Vec<&str> = unit.iter().map(|it| it.0.as_str()).collect();
@@ -8591,6 +8592,10 @@ fn run_holding(
         anyhow::Ok(shared)
     });
 
+    if let Some(socket) = &args.socket {
+        progress::said_beside(socket);
+    }
+    progress::phase("Loading", "workspace");
     let start = Instant::now();
     let selection = args.selection.clone();
     blaze_store::identify_ahead();
@@ -8705,6 +8710,7 @@ fn run_holding(
     if remote::required() {
         shared = pulled(pulling.take().expect("not joined yet"))?;
     }
+    progress::phase("Resolving", "names");
     let built = built_crates(&db, &args)?;
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
@@ -8866,6 +8872,7 @@ fn run_holding(
                 cold
             }
             None => {
+                progress::phase("Compiling", &format!("the functions of {}", args.krate));
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled.
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -8936,6 +8943,7 @@ fn run_holding(
                 .collect();
             let mut all: Vec<_> = paths.keys().copied().collect();
             all.sort_unstable();
+            progress::phase("Checking", &format!("{} files", all.len()));
             let sources = Sources { paths };
             let lints = !args.lints_capped;
             let within = Some(within);
@@ -8952,6 +8960,7 @@ fn run_holding(
         }
         memory::report(&mut db, "build")?;
         report_stats(&known.stats);
+        progress::phase("Linking", &args.krate);
         link(
             args.link_cmd.as_deref(),
             args.splice.as_deref(),
@@ -9055,6 +9064,7 @@ fn run_holding(
             Some((inside.to_owned(), db.file_text(id).text(&db).clone()))
         })
         .collect();
+    progress::idle();
     let listener = match &args.socket {
         Some(path) => match socket::Served::bind(path) {
             Ok(served) => Some(served),

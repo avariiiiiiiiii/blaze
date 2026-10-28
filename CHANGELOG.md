@@ -20,6 +20,16 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   `--why --json` as the NDJSON lines. `BLAZE_TESTS=all` runs every test. Sandboxed tests stay an
   experimental opt-in.
 
+## [0.20261028.2] - 2026-10-28
+
+### Added
+
+- A build or check that waits for the daemon says what it waits for: on a terminal one status
+  line, written over as the worker loads the workspace, resolves names, compiles, checks and
+  links (`Loading workspace (38 s)`), and cleared when it is done; off a terminal one line per
+  step. Before, a first build of a large workspace printed nothing for a minute. `-q` shows
+  none.
+
 ### Removed
 
 - `blaze enable` and `blaze disable`, and plain cargo building through blaze (#93, no-rustc.md's
@@ -30,6 +40,25 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   `BLAZE_RUSTC_BASE` is gone with it: the first edits no longer patch an executable rustc
   linked, which only that mode still had. `blaze-rustc` stays, as the wrapper of a load into
   cargo's target directory.
+
+### Merged
+
+- blaze pin: a workspace pins a release of blaze, which blaze runs (#841)
+- llvm.yaml: an archive already on the release is left alone (main's build jobs 404 on the pinned LLVM) (#879)
+- install.sh --channel canary: the newest dated tag whose release has its SHA256SUMS. releases.atom lists plain tags too, so #873 picked v0.20261028.0 while release.yaml was still building it (install.yaml macos-15, run 40638482080: 404 on its SHA256SUMS). Now each dated tag of the feed is tried newest first until one's checksums download, which also skips a release whose assets are still uploading. (#876)
+- ci.py: stdstatics.py's measured seconds (#880)
+- smoke corpus: programs blaze run/test must get right, std cases in the merge gate (#875)
+- blaze-cargo: the cargo drop-in is a crate of its own (crate split 4b) (#858)
+- promote.yaml: a canary that passes the heavy tests becomes stable, the same release flipped (#883)
+- pin: version = "stable" or "canary" runs the release that channel names (#882)
+- promote.yaml: a run with promote=false opens no issue (#885)
+- answers: a non-Apple target's spec is answered with SDKROOT set (macos arm64 / build: proc-macro server, release v0.20261028.1) (#884)
+- blaze-splice: the splice is a crate of its own (crate split 4b, second half) (#888)
+- answers: an Apple target's spec is answered with SDKROOT set; it names no deployment target (macos arm64 / build after #884) (#890)
+- Delete blaze enable and plain cargo's wrapper: blaze is the only way in (#93) (#886)
+- A workspace's target error keeps its cause; test of release v0.20261028.1's question (wasm32-wasip1 spec under MACOSX_DEPLOYMENT_TARGET) (#881)
+- agents: any agent takes any pull request to merged, drafts and other lanes' included (rule own-prs-to-merge) (#898)
+- blaze shows what the daemon is at while a build or check waits (#851)
 
 ## [0.20261028.1] - 2026-10-28
 
@@ -2735,7 +2764,8 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.1...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.2...HEAD
+[0.20261028.2]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.2
 [0.20261028.1]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.1
 [0.20261028.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.0
 [0.20261027.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261027.0

@@ -64,6 +64,10 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     if let Ok(home) = daemon::home() {
         crate::renamed::say_old_dirs(&home);
     }
+    if let Asked::Build(asked) = &asked {
+        let cwd = std::env::current_dir()?;
+        layout::first_unless_chosen(&cwd, &asked.flags.config, &asked.flags.unstable);
+    }
     if let Asked::Build(_) = asked
         && let Err(why) = toolchain::settle(true)
     {

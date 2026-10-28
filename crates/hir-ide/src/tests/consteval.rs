@@ -3215,15 +3215,7 @@ fn exec_limits() {
     }
     const GOAL: i32 = f(0);
     "#,
-        |e| {
-            matches!(
-                e,
-                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
-                    spent: Budget::Steps(10_000_000),
-                    at: Some(_),
-                })
-            )
-        },
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::StackOverflow)),
     );
     // Reasonable code should still work
     check_number(

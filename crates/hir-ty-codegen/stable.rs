@@ -941,6 +941,28 @@ fn hashed(spelled: &str) -> String {
     out
 }
 
+/// Where the toolchain installs the standard library's sources, the directory `library/` is in.
+const INSTALLED_LIBRARY: &str = "/lib/rustlib/src/rust/";
+
+/// A file's path as a place names it ([`block_place`], [`static_place`]): the same on every
+/// machine for a file of the standard library or of what cargo fetched. The standard library
+/// from the store was built on another machine, and a program finds the statics of its bodies
+/// by the name their place gives them: under a path of this machine's, std's `thread_local!`s
+/// and `thread::min_stack`'s `MIN` were not found, and a program that spawned a thread or made
+/// a `HashMap` was refused (#840).
+fn place_path(symbols: &dyn SymbolResolver, path: Option<String>) -> Option<String> {
+    Some(path_everywhere(path?, symbols.cargo_home().as_deref()))
+}
+
+/// [`place_path`] with cargo's directory on this machine at `cargo_home`.
+fn path_everywhere(path: String, cargo_home: Option<&str>) -> String {
+    let slashed = path.replace('\\', "/");
+    if let Some(at) = slashed.find(INSTALLED_LIBRARY) {
+        return format!("/rustc/{}", &slashed[at + INSTALLED_LIBRARY.len()..]);
+    }
+    cargo_home.and_then(|home| super::moved(&path, home, super::CARGO_HOME)).unwrap_or(path)
+}
+
 /// Where a function inside a block is written, which its path does not say: two blocks of
 /// one function, or two `const _` of one module, can each hold an item of the same name.
 /// `None` for a function outside of any block.
@@ -952,7 +974,7 @@ pub fn block_place(
     func.module(db).block(db)?;
     let id = func.lookup(db).id;
     let mut out = String::new();
-    file_name(db, symbols, &mut out, id.file_id, &|path| path)?;
+    file_name(db, symbols, &mut out, id.file_id, &|path| place_path(symbols, path))?;
     write!(out, "#{}", id.value.erase().into_raw()).ok()?;
     Some(out)
 }
@@ -967,7 +989,7 @@ pub fn function_place(
 ) -> Option<String> {
     let id = func.lookup(db).id;
     let mut out = String::new();
-    file_name(db, symbols, &mut out, id.file_id, &|path| path)?;
+    file_name(db, symbols, &mut out, id.file_id, &|path| place_path(symbols, path))?;
     write!(out, "#{}", id.value.erase().into_raw()).ok()?;
     Some(out)
 }
@@ -981,7 +1003,30 @@ pub fn static_place(
     id.module(db).block(db)?;
     let id = id.lookup(db).id;
     let mut out = String::new();
-    file_name(db, symbols, &mut out, id.file_id, &|path| path)?;
+    file_name(db, symbols, &mut out, id.file_id, &|path| place_path(symbols, path))?;
     write!(out, "#{}", id.value.erase().into_raw()).ok()?;
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_everywhere;
+
+    #[test]
+    fn a_file_of_the_standard_library_or_of_cargo_is_named_the_same_on_every_machine() {
+        let std = "lib/rustlib/src/rust/library/std/src/thread/mod.rs";
+        let runner = format!("/Users/runner/.rustup/toolchains/nightly-aarch64-apple-darwin/{std}");
+        let user = format!("/home/me/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/{std}");
+        let windows = format!(r"C:\Users\me\.rustup\toolchains\nightly\{}", std.replace('/', r"\"));
+        let named = path_everywhere(runner, None);
+        assert_eq!(named, "/rustc/library/std/src/thread/mod.rs");
+        assert_eq!(path_everywhere(user, Some("/home/me/.cargo")), named);
+        assert_eq!(path_everywhere(windows, None), named);
+        let fetched = "/home/me/.cargo/registry/src/index.crates.io-1/x-1.0.0/src/lib.rs";
+        assert_eq!(
+            path_everywhere(fetched.to_owned(), Some("/home/me/.cargo")),
+            "/cargo/registry/src/index.crates.io-1/x-1.0.0/src/lib.rs"
+        );
+        assert_eq!(path_everywhere("src/main.rs".to_owned(), Some("/home/me/.cargo")), "src/main.rs");
+    }
 }

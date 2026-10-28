@@ -4834,7 +4834,7 @@ fn std_unit_at(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"blaze standard library 4");
+    field(b"blaze standard library 5");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
     // A file of one of its crates whose text is blaze's, not the toolchain's.
     if args.run_tool {

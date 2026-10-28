@@ -8,6 +8,20 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Fixed
+
+- A program that spawns a thread or makes a `HashMap` builds with the standard library a
+  release ships (#840, #224). Its build was refused with "writable static `MIN` (or
+  `__RUST_STD_INTERNAL_VAL`) without a rustc symbol": a static declared in a body of std
+  (`thread::min_stack`'s `MIN`, each `thread_local!`'s, `RandomState::new`'s `KEYS`) is named
+  after where it is written, and the name had the path of std's sources on the machine that
+  built the unit (CI's runner, `/Users/runner/.rustup/...`), so a program built anywhere else
+  asked for names the unit does not define. The place now names a file of the standard library
+  from `library/` on, and one cargo fetched under `/cargo`, the same on every machine, and the
+  program links to the unit's one copy of each static. The unit's store key changes, so it is
+  built or fetched once again. `harness/stdstatics.py` makes the unit from std's sources in
+  another directory and runs the three programs, dev and `--release`.
+
 ## [0.20261028.0] - 2026-10-28
 
 ### Changed

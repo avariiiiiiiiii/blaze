@@ -67,6 +67,8 @@ HARNESSES = [
     ("core", ["scriptenv.py"], {}, on("linux", "macos"), 2),
     # Its program of writable statics of its own crates on macOS too, where anim's `HOME` was refused.
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
+    # std's own writable statics (`thread_local!`s, `MIN`), from a unit built on another machine (#840).
+    ("core", ["stdstatics.py"], {}, on("linux", "macos"), 2),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),
     ("core", ["live_e2e.py"], {}, on("linux-x86_64"), 1),
     # A type added beside another, the code moved to it and the old one deleted, each a patch.
@@ -156,6 +158,7 @@ FAST = {
     "unwinds.py": (11, ()),
     "growth.py": (31, (X64,)),
     "coldbuild.py": (78, (X64,)),
+    "stdstatics.py": (120, (X64, MAC)),
     "loadretry.py": (30, ()),
     "scriptenv.py": (70, ()),
     "splices.py": (51, ()),

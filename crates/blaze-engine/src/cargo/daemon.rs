@@ -204,6 +204,11 @@ pub(crate) enum Reply {
     },
     Status(Status),
     Stopping,
+    /// Not the answer, which is still to come: what the process the answer waits for is at,
+    /// a status word and what it is of, when it says ([`crate::progress`]).
+    Progress {
+        step: Option<(String, String)>,
+    },
 }
 
 /// Why the worker did not build a program.
@@ -489,6 +494,7 @@ impl Worker {
         // is not the one to connect to.
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(errors_beside(&socket));
+        let _ = std::fs::remove_file(crate::progress::beside(&socket));
         let config = &checkout.config;
         let mut args = config.args(&checkout.root, &first.crates);
         let rustcs: [(&str, &Path); 5] = [
@@ -933,6 +939,7 @@ impl Checker {
         private_dir(dir)?;
         let (socket, log) = (dir.join("sock"), dir.join("log"));
         let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(crate::progress::beside(&socket));
         let mut args: Vec<OsString> = vec!["--check".into()];
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
@@ -1164,6 +1171,32 @@ pub(crate) fn serve() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How often a command that waits for an answer is told what the process it waits for is at.
+const TELLING: Duration = Duration::from_millis(250);
+
+/// The answer `answering` gives, with the command that waits for it told what the process
+/// that writes `phase` is at every [`TELLING`] meanwhile ([`Reply::Progress`]): a command
+/// that says nothing for the minute a load and a first build can take looks stuck.
+fn telling(stream: &UnixStream, phase: &Path, answering: impl FnOnce() -> Reply) -> Reply {
+    let (answered, told) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            while told.recv_timeout(TELLING) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                let step = crate::progress::read(phase);
+                let Ok(mut line) = serde_json::to_string(&Reply::Progress { step }) else { break };
+                line.push('\n');
+                // A command that went away is told nothing more; its answer goes nowhere too.
+                if (&*stream).write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+        let reply = answering();
+        drop(answered);
+        reply
+    })
+}
+
 impl Daemon {
     /// Reads the one request of a connection and answers it.
     fn answer(&self, stream: UnixStream) -> anyhow::Result<()> {
@@ -1183,7 +1216,12 @@ impl Daemon {
         let replaced = envelope.as_ref().is_ok_and(|it| it.replaces && it.version != self.version);
         let read = Instant::now();
         let mut reply = match envelope {
-            Ok(envelope) if envelope.version == self.version => self.handle(envelope.request),
+            Ok(envelope) if envelope.version == self.version => {
+                match self.phase_of(&envelope.request) {
+                    Some(phase) => telling(&stream, &phase, || self.handle(envelope.request)),
+                    None => self.handle(envelope.request),
+                }
+            }
             _ => Reply::Restart { version: self.version.clone() },
         };
         if let Reply::Synced { spans, .. } = &mut reply {
@@ -1228,6 +1266,19 @@ impl Daemon {
             "" => anyhow::bail!("the worker hung up; its log is {}", worker.log.display()),
             reply => Ok(reply.to_owned()),
         }
+    }
+
+    /// The file the process that answers `request` says what it is at in, for a request
+    /// that can take long: a build, which may load the workspace first, and a check.
+    fn phase_of(&self, request: &Request) -> Option<PathBuf> {
+        let dir = match request {
+            Request::Build(checkout) => self.home.join("workers").join(checkout.config.id()),
+            Request::Check(ahead) | Request::Lint(ahead, _) => {
+                self.home.join("checkers").join(ahead.config.id())
+            }
+            Request::Warm(_) | Request::Status | Request::Stop => return None,
+        };
+        Some(crate::progress::beside(&dir.join("sock")))
     }
 
     fn handle(&self, request: Request) -> Reply {

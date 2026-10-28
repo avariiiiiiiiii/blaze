@@ -341,7 +341,8 @@ fn ask(
         Format::Short => (true, color),
         Format::Json { short, ansi, render } => (short, ansi || render && color),
     };
-    let width = (format == Format::Human || format == Format::Short).then(terminal_width).flatten();
+    let width =
+        (format == Format::Human || format == Format::Short).then(say::terminal_width).flatten();
     Ok(Ask { packages, short, ansi, width })
 }
 
@@ -371,26 +372,6 @@ fn colour(typed: &[String]) -> bool {
         Some("never") => false,
         _ => std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     }
-}
-
-/// The columns of the terminal standard error is, which cargo passes rustc as
-/// `--diagnostic-width`. None on Windows, which has no `TIOCGWINSZ`.
-#[cfg(not(unix))]
-fn terminal_width() -> Option<usize> {
-    None
-}
-
-/// The columns of the terminal standard error is, which cargo passes rustc as
-/// `--diagnostic-width`.
-#[cfg(unix)]
-fn terminal_width() -> Option<usize> {
-    if !std::io::stderr().is_terminal() {
-        return None;
-    }
-    // SAFETY: `TIOCGWINSZ` writes a `winsize` and nothing else.
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    let got = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) };
-    (got == 0 && size.ws_col > 0).then_some(usize::from(size.ws_col))
 }
 
 /// What cargo counts of a unit's warnings.

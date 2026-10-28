@@ -64,6 +64,9 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     if let Ok(home) = daemon::home() {
         crate::renamed::say_old_dirs(&home);
     }
+    if let Asked::Build(asked) = &asked {
+        say::quiet(asked.flags.quiet);
+    }
     if let Asked::Build(_) = asked
         && let Err(why) = toolchain::settle(true)
     {

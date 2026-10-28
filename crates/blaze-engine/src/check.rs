@@ -33,6 +33,8 @@ pub(crate) const LINT: &str = "lint\t";
 /// Loads the workspace of `args` and answers the check requests on its socket.
 pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let socket = args.socket.clone().context("--check needs --socket")?;
+    crate::progress::said_beside(&socket);
+    crate::progress::phase("Loading", "workspace");
     crate::process_wide();
     let read_from = SystemTime::now();
     let cargo_config = crate::cargo_config(&args);
@@ -43,6 +45,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
     let mut checker = Checker::new(&db, &vfs, &checkouts, &members, read_from, root, lints_capped);
+    crate::progress::idle();
     let served = match crate::socket::Served::bind(&socket) {
         Ok(served) => served,
         Err(crate::socket::NotServed::Taken) => {
@@ -62,7 +65,12 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
                 eprintln!("{RELOAD}: {reload}");
                 RELOAD.to_owned()
             }
-            None => checker.answer(&db, &args, &request),
+            None => {
+                crate::progress::phase("Checking", &format!("{} crates", checker.crates));
+                let answer = checker.answer(&db, &args, &request);
+                crate::progress::idle();
+                answer
+            }
         };
         let _ = std::io::Write::write_all(&mut &stream, format!("{reply}\n").as_bytes());
         if reply == RELOAD {

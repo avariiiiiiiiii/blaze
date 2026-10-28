@@ -18,7 +18,7 @@ use uds_windows::UnixStream;
 
 use super::{
     daemon::{Envelope, Reply, Request, SPARE, home, socket_in, version},
-    switch, wrapper,
+    say, switch, wrapper,
 };
 use crate::socket::{connect, private_dir, private_file};
 
@@ -45,6 +45,11 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
     // A whole build is asked for at once: no cargo builds meanwhile for a spare to load beside.
     let spares = !matches!(&request, Request::Build(checkout) if checkout.config.whole);
     let started = |home: &Path| started(home, spares);
+    let doing = match &request {
+        Request::Check(_) | Request::Lint(..) => "Checking",
+        _ => "Building",
+    };
+    let exchange = |stream: &mut UnixStream, envelope: &str| exchange(stream, envelope, doing);
     let request = request.of_this_command();
     let envelope = serde_json::to_string(&Envelope { version: version(), replaces, request })?;
     let mut stream = match (connect(&socket), start) {
@@ -162,19 +167,34 @@ pub(crate) fn why_none() -> String {
     }
 }
 
-fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
+/// Sends `envelope` and reads the answer, showing what the daemon says it is at until it
+/// comes ([`Reply::Progress`]), or that it is `doing` the request when it does not say.
+fn exchange(
+    stream: &mut UnixStream,
+    envelope: &str,
+    doing: &'static str,
+) -> anyhow::Result<Reply> {
     stream.write_all(format!("{envelope}\n").as_bytes())?;
-    let mut line = String::new();
-    let read = BufReader::new(stream).read_line(&mut line);
-    // A line without its end is one the daemon did not live to finish.
-    if !matches!(read, Ok(1..)) || !line.ends_with('\n') {
-        let log = home()?.join("daemon.log");
-        anyhow::bail!(
-            "the daemon ended before it answered (killed?), its log is {}",
-            log.display()
-        );
+    let mut waiting = say::Waiting::new(doing);
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line);
+        // A line without its end is one the daemon did not live to finish.
+        if !matches!(read, Ok(1..)) || !line.ends_with('\n') {
+            drop(waiting);
+            let log = home()?.join("daemon.log");
+            anyhow::bail!(
+                "the daemon ended before it answered (killed?), its log is {}",
+                log.display()
+            );
+        }
+        let reply = serde_json::from_str::<Reply>(&line);
+        match reply.context("the daemon's answer is not one of this version")? {
+            Reply::Progress { step } => waiting.show(step),
+            reply => return Ok(reply),
+        }
     }
-    serde_json::from_str(&line).context("the daemon's answer is not one of this version")
 }
 
 /// Starts a daemon in a process group of its own, so that what ends this command or its

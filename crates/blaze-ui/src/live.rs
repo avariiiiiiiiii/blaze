@@ -2,7 +2,7 @@
 
 use blaze_protocol::events::{CrateState, Record};
 
-use crate::{Build, CYAN, Change, DIM, GREEN, fresh, paint, staying, summary_line, took};
+use crate::{Build, CYAN, Change, DIM, GREEN, last_line, paint, staying, took};
 
 /// The most crates the region lists by name; the rest under way are counted.
 const SHOWN: usize = 6;
@@ -15,11 +15,18 @@ pub struct Live {
     drawn: usize,
     width: usize,
     color: bool,
+    errors_said: bool,
 }
 
 impl Live {
     pub fn new(width: usize, color: bool) -> Live {
-        Live { build: Build::default(), drawn: 0, width: width.max(20), color }
+        Live { build: Build::default(), drawn: 0, width: width.max(20), color, errors_said: false }
+    }
+
+    /// For the command that asked for the build, which says its errors in full after it: a
+    /// failed build has no last line of its own ([`crate::last_line`]).
+    pub fn errors_said(self) -> Live {
+        Live { errors_said: true, ..self }
     }
 
     pub fn build(&self) -> &Build {
@@ -34,7 +41,7 @@ impl Live {
     /// again below them; at the build's end, the summary in the region's place.
     pub fn record(&mut self, record: &Record, now_ns: u64) -> String {
         let change = self.build.apply(record);
-        let lines = staying(&self.build, &change, self.color, true);
+        let lines = staying(&self.build, &change, self.color, true, self.errors_said);
         match change {
             Change::Finished => self.finish_with(&lines),
             _ => self.redraw(&lines, now_ns),
@@ -57,8 +64,9 @@ impl Live {
             out.push_str(line);
             out.push('\n');
         }
-        if let Some(finished) = self.build.finished.as_ref().filter(|it| !fresh(it)) {
-            out.push_str(&summary_line(finished, self.color));
+        let finished = self.build.finished.as_ref();
+        if let Some(last) = finished.and_then(|it| last_line(it, self.color, self.errors_said)) {
+            out.push_str(&last);
             out.push('\n');
         }
         out

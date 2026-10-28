@@ -242,6 +242,10 @@ pub struct Evaluator<'db> {
     steps_left: u64,
     /// An additional limit on stack depth, to prevent stack overflow
     stack_depth_limit: usize,
+    /// Every call takes a frame of [`Self::stack_depth_limit`], which is the crate's recursion
+    /// limit, as in rustc: the evaluation is of a constant's or static's initializer. Running a
+    /// function, only the nested runs of `interpret_mir` do.
+    limits_frames: bool,
     infcx: InferCtxt<'db>,
 }
 
@@ -513,6 +517,13 @@ impl<'db> Evaluator<'db> {
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         let lang_items = interner.lang_items();
         let budget = crate_id.workspace_data(db).const_eval;
+        let limits_frames =
+            !matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)));
+        let stack_depth_limit = if limits_frames {
+            hir_def::nameres::crate_def_map(db, crate_id).recursion_limit() as usize
+        } else {
+            100
+        };
         Ok(Evaluator {
             target_data_layout,
             stack: vec![0],
@@ -539,7 +550,8 @@ impl<'db> Evaluator<'db> {
             stderr: vec![],
             type_ids: Vec::new(),
             assert_placeholder_ty_is_unused,
-            stack_depth_limit: 100,
+            stack_depth_limit,
+            limits_frames,
             budget,
             steps_left: budget.steps,
             layout_cache: RefCell::new(Default::default()),
@@ -798,6 +810,7 @@ impl<'db> Evaluator<'db> {
         args: impl Iterator<Item = IntervalOrOwned>,
         called: Option<(FunctionId, MirSpan, InferBodyId<'db>)>,
     ) -> Result<'db, Interval> {
+        let depth_limit = self.stack_depth_limit;
         if let Some(it) = self.stack_depth_limit.checked_sub(1) {
             self.stack_depth_limit = it;
         } else {
@@ -902,6 +915,12 @@ impl<'db> Evaluator<'db> {
                                 it => not_supported!("unknown function type {it:?}"),
                             };
                             if let Some(stack_frame) = stack_frame {
+                                if self.limits_frames {
+                                    let Some(it) = self.stack_depth_limit.checked_sub(1) else {
+                                        return Err(MirEvalError::StackOverflow);
+                                    };
+                                    self.stack_depth_limit = it;
+                                }
                                 self.code_stack.push(my_stack_frame);
                                 current_block_idx = stack_frame.locals.body.start_block;
                                 self.code_stack.push(stack_frame);
@@ -948,6 +967,7 @@ impl<'db> Evaluator<'db> {
                     }
                     let my_code_stack = mem::replace(&mut self.code_stack, prev_code_stack);
                     self.running = prev_running;
+                    self.stack_depth_limit = depth_limit;
                     let mut error_stack = vec![];
                     for frame in my_code_stack.into_iter().rev() {
                         if let Some(f) = frame.locals.body.owner.as_function() {
@@ -971,6 +991,9 @@ impl<'db> Evaluator<'db> {
                     return Ok(return_interval);
                 }
                 Some(bb) => {
+                    if self.limits_frames {
+                        self.stack_depth_limit += 1;
+                    }
                     // We don't support const promotion, so we can't truncate the stack yet.
                     let _ = my_stack_frame.prev_stack_ptr;
                     // self.stack.truncate(my_stack_frame.prev_stack_ptr);

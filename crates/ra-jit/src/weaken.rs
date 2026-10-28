@@ -1,5 +1,6 @@
 //! `ra-jit weaken FILE...`: copies of rustc's Mach-O objects and archives whose definitions
-//! give way to ra-jit's.
+//! give way to ra-jit's. `ra-jit weaken --shared FILE...`: the copies of ELF ones the daemon
+//! links ([`shared`]).
 //!
 //! ra-jit's object is linked ahead of what rustc built of the same crates, and defines many of
 //! the same names. An ELF linker is told to keep the first definition it meets. Apple's has no
@@ -34,10 +35,14 @@ pub(crate) const DIR: &str = "ra-jit-weak-2";
 /// The directories of copies older ra-jits wrote, which this one deletes.
 const OLD_DIRS: [&str; 1] = ["ra-jit-weak"];
 
-/// Writes the copy of each file and prints where it is, in the order given.
+/// Writes the copy of each file and prints where it is, in the order given. With `--shared`
+/// first, the copy is the one an ELF link takes ([`shared`]), or the file itself.
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let mut args = args.peekable();
+    let made: fn(&Path) -> anyhow::Result<PathBuf> =
+        if args.next_if(|it| it == "--shared").is_some() { shared } else { copy_of };
     for file in args {
-        println!("{}", copy_of(Path::new(&file))?.display());
+        println!("{}", made(Path::new(&file))?.display());
     }
     Ok(())
 }

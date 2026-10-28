@@ -23,17 +23,15 @@
  * pointer that rests for IDLE_MS fades. The who-is-here list has a switch that hides the others' pointers, kept per
  * browser (localStorage).
  *
- * Saying something by the pointer, like Figma's cursor chat or Minecraft's T: on a desk T (outside a field, no
- * modifiers) opens a one-line composer at the reader's pointer (at the foot of the window when the pointer is off the
- * page). What is typed goes to the others on the page as it is typed (`say-live`, at most every SAY_MS), shown as a
- * bubble by the pointer, or by the face on the rail while the pointer is off their screen (or not drawn, on a phone). Enter sends: the bubble
- * stays SAY_LINGER_MS and a signed-in reader's line goes to the chat too, to be kept (client/lib/chat.ts `post`);
- * an anonymous one's is only ever the bubble. Esc, or leaving the field, takes it back.
+ * What the reader writes in the chat's input (client/lib/feed.ts, opened with T) goes to the others on the page as it
+ * is typed (`say`, sent as `say-live` at most every SAY_MS), shown as a bubble by the writer's pointer, in its layer, or
+ * by their face on the rail while the pointer is off this reader's screen or not drawn (a phone). Once sent the
+ * bubble stays SAY_LINGER_MS where it was: on the page, or in the window for a pointer on a region.
  */
 
 import { tipOn } from './tip';
 import { LEAVE, PAGE } from './page';
-import { SHELL, fixedAt, pageTop, placeOf, remeasure, spotAt, spotOf, type Place, type Spot } from './anchor';
+import { SHELL, pageTop, placeOf, remeasure, spotAt, spotOf, type Place, type Spot } from './anchor';
 
 type Who = { key: string; login: string | null; avatar: string | null };
 /** Someone else on this page; `away` while every tab of theirs here is hidden. */
@@ -77,8 +75,6 @@ const SAY_LINGER_MS = 4000;
 let send: (m: object) => void = () => {};
 let face: (w: Who, away?: boolean) => HTMLElement = () => document.createElement('span');
 let name: (w: Who) => string = (w) => w.key;
-let me: () => Who | null = () => null;
-let post: (text: string) => boolean = () => false;
 let path = '';
 const peers = new Map<string, Peer>();
 const remotes = new Map<string, Remote>();
@@ -133,7 +129,7 @@ function resend(): void {
 	sentC = '';
 	sentSay = '';
 	if (pointer) queueCursor();
-	if (saying) queueSay();
+	if (sayText) queueSay();
 }
 
 // ---- What the others are doing ----------------------------------------------------------------------------------
@@ -447,37 +443,20 @@ function placeSay(r: Remote): void {
 	if (b.parentElement !== band) band.append(b);
 }
 
-/** The reader's own composer: one line, in their colour, by their pointer. */
-const sayBox = el('form', 'say-live');
-sayBox.hidden = true;
-const sayField = el('input');
-sayField.type = 'text';
-sayField.maxLength = SAY_MAX;
-sayField.autocomplete = 'off';
-sayField.enterKeyHint = 'send';
-sayField.setAttribute('aria-label', 'Say something on this page');
-const sayKey = el('kbd', '', '↵');
-sayKey.setAttribute('aria-hidden', 'true');
-sayBox.append(sayField, sayKey);
-/** Whether the composer is open; what the others have of it ('' nothing); the timers that send it. */
-let saying = false;
+/**
+ * The line the reader is writing (client/lib/feed.ts's input, client/lib/chat.ts): what the others have of it ('' none),
+ * what it is now, and the timers that send it.
+ */
+let sayText = '';
 let sentSay = '';
 let sayQueue: ReturnType<typeof setTimeout> | undefined;
 let sayKeep: ReturnType<typeof setInterval> | undefined;
-let sayFade: ReturnType<typeof setTimeout> | undefined;
-/** Where the composer is: the pointer's place while it is written, kept once sent; on the page (document px), or in the
- * window (px) while `fixed`, over a region beside the article, which stays put as the page scrolls; null at the foot
- * of the window. */
-let sayAt: { x: number; y: number; fixed: boolean } | null = null;
-
-const line = (v: string) => v.replace(/\s+/g, ' ').trim();
 
 function pushSay(again = false): void {
 	sayQueue = undefined;
-	const text = line(sayField.value);
-	if (!saying || !peers.size || (text === sentSay && !again) || (!text && !sentSay)) return;
-	sentSay = text;
-	send({ t: 'say-live', text: text || null });
+	if (!peers.size || (sayText === sentSay && !again) || (!sayText && !sentSay)) return;
+	sentSay = sayText;
+	send({ t: 'say-live', text: sayText || null });
 }
 
 function queueSay(): void {
@@ -485,107 +464,25 @@ function queueSay(): void {
 }
 
 /**
- * Beside the pointer while the line is written, and where it was sent once it is (scrolling with the page, or staying
- * with the region it is on), kept inside the window; at the foot of the window while the pointer is off the page.
+ * The line the reader is writing, as it stands: the others on the page see it by the reader's pointer as it is typed.
+ * Null (or empty) takes it back; `done` sends it, and their bubble stays SAY_LINGER_MS where the pointer was.
  */
-function placeBox(): void {
-	if (sayBox.hidden) return;
-	if (saying && pointer) {
-		const fixed = fixedAt(pointer.x, pointer.y, mineOnly);
-		sayAt = { ...onLayer({ ...pointer, fixed }), fixed };
+export function say(text: string | null, done = false): void {
+	const t = (text ?? '').replace(/\s+/g, ' ').trim().slice(0, SAY_MAX);
+	if (done) {
+		clearTimeout(sayQueue);
+		clearInterval(sayKeep);
+		sayQueue = sayKeep = undefined;
+		if (t && peers.size) send({ t: 'say-live', text: t, done: true });
+		sayText = sentSay = '';
+		return;
 	}
-	sayBox.classList.toggle('at-foot', !sayAt);
-	sayBox.classList.toggle('fixed', !!sayAt?.fixed);
-	if (!sayAt) return void (sayBox.style.left = sayBox.style.top = '');
-	const { x, y } = origin(sayAt.fixed);
-	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x + x + 14)) - x)}px`;
-	// On the page (absolute), so a bounce moves it with the text; kept inside the window as it was when placed.
-	sayBox.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, sayAt.y + y + 18)) - y)}px`;
-}
-
-function openSay(): void {
-	if (saying) return sayField.focus();
-	clearTimeout(sayFade);
-	const w = me();
-	saying = true;
-	sentSay = '';
-	sayBox.classList.remove('sent', 'out');
-	sayBox.style.setProperty('--c', colour(w?.key ?? ''));
-	sayField.readOnly = false;
-	sayField.value = '';
-	sayField.placeholder = w?.login ? 'Say something on this page' : 'Say hi to this page (not kept)';
-	tipOn(sayKey, 'Enter sends, Esc cancels');
-	sayBox.querySelector(':scope > .face')?.remove();
-	if (w) sayBox.prepend(face(w));
-	sayAt = null;
-	sayBox.hidden = false;
-	placeBox();
-	sayField.focus({ preventScroll: true });
-	sayKeep = setInterval(() => sentSay && pushSay(true), SAY_KEEP_MS);
-}
-
-/** Shuts the composer: with `text` it was sent (a bubble a while, and the chat), without it taken back. */
-function closeSay(text: string | null): void {
-	if (!saying) return;
-	saying = false;
-	clearInterval(sayKeep);
-	clearTimeout(sayQueue);
-	sayQueue = undefined;
-	if (text) {
-		if (peers.size) send({ t: 'say-live', text, done: true });
-		post(text);
-		sayField.value = text;
-		sayField.readOnly = true;
-		sayBox.classList.add('sent');
-		sayField.blur();
-		sayFade = setTimeout(() => {
-			if (still.matches) return void (sayBox.hidden = true);
-			sayBox.classList.add('out');
-			sayFade = setTimeout(() => (sayBox.hidden = true), 300);
-		}, SAY_LINGER_MS);
-	} else {
-		if (sentSay) send({ t: 'say-live', text: null });
-		sayBox.hidden = true;
-	}
-	sentSay = '';
-}
-
-sayField.addEventListener('input', () => {
+	sayText = t;
+	if (!t) {
+		clearInterval(sayKeep);
+		sayKeep = undefined;
+	} else sayKeep ??= setInterval(() => sentSay && pushSay(true), SAY_KEEP_MS);
 	queueSay();
-	placeBox();
-});
-sayField.addEventListener('keydown', (e) => {
-	if (e.isComposing) return;
-	if (e.key === 'Enter') {
-		e.preventDefault();
-		closeSay(line(sayField.value) || null);
-	} else if (e.key === 'Escape') {
-		// Only the composer: nothing else's Esc (the chat, the who-is-here list) on the same press.
-		e.preventDefault();
-		e.stopPropagation();
-		closeSay(null);
-	}
-});
-sayField.addEventListener('blur', () => closeSay(null));
-sayBox.addEventListener('submit', (e) => e.preventDefault());
-// A press on the box (its padding, the key) keeps the field's focus.
-sayBox.addEventListener('mousedown', (e) => {
-	if (e.target !== sayField) e.preventDefault();
-});
-
-/**
- * T, on a desk, when the key would type nothing anywhere else; Enter too, for readers whose T an extension takes first
- * (Vimium opens a tab with it, before the page hears the key), when it would not press a link or a button.
- */
-function sayKeyDown(e: KeyboardEvent): void {
-	if (e.defaultPrevented || e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-	if ((e.key !== 't' && e.key !== 'T' && e.key !== 'Enter') || !fine.matches) return;
-	const t = e.target instanceof HTMLElement ? e.target : null;
-	if (t && (t.isContentEditable || t.closest('input, textarea, select, [contenteditable]'))) return;
-	if (e.key === 'Enter' && t?.closest('a[href], button, summary, [role="button"], [tabindex]')) return;
-	if (document.querySelector('dialog[open]') || document.body.classList.contains('chat-full')) return;
-	e.preventDefault();
-	openSay();
 }
 
 // ---- What client/lib/presence.ts calls ----------------------------------------------------------------------------
@@ -661,29 +558,15 @@ export function toggle(): HTMLElement | null {
 	return b;
 }
 
-/** A line for the who-is-here list: how to say something by the pointer. Null on a phone, which has no T. */
-export function hint(): HTMLElement | null {
-	if (!fine.matches) return null;
-	const p = el('p', 'tl-hint');
-	p.append('Press ', el('kbd', '', 'T'), ' or ', el('kbd', '', '↵'), ' to say something on this page');
-	tipOn(p, 'If Vimium or another extension takes T, use Enter, or exclude the key t for ix.dev in its options.');
-	return p;
-}
-
 export function setup(opts: {
 	send: (m: object) => void;
 	face: (w: Who, away?: boolean) => HTMLElement;
 	name: (w: Who) => string;
-	/** The reader, once the socket says (for their colour and whether they can post). */
-	me: () => Who | null;
-	/** Posts a line to the chat; false when the reader can't (not signed in). */
-	post: (text: string) => boolean;
 }): void {
-	({ send, face, name, me, post } = opts);
+	({ send, face, name } = opts);
 	rail.hidden = true;
-	document.body.append(layer, fixedLayer, rail, sayBox);
-	mineOnly.push(rail, sayBox);
-	document.addEventListener('keydown', sayKeyDown);
+	document.body.append(layer, fixedLayer, rail);
+	mineOnly.push(rail);
 	rail.addEventListener('pointerdown', grab);
 	desk.addEventListener('change', drawRail);
 
@@ -693,7 +576,6 @@ export function setup(opts: {
 			if (e.pointerType === 'touch') return;
 			pointer = { x: e.clientX, y: e.clientY };
 			queueCursor();
-			if (saying) placeBox();
 		},
 		{ passive: true },
 	);
@@ -710,7 +592,6 @@ export function setup(opts: {
 		(e) => {
 			if (pointer) queueCursor();
 			if (e.target === document) moved();
-			placeBox();
 			for (const r of remotes.values()) {
 				if (r.c && (r.fixed || !r.to)) aim(r, true);
 				else placeSay(r);
@@ -727,9 +608,9 @@ export function setup(opts: {
 	});
 	// Leaving the page: off the others' screens now, rather than at the next who-is-here.
 	addEventListener(LEAVE, () => {
-		closeSay(null);
-		clearTimeout(sayFade);
-		sayBox.hidden = true;
+		// The line being written stays in the feed's input; the next page's readers get it (`resend`).
+		if (sentSay) send({ t: 'say-live', text: null });
+		sentSay = '';
 		clearTimeout(cTimer);
 		cTimer = undefined;
 		if (sentC && sentC !== 'null') send({ t: 'c', c: null });

@@ -39,7 +39,6 @@ use hir_ty::{
     layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
     mir::is_by_move_coroutine,
-    mir::type_name::rustc_debug_name,
     next_solver::{
         DbInterner, GenericArgs, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
@@ -47,6 +46,7 @@ use hir_ty::{
     },
     traits::StoredParamEnvAndCrate,
 };
+use hir_ty_mir::mir::type_name::rustc_debug_name;
 
 /// A type of the program, and how many more pointers are followed from it.
 pub(crate) type Key = (StoredTy, u32);

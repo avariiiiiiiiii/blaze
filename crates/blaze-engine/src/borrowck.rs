@@ -544,7 +544,7 @@ fn dump_mir(db: &RootDatabase, file: vfs::FileId, name: &str) {
                 };
                 // The closures after it, as the borrow checker checks them with it.
                 while let Some(body) = bodies.pop() {
-                    eprintln!("{}", hir_ty::mir::print_mir_body(db, body, name));
+                    eprintln!("{}", hir_ty_mir::mir::print_mir_body(db, body, name));
                     for &closure in &body.closures {
                         match db.mir_body_for_closure(closure) {
                             Ok(it) => bodies.push(it),

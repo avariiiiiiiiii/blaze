@@ -120,7 +120,7 @@ fn effects_at<'db>(
                 assigned(place.local, place.projection.as_slice(), &mut effects);
             }
             StatementKind::FakeRead(place)
-                if let hir_ty::mir::MirSpan::ExprId(expr) = statement.span
+                if let hir_ty_mir::mir::MirSpan::ExprId(expr) = statement.span
                     && let Some(value) = statement_values.get(&expr)
                     && value.is_none_or(|value| {
                         place.projection.is_empty()

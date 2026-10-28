@@ -21,13 +21,11 @@ ena = "0.14.3"
 serde.workspace = true
 serde_derive.workspace = true
 either.workspace = true
-oorandom = "11.1.5"
 tracing = { workspace = true, features = ["attributes"] }
 rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
 indexmap.workspace = true
-unicode-width.workspace = true
 rustc_apfloat = "0.2.3"
 salsa.workspace = true
 bitflags.workspace = true

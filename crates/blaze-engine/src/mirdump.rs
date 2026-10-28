@@ -17,8 +17,8 @@ use hir_def::{FunctionId, ItemContainerId, Lookup};
 use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId},
-    mir::{MirBody, MirOptLevel, closure_path_suffix, impl_written_at, print_mir_body},
 };
+use hir_ty_mir::mir::{MirBody, MirOptLevel, closure_path_suffix, impl_written_at, print_mir_body};
 use ide_db::RootDatabase;
 use rustc_hash::FxHashSet;
 

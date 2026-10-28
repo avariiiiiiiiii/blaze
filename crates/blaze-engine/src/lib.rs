@@ -7160,8 +7160,8 @@ fn memo_capacities(db: &mut RootDatabase) -> anyhow::Result<()> {
             ),
         }
     }
-    hir_ty::mir::set_mir_capacity(db, mir);
-    hir_ty::mir::set_runtime_mir_capacity(db, runtime);
+    hir_ty_mir::mir::set_mir_capacity(db, mir);
+    hir_ty_mir::mir::set_runtime_mir_capacity(db, runtime);
     hir_ty_codegen::set_code_capacity(db, compiled, inlinable);
     Ok(())
 }

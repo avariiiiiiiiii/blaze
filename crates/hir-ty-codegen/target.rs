@@ -109,7 +109,7 @@ impl Target {
     pub fn select(triple: &str) -> Result<&'static Target, String> {
         let target = Target::parse(triple)?;
         let selected = SELECTED.get_or_init(|| {
-            hir_ty::mir::target::select_word(target.word());
+            hir_ty_mir::mir::target::select_word(target.word());
             target
         });
         if selected.triple == triple {

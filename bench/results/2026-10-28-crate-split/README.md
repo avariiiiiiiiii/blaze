@@ -72,3 +72,33 @@ everything else, and the engine, 8k lines smaller, compiles in 15.9 s instead of
 A first version had `blaze-cargo` depend on `blaze-splice` for `unwritten` and `copy_file`.
 An edit of the splice then compiled `blaze-cargo` and the engine again, one after the other:
 30.3 s, against 20.5 s before. That is why `blaze-in-place` is a crate of its own.
+
+## (c) MIR's passes are a crate of their own, `hir-ty-mir`
+
+`hir-ty/src/mir`'s lowering, passes to runtime and optimized MIR, monomorphization, interpreter
+and printer moved to `crates/hir-ty-mir` (about 21k of `hir-ty`'s 80k lines). MIR's types,
+its errors (`ConstEvalError` and `MirEvalError` refer to each other) and `held.rs` and
+`target.rs`, which layout reads, stay in `hir-ty`. What `hir-ty` asks of the passes (the MIR
+body queries, `interpret_mir` for const eval, `opaque_of_impl` for the solver) are required
+`HirDatabase` methods, as upstream's `type_name` is, and `hir-ide`'s `impl_hir_database!`
+implements them by calling `hir-ty-mir`. Before is `main` at d236af55ed; after is this on it.
+ABAB, every cold build from an empty target, `cargo build --release --locked -p blaze-engine`.
+
+| | main | + `hir-ty-mir` |
+|---|---:|---:|
+| cold | 75.2, 72.9 | 72.2, 70.8 |
+| edit `mir/lower.rs` (`hir-ty-mir` after) | 55.5, 53.4 | 39.5, 40.7 |
+| edit `mir/eval.rs` (`hir-ty-mir` after) | 53.2, 53.9 | 41.7, 39.7 |
+| edit `mir/optimize.rs` (`hir-ty-mir` after) | 54.4, 54.0 | 41.7, 40.5 |
+| edit `hir-ty/src/infer.rs` | 53.4, 56.7 | 52.3, 52.9 |
+| edit `hir-ty/src/mir.rs` | 54.3, 54.9 | 53.3, 53.1 |
+
+A pass edit compiles `hir-ty-mir` (7.4 s) instead of `hir-ty` (29.8 s), and what is built on
+them starts on `hir-ty-mir`'s metadata 3.7 s in instead of `hir-ty`'s 15.6 s in. `hir-ty`
+alone compiles in 22.2 s instead of 29.2 s, so an edit of it is no slower even though
+`hir-ty-mir` now follows it. The rest of an edit's 40 s is the chain after the front end:
+`hir-ty-codegen` (20.4 s), `blaze-cargo` (17.7 s) and the engine (15.6 s), the latter two in
+series. `blaze-cargo` waits on the front end only for its `hir-ty-codegen`, `ide-db`,
+`blaze-lints` and `blaze-macro-wasm` edges (see (b)); with them cut, the engine could start
+when `ide-db` is done (15.1 s in) rather than on `blaze-cargo`'s metadata (23.4 s in), about
+8 s off every front-end edit (an estimate from these timings, not measured).

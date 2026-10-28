@@ -115,7 +115,7 @@ pub(crate) fn opaque_types_defined_by<'db>(
 // These are firewall queries to prevent drawing dependencies between infers:
 
 #[salsa::tracked(returns(ref))]
-pub(crate) fn rpit_hidden_types(
+pub fn rpit_hidden_types(
     db: &dyn HirDatabase,
     function: FunctionId,
 ) -> ArenaMap<ImplTraitIdx, StoredEarlyBinder<StoredTy>> {

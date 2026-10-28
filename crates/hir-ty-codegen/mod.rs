@@ -4280,10 +4280,11 @@ fn over_budget(
         GeneralConstId::AnonConstId(_) => None,
     };
     let mut what = name(of).unwrap_or_else(|| "a constant expression".to_owned());
-    let ConstEvalError::MirEvalError(mut e) = e else { return None };
+    let ConstEvalError::MirEvalError(e) = e else { return None };
+    let mut e: &MirEvalError<'_> = e;
     let (spent, at) = loop {
         match e {
-            MirEvalError::InFunction(inner, _) => e = inner,
+            MirEvalError::InFunction(inner, _) => e = &**inner,
             MirEvalError::ConstEvalError(inner, error) => {
                 let ConstEvalError::MirEvalError(inner_error) = &**error else { return None };
                 what = format!("`{inner}`");

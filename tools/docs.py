@@ -17,7 +17,7 @@ paths it names in backticks exist, and the BLAZE_* settings it names are in the 
 design not (fully) built, dated: its links and anchors resolve, but it may name paths still to come.
 A `record` (research, a report, a measurement) was true on its date and is never brought up to
 date: only the files it links have to exist. A `superseded` doc names what replaced it and is left
-out of the index. Outside docs/, every docs/...md that code or another document names exists.
+out of the index. Outside docs/, every doc under docs/ that code or another document names exists.
 """
 import os, re, subprocess, sys, unicodedata
 from dataclasses import dataclass
@@ -200,7 +200,7 @@ def check():
         if doc.front is None:
             continue
         status = doc.front.status
-        if status == "superseded":
+        if doc.front.superseded_by is not None:
             check_link(doc, doc.front.superseded_by, True, cache, errors)
         for target in links(doc.body):
             check_link(doc, target, status in ("current", "plan"), cache, errors)

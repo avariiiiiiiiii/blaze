@@ -218,7 +218,7 @@ fields): `current` (how blaze is now, kept true), `plan` (a design not fully bui
 `superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
 generated from it; superseded docs are left out. CI's `python3 tools/docs.py check` holds every
 doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
-against the tree, and every `docs/...md` that code names. A change that makes a current doc
+against the tree, and every doc that code names. A change that makes a current doc
 untrue fixes it in the same change, or marks it superseded; `python3 tools/docs.py write`
 regenerates the index.
 

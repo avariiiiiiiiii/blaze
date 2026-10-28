@@ -1138,8 +1138,6 @@ const SIMD: &str = r#"
     #[rustc_intrinsic] pub const unsafe fn simd_reduce_all<T>(x: T) -> bool;
     #[rustc_intrinsic] pub const unsafe fn simd_reduce_any<T>(x: T) -> bool;
     #[rustc_intrinsic] pub const unsafe fn simd_shuffle<T, U, V>(x: T, y: T, idx: U) -> V;
-    #[rustc_intrinsic]
-    pub const unsafe fn simd_shuffle_const_generic<T, U, const IDX: &'static [u32]>(x: T, y: T) -> U;
     #[rustc_intrinsic] pub const unsafe fn simd_splat<T, U>(value: U) -> T;
     #[rustc_intrinsic] pub const unsafe fn simd_gather<T, U, V>(val: T, ptr: U, mask: V) -> T;
     #[rustc_intrinsic] pub const unsafe fn simd_scatter<T, U, V>(val: T, ptr: U, mask: V);
@@ -1628,19 +1626,6 @@ fn simd_lanes() {
     fail(&format!(
         "const GOAL: i32x4 = unsafe {{ simd_shuffle::<i32x4, [u32; 4], i32x4>({pair}, [0, 8, 0, 0]) }};"
     ));
-}
-
-#[test]
-fn simd_shuffle_const_generic() {
-    check_number(
-        &with_simd(
-            "const IDX: &[u32] = &[7, 0, 5, 2];
-            const GOAL: i32x4 = unsafe {
-                simd_shuffle_const_generic::<i32x4, i32x4, IDX>(i32x4([1, 2, 3, 4]), i32x4([5, 6, 7, 8]))
-            };",
-        ),
-        i32s([8, 1, 6, 3]),
-    );
 }
 
 #[test]

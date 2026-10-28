@@ -61,7 +61,22 @@ function sitePath(): string {
 }
 
 const href = (path: string) => BASE + path.slice(1);
-const name = (w: Who) => (w.login ? `@${w.login}` : `anon ${w.key.slice(1, 5)}`);
+/** Words for anonymous readers' names: the same key is always the same "Quiet Otter", here and on every tab. */
+const ADJECTIVES = [
+	'Amber', 'Brave', 'Bright', 'Calm', 'Clever', 'Cosmic', 'Curious', 'Dapper', 'Eager', 'Fuzzy', 'Gentle', 'Golden',
+	'Happy', 'Jolly', 'Kind', 'Lucky', 'Merry', 'Mighty', 'Nimble', 'Quiet', 'Rapid', 'Rusty', 'Shiny', 'Sleepy',
+	'Snappy', 'Sunny', 'Swift', 'Tidy', 'Witty', 'Zesty', 'Plucky', 'Cozy',
+];
+const ANIMALS = [
+	'Otter', 'Fox', 'Panda', 'Koala', 'Falcon', 'Badger', 'Heron', 'Lynx', 'Moose', 'Owl', 'Penguin', 'Rabbit', 'Raven',
+	'Seal', 'Sparrow', 'Tiger', 'Turtle', 'Walrus', 'Whale', 'Wombat', 'Yak', 'Zebra', 'Crab', 'Gecko', 'Hedgehog',
+	'Lemur', 'Llama', 'Narwhal', 'Octopus', 'Puffin', 'Squid', 'Crane',
+];
+const anonName = (key: string) => {
+	const n = parseInt(key.slice(1, 7), 16) || 0;
+	return `${ADJECTIVES[n % ADJECTIVES.length]} ${ANIMALS[Math.floor(n / ADJECTIVES.length) % ANIMALS.length]}`;
+};
+const name = (w: Who) => (w.login ? `@${w.login}` : anonName(w.key));
 const awayOn = (p: Person, path: string) => p.pages.filter((x) => x.path === path).every((x) => x.away);
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''): HTMLElementTagNameMap[K] {

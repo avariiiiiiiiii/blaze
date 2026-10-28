@@ -266,9 +266,9 @@ def shipped_std(arm, runner, work):
 
 
 def fetch(name, spec, sources):
-    """The pinned checkout, fetched at its revision when it is not there."""
-    if name in bench.PROJECTS:
-        return bench.fetch(name, spec)
+    """The pinned checkout, fetched at its revision when it is not there. Not bench.py's
+    checkout: rival's uv, ruff and ty are pinned where Astral tests its fork, which bench.py's
+    are not, and their `tag` is no ref to clone."""
     source = os.path.join(sources, spec["repo"].replace("/", "-") + "-" + spec["rev"][:12])
     if not os.path.isdir(source):
         os.makedirs(source + ".part", exist_ok=True)

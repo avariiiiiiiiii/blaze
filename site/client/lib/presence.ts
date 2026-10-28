@@ -293,47 +293,59 @@ function drawList(): void {
 	const flip = cursors.toggle();
 	if (flip) head.append(flip);
 	list.replaceChildren(head);
+	// Here now first, then those with every tab in the background; you lead your group, the rest by who came first.
+	const active = (p: Person) => p.pages.some((x) => !x.away);
+	const order = (p: Person) => (active(p) ? 0 : 2) + (p.key === you?.key ? 0 : 1);
+	const sorted = [...people].sort((a, b) => order(a) - order(b) || (a.since ?? 0) - (b.since ?? 0));
 	const ul = el('ul');
-	for (const p of people) {
-		const li = el('li');
-		const who = p.login ? el('a', 'who', name(p)) : el('span', 'who', name(p));
+	let awayHead = false;
+	for (const p of sorted) {
+		const on = active(p);
+		if (!on && !awayHead && sorted.some(active)) {
+			ul.append(el('li', 'tl-sub', 'In the background'));
+			awayHead = true;
+		}
+		const li = el('li', on ? '' : 'away');
+		const av = el('span', 'tl-av');
+		const dot = el('span', on ? 'dot on' : 'dot');
+		tipOn(dot, on ? 'Here now' : 'Every tab in the background');
+		av.append(face(p, !on), dot);
+		// The name (a GitHub link for the signed in, without the @: the list is of people, not handles), then where they
+		// are and how long they have been here, on a quieter line.
+		const top = el('span', 'tl-name');
+		const who = p.login ? el('a', 'who', p.login) : el('span', 'who', name(p));
 		if (who instanceof HTMLAnchorElement) {
 			who.href = `https://github.com/${encodeURIComponent(p.login!)}`;
 			who.rel = 'nofollow noopener';
 		}
-		// The dot: green while a tab of theirs is in front of them, hollow while every one is in the background.
-		const active = p.pages.some((x) => !x.away);
-		const av = el('span', 'tl-av');
-		const dot = el('span', active ? 'dot on' : 'dot');
-		tipOn(dot, active ? 'Here now' : 'Tab in the background');
-		av.append(face(p, !active), dot);
-		li.append(av, who);
-		if (p.country) li.append(flag(p.country));
-		const dev = devices(p);
-		if (dev) li.append(dev);
-		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
-		// The page in front of them, the rest of their tabs as +N (named in its tooltip).
-		const where = el('span', 'where');
+		top.append(who);
+		if (p.key === you?.key) top.append(el('span', 'tag', 'you'));
+		if (p.country) top.append(flag(p.country));
+		const meta = el('span', 'tl-meta');
 		const [front, ...rest] = p.pages;
 		if (front) {
-			const a = el('a', front.away ? 'away' : '', titleOf(front.path));
+			const a = el('a', 'where', titleOf(front.path));
 			a.href = href(front.path);
-			where.append(a);
+			meta.append(a);
 		}
 		if (rest.length) {
 			const more = el('span', 'more', `+${rest.length}`);
 			tipOn(more, rest.map((x) => titleOf(x.path)).join(', '));
-			where.append(more);
+			meta.append(more);
 		}
-		li.append(where);
+		const dev = devices(p);
+		if (dev) meta.append(dev);
 		if (p.since) {
 			const t = el('span', 'for', ago(p.since));
 			tipOn(t, `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
-			li.append(t);
+			meta.append(t);
 		}
+		const body = el('span', 'tl-body');
+		body.append(top, meta);
+		li.append(av, body);
 		ul.append(li);
 	}
-	if (people.length < total) ul.append(el('li', 'tl-head', `and ${total - people.length} more`));
+	if (people.length < total) ul.append(el('li', 'tl-sub', `and ${total - people.length} more`));
 	list.append(ul);
 	const hint = cursors.hint();
 	if (hint) list.append(hint);

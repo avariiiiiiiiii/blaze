@@ -9,6 +9,7 @@
 //! people, never the wire.
 
 pub mod cbor;
+pub mod events;
 
 #[cfg(test)]
 mod tests;

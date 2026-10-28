@@ -210,6 +210,50 @@ fn a_message_is_these_bytes() {
     assert_eq!(from_slice::<Message<Record>>(&newer).unwrap().body.newer, Some(1));
 }
 
+/// A build's record is pinned the same way.
+#[test]
+fn an_event_is_these_bytes() {
+    use crate::events::{Cause, CrateState, Event, Fns, Record, Step};
+    let records = [
+        Record { at_ns: 0, event: Event::Started { step: Step::LoadWorkspace, of: None } },
+        Record {
+            at_ns: 38_300_000_000,
+            event: Event::Crate {
+                name: "anim".into(),
+                state: CrateState::Running,
+                fns: Fns { total: 5353, done: 12, kept: 2 },
+            },
+        },
+        Record {
+            at_ns: 210_000_000,
+            event: Event::Rebuilt {
+                name: "render".into(),
+                krate: "anim".into(),
+                cause: Cause::Body,
+            },
+        },
+    ];
+    let hexes: Vec<String> = records.iter().map(|it| hex(&to_vec(it).unwrap())).collect();
+    let expected = [
+        // {"at_ns": 0, "event": {"Started": {"of": null, "step": "LoadWorkspace"}}}
+        "a2 6561745f6e73 00 656576656e74 a1 6753746172746564 a2 626f66 f6 6473746570 \
+         6d 4c6f6164576f726b7370616365",
+        // {"at_ns": 38300000000, "event": {"Crate": {"fns": {"done": 12, "kept": 2,
+        // "total": 5353}, "name": "anim", "state": "Running"}}}
+        "a2 6561745f6e73 1b00000008eadb9f00 656576656e74 a1 654372617465 a3 63666e73 a3 \
+         64646f6e65 0c 646b657074 02 65746f74616c 1914e9 646e616d65 64616e696d \
+         657374617465 6752756e6e696e67",
+        // {"at_ns": 210000000, "event": {"Rebuilt": {"name": "render", "cause": "Body",
+        // "krate": "anim"}}}
+        "a2 6561745f6e73 1a0c845880 656576656e74 a1 6752656275696c74 a3 646e616d65 \
+         6672656e646572 656361757365 64426f6479 656b72617465 64616e696d",
+    ];
+    for ((hexed, expected), record) in hexes.iter().zip(expected).zip(&records) {
+        assert_eq!(hexed, &expected.replace(' ', ""), "{record:?}");
+        assert_eq!(&from_slice::<Record>(&to_vec(record).unwrap()).unwrap(), record);
+    }
+}
+
 #[test]
 fn what_is_not_deterministic_is_refused() {
     refused("1817", "an argument in more bytes than it needs");

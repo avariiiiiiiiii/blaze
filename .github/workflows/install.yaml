@@ -66,7 +66,7 @@ jobs:
           # A release from before blaze had its own Rust has rustup install the pinned nightly instead.
           tc=$(cat harness/toolchain)
           if [ -x "$CARGO_HOME/bin/blaze" ]; then
-            blaze toolchain | tee /dev/stderr | grep -F "blaze builds with Rust $(cat harness/toolchain)"
+            blaze toolchain | tee /dev/stderr | grep -F "blaze's toolchain (Rust $tc)"
           else
             rustup run "$tc" rustc --version
             rustup component list --toolchain "$tc" --installed | grep -q '^rust-src'

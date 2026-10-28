@@ -7024,6 +7024,7 @@
     "crates/blaze-wasm",
     "demo",
     "harness",
+    "library",
     "vendor/proc-macro-srv",
     "crates/proc-macro-srv/proc-macro-test/imp"
    ],

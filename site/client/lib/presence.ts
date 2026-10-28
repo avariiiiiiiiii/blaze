@@ -32,6 +32,9 @@ type Person = Who & { country: string | null; since?: number; pages: { path: str
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
+/** The close code of a tab pushed out by a newer one (worker/presence.ts). */
+const TOO_MANY_TABS = 4001;
+let pushedOut = false;
 const BASE = (() => {
 	const css = document.querySelector<HTMLLinkElement>('link[rel="stylesheet"][href$="site.css"]');
 	return css ? new URL('.', css.href).pathname : '/';
@@ -423,9 +426,11 @@ function connect(): void {
 		} else return;
 		draw();
 	});
-	s.addEventListener('close', () => {
+	s.addEventListener('close', (e) => {
 		if (ws !== s) return;
 		ws = null;
+		// A newer tab of the same person's took this one's place (worker/presence.ts MAX_TABS): back when shown again.
+		if (e.code === TOO_MANY_TABS) return void (pushedOut = true);
 		// Back off up to a minute; a page that came back from the bfcache reconnects on pageshow.
 		setTimeout(connect, retry + Math.random() * 500);
 		retry = Math.min(retry * 2, 60_000);
@@ -440,7 +445,11 @@ addEventListener('pagehide', () => {
 addEventListener('pageshow', (e) => {
 	if (e.persisted && !ws) connect();
 });
-document.addEventListener('visibilitychange', send);
+document.addEventListener('visibilitychange', () => {
+	if (!pushedOut || document.hidden) return send();
+	pushedOut = false;
+	connect();
+});
 addEventListener(PAGE, send);
 addEventListener(THREADS, drawDiscuss);
 document.addEventListener('keydown', (e) => {

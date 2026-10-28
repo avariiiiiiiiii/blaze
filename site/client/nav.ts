@@ -130,7 +130,10 @@ function fits(doc: Document): boolean {
 	if (rows(doc) !== rows(document)) return false;
 	const sheets = (d: Document) => [...d.querySelectorAll('link[rel="stylesheet"]')].map((l) => l.getAttribute('href')).join('\n');
 	if (sheets(doc) !== sheets(document)) return false;
-	return [...doc.querySelectorAll('script[src]')].every((s) => new URL(s.getAttribute('src')!, location.href).origin === location.origin);
+	// A script from elsewhere that this page doesn't have would need a load to run. One both have, like the analytics
+	// beacon Cloudflare adds to every page, is not a different frame.
+	const have = new Set([...document.querySelectorAll('script[src]')].map((s) => s.getAttribute('src')));
+	return [...doc.querySelectorAll('script[src]')].every((s) => have.has(s.getAttribute('src')) || new URL(s.getAttribute('src')!, location.href).origin === location.origin);
 }
 
 function saveScroll() {

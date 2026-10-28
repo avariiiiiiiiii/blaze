@@ -84,6 +84,10 @@ fn pinned_elsewhere(engine: &Path, args: &[OsString]) -> Option<ExitCode> {
             )));
         }
     }
+    // A release from before pins says only its version.
+    if matches!(text.as_slice(), [it] if it == "--version" || it == "-V") {
+        println!("blaze {} runs blaze {wanted} here, as {shown} pins it:", pin::OURS);
+    }
     let mut command = Command::new(&pinned);
     command.args(args).env(pin::PINNED_BY, &manifest);
     Some(ended(&mut command, &pinned))

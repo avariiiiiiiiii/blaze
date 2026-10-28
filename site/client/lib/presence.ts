@@ -277,13 +277,15 @@ const bubbles = new Map<string, HTMLElement>();
 function speak(key: string, login: string, text: string): void {
 	bubbles.get(key)?.remove();
 	const p = people.find((x) => x.key === key);
-	let at: Element | null = document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
-	if (!at && p) {
-		for (const pg of p.pages) {
-			at = document.querySelector(`.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`);
-			if (at) break;
-		}
+	// The page they are looking at first, then any other tab of theirs.
+	let at: Element | null = null;
+	const pages = p ? [...p.pages].sort((a, b) => Number(a.away) - Number(b.away)) : [];
+	for (const pg of pages) {
+		const row = `.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`;
+		at = document.querySelector(`${row} > .face[data-key="${CSS.escape(key)}"]`) ?? document.querySelector(row);
+		if (at) break;
 	}
+	at ??= document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
 	const r = at?.getBoundingClientRect();
 	if (!at || !r || r.width === 0 || r.bottom < 0 || r.top > innerHeight) return;
 	const b = el('div', 'say-bubble');

@@ -18,7 +18,10 @@ tools/agents/rules.ts --write`). Skills: .agents/skills/.
 4. **superset-of-rust**: Own every layer from source to running code, never by narrowing what blaze
    accepts: every program the pinned nightly builds must build and behave the same under blaze, with
    the real std, C dependencies, build scripts and proc macros. The one allowed difference is
-   sandboxing. See [docs/no-rustc.md](docs/no-rustc.md).
+   sandboxing. Superset means blaze may also accept more than Rust: an extension (new syntax,
+   attributes, semantics) only has to work under blaze, never under rustc, as long as it is opt-in
+   and every program that doesn't use it behaves exactly as under rustc. See
+   [docs/no-rustc.md](docs/no-rustc.md).
 5. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
    (`harness/toolchain`, bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN`
    and `RUSTC`. Projects pin the blaze version, not Rust's. See
@@ -77,7 +80,9 @@ maintainer's approval; they replace neither.
   built by the pinned nightly rustc (`harness/toolchain`): layout, ABI, drop order, overflow and
   panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking.
   Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference
-  is sandboxing build scripts and proc macros.
+  is sandboxing build scripts and proc macros. Code that opts into a blaze extension is exempt: it
+  need not build under rustc, but enabling the extension must not change any program that doesn't
+  use it.
 - Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or
   cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower
   backend, an older cached result). Safe path: stop with an error that names what and where.

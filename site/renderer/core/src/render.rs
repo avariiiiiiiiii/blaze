@@ -933,6 +933,11 @@ pub fn render(
         heads.push(("references".into(), "References".into()));
     }
     let toc = if n.has_tag("Wide") { String::new() } else { crate::side::toc(&heads) };
+    // The square icon (docs/brand/fire/icon.py); the dark one carries its own background, so it reads on any tab bar.
+    // The .ico and the 180px PNG for browsers and home screens that take no SVG.
+    let icon = esc(&s.served.href("/brand/blaze-icon-dark.svg"));
+    let ico = esc(&s.served.href("/brand/favicon.ico"));
+    let touch = esc(&s.served.href("/brand/blaze-icon-dark-180.png"));
     let html = format!(
         "<!doctype html>
 <html lang=\"en\">
@@ -941,6 +946,9 @@ pub fn render(
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 <meta name=\"color-scheme\" content=\"dark light\" />
 <title>{}</title>
+<link rel=\"icon\" href=\"{ico}\" sizes=\"32x32\" />
+<link rel=\"icon\" type=\"image/svg+xml\" href=\"{icon}\" />
+<link rel=\"apple-touch-icon\" href=\"{touch}\" />
 {description}
 {canonical}
 <link rel=\"stylesheet\" href=\"{css}\" />

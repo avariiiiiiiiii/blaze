@@ -113,13 +113,19 @@ function hidden(): boolean {
 
 // ---- Where things are -------------------------------------------------------------------------------------------
 
+/**
+ * How far down the page the window shows (document px), as drawn: during a rubber-band bounce `scrollY` stays put (or
+ * goes past the ends, in Safari) while the page moves, so positions measured or placed against it would be off.
+ */
+const pageTop = () => -document.documentElement.getBoundingClientRect().top;
+
 /** Each block's top (document px) and height, -1 for one not shown (in a shut `<details>`). Dropped when it moves. */
 let blocks: { top: number; h: number }[] | null = null;
 
 function layout(): { top: number; h: number }[] {
 	if (blocks) return blocks;
 	const main = document.querySelector('main');
-	const sy = scrollY;
+	const sy = pageTop();
 	blocks = main
 		? [...main.querySelectorAll<HTMLElement>(BLOCKS)]
 				.filter((e) => !e.closest('.c-thread'))
@@ -160,7 +166,7 @@ function sendCursor(): void {
 	cTimer = undefined;
 	let c: number[] | null = null;
 	const main = document.querySelector('main');
-	const a = pointer && !document.hidden && main ? anchor(pointer.y + scrollY) : null;
+	const a = pointer && !document.hidden && main ? anchor(pointer.y + pageTop()) : null;
 	if (pointer && main && a) {
 		const r = main.getBoundingClientRect();
 		c = [round(clampFrac((pointer.x - r.left) / (r.width || 1))), ...a];
@@ -177,8 +183,9 @@ function queueCursor(): void {
 
 function sendView(): void {
 	vTimer = undefined;
-	const top = anchor(scrollY);
-	const bottom = anchor(scrollY + innerHeight);
+	const y = pageTop();
+	const top = anchor(y);
+	const bottom = anchor(y + innerHeight);
 	const v = top && bottom ? [...top, ...bottom] : null;
 	const s = JSON.stringify(v);
 	if (s === sentV) return;
@@ -465,7 +472,8 @@ function placeSay(r: Remote): void {
 		return;
 	}
 	const to = r.to;
-	if (r.el && to && !r.el.classList.contains('idle') && to.y > scrollY && to.y < scrollY + innerHeight - 40) {
+	const y = pageTop();
+	if (r.el && to && !r.el.classList.contains('idle') && to.y > y && to.y < y + innerHeight - 40) {
 		b.classList.remove('on-rail');
 		// Near the right edge it opens to the left of the pointer, so the page's clip never cuts it.
 		b.classList.toggle('flip', to.x - scrollX > innerWidth - 300);
@@ -520,11 +528,13 @@ function queueSay(): void {
  */
 function placeBox(): void {
 	if (sayBox.hidden) return;
-	if (saying) sayAt = pointer ? { x: pointer.x + scrollX, y: pointer.y + scrollY } : sayAt;
+	const y = pageTop();
+	if (saying) sayAt = pointer ? { x: pointer.x + scrollX, y: pointer.y + y } : sayAt;
 	sayBox.classList.toggle('at-foot', !sayAt);
 	if (!sayAt) return void (sayBox.style.left = sayBox.style.top = '');
-	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x - scrollX + 14)))}px`;
-	sayBox.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, sayAt.y - scrollY + 18)))}px`;
+	sayBox.style.left = `${Math.round(scrollX + Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x - scrollX + 14)))}px`;
+	// On the page (absolute), so a bounce moves it with the text; kept inside the window as it was when placed.
+	sayBox.style.top = `${Math.round(y + Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, sayAt.y - y + 18)))}px`;
 }
 
 function openSay(): void {

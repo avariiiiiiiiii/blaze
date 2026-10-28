@@ -682,8 +682,8 @@ pub(crate) fn headerpad_again(cmd: &str) -> std::io::Result<()> {
             Some(_) => {}
             None => {
                 let words = std::fs::read_to_string(file).ok().and_then(|it| shlex::split(&it));
-                let pads = words.into_iter().flatten().filter_map(|it| headerpad_in(&it));
-                asked = pads.last().or(asked);
+                let mut pads = words.into_iter().flatten().filter_map(|it| headerpad_in(&it));
+                asked = pads.next_back().or(asked);
             }
         }
     }
@@ -926,7 +926,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ra-jit-plan-again-{}", std::process::id()));
         let (response, binary) = (dir.join("link.args"), dir.join("whole").join("bin"));
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        let line = r#""cc" "/t/a.1.rcgu.o" "-arch" "arm64" "-o" "/t/a-1" "-Wl,-headerpad,0x800000""#;
+        let line = r#""cc" "/t/a.rlib" "-arch" "arm64" "-o" "/t/a-1" "-Wl,-headerpad,0x800000""#;
         let command = LinkLine::parse(line).unwrap().command(&[], &binary, &response).unwrap();
         std::fs::remove_file(headerpad_file(&binary)).unwrap();
         headerpad_again(&command).unwrap();

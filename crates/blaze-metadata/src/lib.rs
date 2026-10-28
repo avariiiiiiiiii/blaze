@@ -10,7 +10,8 @@
 //! A registry package the lock file does not pin is chosen from the registry's index, as
 //! cargo chooses it, and a lock file that is missing or that the manifests no longer agree
 //! with is written again, as cargo writes it. What it does not do yet is an error: a git or
-//! vendored-directory package the lock file does not pin, a registry with a git index, and a dependency of a registry package whose `.crate` cannot be fetched.
+//! vendored-directory package the lock file does not pin, a registry with a git index, and a
+//! dependency of a registry package whose `.crate` cannot be fetched.
 
 mod graph;
 mod summary;

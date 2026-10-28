@@ -3,17 +3,21 @@
  * client router's swaps (client/nav.ts). One WebSocket per tab tells the site which page the tab shows and whether it
  * is hidden; what comes back is everyone on the site, drawn three places:
  *
- * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it): the page's discussion
+ * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
+ *   phone bar instead): the page's discussion
  *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
  *   and where), and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
  * - the sidebar: a small stack of faces on each page's row that someone else is reading;
- * - nothing else changes: without JS, or with the socket down, the page is as it was.
+ * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
+ *   threads of that doc if it is the page shown.
+ *
+ * Without JS, or with the socket down, the page is as it was.
  *
  * Signed-in people are their GitHub avatar; anonymous ones a GitHub-style identicon of the key the worker gives them
  * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
  */
 
-import { PAGE, onPage } from './page';
+import { COMMENTS, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
 type Person = Who & { pages: { path: string; away: boolean }[] };
@@ -111,29 +115,39 @@ bar.setAttribute('aria-label', 'Discussion and who is here');
 const discussSlot = el('span', 'tl-discuss');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-bar.append(discussSlot, hereSlot, meSlot);
+bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
+bar.append(list);
+const phone = matchMedia('(max-width: 800px)');
 
+/** In the pane above the page, or on a phone in the phone bar, before its search button. */
 function mount(): void {
+	const mbar = document.querySelector('.mbar');
 	const pane = document.querySelector('.pane');
-	if (!pane || bar.isConnected) return;
-	const grid = pane.querySelector(':scope > .grid');
-	pane.insertBefore(bar, grid);
-	bar.after(list);
+	if (phone.matches && mbar) {
+		if (bar.parentElement !== mbar) mbar.insertBefore(bar, mbar.querySelector('.msearch'));
+	} else if (pane && bar.parentElement !== pane) pane.insertBefore(bar, pane.querySelector(':scope > .grid'));
+}
+phone.addEventListener('change', mount);
+
+function closeList(): void {
+	if (list.hidden) return;
+	list.hidden = true;
+	hereSlot.querySelector('button')?.setAttribute('aria-expanded', 'false');
 }
 
 /** The page's discussion: its comments, counted from the threads the page was rendered with. */
 function drawDiscuss(): void {
 	discussSlot.replaceChildren();
-	const section = document.querySelector<HTMLElement>('main .discussion');
-	if (!section) return;
-	section.id ||= 'discussion';
+	if (!document.querySelector('main #discussion')) return;
 	const n = document.querySelectorAll('main .c-item').length;
 	const a = el('a', 'tl-btn');
 	a.href = '#discussion';
-	a.append(el('span', 'tl-bubble'), el('span', '', n === 0 ? 'Discuss' : n === 1 ? '1 comment' : `${n} comments`));
+	a.title = n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`;
+	a.append(el('span', 'tl-bubble'), el('span', 'tl-label', n === 0 ? 'Discuss' : n === 1 ? 'comment' : 'comments'));
+	if (n > 0) a.insertBefore(el('span', 'tl-n', String(n)), a.lastChild);
 	discussSlot.append(a);
 }
 
@@ -148,9 +162,11 @@ function drawHere(): void {
 	b.setAttribute('aria-controls', list.id);
 	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
 	b.title = `${on.length} on this page, ${total} on the site`;
-	b.addEventListener('click', () => {
-		list.hidden = !list.hidden;
-		b.setAttribute('aria-expanded', String(!list.hidden));
+	b.addEventListener('click', (e) => {
+		e.stopPropagation();
+		if (!list.hidden) return closeList();
+		list.hidden = false;
+		b.setAttribute('aria-expanded', 'true');
 		drawList();
 	});
 	hereSlot.append(b);
@@ -187,6 +203,7 @@ function drawMe(): void {
 	if (!you) return;
 	if (you.login) {
 		const a = el('a', 'tl-btn tl-user');
+		a.setAttribute('aria-label', `Signed in as ${you.login}`);
 		a.href = `https://github.com/${encodeURIComponent(you.login)}`;
 		a.rel = 'noopener';
 		a.title = 'Your GitHub profile';
@@ -203,7 +220,9 @@ function drawMe(): void {
 		form.append(next, out);
 		meSlot.append(a, form);
 	} else if (you.signIn) {
-		const a = el('a', 'tl-btn tl-signin', 'Sign in with GitHub');
+		const a = el('a', 'tl-btn tl-signin');
+		a.append(el('span', 'tl-label', 'Sign in with GitHub'));
+		a.setAttribute('aria-label', 'Sign in with GitHub');
 		a.href = `${BASE}auth/github?next=${encodeURIComponent(sitePath() + location.hash)}`;
 		a.prepend(githubMark());
 		meSlot.append(a);
@@ -281,6 +300,11 @@ function connect(): void {
 		}
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
+		if (msg.t === 'comments') {
+			const doc = (m as { doc?: unknown }).doc;
+			if (typeof doc === 'string') dispatchEvent(new CustomEvent(COMMENTS, { detail: doc }));
+			return;
+		}
 		if (msg.t === 'you') you = m as You;
 		else if (msg.t === 'here') {
 			const h = m as { people?: Person[]; total?: number };
@@ -308,14 +332,16 @@ addEventListener('pageshow', (e) => {
 });
 document.addEventListener('visibilitychange', send);
 addEventListener(PAGE, send);
+addEventListener(THREADS, drawDiscuss);
 document.addEventListener('keydown', (e) => {
-	if (e.key === 'Escape' && !list.hidden) {
-		list.hidden = true;
-		drawHere();
-	}
+	if (e.key === 'Escape') closeList();
+});
+document.addEventListener('click', (e) => {
+	if (!(e.target instanceof Node && list.contains(e.target))) closeList();
 });
 
 onPage(() => {
+	closeList();
 	draw();
 });
 connect();

@@ -21,9 +21,11 @@ on:
         description: rounds of replay's typing
         default: "1"
 
+# A newer push to the branch cancels the run before it; the nightly run and a run by hand are
+# never cancelled.
 concurrency:
-  group: live-latency-${{ github.ref }}
-  cancel-in-progress: true
+  group: live-latency-${{ github.event_name }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_INCREMENTAL: 0
@@ -49,9 +51,9 @@ jobs:
         with:
           submodules: true
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: live-debug
+      # cargo, with no cache: the latency timed is of blaze as rustc compiles it, since the blaze
+      # that blaze builds runs about ten times slower until it inlines one function into another
+      # (https://github.com/indexable-inc/blaze/issues/899).
       - run: cargo build --release -p blaze-engine
       - name: time edits of a running program
         env:

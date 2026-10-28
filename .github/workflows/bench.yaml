@@ -13,9 +13,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # As blaze.yaml: a pull request's newer push cancels its run, every push to main finishes.
-  group: bench-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A newer push to main or to the pull request cancels the run before it; a run by hand is
+  # never cancelled.
+  group: bench-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: 0
@@ -39,9 +40,8 @@ jobs:
         with:
           fetch-depth: 0
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: bench
+      # cargo, with no cache: blaze has no `bench` and leaves --message-format to cargo, and what
+      # is timed is the store as rustc compiles it, which is how a release ships (build_release.py).
       # The base first, in the same checkout, so that the change's build reuses whatever of
       # it the change did not touch. A base without the benchmarks has nothing to pair with.
       - name: Build the base

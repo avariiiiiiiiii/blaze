@@ -10,9 +10,10 @@ on:
         description: how many edits the running program takes
         default: "5"
 
+# A newer push to the branch cancels the run before it; a run by hand is never cancelled.
 concurrency:
-  group: live-debug-${{ github.ref }}
-  cancel-in-progress: true
+  group: live-debug-${{ github.event_name }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_INCREMENTAL: 0
@@ -26,9 +27,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: live-debug
+      # cargo, with no cache: this debugs blaze as rustc compiles it, since the blaze that blaze
+      # builds runs about ten times slower until it inlines one function into another
+      # (https://github.com/indexable-inc/blaze/issues/899).
       - run: cargo build --release -p blaze-engine
       - name: edit a running program, edit after edit
         env:

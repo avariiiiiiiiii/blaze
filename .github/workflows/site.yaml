@@ -27,9 +27,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to main (a newer deploy) or to the pull request cancels the run before it; a run
+# by hand is never cancelled.
 concurrency:
-  group: site-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
-  cancel-in-progress: true
+  group: site-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   site:
@@ -47,10 +49,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown wasm32-wasip2
           components: clippy rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: site/renderer
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The renderer builds with cargo, and no cache, until blaze builds the renderer: what ships
+      # is its own Rust release's wasm32 with LTO at opt-level z, and blaze's wasm32 modules are
+      # still many times rustc's size (docs/platforms.md, "wasm32").
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: wasm-opt (binaryen)
         env:

@@ -28,6 +28,10 @@ on:
         description: the run-pass tests of rustc's in harness/ui-pinned.txt, against this build
         type: boolean
         default: false
+      consteval:
+        description: rustc's tests/ui/consts and const-generics, against this build's const evaluator
+        type: boolean
+        default: false
       blaze-cli:
         description: "`blaze` against cargo on small projects at pinned commits"
         type: boolean
@@ -322,6 +326,41 @@ jobs:
           print(sys.argv[2], *bad, lines[-1] if lines else "no output", sep="\n")
           sys.exit(bool(bad) or not lines or "files" not in lines[-1])' "$RUNNER_TEMP/$crate.json" $crate
           done
+
+  # The const evaluator against rustc's tests/ui/consts and const-generics (docs/harness.md),
+  # at the commit of the pinned toolchain, with floors under the units and run-pass tests that
+  # match. Its summary lists every difference.
+  consteval:
+    name: consteval
+    if: inputs.consteval
+    needs: build
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release
+      - run: tar -xf blaze.tar
+        working-directory: target/release
+      - uses: ./.github/actions/rust-tests
+      - run: |
+          python3 harness/consteval_ui.py "$(python3 -c 'import json, os, sys
+          tmp = os.environ["RUNNER_TEMP"]
+          print(json.dumps({"rust": f"{tmp}/rust", "bin": "target/release/blaze-engine", "jobs": 4,
+                            "work": f"{tmp}/consteval", "out": f"{tmp}/consteval-out",
+                            "min_evaluation": 0, "min_run_pass": 0}))')" || status=$?
+          cat "$RUNNER_TEMP/consteval-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+          exit "${status:-0}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: consteval-${{ inputs.platform }}
+          path: ${{ runner.temp }}/consteval-out
 
   # The few run-pass tests of rustc's that claims.yaml's full run, or a run on another
   # platform, once caught blaze failing (harness/ui-pinned.txt), from the tests of the pinned

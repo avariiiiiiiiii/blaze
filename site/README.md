@@ -43,7 +43,7 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
   next.
 
-The flecs skill (`.claude/skills/flecs/`) has the script syntax and its traps.
+The flecs skill (`.agents/skills/flecs/`) has the script syntax and its traps.
 
 ### The wasm modules: build outputs, fetched
 

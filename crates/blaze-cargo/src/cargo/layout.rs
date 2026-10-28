@@ -57,6 +57,30 @@ fn chosen(
     !matches!(configured, Ok(None))
 }
 
+/// The file cargo marks a target or build directory with, and what is in it.
+pub const CACHE_TAG: &str = "CACHEDIR.TAG";
+const CACHE_TAG_TEXT: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+     # This file is a cache directory tag created by cargo.\n\
+     # For information about cache directory tags see https://bford.info/cachedir/\n";
+
+/// Makes `dir` with cargo's [`CACHE_TAG`] in it, as cargo makes a target or build directory
+/// (its `Layout::new`). What looks for what a build wrote by the tag finds it: a build
+/// script's package without `rerun-if-changed`, whose files are all of the package but those,
+/// the sandbox of a test, the store, `blaze clean`.
+pub fn make_tagged(dir: &Path) {
+    let tag = dir.join(CACHE_TAG);
+    if tag.is_file() {
+        return;
+    }
+    let written = tag.with_extension(format!("{}.partial", std::process::id()));
+    let made = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&written, CACHE_TAG_TEXT))
+        .and_then(|()| std::fs::rename(&written, &tag));
+    if made.is_err() {
+        _ = std::fs::remove_file(&written);
+    }
+}
+
 /// The directories of a profile that cargo has rustc write to in the first layout.
 const FIRST: [&str; 4] = ["deps", "examples", "build", ".fingerprint"];
 

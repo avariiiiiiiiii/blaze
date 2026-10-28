@@ -53,9 +53,6 @@ OPEN_BLAZE = {
     # https://github.com/indexable-inc/blaze/issues/893
     "blaze_engine::remote::gateway::tests::what_is_over_a_put_goes_up_in_parts_checked_whole",
 }
-# Skipped on a blaze run: it overflows its stack, which aborts its whole test binary
-# (https://github.com/indexable-inc/blaze/issues/894).
-SKIP_BLAZE = ["handlers::borrowck::tests::a_5204_arm_else_if_chain_is_diagnosed_in_linear_time"]
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 # A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and
@@ -92,10 +89,14 @@ def main():
     args = args[plain:]
     command = [*(["cargo"] if plain else ["blaze"]), "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *args]
     open_ = OPEN if plain else OPEN | OPEN_BLAZE
-    if not plain:
-        command += [*([] if "--" in args else ["--"]), *(f"--skip={t}" for t in SKIP_BLAZE)]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
+    # blaze's frames are larger than rustc's, and ide-diagnostics' 5204-arm test overflows the
+    # 2 MiB a test thread has, which aborts its whole program
+    # (https://github.com/indexable-inc/blaze/issues/894). Not a `--skip`: an argument to the
+    # tests has blaze run every test, not those an edit reached.
+    if not plain:
+        env.setdefault("RUST_MIN_STACK", str(16 << 20))
     seen, failed = set(), set()
     status, any_failed = run(command, ROOT, env, seen, failed)
     sys.stdout.flush()

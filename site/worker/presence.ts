@@ -15,9 +15,11 @@
  *                     {t: "comments", doc}                      a comment on that doc was posted or deleted
  *                     {t: "chat", messages: [Msg]}              the chat's last CHAT_SHOWN messages, once, on connect
  *                     {t: "msg", m: Msg} / {t: "unsay", id}     a chat message said, or taken back
+ *                     {t: "typing", key, login, avatar}           someone signed in is writing (at most every TYPING_MS)
  *                     {t: "error", text}                        why the tab's last chat message was refused
  *   client -> server  {t: "at", path, away}                       the page the tab shows (a site path) and whether
  *                                                                  it is hidden; unknown paths count as no page
+ *                     {t: "typing"}                            chat: the reader is writing a message
  *                     {t: "say", text} / {t: "unsay", id}       chat: signed-in readers only; taking back is for
  *                                                                  the author or a COMMENT_ADMINS id
  *
@@ -45,6 +47,7 @@ const CHAT_KEPT = 500;
 const RATE_SHORT = 5;
 const RATE_LONG = 120;
 const MAX_PEOPLE = 300;
+const TYPING_MS = 2000;
 
 type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean };
 type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string };
@@ -89,6 +92,8 @@ export class Presence extends DurableObject<Env> {
 	private salt: { day: string; key: CryptoKey } | null = null;
 	/** Each talker's recent message times (ms), for the rate limit. Lost on hibernation, which only forgives. */
 	private said = new Map<string, number[]>();
+	/** When each person last said they were typing (not kept: a lost one only drops an indicator). */
+	private typed = new Map<string, number>();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -129,6 +134,12 @@ export class Presence extends DurableObject<Env> {
 			return ws.close(1003, 'Not JSON.');
 		}
 		const tab = ws.deserializeAttachment() as Tab;
+		if (m.t === 'typing') {
+			const now = Date.now();
+			if (!tab.login || now - (this.typed.get(tab.key) ?? 0) < TYPING_MS) return;
+			this.typed.set(tab.key, now);
+			return this.broadcast(JSON.stringify({ t: 'typing', key: tab.key, login: tab.login, avatar: tab.avatar }));
+		}
 		if (m.t === 'say') return this.say(ws, tab, m.text);
 		if (m.t === 'unsay') return this.unsay(ws, tab, m.id);
 		if (m.t !== 'at') return;
@@ -162,6 +173,7 @@ export class Presence extends DurableObject<Env> {
 		if (times.filter((t) => now - t < 15_000).length >= RATE_SHORT || times.length >= RATE_LONG) return refuse('Slow down a little.');
 		times.push(now);
 		this.said.set(tab.key, times);
+		this.typed.delete(tab.key);
 		const at = new Date(now).toISOString();
 		const row = this.ctx.storage.sql
 			.exec<{ id: number }>('INSERT INTO chat (key, login, avatar, text, at) VALUES (?, ?, ?, ?, ?) RETURNING id', tab.key, tab.login, tab.avatar, text, at)

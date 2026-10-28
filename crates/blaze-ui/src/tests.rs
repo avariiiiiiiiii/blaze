@@ -400,6 +400,11 @@ fn a_long_build_says_what_held_it_up_and_time_no_step_named() {
             "             `blaze why` says more",
         ]
     );
+    // `blaze why` lists every step, and the time at no step between them.
+    assert_eq!(
+        live.build().why_steps(4 * S),
+        ["names 2/5 crates   2.00s", "at no step         1.50s", "link               0.50s"]
+    );
 }
 
 /// How busy the worker's cores were shows as it goes, the last ten seconds a block each half
@@ -432,11 +437,9 @@ fn the_cores_kept_busy_show_as_it_goes_and_at_the_end() {
     ];
     let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
     assert!(drawn.contains("Took 4.00s: std 4.00s (2.7/8 cores)"), "{drawn:?}");
+    assert_eq!(live.build().why_steps(4 * S), ["std   4.00s  2.7/8 cores"]);
 }
 
-/// The lines that stay are those before the region: the region is its header, the steps,
-/// the crates under way and the count of those done. A test of the renderer's own text, with
-/// no color.
 /// The functions done of a crate whose total is not known yet count in no `done/total`, which
 /// would read more done than there are.
 #[test]
@@ -454,6 +457,9 @@ fn functions_with_a_total_unknown_are_a_count() {
     assert!(!drawn.contains("/5353 fns\n"), "{drawn}");
 }
 
+/// The lines that stay are those before the region: the region is its header, the steps,
+/// the crates under way and the count of those done. A test of the renderer's own text, with
+/// no color.
 fn region_len(lines: &[&str]) -> usize {
     let header = lines.iter().rposition(|it| it.starts_with("blaze "));
     header.map_or(0, |at| lines.len() - at)

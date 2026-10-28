@@ -71,22 +71,12 @@ const LISTED: usize = 12;
 /// longest chain of crates waiting for each other, and the crates that compiled the most.
 fn explained(build: &blaze_ui::Build, took: u64) -> String {
     let mut out = String::new();
-    let steps: Vec<String> = build
-        .steps
-        .iter()
-        .map(|it| {
-            let took_ns = it.ended_ns.unwrap_or(took).saturating_sub(it.began_ns);
-            let count = it.count().map(|it| format!(" ({it})")).unwrap_or_default();
-            format!(
-                "{} {}{count} {}",
-                it.step.word().to_lowercase(),
-                it.what(),
-                blaze_ui::took(took_ns)
-            )
-        })
-        .collect();
+    let steps = build.why_steps(took);
     if !steps.is_empty() {
-        out.push_str(&format!("  steps: {}\n", steps.join(", ")));
+        out.push_str("  steps:\n");
+        for step in steps {
+            out.push_str(&format!("    {step}\n"));
+        }
     }
     if let Some(cache) = &build.cache {
         let said = match &cache.cold {
@@ -97,10 +87,11 @@ fn explained(build: &blaze_ui::Build, took: u64) -> String {
     }
     let (chain, chain_ns) = build.critical_path(took);
     if chain.len() > 1 {
-        let names: Vec<&str> = chain.iter().map(|&it| build.crates[it].name.as_str()).collect();
+        let names: Vec<&str> =
+            chain.iter().rev().map(|&it| build.crates[it].name.as_str()).collect();
         out.push_str(&format!(
             "  longest chain: {} {}\n",
-            names.join(" <- "),
+            names.join(" \u{2192} "),
             blaze_ui::took(chain_ns)
         ));
     }

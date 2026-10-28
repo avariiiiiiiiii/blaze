@@ -16,7 +16,10 @@ Changes, each marked `blaze:` in src/backend.rs:
    object keeps a section of its own where `per_data_object_section` or `#[used]` asks for one,
    as `add_subsection` does for the standard sections, since there the section is what the
    linker keeps or drops and what `SHF_GNU_RETAIN` is on. Mach-O objects go by symbols
-   (`MH_SUBSECTIONS_VIA_SYMBOLS`, `N_NO_DEAD_STRIP`), so there they always share.
+   (`MH_SUBSECTIONS_VIA_SYMBOLS`, `N_NO_DEAD_STRIP`), so there they always share. A COFF
+   object keeps upstream's section for each: a COFF symbol has no size, so the section is what
+   says how large a static is (`Target::section_of_static`, read by the PE splice's `rooms`);
+   shared, a static read as reaching the next one, alignment padding and all.
 2. A zero-initialized data object in a custom section is written as zeros: the section is not
    one of uninitialized data, and another data object may follow it there.
 3. `used` marks a Mach-O symbol `N_NO_DEAD_STRIP` after the symbol is defined. Upstream did it

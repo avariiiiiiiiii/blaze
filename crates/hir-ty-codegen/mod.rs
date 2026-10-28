@@ -19515,4 +19515,29 @@ mod tests {
         assert_eq!(sections(true, false), ((count, 0), (count, 0)));
         assert_eq!(sections(false, true), ((count, count), (count, count)));
     }
+
+    /// A COFF symbol does not say how large it is: each static keeps a section of its own,
+    /// whose size the PE splice reads as the static's. Shared, a `u32` before one aligned to
+    /// 8 read as 8 bytes, and an edit of it was linked in full (`splices.py`, "a static
+    /// pointed to").
+    #[test]
+    fn statics_of_one_section_in_a_coff_object_each_keep_their_own() {
+        use object::{Object, ObjectSection, ObjectSymbol};
+
+        let count = 300;
+        let names = (".rdata$static", ".CRT$XCU");
+        let triple = target_lexicon::triple!("x86_64-pc-windows-msvc");
+        let bytes = object_of_statics(triple, false, false, names, count);
+        let file = object::File::parse(&*bytes).unwrap();
+        for (name, prefix, size) in [(names.0, "ENTRY_", 4), (names.1, "CTOR_", 8)] {
+            let found: Vec<_> = file.sections().filter(|it| it.name() == Ok(name)).collect();
+            assert_eq!(found.len(), count as usize, "sections named `{name}`");
+            assert!(found.iter().all(|it| it.size() == size));
+            for symbol in file.symbols().filter(|it| it.name().is_ok_and(|n| n.starts_with(prefix)))
+            {
+                let section = file.section_by_index(symbol.section_index().unwrap()).unwrap();
+                assert_eq!((section.name(), symbol.address()), (Ok(name), 0));
+            }
+        }
+    }
 }

@@ -1593,14 +1593,17 @@ fn simd_masks() {
 #[test]
 fn simd_lanes() {
     let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
-    check("const GOAL: i32 = unsafe { simd_extract(i32x4([1, 2, 3, 4]), 2) };", 3);
-    check("const GOAL: i32 = unsafe { simd_extract_dyn(i32x4([1, 2, 3, 4]), 3) };", 4);
+    check("const GOAL: i32 = unsafe { simd_extract::<i32x4, i32>(i32x4([1, 2, 3, 4]), 2) };", 3);
     check(
-        "const GOAL: i32x4 = unsafe { simd_insert(i32x4([1, 2, 3, 4]), 1, 9) };",
+        "const GOAL: i32 = unsafe { simd_extract_dyn::<i32x4, i32>(i32x4([1, 2, 3, 4]), 3) };",
+        4,
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_insert::<i32x4, i32>(i32x4([1, 2, 3, 4]), 1, 9) };",
         i32s([1, 9, 3, 4]),
     );
     check(
-        "const GOAL: i32x4 = unsafe { simd_insert_dyn(i32x4([1, 2, 3, 4]), 3, -5) };",
+        "const GOAL: i32x4 = unsafe { simd_insert_dyn::<i32x4, i32>(i32x4([1, 2, 3, 4]), 3, -5) };",
         i32s([1, 2, 3, -5]),
     );
     check("const GOAL: i32x4 = unsafe { simd_splat::<i32x4, i32>(7) };", i32s([7, 7, 7, 7]));
@@ -1617,20 +1620,27 @@ fn simd_lanes() {
         ),
         i32s([4, 4, 5, 5]),
     );
-    check(
-        &format!(
-            "const GOAL: i32x4 = unsafe {{
-                simd_shuffle_const_generic::<i32x4, i32x4, {{ &[7, 0, 5, 2] }}>({pair})
-            }};"
-        ),
-        i32s([8, 1, 6, 3]),
-    );
     let fail = |goal: &str| check_fail(&with_simd(goal), is_ub);
-    fail("const GOAL: i32 = unsafe { simd_extract(i32x4([1, 2, 3, 4]), 4) };");
-    fail("const GOAL: i32x4 = unsafe { simd_insert_dyn(i32x4([1, 2, 3, 4]), 7, 0) };");
+    fail("const GOAL: i32 = unsafe { simd_extract::<i32x4, i32>(i32x4([1, 2, 3, 4]), 4) };");
+    fail(
+        "const GOAL: i32x4 = unsafe { simd_insert_dyn::<i32x4, i32>(i32x4([1, 2, 3, 4]), 7, 0) };",
+    );
     fail(&format!(
         "const GOAL: i32x4 = unsafe {{ simd_shuffle::<i32x4, [u32; 4], i32x4>({pair}, [0, 8, 0, 0]) }};"
     ));
+}
+
+#[test]
+fn simd_shuffle_const_generic() {
+    check_number(
+        &with_simd(
+            "const IDX: &[u32] = &[7, 0, 5, 2];
+            const GOAL: i32x4 = unsafe {
+                simd_shuffle_const_generic::<i32x4, i32x4, IDX>(i32x4([1, 2, 3, 4]), i32x4([5, 6, 7, 8]))
+            };",
+        ),
+        i32s([8, 1, 6, 3]),
+    );
 }
 
 #[test]

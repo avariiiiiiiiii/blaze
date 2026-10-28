@@ -40,13 +40,15 @@ published as a full release and counts as stable.
 ## Cutting a canary
 
 Every green main is a canary, cheaply. `canary.yaml` runs when the merge gate's run on a push to
-main ends green (and hourly, and by hand): `.github/scripts/canary.py cut` tags main's HEAD
-`v0.YYYYMMDD.N` through the API and dispatches `release.yaml` on the tag, when
+main ends green (and hourly, and by hand): `.github/scripts/canary.py cut` tags the newest
+commit of main whose `ci` check is green (main moves faster than its gate, so that is seldom
+HEAD itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N`
+through the API and dispatches `release.yaml` on the tag, when
 
-- HEAD's `ci` check is green and HEAD has no release tag yet,
 - something besides the docs (`docs/`, `site/`, `agents/`, `*.md`) and the bots' own commits
-  changed since the newest release,
-- no `release.yaml` or `release-cut.yaml` is running, and the newest release is at least 30
+  changed from the newest release to that commit,
+- no `release-cut.yaml` is running and no `release.yaml` is building a release (a run on a
+  branch is not one), and the newest release is at least 30
   minutes old (`-f min-minutes=N` by hand). A green main inside that window is cut by the next
   green push or the hourly run.
 

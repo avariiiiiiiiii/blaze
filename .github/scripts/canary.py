@@ -2,9 +2,10 @@
 """canary.py: a canary of every green main, cut by a tag on main's own commit (docs/release.md).
 
     canary.py cut '{"push": false, "min_minutes": 30}'
-        when main's HEAD passed the merge gate (its `ci` check, from the push run on main) and
-        has changes since the newest release beyond the bots' own and the docs, the tag
-        v0.YYYYMMDD.N on that commit, made through the API, and release.yaml dispatched on it.
+        the newest commit of main (first parents, since the newest release) that passed the
+        merge gate (its `ci` check, from the push run on main), when it has changes since that
+        release beyond the bots' own and the docs: the tag v0.YYYYMMDD.N on that commit, made
+        through the API, and release.yaml dispatched on it.
         Nothing when a release was published less than `min_minutes` ago or release.yaml is
         running: the next green main, or the hourly run, cuts it then. Without `push`, what it
         would tag is shown and nothing leaves the checkout.
@@ -38,6 +39,8 @@ REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
 DATED = re.compile(r"v0\.(\d{8})\.(0|[1-9]\d*)")
 # A change to nothing but these makes no canary: blaze is the same program.
 DOCS = re.compile(r"^(docs/|site/|agents/|bench/results/)|\.md$")
+# How many of main's newest commits `cut` looks through for a green one.
+LOOK_BACK = 40
 
 
 @dataclass(frozen=True)
@@ -112,25 +115,34 @@ def previous(rev, but=None):
     return found if DATED.fullmatch(found or "") else None
 
 
+def green(sha):
+    checks = json.loads(run("gh", "api", f"repos/{REPO}/commits/{sha}/check-runs?check_name=ci&per_page=20"))
+    return any((c["status"], c["conclusion"]) == ("completed", "success") for c in checks["check_runs"])
+
+
 def cut(args):
-    head = run("git", "rev-parse", "origin/main")
-    checks = json.loads(run("gh", "api", f"repos/{REPO}/commits/{head}/check-runs?check_name=ci&per_page=20"))
-    states = {(c["status"], c["conclusion"]) for c in checks["check_runs"]}
-    if ("completed", "success") not in states:
-        return summary(f"main {head[:10]}: its `ci` is not green yet ({sorted(map(str, states)) or 'no run'}); no canary")
-    if on_head := [t for t in run("git", "tag", "--points-at", head).split() if DATED.fullmatch(t)]:
-        return summary(f"main {head[:10]} is {on_head[0]} already")
-    base = previous(head)
+    main = run("git", "rev-parse", "origin/main")
+    base = previous(main)
+    # Main moves every few minutes and its gate takes longer than that, so HEAD is seldom green
+    # yet: the canary is the newest commit since the last release whose gate is.
+    since = run("git", "rev-list", "--first-parent", "--max-count", str(LOOK_BACK), f"{base}..{main}" if base else main).split()
+    if not since:
+        return summary(f"main {main[:10]} is {base} already")
+    head = next((sha for sha in since if green(sha)), None)
+    if head is None:
+        return summary(f"none of main's {len(since)} newest commits since {base} has a green `ci` yet; no canary")
     if base:
         files = run("git", "diff", "--name-only", f"{base}..{head}").split()
         if not any(not DOCS.search(f) for f in files):
-            return summary(f"nothing but docs since {base}; no canary")
-        titles = asyncio.run(train_release.changes(base))
-        if not titles:
-            return summary(f"nothing since {base} but the bots' own; no canary")
+            return summary(f"nothing but docs from {base} to {head[:10]}; no canary")
+        subjects = run("git", "log", "--first-parent", "--format=%s", f"{base}..{head}").splitlines()
+        if all(train_release.BOT.search(s) for s in subjects):
+            return summary(f"nothing from {base} to {head[:10]} but the bots' own; no canary")
     for workflow, doing in (("release-cut.yaml", "cutting a release"), ("release.yaml", "building")):
         running = json.loads(run("gh", "run", "list", "-R", REPO, "-w", workflow, "-L", "10", "--json", "status,headBranch"))
-        if busy := [r["headBranch"] for r in running if r["status"] in ("queued", "in_progress", "waiting", "pending", "requested")]:
+        # release.yaml on a branch builds and releases nothing: only a tag's run is a release.
+        if busy := [r["headBranch"] for r in running if r["status"] in ("queued", "in_progress", "waiting", "pending", "requested")
+                    and (workflow == "release-cut.yaml" or DATED.fullmatch(r["headBranch"]))]:
             return summary(f"{workflow} is {doing} ({', '.join(busy)}); the next green main or the hourly run cuts the canary")
     releases = json.loads(run("gh", "release", "list", "-R", REPO, "-L", "10", "--json", "tagName,createdAt"))
     dated = [r for r in releases if DATED.fullmatch(r["tagName"])]
@@ -143,7 +155,7 @@ def cut(args):
     version = train_release.next_version(dated_tags(), datetime.datetime.now(datetime.UTC).date())
     tag = f"v{version}"
     if not args.push:
-        return summary(f"would tag {tag} at main {head[:10]} (since {base}) and dispatch release.yaml")
+        return summary(f"would tag {tag} at {head[:10]} ({since.index(head)} behind main, since {base}) and dispatch release.yaml")
     # Through the API with the workflow's own token, which starts no workflow on it: release.yaml
     # runs once, by the dispatch.
     run("gh", "api", f"repos/{REPO}/git/refs", "-f", f"ref=refs/tags/{tag}", "-f", f"sha={head}")

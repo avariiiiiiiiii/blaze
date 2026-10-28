@@ -59,7 +59,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    since.) The train is
    what a bump needs beyond the gate: the corpus difftest with `--layouts` and every other
    harness on four platforms, rustc's borrow-check UI tests in both modes against the new
-   nightly's own verdicts (at its commit, `--min-pass` as the floor), `fork alone` and
+   nightly's own verdicts (at its commit, `--min-pass` as the floor) and
    `cargo ra-jit` on real projects.
 4. When the train finishes, `harness/stdcount.py` compiles the standard library with the bump's
    build and with `toolchain/base`'s (the same main commit, the old pin), each against its own

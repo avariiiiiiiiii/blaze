@@ -1,5 +1,11 @@
 # What goes in the rust-analyzer subtree, and what stays in crates/
 
+**Superseded in part, 2026-10-28** (Andrew: "We don't care about upstreaming rust-analyzer
+anymore"): `vendor/rust-analyzer` is no longer a synced fork. Its crates are members of the root
+workspace with one `Cargo.lock`, the fork repositories are archived, `vendor/subtree.py` and CI's
+`fork alone` job are gone, and steps 5 and 6 below are withdrawn. Where new code goes (sections 1
+to 3) still holds.
+
 Date: 2026-10-21. A design and a plan, being carried out: steps 0 (the rebuild times, 3.3), 2
 (the code generator a crate), 3 (the store a crate), 4 (the borrow checker into the subtree)
 and 5 (the fork builds alone, checked in CI) are done, see their
@@ -338,8 +344,7 @@ detection; the edits that make it build come in the commits after.
 
 The gate named below is, unless a step says otherwise:
 `cargo test --release -p hir-ty -p hir-ty-codegen -p hir-ty-borrowck -p hir-def -p parser -p syntax -p ra-jit`
-(the crates that exist at that step; since #293 the fork's crates are tested with
-in `vendor/rust-analyzer`, as `harness/unittests.py` does),
+(the crates that exist at that step; `harness/unittests.py` runs them in one `cargo test`),
 `cargo test --release -p hir-ide` failing exactly the 18
 known tests, the corpus under Cranelift and LLVM (with `--layouts`), `mixfutures`, `growth.py`,
 `movedlines.py`, `borrowck_ui.py` at its floor, and `cargo fmt --all -- --check`
@@ -352,8 +357,8 @@ known tests, the corpus under Cranelift and LLVM (with `--layouts`), `mixfutures
 | 2 | **Codegen becomes a crate.** Done on `codegen-crate`, 2026-10-21, in two commits (no file moved, so no rename commit). The compile found what the text search in 1.2 missed, in the other direction too: `hir-ty` itself called into the code generator, its interpreter and MIR lowering asking `Target::current().word()`, `body_checks_overflow` and `placed` (where `line!()`, `column!()` and `file!()` are as written). Those semantics moved into three new fork-owned files of `hir-ty`: `mir/target.rs` (the target's word size, which the code generator's `Target::select` sets), `mir/overflow.rs` and `mir/location.rs` (about 270 lines out of codegen's `mod.rs`). Made `pub` in fork-owned code: `is_builtin_index`, `monomorphized`, the `type_name` module and its functions, `loaded_crates`, `MemoryMap::{static_at, memory_at, align_at}`. Four upstream lines changed one word each: `Generics::{iter_self, len_parent}`, `layout::struct_tail_erasing_lifetimes`, `StoredPlace::walk_places`. As step 4 did, `return_slot` is copied, `Operand::span()` used, and `ParamEnv`'s private `clauses` read through `caller_bounds()`. `hir-ty/Cargo.toml`'s diff against upstream went from 36 added lines to 5 (`unicode-width`, now `location.rs`'s, `cfg` and `stacker`). The crate's root `mod.rs` aliases `ra_ap_rustc_*` to the names `hir-ty` gives them; `publish_crates.py` stages it as `ra-jit-hir-ty-codegen` (any crate of `crates/` not named `ra-jit*` gets the prefix); `ra-jit-wasm` turns on `hir-ty-codegen/wasm` and selects its target before lowering MIR; `harness/unittests.py` and CI's fmt run `-p hir-ty-codegen` (45 of its 52 tests on macOS; the rest need LLVM, Windows or Linux); `nix/units.nix` has no special case left | rebuild times again (3.3); `cargo build --release -p ra-jit --features llvm`; `ra-jit-wasm` builds | done |
 | 3 | **Store becomes a crate.** Done on `store-crate`, 2026-10-21: commit 1 the `git mv` alone of `store.rs` (now `crates/ra-jit-store/src/lib.rs`), `store/acl.rs`, `store/bench.rs` and the corpora `pack` and `name`, and of `fuzz.rs`, the inputs and counting allocator the store's and codegen's reader tests share, as `crates/ra-jit-fuzz` (a dev-dependency only, since it sets the global allocator); commit 2 the manifests and imports. What stays in the code generator is what knows about code: the stored entry (`cached.rs`), Cranelift's incremental cache over the store, and the entry key the store bench uses (`hir_ty_codegen::bench::entry_key`). `crc32fast`, `memmap2`, `libc` and `windows-sys` moved with it. `ra-jit`'s remote, signing, keeper and daemon, and `ra-jit-bench`, import `ra_jit_store`; the store's tests run as `-p ra-jit-store` without building a compiler | `cargo test --release -p ra-jit-store`; `remote.py`; the store bench builds | done |
 | 4 | **Borrowck into the subtree.** Done on `borrowck-3`, 2026-10-21, as the plan said: commit 1 the `git mv` alone (100% similar), commit 2 the crate. What the compile needed of `hir-ty` was smaller than 1.2's text search (read: the compile errors): the four `for_each_operand` methods (fork-owned) made `pub`; `Operand` gained a `span()` accessor instead of widening upstream's private field; `return_slot` copied into the crate; `GenericPredicates` was already public at the crate root; `transform::move_paths` was not needed. `hir` depends on the crate and calls `hir_ty_borrowck::borrowck`. `nix/units.nix` lost the borrowck half of its special case (the code generator half goes with step 2), `nix/units/daemon.json` regenerated (one package added), `harness/unittests.py` runs `-p hir-ty-borrowck` (it has no unit tests; its tests are `borrowck_ui.py`), `publish_crates.py` stages it as `ra-jit-hir-ty-borrowck` unchanged (before, the published `hir-ty` lacked the checker's files). The fork still cannot build alone until step 2 removes the `#[path] codegen` line, so step 5 waits for step 2 too | `borrowck_ui.py` scores unchanged in both modes; `ra-jit borrowck --project` on ripgrep, fd, bat, hyperfine, just, axum and nushell finds nothing; the corpus, `mixfutures`, `hir-ide`'s 18 known failures, `cargo test --release -p ra-jit` | done |
-| 5 | **Fork check.** Done on `fork-check`, 2026-10-21: CI's job `fork alone` copies `vendor/rust-analyzer` out of the repository, which is the tree `fork sync` pushes, and runs `cargo test -p hir-ty -p hir-ty-borrowck && cargo check -p hir` there; `ci` needs it. Copying rather than cloning the fork catches a dependency on `crates/` before it merges, not after. The fork alone needed two fixes: its workspace patched `ra-ap-rustc_abi` from `lib/rustc_abi`, a directory the fork never had, and now takes it from `indexable-inc/rustc_abi` `main` (the subtree of `vendor/rustc_abi`, identical to it at `8f6db283fd`; ra-jit's own workspace still patches it by path); and its `Cargo.lock` was brought up to date (it lacked `hir-ty-borrowck`, `stacker`, `unicode-width`) | the job's commands, run in a copy of the subtree | done |
-| 6 | **Shrink the edit surface (ongoing).** Send group F upstream in small pull requests, parser and `macro_rules!` first, each with the rustc source it follows (upstream's AI rule); when one merges, the next `vendor/subtree.py upstream` takes upstream's version. Move group G's additions to new files where they are additive (`Files`'s view, include and env fields behind one field of a type defined in a new `base-db` module). Watch upstream's `hir-ty` split and put new MIR code where upstream's plan will put MIR | each pull request under upstream's CI; the gate here when each comes back through a merge | a day per batch, spread out |
+| 5 | **Fork check.** Withdrawn 2026-10-28 with the fork (one workspace). Was done on `fork-check`, 2026-10-21: CI's job `fork alone` copies `vendor/rust-analyzer` out of the repository, which is the tree `fork sync` pushes, and runs `cargo test -p hir-ty -p hir-ty-borrowck && cargo check -p hir` there; `ci` needs it. Copying rather than cloning the fork catches a dependency on `crates/` before it merges, not after. The fork alone needed two fixes: its workspace patched `ra-ap-rustc_abi` from `lib/rustc_abi`, a directory the fork never had, and now takes it from `indexable-inc/rustc_abi` `main` (the subtree of `vendor/rustc_abi`, identical to it at `8f6db283fd`; ra-jit's own workspace still patches it by path); and its `Cargo.lock` was brought up to date (it lacked `hir-ty-borrowck`, `stacker`, `unicode-width`) | the job's commands, run in a copy of the subtree | done |
+| 6 | **Shrink the edit surface.** Withdrawn 2026-10-28: nothing is sent upstream any more. Was: send group F upstream in small pull requests, parser and `macro_rules!` first, each with the rustc source it follows (upstream's AI rule); when one merges, the next `vendor/subtree.py upstream` takes upstream's version. Move group G's additions to new files where they are additive (`Files`'s view, include and env fields behind one field of a type defined in a new `base-db` module). Watch upstream's `hir-ty` split and put new MIR code where upstream's plan will put MIR | each pull request under upstream's CI; the gate here when each comes back through a merge | a day per batch, spread out |
 | 7 | **Optional.** `type_id.rs` and `vtable.rs` into `hir-ty` when the interpreter needs them; a look at whether `outline.rs` can be an `ItemTree` comparison | the corpus' `TypeId` and `dyn` cases; `growth.py`, `movedlines.py` for `outline.rs` | a day each |
 
 ### 4.1 Sequencing around the branches in flight
@@ -380,17 +385,7 @@ import are left out):
 
 ### 4.2 Fork sync and upstream merges afterwards
 
-- Fork sync (each fork's `sync from blaze` workflow) keeps working as it does: it pushes one fork commit per first-parent commit of
-  `main` that changes `vendor/` (read: `vendor/subtree.py` docstring). Step 2 removes the
-  `#[path] codegen` line and `hir-ty`'s codegen dependencies from the fork; step 4 adds
-  `crates/hir-ty-borrowck` to it and removes the other `#[path]`. From then on the fork's
-  `ra-jit` branch builds by itself.
-- `vendor/subtree.py upstream rust-analyzer` merges exactly as before. Step 2 took
-  31 lines out of `hir-ty/Cargo.toml`'s diff against upstream (36 to 5); step 4 adds one line to
-  `hir/Cargo.toml` and one to the vendor workspace's `Cargo.toml`. The new `hir-ty-borrowck` crate
-  conflicts with nothing. The large conflict surfaces (`mir/lower.rs`, `mir/eval.rs`,
-  `hir-def`'s body lowering) are unchanged by this plan; only step 6 shrinks them.
-- The rustc_abi subtree is not affected.
+None since 2026-10-28: the forks are archived, and upstream rust-analyzer is not merged in.
 
 ## 5. What I did not check
 

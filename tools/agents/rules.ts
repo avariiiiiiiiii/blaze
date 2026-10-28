@@ -45,8 +45,8 @@ export const rules = [
 	},
 	{
 		id: "superset-of-rust",
-		info: "Own every layer from source to running code, never by narrowing what blaze accepts: every program the pinned nightly builds must build and behave the same under blaze, with the real std, C dependencies, build scripts and proc macros. The one allowed difference is sandboxing.",
-		reason: "Owning every layer is what makes blaze fast. Sandboxing has been on by default since 2026-10-26 (https://github.com/indexable-inc/blaze/issues/147).",
+		info: "Own every layer from source to running code, never by narrowing what blaze accepts: every program the pinned nightly builds must build and behave the same under blaze, with the real std, C dependencies, build scripts and proc macros. The one allowed difference is sandboxing. Superset means blaze may also accept more than Rust: an extension (new syntax, attributes, semantics) only has to work under blaze, never under rustc, as long as it is opt-in and every program that doesn't use it behaves exactly as under rustc.",
+		reason: "Owning every layer is what makes blaze fast. Sandboxing has been on by default since 2026-10-26 (https://github.com/indexable-inc/blaze/issues/147). Andrew, 2026-10-28: \"we are superset and if using superset dont need rustc to compile it either\".",
 		link: "docs/no-rustc.md",
 	},
 	{
@@ -137,7 +137,7 @@ These guide Codex code review on pull requests. They add to the rustc comparison
 
 ### Compiler correctness
 
-- Flag any change that can make a program built by blaze behave differently from the same program built by the pinned nightly rustc (\`harness/toolchain\`): layout, ABI, drop order, overflow and panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking. Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference is sandboxing build scripts and proc macros.
+- Flag any change that can make a program built by blaze behave differently from the same program built by the pinned nightly rustc (\`harness/toolchain\`): layout, ABI, drop order, overflow and panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking. Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference is sandboxing build scripts and proc macros. Code that opts into a blaze extension is exempt: it need not build under rustc, but enabling the extension must not change any program that doesn't use it.
 - Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower backend, an older cached result). Safe path: stop with an error that names what and where.
 - Flag a cache key, code-identity hash or live-patch check that misses an input the output depends on (source, cfg, features, target, toolchain, layout of a type it uses), so stale code can be reused or a patch applied after a layout or ABI change.
 - Flag unsafe code in the loader, the splice and the live runtime whose soundness rests on an unchecked assumption (alignment, lifetime of patched code, aliasing, thread safety of a swap), unless a comment states the invariant and where it is upheld.

@@ -6,7 +6,7 @@
     "feat"
   ],
   "env": {
-    "RA_JIT_RELOAD_PAUSE_MS": "3000"
+    "BLAZE_RELOAD_PAUSE_MS": "3000"
   },
   "steps": [
     {

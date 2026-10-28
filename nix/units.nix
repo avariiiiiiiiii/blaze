@@ -5,7 +5,7 @@
 #
 # Why this caches well: a unit's derivation inputs are its own sources, its profile and features,
 # and the store paths of the units it depends on. Nothing else. Editing ra-jit's own sources changes
-# only the ra-jit unit; every registry crate and every vendored rust-analyzer crate keeps its store
+# only the ra-jit unit; every registry crate and every front-end crate keeps its store
 # path and is a cache hit on any machine that has built or substituted it.
 #
 # Native builds only: host units (platform null in the graph) and target units are the same machine,
@@ -13,11 +13,6 @@
 { pkgs, rust, guiLibs, json, repo, gitSha ? "" }:
 let
   inherit (pkgs) lib;
-  # Each vendored tree copied to a store path of its own, named by its contents alone, so that
-  # editing the rest of the repo does not change it.
-  vendored = name: builtins.path { path = repo + "/vendor/${name}"; name = "${name}-src"; };
-  rustAnalyzer = vendored "rust-analyzer";
-  rustcAbi = vendored "rustc_abi";
   system = pkgs.stdenv.hostPlatform.system;
   all = builtins.fromJSON (builtins.readFile json);
   graph = all.systems.${system} or (throw "${json} has no unit graph for ${system}: add its triple to TARGETS in nix/unit_graph.py and rerun it");
@@ -41,19 +36,14 @@ let
     else data;
 
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that
-  # editing anything else in the repo does not change the unit. The vendored trees are whole
-  # store paths of their own.
+  # editing anything else in the repo does not change the unit.
   # crates/ra-jit include_str!s harness/toolchain.
   pathSource = p:
     let d = p.source.dir; in
-    if lib.hasPrefix "vendor/rust-analyzer/" d then "${rustAnalyzer}/${lib.removePrefix "vendor/rust-analyzer/" d}"
-    else if d == "vendor/rust-analyzer" then "${rustAnalyzer}"
-    else if d == "vendor/rustc_abi" then "${rustcAbi}"
-    else
-      "${lib.fileset.toSource {
-        root = repo;
-        fileset = lib.fileset.unions [ (repo + "/${d}") (repo + "/harness/toolchain") ];
-      }}/${d}";
+    "${lib.fileset.toSource {
+      root = repo;
+      fileset = lib.fileset.unions [ (repo + "/${d}") (repo + "/harness/toolchain") ];
+    }}/${d}";
 
   pkgSrc = lib.mapAttrs
     (key: p:
@@ -128,7 +118,7 @@ let
     // lib.optionalAttrs (builtins.elem i checked.roots || u.pkg == (U (builtins.head checked.roots)).pkg) { CARGO_PRIMARY_PACKAGE = "1"; }
     // lib.optionalAttrs (p.links != null) { CARGO_MANIFEST_LINKS = p.links; }
     # `ra-jit --version` and the daemon's log name the commit, as the flake's `daemon` does.
-    // lib.optionalAttrs (p.name == "ra-jit" && gitSha != "") { RA_JIT_GIT_SHA = gitSha; };
+    // lib.optionalAttrs (p.name == "ra-jit" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
 
   mk = i:
     let

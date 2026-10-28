@@ -23,7 +23,7 @@
 //! test` does: the ways out are [`sandboxed::WORKSPACE_TABLE`] in the workspace's root
 //! manifest (`unsandboxed-build-scripts`, the only place a registry's package can be named),
 //! `build-script = false` under [`sandboxed::TABLE`] of a package inside the workspace, and
-//! `RA_JIT_SANDBOX=off`.
+//! `BLAZE_SANDBOX=off`.
 //!
 //! A sandboxed run is given only the part of cargo's environment that is the build's
 //! ([`given`]): cargo's own variables for scripts, the toolchain's and ra-jit's, the C
@@ -118,7 +118,7 @@ pub(crate) enum Plan {
         /// The system directories its `rustc-link-search` may name besides those it always may
         /// (`directives.rs`): `build-script-link-dirs` of the root manifest.
         link_dirs: Vec<PathBuf>,
-        /// The closure it sees alone, when it does (`RA_JIT_SCRIPT_VIEW`): then its run is kept
+        /// The closure it sees alone, when it does (`BLAZE_SCRIPT_VIEW`): then its run is kept
         /// by what it is made of, and not by what it was seen reading.
         in_view: Option<InView>,
     },
@@ -185,7 +185,7 @@ fn on_in(env: &[(String, String)]) -> bool {
 /// The variable that names to a run the root of the workspace being built, set by the
 /// daemon's load (`compile_time.rs`): a path dependency that is a workspace of its own is
 /// still the build's, whose root manifest says how its script runs. The script is not given it.
-pub(crate) const ROOT: &str = "RA_JIT_BUILD_ROOT";
+pub(crate) const ROOT: &str = "BLAZE_BUILD_ROOT";
 
 /// The workspace a script's run is part of: the one [`ROOT`] names; else the one around its
 /// package, for a package not below cargo's home; else the one around the target directory
@@ -226,7 +226,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let mut env = with_own_rustc(script.env, script.scratch)?;
     env.retain(|it| it.0 != ROOT);
     if !on_in(script.env) {
-        return Ok(Plan::Outside(format!("{}=off", crate::sandbox::VAR_BLAZE), env));
+        return Ok(Plan::Outside(format!("{}=off", crate::sandbox::VAR), env));
     }
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         // No running it outside instead: a build that can't keep its promise stops.
@@ -234,7 +234,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
             "the build script of `{package}` runs in a sandbox, and there is none on {} yet \
              (#257); `{}=off` runs build scripts and tests outside a sandbox, as cargo does",
             std::env::consts::OS,
-            crate::sandbox::VAR_BLAZE
+            crate::sandbox::VAR
         );
     }
     let root = workspace_of(script)?;
@@ -396,10 +396,9 @@ pub(crate) fn for_tool(
 /// CMake's, the SDKs' of Apple's platforms, Nix's compiler wrappers', the jobserver, and what
 /// a test is given ([`sandboxed::KEPT`]).
 pub(crate) fn given(name: &str) -> bool {
-    const PREFIXES: [&str; 11] = [
+    const PREFIXES: [&str; 10] = [
         "CARGO_",
         "DEP_",
-        "RA_JIT_",
         "BLAZE_",
         "NIX_",
         "PKG_CONFIG",
@@ -542,7 +541,7 @@ fn user_cache() -> Option<PathBuf> {
 pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Result<Ran> {
     let (spec, root_manifest, in_view) = match plan {
         Plan::Outside(why, env) => {
-            if std::env::var_os("RA_JIT_STATS").is_some() {
+            if std::env::var_os("BLAZE_STATS").is_some() {
                 eprintln!("blaze: the build script of `{}` runs outside: {why}", script.package());
             }
             let mut command = Command::new(script.real);
@@ -581,7 +580,7 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
                 "error: the build script of `{package}` runs in a sandbox, which can't be made \
                  here: {why}\n`{}=off` runs build scripts and tests outside a sandbox, as cargo \
                  does\n",
-                crate::sandbox::VAR_BLAZE
+                crate::sandbox::VAR
             )
             .into_bytes(),
         );

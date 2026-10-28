@@ -34,7 +34,7 @@ Error: Os { code: 30, kind: ReadOnlyFilesystem, message: "Read-only file system"
 ```
 thread 'main' (2) panicked at helix-term/build.rs:5:26:
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-note: the build script of `helix-term` failed in the sandbox, which refused it writing `/root/bs/work/src/helix/runtime/grammars/sources` (the machine is read-only in a sandbox); if it needs that, run it outside: `unsandboxed-build-scripts = ["helix-term"]` under `[workspace.metadata.blaze.sandbox]` in /root/bs/work/src/helix/Cargo.toml (or `build-script = false` under `[package.metadata.blaze.sandbox]` in its own manifest, for a package of the workspace), or `RA_JIT_SANDBOX=off` for every build script and test of the command
+note: the build script of `helix-term` failed in the sandbox, which refused it writing `/root/bs/work/src/helix/runtime/grammars/sources` (the machine is read-only in a sandbox); if it needs that, run it outside: `unsandboxed-build-scripts = ["helix-term"]` under `[workspace.metadata.blaze.sandbox]` in /root/bs/work/src/helix/Cargo.toml (or `build-script = false` under `[package.metadata.blaze.sandbox]` in its own manifest, for a package of the workspace), or `BLAZE_SANDBOX=off` for every build script and test of the command
 ```
 
 ### zed: `webrtc-sys v0.3.23 (https://github.com/zed-industries/livekit-rust-sdks?rev=0a1c519cfce9b365229026b55de9b9dbdb6fed3c#0a1c519c)`

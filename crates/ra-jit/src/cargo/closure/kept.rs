@@ -242,7 +242,7 @@ impl std::fmt::Display for Missing {
             f,
             "blaze's store has no copy of {}, and no remote brought one. CI fills blaze's remote \
              cache with it (`ra-jit closure fetch`, then `ra-jit cache push REMOTE {}`), and \
-             RA_JIT_REMOTE names the remote it is taken from; blaze never takes it from \
+             BLAZE_REMOTE names the remote it is taken from; blaze never takes it from \
              cache.nixos.org itself",
             self.path,
             super::PROJECT

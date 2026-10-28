@@ -9,7 +9,7 @@ it does not cover. The full account, with every finding, is in
 ## Running it
 
     cd harness
-    export RA_JIT_BIN=$PWD/../target/release/ra-jit
+    export BLAZE_BIN=$PWD/../target/release/ra-jit
     python3 fuzz/fuzz.py smoke                                  # 2 programs, fixed seed; in CI
     python3 fuzz/store.py                                       # asm changes, cold and warm store; in CI
     python3 fuzz/fuzz.py run --seed S --rounds N --jobs 8 --out DIR
@@ -17,9 +17,9 @@ it does not cover. The full account, with every finding, is in
     python3 fuzz/fuzz.py check fuzz/found/*.rs                  # every stored reduction against this ra-jit
     python3 fuzz/fuzz.py report DIR [--coverage]                # add up the logs of a run
 
-By default each program is built under both backends, so `RA_JIT_BIN` should be a build with
+By default each program is built under both backends, so `BLAZE_BIN` should be a build with
 `--features llvm`; `--backends cranelift` runs one. LLVM is run with
-`RA_JIT_OPT=2 RA_JIT_EMIT=fast`. The exit status is 1 when there is a finding.
+`BLAZE_OPT=2 BLAZE_EMIT=fast`. The exit status is 1 when there is a finding.
 
 `store.py` uses fresh stores of its own. It compiles a function, changes only its `asm!`
 text, then builds each version again from the store, comparing every output with rustc.

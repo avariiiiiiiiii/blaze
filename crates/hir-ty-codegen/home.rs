@@ -272,7 +272,7 @@ impl Homes {
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
     ) -> StoredParamEnvAndCrate {
-        if std::env::var_os("RA_JIT_NO_HOME").is_some()
+        if std::env::var_os("BLAZE_NO_HOME").is_some()
             || !asked.param_env(db).caller_bounds().is_empty()
         {
             return asked.clone();

@@ -232,7 +232,7 @@ fn around(dir: &Path) -> Option<String> {
 
 /// The variable `cargo ra-jit` names the workspace's own `rustc-workspace-wrapper` in, for
 /// ra-jit's wrapper to run rustc through: the one it puts in that wrapper's place.
-pub(crate) const CHAINED: &str = "RA_JIT_CHAINED_WRAPPER";
+pub(crate) const CHAINED: &str = "BLAZE_CHAINED_WRAPPER";
 
 /// The variables cargo reads the workspace's wrapper from, ahead of every configuration
 /// file: its own, then the one that stands for the key of its configuration.

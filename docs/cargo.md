@@ -5,9 +5,9 @@ subcommand, described here. The second, switching blaze on globally so that plai
 goes through it, has its own section at the end.
 
 blaze was called ra-jit until 2026-10-24. `cargo ra-jit` is still the same command as
-`cargo blaze`, and every setting below, `BLAZE_<NAME>`, is still read by its old name
-`RA_JIT_<NAME>` too (when both are set, the `BLAZE_` one wins). The engine `cargo blaze` runs,
-its helpers and its directories keep the name ra-jit for now.
+`cargo blaze`. Every setting below is `BLAZE_<NAME>`; its old name, `RA_JIT_<NAME>`, is not
+read, and blaze stops when one is set, saying for each what it is called now. The engine
+`cargo blaze` runs, its helpers and its directories keep the name ra-jit for now.
 
 Everything in this file was checked against the code in `crates/ra-jit/src/cargo/` and run on
 Linux x86-64. On macOS arm64 `harness/cargo_ra_jit.py --small` was run, and what is known of

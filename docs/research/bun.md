@@ -46,7 +46,7 @@ Each fix is its own commit on `main` with a regression case (read, the commits):
 
 | What | Where it showed | Case |
 |---|---|---|
-| `cargo ra-jit` went to cargo for any rustc but 1.99.0; `RA_JIT_OTHER_TOOLCHAIN=1` builds with it | every build of bun | `soakrows.py`, "a project pinned to a nightly" |
+| `cargo ra-jit` went to cargo for any rustc but 1.99.0; `BLAZE_OTHER_TOOLCHAIN=1` builds with it | every build of bun | `soakrows.py`, "a project pinned to a nightly" |
 | nightly cargo passes `-Z embed-metadata=no`, which sent the build to cargo | every build | the same row |
 | nightly cargo's second build-dir layout: build scripts' output and the seeded target were not found | every build | the same row |
 | an edit that makes rustc's copy of a function left to rustc out of date failed the build; it is cargo's to build | signature edits | `soakrows.py`, "an item added beside a function left to rustc" |

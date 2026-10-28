@@ -5,11 +5,20 @@
    {
     "checksum": "59317f77929f0e679d39364702289274de2f0f0b22cbf50b2b8cff2169a0b27a",
     "dependencies": [
-     "gimli"
+     "gimli 0.33.0"
     ],
     "name": "addr2line",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.26.1"
+   },
+   {
+    "checksum": "e567177890eb1617b1f774005b66b26b2377afd138a2ca37aae7d8f0c81429d4",
+    "dependencies": [
+     "gimli 0.34.0"
+    ],
+    "name": "addr2line",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.27.1"
    },
    {
     "checksum": "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa",
@@ -73,7 +82,7 @@
    {
     "checksum": "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc",
     "dependencies": [
-     "windows-sys 0.60.2"
+     "windows-sys 0.61.2"
     ],
     "name": "anstyle-query",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -84,7 +93,7 @@
     "dependencies": [
      "anstyle",
      "once_cell_polyfill",
-     "windows-sys 0.60.2"
+     "windows-sys 0.61.2"
     ],
     "name": "anstyle-wincon",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -107,6 +116,9 @@
    },
    {
     "checksum": "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1",
+    "dependencies": [
+     "derive_arbitrary"
+    ],
     "name": "arbitrary",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.4.2"
@@ -588,6 +600,21 @@
     "version": "1.6.0"
    },
    {
+    "checksum": "42f4220217f3288537b83684130f42fad43320b1c3b805f1910d683d52ded24f",
+    "dependencies": [
+     "addr2line 0.27.1",
+     "cfg-if",
+     "libc",
+     "miniz_oxide 0.9.1",
+     "object 0.40.0",
+     "rustc-demangle",
+     "windows-link"
+    ],
+    "name": "backtrace",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.3.77"
+   },
+   {
     "dependencies": [
      "cfg",
      "dashmap",
@@ -953,7 +980,7 @@
      "maybe-owned",
      "rustix",
      "rustix-linux-procfs",
-     "windows-sys 0.60.2",
+     "windows-sys 0.61.2",
      "winx"
     ],
     "name": "cap-primitives",
@@ -1015,9 +1042,14 @@
    },
    {
     "dependencies": [
+     "arbitrary",
+     "cfg",
+     "expect-test",
      "intern",
+     "oorandom",
      "rustc-hash 2.1.2",
      "syntax",
+     "syntax-bridge",
      "tracing",
      "tt"
     ],
@@ -1242,7 +1274,7 @@
      "cranelift-control",
      "cranelift-entity",
      "cranelift-isle",
-     "gimli",
+     "gimli 0.33.0",
      "hashbrown 0.17.1",
      "libm",
      "log",
@@ -1351,7 +1383,7 @@
      "cranelift-codegen",
      "cranelift-control",
      "cranelift-module",
-     "gimli",
+     "gimli 0.33.0",
      "log",
      "object 0.40.0",
      "target-lexicon"
@@ -1558,6 +1590,17 @@
     "version": "1.6.1"
    },
    {
+    "checksum": "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a",
+    "dependencies": [
+     "proc-macro2",
+     "quote",
+     "syn 2.0.117"
+    ],
+    "name": "derive_arbitrary",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.4.2"
+   },
+   {
     "checksum": "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8",
     "name": "diff",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -1704,7 +1747,7 @@
     "checksum": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
     "dependencies": [
      "libc",
-     "windows-sys 0.52.0"
+     "windows-sys 0.61.2"
     ],
     "name": "errno",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -1758,7 +1801,7 @@
     "checksum": "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c",
     "dependencies": [
      "crc32fast",
-     "miniz_oxide"
+     "miniz_oxide 0.8.9"
     ],
     "name": "flate2",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -1943,6 +1986,12 @@
     "version": "0.33.0"
    },
    {
+    "checksum": "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10",
+    "name": "gimli",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.34.0"
+   },
+   {
     "checksum": "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b",
     "name": "glob",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -2039,6 +2088,7 @@
      "base-db",
      "cfg",
      "either",
+     "expect-test",
      "hir-def",
      "hir-expand",
      "hir-ide",
@@ -2055,7 +2105,12 @@
      "span",
      "stdx",
      "syntax",
+     "syntax-bridge",
+     "test-fixture",
+     "test-utils",
      "tracing",
+     "tracing-subscriber",
+     "tracing-tree",
      "triomphe",
      "tt"
     ],
@@ -2071,6 +2126,7 @@
      "cov-mark",
      "drop_bomb",
      "either",
+     "expect-test",
      "fst",
      "hir-expand",
      "indexmap",
@@ -2087,6 +2143,8 @@
      "stdx",
      "syntax",
      "syntax-bridge",
+     "test-fixture",
+     "test-utils",
      "thin-vec",
      "tracing",
      "triomphe",
@@ -2102,6 +2160,7 @@
      "cfg",
      "cov-mark",
      "either",
+     "expect-test",
      "intern",
      "itertools 0.15.0",
      "mbe",
@@ -2126,6 +2185,7 @@
      "base-db",
      "cov-mark",
      "either",
+     "expect-test",
      "hir-def",
      "hir-expand",
      "hir-ty",
@@ -2133,6 +2193,7 @@
      "itertools 0.15.0",
      "la-arena",
      "macros",
+     "project-model",
      "ra-ap-rustc_abi",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_pattern_analysis",
@@ -2144,6 +2205,8 @@
      "span",
      "stdx",
      "syntax",
+     "test-fixture",
+     "test-utils",
      "tracing",
      "triomphe",
      "typed-arena"
@@ -2484,6 +2547,7 @@
      "cov-mark",
      "crossbeam-channel",
      "either",
+     "expect-test",
      "fst",
      "hir",
      "itertools 0.15.0",
@@ -2514,6 +2578,7 @@
      "cfg",
      "cov-mark",
      "either",
+     "expect-test",
      "hir",
      "ide-db",
      "itertools 0.15.0",
@@ -2522,6 +2587,8 @@
      "smallvec",
      "stdx",
      "syntax",
+     "test-fixture",
+     "test-utils",
      "tracing"
     ],
     "name": "ide-diagnostics",
@@ -2962,6 +3029,7 @@
      "arrayvec",
      "bitflags 2.12.1",
      "cov-mark",
+     "expect-test",
      "intern",
      "parser",
      "ra-ap-rustc_lexer",
@@ -2970,7 +3038,9 @@
      "smallvec",
      "span",
      "stdx",
+     "syntax",
      "syntax-bridge",
+     "test-utils",
      "tt"
     ],
     "name": "mbe",
@@ -3048,6 +3118,15 @@
     "version": "0.8.9"
    },
    {
+    "checksum": "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c",
+    "dependencies": [
+     "adler2"
+    ],
+    "name": "miniz_oxide",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.9.1"
+   },
+   {
     "checksum": "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda",
     "dependencies": [
      "libc",
@@ -3062,7 +3141,7 @@
    {
     "checksum": "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08",
     "dependencies": [
-     "windows-sys 0.60.2"
+     "windows-sys 0.61.2"
     ],
     "name": "miow",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -3135,7 +3214,7 @@
    {
     "checksum": "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5",
     "dependencies": [
-     "windows-sys 0.60.2"
+     "windows-sys 0.61.2"
     ],
     "name": "nu-ansi-term",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -3288,8 +3367,10 @@
     "dependencies": [
      "drop_bomb",
      "edition",
+     "expect-test",
      "ra-ap-rustc_lexer",
      "rustc-literal-escaper",
+     "stdx",
      "tracing",
      "winnow 0.7.15"
     ],
@@ -3446,6 +3527,7 @@
      "intern",
      "paths",
      "postcard",
+     "proc-macro-srv",
      "rayon",
      "rustc-hash 2.1.2",
      "semver",
@@ -3461,6 +3543,27 @@
     "version": "0.0.0"
    },
    {
+    "dependencies": [
+     "expect-test",
+     "intern",
+     "line-index",
+     "paths",
+     "proc-macro-test",
+     "rustc-hash 2.1.2",
+     "span",
+     "stdx"
+    ],
+    "name": "proc-macro-srv",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "cargo_metadata"
+    ],
+    "name": "proc-macro-test",
+    "version": "0.0.0"
+   },
+   {
     "checksum": "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934",
     "dependencies": [
      "unicode-ident"
@@ -3473,6 +3576,7 @@
     "dependencies": [
      "libc",
      "perf-event",
+     "tikv-jemalloc-ctl",
      "windows-sys 0.61.2"
     ],
     "name": "profile",
@@ -3484,6 +3588,7 @@
      "base-db",
      "cargo_metadata",
      "cfg",
+     "expect-test",
      "intern",
      "itertools 0.15.0",
      "la-arena",
@@ -3718,7 +3823,7 @@
      "find-msvc-tools",
      "futures-util",
      "getrandom 0.3.4",
-     "gimli",
+     "gimli 0.33.0",
      "hir",
      "hir-def",
      "hir-ty",
@@ -3992,6 +4097,7 @@
      "hashbrown 0.14.5",
      "memoffset 0.9.1",
      "rustc-hash 1.1.0",
+     "serde",
      "text-size"
     ],
     "name": "rowan",
@@ -4053,7 +4159,7 @@
      "errno",
      "libc",
      "linux-raw-sys",
-     "windows-sys 0.52.0"
+     "windows-sys 0.61.2"
     ],
     "name": "rustix",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -4459,7 +4565,7 @@
     "checksum": "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4",
     "dependencies": [
      "libc",
-     "windows-sys 0.60.2"
+     "windows-sys 0.61.2"
     ],
     "name": "socket2",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -4508,7 +4614,7 @@
      "cfg-if",
      "libc",
      "psm",
-     "windows-sys 0.60.2"
+     "windows-sys 0.61.2"
     ],
     "name": "stacker",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -4516,6 +4622,7 @@
    },
    {
     "dependencies": [
+     "backtrace",
      "crossbeam-channel",
      "crossbeam-utils",
      "itertools 0.15.0",
@@ -4577,15 +4684,19 @@
    {
     "dependencies": [
      "either",
+     "expect-test",
      "itertools 0.15.0",
      "parser",
      "ra-ap-rustc_lexer",
+     "rayon",
      "rowan",
      "rustc-hash 2.1.2",
      "rustc-literal-escaper",
+     "rustc_apfloat",
      "smallvec",
      "smol_str",
      "stdx",
+     "test-utils",
      "tracing",
      "triomphe"
     ],
@@ -4594,12 +4705,14 @@
    },
    {
     "dependencies": [
+     "expect-test",
      "intern",
      "parser",
      "rustc-hash 2.1.2",
      "span",
      "stdx",
      "syntax",
+     "test-utils",
      "tt"
     ],
     "name": "syntax-bridge",
@@ -4648,10 +4761,10 @@
     "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
     "dependencies": [
      "fastrand",
-     "getrandom 0.3.4",
+     "getrandom 0.4.2",
      "once_cell",
      "rustix",
-     "windows-sys 0.52.0"
+     "windows-sys 0.61.2"
     ],
     "name": "tempfile",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -4696,6 +4809,9 @@
    },
    {
     "checksum": "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233",
+    "dependencies": [
+     "serde"
+    ],
     "name": "text-size",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.1.1"
@@ -4749,7 +4865,7 @@
    {
     "checksum": "6ce6b46108e50803d2c10216929e49fa3eda07ee3dc246310c18c4a1e3b1fa58",
     "dependencies": [
-     "gimli",
+     "gimli 0.33.0",
      "hashbrown 0.16.1",
      "object 0.38.1",
      "tracing"
@@ -5094,7 +5210,7 @@
     "dependencies": [
      "memoffset 0.9.1",
      "tempfile",
-     "windows-sys 0.60.2"
+     "windows-sys 0.61.2"
     ],
     "name": "uds_windows",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -5416,7 +5532,7 @@
    {
     "checksum": "1801b9c9f91e16e352ed77656824e7c4556a7538dbfc1a50b37243f0e12ea045",
     "dependencies": [
-     "addr2line",
+     "addr2line 0.26.1",
      "async-trait",
      "bitflags 2.12.1",
      "bumpalo",
@@ -5463,7 +5579,7 @@
      "cranelift-bforest",
      "cranelift-bitset",
      "cranelift-entity",
-     "gimli",
+     "gimli 0.33.0",
      "hashbrown 0.17.1",
      "indexmap",
      "log",
@@ -5527,7 +5643,7 @@
      "cranelift-entity",
      "cranelift-frontend",
      "cranelift-native",
-     "gimli",
+     "gimli 0.33.0",
      "itertools 0.14.0",
      "log",
      "object 0.40.0",
@@ -5716,7 +5832,7 @@
    {
     "checksum": "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22",
     "dependencies": [
-     "windows-sys 0.52.0"
+     "windows-sys 0.61.2"
     ],
     "name": "winapi-util",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -6388,7 +6504,7 @@
      "path": "vendor/llvm-sys"
     },
     "ra-ap-rustc_abi": {
-     "path": "vendor/rustc_abi"
+     "path": "crates/rustc_abi"
     },
     "ra-ap-rustc_next_trait_solver": {
      "path": "vendor/rustc_next_trait_solver"
@@ -6397,7 +6513,7 @@
      "path": "vendor/rustc_type_ir"
     },
     "rowan": {
-     "path": "vendor/rust-analyzer/lib/rowan"
+     "path": "crates/rowan"
     },
     "salsa": {
      "path": "vendor/salsa"
@@ -6457,7 +6573,7 @@
     "anyhow": "1.0.98",
     "arrayvec": "0.7.6",
     "base-db": {
-     "path": "vendor/rust-analyzer/crates/base-db",
+     "path": "crates/base-db",
      "version": "0.0.0"
     },
     "bitflags": "2.9.1",
@@ -6495,7 +6611,7 @@
       "tt",
       "syntax"
      ],
-     "path": "vendor/rust-analyzer/crates/cfg",
+     "path": "crates/cfg",
      "version": "0.0.0"
     },
     "crossbeam-channel": "0.5.15",
@@ -6506,10 +6622,8 @@
      ],
      "version": "=6.2.1"
     },
-    "dissimilar": "1.0.10",
-    "dot": "0.1.4",
     "edition": {
-     "path": "vendor/rust-analyzer/crates/edition",
+     "path": "crates/edition",
      "version": "0.0.0"
     },
     "either": "1.15.0",
@@ -6522,58 +6636,42 @@
      "version": "0.17.0"
     },
     "hir": {
-     "path": "vendor/rust-analyzer/crates/hir",
+     "path": "crates/hir",
      "version": "0.0.0"
     },
     "hir-def": {
-     "path": "vendor/rust-analyzer/crates/hir-def",
+     "path": "crates/hir-def",
      "version": "0.0.0"
     },
     "hir-expand": {
-     "path": "vendor/rust-analyzer/crates/hir-expand",
+     "path": "crates/hir-expand",
      "version": "0.0.0"
     },
     "hir-ide": {
-     "path": "vendor/rust-analyzer/crates/hir-ide",
+     "path": "crates/hir-ide",
      "version": "0.0.0"
     },
     "hir-ty": {
-     "path": "vendor/rust-analyzer/crates/hir-ty",
+     "path": "crates/hir-ty",
      "version": "0.0.0"
     },
     "hir-ty-borrowck": {
-     "path": "vendor/rust-analyzer/crates/hir-ty-borrowck",
+     "path": "crates/hir-ty-borrowck",
      "version": "0.0.0"
     },
     "hir-ty-codegen": {
      "path": "crates/hir-ty-codegen"
     },
     "hir-ty-wfcheck": {
-     "path": "vendor/rust-analyzer/crates/hir-ty-wfcheck",
-     "version": "0.0.0"
-    },
-    "ide": {
-     "path": "vendor/rust-analyzer/crates/ide",
-     "version": "0.0.0"
-    },
-    "ide-assists": {
-     "path": "vendor/rust-analyzer/crates/ide-assists",
-     "version": "0.0.0"
-    },
-    "ide-completion": {
-     "path": "vendor/rust-analyzer/crates/ide-completion",
+     "path": "crates/hir-ty-wfcheck",
      "version": "0.0.0"
     },
     "ide-db": {
-     "path": "vendor/rust-analyzer/crates/ide-db",
+     "path": "crates/ide-db",
      "version": "0.0.0"
     },
     "ide-diagnostics": {
-     "path": "vendor/rust-analyzer/crates/ide-diagnostics",
-     "version": "0.0.0"
-    },
-    "ide-ssr": {
-     "path": "vendor/rust-analyzer/crates/ide-ssr",
+     "path": "crates/ide-diagnostics",
      "version": "0.0.0"
     },
     "indexmap": {
@@ -6583,7 +6681,7 @@
      "version": "2.9.0"
     },
     "intern": {
-     "path": "vendor/rust-analyzer/crates/intern",
+     "path": "crates/intern",
      "version": "0.0.0"
     },
     "itertools": "0.15.0",
@@ -6595,28 +6693,24 @@
      "version": "0.1.2"
     },
     "load-cargo": {
-     "path": "vendor/rust-analyzer/crates/load-cargo",
+     "path": "crates/load-cargo",
      "version": "0.0.0"
     },
-    "lsp-server": {
-     "version": "0.7.9"
-    },
     "macros": {
-     "path": "vendor/rust-analyzer/crates/macros",
+     "path": "crates/macros",
      "version": "0.0.0"
     },
     "mbe": {
-     "path": "vendor/rust-analyzer/crates/mbe",
+     "path": "crates/mbe",
      "version": "0.0.0"
     },
     "nohash-hasher": "0.2.0",
-    "oorandom": "11.1.5",
     "parser": {
-     "path": "vendor/rust-analyzer/crates/parser",
+     "path": "crates/parser",
      "version": "0.0.0"
     },
     "paths": {
-     "path": "vendor/rust-analyzer/crates/paths",
+     "path": "crates/paths",
      "version": "0.0.0"
     },
     "postcard": {
@@ -6627,32 +6721,25 @@
      "version": "1.1.3"
     },
     "proc-macro-api": {
-     "path": "vendor/rust-analyzer/crates/proc-macro-api",
+     "path": "crates/proc-macro-api",
      "version": "0.0.0"
     },
     "proc-macro-srv": {
-     "path": "vendor/rust-analyzer/crates/proc-macro-srv",
+     "path": "crates/proc-macro-srv",
      "version": "0.0.0"
     },
-    "process-wrap": {
-     "features": [
-      "std"
-     ],
-     "version": "9.1.0"
-    },
     "profile": {
-     "path": "vendor/rust-analyzer/crates/profile",
+     "path": "crates/profile",
      "version": "0.0.0"
     },
     "project-model": {
-     "path": "vendor/rust-analyzer/crates/project-model",
+     "path": "crates/project-model",
      "version": "0.0.0"
     },
     "pulldown-cmark": {
      "default-features": false,
      "version": "0.9.6"
     },
-    "pulldown-cmark-to-cmark": "10.0.4",
     "ra-ap-rustc_abi": {
      "default-features": false,
      "version": "0.166"
@@ -6730,34 +6817,34 @@
     },
     "smol_str": "0.3.2",
     "span": {
-     "path": "vendor/rust-analyzer/crates/span",
+     "path": "crates/span",
      "version": "0.0.0"
     },
     "stdx": {
-     "path": "vendor/rust-analyzer/crates/stdx",
+     "path": "crates/stdx",
      "version": "0.0.0"
     },
     "syntax": {
-     "path": "vendor/rust-analyzer/crates/syntax",
+     "path": "crates/syntax",
      "version": "0.0.0"
     },
     "syntax-bridge": {
-     "path": "vendor/rust-analyzer/crates/syntax-bridge",
+     "path": "crates/syntax-bridge",
      "version": "0.0.0"
     },
     "test-fixture": {
-     "path": "vendor/rust-analyzer/crates/test-fixture",
+     "path": "crates/test-fixture",
      "version": "0.0.0"
     },
     "test-utils": {
-     "path": "vendor/rust-analyzer/crates/test-utils",
+     "path": "crates/test-utils",
      "version": "0.0.0"
     },
     "text-size": "1.1.1",
     "thin-vec": "0.2.16",
     "toml": "1.1.2",
     "toolchain": {
-     "path": "vendor/rust-analyzer/crates/toolchain",
+     "path": "crates/toolchain",
      "version": "0.0.0"
     },
     "tracing": {
@@ -6788,28 +6875,27 @@
      "version": "0.1.14"
     },
     "tt": {
-     "path": "vendor/rust-analyzer/crates/tt",
+     "path": "crates/tt",
      "version": "0.0.0"
     },
     "unicode-ident": "=1.0.24",
     "unicode-width": "0.2.2",
     "url": "2.5.4",
     "vfs": {
-     "path": "vendor/rust-analyzer/crates/vfs",
+     "path": "crates/vfs",
      "version": "0.0.0"
     },
     "vfs-notify": {
-     "path": "vendor/rust-analyzer/crates/vfs-notify",
+     "path": "crates/vfs-notify",
      "version": "0.0.0"
-    },
-    "xshell": "0.2.7"
+    }
    },
    "exclude": [
     "crates/ra-jit-wasm",
     "demo",
     "harness",
     "vendor/proc-macro-srv",
-    "vendor/rust-analyzer"
+    "crates/proc-macro-srv/proc-macro-test/imp"
    ],
    "lints": {
     "cargo": {
@@ -7599,7 +7685,7 @@
    "version": "1.6.0"
   },
   "base-db@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Basic database trait and infra for rust-analyzer's crate and source root inputs. The concrete DB is defined by `ide` (aka `ra_ap_ide`).",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -7607,10 +7693,10 @@
    "links": null,
    "name": "base-db",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/base-db",
+    "dir": "crates/base-db",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -8160,7 +8246,7 @@
    "version": "1.0.4"
   },
   "cfg@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Conditional compiling options, `cfg` attribute parser and evaluator for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -8168,10 +8254,10 @@
    "links": null,
    "name": "cfg",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/cfg",
+    "dir": "crates/cfg",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -9060,6 +9146,23 @@
    },
    "version": "1.6.1"
   },
+  "derive_arbitrary@1.4.2": {
+   "authors": "The Rust-Fuzz Project Developers:Nick Fitzgerald <fitzgen@gmail.com>:Manish Goregaokar <manishsmail@gmail.com>:Andre Bogus <bogusandre@gmail.com>:Corey Farwell <coreyf@rwell.org>",
+   "description": "Derives arbitrary traits",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "derive_arbitrary",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-fuzz/arbitrary",
+   "rust_version": "1.63.0",
+   "source": {
+    "checksum": "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a",
+    "kind": "registry"
+   },
+   "version": "1.4.2"
+  },
   "diff@0.1.13": {
    "authors": "Utkarsh Kukreti <utkarshkukreti@gmail.com>",
    "description": "An LCS based slice and string diffing implementation.",
@@ -9214,7 +9317,7 @@
    "version": "2.2.3"
   },
   "edition@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Rust edition support crate for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -9222,10 +9325,10 @@
    "links": null,
    "name": "edition",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/edition",
+    "dir": "crates/edition",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -9945,7 +10048,7 @@
    "version": "0.4.3"
   },
   "hir-def@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Early name and import resolution for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -9953,16 +10056,16 @@
    "links": null,
    "name": "hir-def",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/hir-def",
+    "dir": "crates/hir-def",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "hir-expand@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Macro expansion for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -9970,16 +10073,16 @@
    "links": null,
    "name": "hir-expand",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/hir-expand",
+    "dir": "crates/hir-expand",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "hir-ide@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "The final bits of analysis; Display, extra diagnostics, and tests.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -9987,16 +10090,16 @@
    "links": null,
    "name": "hir-ide",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/hir-ide",
+    "dir": "crates/hir-ide",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "hir-ty-borrowck@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "rustc's NLL and Polonius borrow checker over rust-analyzer's MIR.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10004,10 +10107,10 @@
    "links": null,
    "name": "hir-ty-borrowck",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/hir-ty-borrowck",
+    "dir": "crates/hir-ty-borrowck",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10030,7 +10133,7 @@
    "version": "0.20261027.0"
   },
   "hir-ty-wfcheck@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "rustc's item well-formedness checks of what outlives what, over rust-analyzer's types.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10038,16 +10141,16 @@
    "links": null,
    "name": "hir-ty-wfcheck",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/hir-ty-wfcheck",
+    "dir": "crates/hir-ty-wfcheck",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "hir-ty@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "The type system for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10055,16 +10158,16 @@
    "links": null,
    "name": "hir-ty",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/hir-ty",
+    "dir": "crates/hir-ty",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "hir@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "A high-level object-oriented access to Rust code for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10072,10 +10175,10 @@
    "links": null,
    "name": "hir",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/hir",
+    "dir": "crates/hir",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10387,7 +10490,7 @@
    "version": "2.3.0"
   },
   "ide-db@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Core data structure representing IDE state for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10395,16 +10498,16 @@
    "links": null,
    "name": "ide-db",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/ide-db",
+    "dir": "crates/ide-db",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "ide-diagnostics@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Diagnostics rendering and fixits for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10412,10 +10515,10 @@
    "links": null,
    "name": "ide-diagnostics",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/ide-diagnostics",
+    "dir": "crates/ide-diagnostics",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10523,7 +10626,7 @@
    "version": "0.11.2"
   },
   "intern@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Global `Arc`-based object interning infrastructure for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10531,10 +10634,10 @@
    "links": null,
    "name": "intern",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/intern",
+    "dir": "crates/intern",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10965,7 +11068,7 @@
    "version": "0.8.2"
   },
   "load-cargo@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Loads a Cargo project into a static instance of rust-analyzer for analysis.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -10973,10 +11076,10 @@
    "links": null,
    "name": "load-cargo",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/load-cargo",
+    "dir": "crates/load-cargo",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -11067,7 +11170,7 @@
    "version": "0.6.0"
   },
   "macros@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Proc macros for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -11075,16 +11178,16 @@
    "links": null,
    "name": "macros",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/macros",
+    "dir": "crates/macros",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "mbe@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Handling of `macro_rules` macros for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -11092,10 +11195,10 @@
    "links": null,
    "name": "mbe",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/mbe",
+    "dir": "crates/mbe",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -11645,7 +11748,7 @@
    "version": "0.9.12"
   },
   "parser@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "The Rust parser for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -11653,10 +11756,10 @@
    "links": null,
    "name": "parser",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/parser",
+    "dir": "crates/parser",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -11696,7 +11799,7 @@
    "version": "0.2.3"
   },
   "paths@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Path wrappers for absolute and relative paths rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -11704,10 +11807,10 @@
    "links": null,
    "name": "paths",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/paths",
+    "dir": "crates/paths",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -11968,7 +12071,7 @@
    "version": "0.2.37"
   },
   "proc-macro-api@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "RPC Api for the `proc-macro-srv` crate of rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -11976,10 +12079,44 @@
    "links": null,
    "name": "proc-macro-api",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/proc-macro-api",
+    "dir": "crates/proc-macro-api",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "proc-macro-srv@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "Proc-macro server for rust-analyzer.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "proc-macro-srv",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/proc-macro-srv",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "proc-macro-test@0.0.0": {
+   "authors": "",
+   "description": "",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "proc-macro-test",
+   "readme": "",
+   "repository": "",
+   "rust_version": "",
+   "source": {
+    "dir": "crates/proc-macro-srv/proc-macro-test",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -12002,7 +12139,7 @@
    "version": "1.0.106"
   },
   "profile@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "A collection of tools for profiling rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -12010,16 +12147,16 @@
    "links": null,
    "name": "profile",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/profile",
+    "dir": "crates/profile",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "project-model@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "A representation for a Cargo project for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -12027,10 +12164,10 @@
    "links": null,
    "name": "project-model",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/project-model",
+    "dir": "crates/project-model",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -12166,7 +12303,7 @@
    "repository": "",
    "rust_version": "",
    "source": {
-    "dir": "vendor/rustc_abi",
+    "dir": "crates/rustc_abi",
     "kind": "path"
    },
    "version": "0.166.0"
@@ -12676,7 +12813,7 @@
    "repository": "https://github.com/rust-analyzer/rowan",
    "rust_version": "",
    "source": {
-    "dir": "vendor/rust-analyzer/lib/rowan",
+    "dir": "crates/rowan",
     "kind": "path"
    },
    "version": "0.17.0"
@@ -13498,7 +13635,7 @@
    "version": "0.6.5"
   },
   "span@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "File and span related types for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -13506,10 +13643,10 @@
    "links": null,
    "name": "span",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/span",
+    "dir": "crates/span",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -13583,7 +13720,7 @@
    "version": "0.1.25"
   },
   "stdx@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Missing batteries for standard libraries for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -13591,10 +13728,10 @@
    "links": null,
    "name": "stdx",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/stdx",
+    "dir": "crates/stdx",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -13685,7 +13822,7 @@
    "version": "0.13.2"
   },
   "syntax-bridge@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Conversions between syntax nodes and token trees for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -13693,16 +13830,16 @@
    "links": null,
    "name": "syntax-bridge",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/syntax-bridge",
+    "dir": "crates/syntax-bridge",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "syntax@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Concrete syntax tree definitions for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -13710,10 +13847,10 @@
    "links": null,
    "name": "syntax",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/syntax",
+    "dir": "crates/syntax",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -13804,7 +13941,7 @@
    "version": "1.4.1"
   },
   "test-fixture@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Test fixtures for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -13813,15 +13950,15 @@
    "name": "test-fixture",
    "readme": "",
    "repository": "",
-   "rust_version": "1.98",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/test-fixture",
+    "dir": "crates/test-fixture",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "test-utils@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Assorted testing utilities for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -13829,10 +13966,10 @@
    "links": null,
    "name": "test-utils",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/test-utils",
+    "dir": "crates/test-utils",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -14229,7 +14366,7 @@
    "version": "1.1.1+spec-1.1.0"
   },
   "toolchain@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Discovery of `cargo` & `rustc` executables for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -14237,10 +14374,10 @@
    "links": null,
    "name": "toolchain",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/toolchain",
+    "dir": "crates/toolchain",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -14433,7 +14570,7 @@
    "version": "0.2.5"
   },
   "tt@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "A `TokenTree` data structure for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -14441,10 +14578,10 @@
    "links": null,
    "name": "tt",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/tt",
+    "dir": "crates/tt",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -14807,7 +14944,7 @@
    "version": "0.9.5"
   },
   "vfs-notify@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "Implementation of `loader::Handle` for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -14815,16 +14952,16 @@
    "links": null,
    "name": "vfs-notify",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/vfs-notify",
+    "dir": "crates/vfs-notify",
     "kind": "path"
    },
    "version": "0.0.0"
   },
   "vfs@0.0.0": {
-   "authors": "rust-analyzer team",
+   "authors": "blaze contributors",
    "description": "A virtual file system for rust-analyzer.",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
@@ -14832,10 +14969,10 @@
    "links": null,
    "name": "vfs",
    "readme": "",
-   "repository": "https://github.com/rust-lang/rust-analyzer",
-   "rust_version": "1.98",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
    "source": {
-    "dir": "vendor/rust-analyzer/crates/vfs",
+    "dir": "crates/vfs",
     "kind": "path"
    },
    "version": "0.0.0"

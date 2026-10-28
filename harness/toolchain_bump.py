@@ -14,7 +14,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     Windows) rustc-codegen-cranelift-preview for every host blaze ships for;
  2. writes harness/toolchain and runs toolchain_pins.py --write (pins.txt: the files' hashes,
     the nightly's `rustc -V` and its rust-lang/rust commit);
- 3. re-vendors from rust-lang/rust at the new commit: vendor/rustc_abi/src is
+ 3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
     the new commit with ra-jit's changes to them at the old commit carried over (a three-way
     apply; a conflict stops the bump and names the files);
@@ -55,7 +55,7 @@ MENTIONS = ["install.sh", "vendor/proc-macro-srv/Cargo.toml",
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
 # vendor/proc-macro-srv's manifest and lock file are ra-jit's, written from upstream's (their
 # header says how) and carried as they are; its crates are upstream's (`server_dirs`).
-ABI = ("vendor/rustc_abi/src", "compiler/rustc_abi/src")
+ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
 
 
 class Failed(Exception):
@@ -341,7 +341,7 @@ ra-jit is pinned to {name} ({new[1]}). Left to do:
     (with that host's release build of ra-jit), then commit crates/ra-jit/src/answers/rustc.json;
   - `cargo build -p ra-jit --release` and fix what the new rustc_abi and std ask for;
   - `python3 harness/toolchain_bump.py --checks` in an ix VM, under Cranelift and under LLVM
-    (`nix develop -c ...` with RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast);
+    (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);
   - the full tier (uitest.py, libsuite.py, borrowck_ui.py) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
 
@@ -351,13 +351,13 @@ async def checks():
     name = open(PIN).read().strip()
     env = dict(os.environ, RUSTUP_TOOLCHAIN=name)
     await run("build", "cargo", "build", "-p", "ra-jit", "--release", env=env, bound=3600)
-    env.setdefault("RA_JIT_BIN", os.path.join(ROOT, "target/release/ra-jit"))
+    env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/ra-jit"))
     harness = [
         ["toolchain_pins.py"],
         ["answers.py"],
         ["macroserver.py"],
         ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"],
-        *(["ci.py", part] for part in ci.fast_parts(env.get("RA_JIT_BACKEND") or "cranelift")),
+        *(["ci.py", part] for part in ci.fast_parts(env.get("BLAZE_BACKEND") or "cranelift")),
     ]
     failed = []
 

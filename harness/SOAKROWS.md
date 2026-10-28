@@ -94,9 +94,9 @@ daemon: pid 4085930, version 0.0.0-3dbb3e0-18df8554f87b32ab, exits after 1800s i
   1 x the daemon has not loaded this workspace
 /tmp/ra-jit-soakrows-3n083k2o/memory-ceiling/ws2 (dev, 2ff2bf3bf318179d): 0 builds by the daemon, 0 by cargo
 
-worker 7d0428d53c27bf4a of /tmp/ra-jit-soakrows-3n083k2o/memory-ceiling/ws/ stopped: the workers hold 1283 MB, over the 1 MB of RA_JIT_MEMORY_MAX, and it was asked longest ago
-worker 669444e08b2e8df6 of /tmp/ra-jit-soakrows-3n083k2o/memory-ceiling/ws2/ stopped: the workers hold 1168 MB, over the 1 MB of RA_JIT_MEMORY_MAX, and it was asked longest ago
-worker 7d0428d53c27bf4a of /tmp/ra-jit-soakrows-3n083k2o/memory-ceiling/ws/ stopped: the workers hold 1522 MB, over the 1 MB of RA_JIT_MEMORY_MAX, and it was asked longest ago
+worker 7d0428d53c27bf4a of /tmp/ra-jit-soakrows-3n083k2o/memory-ceiling/ws/ stopped: the workers hold 1283 MB, over the 1 MB of BLAZE_MEMORY_MAX, and it was asked longest ago
+worker 669444e08b2e8df6 of /tmp/ra-jit-soakrows-3n083k2o/memory-ceiling/ws2/ stopped: the workers hold 1168 MB, over the 1 MB of BLAZE_MEMORY_MAX, and it was asked longest ago
+worker 7d0428d53c27bf4a of /tmp/ra-jit-soakrows-3n083k2o/memory-ceiling/ws/ stopped: the workers hold 1522 MB, over the 1 MB of BLAZE_MEMORY_MAX, and it was asked longest ago
 ```
 
 ## no memory ceiling

@@ -23,6 +23,6 @@ not found: [("no entry", 26569)]
 manifest: kept, 2 files, 69741328 bytes (4.4s)
 memory after warm-up: 3540 MB resident, 2856 MB live
 watching 135 files
-tier: off (RA_JIT_TIER=off, blaze built without `--features llvm`, or not macOS on AArch64)
+tier: off (BLAZE_TIER=off, blaze built without `--features llvm`, or not macOS on AArch64)
 request: sync at_us=1793147548382228
 request: sync at_us=1793147548398283

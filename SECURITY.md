@@ -29,10 +29,10 @@ Only the latest release, and `main`, get fixes.
 - **A shared store is trusted input unless you turn signing on.** Packs fetched from a
   remote are checked against the hash in their name, so storage cannot alter them. But
   whoever can write to the bucket can list a pack of their own making, and ra-jit will link
-  that code into your programs. With `RA_JIT_REMOTE_TRUST` set, only manifests signed by
+  that code into your programs. With `BLAZE_REMOTE_TRUST` set, only manifests signed by
   keys you list are accepted. See [docs/cache.md](docs/cache.md), "Trust and signing".
 - **The local store is trusted.** Its records carry checksums against damage, not against
-  tampering: anyone who can write to the directory `RA_JIT_CACHE` names can put code into
+  tampering: anyone who can write to the directory `BLAZE_CACHE` names can put code into
   your builds. Keep it writable by you alone.
 - **Credentials.** ra-jit does not hold S3 credentials; the AWS SDK finds and uses them, and
   they are not printed.

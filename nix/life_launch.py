@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Open the Game of Life window; on macOS arm64, edits to its source show up live.
 
-Started by the `ra-jit-life` wrapper in flake.nix, which passes everything in RA_JIT_LIFE_*:
+Started by the `ra-jit-life` wrapper in flake.nix, which passes everything in BLAZE_LIFE_*:
 
   SOURCE       store path holding demo/life and crates/ra-jit-live
   VENDOR       vendored crates.io sources for demo/life's Cargo.lock
@@ -14,7 +14,7 @@ by cargo and the ra-jit daemon, and started. From then on the window's editor se
 text straight to the daemon, which builds it from memory and patches the running window; the
 editor writes the copy's src/main.rs after that, and nothing here runs again. Without live edits
 (they are macOS on AArch64 only) the prebuilt window runs, and the edited copy is not used.
-RA_JIT_LIFE_DAEMON=1 forces the daemon path, RA_JIT_LIFE_DAEMON=0 the prebuilt one.
+BLAZE_LIFE_DAEMON=1 forces the daemon path, BLAZE_LIFE_DAEMON=0 the prebuilt one.
 
 Python 3.13, stdlib only.
 """
@@ -40,9 +40,9 @@ class StepError(Exception):
 
 def env(name: str) -> str:
     try:
-        return os.environ[f"RA_JIT_LIFE_{name}"]
+        return os.environ[f"BLAZE_LIFE_{name}"]
     except KeyError:
-        raise StepError(f"RA_JIT_LIFE_{name} is not set: run this through the `ra-jit-life` wrapper") from None
+        raise StepError(f"BLAZE_LIFE_{name} is not set: run this through the `ra-jit-life` wrapper") from None
 
 
 async def run(step: str, cmd: list[str], timeout: float, cwd: Path, run_env: dict[str, str]) -> str:
@@ -65,7 +65,7 @@ async def run(step: str, cmd: list[str], timeout: float, cwd: Path, run_env: dic
 
 
 def use_daemon() -> bool:
-    forced = os.environ.get("RA_JIT_LIFE_DAEMON")
+    forced = os.environ.get("BLAZE_LIFE_DAEMON")
     if forced is not None:
         return forced == "1"
     return sys.platform == "darwin" and platform.machine() == "arm64"

@@ -2,7 +2,7 @@
 //!
 //! One task does it, a step at a time, on a thread of its own; no build waits for it. A build that lacked a key says so, and the task reads the manifest: when it is
 //! not what it was, it pulls, and the next build finds what arrived. What the daemon
-//! compiled is sealed and pushed every `RA_JIT_REMOTE_PUSH_EVERY` (five minutes; `off` for
+//! compiled is sealed and pushed every `BLAZE_REMOTE_PUSH_EVERY` (five minutes; `off` for
 //! never) and once more when the daemon is told to end, after which it ends as it was told.
 
 use std::{
@@ -25,9 +25,9 @@ const LOOK_EVERY: Duration = Duration::from_secs(5);
 /// How long the push of a daemon that was told to end may take before it ends anyway.
 const LAST_PUSH: Duration = Duration::from_secs(60);
 
-/// `RA_JIT_REMOTE_PUSH_EVERY`: a count and `s`, `m`, `h` or `d`, or `off`.
+/// `BLAZE_REMOTE_PUSH_EVERY`: a count and `s`, `m`, `h` or `d`, or `off`.
 pub(super) fn push_every_from_env() -> anyhow::Result<Option<Duration>> {
-    match std::env::var("RA_JIT_REMOTE_PUSH_EVERY") {
+    match std::env::var("BLAZE_REMOTE_PUSH_EVERY") {
         Err(_) => Ok(Some(PUSH_EVERY)),
         Ok(text) if text == "off" => Ok(None),
         Ok(text) => {
@@ -52,7 +52,7 @@ enum Step {
 #[derive(Default)]
 pub(super) struct Asked {
     /// The packs that are fetched when a key of theirs is asked for, with
-    /// `RA_JIT_REMOTE_LAZY`.
+    /// `BLAZE_REMOTE_LAZY`.
     lazy: RwLock<Option<Arc<Lazy>>>,
     /// What the manifest hashed to when it was last pulled from.
     seen: Mutex<Option<Digest>>,

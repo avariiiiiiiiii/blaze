@@ -2,7 +2,7 @@
 """nocompact.py: a program linked with `-no_compact_unwind` is spliced, and unwinds through the
 patch (macOS on AArch64, issue #33).
 
-usage: nocompact.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: nocompact.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
                         are found next to it)
 
 Such a program has `__eh_frame` and no `__unwind_info`, and the unwinder looks for every
@@ -12,7 +12,7 @@ program is built with `cargo ra-jit build` until the daemon serves the build, th
 few times: every edit after the first (which writes the whole object again) has to be
 spliced, print what the source says, and have the unwinder find the frame of the edited
 function where its symbol now is (`_Unwind_Find_FDE`). The daemon is run with
-`RA_JIT_RUSTC_BASE=0`, as headerpad.py is, and built for macOS 14, as nix's shell builds.
+`BLAZE_RUSTC_BASE=0`, as headerpad.py is, and built for macOS 14, as nix's shell builds.
 
 Python 3, stdlib only.
 """
@@ -128,16 +128,16 @@ def main():
     if sys.platform != "darwin":
         print("nocompact.py: only Apple's linker writes `__unwind_info`; nothing to do")
         return
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     root = tempfile.mkdtemp(prefix="ra-jit-nocompact-", dir="/tmp")
     ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-               RA_JIT_RUSTC_BASE="0", MACOSX_DEPLOYMENT_TARGET="14.0")
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
+               BLAZE_RUSTC_BASE="0", MACOSX_DEPLOYMENT_TARGET="14.0")
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "ncu"), os.path.join(ws, "src", "main.rs")

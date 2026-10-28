@@ -9,7 +9,7 @@ back, asking the daemon for the program after each. For each edit it prints the 
 daemon's answer, which includes the link or the splice, the time of `--after` (a command run
 on the linked program with `{}` standing for its path and `{n}` for the number of the edit,
 wasm-bindgen for one), and with `--run`
-that of running it, whose output must change with each edit. `RA_JIT_TARGET` and `RA_JIT_SPLICE`
+that of running it, whose output must change with each edit. `BLAZE_TARGET` and `BLAZE_SPLICE`
 mean what they do to the other harnesses.
 """
 import argparse, os, shlex, statistics, subprocess, sys, tempfile, time
@@ -48,7 +48,7 @@ def main():
         link[flavor:] = ["@" + response]
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     target = ["--out", obj, "--patch", patch, "--link-cmd", shlex.join(link),
-              *(["--splice", binary] if os.environ.get("RA_JIT_SPLICE") else []), *symbols]
+              *(["--splice", binary] if os.environ.get("BLAZE_SPLICE") else []), *symbols]
     out = open(log_path, "a")
     began = time.time()
     daemon = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--crate", args.crate, "--socket", socket, *target],

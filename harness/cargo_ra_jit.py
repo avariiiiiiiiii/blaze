@@ -5,7 +5,7 @@
 
 Four parts, all of which have to pass.
 
-Projects. Each one below is cloned at its tag, which has to be the commit it is pinned to, into `RA_JIT_PROJECTS` (~/ra-jit-projects) when
+Projects. Each one below is cloned at its tag, which has to be the commit it is pinned to, into `BLAZE_PROJECTS` (~/ra-jit-projects) when
 it is not there, and copied; the clone is never written to. In the copy, with plain cargo
 building into a target directory of its own as the reference:
   cold      `cargo ra-jit build` from nothing, with no daemon; the program is run
@@ -39,7 +39,7 @@ configuration and the environment do; and plain `cargo build`, `run`, `test`, `c
 `install` and doc tests with the daemon there, killed, and of another version.
 
 Writes CARGO-RA_JIT.md and cargo_ra_jit.json next to this file, or CARGO-RA_JIT-LLVM.md and
-cargo_ra_jit_llvm.json under `RA_JIT_BACKEND=llvm`. A run of some projects replaces their rows
+cargo_ra_jit_llvm.json under `BLAZE_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
 import collections, glob, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time, urllib.request
@@ -58,9 +58,9 @@ else:
 ROOT = os.path.dirname(HERE)
 WINDOWS = os.name == "nt"
 EXE = ".exe" if WINDOWS else ""
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit" + EXE)
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit" + EXE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-SOURCES = os.environ.get("RA_JIT_PROJECTS") or os.path.expanduser("~/ra-jit-projects")
+SOURCES = os.environ.get("BLAZE_PROJECTS") or os.path.expanduser("~/ra-jit-projects")
 WARMUP_SECS = 1800
 
 PROJECTS = {
@@ -173,9 +173,9 @@ STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Down
 
 
 def base_env(home):
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_HOME=home, CARGO_TERM_COLOR="never")
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never")
     # The store is on by default, in the user's cache directory: a run has one of its own.
-    env["RA_JIT_CACHE"] = os.path.join(home, "store")
+    env["BLAZE_CACHE"] = os.path.join(home, "store")
     env["PATH"] = os.path.dirname(RA_JIT) + os.pathsep + env["PATH"]
     # Set, not unset: cargo's `[env]` (as in ~/.cargo/config.toml) fills in only what is not already
     # set, so an unset RUST_BACKTRACE would take its value and panics would print differently.
@@ -268,7 +268,7 @@ class Side:
     def __init__(self, ws, env, ra_jit):
         self.ws, self.ra_jit, self.plain = ws, bool(ra_jit), ra_jit == "plain"
         self.env = env if ra_jit else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
-        self.tally = os.path.join(env["RA_JIT_HOME"], "plain-cargo.log")
+        self.tally = os.path.join(env["BLAZE_HOME"], "plain-cargo.log")
         self.read = 0
 
     def argv(self, command, *args):
@@ -294,7 +294,7 @@ class Side:
 
     def settled(self):
         """Waits until no build of plain cargo is still being handed to the daemon."""
-        settling = os.path.join(self.env["RA_JIT_HOME"], "settling")
+        settling = os.path.join(self.env["BLAZE_HOME"], "settling")
         began = time.time()
         while self.plain and os.path.isdir(settling) and os.listdir(settling) and time.time() - began < WARMUP_SECS:
             time.sleep(0.05)
@@ -302,7 +302,7 @@ class Side:
     def share(self):
         """The functions of the largest load the daemon compiled itself, of all it has."""
         loads = []
-        workers = os.path.join(self.env["RA_JIT_HOME"], "workers")
+        workers = os.path.join(self.env["BLAZE_HOME"], "workers")
         for worker in os.listdir(workers) if os.path.isdir(workers) else []:
             path = os.path.join(workers, worker, "log")
             # A worker that began as a spare keeps its log where it began.
@@ -800,14 +800,14 @@ def daemon(work):
     check("the workers of the daemon it replaced are gone", not any(alive(p) for p in workers_now), f"{workers_now}")
     newer.cargo("stop")
 
-    quick = Side(ws, dict(env, RA_JIT_IDLE_SECS="3"), True)
+    quick = Side(ws, dict(env, BLAZE_IDLE_SECS="3"), True)
     quick.cargo("build")
     pid, _, _ = status()
     wait_warm(quick, ws)
     _, workers, _ = status()
     time.sleep(6)
     gone = not alive(pid) and not any(alive(p) for p in workers)
-    check("idle for RA_JIT_IDLE_SECS, the daemon and its workers exit", pid is not None and workers and gone, f"daemon {pid}, workers {workers}")
+    check("idle for BLAZE_IDLE_SECS, the daemon and its workers exit", pid is not None and workers and gone, f"daemon {pid}, workers {workers}")
 
     here.cargo("build")
     wait_warm(here, ws)
@@ -1007,7 +1007,7 @@ def own_toolchain(work, check):
     env = base_env(home)
     for name in ("RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"):
         env.pop(name, None)
-    # BLAZE_HOME is the daemon's directory too, which RA_JIT_HOME names in the other steps.
+    # BLAZE_HOME is the daemon's directory too.
     env["BLAZE_HOME"] = home
     env["RUSTUP_HOME"] = os.path.join(work, "no-rustup")
     # A directory with Rust's programs in it is replaced by one with the rest of them: the C
@@ -1120,11 +1120,11 @@ def in_place(work, check):
     """On Linux the daemon writes a program it linked in full in place after it answered: the
     debug info, to where the splices write it. A program started while its file is open for
     writing is refused ("text file busy"), so whatever is given the program waits for the
-    write. The daemon holds each write here for RA_JIT_LAYOUT_PAUSE_MS (and says "laid out:
+    write. The daemon holds each write here for BLAZE_LAYOUT_PAUSE_MS (and says "laid out:
     paused", then "written") while a client is given the program each way a user is."""
     if not sys.platform.startswith("linux"):
         return
-    env = dict(base_env(os.path.join(work, "home-in-place")), RA_JIT_LAYOUT_PAUSE_MS="3000")
+    env = dict(base_env(os.path.join(work, "home-in-place")), BLAZE_LAYOUT_PAUSE_MS="3000")
     home = os.path.join(work, "in-place-cargo-home")
     os.makedirs(home)
     downloads(home)
@@ -1133,7 +1133,7 @@ def in_place(work, check):
 
     def writes():
         """How many writes in place began and how many are over, in every worker's log."""
-        logs = glob.glob(os.path.join(env["RA_JIT_HOME"], "*", "*", "log"))
+        logs = glob.glob(os.path.join(env["BLAZE_HOME"], "*", "*", "log"))
         said = "".join(open(log, errors="replace").read() for log in logs)
         return said.count("laid out: paused"), said.count("laid out: written")
 
@@ -1285,10 +1285,10 @@ def manners(work, ws, env, here, check, edit):
         cache = os.path.join(work, f"cache-{value}")
         home = os.path.join(work, f"home-store-{value}")
         own = base_env(home)
-        own.pop("RA_JIT_CACHE")
+        own.pop("BLAZE_CACHE")
         own["XDG_CACHE_HOME"] = cache
         if value is not None:
-            own["RA_JIT_CACHE"] = value
+            own["BLAZE_CACHE"] = value
         side = Side(ws, own, True)
         edit(ws, f"store {value}")
         side.cargo("build")
@@ -1298,7 +1298,7 @@ def manners(work, ws, env, here, check, edit):
         stats = subprocess.run([RA_JIT, "cache", "stats"], cwd=ws, env=own, capture_output=True, text=True)
         side.cargo("stop")
         asked = "unset" if value is None else repr(value)
-        check(f"RA_JIT_CACHE {asked}: the store is {'on, in the user cache directory' if kept else 'off'}", filled == kept and (stats.returncode == 0) == kept, f"`ra-jit cache stats` exit {stats.returncode}")
+        check(f"BLAZE_CACHE {asked}: the store is {'on, in the user cache directory' if kept else 'off'}", filled == kept and (stats.returncode == 0) == kept, f"`ra-jit cache stats` exit {stats.returncode}")
 
 
 def greets(out, greeting):
@@ -1401,7 +1401,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     check("and the first build of ra-jit replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and said == "daemon" and not by_rustc(back.stderr) and again not in (None, newer) and not alive(newer), f"{said}, pid {newer} then {again}")
     wait_warm(here, ws)
 
-    stranger(env["RA_JIT_HOME"], check)
+    stranger(env["BLAZE_HOME"], check)
     here.cargo("stop")
 
 
@@ -1418,7 +1418,7 @@ def stranger(home, check):
     name = "ra-jit-stranger"
     sudo = lambda *argv: subprocess.run(["sudo", "-n", *argv], capture_output=True, text=True)
     if sudo("true").returncode != 0:
-        check("a second user is turned away (needs sudo, which is not here)", os.environ.get("RA_JIT_NO_SUDO") == "1", "not run")
+        check("a second user is turned away (needs sudo, which is not here)", os.environ.get("BLAZE_NO_SUDO") == "1", "not run")
         return
     # macOS has no `useradd`, and has a user with nothing of its own.
     DARWIN = sys.platform == "darwin"
@@ -1428,7 +1428,7 @@ def stranger(home, check):
         sudo("userdel", name)
         made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
     sock = os.path.join(home, "daemon.sock")
-    version = re.search(r"version (\S+),", subprocess.run(["cargo", "ra-jit", "status"], env=dict(os.environ, RA_JIT_HOME=home, PATH=os.path.dirname(RA_JIT) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
+    version = re.search(r"version (\S+),", subprocess.run(["cargo", "ra-jit", "status"], env=dict(os.environ, BLAZE_HOME=home, PATH=os.path.dirname(RA_JIT) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
     request = json.dumps({"version": version, "replaces": False, "request": "Status"})
     def knock(user):
         run = subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/")
@@ -1477,7 +1477,7 @@ def stranger(home, check):
 
 # Each call is logged with the build that made it, so the calls of one build can be told from
 # those of a daemon's or a settle's cargo still running in the background.
-WRAPPER = '#!/bin/sh\nprintf "%s\\t%s\\n" "$1" "${{RA_JIT_HARNESS_BUILD:-}}" >> "{log}"\nexec "$@"\n'
+WRAPPER = '#!/bin/sh\nprintf "%s\\t%s\\n" "$1" "${{BLAZE_HARNESS_BUILD:-}}" >> "{log}"\nexec "$@"\n'
 DOCTEST = '/// ```\n/// assert_eq!(util::doubled(2), 4);\n/// ```\npub fn doubled(n: u32) -> u32 {\n    n * 2\n}\n'
 
 
@@ -1562,7 +1562,7 @@ def plain(work):
     downloads(home)
     env = dict(env, CARGO_HOME=home)
     on = subprocess.run([RA_JIT, "enable"], env=env, capture_output=True, text=True)
-    here, alone = Side(ws, env, "plain"), Side(ws, base_env(env["RA_JIT_HOME"]), False)
+    here, alone = Side(ws, env, "plain"), Side(ws, base_env(env["BLAZE_HOME"]), False)
     calls = lambda name: open(logs[name]).read().splitlines() if os.path.exists(logs[name]) else []
     edit = lambda text, root=ws: rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("', f'format!("{text} ')
     touch = lambda text, root=ws: open(os.path.join(root, "app/src/main.rs"), "a").write(f"\n// {text}\n")
@@ -1732,7 +1732,7 @@ def plain(work):
     check("after `ra-jit disable` the configuration is the user's again, byte for byte", back == before)
     touch("off")
     n = len(calls("outer"))
-    mine, how, wrong = same("run", "off", more={"RA_JIT_HARNESS_BUILD": "off"})
+    mine, how, wrong = same("run", "off", more={"BLAZE_HARNESS_BUILD": "off"})
     # Only this build's calls: the other build's daemon is still up and its cargo commands
     # (a settle, a plan, a project load) go through the same wrapper whenever they run.
     later = calls("outer")[n:]
@@ -1776,7 +1776,7 @@ def upgraded(work):
     here, ours = Side(ws, plain_env, "plain"), Side(ws, env, True)
     _, first = here.cargo("build", "--release")
     wait_warm(here, ws)
-    states = os.path.join(env["RA_JIT_HOME"], "states")
+    states = os.path.join(env["BLAZE_HOME"], "states")
     listed = [os.path.join(states, it) for it in os.listdir(states) if it.endswith(".json")] if os.path.isdir(states) else []
     # Beside each build's state are files of other shapes (lists); a state is an object.
     written = [it for it in listed if isinstance(json.load(open(it)), dict)]
@@ -1912,7 +1912,7 @@ def main():
         result["upgraded"] = upgraded(work)
         result["wrong"] += [f"upgraded: {name} {detail}" for name, held, detail in result["upgraded"] if not held]
     # A run of some of it leaves the rows of the rest as the run before wrote them.
-    llvm = os.environ.get("RA_JIT_BACKEND") == "llvm"
+    llvm = os.environ.get("BLAZE_BACKEND") == "llvm"
     stored = os.path.join(HERE, "cargo_ra_jit_llvm.json" if llvm else "cargo_ra_jit.json")
     before = json.load(open(stored)) if os.path.exists(stored) else {}
     rows = {(row["project"], row.get("mode", "ra-jit")): row for row in before.get("projects", []) + result["projects"]}

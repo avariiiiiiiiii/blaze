@@ -9,7 +9,7 @@ the daemon wrote after each edit with the one a new ra-jit process writes from t
 `--cargo` has the daemon link the program after each build, times `cargo build` on the same edit
 in a target directory of its own, and compares what the two programs print.
 
-Starts the daemon on bench2 for one crate (default regex_automata) with RA_JIT_STATS set, applies
+Starts the daemon on bench2 for one crate (default regex_automata) with BLAZE_STATS set, applies
 each scenario, and records the time to apply the change, the time spent in MIR queries, the
 total rebuild time, where it went, and how many functions were compiled again. Writes INVALIDATION.md.
 """
@@ -17,7 +17,7 @@ import os, re, shlex, signal, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-os.environ["RA_JIT_STATS"] = "1"
+os.environ["BLAZE_STATS"] = "1"
 import linkline
 from difftest import Fixture, RA_JIT, sysroot_rlibs
 from editbench import millis

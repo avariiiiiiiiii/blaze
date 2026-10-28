@@ -379,7 +379,7 @@ memory uses it. It combines two readings:
   (`ru_maxrss`; KiB on Linux, bytes on macOS). This is exact, but it is one process: cargo's 16
   rustc at once count as the largest of them.
 - **The sum over a tree, sampled.** A thread reads what every process under the command, and
-  under the daemon, holds every 10 ms (`RA_JIT_MEMORY_INTERVAL`) and keeps the largest sum. On
+  under the daemon, holds every 10 ms (`BLAZE_MEMORY_INTERVAL`) and keeps the largest sum. On
   Linux that is the resident size, from `/proc/PID/statm`, with the children of each thread in
   `/proc/PID/task/*/children`. On macOS it is the physical footprint, from
   `proc_pid_rusage`, with `proc_listchildpids`: what Activity Monitor shows, the memory a
@@ -471,9 +471,9 @@ builds it in a few minutes on the same machine. Its build needs `nix develop .#b
 ## Tiers
 
 Each project is measured with each code producer ra-jit has: Cranelift (the default, in the
-summary tables) and LLVM (`RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`). Cranelift is measured
-with ra-jit as it is installed and released, without the `llvm` feature (`RA_JIT_BIN`), and LLVM
-with a build that has it (`RA_JIT_LLVM_BIN`): a binary that links libLLVM loads it each time it
+summary tables) and LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). Cranelift is measured
+with ra-jit as it is installed and released, without the `llvm` feature (`BLAZE_BIN`), and LLVM
+with a build that has it (`BLAZE_LLVM_BIN`): a binary that links libLLVM loads it each time it
 starts, about 6 ms on the benchmark machine, and every `cargo ra-jit` starts it once. A new tier
 is one more entry in `BACKENDS` in `harness/bench.py`; the report makes a table for every
 backend in the result.
@@ -498,7 +498,7 @@ The flags go in through `--config target.'cfg(all())'.rustflags`, which cargo ad
 project's own (helix sets `--cfg tokio_unstable` there; `RUSTFLAGS` would replace it).
 `-Zshare-generics` is not a column: it is already on in every debug build. The nightly is
 `harness/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
-the flake (`RA_JIT_NIGHTLY`; `rust-bin.nightly."2026-10-09"` in the runs before 2026-10-25). A setup that cannot build a project is reported as failed and not timed
+the flake (`BLAZE_NIGHTLY`; `rust-bin.nightly."2026-10-09"` in the runs before 2026-10-25). A setup that cannot build a project is reported as failed and not timed
 after that.
 
 Hot-patching a running program is compared on its own (`harness/hotpatch.py`): a small program
@@ -540,7 +540,7 @@ patch, today Linux.
 
 ## The machines
 
-Every result records its machine and platform: the name it was given (`RA_JIT_BENCH_MACHINE`),
+Every result records its machine and platform: the name it was given (`BLAZE_BENCH_MACHINE`),
 the CPU, the cores the run could use (it may be pinned with `taskset`) and the machine's total,
 memory, OS, kernel, rustc, C compiler, linker, LLVM version and the load average when it
 started (below and in the JSON). The platforms, their runners' labels and how a result is
@@ -612,7 +612,7 @@ when:
 
 It then commits those files to main as `github-actions[bot]` with `[skip ci]` in the message (so
 the commit starts no other workflow), once for every platform, rebasing onto main if main moved
-during the run. It pushes with the secret `RA_JIT_BOT_TOKEN`, a repository admin's token, which
+during the run. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
 the ruleset on main lets past its required check; the job's own `GITHUB_TOKEN` is refused
 ([harness.md](harness.md#ci)). `bench-bun.yaml` does the same for bun, nightly, on the same runners: bun takes
 hours, so it has a workflow and a stored result of its own (`docs/benchmarks/bun-<platform>.json`
@@ -664,7 +664,7 @@ python3 harness/benchreport.py /tmp/bench.json --check               # what woul
 `--backend cranelift` measures one tier. `--cold-runs 5` repeats the cold builds, `--setups
 all --setups-on ripgrep,nushell` adds the setups above, `--tests` the test suites, and
 `--reference DIR` puts cargo's target directories outside the work directory.
-`python3 harness/hotpatch.py --edits 30` times hot-patching (needs `dx`: the bench shell has it). Projects are cloned once into `RA_JIT_PROJECTS`
+`python3 harness/hotpatch.py --edits 30` times hot-patching (needs `dx`: the bench shell has it). Projects are cloned once into `BLAZE_PROJECTS`
 (default `~/ra-jit-projects`). The whole CI set (seven projects, both tiers, five runs) took 38
 minutes on 16 Zen 5 cores, plus the build of ra-jit. It needs about 20 GB of memory (nushell)
 and 30 GB of disk.
@@ -672,7 +672,7 @@ and 30 GB of disk.
 memory. On macOS give `--work` a short directory (`--work /tmp/bench`): the daemon's socket
 path has to fit in 104 bytes, which a work directory under `$TMPDIR` does not leave room for.
 `python3 harness/benchreport.py RESULT` publishes a run as its platform's (the machine it ran
-on): `RA_JIT_BENCH_MACHINE` names that machine in the tables, and `taskset -c 0-15` before
+on): `BLAZE_BENCH_MACHINE` names that machine in the tables, and `taskset -c 0-15` before
 `python3` gives it the 16 cores of the benchmark machines. `benchreport.py --render` writes
 every table and chart again from the stored results.
 

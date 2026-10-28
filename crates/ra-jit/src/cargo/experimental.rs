@@ -16,7 +16,7 @@ use anyhow::Context as _;
 /// The key, in `[workspace.metadata.blaze]`, that lists the experiments a workspace opts into.
 pub(crate) const KEY: &str = "experimental";
 
-/// Every test of the workspace runs in a sandbox, and under `RA_JIT_TESTS=affected` a pass is
+/// Every test of the workspace runs in a sandbox, and under `BLAZE_TESTS=affected` a pass is
 /// kept by what the test read ([`super::sandboxed`]).
 pub(crate) const SANDBOXED_TESTS: &str = "sandboxed-tests";
 

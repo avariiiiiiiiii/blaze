@@ -28,7 +28,7 @@ from storelib import scratch
 
 WASI = "wasm32-wasip1"
 UNKNOWN = "wasm32-unknown-unknown"
-WASMTIME = os.environ.get("RA_JIT_WASMTIME", "wasmtime")
+WASMTIME = os.environ.get("BLAZE_WASMTIME", "wasmtime")
 
 HELLO = """fn main() {
     let v: Vec<u32> = (1..=10).collect();
@@ -250,7 +250,7 @@ def package(work, name, manifest, path, source, config=None):
 
 
 def ra_jit(root, crate, out, exe, target, store, *extra):
-    env = {"RA_JIT_CACHE": store, "RA_JIT_STD_FROM": "off"}
+    env = {"BLAZE_CACHE": store, "BLAZE_STD_FROM": "off"}
     return run([RA_JIT, root, "--crate", crate, "--out", out, "--exe", exe, "--target", target,
                 *extra], root, f"ra-jit {crate} ({target})", env)
 
@@ -260,7 +260,7 @@ def cargo_blaze(root, what, store, runtime, target):
     and a daemon of its own, in a copy of the package without cargo's build. Returns the copy
     and how long the build took."""
     env = {"PATH": os.path.dirname(os.path.abspath(RA_JIT)) + os.pathsep + os.environ["PATH"],
-           "RA_JIT_CACHE": store, "XDG_RUNTIME_DIR": runtime}
+           "BLAZE_CACHE": store, "XDG_RUNTIME_DIR": runtime}
     copy = root + "-blaze"
     shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target"))
     root = copy

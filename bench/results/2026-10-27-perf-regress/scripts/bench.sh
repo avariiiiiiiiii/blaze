@@ -14,8 +14,8 @@ if [ ! -x $bin/ra-jit ] && [ -s /root/perf/tars/$rev.tar ]; then mkdir -p $bin &
 [ -x $bin/ra-jit ] || { echo "no binary for $rev"; exit 125; }
 [ -d /root/perf/wt ] || git -C /root/perf/blaze worktree add -q --detach /root/perf/wt "$rev"
 cd /root/perf/wt && git checkout -q --force --detach "$rev"
-export RA_JIT_PROJECTS=/root/ra-jit-projects
-export RA_JIT_BIN=$bin/ra-jit RA_JIT_LLVM_BIN=$bin/ra-jit
+export BLAZE_PROJECTS=/root/ra-jit-projects
+export BLAZE_BIN=$bin/ra-jit BLAZE_LLVM_BIN=$bin/ra-jit
 work=/root/perf/work/$tag-$backend
 rm -rf "$work"; mkdir -p "$work"
 cd harness

@@ -373,7 +373,7 @@ def macro_list(library):
             "    _fields_ = [('kind', ctypes.c_uint32), ('name', Slice), ('helpers', Slice),\n"
             "                ('client', ctypes.c_void_p)]\n"
             "text = lambda it: ctypes.string_at(it.ptr, it.len).decode()\n"
-            "listed = Slice.in_dll(ctypes.CDLL(sys.argv[1]), 'RA_JIT_PROC_MACROS')\n"
+            "listed = Slice.in_dll(ctypes.CDLL(sys.argv[1]), 'BLAZE_PROC_MACROS')\n"
             "macros = (Macro * listed.len).from_address(listed.ptr)\n"
             "helpers = lambda it: [text(h) for h in (Slice * it.len).from_address(it.ptr or 1)]\n"
             "print(json.dumps([[m.kind, text(m.name), helpers(m.helpers), bool(m.client)]\n"
@@ -440,11 +440,11 @@ def main():
                 _, took = ra_jit(roots[program], std_of(panic), units[panic])
                 lines.append(f"the standard library alone, panic = \"{panic}\": {took:.2f} s, "
                              f"{os.path.getsize(units[panic]) >> 20} MB")
-        remote = {"RA_JIT_REMOTE": os.path.join(work, "remote"), "RA_JIT_PROJECT": "allrajit",
-                  "RA_JIT_REMOTE_UNSIGNED": "1"}
-        os.makedirs(remote["RA_JIT_REMOTE"])
-        stores = [{"RA_JIT_CACHE": os.path.join(work, "store"), **remote},
-                  {"RA_JIT_CACHE": os.path.join(work, "store2"), **remote}]
+        remote = {"BLAZE_REMOTE": os.path.join(work, "remote"), "BLAZE_PROJECT": "allrajit",
+                  "BLAZE_REMOTE_UNSIGNED": "1"}
+        os.makedirs(remote["BLAZE_REMOTE"])
+        stores = [{"BLAZE_CACHE": os.path.join(work, "store"), **remote},
+                  {"BLAZE_CACHE": os.path.join(work, "store2"), **remote}]
         for way in ways:
             # The first program again once the store has the library, and the second on
             # another store.

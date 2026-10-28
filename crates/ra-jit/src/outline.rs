@@ -162,10 +162,10 @@ impl Outlines {
         listed: &Listed,
         files: Vec<FileId>,
     ) -> Vec<Changed> {
-        let off = std::env::var_os("RA_JIT_NO_BODIES").is_some();
+        let off = std::env::var_os("BLAZE_NO_BODIES").is_some();
         let start = std::time::Instant::now();
         let changed = self.types_changed(db, &files);
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!("types-us: {}", start.elapsed().as_micros());
         }
         if !changed.is_empty() {
@@ -340,7 +340,7 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
 /// The [`outline`] of each file. A wide edit is of thousands of files: their bodies are
 /// lowered together and the files are hashed on all threads.
 fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<u64>> {
-    let stats = std::env::var_os("RA_JIT_STATS").is_some();
+    let stats = std::env::var_os("BLAZE_STATS").is_some();
     if files.len() > 1 {
         let mut crates: Vec<_> =
             files.iter().flat_map(|&file| relevant_crates(db, file).iter().copied()).collect();
@@ -478,7 +478,7 @@ fn types(db: &RootDatabase, file: FileId) -> FxHashMap<String, u64> {
 /// the file is not read as a file of its own. `functions` are those written in it.
 fn outline(db: &RootDatabase, file: FileId, functions: &[FunctionId]) -> Option<u64> {
     let Some(seen) = Written::of(db, functions) else {
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!("outline: {file:?} is included in another file");
         }
         return None;

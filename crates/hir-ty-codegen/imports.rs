@@ -85,11 +85,11 @@ pub(super) struct Import {
 }
 
 /// Whether the compiles of the build under way import what they call: LLVM at `-O2` or above
-/// in a build of a whole program ([`super::tier`]'s `across`), unless `RA_JIT_IMPORT=0`,
+/// in a build of a whole program ([`super::tier`]'s `across`), unless `BLAZE_IMPORT=0`,
 /// which has them build their callees in as compiles at a level above 1 do.
 pub(super) fn enabled() -> bool {
     static ASKED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_IMPORT").is_none_or(|it| it != "0"));
+        LazyLock::new(|| std::env::var_os("BLAZE_IMPORT").is_none_or(|it| it != "0"));
     *ASKED && super::tier::across() && backend::whole_program()
 }
 

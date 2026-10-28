@@ -9,7 +9,7 @@ The registry crates are built once and stay. Then, N times each (default 3):
   ra-jit cold    ra-jit on every crate of the workspace the program uses, with an empty store
   ra-jit warm    the same again with the store the cold run filled
   ra-jit none    the same with no store
-For ra-jit the time is the process's, loading included, with the split its `RA_JIT_STATS`
+For ra-jit the time is the process's, loading included, with the split its `BLAZE_STATS`
 lines give, and user and system CPU seconds next to the wall time. Every run is printed.
 """
 import json, os, re, resource, shutil, statistics, subprocess, sys, tempfile, time
@@ -106,7 +106,7 @@ def main():
     for name in ("cold", "warm", "none"):
         rows = []
         for _ in range(runs):
-            env = dict(os.environ, RA_JIT_STATS="1", RA_JIT_CACHE="off" if name == "none" else store)
+            env = dict(os.environ, BLAZE_STATS="1", BLAZE_CACHE="off" if name == "none" else store)
             if name == "cold":
                 shutil.rmtree(store, ignore_errors=True)
             row = timed(command, env=env)

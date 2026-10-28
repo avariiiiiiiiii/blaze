@@ -47,7 +47,7 @@ them. macOS and Linux; stdlib only.
 
 With `--server` the ra-jit just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
 docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
-proc-macro libraries ra-jit links, found beside ra-jit (`RA_JIT_PROC_MACRO_SERVER=1`). It is
+proc-macro libraries ra-jit links, found beside ra-jit (`BLAZE_PROC_MACRO_SERVER=1`). It is
 built whole by ra-jit (`--exe`), over the standard library ra-jit compiles, so it speaks the
 bridge of the libraries that ra-jit compiles; its own serde derives are expanded by the
 toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
@@ -303,8 +303,8 @@ def proc_macro_server(ra_jit, out):
     own; the path of the executable."""
     exe = out / SERVER_BIN
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
-        env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_CACHE=str(Path(work) / "store"),
-                   RA_JIT_STD_FROM="off", RUST_BACKTRACE="0")
+        env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_CACHE=str(Path(work) / "store"),
+                   BLAZE_STD_FROM="off", RUST_BACKTRACE="0")
         start = time.monotonic()
         # `proc_macro` is not in the standard library's unit: the program that links it has it.
         run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",

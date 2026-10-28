@@ -21,7 +21,7 @@ Everything here ran on ix VMs `perf5` and `perf6`: arm64 (Neoverse), 8 vCPU, 16 
 | no-op | #408 da138e119c ("build is the whole build", so every build reaches `link::stand_ins`, which read the whole 155 MB executable) | #800 (mmap) | 56 ms | 35 ms |
 | cold | #775: the store was keyed by the first toolchain a build script named, so std from `ra-jit std` was never found and was compiled again in the daemon | #801 | 39.0 s, peak 5.4 GB | 20.2 s, peak 2.9 GB |
 | cold load | #450 9bb16676c5 and onwards (no-rustc: build scripts built and probes answered by ra-jit child processes, each loading the sysroot again) | not fixed: see below | load 0.7 s (#441) | 5.4 s (#450), 9.4 s (main) |
-| cold llvm | RA_JIT_OPT=2 runs the thinlto O2 pipelines on every dependency function (31,885 functions, 145 s of LLVM CPU on CI); the baseline took dependencies from rustc | not fixed: needs a design decision | | |
+| cold llvm | BLAZE_OPT=2 runs the thinlto O2 pipelines on every dependency function (31,885 functions, 145 s of LLVM CPU on CI); the baseline took dependencies from rustc | not fixed: needs a design decision | | |
 
 The no-op range was measured per revision (`noop/<rev>/times.txt`): 0b48278e48 34 ms, 32ccb28b37 32 ms, da138e119c 66-99 ms, 58c3e559a0 53-55 ms.
 
@@ -32,7 +32,7 @@ The no-op range was measured per revision (`noop/<rev>/times.txt`): 0b48278e48 3
 - `noop/<rev>/` has a no-op client strace (`noop.strace`), syscall counts and timings.
 - `cold/58c3e559a0/` has the client strace of a cold build, with the ra-jit child processes and their times (strace-inflated).
 - `stdcheck/{base,stdkey}/` has worker logs of a cold build with and without #801 ("standard library: from the store").
-- `mem/<rev>/` holds the `RA_JIT_MEMORY` salsa tables (`tables/*.tsv`), RSS samples of every ra-jit process, and worker logs. `58c3e559a0` is main and `b6095a7b47` is main plus #801.
+- `mem/<rev>/` holds the `BLAZE_MEMORY` salsa tables (`tables/*.tsv`), RSS samples of every ra-jit process, and worker logs. `58c3e559a0` is main and `b6095a7b47` is main plus #801.
 - `prof/`, `prof3/` and `noopperf/` hold earlier worker logs and perf reports from edits and no-ops.
 - `scripts/` has the VM job scripts that produced all of this. Each job runs as a transient systemd unit through `job.sh` and `q.sh`.
 

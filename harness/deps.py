@@ -13,7 +13,7 @@ import os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import RUNNER, TARGET, profile_dir
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(HERE, "..", "target", "release", "ra-jit")
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(HERE, "..", "target", "release", "ra-jit")
 LOCAL = ["app", "near"]
 
 def write(path, text):
@@ -54,8 +54,8 @@ class Said:
 
 # The remote here is a directory of this user's, whose lists nobody signs: pulling from it
 # has to be asked for.
-UNSIGNED = {**os.environ, "RA_JIT_REMOTE_UNSIGNED": "1"}
-ASKED_FOR_NOTHING = {name: value for name, value in os.environ.items() if name != "RA_JIT_REMOTE_UNSIGNED"}
+UNSIGNED = {**os.environ, "BLAZE_REMOTE_UNSIGNED": "1"}
+ASKED_FOR_NOTHING = {name: value for name, value in os.environ.items() if name != "BLAZE_REMOTE_UNSIGNED"}
 
 def ra_jit(root, verb, remote, env=UNSIGNED):
     return Said([subprocess.run([RA_JIT, "deps", verb, remote, directory, name], cwd=root, capture_output=True, text=True, env=env)

@@ -55,11 +55,11 @@ def wasm(link):
 def allowing_duplicates(wasm):
     """What an ELF or wasm link line gets after ra-jit's objects. A wasm module that edits are
     spliced into has to keep its symbol table, as it names nothing but its exports otherwise,
-    and keeps what nothing calls yet, as an edit may. `RA_JIT_LINK_ARGS` is what it gets
+    and keeps what nothing calls yet, as an edit may. `BLAZE_LINK_ARGS` is what it gets
     instead of those."""
-    spliced = "--emit-relocs --no-gc-sections" if wasm and os.environ.get("RA_JIT_SPLICE") else ""
+    spliced = "--emit-relocs --no-gc-sections" if wasm and os.environ.get("BLAZE_SPLICE") else ""
     allow = "--allow-multiple-definition" if wasm else "-Wl,--allow-multiple-definition"
-    return [allow, *shlex.split(os.environ.get("RA_JIT_LINK_ARGS", spliced))]
+    return [allow, *shlex.split(os.environ.get("BLAZE_LINK_ARGS", spliced))]
 
 
 def ahead(link, objects, ra_jit):

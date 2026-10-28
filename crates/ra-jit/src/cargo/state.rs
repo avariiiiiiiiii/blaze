@@ -1130,7 +1130,7 @@ fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBu
 /// library, which the daemon compiles from, is not installed. `cargo blaze` has made it
 /// blaze's (`toolchain::settle`); plain cargo after `blaze enable` builds with the project's.
 ///
-/// `RA_JIT_OTHER_TOOLCHAIN=1` takes another toolchain anyway, for a project pinned to a
+/// `BLAZE_OTHER_TOOLCHAIN=1` takes another toolchain anyway, for a project pinned to a
 /// nightly near ours: the layouts, symbol names, ABI and `TypeId`s are still the pinned
 /// nightly's, and nothing checks that the other rustc agrees with them.
 fn other_toolchain() -> Option<String> {
@@ -1155,7 +1155,7 @@ fn other_toolchain() -> Option<String> {
 }
 
 pub(super) fn other_toolchain_allowed() -> bool {
-    std::env::var_os("RA_JIT_OTHER_TOOLCHAIN").is_some_and(|it| it == "1")
+    std::env::var_os("BLAZE_OTHER_TOOLCHAIN").is_some_and(|it| it == "1")
 }
 
 /// What the checkouts of one repository share: the repository's own directory, which is

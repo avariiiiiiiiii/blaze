@@ -30,8 +30,7 @@
 //! The arguments have to implement `serde::Serialize` and the result `Serialize` and
 //! `DeserializeOwned`. Results are kept under the target directory the program was built in,
 //! `target/ra-jit/fn-cache`, up to 512 MiB, the least recently used going first, and for no
-//! more than a function's last three codes. The environment of the program can change that
-//! (each setting is also read by its old name, `RA_JIT_` for `BLAZE_`):
+//! more than a function's last three codes. The environment of the program can change that:
 //!
 //! - `BLAZE_FN_CACHE=off` calls every function every time; `memory` keeps results for the
 //!   run alone.

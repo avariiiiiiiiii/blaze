@@ -31,7 +31,7 @@ BLAZE = dict(
     run_bin="ra-jit",
     edits=dict(
         # Low in the graph: hir-def is under hir-ty, hir, the code generator and the daemon.
-        body=bench.body("vendor/rust-analyzer/crates/hir-def/src/lib.rs", "    pub fn is_block_module(self, db: &dyn SourceDatabase) -> bool {"),
+        body=bench.body("crates/hir-def/src/lib.rs", "    pub fn is_block_module(self, db: &dyn SourceDatabase) -> bool {"),
         # The daemon's own crate, which nothing in the checkout depends on.
         top=bench.body("crates/ra-jit/src/content.rs", "fn of(&self, krate: Crate) -> std::sync::Arc<OnceLock<Option<ContentId>>> {"),
         signature=[("crates/ra-jit-store/src/lib.rs", "pub fn parse_size(text: &str) -> Option<u64> {",
@@ -79,14 +79,14 @@ def main():
         env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), **extra_env)
         if label != "seed":
             env.update(fresh_env)
-        env.update(RA_JIT_CACHE=os.path.join(home, "store"), RA_JIT_STATS="1")
+        env.update(BLAZE_CACHE=os.path.join(home, "store"), BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
         return Side(ws, env, True)
 
     def cache(side, command):
         """`ra-jit cache push|pull REMOTE`, as CI runs it around a build, timed."""
         # The seed pushes unsigned: what signing costs is the remote's (rcache), not this.
-        env = dict(side.env, RA_JIT_REMOTE_UNSIGNED="1")
+        env = dict(side.env, BLAZE_REMOTE_UNSIGNED="1")
         took, ran, _ = memory.run([cargo_ra_jit.RA_JIT, "cache", command, remote], side.ws, env, 3600)
         assert ran.returncode == 0, f"cache {command}: {ran.stderr[-3000:]}"
         return round(took, 3), ran.stderr.strip().splitlines()[-3:]
@@ -115,7 +115,7 @@ def main():
 
     def step(label, side):
         pulled = cache(side, "pull") if label != "seed" else None
-        side.env["RA_JIT_TRACE"] = os.path.join(work, f"trace-{label}.json")
+        side.env["BLAZE_TRACE"] = os.path.join(work, f"trace-{label}.json")
         daemon = bench.Daemon(side)
         with memory.Sampler() as sampler:
             took, ran, used = bench.metered(side, build, sampler=sampler)
@@ -139,7 +139,7 @@ def main():
         stopped(side, daemon)
         if label == "seed":
             row["push"] = cache(side, "push")
-        row["store_mb"] = round(sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(side.env["RA_JIT_CACHE"]) for f in fs) / 2**20, 1)
+        row["store_mb"] = round(sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(side.env["BLAZE_CACHE"]) for f in fs) / 2**20, 1)
         steps.append(row)
         print(f"{label:14} pull {pulled[0] if pulled else 0:6.2f}s  build {row['build_s']:8.2f}s  ready {row['ready_s']:7.2f}s  peak {row['peak_mb']:6} MB  "
               f"compiled {row['compiled']}  store {row['store']['found']} found {row['store']['added']} added  "

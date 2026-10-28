@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use super::{keyed, units::Record};
 
 /// The variable that has rustc compile the build scripts, as the harness's reference builds do.
-pub(crate) const BY_RUSTC: &str = "RA_JIT_SCRIPTS_BY_RUSTC";
+pub(crate) const BY_RUSTC: &str = "BLAZE_SCRIPTS_BY_RUSTC";
 
 /// The name of the script's crate in the description: the one ra-jit is asked to build.
 const SCRIPT: &str = "build_script_build";
@@ -374,7 +374,7 @@ fn built(
         let kept = Built::read(bytes).ok_or("the store's build of it is not one")?;
         kept.write(made).map_err(|it| format!("writing what the store kept of it: {it}"))?;
         write_made_of(made, &second_of(&first, reads))?;
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!("blaze: a build the store kept: {}", made.exe.display());
         }
         return Ok(());
@@ -422,7 +422,7 @@ fn built(
             only(kept_reads, &reads),
         ));
     }
-    if found.is_some() && std::env::var_os("RA_JIT_STATS").is_some() {
+    if found.is_some() && std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!("blaze: a build the store kept read what this one did: {}", made.exe.display());
     }
     if let Some(store) = store {
@@ -560,21 +560,21 @@ fn build(
     for (name, _) in std::env::vars_os() {
         let text = name.to_string_lossy();
         let cargos = text.starts_with("CARGO_") && text != "CARGO_HOME";
-        if cargos || text.starts_with("RUSTC_") || text.starts_with("RA_JIT_") || text == "CARGO" {
+        if cargos || text.starts_with("RUSTC_") || text.starts_with("BLAZE_") || text == "CARGO" {
             ra_jit.env_remove(&name);
         }
     }
-    for kept in ["RA_JIT_HOME", "RA_JIT_BACKEND", "RA_JIT_STD_FROM", super::own_macro::SERVER] {
+    for kept in ["BLAZE_HOME", "BLAZE_BACKEND", "BLAZE_STD_FROM", super::own_macro::SERVER] {
         if let Some(value) = std::env::var_os(kept) {
             ra_jit.env(kept, value);
         }
     }
     if let Some(store) = store {
-        ra_jit.env("RA_JIT_CACHE", store);
+        ra_jit.env("BLAZE_CACHE", store);
     }
     // No release ships the standard library for wasm32-wasip1, nor with blaze's `std::process`.
     if !shipped || made.wasi || made.wasm {
-        ra_jit.env("RA_JIT_STD_FROM", "off");
+        ra_jit.env("BLAZE_STD_FROM", "off");
     }
     ra_jit.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null());
     let built = ra_jit.output().map_err(|it| format!("blaze did not run: {it}"))?;

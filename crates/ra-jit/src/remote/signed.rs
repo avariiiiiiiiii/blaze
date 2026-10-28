@@ -4,7 +4,7 @@
 //! the lists are the one thing a remote could change without being caught by a hash. A
 //! machine that pushes signs its lists with an Ed25519 key, and a machine that names the
 //! keys it trusts takes no list that none of them signed. A machine that names none takes
-//! no list at all, unless `RA_JIT_REMOTE_UNSIGNED=1` says that whoever writes to the remote
+//! no list at all, unless `BLAZE_REMOTE_UNSIGNED=1` says that whoever writes to the remote
 //! may say what this machine runs.
 //!
 //! A signature does not say that a list is the newest one. Every signed list has a turn, a
@@ -28,12 +28,12 @@ use crate::content::hex;
 /// The word the last line of a signed list starts with.
 const SIGNED: &str = "signed";
 
-/// The keys of this machine: `RA_JIT_REMOTE_SIGN` names the file of the key it signs with,
-/// `RA_JIT_REMOTE_TRUST` lists the public keys it takes lists from, with commas between.
+/// The keys of this machine: `BLAZE_REMOTE_SIGN` names the file of the key it signs with,
+/// `BLAZE_REMOTE_TRUST` lists the public keys it takes lists from, with commas between.
 pub(crate) struct Trust {
     signer: Option<SigningKey>,
     trusted: Vec<VerifyingKey>,
-    /// Whether a machine that names no keys takes lists: `RA_JIT_REMOTE_UNSIGNED=1`.
+    /// Whether a machine that names no keys takes lists: `BLAZE_REMOTE_UNSIGNED=1`.
     unsigned: bool,
 }
 
@@ -58,16 +58,16 @@ pub(crate) struct Opened<'a> {
 
 impl Trust {
     pub(crate) fn from_env() -> anyhow::Result<Trust> {
-        let signer = match std::env::var_os("RA_JIT_REMOTE_SIGN") {
+        let signer = match std::env::var_os("BLAZE_REMOTE_SIGN") {
             Some(file) => Some(read_key(Path::new(&file))?),
             None => None,
         };
-        let trusted = std::env::var("RA_JIT_REMOTE_TRUST").unwrap_or_default();
+        let trusted = std::env::var("BLAZE_REMOTE_TRUST").unwrap_or_default();
         let trusted = trusted.split(',').filter(|it| !it.is_empty()).map(|key| {
             let bytes = unhex::<32>(key).context("BLAZE_REMOTE_TRUST holds what is not a key")?;
             VerifyingKey::from_bytes(&bytes).context("BLAZE_REMOTE_TRUST holds what is not a key")
         });
-        let unsigned = std::env::var_os("RA_JIT_REMOTE_UNSIGNED").is_some_and(|it| it == "1");
+        let unsigned = std::env::var_os("BLAZE_REMOTE_UNSIGNED").is_some_and(|it| it == "1");
         Ok(Trust { signer, trusted: trusted.collect::<anyhow::Result<_>>()?, unsigned })
     }
 

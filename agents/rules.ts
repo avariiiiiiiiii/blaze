@@ -24,7 +24,7 @@ type Rule = {
 
 const header = `# blaze (ra-jit)
 
-How to build, test and change ra-jit, including the vendored rust-analyzer: docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
+How to build, test and change ra-jit, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
 
 export const rules = [
 	{
@@ -57,7 +57,7 @@ export const rules = [
 	},
 	{
 		id: "sandbox-everything",
-		info: "Every build script and proc macro runs in a sandbox, by default, on every platform: every build script, cargo's runs and the daemon's, runs in one through `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in it (`macro_sandbox.rs`). Sandboxed tests are an experiment a workspace opts into (`experimental = [\"sandboxed-tests\"]` under the root manifest's `[workspace.metadata.blaze]`, or a package's `tests = true` under `[package.metadata.blaze.sandbox]`): there `cargo ra-jit test` runs each test executable in one sandbox (Linux namespaces and seccomp, macOS Seatbelt and the interposer) under `all` and `affected` alike, and elsewhere tests run as cargo runs them, every time, never kept as passed. Where a sandbox is due and none can be made it stops, rather than run outside. The only ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`, `unsandboxed-tests`, `build-script = false`), the root manifest's `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`) and `RA_JIT_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by default; tests do until the experiment ends.",
+		info: "Every build script and proc macro runs in a sandbox, by default, on every platform: every build script, cargo's runs and the daemon's, runs in one through `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in it (`macro_sandbox.rs`). Sandboxed tests are an experiment a workspace opts into (`experimental = [\"sandboxed-tests\"]` under the root manifest's `[workspace.metadata.blaze]`, or a package's `tests = true` under `[package.metadata.blaze.sandbox]`): there `cargo ra-jit test` runs each test executable in one sandbox (Linux namespaces and seccomp, macOS Seatbelt and the interposer) under `all` and `affected` alike, and elsewhere tests run as cargo runs them, every time, never kept as passed. Where a sandbox is due and none can be made it stops, rather than run outside. The only ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`, `unsandboxed-tests`, `build-script = false`), the root manifest's `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`) and `BLAZE_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by default; tests do until the experiment ends.",
 		reason: "\"Everything should by default be in sandbox and yea it should have sandbox support macos\" (Andrew, 2026-10-26). Sandboxed tests became an opt-in experiment on 2026-10-27 (Andrew).",
 		link: "docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox",
 	},
@@ -69,7 +69,7 @@ export const rules = [
 	},
 	{
 		id: "semantics-in-rust-analyzer",
-		info: "Language semantics go in the rust-analyzer subtree: MIR building and passes, borrow checking, const eval, layout and code-identity hashes as salsa queries (what rustc keeps in `rustc_middle`, `rustc_mir_transform`, `rustc_borrowck`) go in `vendor/rust-analyzer`, as a new crate there rather than edits to upstream's files where possible. Codegen backends, object writing, the splice, the daemon, cargo integration, the store, tiers, the live runtime and the harnesses stay in `crates/`.",
+		info: "Language semantics go in the front end's crates (`hir-ty`, `hir-def`, `hir-expand` and the rest in `crates/`, derived from rust-analyzer, no longer synced with upstream or a fork): MIR building and passes, borrow checking, const eval, layout and code-identity hashes as salsa queries (what rustc keeps in `rustc_middle`, `rustc_mir_transform`, `rustc_borrowck`), as a crate of its own there rather than growing `hir-ty` or `hir-def` where possible. Codegen backends, object writing, the splice, the daemon, cargo integration, the store, tiers, the live runtime and the harnesses stay out of the front end, in crates of their own.",
 		link: "docs/contributing.md#where-new-code-goes",
 	},
 	{

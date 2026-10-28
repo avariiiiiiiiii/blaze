@@ -65,7 +65,7 @@ which are not about the target (see "Harness results"). The x86-64 numbers are u
   `object` crate reports without a section.
 - `crates/ra-jit/src/splice/wasm.rs` (new): the splice of a wasm module, described under
   "The edit loop".
-- Harnesses: `RA_JIT_TARGET=wasm32-wasip1` makes every harness build cargo's side for that
+- Harnesses: `BLAZE_TARGET=wasm32-wasip1` makes every harness build cargo's side for that
   target, capture `rust-lld`'s line instead of `cc`'s, run programs under wasmtime, use
   `wasm-tools` where they used `strip` and `readelf`, and skip valgrind. `editloop.py` is
   new and measures the times in this report.
@@ -148,7 +148,7 @@ corpus show for the second.
 
 ## 2. Differential test
 
-`RA_JIT_TARGET=wasm32-wasip1 python3 harness/difftest.py corpus --bin runner --crate cases`:
+`BLAZE_TARGET=wasm32-wasip1 python3 harness/difftest.py corpus --bin runner --crate cases`:
 
     cases: 655/656 functions from ra-jit
     MATCH
@@ -282,7 +282,7 @@ functions with their 3,248 instances is 1.1 s.
 
 ### Measured, the splice harnesses
 
-`RA_JIT_SPLICE=1 RA_JIT_TARGET=wasm32-wasip1 python3 harness/splices.py`: 71 of 71 right, 62 of
+`BLAZE_SPLICE=1 BLAZE_TARGET=wasm32-wasip1 python3 harness/splices.py`: 71 of 71 right, 62 of
 the 71 steps spliced (x86-64: 71 of 71, 61 spliced). The nine that linked in full: three
 where the whole object was written again (the set of functions changed), three after the
 harness touched the binary ("written by someone else", as intended), one where a static
@@ -292,12 +292,12 @@ dropped (that step keeps `--no-gc-sections` off). The x86-64 run has the same sh
 one "Text file busy" where an edit arrives while the binary runs, which a wasm module does
 not have since wasmtime does not map the file.
 
-`RA_JIT_SPLICE=1 RA_JIT_TARGET=wasm32-wasip1 python3 harness/stress.py`: 99 of 99 right, 0
+`BLAZE_SPLICE=1 BLAZE_TARGET=wasm32-wasip1 python3 harness/stress.py`: 99 of 99 right, 0
 restarts, 72 of 89 links spliced (x86-64: 64 of 89; the difference is the 14 patches with
 thread-local data that the x86-64 splice declines). The 17 full links on wasm: six first
 links, four after the object was rewritten, six signature changes, one reverted function.
 
-The other daemon harnesses with `RA_JIT_SPLICE=1` on `wasm32-wasip1`: `worktrees.py` 52 of 52
+The other daemon harnesses with `BLAZE_SPLICE=1` on `wasm32-wasip1`: `worktrees.py` 52 of 52
 (39 of 44 links spliced, the same as x86-64), `programs.py` 22 of 22 (13 of 17),
 `includes.py` 9 of 9 (6 of 8), `unwinds.py` 8 of 8.
 
@@ -367,25 +367,25 @@ done.
 
 ## Harness results
 
-`wasm32-wasip1`, this branch, `RA_JIT_TARGET=wasm32-wasip1`:
+`wasm32-wasip1`, this branch, `BLAZE_TARGET=wasm32-wasip1`:
 
 | harness | result | notes |
 |---|---|---|
 | `difftest.py corpus` | MATCH, 655/656 from ra-jit | fixture gates for unwind, threads, x86 SIMD; `%llu` |
-| `stress.py` | 99 of 99, 0 restarts | with `RA_JIT_SPLICE=1`: 99 of 99, 72 spliced |
+| `stress.py` | 99 of 99, 0 restarts | with `BLAZE_SPLICE=1`: 99 of 99, 72 spliced |
 | `breakers.py` | 15 of 15, 1 open, 0 skipped | `future_size` open as on x86; `clmul`, `simd_cast` gated to x86 |
 | `unwinds.py` | 8 of 8 | both sides abort at the same point; nothing is caught |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71, 62 spliced | threads run inline on wasm; `wasm-tools` for `strip`/`readelf` |
-| `RA_JIT_SPLICE=1 worktrees.py` | 52 of 52, 39 spliced | |
-| `includes.py` | 9 of 9 | 6 spliced with `RA_JIT_SPLICE=1` |
-| `programs.py` | 22 of 22 | 13 spliced with `RA_JIT_SPLICE=1` |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71, 62 spliced | threads run inline on wasm; `wasm-tools` for `strip`/`readelf` |
+| `BLAZE_SPLICE=1 worktrees.py` | 52 of 52, 39 spliced | |
+| `includes.py` | 9 of 9 | 6 spliced with `BLAZE_SPLICE=1` |
+| `programs.py` | 22 of 22 | 13 spliced with `BLAZE_SPLICE=1` |
 | `asmedits.py` | not run for wasm | the fixture is x86-64 `asm!` (its docstring says so); there is no wasm inline assembly in Rust to port it to |
 | `deps.py` | not run for wasm | it tests the daemon's cache of cargo's dependency builds, which has no target-specific code; it ran on x86-64 |
 
 `x86_64-unknown-linux-gnu`, this branch, every harness rerun after the last change:
 corpus MATCH with 679/680 from ra-jit, programs 22 of 22, stress 99 of 99 with 0 restarts
-(with `RA_JIT_SPLICE=1`: 99 of 99, 64 of 89 links spliced), breakers 15 of 15 with 1 open,
-unwinds 8 of 8, `RA_JIT_SPLICE=1` splices 71 of 71 with 61 spliced, `RA_JIT_SPLICE=1`
+(with `BLAZE_SPLICE=1`: 99 of 99, 64 of 89 links spliced), breakers 15 of 15 with 1 open,
+unwinds 8 of 8, `BLAZE_SPLICE=1` splices 71 of 71 with 61 spliced, `BLAZE_SPLICE=1`
 worktrees 52 of 52, asmedits 10 of 10, deps 10 of 10, includes 9 of 9. The same as
 `ra-jit-spike`.
 
@@ -398,7 +398,7 @@ worktrees 52 of 52, asmedits 10 of 10, deps 10 of 10, includes 9 of 9. The same 
    splice into a module linked without them: 29 MB of writing per edit is most of the
    splice's 35 ms.
 3. Keep the splice from declining on signature changes by having the full link not include
-   cargo's stale `.rcgu.o` for crates ra-jit compiles (`RA_JIT_ALONE` does this for the
+   cargo's stale `.rcgu.o` for crates ra-jit compiles (`BLAZE_ALONE` does this for the
    differential test), which also removes the `signature_mismatch:` stubs.
 4. `wasm32-unknown-unknown` through the corpus: a tiny runtime (Node with an `env` that
    prints) would let the differential test run there too, rather than relying on the WASI
@@ -407,7 +407,7 @@ worktrees 52 of 52, asmedits 10 of 10, deps 10 of 10, includes 9 of 9. The same 
    future `panic=unwind` with exception handling. None blocked a harness.
 6. Splicing into wasm-bindgen's output for body-only edits (section 4), if option 1 is not
    taken.
-7. `RA_JIT_LINK_ARGS` in the harnesses chooses between `--no-gc-sections` and wasm-bindgen
+7. `BLAZE_LINK_ARGS` in the harnesses chooses between `--no-gc-sections` and wasm-bindgen
    working; the daemon could instead keep a list of what the linker dropped and declare the
    splice unable for those names up front, which it does today by failing the lookup.
 8. Threads (`wasm32-wasip1-threads`, `+atomics`): thread-locals become real TLS again and

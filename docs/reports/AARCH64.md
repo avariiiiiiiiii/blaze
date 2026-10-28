@@ -24,7 +24,7 @@ name. `ObjectFormat` and `UnwindFormat` have one variant each (ELF, `.eh_frame`)
 are places for the macOS, Windows and wasm work to add to, not something this branch
 proves works for a second format.
 
-The harnesses take `RA_JIT_TARGET=<triple>`. `difftest.py` holds, per target, the linker,
+The harnesses take `BLAZE_TARGET=<triple>`. `difftest.py` holds, per target, the linker,
 the emulator to run under and the binutils prefix, and the other harnesses use those.
 
 ## What works
@@ -38,15 +38,15 @@ All of these were run. "x86-64" is the same tree, same build, on the host.
 | `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
 | `breakers.py` | 15 of 15 | 15 of 15 |
 | `unwinds.py` | 8 of 8 | 8 of 8 |
-| `RA_JIT_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
-| `RA_JIT_SPLICE=1 worktrees.py` | 52 of 52 | 52 of 52 |
+| `BLAZE_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
+| `BLAZE_SPLICE=1 worktrees.py` | 52 of 52 | 52 of 52 |
 | `asmedits.py` | 10 of 10 | 10 of 10 |
 | `deps.py` | 10 of 10 | 10 of 10 |
 | `includes.py` | 9 of 9 | 9 of 9 |
-| `RA_JIT_SPLICE=1 farsplices.py` (new) | 6 of 6 | 6 of 6 |
-| `RA_JIT_SPLICE=1 programs.py` | 22 of 22 | 22 of 22 |
-| `RA_JIT_SPLICE=1 stress.py` | 99 of 99 | 99 of 99 |
-| `RA_JIT_SPLICE=1 unwinds.py` | 8 of 8 | 8 of 8 |
+| `BLAZE_SPLICE=1 farsplices.py` (new) | 6 of 6 | 6 of 6 |
+| `BLAZE_SPLICE=1 programs.py` | 22 of 22 | 22 of 22 |
+| `BLAZE_SPLICE=1 stress.py` | 99 of 99 | 99 of 99 |
+| `BLAZE_SPLICE=1 unwinds.py` | 8 of 8 | 8 of 8 |
 
 The one corpus function not from ra-jit is the same on both (a `TypeId` rustc has no symbol
 for). The corpus counts are higher than the 679 of 680 on `ra-jit-spike` because I added

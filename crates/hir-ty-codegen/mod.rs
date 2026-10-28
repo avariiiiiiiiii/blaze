@@ -943,7 +943,7 @@ impl CodegenUnit {
             let round = stdx::time::Instant::now();
             let mut start_over = |why: &str| {
                 discarded += round.elapsed();
-                if std::env::var_os("RA_JIT_STATS").is_some() {
+                if std::env::var_os("BLAZE_STATS").is_some() {
                     eprintln!("round {rounds}: {:.1?}, started over: {why}", round.elapsed());
                 }
             };
@@ -1215,7 +1215,7 @@ impl CodegenUnit {
                 }
                 // The executable is linked from this object from now on.
                 (*rustc, *full) = (None, false);
-                if let Some(path) = std::env::var_os("RA_JIT_LAYOUTS") {
+                if let Some(path) = std::env::var_os("BLAZE_LAYOUTS") {
                     let lines = cg
                         .layouts
                         .iter()
@@ -2268,11 +2268,11 @@ struct ObjectCodegen<'a, 'db> {
     crates_wanted: FxHashSet<Crate>,
     /// Instances that failed in an earlier round, with the reason.
     rejected: &'a FxHashMap<Instance, Rejected>,
-    /// Size and alignment of every type laid out, collected when `RA_JIT_LAYOUTS` names a file
+    /// Size and alignment of every type laid out, collected when `BLAZE_LAYOUTS` names a file
     /// to write them to. The harness compares them with rustc's.
     layouts: FxHashMap<String, (u64, u64)>,
     phases: Phases,
-    /// One line per function for `harness/shapes.py`, when `RA_JIT_SHAPES` is set.
+    /// One line per function for `harness/shapes.py`, when `BLAZE_SHAPES` is set.
     shapes: Option<std::io::BufWriter<std::fs::File>>,
     /// How many compiled functions went into the object.
     bodies: usize,
@@ -2354,7 +2354,7 @@ struct Kept {
     unnamed: usize,
     /// Instances that refer to something an entry has no name for.
     unnamed_requests: usize,
-    /// Entries of the store that differ from what was compiled, with `RA_JIT_CACHE_CHECK`.
+    /// Entries of the store that differ from what was compiled, with `BLAZE_CACHE_CHECK`.
     differing: usize,
     same: usize,
     /// Why instances with a name were not added.
@@ -2504,7 +2504,7 @@ fn target() -> Result<&'static isa::OwnedTargetIsa> {
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
 
-/// The register allocator of a function that is not over [`SINGLE_PASS`]: `RA_JIT_REGALLOC` names one of
+/// The register allocator of a function that is not over [`SINGLE_PASS`]: `BLAZE_REGALLOC` names one of
 /// Cranelift's, `backtracking` (the default) or `single_pass`. The second allocates in one
 /// walk over the code: it took a fifth off Cranelift's time on cold builds of ripgrep and of
 /// just, and none off their wall time, and its code was twice the size and up to 1.8 times
@@ -2512,7 +2512,7 @@ fn target() -> Result<&'static isa::OwnedTargetIsa> {
 /// two with a store of their own each.
 fn regalloc() -> &'static str {
     static REGALLOC: LazyLock<&'static str> =
-        LazyLock::new(|| match std::env::var("RA_JIT_REGALLOC").as_deref() {
+        LazyLock::new(|| match std::env::var("BLAZE_REGALLOC").as_deref() {
             Ok("single_pass") => "single_pass",
             _ => "backtracking",
         });
@@ -2982,7 +2982,7 @@ fn backtrace_name(db: &dyn HirDatabase, instance: &Instance) -> String {
 /// (`tier`), its IR for LLVM.
 fn root_code(db: &dyn HirDatabase, func: FunctionId, tier: bool) -> Result<Produced> {
     let (body, env) = root_body(db, func)?;
-    if std::env::var("RA_JIT_DUMP_MIR")
+    if std::env::var("BLAZE_DUMP_MIR")
         .is_ok_and(|want| FunctionSignature::of(db, func).name.as_str() == want)
     {
         dump_mir(body);
@@ -3076,7 +3076,7 @@ fn instance_code(
             return compile_as(db, env, None, false, instance.checked, shim, |fx| {
                 let ty = ty();
                 fx.drop_glue(ty)?;
-                if std::env::var_os("RA_JIT_DUMP_CLIF").is_some() {
+                if std::env::var_os("BLAZE_DUMP_CLIF").is_some() {
                     eprintln!("drop glue for {ty:?}\n{}", fx.builder.func.display());
                 }
                 Ok(())
@@ -3109,7 +3109,7 @@ fn instance_code(
         | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env)?,
     };
     let body = &*body;
-    let dump = std::env::var("RA_JIT_DUMP_MIR").ok();
+    let dump = std::env::var("BLAZE_DUMP_MIR").ok();
     let (tracked, abi, variadic) = match instance.def {
         InstanceDef::Fn(func) => {
             let signature = FunctionSignature::of(db, func);
@@ -3353,7 +3353,7 @@ impl Variadic {
     }
 }
 
-/// The MIR optimization level the environment asks for with `RA_JIT_MIR_OPT`: 0, the default,
+/// The MIR optimization level the environment asks for with `BLAZE_MIR_OPT`: 0, the default,
 /// compiles the runtime body; 1 and 2 that body after rustc's MIR passes at its
 /// `-Zmir-opt-level` 1 and 2 (`hir_ty::mir::MirOptLevel`).
 pub fn mir_opt_level() -> MirOptLevel {
@@ -3369,7 +3369,7 @@ pub fn mir_opt_level() -> MirOptLevel {
     *LEVEL
 }
 
-pub const MIR_OPT: &str = "RA_JIT_MIR_OPT";
+pub const MIR_OPT: &str = "BLAZE_MIR_OPT";
 
 /// Says whether rustc builds the program with `-C link-dead-code`, before anything of it is
 /// compiled: rustc then keeps every function, `#[inline(always)]` ones too, as one copy in
@@ -3401,7 +3401,7 @@ fn compiled_mir_body_for_closure<'db>(
 }
 
 /// The body of an instance that is not a shim, with the instance's types in place of the
-/// generic parameters. The database does not keep it unless `RA_JIT_LEAN=0`: nothing but
+/// generic parameters. The database does not keep it unless `BLAZE_LEAN=0`: nothing but
 /// compiling the instance reads it, and what was compiled is kept.
 fn instance_body<'db>(
     db: &'db dyn HirDatabase,
@@ -3409,7 +3409,7 @@ fn instance_body<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<Cow<'db, MirBody<'db>>> {
     static LEAN: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_LEAN").is_none_or(|it| it != "0"));
+        LazyLock::new(|| std::env::var_os("BLAZE_LEAN").is_none_or(|it| it != "0"));
     let args = instance.args.clone();
     let tally = backend::Tally::global();
     let filled = |body, args: &StoredGenericArgs, env: &StoredParamEnvAndCrate| {
@@ -3532,12 +3532,12 @@ fn coroutine_layout_line<'db>(
 
 /// Whether a future and everything that makes, polls or drops it have to come from one
 /// compiler. They need not: ra-jit lays a future out as rustc does, from the same MIR
-/// (`docs/mir-passes.md` of the fork). `RA_JIT_SPLIT_FUTURES=1` keeps them apart as before,
+/// (`docs/mir-passes.md` of the fork). `BLAZE_SPLIT_FUTURES=1` keeps them apart as before,
 /// a temporary way back until mixing is verified (`harness/mixfutures`).
 // FIXME: delete with what it guards once mixed futures are verified on den-native.
 fn futures_kept_apart() -> bool {
     static APART: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_SPLIT_FUTURES").is_some_and(|it| it != "0"));
+        LazyLock::new(|| std::env::var_os("BLAZE_SPLIT_FUTURES").is_some_and(|it| it != "0"));
     *APART
 }
 
@@ -4688,9 +4688,9 @@ fn compile_as<'db>(
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
     let tally = backend::Tally::global();
-    /// `RA_JIT_PROMOTE=0` leaves every local in its slot of the frame.
+    /// `BLAZE_PROMOTE=0` leaves every local in its slot of the frame.
     static PROMOTE: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_PROMOTE").is_none_or(|it| it != "0"));
+        LazyLock::new(|| std::env::var_os("BLAZE_PROMOTE").is_none_or(|it| it != "0"));
     let mut ctx = tally.step(Step::Translate, || {
         let mut ctx = build(&mut cg, env, body, tracked, fill)?;
         inline(&mut ctx, &cg.inlined)?;
@@ -5264,7 +5264,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .frozen(ids.clone()),
             None => stable::StableNames::new(db, symbols, own_statics.crates.clone(), hydrate),
         };
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let us = |it: std::time::Duration| it.as_micros();
             eprintln!(
                 "setup-us: module={} debug={} mixed={} settled={} names={}",
@@ -5307,7 +5307,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             rejected,
             layouts: FxHashMap::default(),
             phases: Phases::default(),
-            shapes: std::env::var_os("RA_JIT_SHAPES")
+            shapes: std::env::var_os("BLAZE_SHAPES")
                 .and_then(|path| {
                     use std::io::Write;
                     let mut file =
@@ -5334,7 +5334,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             later: Vec::new(),
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store
-                .filter(|_| base.is_none() && std::env::var_os("RA_JIT_CACHE_CHECK").is_none())
+                .filter(|_| base.is_none() && std::env::var_os("BLAZE_CACHE_CHECK").is_none())
                 .map(|store| {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
                     std::sync::Arc::new(cached::Entries::new(
@@ -5682,7 +5682,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             stored += usize::from(whole);
             self.stored_roots.insert(func, whole.then_some(name));
         }
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!("stored roots: {stored} of {} in {:.1?}", roots.len(), start.elapsed());
         }
     }
@@ -6246,7 +6246,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.mixed.is_none()
             && self.base.is_none()
             && !self.units()
-            && std::env::var_os("RA_JIT_CACHE_CHECK").is_none()
+            && std::env::var_os("BLAZE_CACHE_CHECK").is_none()
     }
 
     fn keeper(&mut self, settled: Option<Vec<Option<Instance>>>) -> later::Keeper<'_, 'db> {
@@ -14545,9 +14545,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         args: GenericArgs<'db>,
         sig: &Signature,
     ) -> Option<ir::FuncRef> {
-        /// `RA_JIT_INLINE=0` calls every function.
+        /// `BLAZE_INLINE=0` calls every function.
         static ENABLED: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("RA_JIT_INLINE").is_none_or(|it| it != "0"));
+            LazyLock::new(|| std::env::var_os("BLAZE_INLINE").is_none_or(|it| it != "0"));
         let db = self.cg.db;
         if !*ENABLED {
             return None;
@@ -14667,7 +14667,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some((body, hint)) = tier::seen_body(db, &instance, &self.env.store(), tracked) {
             if body.func.signature == *sig {
                 self.cg.declare_seen(id, &body, hint);
-            } else if std::env::var_os("RA_JIT_DUMP_TIER").is_some() {
+            } else if std::env::var_os("BLAZE_DUMP_TIER").is_some() {
                 eprintln!("tier: signature differs: {} vs {}", body.func.signature, sig);
             }
         }
@@ -18875,7 +18875,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 }
 
-/// Prints a body one statement a line, for debugging with `RA_JIT_DUMP_MIR`.
+/// Prints a body one statement a line, for debugging with `BLAZE_DUMP_MIR`.
 fn dump_mir(body: &MirBody<'_>) {
     let compact = |text: String| {
         let mut text = text

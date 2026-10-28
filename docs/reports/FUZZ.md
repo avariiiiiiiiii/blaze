@@ -69,7 +69,7 @@ program was still right.
 All with `python3 fuzz/fuzz.py run --seed S --rounds N --cases 30 --jobs 8 --reduce 600 --out DIR`,
 counts from `fuzz.py report DIR`. L1 to L10 ran two backends, Cranelift and LLVM at `-O2` with
 fast emit. From L11 on a run has four (`--backends cranelift,llvm,llvm-O0,llvm-full`): those
-two, `llvm-O0` (`RA_JIT_OPT=0`, fast emit) and `llvm-full` (`RA_JIT_OPT=2 RA_JIT_EMIT=optimized`,
+two, `llvm-O0` (`BLAZE_OPT=0`, fast emit) and `llvm-full` (`BLAZE_OPT=2 BLAZE_EMIT=optimized`,
 LLVM's own instruction selection at `-O2`). Every backend builds the same programs, so the
 number compiled is the same for each; the two "Compiled" columns are then the first two. "Generated" counts the functions the generator
 wrote; "compiled" is the number of functions ra-jit's own report says it compiled, which also
@@ -272,7 +272,7 @@ generated.
 ## The driver
 
     cd harness
-    export RA_JIT_BIN=/path/to/release/ra-jit
+    export BLAZE_BIN=/path/to/release/ra-jit
     python3 fuzz/fuzz.py smoke                              # 2 programs of 25 cases, fixed seed, for CI
     python3 fuzz/fuzz.py run --seed L2 --rounds 360 --jobs 8 --out DIR
     python3 fuzz/fuzz.py repro L2-1 c27                     # one program again, or some of its cases
@@ -281,7 +281,7 @@ generated.
 
 A round is one program: 30 cases by default, about 290 functions. It is one cargo project built
 through `Fixture` from `difftest.py`, once by cargo and once by ra-jit per backend
-(`--backends cranelift,llvm`; llvm runs with `RA_JIT_OPT=2 RA_JIT_EMIT=fast`), so a round costs
+(`--backends cranelift,llvm`; llvm runs with `BLAZE_OPT=2 BLAZE_EMIT=fast`), so a round costs
 one cargo build and two ra-jit builds. Rounds are split over `--jobs` worker processes; round N
 of a seed is the same program whatever the number of jobs.
 
@@ -567,7 +567,7 @@ Reduction: `differs-checksum-L12-18-c0.rs`.
 
 `fuzz.py check fuzz/found/*.rs` with the binary of e45ffdff69: all 38 files give the same
 output as rustc under both backends, with no function left to rustc
-(`RA_JIT_BIN=ra-jit python3 fuzz/fuzz.py check fuzz/found/*.rs`, 76 lines of `same`).
+(`BLAZE_BIN=ra-jit python3 fuzz/fuzz.py check fuzz/found/*.rs`, 76 lines of `same`).
 
 ## Generated edits
 
@@ -662,7 +662,7 @@ too short to jump from, and 3 times a static grew. None of those is wrong; they 
 
 ## AArch64 under qemu
 
-`RA_JIT_TARGET=aarch64-unknown-linux-gnu python3 fuzz/fuzz.py ...` builds both sides for
+`BLAZE_TARGET=aarch64-unknown-linux-gnu python3 fuzz/fuzz.py ...` builds both sides for
 AArch64 with the `aarch64-linux-gnu-gcc` linker and runs the binaries with `qemu-aarch64`, as
 `buildmodel.py` does; ra-jit itself runs on x86-64 and cross-compiles. The smoke run there
 (2 programs, 477 functions generated, 676 compiled under each backend) found nothing.
@@ -718,8 +718,8 @@ the gate, the reductions and 17,000 functions behind it.
 
 ## The required harnesses
 
-Run from `harness/` with `RA_JIT_BIN` at the release binary of the merged head (27920a4f69), once with
-`RA_JIT_BACKEND=cranelift` and once with `RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`. The
+Run from `harness/` with `BLAZE_BIN` at the release binary of the merged head (27920a4f69), once with
+`BLAZE_BACKEND=cranelift` and once with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`. The
 results were the same under both:
 
 | Command | Result |

@@ -15,7 +15,7 @@ runs) of the merge gate:
 | `fill` | `cargo blaze` on a store kept across runs: a run the machine runs out of memory for keeps the packs it sealed, so repeating it ends with main's store (then pushed, as cold `a 1` is) |
 
 Each blaze run is a fresh CI job: a fresh copy of the tree at `/root/rb/b`, an empty target
-directory, a new `RA_JIT_HOME`, `RA_JIT_STATS=1` and a trace. Results are rows of
+directory, a new `BLAZE_HOME`, `BLAZE_STATS=1` and a trace. Results are rows of
 `/root/rb/results.tsv`; the measured ones are in `../selfbuild.tsv`.
 
 ## Running it
@@ -41,7 +41,7 @@ these files and the two patches in `/root/rb`, and the gateway's token, signing 
   wedged or killed by its host within minutes.
 - A cold blaze build of blaze does not fit 16 GB: the worker loads (158 s, nearly all of it the
   build scripts), then compiling 131,167 roots takes it from 4 to 15 GB in 90 s and the kernel kills
-  it, with `RA_JIT_LRU` lowered and no spare worker too. Where it finished (32 GB) its peak was
+  it, with `BLAZE_LRU` lowered and no spare worker too. Where it finished (32 GB) its peak was
   28.3 GB. The merge gate's runners (`ubuntu-24.04`, 16 GB) meet the same limit on a cold store.
 - x86_64 VMs and committed arm64 VMs above 16 GB could not be placed that day (ix capacity), and
   the 16 GB VM that could was killed by its host at about 8 GB touched, so the warm and remote arms

@@ -17,7 +17,7 @@
   pointer, enum checks on transmutes (read, `check_alignment.rs`, `check_null.rs`,
   `check_enums.rs`; on when `debug_assertions`). ra-jit has none (read, no such assert kinds in
   `hir-ty/src/mir`).
-- So ra-jit before this work (its runtime body, `RA_JIT_MIR_OPT` unset) is compared with
+- So ra-jit before this work (its runtime body, `BLAZE_MIR_OPT` unset) is compared with
   rustc's level 1, ra-jit's level 1 with rustc's level 1, and ra-jit's level 2 with rustc's
   `-Copt-level=2 -Zinline-mir=no` with debug assertions and overflow checks kept on, since
   ra-jit compiles the dev profile. UB checks are left out on rustc's side unless asked
@@ -47,7 +47,7 @@ Most of the level 1 gain is the passes; moving out of temporaries in lowering, a
 took identical from 15.3% to 21.5% (read, the same runs before and after).
 
 ```sh
-cd harness && RA_JIT_BIN=<release ra-jit> python3 mirparity.py corpus --crate cases --level 1
+cd harness && BLAZE_BIN=<release ra-jit> python3 mirparity.py corpus --crate cases --level 1
 python3 mirparity.py corpus --crate cases --level 2 --rustc-level 2
 ```
 

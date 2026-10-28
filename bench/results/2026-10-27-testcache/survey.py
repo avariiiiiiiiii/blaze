@@ -43,10 +43,10 @@ def main():
         if not os.path.isdir(ws):
             subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", spec["tag"],
                             f"https://github.com/{spec['repo']}", ws], check=True)
-        env = dict(os.environ, PATH=f"{BIN}:{os.environ['PATH']}", RA_JIT_HOME=f"/tmp/rjh-{name}",
-                   RA_JIT_CACHE=f"{APPS}/store", RA_JIT_TESTS="affected",
+        env = dict(os.environ, PATH=f"{BIN}:{os.environ['PATH']}", BLAZE_HOME=f"/tmp/rjh-{name}",
+                   BLAZE_CACHE=f"{APPS}/store", BLAZE_TESTS="affected",
                    # The build manifest (#550) parses `.md` inputs as Rust on a fresh target with a warm store.
-                   RA_JIT_MANIFEST="off", RUST_BACKTRACE="0", HOME="/root")
+                   BLAZE_MANIFEST="off", RUST_BACKTRACE="0", HOME="/root")
         env.pop("CARGO_TARGET_DIR", None)
         args = spec.get("test", [])
         if name == "starship":

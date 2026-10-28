@@ -106,7 +106,7 @@ wasmtime serve -S cli target/wasm32-wasip2/release/site-serve.wasm
 - It is a demo: the viewer comes from an `x-demo-user` header (`octo`, `mallory`, `admin`). `wasmtime serve` creates
   a fresh instance per request, so the store has no writes.
 - A page request takes about 5.6 ms, including instantiation and the snapshot load.
-- The component is 3.9 MB, of which 2.7 MB is `demo.avif`.
+- The component was 3.9 MB, of which 2.7 MB was `demo.avif` (since removed with the home page's demo).
 
 ## Parity with the former TS renderer
 

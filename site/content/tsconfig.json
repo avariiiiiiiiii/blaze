@@ -15,7 +15,8 @@
       ],
       "options": {
         "scripts": ".",
-        "wasm": "../flecs/flecs-doc.wasm"
+        "wasm": "../flecs/flecs-doc.wasm",
+        "first": ["schema.flecs", "refs.flecs", "nav.flecs"]
       }
     }
   ],

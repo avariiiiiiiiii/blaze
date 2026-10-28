@@ -25,7 +25,7 @@ NOTE = "app/src/note.txt"
 MORE = "app/src/more.rs"
 # Of the workspace and of no package.
 SHARED = "shared.txt"
-# Not the same in any two runs either: with `RA_JIT_CACHE` a run has what the last one compiled.
+# Not the same in any two runs either: with `BLAZE_CACHE` a run has what the last one compiled.
 RUN = os.getpid()
 # (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones cargo rejects)
 STEPS = [
@@ -85,12 +85,12 @@ THIN = "--thin" in sys.argv
 # With `--slow` every build of a checkout read as another counts as a long one, so that the
 # daemon gives up on reading them so and loads them.
 if "--slow" in sys.argv:
-    os.environ["RA_JIT_SLOW_SWITCH_MS"] = "0"
+    os.environ["BLAZE_SLOW_SWITCH_MS"] = "0"
 JOIN = "--join" in sys.argv or SPLIT or THIN
 
 
 def splice(program):
-    """Edits are added to the linked binary where that can be done; RA_JIT_SPLICE=0 links each in full."""
+    """Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full."""
     return ["--binary", program["bin"]]
 
 
@@ -152,7 +152,7 @@ def main():
          "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
          *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
         stderr=out, stdout=out,
-        env={**os.environ, **({"RA_JIT_OVERLAY": "1"} if OVERLAY else {}), "RA_JIT_SPLIT": "1" if SPLIT else "0"})
+        env={**os.environ, **({"BLAZE_OVERLAY": "1"} if OVERLAY else {}), "BLAZE_SPLIT": "1" if SPLIT else "0"})
     while "watching" not in open(log_path).read():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")

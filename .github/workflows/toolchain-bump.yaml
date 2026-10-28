@@ -18,7 +18,7 @@
 #
 # Fixes for what a nightly breaks are pushed to toolchain/bump by hand; the next day's run merges
 # main into the branch and moves it on from there, so they are kept. git pushes with
-# RA_JIT_BOT_TOKEN, since a push with GITHUB_TOKEN starts no workflow; gh is GITHUB_TOKEN, which
+# BLAZE_BOT_TOKEN, since a push with GITHUB_TOKEN starts no workflow; gh is GITHUB_TOKEN, which
 # may open pull requests and issues where the bot's token may not.
 name: toolchain bump
 on:

@@ -10,7 +10,7 @@
 its programs (NAME..., its defaults without), `--runs` rounds each (default 5), and writes its
 result with the machine, the commit and the date, for benchreport.py's runtime table.
 
-Each project is one pinned checkout (cloned into `RA_JIT_PROJECTS` as cargo_ra_jit.py does, and
+Each project is one pinned checkout (cloned into `BLAZE_PROJECTS` as cargo_ra_jit.py does, and
 copied; the clone is never written to). A project with `prepare` (bun) is copied from the tree
 that module's `prepare` makes beside the clone, and is measured only when named. Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
@@ -35,7 +35,7 @@ test`, is written down in `wrong`. A build that fails ends its project (what was
 kept, with the error in `failed`) and the run goes on. Either way the run ends with exit code 3
 after writing the result.
 The result also names the commit of ra-jit, the date and the machine
-(`RA_JIT_BENCH_MACHINE` names it, for example the instance type); `benchreport.py` turns it
+(`BLAZE_BENCH_MACHINE` names it, for example the instance type); `benchreport.py` turns it
 into docs/benchmarks.md's tables and the README's numbers.
 
 For every phase the result has the wall time of the command, cargo's time for the same
@@ -53,7 +53,7 @@ program's peak and size.
 than in the first by more than the threshold, was built by cargo where the daemon built it,
 was linked again where it was added, or is missing. Differences under 50 ms are not counted.
 
-The ra-jit of a backend is `RA_JIT_BIN` (cranelift) or `RA_JIT_LLVM_BIN` (llvm).
+The ra-jit of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm).
 """
 import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
@@ -278,7 +278,7 @@ SETUPS = {
     # The parallel front end on the same compiler, which takes -Z flags with RUSTC_BOOTSTRAP.
     # (-Zshare-generics is already on in a debug build, so it is not a setup of its own.)
     "threads8": dict(rustflags=["-Zthreads=8"], env=dict(RUSTC_BOOTSTRAP="1")),
-    # rustc_codegen_cranelift comes only with a nightly (RA_JIT_NIGHTLY): the nightly with
+    # rustc_codegen_cranelift comes only with a nightly (BLAZE_NIGHTLY): the nightly with
     # LLVM tells its own difference from the backend's.
     "nightly": dict(nightly=True),
     "cranelift": dict(nightly=True, rustflags=["-Zcodegen-backend=cranelift"]),
@@ -288,8 +288,8 @@ SETUPS = {
 }
 
 BACKENDS = {
-    "cranelift": dict(RA_JIT_BACKEND="cranelift"),
-    "llvm": dict(RA_JIT_BACKEND="llvm", RA_JIT_OPT="2", RA_JIT_EMIT="fast"),
+    "cranelift": dict(BLAZE_BACKEND="cranelift"),
+    "llvm": dict(BLAZE_BACKEND="llvm", BLAZE_OPT="2", BLAZE_EMIT="fast"),
 }
 DURATION = re.compile(r"([0-9.]+)(ns|µs|ms|s)\b")
 UNITS = {"ns": 1e-9, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
@@ -298,7 +298,7 @@ FLOOR_SECS = 0.05
 
 def ra_jit_of(backend):
     if backend == "llvm":
-        return os.environ.get("RA_JIT_LLVM_BIN") or os.path.join(ROOT, "target-llvm/release/ra-jit")
+        return os.environ.get("BLAZE_LLVM_BIN") or os.path.join(ROOT, "target-llvm/release/ra-jit")
     return cargo_ra_jit.RA_JIT
 
 
@@ -511,9 +511,9 @@ class Setup:
         self.config = ["--config", "target.'cfg(all())'.rustflags=" + json.dumps(spec["rustflags"])] if spec.get("rustflags") else []
         self.cargo_bin = "cargo"
         if spec.get("nightly"):
-            nightly = os.environ.get("RA_JIT_NIGHTLY")
+            nightly = os.environ.get("BLAZE_NIGHTLY")
             if not nightly:
-                raise SystemExit(f"the setup {name} needs RA_JIT_NIGHTLY, a nightly toolchain with rustc-codegen-cranelift-preview (the bench shell sets it)")
+                raise SystemExit(f"the setup {name} needs BLAZE_NIGHTLY, a nightly toolchain with rustc-codegen-cranelift-preview (the bench shell sets it)")
             self.cargo_bin = os.path.join(nightly, "bin/cargo")
             self.env.update(RUSTC=os.path.join(nightly, "bin/rustc"), PATH=os.path.join(nightly, "bin") + os.pathsep + env["PATH"])
 
@@ -549,8 +549,8 @@ def disk(ws, ours, theirs):
     target directory (cargo's own build, which `cargo ra-jit build` starts with, and the
     daemon's programs), its store and its home (workers' files, logs), and cargo's target
     directory."""
-    return {"target": memory.disk_mb(os.path.join(ws, "target")), "store": memory.disk_mb(ours.env["RA_JIT_CACHE"]),
-            "home": memory.disk_mb(ours.env["RA_JIT_HOME"]), "cargo target": memory.disk_mb(theirs.env["CARGO_TARGET_DIR"])}
+    return {"target": memory.disk_mb(os.path.join(ws, "target")), "store": memory.disk_mb(ours.env["BLAZE_CACHE"]),
+            "home": memory.disk_mb(ours.env["BLAZE_HOME"]), "cargo target": memory.disk_mb(theirs.env["CARGO_TARGET_DIR"])}
 
 
 # The keys the projects measured so far in this run stored: what one store on the machine would
@@ -615,7 +615,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     home = lambda label: os.path.join(work, f"home-{name}-{backend}-{label}")
     env = dict(cargo_ra_jit.base_env(home(0)), **spec.get("env", {}), **prepared)
     env["PATH"] = os.path.dirname(ra_jit) + os.pathsep + env["PATH"]
-    env.update(BACKENDS[backend], RA_JIT_STATS="1")
+    env.update(BACKENDS[backend], BLAZE_STATS="1")
     # Neither side gets a compiler cache: a cold build is a cold build.
     env.pop("RUSTC_WRAPPER", None)
     ours, theirs = Side(ws, env, True), Side(ws, env, False)
@@ -682,14 +682,14 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     # turns, never at once: they would share the cores (a daemon that is ready is idle). The
     # last one's daemon is the one the edits are measured with.
     std_from, std_s = shipped_std(ra_jit, backend, work)
-    ours.env["RA_JIT_STD_FROM"] = std_from
+    ours.env["BLAZE_STD_FROM"] = std_from
     colds, builds = [], [0]
     for turn in range(cold_runs):
         ours.cargo("stop")
         store = os.path.join(work, f"store-{name}-{backend}-{turn}")
         for path in (os.path.join(ws, "target"), theirs.env["CARGO_TARGET_DIR"], store, home(turn)):
             shutil.rmtree(path, ignore_errors=True)
-        ours.env.update(RA_JIT_HOME=home(turn), RA_JIT_CACHE=store)
+        ours.env.update(BLAZE_HOME=home(turn), BLAZE_CACHE=store)
         daemon = Daemon(ours)
         took, warm, mine, used = cold_ra_jit(ours, "empty store", daemon)
         said, built, peak = daemon.said(), how_built(mine.stderr), daemon.peak_mb()
@@ -774,7 +774,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     for turn in range(cold_runs):
         other_ws = ws + "-b"
         shutil.copytree(ws, other_ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
-        second = Side(other_ws, dict(ours.env, RA_JIT_HOME=home(f"{turn}b")), True)
+        second = Side(other_ws, dict(ours.env, BLAZE_HOME=home(f"{turn}b")), True)
         took_b, warm_b, _, used_b = cold_ra_jit(second, "store filled by another checkout", Daemon(second))
         second.cargo("stop")
         shutil.rmtree(other_ws, ignore_errors=True)
@@ -788,11 +788,11 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
                               warm_store_samples_s=[round(b + w, 3) for b, w, _ in warm_store],
                               warm_store_memory=dict(peak_mb=round(statistics.median(u["peak_mb"] for _, _, u in warm_store)),
                                                      resident_mb=round(statistics.median(u["resident_mb"] for _, _, u in warm_store))))
-    entries = store_entries(ours.env["RA_JIT_CACHE"])
+    entries = store_entries(ours.env["BLAZE_CACHE"])
     added = sum(size for key, size in entries.items() if key not in STORED)
     STORED.update(entries)
-    print(f"  store {store_mb(ours.env['RA_JIT_CACHE'])} MB, {added / 1e6:.0f} MB of it not stored by a project before", flush=True)
-    result = dict(phases=phases, wrong=wrong, tag=spec["tag"], rev=spec["rev"], store_mb=store_mb(ours.env["RA_JIT_CACHE"]),
+    print(f"  store {store_mb(ours.env['BLAZE_CACHE'])} MB, {added / 1e6:.0f} MB of it not stored by a project before", flush=True)
+    result = dict(phases=phases, wrong=wrong, tag=spec["tag"], rev=spec["rev"], store_mb=store_mb(ours.env["BLAZE_CACHE"]),
                   store_added_mb=round(added / 1e6), cold_runs=cold_runs, resident=resident, disk_mb=end_disk)
     if "RUSTUP_TOOLCHAIN" in prepared:
         # The project's own toolchain, not the one ra-jit is pinned to.
@@ -922,7 +922,7 @@ def machine():
     cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
     return dict(
         # Named by whoever runs it (the workflow names the instance type).
-        name=os.environ.get("RA_JIT_BENCH_MACHINE"),
+        name=os.environ.get("BLAZE_BENCH_MACHINE"),
         cpu=cpu, cores=cores, machine_cores=os.cpu_count(),
         # What else the machine was running: 1, 5 and 15 minute averages when the run started.
         load=", ".join(f"{v:.1f}" for v in os.getloadavg()),
@@ -939,10 +939,10 @@ def machine():
 
 
 def ra_jit_commit():
-    """The commit of ra-jit measured: `RA_JIT_BENCH_COMMIT` when the caller knows better than the
+    """The commit of ra-jit measured: `BLAZE_BENCH_COMMIT` when the caller knows better than the
     checkout (a branch that changes only the harness, measured for main)."""
-    if os.environ.get("RA_JIT_BENCH_COMMIT"):
-        return os.environ["RA_JIT_BENCH_COMMIT"]
+    if os.environ.get("BLAZE_BENCH_COMMIT"):
+        return os.environ["BLAZE_BENCH_COMMIT"]
     ran = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True)
     return ran.stdout.strip() or None
 
@@ -1038,7 +1038,7 @@ def main():
                   commit=ra_jit_commit(), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=machine(),
                   backends={b: BACKENDS[b] for b in backends}, setups={s: SETUPS[s] for s in setup_names}, results={})
     if any(SETUPS[s].get("nightly") for s in setup_names):
-        result["host"]["nightly"] = subprocess.run([os.path.join(os.environ.get("RA_JIT_NIGHTLY", ""), "bin/rustc"), "-V"],
+        result["host"]["nightly"] = subprocess.run([os.path.join(os.environ.get("BLAZE_NIGHTLY", ""), "bin/rustc"), "-V"],
                                                    capture_output=True, text=True).stdout.strip() or None
     if os.environ.get("GITHUB_RUN_ID"):
         result["run_url"] = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"

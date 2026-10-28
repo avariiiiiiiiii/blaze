@@ -14,7 +14,7 @@ run` prints the value. Under blaze it has to as well:
   named     the same with `build-script-env = ["SDK_DIR"]` in the root manifest
   path dep  a path dependency that is a workspace of its own is given what the build's root
             manifest names in `build-script-env`, for a script that does not say it reads it
-RA_JIT_BIN names the compiler, with cargo-ra-jit beside it.
+BLAZE_BIN names the compiler, with cargo-ra-jit beside it.
 """
 import os, re, shutil, subprocess, tempfile
 

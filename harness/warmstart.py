@@ -2,7 +2,7 @@
 """warmstart.py PROJECT [--work DIR] [--env NAME=VALUE]...: what a start costs when the store
 already has every function, with nothing of rustc's to start from (#41).
 
-Every step has `RA_JIT_RUSTC_BASE=0`, so the first build of a daemon is its own, as it is
+Every step has `BLAZE_RUSTC_BASE=0`, so the first build of a daemon is its own, as it is
 without rustc (docs/no-rustc.md, step K):
   first    a checkout and an empty store: `cargo ra-jit build` and the wait until ready
   warm     a second checkout of the same commit with a home of its own and the store the first
@@ -52,12 +52,12 @@ def main():
         ws = os.path.join(work, label)
         shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
         env = dict(cargo_ra_jit.base_env(os.path.join(work, f"home-{label}")), **spec.get("env", {}), **extra_env)
-        env.update(RA_JIT_CACHE=store, RA_JIT_RUSTC_BASE="0", RA_JIT_STATS="1")
+        env.update(BLAZE_CACHE=store, BLAZE_RUSTC_BASE="0", BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
         return Side(ws, env, True)
 
     reference = checkout("reference")
-    reference.env.pop("RA_JIT_CACHE")
+    reference.env.pop("BLAZE_CACHE")
     plain = Side(reference.ws, reference.env, False)
     _, ran = plain.cargo("build", *build)
     assert ran.returncode == 0, ran.stderr[-3000:]

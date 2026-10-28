@@ -10,7 +10,7 @@
  * Everything put into the page goes through HTMLRewriter's setAttribute / setInnerContent (text mode).
  */
 import type { Env } from './env';
-import { boundedBody, csp, json, methodNotAllowed, plain, sameOrigin } from './http';
+import { ASSETS, ASSETS_HEADER, boundedBody, csp, json, methodNotAllowed, plain, sameOrigin } from './http';
 
 const EMAIL_MAX = 254;
 const COMPANY_MAX = 200;
@@ -192,6 +192,7 @@ async function page(env: Env, url: URL, fill: Fill, status = 200): Promise<Respo
 	const headers = new Headers(asset.headers);
 	headers.set('cache-control', 'no-store');
 	headers.set('content-security-policy', csp({ turnstile: !!siteKey }));
+	headers.set(ASSETS_HEADER, ASSETS);
 	headers.delete('etag');
 	headers.delete('content-length');
 	const out = rw.transform(new Response(asset.body, { status, headers }));

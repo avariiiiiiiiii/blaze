@@ -1250,7 +1250,7 @@ impl FromStore {
             let why = if entry.is_none() { "no entry" } else { "no mark" };
             let (Some(entry), Some(tracked)) = (entry, tracked) else {
                 from.untracked = true;
-                if std::env::var_os("RA_JIT_STATS").is_some() && from.untracked_seen < 3 {
+                if std::env::var_os("BLAZE_STATS").is_some() && from.untracked_seen < 3 {
                     from.untracked_seen += 1;
                     eprintln!("base from the store: `{name}` untracked: {why}");
                 }
@@ -1444,7 +1444,7 @@ impl Base {
             }
         };
         let mut from_store = FromStore::new(db, cg, compiled, &stored_marks);
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let known = from_store.hydrated.iter().filter(|it| it.known.is_some()).count();
             eprintln!(
                 "base from the store: {} roots, {} other functions of the checkout ({known} called \
@@ -1957,7 +1957,7 @@ impl Base {
     /// Walking to them is slow, and nothing changes where the walk goes but the code of what
     /// it went through.
     fn their_statics(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
-        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
+        let check_all = std::env::var_os("BLAZE_CHECK_ALL").is_some();
         let changed = found.iter().any(|it| it.their_walk_changed);
         let Some(first) = found.first_mut() else { return };
         if !changed && !check_all {
@@ -2302,7 +2302,7 @@ impl Base {
         }
         // A check of the skipping below: looks at what no edit can have changed too, and says
         // so if one did.
-        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
+        let check_all = std::env::var_os("BLAZE_CHECK_ALL").is_some();
         for i in every(self.rejected.len()) {
             let (instance, env) = &self.rejected[i];
             let compiles = probe(|| compiled_instance(db, instance.clone(), env.clone()).is_ok());
@@ -2926,7 +2926,7 @@ impl Base {
                 return Ok(Err("a function now shares an `async` block with one left to rustc"));
             }
         }
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let decls = cg.module.declarations();
             let anew = (cg.instances.values())
                 .filter(|&&id| {

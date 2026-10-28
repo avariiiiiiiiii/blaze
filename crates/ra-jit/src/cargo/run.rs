@@ -175,7 +175,7 @@ fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std
 /// Runs the test executables one after another, each in the directory of its package, and in
 /// a sandbox ([`sandboxed`]) when its workspace or package opts in and neither it nor the
 /// command takes it out, and stops at the first that fails unless told not to. The result is
-/// cargo's exit status. Under `RA_JIT_TESTS=affected` each runs only the tests that have not
+/// cargo's exit status. Under `BLAZE_TESTS=affected` each runs only the tests that have not
 /// passed with what they are a function of as it is now, as the store keeps them
 /// ([`results`]); `verify` runs those too and says whether they passed again ([`affected`]).
 pub(crate) fn tests(
@@ -201,7 +201,7 @@ pub(crate) fn tests(
         say::error(&format!("the tests run in a sandbox, which can't be made here: {why}"));
         say::note(&format!(
             "`{}=off` runs the tests of this command outside a sandbox, as cargo does",
-            crate::sandbox::VAR_BLAZE
+            crate::sandbox::VAR
         ));
         return Ok(FAILED);
     }
@@ -250,7 +250,7 @@ pub(crate) fn tests(
         let identity = env.as_deref().filter(|_| affected::on()).map(sandboxed::identity_of);
         let manifest = opt_out.manifest.display();
         let why_outside = match (sandboxing, opt_out.all) {
-            (false, _) => format!("`{}=off`", crate::sandbox::VAR_BLAZE),
+            (false, _) => format!("`{}=off`", crate::sandbox::VAR),
             (true, true) => format!("`tests = false` under `{}` in {manifest}", sandboxed::TABLE),
             (true, false) => format!(
                 "its workspace has not opted into sandboxed tests ({})",

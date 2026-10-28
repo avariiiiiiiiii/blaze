@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parents[2]
+REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
+# GitHub refuses a release whose body is longer than 125000 characters ("body is too long").
+LIMIT = 120_000
 
 
 def fail(message: str) -> NoReturn:
@@ -62,6 +65,18 @@ def section(changelog: str, version: str) -> str:
     return body + "\n"
 
 
+def fit(notes: str, version: str) -> str:
+    """`notes` as they are when they fit a release's body; else as many whole entries as fit,
+    then a link to the section in CHANGELOG.md at the tag."""
+    if len(notes) <= LIMIT:
+        return notes
+    rest = f"\n\nThe rest of these notes is in [CHANGELOG.md](https://github.com/{REPO}/blob/v{version}/CHANGELOG.md).\n"
+    cut = notes.rfind("\n- ", 0, LIMIT - len(rest))
+    if cut < 0:
+        cut = notes.rfind("\n", 0, LIMIT - len(rest))
+    return notes[:cut].rstrip() + rest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tag", default="", help="the pushed tag, `v<version>`; empty for none")
@@ -74,7 +89,7 @@ def main() -> None:
     if args.tag:
         dated(version)
 
-    notes = section((ROOT / "CHANGELOG.md").read_text(), version)
+    notes = fit(section((ROOT / "CHANGELOG.md").read_text(), version), version)
     args.out.write_text(notes)
     print(f"ra-jit {version}: {len(notes.splitlines())} lines of notes -> {args.out}")
     print(notes)

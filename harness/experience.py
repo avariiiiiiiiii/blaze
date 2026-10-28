@@ -11,7 +11,7 @@ each beside plain `cargo` on a copy of the same project, with what each step pri
     python3 experience.py --update ...             # write what each step printed as experience/<project>.txt
     python3 experience.py --list
 
-It is a user's view: it runs `cargo blaze` from `PATH`, sets no `RA_JIT_*` or `BLAZE_*`
+It is a user's view: it runs `cargo blaze` from `PATH`, sets no `BLAZE_*`
 variable, and reads nothing but what the commands print and leave behind. A step fails the
 run when it is a rough edge a user would trip on:
 
@@ -446,7 +446,7 @@ def transcript(steps, where):
 
 def install(home, archive, readme, rustup):
     os.makedirs(home, exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("RA_JIT", "BLAZE", "CARGO", "RUSTUP"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("BLAZE", "CARGO", "RUSTUP"))}
     if rustup:
         # A user who has rustup: its toolchains stay where they are.
         env["RUSTUP_HOME"] = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")

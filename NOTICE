@@ -1,0 +1,8 @@
+blaze
+Copyright (c) 2026 Indexable, Inc. and the blaze contributors
+Licensed under MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).
+
+crates derived from rust-analyzer (MIT OR Apache-2.0): the front end's crates in crates/
+(hir-ty, hir-def, hir-expand, syntax, parser, base-db, rowan and the rest), copyright the
+rust-analyzer developers; their license texts are licenses/rust-analyzer-LICENSE-MIT and
+licenses/rust-analyzer-LICENSE-APACHE.

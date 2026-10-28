@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mem.sh REV: cold `cargo ra-jit build` of ripgrep with RA_JIT_MEMORY set (salsa ingredient tables and
+# mem.sh REV: cold `cargo ra-jit build` of ripgrep with BLAZE_MEMORY set (salsa ingredient tables and
 # resident/live checkpoints per step), sampling every ra-jit process's RSS each 200 ms for the peak by
 # process kind. Out: /root/perf/mem/REV/.
 set -uo pipefail
@@ -14,8 +14,8 @@ wt=/root/perf/wt-prof
 git -C $wt checkout -q --force --detach "$rev"
 tc=$(cat $wt/harness/toolchain)
 std=$(ls -d /root/perf/work/$rev-cranelift/std-cranelift 2>/dev/null | head -1)
-export RA_JIT_HOME=$p/home RA_JIT_CACHE=$p/store RA_JIT_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
-export RA_JIT_STD_FROM=$std RUST_BACKTRACE=0 CARGO_TERM_COLOR=never RA_JIT_MEMORY=$out/tables
+export BLAZE_HOME=$p/home BLAZE_CACHE=$p/store BLAZE_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
+export BLAZE_STD_FROM=$std RUST_BACKTRACE=0 CARGO_TERM_COLOR=never BLAZE_MEMORY=$out/tables
 export PATH=$bin:$PATH
 cd $p/rg
 ( while :; do
@@ -36,7 +36,7 @@ for i in $(seq 600); do cargo ra-jit status 2>&1 | grep -q "$p/rg: ready" && bre
 sleep 3
 taskset -c 0-3 cargo ra-jit build > $out/noop.out 2>&1
 kill $sampler
-for w in $RA_JIT_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log 2>/dev/null; done
-cp $RA_JIT_HOME/*.log $out/ 2>/dev/null
+for w in $BLAZE_HOME/workers/*/; do cp $w/log $out/worker-$(basename $w).log 2>/dev/null; done
+cp $BLAZE_HOME/*.log $out/ 2>/dev/null
 cargo ra-jit stop >/dev/null 2>&1
 echo done

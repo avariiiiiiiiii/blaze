@@ -64,7 +64,7 @@ dependencies built by rustc through cargo.
 - This matters more for ra-jit than for rustc: Cranelift does no memcpy elimination, so every
   MIR copy of an aggregate is a copy in the machine code (unverified, from Cranelift's design).
 - **ra-jit:** done here, as a first step: rustc's copy propagation and dead-store elimination,
-  ported (`RA_JIT_MIR_OPT`). Next: port `TailCopyToMove` and `MoveElimination` when they land.
+  ported (`BLAZE_MIR_OPT`). Next: port `TailCopyToMove` and `MoveElimination` when they land.
 
 ## Polymorphization
 

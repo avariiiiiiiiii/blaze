@@ -239,7 +239,7 @@ larger part of an edit build on big crates; "Measurements" has the numbers.
 
 There is one daemon per user, shared by both modes. It is started by the first build that
 needs it, in a session of its own, and outlives the command that started it and any client
-that is killed. It exits after 30 minutes without a request. `RA_JIT_IDLE_SECS` sets
+that is killed. It exits after 30 minutes without a request. `BLAZE_IDLE_SECS` sets
 another time (0 is never) and is read when the daemon starts.
 
 The daemon holds no compiler state itself. It owns worker processes, each with one
@@ -263,15 +263,15 @@ Things that can go wrong, and what happens:
 
 ### Where things are kept
 
-    $RA_JIT_HOME/daemon.sock, daemon.sock.lock, daemon.log    the daemon
-    $RA_JIT_HOME/workers/<id>/sock, sock.lock, log            one directory a worker
-    $RA_JIT_HOME/states/                                      what each build was last loaded as
-    $RA_JIT_HOME/plain-cargo.log                              the counts `ra-jit status` prints
+    $BLAZE_HOME/daemon.sock, daemon.sock.lock, daemon.log    the daemon
+    $BLAZE_HOME/workers/<id>/sock, sock.lock, log            one directory a worker
+    $BLAZE_HOME/states/                                      what each build was last loaded as
+    $BLAZE_HOME/plain-cargo.log                              the counts `ra-jit status` prints
     <target-dir>/<profile>/.ra-jit-units/                     what rustc was asked, per crate
     <target-dir>/ra-jit/                                      the daemon's programs
     ~/.cache/ra-jit/store/                                    the store
 
-`RA_JIT_HOME` is `$XDG_RUNTIME_DIR/ra-jit` when that is set and `~/.cache/ra-jit` otherwise.
+`BLAZE_HOME` is `$XDG_RUNTIME_DIR/ra-jit` when that is set and `~/.cache/ra-jit` otherwise.
 
 ### The store
 
@@ -282,9 +282,9 @@ without `XDG_CACHE_HOME`. It is deliberately not in the runtime directory, which
 when you log out.
 
 The store is kept under 32 GiB: when it grows past that, packs are removed until it
-fits. `RA_JIT_CACHE_MAX=<size>` (`2G`, `500M`) sets another limit and `off` none.
+fits. `BLAZE_CACHE_MAX=<size>` (`2G`, `500M`) sets another limit and `off` none.
 
-`RA_JIT_CACHE=<directory>` puts it elsewhere. `RA_JIT_CACHE=off` (or `0`, or empty) turns it
+`BLAZE_CACHE=<directory>` puts it elsewhere. `BLAZE_CACHE=off` (or `0`, or empty) turns it
 off. Like the other settings of the daemon it is read when the daemon starts, so run
 `ra-jit stop` after changing it. `ra-jit cache stats`, `gc` and `verify` work on the same
 directory; `RA_JIT.md` describes them and the remote store.
@@ -293,19 +293,19 @@ directory; `RA_JIT.md` describes them and the remote store.
 
 | Variable | What it does |
 |---|---|
-| `RA_JIT_HOME` | The directory of the daemon's socket, logs and state. Must be yours alone (mode 0700). |
-| `RA_JIT_IDLE_SECS` | Seconds without a request after which the daemon exits. 1800 by default, 0 is never. |
-| `RA_JIT_CACHE` | The store's directory; `off`, `0` or empty for none. |
-| `RA_JIT_CACHE_MAX` | The most the store may take on disk. 32 GiB by default; `off` for no limit. |
-| `RA_JIT_BACKEND` | `cranelift` (the default) or `llvm`. |
-| `RA_JIT_OPT`, `RA_JIT_EMIT` | With the LLVM backend: the optimisation level, and `fast` emission. |
+| `BLAZE_HOME` | The directory of the daemon's socket, logs and state. Must be yours alone (mode 0700). |
+| `BLAZE_IDLE_SECS` | Seconds without a request after which the daemon exits. 1800 by default, 0 is never. |
+| `BLAZE_CACHE` | The store's directory; `off`, `0` or empty for none. |
+| `BLAZE_CACHE_MAX` | The most the store may take on disk. 32 GiB by default; `off` for no limit. |
+| `BLAZE_BACKEND` | `cranelift` (the default) or `llvm`. |
+| `BLAZE_OPT`, `BLAZE_EMIT` | With the LLVM backend: the optimisation level, and `fast` emission. |
 | `RUSTC_WORKSPACE_WRAPPER` | Cargo's own. Set to something else, it takes the build away from ra-jit. |
 | `RUSTC_WRAPPER` | Cargo's own. Left alone; it runs around ra-jit's wrapper. |
 | `CARGO_HOME` | Cargo's own. `ra-jit enable` writes the configuration file in it. |
 | `CARGO_INCREMENTAL` | Cargo's own. With `0`, test executables are cargo's. |
 | `NO_COLOR` | No colour in ra-jit's own lines. |
 
-The `RA_JIT_*` variables are read by the daemon when it starts, from the environment of
+The `BLAZE_*` variables are read by the daemon when it starts, from the environment of
 the build that starts it. `ra-jit stop` and the next build pick up a change.
 
 ## Troubleshooting
@@ -326,12 +326,12 @@ The same reasons, counted, are in `ra-jit status`.
 **Something looks wrong.** `ra-jit stop` ends the daemon and its workers; the next build
 starts over from cargo's own build. `ra-jit disable` takes ra-jit out of plain cargo
 altogether. `cargo clean` removes everything ra-jit keeps in the target directory.
-`$RA_JIT_HOME/daemon.log` and `workers/<id>/log` say what the daemon did.
+`$BLAZE_HOME/daemon.log` and `workers/<id>/log` say what the daemon did.
 
 **"`ra-jit-rustc` is not installed next to `ra-jit`".** The three programs have to be in one
 directory. Install them together again.
 
-**ra-jit refuses its home directory.** `RA_JIT_HOME` and every directory above it must be
+**ra-jit refuses its home directory.** `BLAZE_HOME` and every directory above it must be
 yours or root's, and it must not be open to group or others. The message says which
 directory fails and why.
 
@@ -344,7 +344,7 @@ ra-jit is not run there. `ra-jit status` says so. Use `cargo ra-jit` in that pro
 Everything here is from one machine (Linux x86-64, 8 cores, 31 GB), one run per number, so
 read the times as sizes, not as benchmarks. The command, from `harness/`:
 
-    RA_JIT_BIN=<release ra-jit> TMPDIR=/dev/shm RA_JIT_CACHE_MAX=1G python3 cargo_ra_jit.py <project> --only-projects
+    BLAZE_BIN=<release ra-jit> TMPDIR=/dev/shm BLAZE_CACHE_MAX=1G python3 cargo_ra_jit.py <project> --only-projects
 
 Each project is cloned at a pinned commit, not modified, and built three ways: plain cargo
 as the reference, `cargo ra-jit`, and plain cargo after `ra-jit enable`. A step passes when
@@ -456,7 +456,7 @@ shown to be correct or faster, and it is not in the branch.
 
 ### Store size
 
-On this machine the store had to be capped for the runs (`RA_JIT_CACHE_MAX=1G`): the
+On this machine the store had to be capped for the runs (`BLAZE_CACHE_MAX=1G`): the
 harness keeps everything in `/dev/shm`, which is memory, and with the default 8 GiB limit
 one harness pass over starship wrote 7.6 GiB of store and the workers were killed for
 memory. That is the only measurement. What the 7.6 GiB is made of, whether the two modes,
@@ -478,7 +478,7 @@ under both backends, with:
   mid-request, the daemon killed mid-build, another version, 16 clients on 4 worktrees,
   a second user (made with `useradd`) refused on the socket and getting nothing from a
   socket of its own, `--help`, a closed pipe, a build straight after `stop`, the store on
-  by default and off with `RA_JIT_CACHE=off`.
+  by default and off with `BLAZE_CACHE=off`.
 - 56 of 56 plain cargo checks after `ra-jit enable`, listed under "What is verified under
   plain cargo" below.
 
@@ -523,8 +523,8 @@ anything on macOS or Windows.
 ### The regression gate
 
 Run on the head with `ra-jit-collate` 3d47ed59bf merged in, Linux x86-64, from `harness/`
-with `RA_JIT_BIN` set to the release binary, once with `RA_JIT_BACKEND=cranelift` and once
-with `RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`. The results are the same under both:
+with `BLAZE_BIN` set to the release binary, once with `BLAZE_BACKEND=cranelift` and once
+with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`. The results are the same under both:
 
 | Check | Result |
 |---|---|
@@ -608,12 +608,12 @@ only when nothing differs. CI runs `cargo_ra_jit.py --small` under both backends
 Both the daemon's socket and each worker's go through `socket.rs`, and so does the socket
 of a plain `ra-jit ... --socket PATH`.
 
-- The directory. `$RA_JIT_HOME` is made with mode 0700. Before use it is checked: it must be
+- The directory. `$BLAZE_HOME` is made with mode 0700. Before use it is checked: it must be
   a directory, owned by the user, with no access for group or others, and every directory
   above it must be the user's or root's and not writable by everyone without the sticky
   bit. Otherwise the client and the daemon refuse with the reason and nothing is bound.
   `$XDG_RUNTIME_DIR/ra-jit` is used when `XDG_RUNTIME_DIR` is set, `~/.cache/ra-jit`
-  otherwise; the same check applies to both and to a `RA_JIT_HOME` the user sets.
+  otherwise; the same check applies to both and to a `BLAZE_HOME` the user sets.
 - The socket is bound inside a 0700 directory made next to where it is asked for
   (`<socket>.new/`), set to 0600 there, and renamed into place. It is never reachable with
   the mode the umask gave it, whatever directory it ends up in.
@@ -696,7 +696,7 @@ macOS: the commands exist, `ra-jit enable`, `disable` and `status` edit cargo's
 configuration the same way, and every build is cargo's with its reason, so nothing breaks
 and nothing is faster. Nothing has been run there from this branch.
 
-To check either natively, a platform session can run, from `harness/` with `RA_JIT_BIN`
+To check either natively, a platform session can run, from `harness/` with `BLAZE_BIN`
 set to its release `ra-jit`:
 
     python3 cargo_ra_jit.py --small
@@ -706,7 +706,7 @@ It clones ripgrep, fd and hyperfine at pinned commits and runs them in three way
 and the `enable`/`disable` round trips. On macOS the expected result today is that every
 step is the same as cargo and every build is marked as cargo's; on Windows, that every
 step is the same as cargo. A step that differs, or a build that fails, is a bug. The
-second-user checks need `sudo useradd`; where there is no sudo, `RA_JIT_NO_SUDO=1` leaves
+second-user checks need `sudo useradd`; where there is no sudo, `BLAZE_NO_SUDO=1` leaves
 them out.
 
 What has to change for the daemon to serve builds on macOS: `only_cargo` (`cargo/cli.rs`,
@@ -758,7 +758,7 @@ Windows (COFF/PE, `link.exe` or `lld-link`), as listed before the Windows sessio
 5. `State::after` records programs by `Record::outputs()`; on Windows that includes the
    `.pdb`, which must not be taken for a second name of the program.
 6. The socket. `uds_windows` gives AF_UNIX on Windows 10 1803 and later, and that is what
-   the code uses. For it to be safe: create `RA_JIT_HOME` with a DACL of the user's SID
+   the code uses. For it to be safe: create `BLAZE_HOME` with a DACL of the user's SID
    alone (no inheritance) and check that DACL and the owner before use, where
    `private_dir` checks mode and uid; give the lock and the logs the same DACL where
    `private_file` sets 0600. AF_UNIX on Windows has no peer credentials, so the peer check
@@ -882,10 +882,10 @@ What I would do next, in order:
 - Test executables built optimised or without incremental compilation are cargo's.
 - The store grows fast: one pass of the harness over starship wrote 7.6 GiB, which is
   nearly the default limit. See "Store size".
-- A long `RA_JIT_HOME` makes a worker's socket path longer than the system allows (108
+- A long `BLAZE_HOME` makes a worker's socket path longer than the system allows (108
   bytes on Linux, 104 on macOS). The build then goes to cargo with "path must be shorter
   than SUN_LEN" in the reason. `~/.cache/ra-jit` and `$XDG_RUNTIME_DIR/ra-jit` are well
-  inside it for ordinary user names; a deep `RA_JIT_HOME` is not. Binding by a shorter
+  inside it for ordinary user names; a deep `BLAZE_HOME` is not. Binding by a shorter
   name (a relative path from the directory) would remove the limit.
 - macOS: every build is cargo's, and nothing has been run there. Windows x86-64 MSVC is
   served since the Windows session's work was merged (see "macOS and Windows"); the

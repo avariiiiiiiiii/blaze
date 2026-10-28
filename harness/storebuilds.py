@@ -8,7 +8,7 @@ CI runner that builds ra-jit for each commit reused nothing. It keys by what the
 from now: a hash of the workspace's sources, its features, target and whether debug
 assertions are on, which `crates/ra-jit/build.rs` takes.
 
-A daemon of RA_JIT_BIN builds the stress workspace into an empty store and ends. A copy of the
+A daemon of BLAZE_BIN builds the stress workspace into an empty store and ends. A copy of the
 executable with other bytes, which is another build of the same sources, starts a daemon on
 that store: it has to find nearly everything the first one compiled, and the program has to
 print what cargo's does.

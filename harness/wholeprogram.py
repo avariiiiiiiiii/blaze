@@ -20,7 +20,7 @@ finished them (#200).
   trait_block    a method a trait provides calls a function declared in its body
   c_main         `#![no_main]` and a `main` of C's, as bun's, with a body of 16 384 statements
 
-The backend is `RA_JIT_BACKEND`'s; `--release` builds both with the release profile. With
+The backend is `BLAZE_BACKEND`'s; `--release` builds both with the release profile. With
 LLVM, a build of a whole program, whichever `main` it has, leaves no function to Cranelift
 for being large or for its handlers, as a build that edits follow does.
 """

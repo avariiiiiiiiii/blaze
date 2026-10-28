@@ -3041,7 +3041,7 @@
    "[1201701]"
   ],
   [
-   "idle for RA_JIT_IDLE_SECS, the daemon and its workers exit",
+   "idle for BLAZE_IDLE_SECS, the daemon and its workers exit",
    true,
    "daemon 1204875, workers [1204876]"
   ],
@@ -3136,22 +3136,22 @@
    "daemon"
   ],
   [
-   "RA_JIT_CACHE unset: the store is on, in the user cache directory",
+   "BLAZE_CACHE unset: the store is on, in the user cache directory",
    true,
    "`ra-jit cache stats` exit 0"
   ],
   [
-   "RA_JIT_CACHE 'off': the store is off",
+   "BLAZE_CACHE 'off': the store is off",
    true,
    "`ra-jit cache stats` exit 1"
   ],
   [
-   "RA_JIT_CACHE '0': the store is off",
+   "BLAZE_CACHE '0': the store is off",
    true,
    "`ra-jit cache stats` exit 1"
   ],
   [
-   "RA_JIT_CACHE '': the store is off",
+   "BLAZE_CACHE '': the store is off",
    true,
    "`ra-jit cache stats` exit 1"
   ],

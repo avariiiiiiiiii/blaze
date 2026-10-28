@@ -89,7 +89,7 @@ CASES = {
         # bun's own build keeps frame pointers; LLVM, unlike Cranelift, otherwise gives the
         # register to values.
         "rustflags": "-C link-dead-code -Cforce-frame-pointers=yes",
-        "env": {"RA_JIT_BACKEND": "llvm"},
+        "env": {"BLAZE_BACKEND": "llvm"},
         "expected": "compiled",
         "reasons": (),
     },

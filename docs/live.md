@@ -140,7 +140,7 @@ The program is told to start again (`Outcome::Restart`) when:
 
 A build of several programs where cargo builds one (`blaze build -p server -p client`, and an
 edit only rustc's copy of the client's code sees) links none of the others again: cargo's run
-is told which programs the daemon built (`RA_JIT_DAEMONS_BUILT`), and the wrapper asks the
+is told which programs the daemon built (`BLAZE_DAEMONS_BUILT`), and the wrapper asks the
 daemon for each of those as it does under plain cargo, giving cargo the daemon's executable
 where rustc would have linked one; nor is rustc's old executable put back over a running one
 first. The checkout is then `kept`: the daemon's worker loads what rustc built in place,
@@ -154,7 +154,7 @@ A patch that can't be applied (`Outcome::Declined`) leaves the program as it was
 
 A type is never changed in place under a running program: a new one is added beside it under
 a name of its own, the code moved to it with the values converted, and the old one deleted,
-each edit a patch. On the daemon's own base (`RA_JIT_RUSTC_BASE=0`, or once it has built one)
+each edit a patch. On the daemon's own base (`BLAZE_RUSTC_BASE=0`, or once it has built one)
 an edit that adds a struct, an enum, a derive, a trait impl or a `macro_rules!` call that
 writes them, anywhere in a file with other types, is a patch of the functions it adds and the
 generic instances over the new type; taking a type away is a patch of the code that no longer

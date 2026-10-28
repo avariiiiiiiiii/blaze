@@ -12,7 +12,7 @@ its build script writes into `OUT_DIR`. ra-jit builds it, with nothing of rustc'
   - warm, twice: they are served, and the program is built and prints what cargo's does
     (a def map served before the files it was read from were loaded broke on its
     `macro_rules!`, "Can't find ast id MacroRules");
-  - warm with `RA_JIT_FROZEN=check` and with `=verify`: what was frozen is what resolving finds,
+  - warm with `BLAZE_FROZEN=check` and with `=verify`: what was frozen is what resolving finds,
     and what reading it writes back;
   - another checkout of the same source at another path, whose build script writes below its
     own target directory, with the first's put away: it is served the def maps of as many
@@ -95,7 +95,7 @@ def main():
               f'[dependencies]\nincdata = {{ path = "{dep}" }}\ngendata = {{ path = "{gen}" }}\n[workspace]\n')
         write(os.path.join(root, "src/main.rs"), MAIN)
         subprocess.run(["cargo", "generate-lockfile", "-q"], cwd=root, check=True)
-        store = {"RA_JIT_CACHE": os.path.join(work, "store")}
+        store = {"BLAZE_CACHE": os.path.join(work, "store")}
         target = os.path.join(root, "target")
 
         def cargo_says():
@@ -129,8 +129,8 @@ def main():
         build("cold", served=False)
         served = build("warm", served=True)
         build("warm again", served=True)
-        build("warm, checked", served=True, RA_JIT_FROZEN="check")
-        build("warm, verified", served=True, RA_JIT_FROZEN="verify")
+        build("warm, checked", served=True, BLAZE_FROZEN="check")
+        build("warm, verified", served=True, BLAZE_FROZEN="verify")
         # Another checkout of the same source elsewhere, whose build script writes below its own
         # target directory: every frozen crate is the first checkout's (#105).
         # The first's target directory is put away meanwhile, so nothing it serves names a file

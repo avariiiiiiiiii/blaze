@@ -167,7 +167,7 @@ flat tree removes.
 
 **Gate.** Unit tests (ra-jit 138, hir-ty-codegen 13), hir-ide (its 18 known failures),
 corpus `--mixed 8` under Cranelift and LLVM (MATCH, 0 of 902 layouts differ), the corpus
-again with `RA_CHECK_RELATIVE_BODIES=1 RA_JIT_CHECK_PLACES=1`, mixfutures `--mixed 16
+again with `RA_CHECK_RELATIVE_BODIES=1 BLAZE_CHECK_PLACES=1`, mixfutures `--mixed 16
 --layouts` under both, growth, movedlines (6 of 6), borrowck_ui (as main), the pinned ui
 tests (15 of 15) and the ui run-pass claims against `ui-known.txt`: the differences are the
 host's (main has the same five).
@@ -185,14 +185,14 @@ takes: an enter pushes a node and remembers it, an exit writes where its subtree
 token pushes a token. The parser does not change.
 
 **How lowering consumes it.** Unchanged. rowan 0.17's cursor is about 35 functions over
-`NodeData` (a green pointer, a parent, an offset). A fork in `vendor/rust-analyzer/lib/rowan`
+`NodeData` (a green pointer, a parent, an offset). A fork in `crates/rowan`
 (we pin every layer; inside the subtree so that the fork builds alone) gives the cursor a second kind of tree: a `SyntaxNode` that is a flat tree's root and an
 element's number, with nothing allocated per node, and moves that are arithmetic on the
 arrays. `syntax::ast`, `AstPtr`, ast id maps, item trees and body lowering compile and run as
 they are. A green tree of a part of a flat one is made only when something asks for it (the
 syntax editor that builtin derives use, IDE assists): `green()` builds that part's and keeps
 it with the root. `Parse` holds a green tree or a flat one; parses make flat ones, and
-`RA_JIT_GREEN_TREES=1` makes green ones, to compare. Steps (b) and (c) are the one change:
+`BLAZE_GREEN_TREES=1` makes green ones, to compare. Steps (b) and (c) are the one change:
 with the cursor serving flat trees nothing in the compiler path makes a green tree.
 
 **What changed.** rowan 0.17.0 is vendored as published, then given `flat.rs` (the tree
@@ -267,7 +267,7 @@ when the daemon is ready is elsewhere).
 
 **Gate.** Unit tests (ra-jit 139, hir-ty-codegen 13), hir-ide (its 18 known failures),
 corpus `--mixed 8` under Cranelift and LLVM (MATCH, 0 of 908 layouts differ), the corpus with
-`RA_CHECK_RELATIVE_BODIES=1 RA_JIT_CHECK_PLACES=1`, mixfutures `--mixed 16 --layouts` under
+`RA_CHECK_RELATIVE_BODIES=1 BLAZE_CHECK_PLACES=1`, mixfutures `--mixed 16 --layouts` under
 both, growth, movedlines (6 of 6), borrowck_ui (Polonius 1,363 and NLL 1,358, as main), the
 pinned ui tests (15 of 15) and the ui run-pass tests against `ui-known.txt` (the host's five
 differences, as with (a)); and rust-analyzer's own tests of `parser` (333), `syntax` (56), `mbe` (7),
@@ -286,7 +286,7 @@ tree of that part, made then and kept with the root, so editing behaves as on a 
 runs as above (perf of `heap-profile` builds, then quiet rounds of release and `dist` builds).
 
 **Why walking took a larger share.** The same binary (main), with flat trees and with
-`RA_JIT_GREEN_TREES=1`, samples whose innermost frame of a kind walks a tree:
+`BLAZE_GREEN_TREES=1`, samples whose innermost frame of a kind walks a tree:
 
 | | ripgrep | nushell | helix |
 |---|---:|---:|---:|
@@ -325,7 +325,7 @@ what they keep:
   `loaded_crates`' identifiers of a file (as text, no longer interned).
 
 One path: these callers have no cursor fallback. A green tree reaching them (what the syntax
-editor makes, or every tree under `RA_JIT_GREEN_TREES=1`) is made flat first, except in the
+editor makes, or every tree under `BLAZE_GREEN_TREES=1`) is made flat first, except in the
 accessors, whose green arm is the cursor, for trees the syntax editor makes.
 
 **Measured, the daemon** (`harness/cpufold.py`, as above):
@@ -385,7 +385,7 @@ answer.
 `hir-expand`, `hir-def`, `span` and `rowan` (the new test compares the array walks with the
 cursor's on green and flat trees, and `hash_subtree` in place with the copy's hash), hir-ide
 (its 18 known failures), the corpus under Cranelift and LLVM (MATCH, 0 of 910 layouts
-differ), the corpus with `RA_CHECK_RELATIVE_BODIES=1 RA_JIT_CHECK_PLACES=1`, mixfutures under
+differ), the corpus with `RA_CHECK_RELATIVE_BODIES=1 BLAZE_CHECK_PLACES=1`, mixfutures under
 both, growth, movedlines (6 of 6), norustc (no count above its baseline, and none above
 main's), borrowck_ui (Polonius 1,405 and NLL 1,401, as main), the pinned ui tests (15 of 15)
 and the ui run-pass tests, whose differences from `ui-known.txt` are the same on main on this
@@ -396,4 +396,4 @@ host (**read**).
 - bun: not run. Its workspace builds only after bun's own build has made its C and C++
   (`harness/bunprep.py` under `nix develop .#bench-bun`), which the host did not have.
 - Files being edited keep a flat tree too: the daemon has no editor's buffers, so nothing
-  in ra-jit tells an edited file from another. `RA_JIT_GREEN_TREES=1` makes every tree green.
+  in ra-jit tells an edited file from another. `BLAZE_GREEN_TREES=1` makes every tree green.

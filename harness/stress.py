@@ -239,7 +239,7 @@ def main():
             if os.path.exists(path):
                 os.remove(path)
         seen = len(open(log_path).read())
-        # Edits are added to the linked binary where that can be done; RA_JIT_SPLICE=0 links each in full.
+        # Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full.
         splice = ["--binary", binary]
         daemon = subprocess.Popen(
             [RA_JIT, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
@@ -338,7 +338,7 @@ def main():
                     open(path, "a").write(op[2])
                 elif op[0] == "delete":
                     os.remove(path)
-        if os.environ.get("RA_JIT_PATCH_FIRST"):
+        if os.environ.get("BLAZE_PATCH_FIRST"):
             # The edit is first built for a request that does not link.
             subprocess.run([RA_JIT, "patch", socket], capture_output=True, text=True, timeout=120)
         asked = time.time()
@@ -362,7 +362,7 @@ def main():
             verdict = "REFUSED: " + reply[:120].replace("|", "/").replace("\n", " ")
         else:
             ours, theirs = run(binary), run(built(reference, "sapp"))
-            if ours == theirs and mended and kind != "patch" and not os.environ.get("RA_JIT_PATCH_FIRST"):
+            if ours == theirs and mended and kind != "patch" and not os.environ.get("BLAZE_PATCH_FIRST"):
                 verdict = "WRONG: not a patch, as if the refused text had been built"
             elif ours == theirs and meanwhile is not None and not meanwhile.startswith("ok"):
                 verdict = "WRONG: the edit sent meanwhile was answered " + meanwhile[:100]

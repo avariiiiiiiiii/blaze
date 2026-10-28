@@ -155,7 +155,7 @@ impl App {
         } else if self.editor.file.is_none() {
             ui.colored_label(
                 t.comment,
-                "no source to edit: start the window from demo/life, or set RA_JIT_LIFE_FILE",
+                "no source to edit: start the window from demo/life, or set BLAZE_LIFE_FILE",
             );
         } else if self.build.ok || self.build.text.is_empty() {
             let file =
@@ -284,10 +284,10 @@ impl eframe::App for App {
     }
 }
 
-/// The file to edit: `RA_JIT_LIFE_FILE`, else src/main.rs here (the launcher starts the window
+/// The file to edit: `BLAZE_LIFE_FILE`, else src/main.rs here (the launcher starts the window
 /// in the crate's copy), else the crate this was built from, if it is still there.
 fn source_file() -> Option<PathBuf> {
-    if let Some(file) = std::env::var_os("RA_JIT_LIFE_FILE") {
+    if let Some(file) = std::env::var_os("BLAZE_LIFE_FILE") {
         return Some(file.into());
     }
     [
@@ -299,7 +299,7 @@ fn source_file() -> Option<PathBuf> {
     .map(|p| std::path::absolute(&p).unwrap_or(p))
 }
 
-/// `RA_JIT_LIFE_HEADLESS=1`: the same program without a window, for harness/live_latency.py to
+/// `BLAZE_LIFE_HEADLESS=1`: the same program without a window, for harness/live_latency.py to
 /// time edits of the demo by (its executable is the window's, eframe and all). Each patch is
 /// applied as it lands, as in the window; what `step_ms()` returns is printed whenever it
 /// changes, with the time it was seen.
@@ -339,7 +339,7 @@ fn headless(mut life: Life) -> eframe::Result {
 }
 
 pub fn run(life: Life) -> eframe::Result {
-    if std::env::var_os("RA_JIT_LIFE_HEADLESS").is_some() {
+    if std::env::var_os("BLAZE_LIFE_HEADLESS").is_some() {
         return headless(life);
     }
     let (live, live_note) = match Live::start() {
@@ -348,8 +348,8 @@ pub fn run(life: Life) -> eframe::Result {
     };
     let tiering_off = if live.is_none() {
         Some("tiering: off, as live edits are".to_owned())
-    } else if std::env::var_os("RA_JIT_TIER").is_some_and(|it| it == "off") {
-        Some("tiering: off (RA_JIT_TIER=off)".to_owned())
+    } else if std::env::var_os("BLAZE_TIER").is_some_and(|it| it == "off") {
+        Some("tiering: off (BLAZE_TIER=off)".to_owned())
     } else {
         None
     };

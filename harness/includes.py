@@ -71,7 +71,7 @@ def follow(files, steps):
     link = list(fx.link_args)
     link = linkline.with_output(linkline.ahead(link, [patch, obj], RA_JIT), binary)
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    # Edits are added to the linked binary where that can be done; RA_JIT_SPLICE=0 links each in full.
+    # Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full.
     splice = ["--binary", binary]
     ask = ["--crate", "sinc", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols]
     out = open(log_path, "a")
@@ -80,7 +80,7 @@ def follow(files, steps):
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon did not start: {log_path}")
         time.sleep(0.05)
-    # A daemon whose first build took code of the checkout from the store (RA_JIT_CACHE) builds
+    # A daemon whose first build took code of the checkout from the store (BLAZE_CACHE) builds
     # again by itself before anything else (#12), and a request waits for that build: what it
     # compiles is no step's.
     subprocess.run([RA_JIT, "sync", socket, *ask], capture_output=True, text=True, timeout=120)

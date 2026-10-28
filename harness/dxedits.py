@@ -11,8 +11,8 @@ import linkline
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-os.environ["RA_JIT_STATS"] = "1"
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(HERE, "../target/release/ra-jit")
+os.environ["BLAZE_STATS"] = "1"
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(HERE, "../target/release/ra-jit")
 BODY = "let _ra_jit_edit = 1u32;"
 ASYNC_MAIN = "async fn main() -> ExitCode {\n"
 NEW_FN = "\nfn ra_jit_new_item(x: u32) -> u32 { x + 1 }\n"
@@ -78,7 +78,7 @@ def main():
             link = [a for a in link if not (a.startswith("-B") and "gcc-ld" in a)]
             link[link.index("-fuse-ld=lld")] = "-B" + ld
         args += ["--patch", patch, "--link-cmd", shlex.join(link)]
-        # Edits are added to the linked binary where that can be done; RA_JIT_SPLICE=0 links each in full.
+        # Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full.
         args += ["--binary", binary]
     # DXEDITS_REQUEST: `sync` or `patch`; each build is then asked for once the file is written.
     request = os.environ.get("DXEDITS_REQUEST")

@@ -12,7 +12,7 @@
 #
 # Reads the registration token (valid one hour, needs repo admin) from stdin; the arguments are
 # the platform (the machine's own, checked) and the name of the machine for the results
-# (RA_JIT_BENCH_MACHINE). One argument is the name, on linux-x86-64, as before there were
+# (BLAZE_BENCH_MACHINE). One argument is the name, on linux-x86-64, as before there were
 # platforms. Installs the runner in ~/actions-runner and runs it at boot: on Linux from a user
 # systemd unit, ra-jit-bench-runner.service, that lingers; on macOS as the runner's own launchd
 # service (svc.sh), which needs the user logged in, and the Mac kept from sleeping.
@@ -45,7 +45,7 @@ export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 ./config.sh --unattended --replace --url https://github.com/indexable-inc/blaze --token "$token" \
   --name "$(hostname -s)" --labels "$label" --work _work
 cat > .env <<EOF
-RA_JIT_BENCH_MACHINE=$machine
+BLAZE_BENCH_MACHINE=$machine
 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 EOF
 if [ "$(uname -s)" = Darwin ]; then

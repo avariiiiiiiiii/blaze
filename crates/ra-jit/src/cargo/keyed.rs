@@ -28,7 +28,7 @@ const VAR: &str = "$";
 const KIND: &str = "?";
 
 /// The variable that has every entry found made again and compared ([`check`]).
-pub(crate) const CHECK: &str = "RA_JIT_BSCACHE";
+pub(crate) const CHECK: &str = "BLAZE_BSCACHE";
 
 /// Whether [`CHECK`] is `check`: an entry found is not used but made again, and what it made
 /// compared with the entry. A difference is fatal.
@@ -38,7 +38,7 @@ pub(crate) fn check() -> bool {
 
 /// The variable naming a directory where each key done is written as its fields, one a line,
 /// in `<key>.txt`: what two machines' keys differ in.
-const TRACE: &str = "RA_JIT_KEY_TRACE";
+const TRACE: &str = "BLAZE_KEY_TRACE";
 
 /// A key of fields, each its length and its bytes, and them as text when [`TRACE`] is set.
 pub(crate) struct Key(Sha256, Option<Vec<u8>>);
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn a_variable_read_is_its_value() {
-        let name = format!("RA_JIT_KEYED_TEST_{}", std::process::id());
+        let name = format!("BLAZE_KEYED_TEST_{}", std::process::id());
         assert_eq!(digest(&var(&name)), "-");
         // SAFETY: no other thread of this test reads this variable.
         unsafe { std::env::set_var(&name, "1") };

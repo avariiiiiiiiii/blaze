@@ -336,7 +336,7 @@ fn doc_tests(
             args.extend(["--target".into(), triple.into()]);
         }
         let mut env: Vec<(OsString, OsString)> =
-            std::env::vars_os().filter(|(name, _)| name != "RA_JIT_CACHE").collect();
+            std::env::vars_os().filter(|(name, _)| name != "BLAZE_CACHE").collect();
         env.extend(
             run_env(package, &[]).into_iter().map(|(name, value)| (name.into(), value.into())),
         );
@@ -344,7 +344,7 @@ fn doc_tests(
         // The daemon's store, as its workers have it: what the examples link of the standard
         // library is compiled once, not for each library each run.
         if let Some(store) = super::daemon::store() {
-            env.push(("RA_JIT_CACHE".into(), store.into()));
+            env.push(("BLAZE_CACHE".into(), store.into()));
         }
         crate::doctest::write_run(&replay.dir, args, root.to_owned(), env)?;
     }

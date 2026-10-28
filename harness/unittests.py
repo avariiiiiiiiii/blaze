@@ -3,25 +3,20 @@
 
 usage: unittests.py [cargo test argument ...]
 
-Runs `cargo test --release --no-fail-fast` of the crates below, in two cargo runs: ROOT_CRATES
-in the root workspace, and FORK_CRATES (the rust-analyzer fork's) in vendor/rust-analyzer's own
-workspace (run in vendor/rust-analyzer, so that its own .cargo/config.toml sets
-CARGO_WORKSPACE_DIR, where expect-test finds the parser's .rast files), since the root does not claim
-them as members (#293: so that `cargo install --git` builds ra-jit), and cargo only tests a
-member's dev-dependencies. Both share one target directory and the arguments given. A failing
-test that is not in OPEN fails the run, and so does a test in OPEN that passes or no longer
-exists: take it out; so does either cargo run failing before any of its tests failed.
+Runs `cargo test --release --no-fail-fast` of CRATES, one cargo run in the root workspace, with
+the arguments given. A failing test that is not in OPEN fails the run, and so does a test in
+OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
+its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
 `hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
 import os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Members of the root workspace.
-ROOT_CRATES = ["hir-ty-codegen", "ra-jit-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "ra-jit"]
-# Members of vendor/rust-analyzer's workspace (its own Cargo.toml and Cargo.lock).
-FORK_CRATES = ["hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide"]
-FORK = os.path.join(ROOT, "vendor", "rust-analyzer")
+CRATES = [
+    "hir-ty-codegen", "ra-jit-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "ra-jit",
+    "hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics",
+]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
@@ -74,20 +69,11 @@ def run(command, cwd, env, seen, failed):
 
 
 def main():
-    test = ["cargo", "test", "--release", "--no-fail-fast"]
-    commands = [
-        (ROOT, [*test, *(f"-p{c}" for c in ROOT_CRATES), *sys.argv[1:]]),
-        # cargo reads .cargo/config.toml from where it runs, not from --manifest-path.
-        (FORK, [*test, *(f"-p{c}" for c in FORK_CRATES), *sys.argv[1:]]),
-    ]
-    # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory,
-    # which they take to be vendor/rust-analyzer/target unless told.
+    command = ["cargo", "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *sys.argv[1:]]
+    # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
-    seen, failed, broken = set(), set(), []
-    for cwd, command in commands:
-        status, any_failed = run(command, cwd, env, seen, failed)
-        if status and not any_failed:
-            broken.append((command, status))
+    seen, failed = set(), set()
+    status, any_failed = run(command, ROOT, env, seen, failed)
     sys.stdout.flush()
     new, fixed, gone = sorted(failed - OPEN), sorted(OPEN & seen - failed), sorted(OPEN - seen)
     print(f"\n{len(seen)} tests, {len(failed)} failed, {len(OPEN & failed)} of them known (OPEN in harness/unittests.py)")
@@ -97,9 +83,8 @@ def main():
         print(f"::error::{name} passes now: take it out of OPEN in harness/unittests.py")
     for name in gone:
         print(f"::error::{name} did not run: take it out of OPEN in harness/unittests.py")
-    for command, status in broken:
+    if status and not any_failed:
         print(f"::error::{' '.join(command)} failed (exit status {status}) before any test failed: the build, most likely")
-    if broken:
         sys.exit(1)
     sys.exit(1 if new or fixed or gone else 0)
 

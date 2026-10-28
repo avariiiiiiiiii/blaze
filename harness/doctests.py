@@ -4,7 +4,7 @@ the same tests must end the same way and print the same, in ra-jit's first run a
 second, which reuses the programs of the first. Each crate's line says how many examples
 ra-jit built and how many it did not: those fail, saying why, and are not compared.
 
-    RA_JIT_BIN=../target/release/ra-jit python3 doctests.py [--few] [name-version ...]
+    BLAZE_BIN=../target/release/ra-jit python3 doctests.py [--few] [name-version ...]
 
 Each crate is unpacked by `vendor.sh` and built in a directory that is removed afterwards.
 A difference is WRONG and fails the run. `--few` is the first three crates."""
@@ -17,7 +17,7 @@ import tempfile
 from buildmodel import doctest_report, judge_doctests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RA_JIT = os.path.abspath(os.environ.get("RA_JIT_BIN", os.path.join(HERE, "..", "target", "release", "ra-jit")))
+RA_JIT = os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "..", "target", "release", "ra-jit")))
 CRATES = [
     "semver-1.0.28", "either-1.19.0", "smallvec-1.16.3",
     "serde_core-1.0.229", "regex-1.13.1", "itertools-0.15.0", "chrono-0.4.45", "anyhow-1.0.104",
@@ -68,7 +68,7 @@ def main():
     for spec in args or (CRATES[:3] if "--few" in sys.argv else CRATES):
         verdict, said = row(spec)
         counts[verdict] += 1
-        print(f"{spec:28} {os.environ.get('RA_JIT_BACKEND', 'cranelift'):9} {verdict:8} {said}", flush=True)
+        print(f"{spec:28} {os.environ.get('BLAZE_BACKEND', 'cranelift'):9} {verdict:8} {said}", flush=True)
     print(f"{counts['same']} same, {counts['refused']} refused, {counts['WRONG']} WRONG")
     sys.exit(1 if counts["WRONG"] else 0)
 

@@ -20,15 +20,15 @@ use stdx::time::Instant;
 use super::{CodegenError, Result, debuginfo::SlotPlaces, fragment::Code, fragment::Recorder};
 
 /// Names the producer: `cranelift` (the default) or `llvm`.
-const BACKEND: &str = "RA_JIT_BACKEND";
+const BACKEND: &str = "BLAZE_BACKEND";
 /// How hard LLVM optimizes each function, `0` to `3`. Each function is compiled alone, with
 /// what it calls built into it at `-O2` and above only in a build of a whole program (see
 /// `tier::across`).
-const OPTIMIZATION: &str = "RA_JIT_OPT";
+const OPTIMIZATION: &str = "BLAZE_OPT";
 /// How LLVM turns the optimized function into machine code: `optimized` (the default) or
 /// `fast`, its quick instruction selection and register allocation. Most of LLVM's time on a
 /// function is here, not in the passes before it.
-const SELECTION: &str = "RA_JIT_EMIT";
+const SELECTION: &str = "BLAZE_EMIT";
 
 /// The most instructions of Cranelift IR a body has that LLVM compiles in a build. LLVM takes
 /// 5 to 7 µs for each at `-O2` (16 Zen 5 cores, nushell 0.108.0, 2026-10-20), Cranelift about
@@ -371,7 +371,7 @@ pub(super) struct Tally {
     pub(super) phases: [AtomicU64; Phase::COUNT],
     /// Where the time around the producer went.
     steps: [AtomicU64; Step::COUNT],
-    /// Where Cranelift's time went, summed over the threads, with `RA_JIT_STATS`.
+    /// Where Cranelift's time went, summed over the threads, with `BLAZE_STATS`.
     passes: Mutex<Option<cranelift_codegen::timing::PassTimes>>,
     /// The exports built for compiles to import ([`super::imports`]), and how many bodies
     /// and instructions those imported.
@@ -489,10 +489,10 @@ impl Tally {
     }
 
     /// Adds the times of Cranelift's passes on this thread since it was last asked, with
-    /// `RA_JIT_STATS`.
+    /// `BLAZE_STATS`.
     pub(super) fn passes(&self) {
         static STATS: OnceLock<bool> = OnceLock::new();
-        if !*STATS.get_or_init(|| std::env::var_os("RA_JIT_STATS").is_some()) {
+        if !*STATS.get_or_init(|| std::env::var_os("BLAZE_STATS").is_some()) {
             return;
         }
         let times = cranelift_codegen::timing::take_current();
@@ -539,7 +539,7 @@ impl Tally {
             format!("{name} {took:.1?}")
         });
         let selected = Self::selected_llvm();
-        let stats = std::env::var_os("RA_JIT_STATS").is_some();
+        let stats = std::env::var_os("BLAZE_STATS").is_some();
         if !selected && !stats {
             return;
         }

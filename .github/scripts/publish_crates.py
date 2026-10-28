@@ -7,10 +7,10 @@
 
 blaze's crate, `crates/ra-jit` in the repository, is published as `cargo-blaze`, so that
 `cargo install cargo-blaze` installs it; its binaries keep their names. It depends by path on
-rust-analyzer's crates (the fork in vendor/rust-analyzer) and on
-rustc's rustc_abi (vendor/rustc_abi), which crates.io does not have in this form. Each one in
+the front end's crates, derived from rust-analyzer's (crates/hir-ty, hir-def and the rest), and
+on rustc's rustc_abi (crates/rustc_abi), which crates.io does not have in this form. Each one in
 ra-jit's dependency closure is published as `ra-jit-<name>` at the workspace version, without
-touching vendor/: every crate is copied into a staging workspace and its manifest is
+touching the tree: every crate is copied into a staging workspace and its manifest is
 rewritten there (name, version, metadata, path dependencies pinned with `=<version>` and
 renamed with `package = ...`, so `use hir::...` still compiles). A crate of ra-jit's own whose
 name does not start with `ra-jit` (hir-ty-codegen) is published as `ra-jit-<name>` the same way.
@@ -81,7 +81,7 @@ EXTRAS: dict[str, list[Extra]] = {
         Extra(
             "harness/toolchain",
             "toolchain",
-            "src/cargo/state.rs",
+            "src/cargo/toolchain.rs",
             'include_str!("../../../../harness/toolchain")',
             'include_str!("../../toolchain")',
         ),
@@ -208,7 +208,13 @@ class Repo:
             manifest = load(d / "Cargo.toml")
             package = manifest["package"]
             orig = package["name"]
-            fork = not d.is_relative_to(ROOT / "crates")
+            # Forks: vendor/, the crates in crates/ derived from rust-analyzer (which keep its version,
+            # 0.0.0), and rowan and rustc_abi, forks of crates on crates.io.
+            fork = (
+                not d.is_relative_to(ROOT / "crates")
+                or package["version"] == "0.0.0"
+                or orig in ("rowan", "ra-ap-rustc_abi")
+            )
             if fork:
                 name, version = "ra-jit-" + orig.removeprefix("ra-ap-"), self.version
             else:
@@ -422,11 +428,13 @@ def staged_manifest(c: Crate, by_dir: dict[Path, Crate], stage: Path) -> dict[st
                 del table[key]
                 pruned.add(key)
                 continue
-            if isinstance(spec, dict) and spec.get("workspace"):
+            if isinstance(spec, str):
+                spec = {"version": spec}
+            if spec.get("workspace"):
                 continue  # the staged workspace's table names it
             dep = by_dir[d]
             new = {
-                k: v for k, v in spec.items() if k not in ("path", "version", "package")
+                k: v for k, v in (spec.items() if isinstance(spec, dict) else ()) if k not in ("path", "version", "package")
             }
             new = {"path": f"../{dep.name}", "version": dep.requirement, **new}
             if dep.name != key:

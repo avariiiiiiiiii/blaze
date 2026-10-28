@@ -33,7 +33,15 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
 - `flecs/`: Flecs compiled to wasm (`flecs-doc.wasm`, checked in; `python3 flecs/build.py <flecs checkout>` rebuilds it
   with zig). The build's bake step and the editor's `.flecs` type checking (`content/tsconfig.json`) read the scripts
   with it.
-- `client/`: browser scripts (comment enhancements, the signup form, /bench, copy buttons).
+- `content/nav.flecs`: the sidebar's groups (`Group`, `Icon`) and outside links. A page joins one with `Nav` and
+  `(InGroup, nav.x)`; `renderer/core/src/side.rs` draws the sidebar, crumb, pager and outline from them, in the ix
+  docs' layout.
+- `client/`: browser scripts (the sidebar's folds, drawer, search over `dist/search.json` and outline in `side.ts`;
+  comment enhancements, the signup form, /bench, copy buttons). `nav.ts` is the client router: a click on a link to
+  another page fetches it (fetched ahead on hover) and swaps only the page column, the head's tags and the sidebar's
+  open row, without a load, as the ix docs move between pages; anything unexpected falls back to a plain load. Each
+  page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
+  next.
 
 The flecs skill (`.claude/skills/flecs/`) has the script syntax and its traps.
 

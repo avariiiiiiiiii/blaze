@@ -6,7 +6,7 @@ usage: mirparity.py [<workspace>] [--crate <package>] [--level 0|1|2] [--rustc-l
 
 Both sides are written as rustc's `-Zunpretty=mir` writes MIR: rustc's by rustc itself,
 ra-jit's by `ra-jit mir`, which prints the bodies its code generator compiles at the MIR
-optimization level `--level` (`RA_JIT_MIR_OPT`). rustc's are its optimized MIR, which is what
+optimization level `--level` (`BLAZE_MIR_OPT`). rustc's are its optimized MIR, which is what
 it generates code from: at `-Copt-level=0` that is its `-Zmir-opt-level=1`, the level a debug
 build gets, and with `--rustc-level 2` the MIR of `-Copt-level=2`, without inlining
 (`-Zinline-mir=no`), which ra-jit leaves to the code generator, and with the debug
@@ -27,14 +27,14 @@ and the share of pairs that pass each is printed. `identical` is the match rate.
 statements one side has in a function and the other has not are counted over all pairs, and
 the most frequent are listed with an example function, which is what to work on next.
 
-Exit status is 0 unless a side fails to build or to print. RA_JIT_BIN names the ra-jit binary.
+Exit status is 0 unless a side fails to build or to print. BLAZE_BIN names the ra-jit binary.
 """
 import argparse, collections, json, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
 
 
 def rustc_mir(workspace, package, level, ub_checks):

@@ -39,7 +39,7 @@ class Row:
         self.ws = os.path.realpath(at or os.path.join(self.dir, "ws"))
         self.home = os.path.join(self.dir, "home")
         os.makedirs(self.dir, exist_ok=True)
-        self.env = dict(base_env(self.home), RA_JIT_CACHE=os.path.join(self.dir, "store"), **(env or {}))
+        self.env = dict(base_env(self.home), BLAZE_CACHE=os.path.join(self.dir, "store"), **(env or {}))
         self.built, self.notes, self.mark = [], [], 1000
         self.copy(self.ws)
 
@@ -400,7 +400,7 @@ def non_utf8_root(row):
 
 
 def other_filesystem(row):
-    here, there = os.stat(row.ws).st_dev, os.stat(row.env["RA_JIT_CACHE"] if os.path.isdir(row.env["RA_JIT_CACHE"]) else row.dir).st_dev
+    here, there = os.stat(row.ws).st_dev, os.stat(row.env["BLAZE_CACHE"] if os.path.isdir(row.env["BLAZE_CACHE"]) else row.dir).st_dev
     if here == there:
         raise Wrong("the workspace and the store are on one filesystem here; name another with --other-fs")
     row.warm()
@@ -409,7 +409,7 @@ def other_filesystem(row):
         row.both(f"edited, {round}", want=f"mark {row.mark}")
     row.both("tests", command="test")
     # A pack is open for as long as the worker that writes it lives.
-    packs = [it for kind in ("*.pack", "*.open") for it in glob.glob(os.path.join(row.env["RA_JIT_CACHE"], kind))]
+    packs = [it for kind in ("*.pack", "*.open") for it in glob.glob(os.path.join(row.env["BLAZE_CACHE"], kind))]
     stored = sum(os.path.getsize(it) for it in packs)
     row.notes.append(f"{stored} bytes in {len(packs)} packs in the store on the other filesystem")
     if not stored:
@@ -471,14 +471,14 @@ def toolchains_in_turn(row):
 
 def pinned_to_a_nightly(row):
     """A project pinned to a nightly of the next release, built anyway
-    (`RA_JIT_OTHER_TOOLCHAIN=1`), as bun is: nightly cargo passes every crate
+    (`BLAZE_OTHER_TOOLCHAIN=1`), as bun is: nightly cargo passes every crate
     `-Z embed-metadata=no` and writes its build directory in its second layout, where the
     build script's output is. Each sent the build to cargo."""
     if shutil.which("rustup"):
         subprocess.run(["rustup", "toolchain", "install", NIGHTLY, "--profile", "minimal", "-c", "rust-src"],
                        check=True, capture_output=True)
     says_its_rustc(row)
-    row.env.update(RUSTUP_TOOLCHAIN=NIGHTLY, RA_JIT_OTHER_TOOLCHAIN="1")
+    row.env.update(RUSTUP_TOOLCHAIN=NIGHTLY, BLAZE_OTHER_TOOLCHAIN="1")
     row.warm()
     row.both("warm", want="-nightly")
     row.edit()
@@ -592,7 +592,7 @@ def memory_ceiling(row):
     time.sleep(3)
     row.notes.append("after the first was asked again:\n" + row.status()[2])
     log = open(os.path.join(row.home, "daemon.log"), errors="replace").read()
-    row.notes.append("\n".join(l for l in log.splitlines() if "RA_JIT_MEMORY_MAX" in l))
+    row.notes.append("\n".join(l for l in log.splitlines() if "BLAZE_MEMORY_MAX" in l))
 
 
 def no_ceiling(row):
@@ -1086,8 +1086,8 @@ ROWS = {
     "toolchain file switched": (toolchain_switched, {}),
     "two toolchains in turn": (toolchains_in_turn, {}),
     "daemon binary replaced": (binary_replaced, {}),
-    "memory ceiling": (memory_ceiling, {"RA_JIT_MEMORY_MAX": "1M"}),
-    "no memory ceiling": (no_ceiling, {"RA_JIT_MEMORY_MAX": "off"}),
+    "memory ceiling": (memory_ceiling, {"BLAZE_MEMORY_MAX": "1M"}),
+    "no memory ceiling": (no_ceiling, {"BLAZE_MEMORY_MAX": "off"}),
     "control group's memory": (in_a_control_group, {}),
     "tests of a proc macro": (proc_macro_tests, {}),
     "proc macro on generated code": (generated_for_a_proc_macro, {}),
@@ -1112,7 +1112,7 @@ def main():
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     if not shutil.which("cargo-ra-jit", path=os.path.dirname(RA_JIT)):
-        sys.exit("no cargo-ra-jit beside the ra-jit of RA_JIT_BIN")
+        sys.exit("no cargo-ra-jit beside the ra-jit of BLAZE_BIN")
     unknown = [wanted for wanted in args.rows if not any(wanted in name for name in ROWS)]
     if unknown:
         sys.exit(f"no row is named like {unknown}; the rows are: {', '.join(ROWS)}")
@@ -1146,7 +1146,7 @@ def main():
         print(f"{'ok ' if result == 'right' else '-- ' if result.startswith('not run') else 'NOT'} {name}  {time.time() - began:.0f}s  {result if result != 'right' else ''}", flush=True)
         for line in row.built:
             print(f"      {line}", flush=True)
-    backend = os.environ.get("RA_JIT_BACKEND", "cranelift")
+    backend = os.environ.get("BLAZE_BACKEND", "cranelift")
     with open(os.path.join(HERE, "SOAKROWS.md"), "w") as out:
         out.write(f"# soakrows.py\n\n{len(table) - failed} of {len(table)} rows right, {backend}.\n\n| row | result | who built each comparison |\n|---|---|---|\n")
         for name, result, built, _ in table:

@@ -8,7 +8,7 @@ the text of a span, which asks the database) is built by three daemons on one st
   - the first, on an empty store, keeps what it expanded that asked nothing of the database;
   - the second finds all of that, and expands only what asked;
   - after an edit to a struct and to a function, the third runs under
-    `RA_JIT_PROC_MACRO_CACHE=check`, which expands every call anyway: nothing may expand
+    `BLAZE_PROC_MACRO_CACHE=check`, which expands every call anyway: nothing may expand
     otherwise than it was kept.
 
 Each program has to print what cargo's does. The toolchain's proc-macro server answers no
@@ -166,7 +166,7 @@ def main():
         want = cargo()
         with open(log_path, "w") as out:
             proc = subprocess.Popen([RA_JIT, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out,
-                                    env={**os.environ, "RA_JIT_CACHE": store, **env})
+                                    env={**os.environ, "BLAZE_CACHE": store, **env})
         try:
             while "watching" not in open(log_path).read():
                 if proc.poll() is not None:
@@ -200,7 +200,7 @@ def main():
         text = open(main_rs).read()
         text = text.replace("struct S3 {\n", "struct S3 {\n    added: u8,\n", 1).replace("    x * 2\n", "    x * 7\n", 1)
         open(main_rs, "w").write(text)
-        third, _, found = daemon("third", RA_JIT_PROC_MACRO_CACHE="check")
+        third, _, found = daemon("third", BLAZE_PROC_MACRO_CACHE="check")
         if "expanded otherwise" in third or found < kept - 2:
             raise SystemExit(f"FAIL: under check, {found} were found again of {kept}, or one expanded otherwise "
                              f"than it was kept: {work}/third.log")

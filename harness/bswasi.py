@@ -8,11 +8,11 @@ usage: bswasi.py record [PROJECT...] --ra-jit BIN [--work DIR] [--out DIR] [--jo
 `record` fetches each project of harness/bench.py at its pinned revision (all of them when none
 is named) and runs `cargo check --compile-time-deps --workspace --all-targets` through ra-jit's
 wrapper (RUSTC_WRAPPER=ra-jit-rustc beside BIN), as harness/bscache.py does, with an empty store
-of its own, but with RA_JIT_BUILD_SCRIPTS=wasi-compare and RA_JIT_SCRIPTS_BY_RUSTC=1: every
+of its own, but with BLAZE_BUILD_SCRIPTS=wasi-compare and BLAZE_SCRIPTS_BY_RUSTC=1: every
 build script is compiled by rustc for the host and by ra-jit for wasm32-wasip1, and each run
 runs the module under Wasmtime first, setting aside what it printed and wrote (`ra-jit-wasi/`
 beside OUT_DIR), then the native executable in the sandbox, for cargo. BIN is built with the
-feature `wasi`. RA_JIT_ONLY_ASKS is not set: the module's description needs the records the
+feature `wasi`. BLAZE_ONLY_ASKS is not set: the module's description needs the records the
 wrapper keeps of the libraries rustc compiles. Each project's runs, each compared, are collected
 into `<out>/<project>.json`, and the project's checkout, target directory and store are removed
 (BSWASI_KEEP=1 keeps them).
@@ -73,14 +73,14 @@ def record(name, repo, rev, work, ra_jit, jobs):
         shutil.rmtree(dir, ignore_errors=True)
     env = dict(os.environ)
     for key in list(env):
-        if key.startswith(("CARGO_", "RA_JIT_", "RUSTC_")) and key != "CARGO_HOME":
+        if key.startswith(("CARGO_", "BLAZE_", "RUSTC_")) and key != "CARGO_HOME":
             del env[key]
     env.update(
         RUSTC_WRAPPER=os.path.join(os.path.dirname(ra_jit), "ra-jit-rustc"),
-        RA_JIT_PROC_MACRO_SERVER="0",
-        RA_JIT_SCRIPTS_BY_RUSTC="1",
-        RA_JIT_BUILD_SCRIPTS="wasi-compare",
-        RA_JIT_CACHE=store,
+        BLAZE_PROC_MACRO_SERVER="0",
+        BLAZE_SCRIPTS_BY_RUSTC="1",
+        BLAZE_BUILD_SCRIPTS="wasi-compare",
+        BLAZE_CACHE=store,
         CARGO_TARGET_DIR=target,
         CARGO_BUILD_JOBS=str(jobs),
         CARGO_UNSTABLE_CHECKSUM_FRESHNESS="false",

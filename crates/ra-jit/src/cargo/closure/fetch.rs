@@ -49,7 +49,7 @@ pub(crate) struct Fetched {
     pub(crate) nar_bytes: u64,
 }
 
-/// Where narinfos and NARs come from: the cache, or what `RA_JIT_NIX_CACHE` names, an address
+/// Where narinfos and NARs come from: the cache, or what `BLAZE_NIX_CACHE` names, an address
 /// or a directory laid out as a cache is (`<hash>.narinfo`, `nar/<file>`).
 pub(crate) enum Source {
     Web { infos: Https, nars: Https },
@@ -58,7 +58,7 @@ pub(crate) enum Source {
 
 impl Source {
     pub(crate) fn from_env() -> anyhow::Result<Source> {
-        let given = std::env::var("RA_JIT_NIX_CACHE").ok().filter(|it| !it.is_empty());
+        let given = std::env::var("BLAZE_NIX_CACHE").ok().filter(|it| !it.is_empty());
         if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
             return Ok(Source::Dir(PathBuf::from(dir)));
         }

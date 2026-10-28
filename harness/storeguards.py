@@ -13,7 +13,7 @@ A daemon fills a store and ends. Then:
     with the reason, and a daemon on it has to say it is not used, build the right
     program, and neither read nor write anything in it;
   - `ra-jit cache pull` from a remote whose lists nobody signed has to be refused, with
-    nothing fetched, unless RA_JIT_REMOTE_UNSIGNED=1; `ra-jit cache push` asks for nothing.
+    nothing fetched, unless BLAZE_REMOTE_UNSIGNED=1; `ra-jit cache push` asks for nothing.
 
   - a crate cargo fetched from a registry is kept under `/cargo`, not under the cargo home
     of whoever built it: a second user with another cargo home has to find what the first
@@ -30,7 +30,7 @@ from storelib import Checkout, Daemon, cache, files, run, scratch, verify
 from difftest import Fixture
 import packs
 
-SEALS = {"RA_JIT_CACHE_SEAL_AT": "1", "RA_JIT_CACHE_MAX": "off"}
+SEALS = {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "off"}
 OTHERS_WRITE = "written to by other users"
 
 
@@ -127,21 +127,21 @@ def writable_store(checkout, store):
 
 def unsigned(checkout, store, work):
     remote, second = os.path.join(work, "remote"), os.path.join(work, "second")
-    nothing_asked = {"RA_JIT_REMOTE_UNSIGNED": ""}
+    nothing_asked = {"BLAZE_REMOTE_UNSIGNED": ""}
     status, out = cache(store, "push", remote, env=nothing_asked)
     if status != 0:
         fail(f"push: {out}")
     names_no_checkout(checkout, remote, "the remote")
     for value in ("", "0", "true"):
-        status, out = cache(second, "pull", remote, env={"RA_JIT_REMOTE_UNSIGNED": value})
+        status, out = cache(second, "pull", remote, env={"BLAZE_REMOTE_UNSIGNED": value})
         if status == 0 or "BLAZE_REMOTE_UNSIGNED=1" not in out or files(second, ".pack"):
-            fail(f"pull with RA_JIT_REMOTE_UNSIGNED={value!r} was not refused: {out}")
-    status, out = cache(second, "pull", remote, env={"RA_JIT_REMOTE_UNSIGNED": "1"})
+            fail(f"pull with BLAZE_REMOTE_UNSIGNED={value!r} was not refused: {out}")
+    status, out = cache(second, "pull", remote, env={"BLAZE_REMOTE_UNSIGNED": "1"})
     whole, _, verified = verify(second)
     if status != 0 or not whole or len(files(second, ".pack")) != len(files(store, ".pack")):
-        fail(f"pull with RA_JIT_REMOTE_UNSIGNED=1: {out}\n{verified}")
+        fail(f"pull with BLAZE_REMOTE_UNSIGNED=1: {out}\n{verified}")
     the_users_alone(second)
-    print(f"  unsigned lists: push asks for nothing; pull refused unless RA_JIT_REMOTE_UNSIGNED=1, "
+    print(f"  unsigned lists: push asks for nothing; pull refused unless BLAZE_REMOTE_UNSIGNED=1, "
           f"then {len(files(second, '.pack'))} packs fetched")
 
 
@@ -183,9 +183,9 @@ def fetched_workspace(top):
 
 def built_with_home(ws, home, store):
     """Builds the program with `home` as cargo's; returns what ra-jit said of the store."""
-    were = {name: os.environ.get(name) for name in ("CARGO_HOME", "RA_JIT_CACHE", "PATH")}
+    were = {name: os.environ.get(name) for name in ("CARGO_HOME", "BLAZE_CACHE", "PATH")}
     cargo_bin = os.path.dirname(shutil.which("cargo"))
-    os.environ.update(CARGO_HOME=home, RA_JIT_CACHE=store, PATH=cargo_bin + os.pathsep + os.environ["PATH"],
+    os.environ.update(CARGO_HOME=home, BLAZE_CACHE=store, PATH=cargo_bin + os.pathsep + os.environ["PATH"],
                       **SEALS)
     try:
         fx = Fixture(ws, ["dep", "app"], ["-p", "app"])

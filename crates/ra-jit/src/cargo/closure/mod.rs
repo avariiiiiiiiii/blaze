@@ -139,7 +139,7 @@ const USAGE: &str = "usage: ra-jit closure fetch|materialize [--host <host>] [<r
                 checked against the NarHash cache.nixos.org signs: what CI does, before
                 `ra-jit cache push <remote> nix-closure`
   materialize   lays the closure out in ~/.blaze/nix from blaze's store, taking what it
-                lacks from RA_JIT_REMOTE, and prints each store path and its directory
+                lacks from BLAZE_REMOTE, and prints each store path and its directory
   A root is an attribute pins.txt names (`openssl.dev`) or its store path; with none, every
   root of the host. The host is this machine's (x86_64-linux, aarch64-linux) unless given.";
 
@@ -230,7 +230,7 @@ fn fetch_command(host: &str, roots: &[Root]) -> anyhow::Result<()> {
 
 fn materialize_command(roots: &[StorePath]) -> anyhow::Result<()> {
     let start = Instant::now();
-    if let Ok(spec) = std::env::var("RA_JIT_REMOTE")
+    if let Ok(spec) = std::env::var("BLAZE_REMOTE")
         && !spec.is_empty()
         && spec != "off"
     {

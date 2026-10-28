@@ -23,7 +23,7 @@ const LIBS: &str = include_str!("libs.toml");
 /// The variable that has build scripts run in their closure alone (`on`), until the remote
 /// cache has the closure for everyone ([`closure::PROJECT`]): then it is how every script runs
 /// on Linux.
-pub(crate) const VAR: &str = "RA_JIT_SCRIPT_VIEW";
+pub(crate) const VAR: &str = "BLAZE_SCRIPT_VIEW";
 
 /// The table of the workspace's root manifest that gives crates their system libraries,
 /// before blaze's own table.
@@ -135,9 +135,9 @@ pub(crate) fn closure_for(
     Ok(Closure { roots, libs, paths })
 }
 
-/// The remote cache `RA_JIT_REMOTE` names, when it names one.
+/// The remote cache `BLAZE_REMOTE` names, when it names one.
 fn remote() -> Option<String> {
-    std::env::var("RA_JIT_REMOTE").ok().filter(|it| !it.is_empty() && it != "off")
+    std::env::var("BLAZE_REMOTE").ok().filter(|it| !it.is_empty() && it != "off")
 }
 
 /// A lock of blaze's store that one process holds at a time, beside the store's own files,

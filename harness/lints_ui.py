@@ -126,7 +126,7 @@ def rustc_errors(toolchain, unit, cache, work):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("rust")
-    ap.add_argument("--bin", default=os.environ.get("RA_JIT_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
     ap.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "lints-ui"))
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
     ap.add_argument("--filter")

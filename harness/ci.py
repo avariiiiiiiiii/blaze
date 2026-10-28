@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ci.py: the harnesses CI runs, in parts that take about the same time on a hosted runner.
 
-usage: ci.py PART                 run the harnesses of PART for RA_JIT_BACKEND on this machine
+usage: ci.py PART                 run the harnesses of PART for BLAZE_BACKEND on this machine
        ci.py fast                 run every harness of the fast tier here, one after another
        ci.py --parts [TIER]       CI's matrix for this machine, as JSON: {"include": [{"backend",
                                   "part", "apt"}, ...]}, TIER `full` (the default) or `fast`
@@ -17,19 +17,19 @@ tier, the release train's (every push to main) and by hand, is every harness, in
 core-1 ... core-N (packed as the fast tier is, to about CORE_SECS by the seconds CORE says),
 keys-N, buildmodel, store-kills, store and daemon (docs/harness.md, "CI").
 
-Each harness runs with an RA_JIT_HOME of its own (a harness may set its own over it), so no
-daemon or socket of one harness is seen by the next. RA_JIT_CACHE is left alone: set, it turns
+Each harness runs with an BLAZE_HOME of its own (a harness may set its own over it), so no
+daemon or socket of one harness is seen by the next. BLAZE_CACHE is left alone: set, it turns
 the store on.
 
 Every harness in a part runs even when one before it fails; the part fails at the end and names
-them. RA_JIT_BIN is the ra-jit the harnesses run, as for each harness on its own.
+them. BLAZE_BIN is the ra-jit the harnesses run, as for each harness on its own.
 """
 import json, math, os, platform, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYSTEM = {"linux": "linux", "darwin": "macos", "win32": "windows"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
-BACKEND = os.environ.get("RA_JIT_BACKEND") or "cranelift"
+BACKEND = os.environ.get("BLAZE_BACKEND") or "cranelift"
 KEYS = 3
 
 
@@ -40,7 +40,7 @@ def here(hosts):
 
 
 def on(*hosts, backend=None):
-    """Whether a harness runs here under a backend (RA_JIT_BACKEND's when none is given)."""
+    """Whether a harness runs here under a backend (BLAZE_BACKEND's when none is given)."""
     return lambda chosen=None: here(hosts) and backend in (None, chosen or BACKEND)
 
 
@@ -52,7 +52,7 @@ HARNESSES = [
     ("core", ["programs.py"], {}, EVERYWHERE, 1),
     # The daemon compiles every function of both programs, main too, and LLVM is optimizing: an
     # edit of what both use has to reach each program, whatever its callers had built into them.
-    ("core", ["programs.py"], {"RA_JIT_ALONE": "1"}, on("linux", "macos", backend="llvm"), 1),
+    ("core", ["programs.py"], {"BLAZE_ALONE": "1"}, on("linux", "macos", backend="llvm"), 1),
     ("core", ["breakers.py"], {}, EVERYWHERE, 1),
     ("core", ["unwinds.py"], {}, EVERYWHERE, 1),
     ("core", ["growth.py"], {}, on(backend="cranelift"), 1),
@@ -78,7 +78,7 @@ HARNESSES = [
     # bun links with `-no_compact_unwind`, which leaves `__eh_frame` alone to the unwinder.
     ("core", ["nocompact.py"], {}, on("macos"), 1),
     # A branch reaches 128 MB on AArch64, and the splice has to get past that. Mach-O is not spliced.
-    ("core", ["farsplices.py"], {"RA_JIT_SPLICE": "1"}, on("linux-aarch64"), 1),
+    ("core", ["farsplices.py"], {"BLAZE_SPLICE": "1"}, on("linux-aarch64"), 1),
     # A file 2.3 GB past what it loads, as bevy's debug builds are; about 9 GB of disk at once.
     ("core", ["farfile.py"], {}, on("linux"), None),
     # 220 MB of code, 16 MB of frames and, on Linux, 4.2 GB of DWARF: no size is a full link.
@@ -95,7 +95,7 @@ HARNESSES = [
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
     ("core", ["asmedits.py"], {}, EVERYWHERE, 1),
     # The assembler of a build of ra-jit without LLVM, which is the release's.
-    ("core", ["asmedits.py"], {"RA_JIT_ASSEMBLER": "cc"}, on("linux", "macos", backend="cranelift"), 1),
+    ("core", ["asmedits.py"], {"BLAZE_ASSEMBLER": "cc"}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["includes.py"], {}, EVERYWHERE, 1),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
@@ -151,7 +151,7 @@ X64, MAC = "linux-x86_64", "macos"
 FAST = {
     "difftest.py corpus": (34, ()),
     "programs.py": (20, ()),
-    "RA_JIT_ALONE=1 programs.py": (20, (X64,)),
+    "BLAZE_ALONE=1 programs.py": (20, (X64,)),
     "breakers.py": (211, ()),
     "unwinds.py": (11, ()),
     "growth.py": (31, (X64,)),
@@ -164,7 +164,7 @@ FAST = {
     "LIVE_PROGRAM=live-alloc live_e2e.py": (16, ()),
     "headerpad.py": (18, ()),
     "nocompact.py": (12, ()),
-    "RA_JIT_SPLICE=1 farsplices.py": (8, ()),
+    "BLAZE_SPLICE=1 farsplices.py": (8, ()),
     "unreached.py": (9, ()),
     "anonstatics.py": (9, ()),
     "loadedits.py": (19, (X64, MAC)),
@@ -172,7 +172,7 @@ FAST = {
     "testselect.py": (58, (X64, MAC)),
     "doctestonce.py": (92, (X64,)),
     "asmedits.py": (12, ()),
-    "RA_JIT_ASSEMBLER=cc asmedits.py": (12, ()),
+    "BLAZE_ASSEMBLER=cc asmedits.py": (12, ()),
     "includes.py": (12, ()),
     "latelisted.py": (126, (X64,)),
     "rustsrc.py": (1, ()),
@@ -325,15 +325,15 @@ def parts(tier="full"):
 
 def run_one(args, env):
     """Runs one harness with a daemon home of its own, kept when it fails (CI shows the daemon
-    logs under /tmp then). RA_JIT_CACHE stays as the caller has it: set, it turns the store on,
+    logs under /tmp then). BLAZE_CACHE stays as the caller has it: set, it turns the store on,
     which only the store harnesses do."""
     # Under /tmp, short: a daemon's socket is under its home, and macOS allows 104 bytes.
     home = tempfile.mkdtemp(prefix="rj-ci-", dir="/tmp" if SYSTEM != "windows" else None)
-    own = {"RA_JIT_HOME": home}
+    own = {"BLAZE_HOME": home}
     status = subprocess.run([sys.executable, *args], cwd=HERE, env={**os.environ, **own, **env}).returncode
     # A daemon the harness left running in that home, which nothing after it may talk to.
-    cargo_ra_jit = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("RA_JIT_BIN", ""))), "cargo-ra-jit")
-    if os.environ.get("RA_JIT_BIN") and os.path.exists(cargo_ra_jit + (".exe" if SYSTEM == "windows" else "")):
+    cargo_ra_jit = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", ""))), "cargo-ra-jit")
+    if os.environ.get("BLAZE_BIN") and os.path.exists(cargo_ra_jit + (".exe" if SYSTEM == "windows" else "")):
         subprocess.run([cargo_ra_jit, "ra-jit", "stop"], env={**os.environ, **own}, capture_output=True, timeout=120)
     if status == 0:
         shutil.rmtree(home, ignore_errors=True)
@@ -349,7 +349,7 @@ def run(part):
     if not chosen:
         known = list((fast_parts if tier == "fast" else full_parts)(BACKEND))
         sys.exit(f"ci.py: no harness of part {part!r} runs on {SYSTEM} {ARCH} with {BACKEND}; the parts here are {known}")
-    os.environ["RA_JIT_CI_TIER"] = tier
+    os.environ["BLAZE_CI_TIER"] = tier
     failed, times = [], []
     for args, env in chosen:
         what = " ".join([*(f"{k}={v}" for k, v in env.items()), *args])

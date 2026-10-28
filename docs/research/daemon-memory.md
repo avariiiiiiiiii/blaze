@@ -26,7 +26,7 @@ Cranelift, the `bench.py` projects. Each claim is **read** (measured, or read in
 
 ## How it was measured
 
-- `RA_JIT_MEMORY=<dir>` reports after load, resolve, build and warm-up, and now after each
+- `BLAZE_MEMORY=<dir>` reports after load, resolve, build and warm-up, and now after each
   request a worker answers (`request-N`). On macOS the resident figure is now the physical
   footprint (`proc_pid_rusage`), which was 0 before (**read**).
 - A `--features heap-profile` build allocates with jemalloc and, under
@@ -141,7 +141,7 @@ nushell, whose processes were not measured one by one).
    project asks, or let it go when a project is served. A second project's cold start pays
    loading the standard library again (5.4 s on this Mac).
 3. **Eviction salsa can do**: patch `previous_iteration` to throw only for a
-   `fixpoint_initial` memo (a vendored salsa, as `vendor/rustc_abi` is patched in), then
+   `fixpoint_initial` memo (a vendored salsa, as `crates/rustc_abi` is patched in), then
    `lru` on `infer` and the MIR queries. Bounded by what those hold (nushell about
    1.2 GB of values) and by the allocator returning it. An edit that reaches an evicted body
    re-executes what depends on it rather than backdating.
@@ -174,7 +174,7 @@ other.
   told its build at once that loads the library with the workspace, as a plain worker does
   (warm 2.90 s), and one that resolves the library on every core instead of a quarter (2.66 s).
   The time is not the resolving.
-- No spare at all (`RA_JIT_SPARE=0`) holds the same and loses the overlap with cargo: cold 7.14
+- No spare at all (`BLAZE_SPARE=0`) holds the same and loses the overlap with cargo: cold 7.14
   s on ripgrep, 27.46 s on fd, 38.43 s on nushell; warm 2.14, 2.25 and 6.83 s (**read**).
 - Loading the library into the spare without resolving it holds 1,631 MB idle (350 MB more than
   none) and gains nothing: warm 2.55 s on ripgrep, cold as with one (**read**).
@@ -363,7 +363,7 @@ where main's stopped at the bound.
 
 Before main's jemalloc (main `ee227bdb4d` against the branch then, mimalloc): ready at 16.2
 and 14.7 GB; the own base reached the bound (31.7 GB) in 27 s on main and 94 s on the branch,
-about 0.58 and 0.18 GB/s; with `RA_JIT_OWN_BASE_MEMORY=off` under a 64 GB cgroup the
+about 0.58 and 0.18 GB/s; with `BLAZE_OWN_BASE_MEMORY=off` under a 64 GB cgroup the
 branch's worker was killed at 66.7 GB (**read**). So what `described` copied was most of
 zed's growth, as the 2026-10-22 profile said, and something else still grows past 64 GB; #29
 stays open.
@@ -372,7 +372,7 @@ stays open.
 
 For [#29](https://github.com/indexable-inc/ra-jit/issues/29). Same host (dev-aws-7, 124 GiB),
 ra-jit's `described-nodes` branch, Cranelift, 16 cores, `harness/memsplit.py` with
-`RA_JIT_OWN_BASE_MEMORY=off` under a 64 GB cgroup, profiles with `heap.py`.
+`BLAZE_OWN_BASE_MEMORY=off` under a 64 GB cgroup, profiles with `heap.py`.
 
 ### What changed
 
@@ -482,7 +482,7 @@ GB against 16.2, `background_thread:true` 15.9).
 
 - salsa's evicted-memo patch (`docs/upstream/daemon-memory/`) is applied to `vendor/salsa`.
 - The MIR queries, `compiled_instance` and `inlinable` have an `lru`, which the worker sets
-  (`RA_JIT_LRU`, [cargo.md](../cargo.md)): 2,048 lowered and runtime bodies each, 16,384
+  (`BLAZE_LRU`, [cargo.md](../cargo.md)): 2,048 lowered and runtime bodies each, 16,384
   instances' code, 8,192 bodies to inline. Values past that are let go when the build is over
   (`let_go`), and jemalloc is asked to purge (`memory::give_back`).
 - Nothing is let go while a program's own base is still to come (wanted, not built and not

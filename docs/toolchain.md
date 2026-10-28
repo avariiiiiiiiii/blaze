@@ -47,7 +47,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
 1. On the branch `toolchain/bump` (the open bump's with main merged in, or a new one from main),
    `harness/toolchain_bump.py` pins the newest nightly whose manifest has every component blaze
    needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
-   `vendor/rustc_abi` and the proc-macro server from rust-lang/rust at the new commit, and
+   `crates/rustc_abi` and the proc-macro server from rust-lang/rust at the new commit, and
    moves the pin in `install.sh`, the server's manifest, `Cargo.toml` and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
@@ -59,7 +59,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    since.) The train is
    what a bump needs beyond the gate: the corpus difftest with `--layouts` and every other
    harness on four platforms, rustc's borrow-check UI tests in both modes against the new
-   nightly's own verdicts (at its commit, `--min-pass` as the floor), `fork alone` and
+   nightly's own verdicts (at its commit, `--min-pass` as the floor) and
    `cargo ra-jit` on real projects.
 4. When the train finishes, `harness/stdcount.py` compiles the standard library with the bump's
    build and with `toolchain/base`'s (the same main commit, the old pin), each against its own

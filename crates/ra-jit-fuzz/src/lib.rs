@@ -12,7 +12,7 @@ use std::{
     path::Path,
 };
 
-/// How many changed inputs a target is given, unless `RA_JIT_FUZZ_RUNS` says.
+/// How many changed inputs a target is given, unless `BLAZE_FUZZ_RUNS` says.
 const RUNS: usize = 20_000;
 
 /// Bytes that are a length, a tag or an index somewhere, at their edges.
@@ -24,7 +24,7 @@ pub fn inputs(dir: impl AsRef<Path>, seeds: Vec<Vec<u8>>) -> impl Iterator<Item 
     let target = dir.file_name().map_or(0, |it| it.len());
     let mut known = corpus(dir);
     known.extend(seeds);
-    let runs = std::env::var("RA_JIT_FUZZ_RUNS").ok().and_then(|it| it.parse().ok());
+    let runs = std::env::var("BLAZE_FUZZ_RUNS").ok().and_then(|it| it.parse().ok());
     let mut random = Random(0x9e37_79b9_7f4a_7c15 ^ target as u64);
     let changed: Vec<Vec<u8>> = (0..runs.unwrap_or(RUNS))
         .map(|run| {

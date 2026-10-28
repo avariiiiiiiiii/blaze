@@ -588,7 +588,7 @@ impl super::Remote {
         }
     }
 
-    /// As [`Self::append_rest`], in ranges of [`RANGE`] bytes asked for `RA_JIT_REMOTE_JOBS`
+    /// As [`Self::append_rest`], in ranges of [`RANGE`] bytes asked for `BLAZE_REMOTE_JOBS`
     /// at a time and appended in order: one stream through the gateway is slower than the
     /// line. The first range says how long the object is.
     async fn append_ranges(

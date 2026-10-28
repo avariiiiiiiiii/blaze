@@ -2,13 +2,13 @@
 """fncache.py: `#[ra_jit::cache]` keeps what a pure function returns across runs, by the code
 ra-jit compiled for it and everything that code reaches (docs/fn-cache.md).
 
-usage: fncache.py            (RA_JIT_BIN names the ra-jit built)
+usage: fncache.py            (BLAZE_BIN names the ra-jit built)
        fncache.py --live     (macOS on AArch64: a live edit drops what the old code kept;
-                              cargo-ra-jit and ra-jit-rustc are found next to RA_JIT_BIN)
+                              cargo-ra-jit and ra-jit-rustc are found next to BLAZE_BIN)
 
 A crate with cached functions is built by a daemon a step at a time, and each step runs the
 program the daemon linked and the one `cargo build` linked, which have to print the same.
-`RA_JIT_FN_CACHE_LOG` has the program say, for each cached function, whether a result was found
+`BLAZE_FN_CACHE_LOG` has the program say, for each cached function, whether a result was found
 in memory, found on disk or computed, and each step says which it has to be:
 
 - the first run computes `slow` and the second finds it on disk, and is that much faster;
@@ -244,7 +244,7 @@ def main():
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     ask = ["--crate", "fcache", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link),
            "--binary", binary, *symbols]
-    env = {**os.environ, "RA_JIT_FN_CACHE_DIR": store, "RA_JIT_FN_CACHE_LOG": "1"}
+    env = {**os.environ, "BLAZE_FN_CACHE_DIR": store, "BLAZE_FN_CACHE_LOG": "1"}
 
     def start():
         seen = len(open(log_path).read()) if os.path.exists(log_path) else 0
@@ -293,7 +293,7 @@ def main():
                 verdict(what, False, f"the daemon refused: {reply[:200]}")
                 continue
             ours, stderr, took = run(binary)
-            theirs, _, cargo_took = run(cargo(), {**os.environ, "RA_JIT_FN_CACHE_LOG": "1"})
+            theirs, _, cargo_took = run(cargo(), {**os.environ, "BLAZE_FN_CACHE_LOG": "1"})
             found = said(stderr)
             missed = {k: found.get(k) for k, v in wanted.items() if not found.get(k, "").startswith(v)}
             times.append((what, took, cargo_took))
@@ -326,7 +326,7 @@ def main():
         # `clear --stale` leaves the code's alone, and the next run still finds them.
         cargo_ra_jit = os.path.join(os.path.dirname(os.path.abspath(RA_JIT)), "cargo-ra-jit")
         listed = lambda *args: subprocess.run([cargo_ra_jit, "ra-jit", "cache", *args], capture_output=True, text=True,
-                                              env={**os.environ, "RA_JIT_FN_CACHE_DIR": store}, timeout=60).stdout
+                                              env={**os.environ, "BLAZE_FN_CACHE_DIR": store}, timeout=60).stdout
         before = listed()
         cleared = listed("clear", "--stale")
         after = listed()
@@ -336,7 +336,7 @@ def main():
                 and "older code" not in after and said(stderr).get("slow") == "found on disk",
                 f"{slow[0].strip() if slow else before[:120]!r}; {cleared.strip()}")
         # Under cargo the attribute does nothing: every call runs, and nothing is kept.
-        theirs, stderr, cargo_took = run(cargo(), {**os.environ, "RA_JIT_FN_CACHE_LOG": "1", "RA_JIT_FN_CACHE_DIR": store})
+        theirs, stderr, cargo_took = run(cargo(), {**os.environ, "BLAZE_FN_CACHE_LOG": "1", "BLAZE_FN_CACHE_DIR": store})
         verdict("cargo's build caches nothing", "ra-jit" not in stderr and theirs == ours, f"{cargo_took * 1000:.0f} ms")
     finally:
         daemon.kill()
@@ -408,8 +408,8 @@ def live():
             source = os.path.join(project, MAIN)
             open(source, "w").write(LIVE_TEXT)
             env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-                       CARGO_TARGET_DIR=os.path.join(work, "target"), RA_JIT_HOME=home,
-                       RA_JIT_FN_CACHE_LOG="1", RA_JIT_FN_CACHE="memory")
+                       CARGO_TARGET_DIR=os.path.join(work, "target"), BLAZE_HOME=home,
+                       BLAZE_FN_CACHE_LOG="1", BLAZE_FN_CACHE="memory")
             env.pop("CARGO_INCREMENTAL", None)
             build = ["cargo-ra-jit", "ra-jit", "build"]
             subprocess.run(["cargo", "generate-lockfile"], cwd=project, env=env, check=True, capture_output=True)
@@ -461,7 +461,7 @@ def live():
             if probe is not None and probe.returncode is None:
                 probe.terminate()
                 await probe.wait()
-            subprocess.run(["cargo-ra-jit", "ra-jit", "stop"], env=dict(os.environ, RA_JIT_HOME=home,
+            subprocess.run(["cargo-ra-jit", "ra-jit", "stop"], env=dict(os.environ, BLAZE_HOME=home,
                            PATH=f"{os.path.dirname(os.path.abspath(RA_JIT))}{os.pathsep}{os.environ['PATH']}"),
                            capture_output=True)
             shutil.rmtree(work, ignore_errors=True)

@@ -109,10 +109,10 @@ So:
 
 ## Builds, end to end
 
-`ra-jit <workspace> --crate <bin> --out <o> --exe <exe>` with `RA_JIT_CACHE` set to a store
+`ra-jit <workspace> --crate <bin> --out <o> --exe <exe>` with `BLAZE_CACHE` set to a store
 of the run's own, total wall time and ra-jit's "load workspace" line, seconds. "cold" is the
 first run with an empty store and no module built; "again" is the next run; "native" is
-`RA_JIT_PROC_MACRO_WASM=0` (rustc's dylibs, through the toolchain's server), after the
+`BLAZE_PROC_MACRO_WASM=0` (rustc's dylibs, through the toolchain's server), after the
 others. tiny is one derive and one function-like macro; corpus is the workspace above with
 all 8 crates' macros used by one binary. `--own-target` is the build in which blaze builds
 the proc macros itself (`cargo/compile_time.rs`).

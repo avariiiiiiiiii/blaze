@@ -671,7 +671,7 @@ impl Linked {
         linked.private = by_path(local, shared);
         let read = start.elapsed();
         linked.named = names_in_symbols(&[&linked.functions, &linked.unkept]);
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let (read, named) = (read.as_micros(), (start.elapsed() - read).as_micros());
             eprintln!("rustc-symbols-us: read={read} named={named}");
         }
@@ -865,7 +865,7 @@ impl SymbolTable {
         let added_in = start.elapsed() - read_in;
         table.place(unplaced);
         table.index(symbols);
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let indexed_in = start.elapsed() - read_in - added_in;
             let ahead = READ_BEFORE.load(std::sync::atomic::Ordering::Relaxed);
             eprintln!(

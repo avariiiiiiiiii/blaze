@@ -1456,11 +1456,11 @@ mod tests {
 
     /// A bash of the Nix store and the store paths it runs with: its own and those its
     /// interpreter loads (`ld.so --list`). `None` where there is no such bash or no sandbox can
-    /// be made, which the test says and passes on, unless `RA_JIT_VIEW_TESTS=require` (as in
+    /// be made, which the test says and passes on, unless `BLAZE_VIEW_TESTS=require` (as in
     /// an ix VM), when it fails.
     fn store_bash() -> Option<(PathBuf, Vec<PathBuf>)> {
         let skip = |why: &str| {
-            let required = std::env::var("RA_JIT_VIEW_TESTS").is_ok_and(|it| it == "require");
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");
             None

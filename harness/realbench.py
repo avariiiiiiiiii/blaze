@@ -3,7 +3,7 @@
 
     realbench.py [PROJECT...] [--runs N] [--work DIR] [--parts cold,noop,edits] [--pause S]
 
-Projects are cloned at the tags `cargo_ra_jit.py` pins, into `RA_JIT_PROJECTS`
+Projects are cloned at the tags `cargo_ra_jit.py` pins, into `BLAZE_PROJECTS`
 (~/ra-jit-projects), and copied into WORK/<project>/a; the clone is never written to.
 Cargo builds into WORK/<project>/t-cargo and ra-jit into WORK/<project>/t-ra-jit, both from
 the same checkout, so an edit is seen by both. Every step runs N times (default 5) and the
@@ -27,7 +27,7 @@ report gives the median, min and max.
 `--pause S` waits S seconds once the daemon is ready, before the no-op and the edits, as a
 person would before the first edit: what the daemon does by itself once ready is then over.
 
-Every warm `cargo ra-jit build` (no-op and edits) runs with RA_JIT_TRACE, and the row keeps
+Every warm `cargo ra-jit build` (no-op and edits) runs with BLAZE_TRACE, and the row keeps
 where the time of its median run went: the client's breakdown of its wall time into steps of
 the client, the daemon and the worker, plus the time outside the client (cargo, process
 start). `--table FILE` prints the results table and that breakdown table.
@@ -38,9 +38,9 @@ import asyncio, json, os, re, shutil, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-SOURCES = os.environ.get("RA_JIT_PROJECTS") or os.path.expanduser("~/ra-jit-projects")
+SOURCES = os.environ.get("BLAZE_PROJECTS") or os.path.expanduser("~/ra-jit-projects")
 STEP_SECS = 3600
 
 
@@ -89,13 +89,13 @@ def edit_text(kind, spec, text, r):
 
 
 def base_env(home, store, target):
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_HOME=home, CARGO_TERM_COLOR="never",
-               CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=target, RA_JIT_IDLE_SECS="0")
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never",
+               CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=target, BLAZE_IDLE_SECS="0")
     env["PATH"] = os.path.dirname(RA_JIT) + os.pathsep + env["PATH"]
-    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_INCREMENTAL", "RA_JIT_CACHE"):
+    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_INCREMENTAL", "BLAZE_CACHE"):
         env.pop(name, None)
     if store:
-        env["RA_JIT_CACHE"] = store
+        env["BLAZE_CACHE"] = store
     return env
 
 
@@ -163,10 +163,10 @@ async def wait_ready(ws, env, began, step):
 
 
 async def traced(argv, cwd, env, step, trace):
-    """Runs a `cargo ra-jit build` with RA_JIT_TRACE at `trace`; the result is run()'s and
+    """Runs a `cargo ra-jit build` with BLAZE_TRACE at `trace`; the result is run()'s and
     where its time went, from the trace: the client's breakdown (ms, adding up to its wall
     time) and the time outside the client (cargo before and after it, process start)."""
-    took, rc, out, err = await run(argv, cwd, dict(env, RA_JIT_TRACE=trace), step)
+    took, rc, out, err = await run(argv, cwd, dict(env, BLAZE_TRACE=trace), step)
     try:
         ours = json.load(open(trace))["raJit"]
         os.remove(trace)
@@ -267,7 +267,7 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     if "cold" in parts:
         env = base_env(os.path.join(top, f"home-warm-store-{runs}"), warm_store, tr)
     else:
-        os.makedirs(env["RA_JIT_HOME"], mode=0o700, exist_ok=True)
+        os.makedirs(env["BLAZE_HOME"], mode=0o700, exist_ok=True)
         await run(["cargo", "build"], ws, cargo_env, f"{name} cargo setup")
         began = time.monotonic()
         await run(["cargo", "ra-jit", "build"], ws, env, f"{name} ra-jit setup")

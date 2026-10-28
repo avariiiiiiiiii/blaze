@@ -6,7 +6,7 @@
 //! `std-<target>-<build>`; the release workflow does that for each target and attaches what
 //! it sent to the release. A build of a release fetches that project once a store, beside
 //! the build and never waited for: the build compiles what has not arrived, and what has is
-//! found in the store. `RA_JIT_STD_FROM` names another remote to fetch it from (`off` for
+//! found in the store. `BLAZE_STD_FROM` names another remote to fetch it from (`off` for
 //! none), and `fetch-public = false` in `[workspace.metadata.blaze]` of the root manifest
 //! turns the release's off.
 //!
@@ -14,7 +14,7 @@
 //! only when its bytes hash to the name its list gives it, and only by the build of ra-jit
 //! and the toolchain that made it, which its keys say. Its list is not signed (`signed.rs`):
 //! it is taken from the release the program came from, or from the remote the user named.
-//! `RA_JIT_REMOTE_TRUST` is for the lists of `RA_JIT_REMOTE`.
+//! `BLAZE_REMOTE_TRUST` is for the lists of `BLAZE_REMOTE`.
 
 use std::{
     path::Path,
@@ -41,15 +41,15 @@ fn project(target: &str) -> Option<String> {
 /// fetching what is public (the standard library a release ships) when `false`.
 pub(crate) const FETCH_PUBLIC: &str = "fetch-public";
 
-/// Where the standard library is fetched from: `RA_JIT_STD_FROM`, and without it the release
+/// Where the standard library is fetched from: `BLAZE_STD_FROM`, and without it the release
 /// this build is, when it is one and the workspace at `root` does not say [`FETCH_PUBLIC`]
 /// `= false`.
 fn source(root: &Path) -> anyhow::Result<Option<String>> {
-    match std::env::var("RA_JIT_STD_FROM") {
+    match std::env::var("BLAZE_STD_FROM") {
         Ok(from) => Ok((!from.is_empty() && from != "off").then_some(from)),
         Err(_) if !fetch_public(root)? => Ok(None),
         Err(_) => {
-            let release = option_env!("RA_JIT_RELEASE").filter(|it| !it.is_empty());
+            let release = option_env!("BLAZE_RELEASE").filter(|it| !it.is_empty());
             Ok(release.map(|tag| format!("{RELEASES}/{tag}")))
         }
     }
@@ -147,7 +147,7 @@ fn program_unit(sysroot: &Path, dir: &Path, store: &Path, profile: &str) -> anyh
     ra_jit.arg(dir).arg("--own-target").args(["--profile", profile, "--crate", "src/main.rs"]);
     ra_jit.arg("--out").arg(dir.join(format!("{profile}.o")));
     ra_jit.arg("--exe").arg(dir.join(format!("hello-{profile}")));
-    ra_jit.env("PATH", path).env("RA_JIT_CACHE", store).env("RA_JIT_STD_FROM", "off");
+    ra_jit.env("PATH", path).env("BLAZE_CACHE", store).env("BLAZE_STD_FROM", "off");
     ra_jit.env_remove("RUSTUP_TOOLCHAIN").env_remove("CARGO_TARGET_DIR");
     ra_jit.current_dir(dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
     let built = ra_jit.output().context("running blaze")?;
@@ -163,7 +163,7 @@ fn program_unit(sysroot: &Path, dir: &Path, store: &Path, profile: &str) -> anyh
 const USAGE: &str = "usage: ra-jit std REMOTE TOOLCHAIN\n\n\
                      Builds the standard library of TOOLCHAIN (the directory `rustc --print \
                      sysroot` names) for a build with nothing of rustc's, and sends it to \
-                     REMOTE for this build of ra-jit to fetch with RA_JIT_STD_FROM=REMOTE. \
+                     REMOTE for this build of ra-jit to fetch with BLAZE_STD_FROM=REMOTE. \
                      Nothing is built when REMOTE has it.";
 
 /// `ra-jit std REMOTE TOOLCHAIN`: builds the standard library for this build of ra-jit, the

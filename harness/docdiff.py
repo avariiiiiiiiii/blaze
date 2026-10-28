@@ -15,14 +15,14 @@ they wrote, for every crate both documented:
   warnings   the `unresolved link to` warnings each printed
 
 and prints, per crate, what each side has and what blaze misses or adds, with up to `--show`
-examples of each. Exit status is 0 unless a side fails. RA_JIT_BIN names the ra-jit binary.
+examples of each. Exit status is 0 unless a side fails. BLAZE_BIN names the ra-jit binary.
 """
 import argparse, collections, html, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
 
 NOT_CRATES = {"src", "static.files", "search-index", "search.index", "trait.impl", "type.impl",
               "implementors", "settings.html", "help.html"}

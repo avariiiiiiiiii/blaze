@@ -39,7 +39,7 @@ use super::{Reached, Recorder, Spec, tidy};
 
 /// The variables the sandbox gives the program's processes for the library, which takes them
 /// out of what the program sees as it loads.
-const OURS: [&str; 3] = ["DYLD_INSERT_LIBRARIES", "__RA_JIT_SANDBOX", "__RA_JIT_SANDBOX_EXEC"];
+const OURS: [&str; 3] = ["DYLD_INSERT_LIBRARIES", "__BLAZE_SANDBOX", "__BLAZE_SANDBOX_EXEC"];
 
 /// The library every process of a run loads, built from `macos_interpose.c` by `build.rs`.
 const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ra_jit_sandbox.dylib"));
@@ -174,7 +174,7 @@ fn library() -> Result<PathBuf, String> {
     let caches = caches
         .or_else(|| std::env::home_dir().map(|it| it.join(".cache")))
         .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's library in")?;
-    let dir = caches.join("ra-jit/sandbox").join(env!("RA_JIT_SANDBOX_LIBRARY"));
+    let dir = caches.join("ra-jit/sandbox").join(env!("BLAZE_SANDBOX_LIBRARY"));
     let file = dir.join("libra_jit_sandbox.dylib");
     // The name is that of the contents it should have; what is there is still compared, so a
     // file left half written, or changed since, is written again.
@@ -355,8 +355,8 @@ pub(super) fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, Stri
     insert_var.push(insert);
     env.push(c(insert_var.as_bytes()));
     env.push(c(format!("TMPDIR={}/", user_in.display()).as_bytes()));
-    env.push(c(format!("__RA_JIT_SANDBOX={dir}").as_bytes()));
-    env.push(c(format!("__RA_JIT_SANDBOX_EXEC={nonce}").as_bytes()));
+    env.push(c(format!("__BLAZE_SANDBOX={dir}").as_bytes()));
+    env.push(c(format!("__BLAZE_SANDBOX_EXEC={nonce}").as_bytes()));
     let mut env_ptrs: Vec<*const libc::c_char> = env.iter().map(|it| it.as_ptr()).collect();
     env_ptrs.push(std::ptr::null());
     let cwd = c(spec.cwd.as_os_str().as_bytes());

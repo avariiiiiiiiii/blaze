@@ -76,12 +76,12 @@ jobs:
           mkdir -p "$BENCH_HOME"
           CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p ra-jit --release
           CARGO_TARGET_DIR="$BENCH_HOME/target-llvm" nix develop .#bench -c cargo build -p ra-jit --release --features llvm
-      # Edits: bun's own build of its C and C++ goes to RA_JIT_PROJECTS/bun-native once per
+      # Edits: bun's own build of its C and C++ goes to BLAZE_PROJECTS/bun-native once per
       # revision (bunprep.py); the measured trees are copies of it.
       - name: Bench
         id: bench
         run: |
-          export RA_JIT_BIN="$BENCH_HOME/target/release/ra-jit" RA_JIT_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit" RA_JIT_PROJECTS="$BENCH_HOME/projects"
+          export BLAZE_BIN="$BENCH_HOME/target/release/ra-jit" BLAZE_LLVM_BIN="$BENCH_HOME/target-llvm/release/ra-jit" BLAZE_PROJECTS="$BENCH_HOME/projects"
           work=${BENCH_WORK:+$BENCH_WORK-bun}
           work=${work:-$BENCH_HOME/work-bun}
           rm -rf "$work" "$BENCH_HOME/reference-bun"
@@ -92,7 +92,7 @@ jobs:
       - name: Runtime bench
         continue-on-error: true
         run: |
-          export RA_JIT_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
+          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/ra-jit" APPS_DIR="$BENCH_HOME/apps"
           nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime bun \
             --runs 5 --out "$RUNNER_TEMP/results/runtime-bun.json"
       - uses: actions/upload-artifact@v7

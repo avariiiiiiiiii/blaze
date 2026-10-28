@@ -53,10 +53,10 @@ pub(crate) fn row_location(
 }
 
 /// Whether each place is checked against the one found from where the body is in its file
-/// (`RA_JIT_CHECK_PLACES`). A place that differs is printed.
+/// (`BLAZE_CHECK_PLACES`). A place that differs is printed.
 fn check() -> bool {
     static CHECK: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_CHECK_PLACES").is_some());
+        LazyLock::new(|| std::env::var_os("BLAZE_CHECK_PLACES").is_some());
     *CHECK
 }
 

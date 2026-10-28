@@ -3,7 +3,7 @@
 
 FOLDED is what `jeprof --collapsed` makes of a profile the daemon wrote (on macOS, what
 `heapfold.py` makes of it): build it with `--features heap-profile`, run it with
-`RA_JIT_MEMORY=DIR _RJEM_MALLOC_CONF=prof:true`.
+`BLAZE_MEMORY=DIR _RJEM_MALLOC_CONF=prof:true`.
 
 Each allocation goes to the innermost salsa ingredient on its stack: a query's `value` (what the
 memo keeps, which an `lru` can let go of), its `record` (the dependencies and revisions salsa keeps

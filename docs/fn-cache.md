@@ -119,8 +119,8 @@ directory the program was built in, or `BLAZE_FN_CACHE_DIR`, up to 512 MiB
 a file of its own and renamed into place, so a run that stops partway leaves a whole entry or
 none, and each holds its key, so a damaged one is never taken for another.
 
-The program reads each setting by its old name too, `RA_JIT_` for `BLAZE_`; when both are set,
-the `BLAZE_` one wins.
+A setting's old name, `RA_JIT_` for `BLAZE_`, is not read: `cargo blaze` stops when one is
+set, saying what it is called now.
 
 | Variable | |
 |---|---|

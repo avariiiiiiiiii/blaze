@@ -93,7 +93,7 @@ const SEAL_AT: u64 = 4 << 20;
 const ROLL_AFTER: u64 = 16;
 /// Records wait in memory until there are this many bytes of them, or the build ends.
 const WRITE_AT: usize = 64 << 10;
-/// What the packs of a store may take when `RA_JIT_CACHE_MAX` does not say: this share of
+/// What the packs of a store may take when `BLAZE_CACHE_MAX` does not say: this share of
 /// the disk it is on that is free or already the store's, so that a disk that fills up
 /// with other things takes room back from the store. Within [`LEAST_LIMIT`] and
 /// [`MOST_LIMIT`].
@@ -167,7 +167,7 @@ fn program() -> Option<[u8; KEY]> {
 /// Reads the executable on a thread of its own, for the store that is opened once the
 /// workspace is loaded: it is tens of megabytes to hash.
 pub fn identify_ahead() {
-    if SOURCES.get().is_none() && std::env::var_os("RA_JIT_CACHE").is_some_and(|it| !is_off(&it)) {
+    if SOURCES.get().is_none() && std::env::var_os("BLAZE_CACHE").is_some_and(|it| !is_off(&it)) {
         std::thread::spawn(program);
     }
 }
@@ -232,9 +232,9 @@ pub enum Limit {
 }
 
 impl Limit {
-    /// From `RA_JIT_CACHE_MAX`: a size, or `off` for no limit.
+    /// From `BLAZE_CACHE_MAX`: a size, or `off` for no limit.
     pub fn from_env() -> Result<Limit, String> {
-        match std::env::var("RA_JIT_CACHE_MAX") {
+        match std::env::var("BLAZE_CACHE_MAX") {
             Err(_) => Ok(Limit::OfDisk),
             Ok(text) if text == "off" => Ok(Limit::Off),
             Ok(text) => parse_size(&text)
@@ -259,7 +259,7 @@ impl Limit {
     }
 }
 
-/// The most the packs of the store in `dir` may take now, from `RA_JIT_CACHE_MAX` or the
+/// The most the packs of the store in `dir` may take now, from `BLAZE_CACHE_MAX` or the
 /// disk it is on: `None` for no limit.
 pub fn limit_for(dir: &Path) -> Result<Option<u64>, String> {
     Ok(Limit::from_env()?.bytes(dir))
@@ -350,7 +350,7 @@ pub fn settled() {
 /// key in it, as each build script of a cold build does in a store it shares.
 pub fn check_packs() {
     // Unset, the store is the one a later `Store::global_or` names, which opens it.
-    if std::env::var_os("RA_JIT_CACHE").is_some()
+    if std::env::var_os("BLAZE_CACHE").is_some()
         && let Some(store) = Store::global()
     {
         store.check_all();
@@ -1321,10 +1321,10 @@ struct Tuning {
 }
 
 impl Tuning {
-    /// `RA_JIT_CACHE_MAX` and `RA_JIT_CACHE_SEAL_AT`, a size each.
+    /// `BLAZE_CACHE_MAX` and `BLAZE_CACHE_SEAL_AT`, a size each.
     fn from_env() -> io::Result<Tuning> {
         let limit = Limit::from_env().map_err(io::Error::other)?;
-        let seal_at = match std::env::var("RA_JIT_CACHE_SEAL_AT") {
+        let seal_at = match std::env::var("BLAZE_CACHE_SEAL_AT") {
             Err(_) => SEAL_AT,
             Ok(text) => parse_size(&text).filter(|&it| it != 0).ok_or_else(|| {
                 io::Error::other(format!("BLAZE_CACHE_SEAL_AT=`{text}` is not a size"))
@@ -1655,25 +1655,25 @@ struct New {
     pending: Vec<u8>,
 }
 
-/// Whether a value of `RA_JIT_CACHE` says there is to be no store.
+/// Whether a value of `BLAZE_CACHE` says there is to be no store.
 pub fn is_off(value: &std::ffi::OsStr) -> bool {
     value.is_empty() || value == "off" || value == "0"
 }
 
 impl Store {
-    /// The store of this process: the directory `RA_JIT_CACHE` names, when it names one. A
+    /// The store of this process: the directory `BLAZE_CACHE` names, when it names one. A
     /// directory that cannot be used is said once, and the process compiles without one.
     pub fn global() -> Option<&'static Store> {
         Store::global_or(None)
     }
 
-    /// The store of this process: the directory `RA_JIT_CACHE` names, or `otherwise` when the
+    /// The store of this process: the directory `BLAZE_CACHE` names, or `otherwise` when the
     /// variable is not set. The first call decides.
     pub fn global_or(otherwise: Option<&Path>) -> Option<&'static Store> {
         static STORE: OnceLock<Option<Store>> = OnceLock::new();
         STORE
             .get_or_init(|| {
-                let dir = match std::env::var_os("RA_JIT_CACHE") {
+                let dir = match std::env::var_os("BLAZE_CACHE") {
                     Some(named) => named,
                     None => otherwise?.as_os_str().to_owned(),
                 };

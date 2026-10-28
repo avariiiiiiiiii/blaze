@@ -28,7 +28,12 @@ use std::os::unix::net::UnixStream;
 use uds_windows::UnixStream;
 
 use super::{plan::Plan, units::stamp_of};
-use crate::socket::{self, NotServed, Served, private_dir, private_file, read_request};
+use blaze_protocol::{
+    Message,
+    events::{Event, Record, Subscribe},
+};
+
+use crate::socket::{self, Asked, NotServed, Served, private_dir, private_file};
 
 /// How long the daemon and each worker live without being asked, unless
 /// `BLAZE_IDLE_SECS` says otherwise.
@@ -134,6 +139,14 @@ pub fn errors_beside(socket: &Path) -> PathBuf {
     socket.with_file_name("errors")
 }
 
+/// What the daemon reads of a request of a blaze from before the frames, which sent JSON:
+/// whether it starts a daemon of its own.
+#[derive(Deserialize)]
+struct Older {
+    #[serde(default)]
+    replaces: bool,
+}
+
 /// A request with the version of the client that sends it.
 #[derive(Serialize, Deserialize)]
 pub struct Envelope {
@@ -158,6 +171,12 @@ pub enum Request {
     Lint(Ahead, String),
     Status,
     Stop,
+    /// The records of the builds `subscribe` names: those of before, and with `follow` each
+    /// one after as it comes ([`Watched`]).
+    Watch {
+        subscribe: Subscribe,
+        follow: bool,
+    },
 }
 
 impl Request {
@@ -204,6 +223,9 @@ pub enum Reply {
     },
     Status(Status),
     Stopping,
+    /// The records of a [`Request::Watch`] that does not follow; one that does was sent them
+    /// as they came.
+    Watched(Vec<Record>),
 }
 
 /// Why the worker did not build a program.
@@ -489,6 +511,7 @@ impl Worker {
         // is not the one to connect to.
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(errors_beside(&socket));
+        blaze_protocol::follow::forget_beside(&socket);
         let config = &checkout.config;
         let mut args = config.args(&checkout.root, &first.crates);
         let rustcs: [(&str, &Path); 5] = [
@@ -921,6 +944,7 @@ impl Checker {
         private_dir(dir)?;
         let (socket, log) = (dir.join("sock"), dir.join("log"));
         let _ = std::fs::remove_file(&socket);
+        blaze_protocol::follow::forget_beside(&socket);
         let mut args: Vec<OsString> = vec!["--check".into()];
         args.extend(ahead.config.args(&ahead.root, &ahead.crates));
         args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
@@ -1036,6 +1060,79 @@ struct Daemon {
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
     asked: Mutex<Instant>,
+    watched: Arc<Mutex<Watched>>,
+    relays: Arc<Relays>,
+}
+
+/// The records of the builds under way and of the last of each workspace, for the commands
+/// that watch them: `blaze watch` follows every build, `blaze status` shows the one of its
+/// workspace.
+#[derive(Default)]
+struct Watched {
+    /// The number of the last build that began.
+    builds: u64,
+    watching: Vec<Watching>,
+    watchers: Vec<Watcher>,
+}
+
+struct Watching {
+    build: u64,
+    root: PathBuf,
+    records: Vec<Record>,
+    done: bool,
+}
+
+/// A command that is sent the records of the builds of the workspace at `root`, or of every
+/// one.
+struct Watcher {
+    root: Option<PathBuf>,
+    to: std::sync::mpsc::Sender<Record>,
+}
+
+/// How many workspaces' last builds the daemon keeps the records of.
+const WATCHED: usize = 16;
+
+impl Watched {
+    fn began(&mut self, root: &Path) -> u64 {
+        self.builds += 1;
+        self.watching.retain(|it| !(it.done && it.root == root));
+        let done = self.watching.iter().filter(|it| it.done).count();
+        if let Some(oldest) = self.watching.iter().position(|it| it.done)
+            && done >= WATCHED
+        {
+            self.watching.remove(oldest);
+        }
+        let watching = Watching {
+            build: self.builds,
+            root: root.to_owned(),
+            records: Vec::new(),
+            done: false,
+        };
+        self.watching.push(watching);
+        self.builds
+    }
+
+    fn record(&mut self, build: u64, record: &Record) {
+        let Some(watching) = self.watching.iter_mut().find(|it| it.build == build) else { return };
+        watching.records.push(record.clone());
+        let done = matches!(record.event, Event::Finished { .. });
+        watching.done |= done;
+        let root = &watching.root;
+        // One that went away is told nothing more, and one of a workspace whose build is
+        // done is done too.
+        self.watchers.retain(|watcher| {
+            let ours = watcher.root.as_ref().is_none_or(|it| it == root);
+            !ours || watcher.to.send(record.clone()).is_ok() && !(done && watcher.root.is_some())
+        });
+    }
+
+    /// The build under way in the workspace `at` is in, or else its last.
+    fn of(&self, at: &Path) -> Option<&Watching> {
+        let of = |done: bool| {
+            self.watching.iter().rev().find(|it| it.done == done && at.starts_with(&it.root))
+        };
+        of(false).or_else(|| of(true))
+    }
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -1126,6 +1223,8 @@ pub fn serve() -> anyhow::Result<()> {
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
         asked: Mutex::new(Instant::now()),
+        watched: Arc::default(),
+        relays: Arc::default(),
     });
     // A build starts the daemon, and is given this one.
     daemon.spare();
@@ -1140,6 +1239,10 @@ pub fn serve() -> anyhow::Result<()> {
         let daemon = daemon.clone();
         std::thread::spawn(move || daemon.reap());
     }
+    {
+        let relays = daemon.relays.clone();
+        std::thread::spawn(move || relays.serve());
+    }
     for (stream, open) in served.incoming() {
         let daemon = daemon.clone();
         std::thread::spawn(move || {
@@ -1152,37 +1255,234 @@ pub fn serve() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How often a command that waits for an answer is handed what the process it waits for
+/// said since.
+const RELAYED: Duration = Duration::from_millis(100);
+
+/// The process whose records a command is handed, the root of the workspace it builds, and
+/// what the command is.
+struct Followed {
+    dir: PathBuf,
+    root: PathBuf,
+    command: &'static str,
+}
+
+/// What the daemon sends a client in answer to a request: the records of the build it waits
+/// for as they come, then the reply.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Answer {
+    Record(Record),
+    Reply(Reply),
+}
+
+/// The commands that wait for their answers, each handed what the process it waits for said
+/// ([`blaze_protocol::follow`]) every [`RELAYED`] by one thread, rather than a thread each:
+/// a quick build is answered before the first.
+#[derive(Default)]
+struct Relays {
+    under_way: Mutex<Vec<Arc<Relay>>>,
+    more: std::sync::Condvar,
+}
+
+impl Relays {
+    fn serve(&self) {
+        loop {
+            let waiting = lock(&self.under_way);
+            let waiting = self.more.wait_while(waiting, |it| it.is_empty());
+            drop(waiting.unwrap_or_else(PoisonError::into_inner));
+            std::thread::sleep(RELAYED);
+            let under_way = lock(&self.under_way).clone();
+            for relay in under_way {
+                let mut relayed = lock(&relay.relayed);
+                if !relayed.done {
+                    relay.relay(&mut relayed);
+                    relay.flush(&mut relayed);
+                }
+            }
+        }
+    }
+
+    fn add(&self, relay: &Arc<Relay>) {
+        lock(&self.under_way).push(relay.clone());
+        self.more.notify_one();
+    }
+
+    fn remove(&self, relay: &Arc<Relay>) {
+        lock(&self.under_way).retain(|it| !Arc::ptr_eq(it, relay));
+    }
+}
+
+/// A command that waits for request `id`, handed the records of build `number`: their times
+/// from when it asked, `began_ns`.
+struct Relay {
+    stream: UnixStream,
+    id: u64,
+    dir: PathBuf,
+    began_ns: u64,
+    number: u64,
+    watched: Arc<Mutex<Watched>>,
+    relayed: Mutex<Relayed>,
+}
+
+#[derive(Default)]
+struct Relayed {
+    follow: blaze_protocol::follow::Follow,
+    build: blaze_ui::Build,
+    /// Frames not sent yet: they go with the next of [`Relays`], or with the answer.
+    unsent: Vec<u8>,
+    /// The command went away: it is handed nothing more, and its answer goes nowhere.
+    gone: bool,
+    /// It was answered: nothing more is its.
+    done: bool,
+}
+
+impl Relay {
+    fn send(&self, relayed: &mut Relayed, event: Event, at_ns: u64) {
+        let record = Record { at_ns: at_ns.saturating_sub(self.began_ns), event };
+        relayed.build.apply(&record);
+        lock(&self.watched).record(self.number, &record);
+        if !relayed.gone {
+            let message = Message::new(self.id, Answer::Record(record));
+            relayed.gone = blaze_protocol::send(&mut relayed.unsent, &message).is_err();
+        }
+    }
+
+    /// What the process said since.
+    fn relay(&self, relayed: &mut Relayed) {
+        let Some((path, len)) = blaze_protocol::follow::written_in(&self.dir) else { return };
+        for record in relayed.follow.read(&path, len) {
+            match record {
+                Ok(record) => self.send(relayed, record.event, record.at_ns),
+                Err(why) => eprintln!("{}: a record is not read: {why}", path.display()),
+            }
+        }
+    }
+
+    fn flush(&self, relayed: &mut Relayed) {
+        if !relayed.gone && !relayed.unsent.is_empty() {
+            relayed.gone = (&self.stream).write_all(&relayed.unsent).is_err();
+        }
+        relayed.unsent.clear();
+    }
+}
+
+/// The answer `answering` gives, with the command that waits for it, request `id`, handed
+/// each record the process it waits for writes meanwhile ([`Relays`]), and last how the build
+/// went; and the frames of those not sent yet, to go with the answer. A command that says
+/// nothing for the minute a load and a first build can take looks stuck.
+fn relaying(
+    stream: &UnixStream,
+    id: u64,
+    followed: &Followed,
+    daemon: &Daemon,
+    answering: impl FnOnce() -> Reply,
+) -> anyhow::Result<(Reply, Vec<u8>)> {
+    let Followed { dir, root, command } = followed;
+    let began_ns = blaze_protocol::follow::now_ns();
+    let number = lock(&daemon.watched).began(root);
+    let follow = blaze_protocol::follow::Follow::from_now(dir);
+    let relay = Arc::new(Relay {
+        stream: stream.try_clone()?,
+        id,
+        dir: dir.clone(),
+        began_ns,
+        number,
+        watched: daemon.watched.clone(),
+        relayed: Mutex::new(Relayed { follow, ..Relayed::default() }),
+    });
+    let began = Event::Began { build: number, command: (*command).to_owned(), root: root.clone() };
+    relay.send(&mut lock(&relay.relayed), began, began_ns);
+    daemon.relays.add(&relay);
+    let reply = answering();
+    daemon.relays.remove(&relay);
+    let mut relayed = lock(&relay.relayed);
+    relayed.done = true;
+    // What the process said before it answered.
+    relay.relay(&mut relayed);
+    let first_line = |text: String| text.lines().next().unwrap_or_default().to_owned();
+    let error = match &reply {
+        Reply::Synced { programs, .. } => {
+            programs.iter().find_map(|it| it.as_ref().err()).map(|it| first_line(it.clone().why()))
+        }
+        Reply::Checked { errors: Some(said) } => Some(first_line(said.to_string())),
+        Reply::Cold { reason } => Some(first_line(reason.clone())),
+        _ => None,
+    };
+    let ok = error.is_none();
+    let now_ns = blaze_protocol::follow::now_ns();
+    let summary = relayed.build.summary(now_ns.saturating_sub(began_ns), error);
+    relay.send(&mut relayed, Event::Finished { ok, summary }, now_ns);
+    let unsent = if relayed.gone { Vec::new() } else { std::mem::take(&mut relayed.unsent) };
+    Ok((reply, unsent))
+}
+
 impl Daemon {
     /// Reads the one request of a connection and answers it.
     fn answer(&self, stream: UnixStream) -> anyhow::Result<()> {
         let began = Instant::now();
-        let line = read_request(&stream)?;
-        // An editor's text, on a line of its own that is not JSON: it is long and comes
-        // with every key typed. The worker answers as to `blaze build`.
+        let line = match socket::read_asked(&stream)? {
+            Asked::Frame(item) => return self.answer_frame(&stream, &item, began),
+            Asked::Line(line) => line,
+        };
+        // An editor's text, on a line of its own: it is long and comes with every key typed.
+        // The worker answers as to `blaze build`.
         if line.starts_with("edit\t") {
             let reply = self.edit(&line).unwrap_or_else(|why| format!("error: {why:#}"));
             // An editor's client reads the errors as text.
             let reply = crate::errors::Said::text_of_reply(&reply);
             return Ok((&stream).write_all(format!("{}\n", reply.replace('\n', " ")).as_bytes())?);
         }
-        let envelope = serde_json::from_str::<Envelope>(&line);
-        // A request that can't be read is one of another version too, and of a client
-        // that waits for an answer it can read: it gets none, and the daemon stays.
-        let replaced = envelope.as_ref().is_ok_and(|it| it.replaces && it.version != self.version);
+        // Any other line is the JSON of a blaze from before the frames, of another version: it
+        // is answered so in its JSON, and the daemon exits for one that starts its own.
+        let replaces = serde_json::from_str::<Older>(&line).is_ok_and(|it| it.replaces);
+        let mut text = serde_json::to_string(&Reply::Restart { version: self.version.clone() })?;
+        text.push('\n');
+        let sent = (&stream).write_all(text.as_bytes());
+        if replaces {
+            self.end();
+        }
+        Ok(sent?)
+    }
+
+    /// Answers the request of a frame, a [`Message`] of an [`Envelope`].
+    fn answer_frame(&self, stream: &UnixStream, item: &[u8], began: Instant) -> anyhow::Result<()> {
+        // One that can't be read is of another version, and of a client that waits for an
+        // answer it can read: it gets none, and the daemon stays.
+        let message = blaze_protocol::cbor::from_slice::<Message<Envelope>>(item).ok();
+        let (id, envelope) = match message {
+            Some(message) if message.schema == blaze_protocol::SCHEMA => {
+                (message.id, Some(message.body))
+            }
+            Some(message) => (message.id, None),
+            None => (0, None),
+        };
+        let replaced =
+            envelope.as_ref().is_some_and(|it| it.replaces && it.version != self.version);
         let read = Instant::now();
-        let mut reply = match envelope {
-            Ok(envelope) if envelope.version == self.version => self.handle(envelope.request),
-            _ => Reply::Restart { version: self.version.clone() },
+        let (mut reply, mut unsent) = match envelope {
+            Some(envelope) if envelope.version == self.version => {
+                match (self.followed_in(&envelope.request), envelope.request) {
+                    (_, Request::Watch { subscribe, follow }) => {
+                        (self.watch(stream, id, &subscribe, follow), Vec::new())
+                    }
+                    (Some(followed), request) => {
+                        relaying(stream, id, &followed, self, || self.handle(request))?
+                    }
+                    (None, request) => (self.handle(request), Vec::new()),
+                }
+            }
+            _ => (Reply::Restart { version: self.version.clone() }, Vec::new()),
         };
         if let Reply::Synced { spans, .. } = &mut reply {
             let level = Some(crate::trace::DAEMON);
             spans.push(crate::trace::span("daemon read request", level, began, read));
             spans.push(crate::trace::span("daemon", level, read, Instant::now()));
         }
-        let mut text = serde_json::to_string(&reply)?;
-        text.push('\n');
-        let sent = (&stream).write_all(text.as_bytes());
-        if replaced || matches!(reply, Reply::Stopping) {
+        let stopping = matches!(reply, Reply::Stopping);
+        blaze_protocol::send(&mut unsent, &Message::new(id, Answer::Reply(reply)))?;
+        // The records not sent yet and the answer in one write: a quick build's in one read.
+        let sent = (&*stream).write_all(&unsent);
+        if replaced || stopping {
             self.end();
         }
         Ok(sent?)
@@ -1218,6 +1518,63 @@ impl Daemon {
         }
     }
 
+    /// The process that answers `request`, whose records the command that asks is handed
+    /// ([`blaze_protocol::follow`]): a build, which may load the workspace first, and a
+    /// check, which can take long.
+    fn followed_in(&self, request: &Request) -> Option<Followed> {
+        let (dir, root, command) = match request {
+            Request::Build(checkout) => {
+                (self.home.join("workers").join(checkout.config.id()), &checkout.root, "build")
+            }
+            Request::Check(ahead) => {
+                (self.home.join("checkers").join(ahead.config.id()), &ahead.root, "check")
+            }
+            Request::Lint(ahead, _) => {
+                (self.home.join("checkers").join(ahead.config.id()), &ahead.root, "clippy")
+            }
+            Request::Warm(_) | Request::Status | Request::Stop | Request::Watch { .. } => {
+                return None;
+            }
+        };
+        Some(Followed { dir, root: root.clone(), command })
+    }
+
+    /// Answers a [`Request::Watch`]: the records of before, and with `follow` each one after
+    /// as it comes, until the build of a workspace is done or the command goes away.
+    fn watch(&self, stream: &UnixStream, id: u64, subscribe: &Subscribe, follow: bool) -> Reply {
+        let mut watched = lock(&self.watched);
+        let (root, before) = match subscribe {
+            Subscribe::Build { root } => {
+                let Some(watching) = watched.of(root) else { return Reply::Watched(Vec::new()) };
+                let done = watching.done;
+                let watching_root = watching.root.clone();
+                let records = watching.records.clone();
+                if done || !follow {
+                    return Reply::Watched(records);
+                }
+                (Some(watching_root), records)
+            }
+            Subscribe::All => {
+                let under_way = watched.watching.iter().filter(|it| !it.done);
+                (None, under_way.flat_map(|it| it.records.clone()).collect())
+            }
+        };
+        if !follow {
+            return Reply::Watched(before);
+        }
+        let (to, told) = std::sync::mpsc::channel();
+        watched.watchers.push(Watcher { root, to });
+        drop(watched);
+        for record in before.into_iter().chain(told) {
+            let sent =
+                blaze_protocol::send(&mut &*stream, &Message::new(id, Answer::Record(record)));
+            if sent.is_err() {
+                break;
+            }
+        }
+        Reply::Watched(Vec::new())
+    }
+
     fn handle(&self, request: Request) -> Reply {
         *lock(&self.asked) = Instant::now();
         match request {
@@ -1245,6 +1602,7 @@ impl Daemon {
                     .collect(),
             }),
             Request::Stop => Reply::Stopping,
+            Request::Watch { .. } => Reply::Watched(Vec::new()),
         }
     }
 
@@ -1641,6 +1999,36 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_watcher_is_handed_the_builds_it_watches_and_a_workspace_keeps_its_last() {
+        let began =
+            |root: &str| Event::Began { build: 0, command: "build".into(), root: root.into() };
+        let finished = Event::Finished { ok: true, summary: Default::default() };
+        let record = |event: Event| Record { at_ns: 0, event };
+        let mut watched = Watched::default();
+        let first = watched.began(Path::new("/w/a"));
+        watched.record(first, &record(began("/w/a")));
+        let (to, every) = std::sync::mpsc::channel();
+        watched.watchers.push(Watcher { root: None, to });
+        let (to, of_a) = std::sync::mpsc::channel();
+        watched.watchers.push(Watcher { root: Some("/w/a".into()), to });
+        let other = watched.began(Path::new("/w/b"));
+        watched.record(other, &record(began("/w/b")));
+        watched.record(first, &record(finished.clone()));
+        assert_eq!(every.try_iter().count(), 2, "every build's records");
+        assert_eq!(of_a.try_iter().count(), 1, "only a's");
+        assert_eq!(watched.watchers.len(), 1, "a's watcher is done when a's build is");
+        let of = watched.of(Path::new("/w/a/src")).unwrap();
+        assert!(
+            of.done && of.records.len() == 2,
+            "the last build of the workspace of a directory in it"
+        );
+        let again = watched.began(Path::new("/w/a"));
+        watched.record(again, &record(began("/w/a")));
+        assert!(!watched.of(Path::new("/w/a")).unwrap().done, "the one under way before the last");
+        assert_eq!(watched.watching.len(), 2, "a's last is dropped once another begins");
+    }
 
     #[test]
     fn the_workers_asked_longest_ago_are_stopped_for_the_rest_to_fit() {

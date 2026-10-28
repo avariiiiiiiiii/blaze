@@ -33,6 +33,55 @@
       "rev": "{blaze}",
       "runs": [{ "select": ["-p", "blaze-engine", "--bin", "blaze-engine"], "args": ["--version"], "contains": "blaze " }],
       "test": ["-p", "syntax-tree"]
+    },
+    "cargo": {
+      "group": "apps",
+      "repo": "rust-lang/cargo",
+      "rev": "ea2d97820c16195b0ca3fadb4319fe512c199a43",
+      "apt": ["libssl-dev", "pkg-config"],
+      "seconds": 7200,
+      "runs": [{ "select": ["-p", "cargo", "--bin", "cargo"], "args": ["--version"], "contains": "cargo 1.91.0 (ea2d97820" }],
+      "test": ["-p", "cargo-util", "-p", "cargo-platform"]
+    },
+    "zed": {
+      "group": "apps",
+      "repo": "zed-industries/zed",
+      "rev": "aed37547d8543000494fb69101c05daec5891068",
+      "note": "System libraries from its script/linux; on macOS its shaders build with Xcode's Metal compiler. `--help` is answered before a window opens. Its tests are those of the crates below gpui: the rest run on gpui's headless test platform, but the whole suite with dev and release builds is longer than a hosted runner's six hours.",
+      "apt": ["build-essential", "clang", "cmake", "curl", "elfutils", "g++", "gcc", "gettext-base", "git", "jq", "libasound2-dev",
+              "libfontconfig-dev", "libgit2-dev", "libglib2.0-dev", "libsqlite3-dev", "libssl-dev", "libstdc++-14-dev", "libva-dev",
+              "libvulkan1", "libwayland-dev", "libx11-xcb-dev", "libxkbcommon-x11-dev", "libzstd-dev", "lld", "llvm", "make",
+              "musl-dev", "musl-tools"],
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "zed", "--bin", "zed"], "args": ["--help"], "contains": "Usage:" }],
+      "test": ["-p", "util", "-p", "rope", "-p", "sum_tree", "-p", "text", "-p", "fuzzy", "-p", "clock"]
+    },
+    "servo": {
+      "group": "apps",
+      "repo": "servo/servo",
+      "rev": "aac43a3f31a259f04a574f5ec4e959c943ad7cc7",
+      "note": "v0.7.0. System libraries from its python/servo/platform (apt_common.txt, apt_ubuntu_only.txt, Brewfile); SpiderMonkey is mozjs's prebuilt archive. Its tests are those of crates without a window or a GPU.",
+      "apt": ["build-essential", "ca-certificates", "clang", "cmake", "curl", "g++", "git", "gperf", "gstreamer1.0-libav",
+              "gstreamer1.0-plugins-bad", "gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-ugly",
+              "gstreamer1.0-tools", "libdbus-1-dev", "libegl1-mesa-dev", "libfreetype6-dev", "libges-1.0-dev", "libgl1-mesa-dri",
+              "libgles2-mesa-dev", "libglib2.0-dev", "libgstreamer-plugins-bad1.0-dev", "libgstreamer-plugins-base1.0-dev",
+              "libgstreamer-plugins-good1.0-dev", "libgstrtspserver-1.0-dev", "libharfbuzz-dev", "liblzma-dev", "libudev-dev",
+              "libunwind-dev", "libvulkan1", "libx11-dev", "libxcb-render0-dev", "libxcb-shape0-dev", "libxcb-xfixes0-dev",
+              "libxkbcommon-x11-0", "libxkbcommon0", "libxmu-dev", "libxmu6", "llvm-dev", "m4", "xorg-dev"],
+      "brew": ["cmake", "pkg-config"],
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "servoshell", "--bin", "servoshell"], "args": ["--version"], "contains": "Servo " }],
+      "test": ["-p", "servo-url", "-p", "servo-config", "-p", "servo-xpath"]
+    },
+    "bun": {
+      "group": "apps",
+      "repo": "oven-sh/bun",
+      "rev": "c6da4a4d3010e5553438c60f6bd76d981976867c",
+      "note": "bun's Rust port (bun-v1.4.3). bunprep.py builds its C and C++ once (in `nix develop .#bench-bun`, which has what that needs) and adds the member bun-exe, whose link takes them.",
+      "prepare": "bunprep",
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "bun-exe"], "args": ["-e", "console.log(1 + 2)"], "stdout": "3\n" }],
+      "test": ["-p", "bun_semver"]
     }
   }
 }

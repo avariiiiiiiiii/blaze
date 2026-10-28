@@ -1358,7 +1358,34 @@ def abuse(work, ws, tree, env, check, status, alive):
 
 # A daemon that turns the peer away closes the connection, which can come before the request
 # is sent (a broken pipe) as well as after it.
-CONNECT = "import socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.settimeout(5)\ntry:\n    s.connect(sys.argv[1])\nexcept OSError as e:\n    print('connect:', e.strerror)\n    sys.exit()\ntry:\n    s.sendall(sys.argv[2].encode() + b'\\n')\n    print('answer:', s.recv(65536).decode())\nexcept OSError as e:\n    print('answer:', e)\n"
+CONNECT = "import socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.settimeout(5)\ntry:\n    s.connect(sys.argv[1])\nexcept OSError as e:\n    print('connect:', e.strerror)\n    sys.exit()\ntry:\n    s.sendall(bytes.fromhex(sys.argv[2]) + b'\\n')\n    print('answer:', s.recv(65536).decode(errors='replace'))\nexcept OSError as e:\n    print('answer:', e)\n"
+
+
+def cbor(value):
+    """RFC 8949 section 4.2.1's deterministic CBOR of what a request to the daemon has: maps
+    with their keys in the order of their bytes, text, integers and booleans."""
+    def head(major, n):
+        if n < 24:
+            return bytes([major << 5 | n])
+        for extra, size in ((24, 1), (25, 2), (26, 4), (27, 8)):
+            if n < 1 << (8 * size):
+                return bytes([major << 5 | extra]) + n.to_bytes(size, "big")
+    if isinstance(value, bool):
+        return b"\xf5" if value else b"\xf4"
+    if isinstance(value, int):
+        return head(0, value)
+    if isinstance(value, str):
+        return head(3, len(value.encode())) + value.encode()
+    if isinstance(value, dict):
+        items = sorted((cbor(key), cbor(it)) for key, it in value.items())
+        return head(5, len(items)) + b"".join(key + it for key, it in items)
+    raise TypeError(value)
+
+
+def framed(body):
+    """A request as the daemon reads one: a frame of a `blaze_protocol::Message`."""
+    item = cbor({"schema": 1, "id": 1, "body": body})
+    return (len(item).to_bytes(4, "big") + item).hex()
 
 LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\nos.chmod(sys.argv[1], 0o666)\ns.listen()\nprint('listening', flush=True)\ns.settimeout(20)\ntry:\n    c, _ = s.accept()\n    c.settimeout(5)\n    print('heard:', len(c.recv(65536)))\nexcept OSError as e:\n    print('heard: nothing,', e)\n"
 
@@ -1380,14 +1407,14 @@ def stranger(home, check):
         made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
     sock = os.path.join(home, "daemon.sock")
     version = re.search(r"version (\S+),", subprocess.run(["blaze", "status"], env=dict(os.environ, BLAZE_HOME=home, PATH=os.path.dirname(BLAZE) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
-    request = json.dumps({"version": version, "replaces": False, "request": "Status"})
+    request = framed({"version": version, "replaces": False, "request": "Status"})
     def knock(user):
         run = subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/")
         # What went wrong before the request was made, where nothing was printed.
         return run.stdout.strip() or run.stderr.strip()[-300:]
     try:
         mine = knock(None)
-        check("the user's own raw request is answered", made.returncode == 0 and '"Status"' in mine, mine[:60])
+        check("the user's own raw request is answered", made.returncode == 0 and "Status" in mine, mine[:60])
         modes = (os.stat(home).st_mode & 0o777, os.stat(sock).st_mode & 0o777)
         closed = knock(name)
         check("a second user can't reach the socket", modes == (0o700, 0o600) and closed == "connect: Permission denied", f"modes {modes[0]:o} {modes[1]:o}, {closed}")
@@ -1407,7 +1434,7 @@ def stranger(home, check):
         log = open(os.path.join(home, "daemon.log")).read()
         check("with the modes opened, the daemon turns the second user away by its uid", refused.startswith("answer:") and "Status" not in refused and "the peer is user" in log, f"{refused!r}")
         mine = knock(None)
-        check("and still answers its own user", '"Status"' in mine, mine[:60])
+        check("and still answers its own user", "Status" in mine, mine[:60])
         # The other way round: the second user listens where a command line points the
         # user's client, which sends its request and its variables to whoever serves it.
         trap = os.path.join(tempfile.mkdtemp(prefix="blaze-trap-", dir="/tmp"), "sock")

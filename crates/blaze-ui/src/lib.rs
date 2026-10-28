@@ -33,6 +33,8 @@ pub struct Build {
     pub crates: Vec<Crated>,
     /// What was compiled again and why: name, crate, cause.
     pub rebuilt: Vec<(String, String, Cause)>,
+    /// How many more were compiled again than `rebuilt` names.
+    pub unlisted: u64,
     pub refused: Vec<(String, String)>,
     pub finished: Option<Finished>,
     /// The time of the last record.
@@ -138,6 +140,10 @@ impl Build {
                 }
                 krate.state = *state;
                 krate.fns = *fns;
+                // Compiled again in the same build: a patch that is built in full after all.
+                if *state == CrateState::Running {
+                    krate.ended_ns = None;
+                }
                 if done && krate.ended_ns.is_none() {
                     krate.ended_ns = Some(at);
                 }
@@ -146,6 +152,10 @@ impl Build {
             Event::Rebuilt { name, krate, cause } => {
                 self.rebuilt.push((name.clone(), krate.clone(), cause.clone()));
                 Change::Rebuilt(self.rebuilt.len() - 1)
+            }
+            Event::Unlisted { count } => {
+                self.unlisted += count;
+                Change::Nothing
             }
             Event::Refused { name, why } => {
                 self.refused.push((name.clone(), why.clone()));
@@ -162,6 +172,17 @@ impl Build {
     /// The steps under way, the one begun last at the end.
     pub fn running(&self) -> impl Iterator<Item = &Stepped> {
         self.steps.iter().filter(|it| it.ended_ns.is_none())
+    }
+
+    /// What the records so far come to, for the last line of a build that took `took_ns`:
+    /// the first few rebuilt, and a count of the rest.
+    pub fn summary(&self, took_ns: u64, error: Option<String>) -> Summary {
+        const LISTED: usize = 8;
+        let rebuilt = self.rebuilt.iter().take(LISTED);
+        let rebuilt = rebuilt.map(|(name, _, cause)| (name.clone(), cause.clone())).collect();
+        let more = self.rebuilt.len().saturating_sub(LISTED) as u64 + self.unlisted;
+        let crates = self.crates.len() as u64;
+        Summary { took_ns, crates, fns: self.fns(), rebuilt, more, error }
     }
 
     /// The functions of every crate together.
@@ -184,7 +205,15 @@ pub fn took(ns: u64) -> String {
     }
 }
 
+/// Whether a build did nothing and failed at nothing: it has no last line of its own, as cargo
+/// says nothing of a fresh build but its `Finished`.
+pub fn fresh(finished: &Finished) -> bool {
+    let summary = &finished.summary;
+    finished.ok && summary.rebuilt.is_empty() && summary.fns.compiled() == 0
+}
+
 /// The last line of a build: what it rebuilt and why, or why it failed, and how long it took.
+/// Not cargo's `Finished`, which `blaze` says after it.
 pub fn summary_line(finished: &Finished, color: bool) -> String {
     let summary = &finished.summary;
     let took = took(if summary.took_ns > 0 { summary.took_ns } else { finished.at_ns });
@@ -193,26 +222,26 @@ pub fn summary_line(finished: &Finished, color: bool) -> String {
         return format!("{}: {why} (after {took})", paint(RED, "error", color));
     }
     let compiled = summary.fns.compiled();
-    let what = if !summary.rebuilt.is_empty() {
+    let (word, what) = if !summary.rebuilt.is_empty() {
         let listed = summary.rebuilt.len() as u64 + summary.more;
-        let mut said =
-            format!("rebuilt {listed} {}: {}", plural(listed, "fn"), causes(&summary.rebuilt));
+        let mut said = format!("{listed} {}: {}", plural(listed, "fn"), causes(&summary.rebuilt));
         if summary.more > 0 {
             said.push_str(&format!(" and {} more", summary.more));
         }
-        said
+        ("Rebuilt", said)
     } else if compiled > 0 {
         let kept = summary.fns.kept;
         let crates = summary.crates;
-        format!(
-            "compiled {compiled} {} in {crates} {}, {kept} kept",
+        let said = format!(
+            "{compiled} {} in {crates} {}, {kept} kept",
             plural(compiled, "fn"),
             plural(crates, "crate")
-        )
+        );
+        ("Compiled", said)
     } else {
-        "nothing to rebuild".to_owned()
+        ("Fresh", "nothing to rebuild".to_owned())
     };
-    format!("{} {what}; {took}", paint(GREEN, &format!("{:>12}", "Finished"), color))
+    format!("{} {what}; {took}", paint(GREEN, &format!("{word:>12}"), color))
 }
 
 /// The word a step is said done with.
@@ -260,7 +289,15 @@ fn staying(build: &Build, change: &Change, color: bool, live: bool) -> Vec<Strin
             let krate = &build.crates[*at];
             let took_ns = krate.ended_ns.unwrap_or(krate.began_ns) - krate.began_ns;
             match krate.state {
-                CrateState::Running if !live => vec![status("Compiling", &krate.name)],
+                // The step of compiling it said so already.
+                CrateState::Running
+                    if !live
+                        && !build.running().any(|it| {
+                            it.step == Step::Codegen && it.of.as_deref() == Some(&krate.name)
+                        }) =>
+                {
+                    vec![status("Compiling", &krate.name)]
+                }
                 CrateState::Built if live || took_ns >= NEWS_NS => {
                     let fns = match krate.fns.total {
                         0 => String::new(),
@@ -280,9 +317,12 @@ fn staying(build: &Build, change: &Change, color: bool, live: bool) -> Vec<Strin
             let (name, why) = &build.refused[*at];
             vec![said_line(Level::Error, &format!("blaze does not build `{name}`: {why}"), color)]
         }
-        Change::Finished if !live => {
-            build.finished.iter().map(|it| summary_line(it, color)).collect()
-        }
+        Change::Finished if !live => build
+            .finished
+            .iter()
+            .filter(|it| !fresh(it))
+            .map(|it| summary_line(it, color))
+            .collect(),
         _ => Vec::new(),
     }
 }

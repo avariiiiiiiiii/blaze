@@ -233,6 +233,17 @@ PROJECTS = {
         ),
         test=["-p", "util"],
     ),
+    # A browser engine. SpiderMonkey comes as mozjs's prebuilt archive; `--version` is answered
+    # before anything opens a window.
+    "servo": dict(
+        repo="servo/servo", tag="v0.7.0", rev="aac43a3f31a259f04a574f5ec4e959c943ad7cc7",
+        build=["-p", "servoshell", "--bin", "servoshell"], run=["--version"],
+        edits=dict(
+            body=body("ports/servoshell/main.rs", "fn main() {"),
+            leaf=body("components/url/lib.rs", "pub fn scheme(&self) -> &str {"),
+        ),
+        test=["-p", "servo-url"],
+    ),
     # 1.25M lines of Rust in 103 crates, with the C and C++ of a JavaScript runtime (bun's port
     # from Zig, docs/research/bun.md). Its own build makes the C and C++ once per revision
     # (bunprep.py), and its pinned nightly builds the Rust. Measured only when named.

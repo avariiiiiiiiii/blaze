@@ -1752,8 +1752,12 @@ impl Enc<'_> {
             derive_helpers_in_scope,
             diagnostics,
             data,
+            session_macros,
         } = it;
         let db = self.db;
+        if *session_macros {
+            return Err("compilation-local macro state".to_owned());
+        }
         if block.is_some() {
             return Err("a def map of a block".to_owned());
         }

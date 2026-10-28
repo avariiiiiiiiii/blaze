@@ -3951,6 +3951,7 @@ dependencies = [
  "ra-ap-rustc_lexer",
  "ra-jit-store",
  "rustc-hash 2.1.2",
+ "salsa",
  "sha2 0.10.9",
  "span",
  "tt",

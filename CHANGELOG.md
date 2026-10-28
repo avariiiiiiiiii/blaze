@@ -1063,6 +1063,8 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
+
 - `Self::Variant` in a pattern of an `impl` whose `Self` type is an alias or projection to an
   enum (`impl Deserialize<E, D> for <E as Archive>::Archived`, as `#[derive(rkyv::Deserialize)]`
   writes) resolves the variant instead of failing MIR lowering with `unresolved variant`.

@@ -105,7 +105,8 @@ fn wrap(
         Mode::Off => true,
         Mode::On => kind == ProcMacroKind::Bang,
         Mode::All | Mode::Check => false,
-    } || config().compare
+    } || inner.requires_session()
+        || config().compare
         || config().skip.iter().any(|it| **it == *name);
     Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind, skipped })
 }
@@ -291,6 +292,10 @@ pub fn server_failed() -> Option<&'static str> {
 }
 
 impl ProcMacroExpander for Kept {
+    fn requires_session(&self) -> bool {
+        self.inner.requires_session()
+    }
+
     fn expand(
         &self,
         db: &dyn SourceDatabase,
@@ -391,6 +396,52 @@ impl ProcMacroExpander for Kept {
                 COUNTS.kept.add(Duration::ZERO);
             }
         }
+        expanded
+    }
+
+    fn expand_in(
+        &self,
+        db: &dyn SourceDatabase,
+        calling_crate: base_db::Crate,
+        subtree: &tt::TopSubtree,
+        attrs: Option<&tt::TopSubtree>,
+        env: &Env,
+        def_site: Span,
+        call_site: Span,
+        mixed_site: Span,
+        current_dir: String,
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        if !self.requires_session() {
+            return self.expand(
+                db,
+                subtree,
+                attrs,
+                env,
+                def_site,
+                call_site,
+                mixed_site,
+                current_dir,
+            );
+        }
+        // Neither an output-cache hit nor a diagnostic second run can replay guest state.
+        let start = Instant::now();
+        let expanded = self.inner.expand_in(
+            db,
+            calling_crate,
+            subtree,
+            attrs,
+            env,
+            def_site,
+            call_site,
+            mixed_site,
+            current_dir,
+        );
+        COUNTS.expanded.add(start.elapsed());
+        COUNTS.kinds[kind_index(self.kind)].add(start.elapsed());
+        if expanded.is_err() {
+            COUNTS.failed.add(Duration::ZERO);
+        }
+        self.failed(&expanded);
         expanded
     }
 

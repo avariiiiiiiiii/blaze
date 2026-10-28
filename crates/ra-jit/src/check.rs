@@ -41,6 +41,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let (mut db, vfs, checkouts) =
         crate::load(&projects, &cargo_config, crate::load_config(), selection, None, None)?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
+    crate::prepare_macro_sessions(&db);
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
     let mut checker = Checker::new(&db, &vfs, &checkouts, &members, read_from, root, lints_capped);
     let served = match crate::socket::Served::bind(&socket) {
@@ -94,6 +95,7 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
         None,
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
+    crate::prepare_macro_sessions(&db);
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
     let checker = Checker::new(&db, &vfs, &checkouts, &members, read_from, root, lints_capped);
     // A probe's `rust-project.json` has no cargo targets to pick from: its crates are checked.
@@ -446,6 +448,7 @@ impl Checker {
             change.change_file(id, Some(text));
         }
         db.apply_change(change);
+        crate::prepare_macro_sessions(db);
         None
     }
 

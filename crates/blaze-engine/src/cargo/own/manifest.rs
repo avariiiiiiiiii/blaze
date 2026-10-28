@@ -224,11 +224,8 @@ pub(super) fn locate_project(args: Args<'_>) -> anyhow::Result<i32> {
 /// `cargo verify-project`: whether the workspace of the manifest reads, as JSON.
 pub(super) fn verify_project(args: Args<'_>) -> anyhow::Result<i32> {
     let flags = [valued(&["--manifest-path"])];
-    let read = match read_or_refuse(
-        &args,
-        &flags,
-        "blaze verify-project [--manifest-path <PATH>]",
-    ) {
+    let read = match read_or_refuse(&args, &flags, "blaze verify-project [--manifest-path <PATH>]")
+    {
         Ok(read) => read,
         Err(code) => return Ok(code),
     };

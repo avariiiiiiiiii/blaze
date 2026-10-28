@@ -2,9 +2,9 @@
 
 use std::{cmp::Ordering, ops::Range};
 
-use syntax_tree::TextRange;
 use rustc_hash::FxHashMap;
 use stdx::format_to;
+use syntax_tree::TextRange;
 
 use crate::{NodeOrToken, SyntaxElement, SyntaxNode};
 
@@ -541,7 +541,9 @@ struct PreparedElement {
 }
 
 impl PreparedElement {
-    fn into_green(self) -> syntax_tree::NodeOrToken<syntax_tree::GreenNode, syntax_tree::GreenToken> {
+    fn into_green(
+        self,
+    ) -> syntax_tree::NodeOrToken<syntax_tree::GreenNode, syntax_tree::GreenToken> {
         match self.syntax {
             SyntaxElement::Node(node) => NodeOrToken::Node(node.green().to_owned()),
             SyntaxElement::Token(token) => NodeOrToken::Token(token.green().to_owned()),

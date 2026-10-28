@@ -2922,6 +2922,9 @@
  },
  "manifest": {
   "dependencies": {
+   "blaze-live": {
+    "path": "../../crates/blaze-live"
+   },
    "eframe": {
     "default-features": false,
     "features": [
@@ -2931,9 +2934,6 @@
      "default_fonts"
     ],
     "version": "0.37"
-   },
-   "blaze-live": {
-    "path": "../../crates/blaze-live"
    }
   },
   "package": {
@@ -3184,6 +3184,23 @@
     "kind": "registry"
    },
    "version": "2.13.2"
+  },
+  "blaze-live@0.1.0": {
+   "authors": "Indexable, Inc.",
+   "description": "Applies blaze's edits to a program while it runs",
+   "homepage": "https://ix.dev/blaze",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-live",
+   "readme": "README.md",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "",
+   "source": {
+    "dir": "crates/blaze-live",
+    "kind": "path"
+   },
+   "version": "0.1.0"
   },
   "block2@0.5.1": {
    "authors": "Steven Sheldon:Mads Marquart <mads@marquart.dk>",
@@ -6024,23 +6041,6 @@
    },
    "version": "6.0.0"
   },
-  "blaze-live@0.1.0": {
-   "authors": "Indexable, Inc.",
-   "description": "Applies blaze's edits to a program while it runs",
-   "homepage": "https://ix.dev/blaze",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "blaze-live",
-   "readme": "README.md",
-   "repository": "https://github.com/indexable-inc/blaze",
-   "rust_version": "",
-   "source": {
-    "dir": "crates/blaze-live",
-    "kind": "path"
-   },
-   "version": "0.1.0"
-  },
   "raw-window-handle@0.6.2": {
    "authors": "Osspial <osspial@gmail.com>",
    "description": "Interoperability library for Rust Windowing applications.",
@@ -8160,6 +8160,26 @@
      "src": "src/lib.rs",
      "target": "bitflags"
     },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-live@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_live"
+    },
     "block2@0.5.1 lib block2 build": {
      "crate_type": "lib",
      "deps": [
@@ -10047,12 +10067,12 @@
      "crate_type": "bin",
      "deps": [
       {
-       "name": "eframe",
-       "unit": "eframe@0.37.0 lib eframe build"
-      },
-      {
        "name": "blaze_live",
        "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "eframe",
+       "unit": "eframe@0.37.0 lib eframe build"
       }
      ],
      "edition": "2024",
@@ -11409,26 +11429,6 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "blaze-live@0.1.0 lib blaze_live build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-live@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_live"
-    },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",
      "deps": [],
@@ -12616,6 +12616,26 @@
      },
      "src": "src/lib.rs",
      "target": "bitflags"
+    },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-live@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_live"
     },
     "bytemuck@1.25.2 lib bytemuck build": {
      "crate_type": "lib",
@@ -14655,12 +14675,12 @@
      "crate_type": "bin",
      "deps": [
       {
-       "name": "eframe",
-       "unit": "eframe@0.37.0 lib eframe build"
-      },
-      {
        "name": "blaze_live",
        "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "eframe",
+       "unit": "eframe@0.37.0 lib eframe build"
       }
      ],
      "edition": "2024",
@@ -15697,26 +15717,6 @@
      },
      "src": "src/lib.rs",
      "target": "quote"
-    },
-    "blaze-live@0.1.0 lib blaze_live build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-live@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_live"
     },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",
@@ -18315,6 +18315,26 @@
      "src": "src/lib.rs",
      "target": "bitflags"
     },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-live@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_live"
+    },
     "block2@0.5.1 lib block2 build": {
      "crate_type": "lib",
      "deps": [
@@ -20202,12 +20222,12 @@
      "crate_type": "bin",
      "deps": [
       {
-       "name": "eframe",
-       "unit": "eframe@0.37.0 lib eframe build"
-      },
-      {
        "name": "blaze_live",
        "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "eframe",
+       "unit": "eframe@0.37.0 lib eframe build"
       }
      ],
      "edition": "2024",
@@ -21564,26 +21584,6 @@
      "src": "src/lib.rs",
      "target": "quote"
     },
-    "blaze-live@0.1.0 lib blaze_live build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-live@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_live"
-    },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",
      "deps": [],
@@ -22771,6 +22771,26 @@
      },
      "src": "src/lib.rs",
      "target": "bitflags"
+    },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-live@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_live"
     },
     "bytemuck@1.25.2 lib bytemuck build": {
      "crate_type": "lib",
@@ -24810,12 +24830,12 @@
      "crate_type": "bin",
      "deps": [
       {
-       "name": "eframe",
-       "unit": "eframe@0.37.0 lib eframe build"
-      },
-      {
        "name": "blaze_live",
        "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "eframe",
+       "unit": "eframe@0.37.0 lib eframe build"
       }
      ],
      "edition": "2024",
@@ -25852,26 +25872,6 @@
      },
      "src": "src/lib.rs",
      "target": "quote"
-    },
-    "blaze-live@0.1.0 lib blaze_live build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-live@0.1.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_live"
     },
     "raw-window-handle@0.6.2 lib raw_window_handle build": {
      "crate_type": "lib",

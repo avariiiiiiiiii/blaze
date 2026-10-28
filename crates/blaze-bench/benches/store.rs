@@ -6,8 +6,8 @@
 
 use std::hint::black_box;
 
-use hir_ty_codegen::bench::entry_key;
 use blaze_store::bench::{Salted, SealedStore, check_pack, encode_record, key_of};
+use hir_ty_codegen::bench::entry_key;
 use tango_bench::{IntoBenchmarks, benchmark_fn, tango_benchmarks};
 
 /// A name as long as a mangled generic function's.

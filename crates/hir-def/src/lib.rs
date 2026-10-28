@@ -15,8 +15,8 @@ extern crate rustc_parse_format;
 #[cfg(not(feature = "in-rust-tree"))]
 extern crate ra_ap_rustc_parse_format as rustc_parse_format;
 
-pub extern crate rustc_abi as layout;
 pub extern crate rustc_abi;
+pub extern crate rustc_abi as layout;
 
 pub mod attrs;
 pub mod builtin_type;

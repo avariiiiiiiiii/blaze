@@ -15,8 +15,8 @@ use std::{
 
 use anyhow::{Context, bail};
 use aws_sdk_s3::primitives::ByteStream;
-use futures_util::{StreamExt, stream};
 use blaze_store::name_file_whole;
+use futures_util::{StreamExt, stream};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     fs::File,

@@ -47,7 +47,8 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
             _ => anyhow::bail!("unexpected argument {arg}"),
         }
     }
-    let project = project.context("usage: blaze-engine mir <project> --crate <name> [--level N]")?;
+    let project =
+        project.context("usage: blaze-engine mir <project> --crate <name> [--level N]")?;
     let krate = krate.context("--crate is needed")?;
     let asked = [project.clone(), "--crate".into(), krate.clone(), "--out".into(), "none".into()];
     let mut args = Args::parse(asked.into_iter())?;

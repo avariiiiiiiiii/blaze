@@ -259,8 +259,7 @@ impl Baseline {
             );
             // Every object the daemon writes defines symbols named `blaze.<...>` (`_blaze.<...>`
             // in Mach-O), which no Rust symbol (`_ZN`, `_R`) and no C name is.
-            let ours =
-                |name: &[u8]| name.strip_prefix(b"_").unwrap_or(name).starts_with(b"blaze.");
+            let ours = |name: &[u8]| name.strip_prefix(b"_").unwrap_or(name).starts_with(b"blaze.");
             ensure!(
                 !image.symbols().any(|it| it.name_bytes().is_ok_and(ours)),
                 "the executable where cargo has the program is one the daemon linked"

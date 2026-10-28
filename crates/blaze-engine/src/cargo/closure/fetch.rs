@@ -12,8 +12,8 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use futures_util::{StreamExt as _, stream};
 use blaze_store::Store;
+use futures_util::{StreamExt as _, stream};
 use tokio::runtime::Runtime;
 
 use super::{

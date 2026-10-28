@@ -48,9 +48,7 @@ pub(crate) fn command(rest: &[String]) -> anyhow::Result<i32> {
     let mut typed = vec!["check".to_owned()];
     typed.extend(ours.iter().filter(|it| !CLIPPYS.contains(&it.as_str())).cloned());
     let Asked::Build(asked) = Asked::parse(typed) else {
-        anyhow::bail!(
-            "`blaze clippy` reads its flags as `cargo check`'s, and they did not read"
-        );
+        anyhow::bail!("`blaze clippy` reads its flags as `cargo check`'s, and they did not read");
     };
     let format = match Format::of(&asked.flags.message_format) {
         Ok(format) => format,

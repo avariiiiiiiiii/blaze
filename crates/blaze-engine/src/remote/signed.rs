@@ -19,8 +19,8 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use blaze_store::write_file_whole;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 
 use crate::content::hex;

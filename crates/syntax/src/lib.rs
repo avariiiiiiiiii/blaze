@@ -59,12 +59,12 @@ pub use crate::{
     },
 };
 pub use parser::{Edition, LexedStr, SyntaxKind, T};
+pub use rustc_literal_escaper as unescape;
+pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
     Direction, FlatTree, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset,
     WalkEvent, api::Preorder,
 };
-pub use rustc_literal_escaper as unescape;
-pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
 /// errors.

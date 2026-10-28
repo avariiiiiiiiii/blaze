@@ -1029,12 +1029,12 @@ impl Entries {
 
 #[cfg(test)]
 mod tests {
+    use blaze_fuzz as fuzz;
     use cranelift_codegen::{
         ir::{AbiParam, types},
         isa::CallConv,
     };
     use cranelift_module::{DataId, FuncId};
-    use blaze_fuzz as fuzz;
 
     use super::{
         super::{

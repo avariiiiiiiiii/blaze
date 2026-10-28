@@ -67,6 +67,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
+name = "blaze-store"
+version = "0.20261027.0"
+dependencies = [
+ "crc32fast",
+ "libc",
+ "memmap2",
+ "rustc-hash 2.1.2",
+ "sha2",
+ "windows-sys 0.61.2",
+ "zstd",
+]
+
+[[package]]
+name = "blaze-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cfg",
+ "core-macro",
+ "dioxus-rsx",
+ "gimli",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-codegen",
+ "ide-db",
+ "intern",
+ "load-cargo",
+ "object 0.37.3",
+ "proc-macro2",
+ "project-model",
+ "quote",
+ "rustc-demangle",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
+ "span",
+ "stdx",
+ "syn 2.0.117",
+ "syntax",
+ "syntax-bridge",
+ "triomphe",
+ "tt",
+ "vfs",
+ "wasm-encoder",
+ "wasmparser",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -574,12 +624,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
-name = "fixedbitset"
-version = "0.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -711,8 +755,8 @@ dependencies = [
  "intern",
  "itertools",
  "la-arena",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_type_ir",
  "salsa",
  "serde_json",
  "smallvec",
@@ -741,9 +785,9 @@ dependencies = [
  "intern",
  "itertools",
  "la-arena",
- "rustc_abi",
  "ra-ap-rustc_parse_format",
  "rustc-hash 2.1.2",
+ "rustc_abi",
  "rustc_apfloat",
  "salsa",
  "smallvec",
@@ -797,12 +841,12 @@ dependencies = [
  "itertools",
  "la-arena",
  "macros",
- "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_pattern_analysis",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_abi",
  "rustc_apfloat",
+ "rustc_type_ir",
  "salsa",
  "smallvec",
  "span",
@@ -832,14 +876,13 @@ dependencies = [
  "la-arena",
  "macros",
  "oorandom",
- "petgraph",
- "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
+ "rustc-hash 2.1.2",
+ "rustc_abi",
+ "rustc_apfloat",
  "rustc_next_trait_solver",
  "rustc_type_ir",
- "rustc-hash 2.1.2",
- "rustc_apfloat",
  "salsa",
  "serde",
  "serde_derive",
@@ -866,8 +909,8 @@ dependencies = [
  "hir-ty-wfcheck",
  "la-arena",
  "ra-ap-rustc_ast_ir",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_type_ir",
  "salsa",
  "smallvec",
  "syntax",
@@ -875,9 +918,10 @@ dependencies = [
 
 [[package]]
 name = "hir-ty-codegen"
-version = "0.1.0"
+version = "0.20261027.0"
 dependencies = [
  "base-db",
+ "blaze-store",
  "cfg",
  "cranelift-codegen",
  "cranelift-frontend",
@@ -892,14 +936,13 @@ dependencies = [
  "la-arena",
  "object 0.37.3",
  "postcard",
- "rustc_abi",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
- "rustc_type_ir",
- "blaze-store",
  "rustc-demangle",
  "rustc-hash 2.1.2",
  "rustc-stable-hash",
+ "rustc_abi",
+ "rustc_type_ir",
  "salsa",
  "serde",
  "serde_derive",
@@ -919,8 +962,8 @@ version = "0.0.0"
 dependencies = [
  "hir-def",
  "hir-ty",
- "rustc_type_ir",
  "rustc-hash 2.1.2",
+ "rustc_type_ir",
  "salsa",
 ]
 
@@ -1115,6 +1158,7 @@ name = "load-cargo"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cfg",
  "crossbeam-channel",
  "hir-expand",
  "ide-db",
@@ -1122,6 +1166,7 @@ dependencies = [
  "itertools",
  "proc-macro-api",
  "project-model",
+ "serde_json",
  "span",
  "tracing",
  "triomphe",
@@ -1380,17 +1425,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "petgraph"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
-dependencies = [
- "fixedbitset",
- "hashbrown 0.15.5",
- "indexmap",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1527,16 +1561,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "rustc_abi"
-version = "0.166.0"
-dependencies = [
- "bitflags",
- "ra-ap-rustc_hashes",
- "ra-ap-rustc_index",
- "tracing",
-]
-
-[[package]]
 name = "ra-ap-rustc_ast_ir"
 version = "0.166.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1583,19 +1607,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustc_next_trait_solver"
-version = "0.166.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7a9663a8d7c369e934aac2b74a638537ad7eb4be75b4530d765384dc071c936"
-dependencies = [
- "derive-where",
- "ra-ap-rustc_index",
- "rustc_type_ir",
- "ra-ap-rustc_type_ir_macros",
- "tracing",
-]
-
-[[package]]
 name = "ra-ap-rustc_parse_format"
 version = "0.166.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1619,27 +1630,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustc_type_ir"
-version = "0.166.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d6efb6008f665a9485e0afecf9f4950a6c4bedd8ddd330a9df8986a6c0160b"
-dependencies = [
- "arrayvec",
- "bitflags",
- "derive-where",
- "ena",
- "indexmap",
- "rustc_abi",
- "ra-ap-rustc_ast_ir",
- "ra-ap-rustc_index",
- "ra-ap-rustc_type_ir_macros",
- "rustc-hash 2.1.2",
- "smallvec",
- "thin-vec",
- "tracing",
-]
-
-[[package]]
 name = "ra-ap-rustc_type_ir_macros"
 version = "0.166.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1649,55 +1639,6 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
-]
-
-[[package]]
-name = "blaze-store"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "libc",
- "memmap2",
- "rustc-hash 2.1.2",
- "sha2",
- "windows-sys 0.61.2",
- "zstd",
-]
-
-[[package]]
-name = "blaze-wasm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cfg",
- "core-macro",
- "dioxus-rsx",
- "hir",
- "hir-def",
- "hir-expand",
- "hir-ty",
- "hir-ty-codegen",
- "ide-db",
- "intern",
- "load-cargo",
- "object 0.37.3",
- "proc-macro2",
- "project-model",
- "quote",
- "rustc-demangle",
- "rustc-hash 2.1.2",
- "serde",
- "serde_json",
- "span",
- "stdx",
- "syn 2.0.117",
- "syntax",
- "syntax-bridge",
- "triomphe",
- "tt",
- "vfs",
- "wasm-encoder",
- "wasmparser",
 ]
 
 [[package]]
@@ -1745,19 +1686,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "syntax-tree"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14b574c58582fa59fa43a2feb6608b8744184659f08a2e0117e4b8224d95ed61"
-dependencies = [
- "countme",
- "hashbrown 0.14.5",
- "memoffset",
- "rustc-hash 1.1.0",
- "text-size",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1788,6 +1716,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
 
 [[package]]
+name = "rustc_abi"
+version = "0.0.0"
+dependencies = [
+ "bitflags",
+ "ra-ap-rustc_hashes",
+ "ra-ap-rustc_index",
+ "tracing",
+]
+
+[[package]]
 name = "rustc_apfloat"
 version = "0.2.3+llvm-462a31f5a5ab"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1795,6 +1733,36 @@ checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
 dependencies = [
  "bitflags",
  "smallvec",
+]
+
+[[package]]
+name = "rustc_next_trait_solver"
+version = "0.0.0"
+dependencies = [
+ "derive-where",
+ "ra-ap-rustc_index",
+ "ra-ap-rustc_type_ir_macros",
+ "rustc_type_ir",
+ "tracing",
+]
+
+[[package]]
+name = "rustc_type_ir"
+version = "0.0.0"
+dependencies = [
+ "arrayvec",
+ "bitflags",
+ "derive-where",
+ "ena",
+ "indexmap",
+ "ra-ap-rustc_ast_ir",
+ "ra-ap-rustc_index",
+ "ra-ap-rustc_type_ir_macros",
+ "rustc-hash 2.1.2",
+ "rustc_abi",
+ "smallvec",
+ "thin-vec",
+ "tracing",
 ]
 
 [[package]]
@@ -2058,12 +2026,12 @@ dependencies = [
  "itertools",
  "parser",
  "ra-ap-rustc_lexer",
- "syntax-tree",
  "rustc-hash 2.1.2",
  "rustc-literal-escaper",
  "smallvec",
  "smol_str",
  "stdx",
+ "syntax-tree",
  "tracing",
  "triomphe",
 ]
@@ -2079,6 +2047,17 @@ dependencies = [
  "stdx",
  "syntax",
  "tt",
+]
+
+[[package]]
+name = "syntax-tree"
+version = "0.0.0"
+dependencies = [
+ "countme",
+ "hashbrown 0.14.5",
+ "memoffset",
+ "rustc-hash 1.1.0",
+ "text-size",
 ]
 
 [[package]]

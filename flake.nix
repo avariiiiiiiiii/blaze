@@ -135,7 +135,7 @@
           '';
         });
         # What `nix profile install` puts on PATH: the same binaries, with the toolchain.
-        daemon = pkgs.runCommand "ra-jit-${version}" {
+        daemon = pkgs.runCommand "blaze-${version}" {
           nativeBuildInputs = [ pkgs.makeWrapper ];
           meta.mainProgram = "cargo-blaze";
         } ''
@@ -194,7 +194,7 @@
           fileset = pkgs.lib.fileset.unions [ ./demo/life ./crates/ra-jit-live ];
         };
         lifeVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./demo/life/Cargo.lock; };
-        # `nix run github:indexable-inc/blaze`: the Game of Life window. On macOS on AArch64 the
+        # `nix run github:indexable-inc/blaze#life`: the Game of Life window. On macOS on AArch64 the
         # daemon builds the copy and edits to it show up live; elsewhere the prebuilt window runs.
         life = pkgs.writeShellScriptBin "ra-jit-life" ''
           export RA_JIT_LIFE_SOURCE=${lifeSource} RA_JIT_LIFE_VENDOR=${lifeVendor}
@@ -205,9 +205,10 @@
         '';
       in {
         packages = {
-          default = life;
-          # `nix profile install github:indexable-inc/blaze#blaze`: cargo-blaze and the programs it
-          # runs, so `cargo blaze` and `cargo blaze enable` work. `ra-jit` is its name from before.
+          # `nix profile install github:indexable-inc/blaze`: cargo-blaze and the programs it runs, so
+          # `cargo blaze` and `cargo blaze enable` work. `#blaze` names it too, and `ra-jit` is its
+          # name from before.
+          default = daemon;
           blaze = daemon;
           ra-jit = daemon;
           inherit dist daemon run life daemon-units life-bin;
@@ -215,7 +216,12 @@
           # read debug info, and the prefix a build of the `llvm` feature links.
           inherit llvm;
         };
+        # `nix run github:indexable-inc/blaze -- build` is `blaze build`.
         apps.default = {
+          type = "app";
+          program = "${run}/bin/blaze";
+        };
+        apps.life = {
           type = "app";
           program = "${life}/bin/ra-jit-life";
         };

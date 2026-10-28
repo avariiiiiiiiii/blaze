@@ -95,7 +95,7 @@ All the details: [what works and what doesn't yet](docs/usage.md#what-works-and-
 ## Demo: a Game of Life you can edit
 
 ```sh
-nix run github:indexable-inc/blaze
+nix run github:indexable-inc/blaze#life
 ```
 
 This opens a Game of Life window. On macOS on Apple silicon you can change its rules, colours and

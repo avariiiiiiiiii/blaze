@@ -2837,6 +2837,21 @@ pub fn compiled_so_far() -> usize {
     COMPILES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// [`COMPILES`] by the crate each was compiled for: what the build's tree of crates says of
+/// each as it goes.
+static COMPILES_OF: LazyLock<std::sync::Mutex<FxHashMap<Crate, usize>>> =
+    LazyLock::new(Default::default);
+
+fn compiles_of(krate: Crate) {
+    *COMPILES_OF.lock().unwrap_or_else(|e| e.into_inner()).entry(krate).or_default() += 1;
+}
+
+/// How many functions and instances this process has compiled for each crate.
+pub fn compiled_by_crate() -> Vec<(Crate, usize)> {
+    let counts = COMPILES_OF.lock().unwrap_or_else(|e| e.into_inner());
+    counts.iter().map(|(&krate, &count)| (krate, count)).collect()
+}
+
 /// A function of the source a build compiled: its name, the crate it is of and the file it
 /// is written in.
 pub struct Recompiled {
@@ -2886,6 +2901,7 @@ fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    compiles_of(func.krate(db));
     {
         let mut recompiled = RECOMPILED.lock().unwrap_or_else(|e| e.into_inner());
         if recompiled.1 < RECOMPILED_KEPT {
@@ -3087,6 +3103,7 @@ fn compiled_instance<'db>(
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
     COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    compiles_of(env.krate);
     tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
 }
 

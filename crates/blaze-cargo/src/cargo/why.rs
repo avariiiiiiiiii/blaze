@@ -64,6 +64,69 @@ fn last() -> anyhow::Result<Vec<Record>> {
     Ok(records)
 }
 
+/// The most crates `blaze why` lists by name.
+const LISTED: usize = 12;
+
+/// Where the time of a build that took `took` ns went: each step, what the store had, the
+/// longest chain of crates waiting for each other, and the crates that compiled the most.
+fn explained(build: &blaze_ui::Build, took: u64) -> String {
+    let mut out = String::new();
+    let steps: Vec<String> = build
+        .steps
+        .iter()
+        .map(|it| {
+            let took_ns = it.ended_ns.unwrap_or(took).saturating_sub(it.began_ns);
+            let count = it.count().map(|it| format!(" ({it})")).unwrap_or_default();
+            format!(
+                "{} {}{count} {}",
+                it.step.word().to_lowercase(),
+                it.what(),
+                blaze_ui::took(took_ns)
+            )
+        })
+        .collect();
+    if !steps.is_empty() {
+        out.push_str(&format!("  steps: {}\n", steps.join(", ")));
+    }
+    if let Some(cache) = &build.cache {
+        let said = match &cache.cold {
+            Some(why) => format!("cold ({why})"),
+            None => format!("{} found here, {} fetched", cache.found, cache.fetched),
+        };
+        out.push_str(&format!("  cache: {said}; {} compiled\n", cache.compiled));
+    }
+    let (chain, chain_ns) = build.critical_path(took);
+    if chain.len() > 1 {
+        let names: Vec<&str> = chain.iter().map(|&it| build.crates[it].name.as_str()).collect();
+        out.push_str(&format!(
+            "  longest chain: {} {}\n",
+            names.join(" <- "),
+            blaze_ui::took(chain_ns)
+        ));
+    }
+    let mut compiled: Vec<_> = build.crates.iter().filter(|it| it.fns.compiled() > 0).collect();
+    compiled.sort_by_key(|it| std::cmp::Reverse(it.fns.compiled()));
+    for krate in compiled.iter().take(LISTED) {
+        let fns = krate.fns;
+        let busy = match krate.busy_ns(took) {
+            ..10_000_000 => String::new(),
+            busy => format!(", busy {}", blaze_ui::took(busy)),
+        };
+        out.push_str(&format!(
+            "  {}: {} fns compiled, {} kept{busy}\n",
+            krate.name,
+            fns.compiled(),
+            fns.kept
+        ));
+    }
+    let rest = build.crates.len().saturating_sub(compiled.len().min(LISTED));
+    if rest > 0 {
+        let more = compiled.len().saturating_sub(LISTED);
+        out.push_str(&format!("  and {rest} more crates ({more} of them compiled something)\n"));
+    }
+    out
+}
+
 /// `blaze why`, of the last build, or of the function or crate `args` names.
 pub fn command(args: &[String]) -> anyhow::Result<i32> {
     let records = last()?;
@@ -92,16 +155,7 @@ pub fn command(args: &[String]) -> anyhow::Result<i32> {
             if build.unlisted > 0 {
                 out.push_str(&format!("  and {} more\n", build.unlisted));
             }
-            for krate in &build.crates {
-                let fns = krate.fns;
-                out.push_str(&format!(
-                    "  {}: {} fns, {} compiled, {} kept\n",
-                    krate.name,
-                    fns.total,
-                    fns.compiled(),
-                    fns.kept
-                ));
-            }
+            out.push_str(&explained(&build, took));
         }
         Some(asked) => {
             let of_crate = build.crates.iter().find(|it| it.name == *asked);

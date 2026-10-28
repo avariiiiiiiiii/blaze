@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// The version of the schema of every body: a reader of another refuses the message by
 /// name rather than guess at its fields.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 /// The longest item a frame carries: a build names every file it read.
 pub const LONGEST_FRAME: u32 = 16 << 20;

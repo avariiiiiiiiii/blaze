@@ -46,6 +46,8 @@ impl Plain {
         let Some(step) = self.build.running().last() else { return String::new() };
         self.said_ns = now_ns;
         let word = paint(GREEN, &format!("{:>12}", step.step.word()), self.color);
-        format!("{word} {} ({})\n", step.what(), took(now_ns.saturating_sub(step.began_ns)))
+        let count = step.count().map(|it| format!(": {it}")).unwrap_or_default();
+        let took = took(now_ns.saturating_sub(step.began_ns));
+        format!("{word} {}{count} ({took})\n", step.what())
     }
 }

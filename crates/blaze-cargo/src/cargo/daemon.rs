@@ -1080,6 +1080,8 @@ struct Watching {
     root: PathBuf,
     records: Vec<Record>,
     done: bool,
+    /// When it began ([`blaze_protocol::follow::now_ns`]): its records' times are since.
+    began_ns: u64,
 }
 
 /// A command that is sent the records of the builds of the workspace at `root`, or of every
@@ -1107,6 +1109,7 @@ impl Watched {
             root: root.to_owned(),
             records: Vec::new(),
             done: false,
+            began_ns: blaze_protocol::follow::now_ns(),
         };
         self.watching.push(watching);
         self.builds
@@ -1133,6 +1136,21 @@ impl Watched {
         };
         of(false).or_else(|| of(true))
     }
+
+    /// The step the build under way in the workspace at `root` is at, as its live view says
+    /// it: `Resolving names 2.40s (3/120 crates)`.
+    fn under_way(&self, root: &Path) -> Option<String> {
+        let watching = self.watching.iter().rev().find(|it| !it.done && it.root == root)?;
+        let mut build = blaze_ui::Build::default();
+        for record in &watching.records {
+            build.apply(record);
+        }
+        let step = build.running().last()?;
+        let now_ns = blaze_protocol::follow::now_ns().saturating_sub(watching.began_ns);
+        let took = blaze_ui::took(now_ns.saturating_sub(step.began_ns));
+        let count = step.count().map(|it| format!(" ({it})")).unwrap_or_default();
+        Some(format!("{} {} {took}{count}", step.step.word(), step.what()))
+    }
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -1158,6 +1176,14 @@ pub fn store() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let caches = caches.or_else(|| Some(PathBuf::from(home?).join(".cache")))?;
     Some(caches.join("blaze/store"))
+}
+
+/// Why there is no [`store`]: what to set for one.
+pub fn no_store() -> &'static str {
+    match std::env::var_os("BLAZE_CACHE") {
+        Some(_) => "BLAZE_CACHE=off",
+        None => "no BLAZE_CACHE, XDG_CACHE_HOME or HOME says where to keep it",
+    }
 }
 
 pub fn socket_in(home: &Path) -> PathBuf {
@@ -1590,17 +1616,31 @@ impl Daemon {
             Request::Lint(ahead, ask) => {
                 self.check(&ahead, &format!("{}{ask}", crate::check::LINT))
             }
-            Request::Status => Reply::Status(Status {
-                pid: std::process::id(),
-                version: self.version.clone(),
-                idle_secs: self.idle.map(|it| it.as_secs()),
-                memory_max: self.memory_max,
-                workers: lock(&self.workers)
+            Request::Status => {
+                let mut workers: Vec<WorkerStatus> = lock(&self.workers)
                     .values()
                     .map(|it| it.status())
                     .chain(lock(&self.checkers).iter_mut().map(Checker::status))
-                    .collect(),
-            }),
+                    .collect();
+                // A checkout being loaded says the step its build is at, as the live view of
+                // that build does.
+                let watched = lock(&self.watched);
+                for (root, warmth) in workers.iter_mut().flat_map(|it| it.checkouts.iter_mut()) {
+                    if warmth.starts_with("loading")
+                        && let Some(step) = watched.under_way(root)
+                    {
+                        *warmth = step;
+                    }
+                }
+                drop(watched);
+                Reply::Status(Status {
+                    pid: std::process::id(),
+                    version: self.version.clone(),
+                    idle_secs: self.idle.map(|it| it.as_secs()),
+                    memory_max: self.memory_max,
+                    workers,
+                })
+            }
             Request::Stop => Reply::Stopping,
             Request::Watch { .. } => Reply::Watched(Vec::new()),
         }

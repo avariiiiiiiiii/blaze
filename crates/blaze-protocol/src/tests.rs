@@ -202,7 +202,7 @@ fn a_message_is_these_bytes() {
         "a1 644c696e65 6c 202020436f6d70696c696e67", //     {"Line": "   Compiling"}
         "a1 6450616972 82 18ff 387f",                //     {"Pair": [255, -128]}
         "6561745f6e73 1a4a817c80",                   //   "at_ns": 1250000000
-        "66736368656d61 01",                         // "schema": 1
+        "66736368656d61 02",                         // "schema": 2
     ];
     assert_eq!(hex(&bytes), expected.concat().replace(' ', ""));
     assert_eq!(from_slice::<Message<Record>>(&bytes).unwrap(), record());
@@ -215,7 +215,7 @@ fn a_message_is_these_bytes() {
 /// A build's record is pinned the same way.
 #[test]
 fn an_event_is_these_bytes() {
-    use crate::events::{Cause, CrateState, Event, Fns, Record, Step};
+    use crate::events::{Cause, CrateState, Event, Fns, NodeKind, Record, Step};
     let records = [
         Record { at_ns: 0, event: Event::Started { step: Step::LoadWorkspace, of: None } },
         Record {
@@ -234,6 +234,19 @@ fn an_event_is_these_bytes() {
                 cause: Cause::Body,
             },
         },
+        Record {
+            at_ns: 2_000_000_000,
+            event: Event::Progress {
+                step: Step::Check,
+                done: 3,
+                total: 14,
+                longest: Some("src/main.rs".into()),
+            },
+        },
+        Record {
+            at_ns: 0,
+            event: Event::Node { id: 1, kind: NodeKind::Std, name: "std".into(), deps: vec![0] },
+        },
     ];
     let hexes: Vec<String> = records.iter().map(|it| hex(&to_vec(it).unwrap())).collect();
     let expected = [
@@ -249,6 +262,13 @@ fn an_event_is_these_bytes() {
         // "krate": "anim"}}}
         "a2 6561745f6e73 1a0c845880 656576656e74 a1 6752656275696c74 a3 646e616d65 \
          6672656e646572 656361757365 64426f6479 656b72617465 64616e696d",
+        // {"at_ns": 2000000000, "event": {"Progress": {"done": 3, "step": "Check",
+        // "total": 14, "longest": "src/main.rs"}}}
+        "a2 6561745f6e73 1a77359400 656576656e74 a1 6850726f6772657373 a4 64646f6e65 03 \
+         6473746570 65436865636b 65746f74616c 0e 676c6f6e67657374 6b 7372632f6d61696e2e7273",
+        // {"at_ns": 0, "event": {"Node": {"id": 1, "deps": [0], "kind": "Std", "name": "std"}}}
+        "a2 6561745f6e73 00 656576656e74 a1 644e6f6465 a4 626964 01 6464657073 81 00 \
+         646b696e64 63537464 646e616d65 63737464",
     ];
     for ((hexed, expected), record) in hexes.iter().zip(expected).zip(&records) {
         assert_eq!(hexed, &expected.replace(' ', ""), "{record:?}");

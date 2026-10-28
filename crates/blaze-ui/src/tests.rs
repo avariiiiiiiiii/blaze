@@ -19,7 +19,7 @@ fn anim(state: CrateState, done: u64, kept: u64) -> Event {
 /// compiling.
 fn cold() -> Vec<Record> {
     vec![
-        at(0, Event::Began { build: 1, command: "blaze run".into(), root: "/w/anim".into() }),
+        at(0, Event::Began { build: 1, command: "run".into(), root: "/w/anim".into() }),
         at(0, Event::Started { step: Step::LoadWorkspace, of: None }),
         at(38_300 * MS, Event::Ended { step: Step::LoadWorkspace, of: None }),
         at(38_300 * MS, Event::Started { step: Step::Resolve, of: None }),
@@ -203,6 +203,8 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
     assert_eq!(
         region,
         [
+            format!("blaze run{:45}1m00s", "").as_str(),
+            "\u{2713} workspace 38.3s  \u{2713} names 3.20s  \u{25cf} codegen 18.5s",
             "   Compiling functions 18.5s \u{b7} 0/1 crates \u{b7} 1200/5353 fns",
             "            \u{2514}\u{2500} anim  1200/5353 fns  18.5s",
         ]
@@ -270,12 +272,13 @@ fn the_region_is_a_tree_of_the_crates_under_way() {
     assert_eq!(
         region,
         [
+            format!("blaze run{:105}3.00s", "").as_str(),
+            "\u{25cf} names 2/5 crates 3.00s",
             "   Resolving names 3.00s \u{b7} 2/5 crates \u{b7} longest winit",
             "             anim waiting",
             "             \u{251c}\u{2500} winit  resolving  1.50s",
             "             \u{2514}\u{2500} wgpu  resolving  1.50s",
-            "             0 done \u{b7} 2 under way \u{b7} 3 waiting \u{b7} longest chain 2.90s: anim \u{2190} \
-             wgpu \u{2190} libc \u{2190} std",
+            "             0 done \u{b7} 2 under way \u{b7} 3 waiting",
         ]
     );
 }
@@ -303,6 +306,8 @@ fn a_build_script_is_a_node_of_its_own() {
     assert_eq!(
         region,
         [
+            format!("blaze build{:103}2.00s", "").as_str(),
+            "\u{25cf} build scripts 2.00s",
             "    Building build scripts and proc macros 2.00s",
             "             anyhow build script  compiling  1.90s",
             "             1 done (1 up to date) \u{b7} 1 under way \u{b7} 0 waiting",
@@ -334,7 +339,9 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
     ));
     build.apply(&at(17 * S, crate_is("anim", CrateState::Built, 77917)));
     let summary = build.summary(117_400 * MS, None);
-    let finished = crate::Finished { ok: true, summary, at_ns: 117_400 * MS };
+    let (chain, chain_ns, unnamed) = (Vec::new(), 0, None);
+    let finished =
+        crate::Finished { ok: true, summary, at_ns: 117_400 * MS, chain, chain_ns, unnamed };
     let lines = crate::last_lines(&finished, false, true);
     assert_eq!(
         lines,
@@ -342,6 +349,7 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
             "    Compiled 77917 fns in 1 crate, 0 kept; 1m57s",
             "        Took 1m57s: checking 14 files 1m40s, loading workspace 10.7s, compiling anim 4.20s",
             "       Cache cold: cache keys changed since blaze 0.20261027.0 (fb82b09)",
+            "             `blaze why` says more",
         ]
     );
     // A quick build says nothing more than it did.
@@ -350,16 +358,37 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
     assert_eq!(crate::last_lines(&quick, false, true).len(), 1);
 }
 
-/// The lines that stay are those before the region: the region is its header, the crates
-/// under way and the count of those done. A test of the renderer's own text, with no color.
+/// A build that ends says what held it up, as its graph says it, and time that went by with
+/// no step named, which is a step that is missing.
+#[test]
+fn a_long_build_says_what_held_it_up_and_time_no_step_named() {
+    let mut live = Live::new(120, false);
+    let records = graphed().into_iter().chain([
+        at(2 * S, crate_is("winit", CrateState::Resolved, 0)),
+        at(2 * S, crate_is("wgpu", CrateState::Resolved, 0)),
+        at(2 * S, Event::Ended { step: Step::Resolve, of: None }),
+        at(3500 * MS, Event::Started { step: Step::Link, of: None }),
+        at(4 * S, Event::Ended { step: Step::Link, of: None }),
+        at(4 * S, Event::Critical { path: vec![10, 11, 13] }),
+        at(4 * S, Event::Finished { ok: true, summary: Summary::default() }),
+    ]);
+    let drawn: String = records.map(|it| live.record(&it, it.at_ns)).collect();
+    let end: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    assert_eq!(
+        end[1..],
+        [
+            "       Chain std \u{2192} libc \u{2192} wgpu 1.90s",
+            "warning: 1.50s with no step named, after names",
+            "             `blaze why` says more",
+        ]
+    );
+}
+
+/// The lines that stay are those before the region: the region is its header, the steps,
+/// the crates under way and the count of those done. A test of the renderer's own text, with
+/// no color.
 fn region_len(lines: &[&str]) -> usize {
-    let header = lines.iter().rposition(|it| {
-        it.starts_with("   Compiling functions")
-            || it.starts_with("     Loading workspace ")
-            || it.starts_with("   Resolving names ")
-            || it.starts_with("     Linking anim ")
-            || it.starts_with("     Waiting ")
-    });
+    let header = lines.iter().rposition(|it| it.starts_with("blaze "));
     header.map_or(0, |at| lines.len() - at)
 }
 

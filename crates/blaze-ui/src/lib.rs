@@ -46,6 +46,35 @@ pub struct Build {
     pub finished: Option<Finished>,
     /// The time of the last record.
     pub last_ns: u64,
+    /// The longest stretch so far with no step under way, when it ended, and the step that
+    /// ended before it ([`Build::unnamed`]).
+    pub unnamed: Option<Unnamed>,
+    /// The nodes of [`Build::graph`] that held the build up, from the first
+    /// ([`Event::Critical`]).
+    pub critical: Vec<usize>,
+    /// Since when no step is under way, and the step that ended then.
+    idle: Option<(u64, Step)>,
+}
+
+/// Time a build spent with no step under way: what ran then is shown as nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unnamed {
+    pub took_ns: u64,
+    pub after: Step,
+}
+
+/// A stretch with no step under way longer than this is said ([`why_lines`]): every phase
+/// that takes long has a name.
+pub const UNNAMED_NS: u64 = 1_000_000_000;
+
+/// A kind of step in the line of steps ([`Build::strip`]): under way or done, how long all
+/// of its kind took, and the count of the last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Strip {
+    pub step: Step,
+    pub running: bool,
+    pub took_ns: u64,
+    pub count: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +234,11 @@ pub struct Finished {
     pub ok: bool,
     pub summary: Summary,
     pub at_ns: u64,
+    /// What held the build up, the first first, and the time from its start to the last's end
+    /// ([`Build::critical_path`]).
+    pub chain: Vec<String>,
+    pub chain_ns: u64,
+    pub unnamed: Option<Unnamed>,
 }
 
 /// What a record changed, for a renderer to say.
@@ -235,6 +269,7 @@ impl Build {
                 Change::Nothing
             }
             Event::Started { step, of } => {
+                self.named(at);
                 let of = of.clone();
                 let (began_ns, ended_ns, progress) = (at, None, None);
                 self.steps.push(Stepped { step: *step, of, began_ns, ended_ns, progress });
@@ -279,6 +314,9 @@ impl Build {
                 match open {
                     Some(index) => {
                         self.steps[index].ended_ns = Some(at);
+                        if self.running().next().is_none() {
+                            self.idle = Some((at, *step));
+                        }
                         Change::Ended(index)
                     }
                     None => Change::Nothing,
@@ -306,12 +344,49 @@ impl Build {
             }
             Event::Said { level, text } => Change::Said(*level, text.clone()),
             Event::Finished { ok, summary } => {
-                self.finished = Some(Finished { ok: *ok, summary: summary.clone(), at_ns: at });
+                self.named(at);
+                let (chain, chain_ns) = self.critical_path(at);
+                let chain = chain.iter().rev().map(|&it| self.crates[it].name.clone()).collect();
+                let (ok, summary, unnamed) = (*ok, summary.clone(), self.unnamed);
+                self.finished = Some(Finished { ok, summary, at_ns: at, chain, chain_ns, unnamed });
                 Change::Finished
             }
-            // The live view finds the longest chain as it goes ([`Build::critical_path`]).
-            Event::Critical { .. } => Change::Nothing,
+            Event::Critical { path } => {
+                self.critical = path.iter().filter_map(|&it| self.node(it)).collect();
+                Change::Nothing
+            }
         }
+    }
+
+    /// A step began, or the build ended, at `at`: the time since the last step ended went
+    /// unnamed.
+    fn named(&mut self, at: u64) {
+        let Some((since, after)) = self.idle.take() else { return };
+        let took_ns = at.saturating_sub(since);
+        if self.unnamed.is_none_or(|it| took_ns > it.took_ns) {
+            self.unnamed = Some(Unnamed { took_ns, after });
+        }
+    }
+
+    /// Each kind of step begun, in the order it first began: whether one of it is under way,
+    /// and how long they took by `now_ns`. Done ones too quick to matter are left out.
+    pub fn strip(&self, now_ns: u64) -> Vec<Strip> {
+        let mut strip: Vec<Strip> = Vec::new();
+        for stepped in &self.steps {
+            let took_ns = stepped.ended_ns.unwrap_or(now_ns).saturating_sub(stepped.began_ns);
+            let running = stepped.ended_ns.is_none();
+            let count = stepped.count();
+            match strip.iter_mut().find(|it| it.step == stepped.step) {
+                Some(it) => {
+                    it.took_ns += took_ns;
+                    it.running |= running;
+                    it.count = count.or(it.count.take());
+                }
+                None => strip.push(Strip { step: stepped.step, running, took_ns, count }),
+            }
+        }
+        strip.retain(|it| it.running || it.took_ns >= 50_000_000);
+        strip
     }
 
     /// The row of [`Build::crates`] named `name`, a new one waiting from `at` if none is.
@@ -347,15 +422,18 @@ impl Build {
         Summary { took_ns, crates: crates as u64, fns, rebuilt, more, error, cache, slowest }
     }
 
-    /// The steps that took longest by `now_ns`, longest first: each step once, its times
-    /// added up (the codegen of each crate is one), and only those that took a part of the
-    /// build worth naming.
+    /// The steps that took longest by `now_ns`, longest first: each step of the same thing
+    /// once, its times added up (the codegen of every crate is one), and only those that took
+    /// a part of the build worth naming.
     pub fn slowest(&self, now_ns: u64) -> Vec<Took> {
         const LISTED: usize = 3;
         let mut by_step: Vec<Took> = Vec::new();
         for stepped in &self.steps {
             let took_ns = stepped.ended_ns.unwrap_or(now_ns).saturating_sub(stepped.began_ns);
-            match by_step.iter_mut().find(|it| it.step == stepped.step) {
+            let same = |it: &&mut Took| {
+                it.step == stepped.step && (it.step == Step::Codegen || it.of == stepped.of)
+            };
+            match by_step.iter_mut().find(same) {
                 Some(took) => {
                     took.took_ns += took_ns;
                     if took.of != stepped.of {
@@ -373,42 +451,29 @@ impl Build {
         by_step
     }
 
-    /// The crates on the longest chain of what waits for what, by how long each was busy
-    /// until `now_ns`, the one the others wait for last; and that time added up. Empty
-    /// without a graph.
+    /// The rows on what held the build up, as the graph said it at its end
+    /// ([`Event::Critical`]): the one that finished last first, back to the one it began
+    /// with; and the time from that one's start to the last one's end, by `now_ns` if it is
+    /// not done. Empty before the graph says it.
     pub fn critical_path(&self, now_ns: u64) -> (Vec<usize>, u64) {
-        // A row's time is its last node's, so a crate of several nodes counts once.
-        let mut last = vec![None; self.crates.len()];
-        for (at, node) in self.graph.iter().enumerate() {
-            last[node.row] = Some(at);
-        }
-        // The longest chain ending at each node, and the node before it there.
-        let mut longest: Vec<(u64, Option<usize>)> = Vec::with_capacity(self.graph.len());
-        for (at, node) in self.graph.iter().enumerate() {
-            let own = match last[node.row] == Some(at) {
-                true => self.crates[node.row].busy_ns(now_ns),
-                false => 0,
-            };
-            let before = node
-                .deps
-                .iter()
-                .filter_map(|&dep| longest.get(dep).map(|it| (it.0, dep)))
-                .max_by_key(|it| it.0);
-            longest.push((own + before.map_or(0, |it| it.0), before.map(|it| it.1)));
-        }
-        let Some(end) = (0..longest.len()).max_by_key(|&it| longest[it].0) else {
-            return (Vec::new(), 0);
-        };
         let mut chain: Vec<usize> = Vec::new();
-        let mut at = Some(end);
-        while let Some(node) = at {
+        for &node in self.critical.iter().rev() {
             let row = self.graph[node].row;
-            if chain.last() != Some(&row) {
+            if !chain.contains(&row) {
                 chain.push(row);
             }
-            at = longest[node].1;
         }
-        (chain, longest[end].0)
+        let (Some(&last), Some(&first)) = (chain.first(), chain.last()) else {
+            return (Vec::new(), 0);
+        };
+        let last = &self.crates[last];
+        let ended = match (last.ended_ns, last.is_busy()) {
+            (Some(ended), _) => ended,
+            (None, true) => now_ns,
+            // Resolved and waiting to be compiled: done with what it did last.
+            (None, false) => last.since_ns,
+        };
+        (chain, ended.saturating_sub(self.crates[first].began_ns))
     }
 
     /// The functions of every crate together.
@@ -460,11 +525,14 @@ pub fn last_lines(finished: &Finished, color: bool, errors_said: bool) -> Vec<St
 }
 
 /// Why a build took as long as it did, for one that took longer than [`WHY_NS`]: its slowest
-/// steps, and what the store had of its compile.
+/// steps, what the store had of its compile, the longest chain of crates that waited for
+/// each other, and time no step was named for.
 ///
 /// ```text
 ///         Took 2m15s: checking 14 files 1m40s, loading workspace 10.7s, compiling functions 4.20s
 ///        Cache cold: the store has none of this build
+///        Chain syn → serde_derive → anim 18.2s
+///              `blaze why` says more
 /// ```
 pub fn why_lines(finished: &Finished, color: bool) -> Vec<String> {
     let summary = &finished.summary;
@@ -498,7 +566,40 @@ pub fn why_lines(finished: &Finished, color: bool) -> Vec<String> {
         };
         lines.extend(rest.map(|rest| status("Cache", &rest)));
     }
+    if finished.chain.len() > 1 && finished.chain_ns > 0 {
+        let chain = finished.chain.join(" \u{2192} ");
+        lines.push(status("Chain", &format!("{chain} {}", took(finished.chain_ns))));
+    }
+    if let Some(unnamed) = finished.unnamed.filter(|it| it.took_ns >= UNNAMED_NS) {
+        let after = unnamed.after.whole();
+        let rest = format!("{} with no step named, after {after}", took(unnamed.took_ns));
+        lines.push(said_line(Level::Warning, &rest, color));
+    }
+    if !lines.is_empty() {
+        lines.push(paint(DIM, &format!("{:>12} `blaze why` says more", ""), color));
+    }
     lines
+}
+
+/// The word of a step in the line of steps: short, as the line has all of them.
+pub fn label(step: Step) -> &'static str {
+    match step {
+        Step::LoadWorkspace => "workspace",
+        Step::Fetch => "fetch",
+        Step::Resolve => "names",
+        Step::FrontEnd => "types",
+        Step::Codegen => "codegen",
+        Step::Std => "std",
+        Step::Link => "link",
+        Step::Check => "check",
+        Step::Run => "run",
+        Step::Test => "tests",
+        Step::BuildScripts => "build scripts",
+        Step::Macros => "proc macros",
+        Step::Optimize => "optimize",
+        Step::Store => "store",
+        Step::Remote => "remote",
+    }
 }
 
 /// The last line of a build: what it rebuilt and why, or why it failed, and how long it took.

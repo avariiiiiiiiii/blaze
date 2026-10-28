@@ -2,7 +2,7 @@
 
 use blaze_protocol::events::{CrateState, Record};
 
-use crate::{Build, CYAN, Change, DIM, GREEN, last_lines, paint, staying, took};
+use crate::{Build, CYAN, Change, DIM, GREEN, label, last_lines, paint, staying, took};
 
 /// The most crates the region lists by name; the rest under way are counted.
 const SHOWN: usize = 6;
@@ -100,13 +100,87 @@ impl Live {
         out
     }
 
-    /// The region at `now_ns`: what is under way, with the time it has taken, and a count of
-    /// what is done. Each line fits the width, so the region is as many rows as lines.
+    /// The region at `now_ns`: the command and how long it has taken, every kind of step so
+    /// far, what is under way with the time it has taken, and a count of what is done. Each
+    /// line fits the width, so the region is as many rows as lines.
+    ///
+    /// ```text
+    /// blaze build · cold: the store is empty                                     12.4s
+    /// ✓ workspace 0.31s  ✓ names 2.37s  ● build scripts 3/14 steps 2.10s
+    ///     Building anyhow, compiling its build script 1.20s · 3/14 steps
+    /// ```
     fn region(&self, now_ns: u64) -> Vec<String> {
         let build = &self.build;
         if build.finished.is_some() {
             return Vec::new();
         }
+        let mut lines = vec![self.header(now_ns)];
+        lines.extend(self.strip(now_ns));
+        lines.extend(self.under_way(now_ns));
+        lines
+    }
+
+    /// `blaze build · cold: the store is empty`, and how long it has taken at the right.
+    fn header(&self, now_ns: u64) -> String {
+        let build = &self.build;
+        let mut left = format!("blaze {}", build.command.as_deref().unwrap_or("build"));
+        if let Some(why) = build.cache.as_ref().and_then(|it| it.cold.as_deref()) {
+            left.push_str(&format!(" \u{b7} cold: {why}"));
+        }
+        let right = took(now_ns);
+        let room = self.width.saturating_sub(right.chars().count() + 2);
+        let left: String = match left.chars().count() > room {
+            true => left.chars().take(room.saturating_sub(1)).chain(['\u{2026}']).collect(),
+            false => left,
+        };
+        let pad = self.width.saturating_sub(left.chars().count() + right.chars().count() + 1);
+        format!("{}{:pad$}{}", paint(GREEN, &left, self.color), "", paint(DIM, &right, self.color))
+    }
+
+    /// Each kind of step so far, done or under way, with its count and time; the first done
+    /// ones counted when they don't fit.
+    fn strip(&self, now_ns: u64) -> Option<String> {
+        let strip = self.build.strip(now_ns);
+        if strip.is_empty() {
+            return None;
+        }
+        let mark = |it: &crate::Strip| if it.running { "\u{25cf}" } else { "\u{2713}" };
+        let plain = |it: &crate::Strip| {
+            let count = it.count.as_ref().map(|it| format!(" {it}")).unwrap_or_default();
+            format!("{} {}{count} {}", mark(it), label(it.step), took(it.took_ns))
+        };
+        let texts: Vec<String> = strip.iter().map(plain).collect();
+        let counted =
+            |from: usize| if from > 0 { format!("\u{2713} {from} more  ") } else { String::new() };
+        let width = |from: usize| {
+            let shown: usize = texts[from..].iter().map(|it| it.chars().count() + 2).sum();
+            counted(from).chars().count() + shown - 2
+        };
+        let room = self.width.saturating_sub(1);
+        let mut first = 0;
+        while first + 1 < texts.len() && !strip[first].running && width(first) > room {
+            first += 1;
+        }
+        // Too narrow for even the last: its text alone, cut to the width.
+        if width(first) > room {
+            let line = counted(first) + &texts[first..].join("  ");
+            return Some(line.chars().take(room).collect());
+        }
+        let mut line = counted(first);
+        for (at, it) in strip.iter().enumerate().skip(first) {
+            if at > first {
+                line.push_str("  ");
+            }
+            let color = if it.running { CYAN } else { GREEN };
+            line.push_str(&paint(color, mark(it), self.color));
+            line.push_str(&texts[at][mark(it).len()..]);
+        }
+        Some(line)
+    }
+
+    /// The step under way and what it does, and the crates under way.
+    fn under_way(&self, now_ns: u64) -> Vec<String> {
+        let build = &self.build;
         let since = |began: u64| took(now_ns.saturating_sub(began));
         let mut totals = Vec::new();
         let crates = build.crates.len();
@@ -177,13 +251,13 @@ impl Live {
     /// The crates under way as a tree, from the program down what it waits for: each crate
     /// being resolved, checked or compiled with what it did so far and for how long, under
     /// the crates waiting for it; what is done is left out, and counted in the last line with
-    /// the longest chain so far.
+    /// what held the build up once the graph says it ([`Build::critical_path`]).
     ///
     /// ```text
     ///             anim waiting
     ///             ├─ wgpu  compiling 1201 fns  4.10s
     ///             └─ winit  resolving  0.80s
-    ///             98 done (40 up to date) · 2 under way · 21 waiting · longest chain 41.2s: anim ← wgpu
+    ///             98 done (40 up to date) · 2 under way · 21 waiting
     /// ```
     fn tree(&self, now_ns: u64) -> Vec<String> {
         let build = &self.build;

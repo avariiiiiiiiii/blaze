@@ -168,8 +168,8 @@ MODES = {"blaze": "`blaze`"}
 
 # What cargo and `blaze` print about the build, which is not the program's output.
 # cargo's status words, then blaze's own steps' (crates/blaze-ui), right-aligned to 12 columns.
-STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:)"
-                    r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing|Took|Cache|Building|Built|Storing|Stored|Optimizing|Optimized) ")
+STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:|`blaze why` says more$)"
+                    r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing|Took|Cache|Chain|Building|Built|Storing|Stored|Optimizing|Optimized) ")
 
 
 def base_env(home):

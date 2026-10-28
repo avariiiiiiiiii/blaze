@@ -1,0 +1,20 @@
+[package]
+name = "blaze-ui"
+description = "How blaze shows a build: its records from the daemon rendered live on a terminal, as lines elsewhere, and summed up"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-protocol.workspace = true
+
+[lints]
+workspace = true

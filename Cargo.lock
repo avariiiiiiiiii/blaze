@@ -971,6 +971,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-protocol"
+version = "0.20261028.0"
+dependencies = [
+ "blaze-fuzz",
+ "rustc-hash 2.1.2",
+ "serde",
+]
+
+[[package]]
 name = "blaze-registry"
 version = "0.20261028.0"
 dependencies = [
@@ -1053,6 +1062,13 @@ dependencies = [
  "blaze-metadata",
  "blaze-resolve",
  "rustc-hash 2.1.2",
+]
+
+[[package]]
+name = "blaze-ui"
+version = "0.20261028.0"
+dependencies = [
+ "blaze-protocol",
 ]
 
 [[package]]

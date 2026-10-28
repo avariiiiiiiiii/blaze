@@ -127,7 +127,8 @@ pub(crate) fn lines_of(program: &Program, planned: &[Planned], ended: &Ended<'_>
 /// `tests.ndjson` as it is written: what `blaze test` ran so far.
 pub(crate) struct Report {
     dir: PathBuf,
-    lines: Vec<Line>,
+    /// Each line with its text, made once.
+    lines: Vec<(Line, String)>,
     file: Option<std::fs::File>,
 }
 
@@ -144,23 +145,32 @@ impl Report {
 
     /// Adds the lines of a test executable that finished.
     pub(crate) fn add(&mut self, lines: Vec<Line>) {
+        let lines: Vec<(Line, String)> = lines
+            .into_iter()
+            .map(|line| {
+                let text = ndjson(&line);
+                (line, text)
+            })
+            .collect();
         if let Some(file) = &mut self.file {
-            let text: String = lines.iter().map(ndjson).collect();
+            let text: String = lines.iter().map(|(_, text)| text.as_str()).collect();
             _ = file.write_all(text.as_bytes());
         }
         self.lines.extend(lines);
     }
 
-    /// Writes `tests.ndjson` again, sorted, and `tests.summary.json`; the lines and the summary.
-    pub(crate) fn finish(mut self) -> (Vec<Line>, Summary) {
-        self.lines.sort_by(|a, b| a.order().cmp(&b.order()));
-        let summary = Summary::of(&self.lines);
-        let text: String = self.lines.iter().map(ndjson).collect();
+    /// Writes `tests.ndjson` again, sorted, and `tests.summary.json`; the lines, the summary
+    /// and the text of `tests.ndjson`.
+    pub(crate) fn finish(mut self) -> (Vec<Line>, Summary, String) {
+        self.lines.sort_by(|(a, _), (b, _)| a.order().cmp(&b.order()));
+        let text: String = self.lines.iter().map(|(_, text)| text.as_str()).collect();
+        let lines: Vec<Line> = self.lines.into_iter().map(|(line, _)| line).collect();
+        let summary = Summary::of(&lines);
         write_whole(&self.dir.join("tests.ndjson"), text.as_bytes());
         if let Ok(json) = serde_json::to_string_pretty(&summary) {
             write_whole(&self.dir.join("tests.summary.json"), format!("{json}\n").as_bytes());
         }
-        (self.lines, summary)
+        (lines, summary, text)
     }
 
     pub(crate) fn dir(&self) -> &Path {

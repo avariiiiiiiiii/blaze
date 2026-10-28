@@ -210,7 +210,10 @@ pub(crate) fn pick(
     if lines.next() != Some(plan::REACH_FORMAT) {
         return Pick::Asked;
     }
-    let programs = programs_run_by(state, test);
+    // Hashed only for a test that is kept: a program is read whole, and an integration test's
+    // tests that all run every time need none.
+    let hashed = std::cell::OnceCell::new();
+    let programs = || hashed.get_or_init(|| programs_run_by(state, test)).as_str();
     let mut results = results;
     let (mut names, mut keys, mut always, mut reaching) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new());
@@ -262,8 +265,8 @@ pub(crate) fn pick(
             continue;
         }
         let identity = match (reads, sandboxed) {
-            (true, Some(env)) => format!("~{hash}{programs}{env}{run}"),
-            _ => format!("{hash}{programs}{run}"),
+            (true, Some(env)) => format!("~{hash}{}{env}{run}", programs()),
+            _ => format!("{hash}{}{run}", programs()),
         };
         let first = Results::first(&identity, name);
         keys.insert(name.to_owned(), (first, reads));

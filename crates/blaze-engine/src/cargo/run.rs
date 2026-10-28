@@ -427,10 +427,10 @@ pub(crate) fn tests(
         results.seal();
     }
     let dir = report.dir().to_owned();
-    let (lines, summary) = report.finish();
+    let (lines, summary, text) = report.finish();
     if why_only {
         match asked.flags.json {
-            true => print!("{}", lines.iter().map(report::ndjson).collect::<String>()),
+            true => print!("{text}"),
             false => print!("{}", report::table(&lines, &summary, &dir)),
         }
         return Ok(0);

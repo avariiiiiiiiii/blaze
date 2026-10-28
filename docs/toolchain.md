@@ -99,6 +99,10 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
 5. A step before the pull request that fails (a vendoring conflict, a conflict merging the
    standard library, no usable nightly in two weeks, a conflict merging main into the bump) opens or comments on the same issue with what
    failed, and so does a bump open for a day without merging. Nothing is skipped quietly.
+6. Once a bump has merged, `python3 harness/nightly_features.py '{}'` on main moves the
+   tree of nightly features (#967) to the new pin: an issue for each new language feature, and
+   a comment and a close on the issue of each one stabilized or removed. The workflow does not
+   run it yet; it is run by hand after the merge.
 
 Fixes for what a nightly breaks (layouts, the ABI, std's source, intrinsics, borrow-check
 verdicts) are pushed to `toolchain/bump`. The next day's run merges main into it and moves it to

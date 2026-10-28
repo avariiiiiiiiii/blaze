@@ -21,7 +21,7 @@ cargo test --release -p ra-jit -p hir-ty -p hir-def -p parser -p syntax
 ```
 
 `python3 harness/unittests.py` is the one `cargo test` CI runs, over blaze's crates and the
-front end's (`vendor/rust-analyzer`, members of the same workspace).
+front end's (`hir-ty`, `hir-def`, `parser`, `syntax` and the rest), all in `crates/`.
 
 The real gate compares ra-jit's output with rustc's on real programs: see
 [docs/harness.md](docs/harness.md). Run what fits your change and say in the pull request

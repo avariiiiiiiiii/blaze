@@ -1,7 +1,7 @@
-diff --git a/vendor/rust-analyzer/crates/hir-def/src/attrs.rs b/vendor/rust-analyzer/crates/hir-def/src/attrs.rs
+diff --git a/crates/hir-def/src/attrs.rs b/crates/hir-def/src/attrs.rs
 index cefb774401..ba3d25f453 100644
---- a/vendor/rust-analyzer/crates/hir-def/src/attrs.rs
-+++ b/vendor/rust-analyzer/crates/hir-def/src/attrs.rs
+--- a/crates/hir-def/src/attrs.rs
++++ b/crates/hir-def/src/attrs.rs
 @@ -674,7 +674,7 @@ pub enum NativeLibKind {
  /// name (`wasm_import_module` alone).
  fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
@@ -11,10 +11,10 @@ index cefb774401..ba3d25f453 100644
          kind: NativeLibKind::Unspecified,
          verbatim: false,
          whole_archive: false,
-diff --git a/vendor/rust-analyzer/crates/hir-def/src/hir.rs b/vendor/rust-analyzer/crates/hir-def/src/hir.rs
+diff --git a/crates/hir-def/src/hir.rs b/crates/hir-def/src/hir.rs
 index 17b2673cc5..6e8a6c39b7 100644
---- a/vendor/rust-analyzer/crates/hir-def/src/hir.rs
-+++ b/vendor/rust-analyzer/crates/hir-def/src/hir.rs
+--- a/crates/hir-def/src/hir.rs
++++ b/crates/hir-def/src/hir.rs
 @@ -248,7 +248,7 @@ impl From<ast::LiteralKind> for Literal {
                  Literal::ByteString(text)
              }
@@ -24,10 +24,10 @@ index 17b2673cc5..6e8a6c39b7 100644
                  Literal::String(text)
              }
              LiteralKind::CString(s) => {
-diff --git a/vendor/rust-analyzer/crates/intern/src/symbol.rs b/vendor/rust-analyzer/crates/intern/src/symbol.rs
+diff --git a/crates/intern/src/symbol.rs b/crates/intern/src/symbol.rs
 index 72e3f00b40..a8367248cc 100644
---- a/vendor/rust-analyzer/crates/intern/src/symbol.rs
-+++ b/vendor/rust-analyzer/crates/intern/src/symbol.rs
+--- a/crates/intern/src/symbol.rs
++++ b/crates/intern/src/symbol.rs
 @@ -173,7 +173,7 @@ impl Symbol {
          unsafe { bucket.as_ref().0.clone() }
      }
@@ -37,10 +37,10 @@ index 72e3f00b40..a8367248cc 100644
          symbols::__empty
      }
  
-diff --git a/vendor/rust-analyzer/crates/test-fixture/src/lib.rs b/vendor/rust-analyzer/crates/test-fixture/src/lib.rs
+diff --git a/crates/test-fixture/src/lib.rs b/crates/test-fixture/src/lib.rs
 index 3c895457d5..965db7884e 100644
---- a/vendor/rust-analyzer/crates/test-fixture/src/lib.rs
-+++ b/vendor/rust-analyzer/crates/test-fixture/src/lib.rs
+--- a/crates/test-fixture/src/lib.rs
++++ b/crates/test-fixture/src/lib.rs
 @@ -1055,7 +1055,7 @@ impl ProcMacroExpander for ShortenProcMacroExpander {
                  Leaf::Literal(it) => {
                      // XXX Currently replaces any literals with an empty string, but supporting

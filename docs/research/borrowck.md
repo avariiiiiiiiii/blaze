@@ -359,7 +359,7 @@ only live where a live region reaches it (read: section 2.2). Examples from the 
 - rust-analyzer's MIR at the vendored commit has what borrowck needs in places: `FakeRead`,
   `StorageLive`/`StorageDead`, `Deinit`, shallow (fake) borrows, `MutBorrowKind::TwoPhasedBorrow`,
   a `MirPhase::Built` before drop elaboration, and promoted locals (read:
-  `vendor/rust-analyzer/crates/hir-ty/src/mir.rs:672-710,1052-1064,1356-1409`). It lacks
+  `crates/hir-ty/src/mir.rs:672-710,1052-1064,1356-1409`). It lacks
   `AscribeUserType` (commented out at `mir.rs:1063`), which rustc uses for `let x: &'a T`
   annotations, and MIR lowering erases regions (read: `mir/lower.rs:3294,3765`). Erased regions are
   fine for locals since rustc renumbers them anyway; user annotations and the signature's

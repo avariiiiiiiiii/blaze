@@ -218,7 +218,7 @@ mapped (**unverified** until built).
 
 ### What exists today
 
-- **rust-analyzer's `vfs`** (**read**, `vendor/rust-analyzer/crates/vfs/src/lib.rs`): a flat map
+- **rust-analyzer's `vfs`** (**read**, `crates/vfs/src/lib.rs`): a flat map
   from `FileId` (an interned path) to bytes with a change log that salsa drains; no versions, no
   roots, no hashes; IO and watching are a separate `loader::Handle`. It stays as the front end's
   file table, fed from the Merkle VFS, until the front end reads nodes directly.

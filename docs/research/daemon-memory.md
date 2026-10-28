@@ -141,7 +141,7 @@ nushell, whose processes were not measured one by one).
    project asks, or let it go when a project is served. A second project's cold start pays
    loading the standard library again (5.4 s on this Mac).
 3. **Eviction salsa can do**: patch `previous_iteration` to throw only for a
-   `fixpoint_initial` memo (a vendored salsa, as `vendor/rustc_abi` is patched in), then
+   `fixpoint_initial` memo (a vendored salsa, as `crates/rustc_abi` is patched in), then
    `lru` on `infer` and the MIR queries. Bounded by what those hold (nushell about
    1.2 GB of values) and by the allocator returning it. An edit that reaches an evicted body
    re-executes what depends on it rather than backdating.

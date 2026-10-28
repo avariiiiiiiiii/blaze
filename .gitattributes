@@ -1,0 +1,36 @@
+# The front end's crates (from rust-analyzer) keep LF line endings on every platform: their expect
+# tests compare files byte for byte.
+crates/base-db/** text=auto eol=lf
+crates/cfg/** text=auto eol=lf
+crates/edition/** text=auto eol=lf
+crates/hir/** text=auto eol=lf
+crates/hir-def/** text=auto eol=lf
+crates/hir-expand/** text=auto eol=lf
+crates/hir-ide/** text=auto eol=lf
+crates/hir-ty/** text=auto eol=lf
+crates/hir-ty-borrowck/** text=auto eol=lf
+crates/hir-ty-wfcheck/** text=auto eol=lf
+crates/ide-db/** text=auto eol=lf
+crates/ide-diagnostics/** text=auto eol=lf
+crates/intern/** text=auto eol=lf
+crates/load-cargo/** text=auto eol=lf
+crates/macros/** text=auto eol=lf
+crates/mbe/** text=auto eol=lf
+crates/parser/** text=auto eol=lf
+crates/paths/** text=auto eol=lf
+crates/proc-macro-api/** text=auto eol=lf
+crates/proc-macro-srv/** text=auto eol=lf
+crates/profile/** text=auto eol=lf
+crates/project-model/** text=auto eol=lf
+crates/span/** text=auto eol=lf
+crates/stdx/** text=auto eol=lf
+crates/syntax/** text=auto eol=lf
+crates/syntax-bridge/** text=auto eol=lf
+crates/test-fixture/** text=auto eol=lf
+crates/test-utils/** text=auto eol=lf
+crates/toolchain/** text=auto eol=lf
+crates/tt/** text=auto eol=lf
+crates/vfs/** text=auto eol=lf
+crates/vfs-notify/** text=auto eol=lf
+crates/rowan/** text=auto eol=lf
+crates/test-utils/bench_data/** binary

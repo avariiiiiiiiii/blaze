@@ -31,7 +31,7 @@ BLAZE = dict(
     run_bin="ra-jit",
     edits=dict(
         # Low in the graph: hir-def is under hir-ty, hir, the code generator and the daemon.
-        body=bench.body("vendor/rust-analyzer/crates/hir-def/src/lib.rs", "    pub fn is_block_module(self, db: &dyn SourceDatabase) -> bool {"),
+        body=bench.body("crates/hir-def/src/lib.rs", "    pub fn is_block_module(self, db: &dyn SourceDatabase) -> bool {"),
         # The daemon's own crate, which nothing in the checkout depends on.
         top=bench.body("crates/ra-jit/src/content.rs", "fn of(&self, krate: Crate) -> std::sync::Arc<OnceLock<Option<ContentId>>> {"),
         signature=[("crates/ra-jit-store/src/lib.rs", "pub fn parse_size(text: &str) -> Option<u64> {",

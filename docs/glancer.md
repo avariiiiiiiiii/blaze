@@ -160,7 +160,7 @@ macros that read files or the environment by themselves, which the server cannot
 **Where.** The wrapper and its disk format in a new crate under `crates/` (it is machinery:
 hashing, files, no Rust semantics), stored in the same store directory with its own key
 domain. Seeing the sub-requests needs a hook in load-cargo's `Expander`
-(`vendor/rust-analyzer/crates/load-cargo/src/lib.rs`, around line 703): a new module file
+(`crates/load-cargo/src/lib.rs`, around line 703): a new module file
 in load-cargo declared with one line, which counts the callback's requests per expansion.
 
 **Payoff, measured (2026-10-21, dev-aws-7, 16 cores, `cargo ra-jit build` cold then warm on

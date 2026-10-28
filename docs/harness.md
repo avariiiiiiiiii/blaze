@@ -67,7 +67,7 @@ long each took. Alongside the harnesses, CI runs `python3 harness/imports.py`, w
 every script of the harness, and
 `python3 harness/unittests.py`, which runs the Rust unit tests and holds them to its `OPEN`
 list (below). It is one `cargo test` from the root over blaze's crates and the front end's
-(`hir-ty`, `hir-def`, `hir-ide`, `ide-diagnostics` and the rest, in `vendor/rust-analyzer`), all
+(`hir-ty`, `hir-def`, `hir-ide`, `ide-diagnostics` and the rest), all
 members of the one workspace; the root `.cargo/config.toml` sets `CARGO_WORKSPACE_DIR`, where
 expect-test finds the parser's `.rast` files.
 

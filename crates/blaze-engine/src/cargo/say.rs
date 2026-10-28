@@ -233,7 +233,7 @@ impl Shown {
         };
         match self.held.take() {
             Some(_) => {
-                let last = live.build().finished.as_ref();
+                let last = live.build().finished.as_ref().filter(|it| !blaze_ui::fresh(it));
                 let last = last.map(|it| blaze_ui::summary_line(it, colored()) + "\n");
                 eprint!("{}", last.unwrap_or_default());
             }

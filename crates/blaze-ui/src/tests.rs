@@ -129,6 +129,19 @@ fn an_edit_says_what_it_rebuilt_and_why() {
     assert!(summary_line(&finished, true).contains("\x1b["));
 }
 
+#[test]
+fn a_fresh_build_says_nothing_of_its_own() {
+    let records = [
+        at(0, Event::Began { build: 1, command: "build".into(), root: "/w/anim".into() }),
+        at(MS, Event::Finished { ok: true, summary: Summary::default() }),
+    ];
+    let mut plain = Plain::new(false);
+    assert_eq!(records.iter().map(|it| plain.record(it)).collect::<String>(), "");
+    let mut live = Live::new(80, false);
+    let drawn: String = records.iter().map(|it| live.record(it, MS)).collect();
+    assert!(!drawn.contains("Fresh"), "{drawn:?}");
+}
+
 /// On a terminal: the region is redrawn in place, each of its lines fits the width, each
 /// redraw clears exactly what was drawn, and at the end the summary is all that is left
 /// of it.

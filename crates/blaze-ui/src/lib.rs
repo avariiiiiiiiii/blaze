@@ -205,6 +205,13 @@ pub fn took(ns: u64) -> String {
     }
 }
 
+/// Whether a build did nothing and failed at nothing: it has no last line of its own, as cargo
+/// says nothing of a fresh build but its `Finished`.
+pub fn fresh(finished: &Finished) -> bool {
+    let summary = &finished.summary;
+    finished.ok && summary.rebuilt.is_empty() && summary.fns.compiled() == 0
+}
+
 /// The last line of a build: what it rebuilt and why, or why it failed, and how long it took.
 /// Not cargo's `Finished`, which `blaze` says after it.
 pub fn summary_line(finished: &Finished, color: bool) -> String {
@@ -310,9 +317,12 @@ fn staying(build: &Build, change: &Change, color: bool, live: bool) -> Vec<Strin
             let (name, why) = &build.refused[*at];
             vec![said_line(Level::Error, &format!("blaze does not build `{name}`: {why}"), color)]
         }
-        Change::Finished if !live => {
-            build.finished.iter().map(|it| summary_line(it, color)).collect()
-        }
+        Change::Finished if !live => build
+            .finished
+            .iter()
+            .filter(|it| !fresh(it))
+            .map(|it| summary_line(it, color))
+            .collect(),
         _ => Vec::new(),
     }
 }

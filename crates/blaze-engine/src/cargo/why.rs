@@ -5,7 +5,7 @@
 use std::{io::Write as _, path::PathBuf};
 
 use anyhow::Context as _;
-use blaze_protocol::events::{Event, Record};
+use blaze_protocol::events::{CrateState, Event, Record};
 
 use super::daemon;
 
@@ -14,12 +14,20 @@ fn kept() -> anyhow::Result<PathBuf> {
     Ok(daemon::home()?.join("last-build"))
 }
 
-/// Keeps `records` as the last build's, when they are of a build: a check compiles nothing.
+/// Keeps `records` as the last build's, when they are of a build that compiled, refused or
+/// failed: a check compiles nothing, and a fresh build has nothing to say why of.
 pub(crate) fn keep(records: &[Record]) {
     let build = records
         .iter()
         .any(|it| matches!(&it.event, Event::Began { command, .. } if command == "build"));
-    if !build {
+    // A build that did nothing leaves the last that did something to say why of.
+    let did = records.iter().any(|it| match &it.event {
+        Event::Crate { state, .. } => matches!(state, CrateState::Built | CrateState::Failed),
+        Event::Rebuilt { .. } | Event::Unlisted { .. } | Event::Refused { .. } => true,
+        Event::Finished { ok, .. } => !ok,
+        _ => false,
+    });
+    if !build || !did {
         return;
     }
     let Ok(path) = kept() else { return };
@@ -71,7 +79,10 @@ pub(crate) fn command(args: &[String]) -> anyhow::Result<i32> {
     };
     match args.first() {
         None => {
-            out.push_str(&format!("the last `blaze {command}` took {}\n", blaze_ui::took(took)));
+            out.push_str(&format!(
+                "the last `blaze {command}` that compiled anything took {}\n",
+                blaze_ui::took(took)
+            ));
             if build.rebuilt.is_empty() {
                 out.push_str("  compiled nothing again\n");
             }

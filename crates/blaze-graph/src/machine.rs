@@ -43,8 +43,7 @@ impl Pool {
     }
 }
 
-/// A node to add. Its `deps` are added before it: earlier in the same input, or in an
-/// earlier one.
+/// A node to add. Its `deps` are added with it, in the same input in any order, or before.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
     pub id: NodeId,
@@ -113,6 +112,8 @@ pub enum Error {
     NoThreads(Pool),
     Twice(NodeId),
     UnknownDep { node: NodeId, dep: NodeId },
+    /// Nodes of one input that wait for one another.
+    Cycle(Vec<NodeId>),
     NotRunning(NodeId),
     Closed,
     Over,
@@ -124,7 +125,11 @@ impl fmt::Display for Error {
             Error::NoThreads(pool) => write!(f, "the {pool:?} pool runs no node at once"),
             Error::Twice(id) => write!(f, "node {id} is added twice"),
             Error::UnknownDep { node, dep } => {
-                write!(f, "node {node} waits for {dep}, which is not added before it")
+                write!(f, "node {node} waits for {dep}, which is not added")
+            }
+            Error::Cycle(nodes) => {
+                let nodes: Vec<String> = nodes.iter().map(ToString::to_string).collect();
+                write!(f, "nodes {} wait for one another", nodes.join(", "))
             }
             Error::NotRunning(id) => write!(f, "node {id} is said done, but it is not running"),
             Error::Closed => write!(f, "nodes added or the build closed after it was closed"),
@@ -210,7 +215,7 @@ impl Machine {
                 if self.closed {
                     return Err(Error::Closed);
                 }
-                self.check(&nodes)?;
+                let nodes = self.check(nodes)?;
                 self.add(at, nodes, &mut out);
             }
             Input::Close { .. } => {
@@ -224,7 +229,7 @@ impl Machine {
                     Some(&it) if self.nodes[it].state == NodeState::Running => it,
                     _ => return Err(Error::NotRunning(id)),
                 };
-                self.check(&added)?;
+                let added = self.check(added)?;
                 self.running[self.nodes[at_node].spec.pool.at()] -= 1;
                 let state = match outcome {
                     Outcome::Built => NodeState::Built,
@@ -246,20 +251,49 @@ impl Machine {
         Ok(out)
     }
 
-    /// Refuses `nodes` before anything of them is added.
-    fn check(&self, nodes: &[Spec]) -> Result<(), Error> {
-        let mut new = FxHashMap::default();
-        for spec in nodes {
-            for &dep in &spec.deps {
-                if !self.index.contains_key(&dep) && !new.contains_key(&dep) {
-                    return Err(Error::UnknownDep { node: spec.id, dep });
-                }
-            }
-            if self.index.contains_key(&spec.id) || new.insert(spec.id, ()).is_some() {
+    /// `nodes`, each after its deps of them, or why they cannot be added. Nothing of them is
+    /// added yet.
+    fn check(&self, nodes: Vec<Spec>) -> Result<Vec<Spec>, Error> {
+        let mut new: FxHashMap<NodeId, usize> = FxHashMap::default();
+        for (at, spec) in nodes.iter().enumerate() {
+            if self.index.contains_key(&spec.id) || new.insert(spec.id, at).is_some() {
                 return Err(Error::Twice(spec.id));
             }
         }
-        Ok(())
+        // Kahn's order over the new nodes, the first given first among those that can go.
+        let mut waiting = vec![0usize; nodes.len()];
+        let mut then: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        for (at, spec) in nodes.iter().enumerate() {
+            for dep in &spec.deps {
+                match new.get(dep) {
+                    Some(&it) => {
+                        waiting[at] += 1;
+                        then[it].push(at);
+                    }
+                    None if self.index.contains_key(dep) => {}
+                    None => return Err(Error::UnknownDep { node: spec.id, dep: *dep }),
+                }
+            }
+        }
+        let mut can: BTreeSet<usize> = (0..nodes.len()).filter(|&it| waiting[it] == 0).collect();
+        let mut order = Vec::with_capacity(nodes.len());
+        while let Some(at) = can.pop_first() {
+            order.push(at);
+            for &next in &then[at] {
+                waiting[next] -= 1;
+                if waiting[next] == 0 {
+                    can.insert(next);
+                }
+            }
+        }
+        if order.len() < nodes.len() {
+            let mut cycle: Vec<NodeId> =
+                (0..nodes.len()).filter(|&it| waiting[it] > 0).map(|it| nodes[it].id).collect();
+            cycle.sort();
+            return Err(Error::Cycle(cycle));
+        }
+        let mut nodes: Vec<Option<Spec>> = nodes.into_iter().map(Some).collect();
+        Ok(order.into_iter().filter_map(|at| nodes[at].take()).collect())
     }
 
     fn add(&mut self, at: u64, nodes: Vec<Spec>, out: &mut Vec<Output>) {

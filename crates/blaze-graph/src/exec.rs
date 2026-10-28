@@ -5,6 +5,7 @@
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::atomic::{AtomicU32, Ordering},
     time::Instant,
 };
 
@@ -12,6 +13,14 @@ use blaze_protocol::events::Record;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec};
+
+static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+/// `count` node ids no other graph of this process has, the first of them: what one process
+/// says of several graphs is one stream.
+pub fn ids(count: usize) -> u32 {
+    NEXT_ID.fetch_add(u32::try_from(count).unwrap_or(u32::MAX), Ordering::Relaxed)
+}
 
 /// What a node's work came to, and the nodes it found.
 #[derive(Debug, Clone, PartialEq, Eq)]

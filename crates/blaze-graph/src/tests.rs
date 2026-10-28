@@ -115,6 +115,24 @@ fn a_diamond_runs_each_node_after_what_it_waits_for() {
     assert!(machine.is_over());
 }
 
+/// A node may come before what it waits for in one input: it is added after it.
+#[test]
+fn an_input_is_added_in_the_order_of_what_waits() {
+    let mut machine = Machine::new(ONE).unwrap();
+    let out = machine
+        .step(Input::Add { at_ns: 0, nodes: vec![work(2, &[1], 1), work(1, &[], 1)] })
+        .unwrap();
+    expect![[r#"
+                0 node #1 Names n1 deps []
+                0 #1 Ready
+                0 node #2 Names n2 deps [1]
+                0 #2 Waiting
+                0 #1 Running
+                  run #1 on Work
+        "#]]
+    .assert_eq(&render(&out));
+}
+
 /// Of the nodes that are ready, the one the most waits behind runs first.
 #[test]
 fn the_longest_path_runs_first() {
@@ -227,8 +245,15 @@ fn inputs_it_cannot_take_are_refused_and_change_nothing() {
             Error::Twice(NodeId(3)),
         ),
         (
-            Input::Add { at_ns: 1, nodes: vec![work(3, &[4], 1), work(4, &[], 1)] },
-            Error::UnknownDep { node: NodeId(3), dep: NodeId(4) },
+            Input::Add { at_ns: 1, nodes: vec![work(3, &[9], 1)] },
+            Error::UnknownDep { node: NodeId(3), dep: NodeId(9) },
+        ),
+        (
+            Input::Add {
+                at_ns: 1,
+                nodes: vec![work(3, &[5], 1), work(4, &[3], 1), work(5, &[4], 1), work(6, &[], 1)],
+            },
+            Error::Cycle(vec![NodeId(3), NodeId(4), NodeId(5)]),
         ),
         (done(1, 2, Outcome::Built), Error::NotRunning(NodeId(2))),
         (done(1, 9, Outcome::Built), Error::NotRunning(NodeId(9))),
@@ -242,6 +267,7 @@ fn inputs_it_cannot_take_are_refused_and_change_nothing() {
     }
     assert_eq!(machine.state(NodeId(1)), Some(&NodeState::Running));
     assert_eq!(machine.state(NodeId(3)), None);
+    assert_eq!(machine.state(NodeId(6)), None);
     machine.step(Input::Close { at_ns: 1 }).unwrap();
     assert_eq!(machine.step(Input::Close { at_ns: 1 }).err(), Some(Error::Closed));
     assert_eq!(machine.step(Input::Add { at_ns: 1, nodes: vec![] }).err(), Some(Error::Closed));

@@ -585,9 +585,14 @@ impl Module for ObjectModule {
             };
             // blaze: as `add_subsection` does for the standard sections, a data object gets a
             // section of its own only where the section is what the linker keeps or drops. A
-            // Mach-O object has room for 255 sections, and its linker goes by symbols.
-            let own = (self.per_data_object_section || used)
-                && self.object.format() != BinaryFormat::MachO;
+            // Mach-O object has room for 255 sections, and its linker goes by symbols. A COFF
+            // symbol does not say how large it is, and its section is all that does: there
+            // every data object keeps one of its own, as upstream.
+            let own = match self.object.format() {
+                BinaryFormat::MachO => false,
+                BinaryFormat::Coff => true,
+                _ => self.per_data_object_section || used,
+            };
             match self.custom_sections.get(&key) {
                 Some(&section) if !own => section,
                 _ => {

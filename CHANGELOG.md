@@ -8,6 +8,12 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
+
+## [0.20261028.0] - 2026-10-28
+
 ### Changed
 
 - `cargo blaze` is gone: run `blaze` (same subcommands and flags). The program `cargo-blaze`,
@@ -37,6 +43,28 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   `RA_JIT_<NAME>`, is no longer read; blaze stops when one is set, with a line for each:
   `RA_JIT_CACHE was renamed BLAZE_CACHE`. The programs blaze builds read `BLAZE_FN_CACHE*`
   and `BLAZE_TIER` alone too.
+
+### Merged
+
+- a build keeps its plan while what it was made of is unchanged, not resolving the workspace on every no-op (#814)
+- BLAZE_REMOTE never holds up a build; lazy packs waited for 250 ms at most; gateway connects within 2 s (#815)
+- nix: the flake's default is blaze, so nix profile install github:indexable-inc/blaze installs it (#816)
+- release: notes under GitHub's limit, publish_crates fixes, crates.io off until the rename (#819)
+- release: notes longer than a GitHub release allows keep the entries that fit and link CHANGELOG.md (#820)
+- install: the check reads what `blaze toolchain` says now (#821)
+- one workspace: vendor/rust-analyzer's crates are root members with one Cargo.lock, the fork's unused crates and fork sync removed (#818)
+- settings are BLAZE_* alone; RA_JIT_* stops blaze, naming the new name (#270) (#817)
+- build(deps): bump actions/setup-python from 6 to 7 in the actions group (#822)
+- wasm proc macros: a kept expansion loads no module, expansions that ask a span's line/text/file kept with their answers, counters per edit (#824)
+- site: redesign in the ix docs layout: sidebar, animated fire logo, a home page around four goals with drawings, install and usage pages, client-side page swaps (#825)
+- publish_crates.py: a version-string dependency and the toolchain's include_str! in toolchain.rs (crates.io job of v0.20261027.0) (#826)
+- move the front end's crates (from vendor/rust-analyzer), rowan and rustc_abi into crates/ (#829)
+- an Apple link writes again the headerpad file a clean took (#721 on macOS) (#835)
+- blaze builds wasmtime again: System V vectors in XMM registers, negative float literal patterns (#834)
+- a checkout's git asks DNS for nothing (#838)
+- harness: cargo_ra_jit lays out every side as stable cargo (fd/ripgrep/just tests found their program, train #61) (#845)
+- ra-jit is blaze everywhere; blaze is the only command; forks renamed (#270) (#832)
+- COFF statics keep a section each, so the PE splice reads their size (splices.py 59 on Windows LLVM) (#846)
 
 ## [0.20261027.0] - 2026-10-27
 
@@ -1085,8 +1113,6 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   and takes 12.6 s (12.5 to 12.7) with the entry above, against main's 15.6 s.
 
 ### Fixed
-
-- Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
 
 - `Self::Variant` in a pattern of an `impl` whose `Self` type is an alias or projection to an
   enum (`impl Deserialize<E, D> for <E as Archive>::Archived`, as `#[derive(rkyv::Deserialize)]`
@@ -2667,6 +2693,7 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261027.0...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.0...HEAD
+[0.20261028.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.0
 [0.20261027.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261027.0
 [0.1.0]: https://github.com/indexable-inc/ra-jit/releases/tag/v0.1.0

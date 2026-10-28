@@ -367,7 +367,7 @@ impl<'db> Generics<'db> {
         }
     }
 
-    pub(crate) fn type_or_const_param_idx(&self, param: TypeOrConstParamId) -> u32 {
+    pub fn type_or_const_param_idx(&self, param: TypeOrConstParamId) -> u32 {
         let owner = self.find_owner(param.parent);
         let has_trait_self = matches!(owner.def, GenericDefId::TraitId(_));
         if has_trait_self && param.local_id == GenericParams::SELF_PARAM_ID_IN_SELF {

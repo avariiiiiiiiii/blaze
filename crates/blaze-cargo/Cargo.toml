@@ -59,7 +59,9 @@ blaze-lints.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
+blaze-protocol.workspace = true
 blaze-tree.workspace = true
+blaze-ui.workspace = true
 blaze-units.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-registry = { path = "../blaze-registry" }
@@ -133,6 +135,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 [features]
 # Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.
 heap-profile = ["tikv-jemalloc-sys/profiling"]
+
+# Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm` or a profile's `opt-level`.
+llvm = ["hir-ty-codegen/llvm"]
 
 # Runs build scripts compiled for wasm32-wasip1 under Wasmtime when a workspace asks for it
 # (`BLAZE_BUILD_SCRIPTS=wasi`, docs/cargo.md "Build scripts under WASI"): an experiment.

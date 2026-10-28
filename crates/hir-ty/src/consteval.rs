@@ -29,8 +29,6 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
-use super::mir::interpret_mir;
-
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 pub enum ConstEvalError<'db> {
     MirLowerError(MirLowerError<'db>),
@@ -443,7 +441,7 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
         }
         .store(),
     )?;
-    let c = interpret_mir(db, mir_body, false, None)?.0?;
+    let c = db.interpret_mir(mir_body, false, None)?;
     let c = if is_signed { allocation_as_isize(c) } else { allocation_as_usize(c) as i128 };
     Ok(c)
 }
@@ -485,7 +483,7 @@ pub(crate) fn const_eval<'db>(
             }
             .store(),
         )?;
-        let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?.0?;
+        let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
         Ok(c.store())
     }
 
@@ -527,7 +525,7 @@ pub(crate) fn anon_const_eval<'db>(
             }
             .store(),
         )?;
-        let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?.0?;
+        let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
         Ok(c.store())
     }
 
@@ -562,7 +560,7 @@ pub(crate) fn const_eval_static<'db>(
             ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
                 .store(),
         )?;
-        let c = interpret_mir(db, body, false, None)?.0?;
+        let c = db.interpret_mir(body, false, None)?;
         Ok(c.store())
     }
 

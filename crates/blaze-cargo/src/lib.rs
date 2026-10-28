@@ -23,7 +23,6 @@ pub mod live;
 pub mod memory;
 pub mod plan;
 pub mod process;
-pub mod progress;
 pub mod remote;
 pub mod renamed;
 pub mod sandbox;

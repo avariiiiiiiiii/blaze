@@ -8,6 +8,27 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Added
+
+- A build shows what it does while it does it. The daemon and its workers speak deterministic
+  CBOR frames (RFC 8949 §4.2.1) instead of JSON lines, and a worker publishes the build as
+  events: each step (loading the workspace, resolving names, compiling, checking, linking),
+  each crate's functions compiled and reused, and every function an edit rebuilt with why (its
+  body was edited, or it uses what was). On a terminal a live region is redrawn, never silent
+  for more than a second, and the build ends with one line (`Rebuilt 3 fns: render
+  (src/main.rs edited), draw, tick (uses what changed); 0.21s`); off a terminal cargo-like
+  lines. `-q` shows none.
+- `blaze why [fn|crate]` says what the last build rebuilt and why.
+- `--events json|cbor` writes the build's events to stdout, one record a line or frame.
+
+### Changed
+
+- Release profiles build with LLVM at the profile's level (#831): `opt-level` 2 and 3
+  (`release`, `bench`, a profile that inherits them) build at `-O2` and `-O3`, `s` and `z` at
+  `-O2`, and 0 and 1 (`dev`, `test`) stay on Cranelift. `BLAZE_BACKEND` and `BLAZE_OPT` still
+  choose. A dev build and a release build of one project keep separate workers. A blaze built
+  without its `llvm` feature refuses a profile that asks for LLVM instead of using Cranelift.
+
 ### Fixed
 
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.

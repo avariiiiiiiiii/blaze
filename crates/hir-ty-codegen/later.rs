@@ -99,7 +99,7 @@ impl<'db> Keeper<'_, 'db> {
         let db = self.db;
         let (debug, declared, rows, kept) = match &later.of {
             Of::Root { func, symbol } => {
-                let name = hir_ty::mir::type_name::rustc_debug_function(db, *func, &[])
+                let name = hir_ty_mir::mir::type_name::rustc_debug_function(db, *func, &[])
                     .unwrap_or_else(|| FunctionSignature::of(db, *func).name.as_str().to_owned());
                 let declared = self.debug_declaration_at(*func);
                 let rows = match &later.unit_rows {
@@ -113,7 +113,7 @@ impl<'db> Keeper<'_, 'db> {
                 let name = backtrace_name(db, instance);
                 let declared = self.written_at(instance, env.krate);
                 let known = match instance.def {
-                    InstanceDef::Fn(func) => hir_ty::mir::type_name::rustc_debug_function(
+                    InstanceDef::Fn(func) => hir_ty_mir::mir::type_name::rustc_debug_function(
                         db,
                         func,
                         instance.args.as_ref().as_slice(),

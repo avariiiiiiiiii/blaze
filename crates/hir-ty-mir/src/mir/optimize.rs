@@ -35,42 +35,12 @@ use crate::{
 use crate::next_solver::StoredGenericArgs;
 
 use super::{
-    BasicBlock, BasicBlockId, LocalId, MirBody, MirLowerError, OperandKind, PlaceElem,
+    BasicBlock, BasicBlockId, LocalId, MirBody, MirLowerError, MirOptLevel, OperandKind, PlaceElem,
     ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     monomorphization::monomorphized, transform::Ctx,
 };
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
-
-/// How much of rustc's optimization pipeline runs: rustc's `-Zmir-opt-level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
-pub enum MirOptLevel {
-    /// None: the body is the runtime body.
-    Off,
-    /// rustc's level 1, what a build at `opt-level=0` gets.
-    Debug,
-    /// rustc's level 2, what a build at any other `opt-level` gets.
-    Release,
-}
-
-impl MirOptLevel {
-    pub fn from_number(level: u8) -> Option<MirOptLevel> {
-        match level {
-            0 => Some(MirOptLevel::Off),
-            1 => Some(MirOptLevel::Debug),
-            2 => Some(MirOptLevel::Release),
-            _ => None,
-        }
-    }
-
-    pub fn number(self) -> u8 {
-        match self {
-            MirOptLevel::Off => 0,
-            MirOptLevel::Debug => 1,
-            MirOptLevel::Release => 2,
-        }
-    }
-}
 
 /// The passes of rustc's pipeline at `level` that this module does not run, in rustc's order.
 /// `harness/mirparity.py` prints them next to what it measured.

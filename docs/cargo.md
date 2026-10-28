@@ -106,7 +106,7 @@ other subcommand of cargo's is blaze's own, or fails saying blaze has none yet: 
 to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
 While a build or check waits for the daemon, the command shows what the worker is at
-(`crates/blaze-cargo/src/progress.rs`): the worker writes a status word and its object to a
+(`crates/blaze-engine/src/progress.rs`): the worker writes a status word and its object to a
 `phase` file beside its socket (`Loading workspace`, `Resolving names`, `Compiling the
 functions of app`, `Checking 12 files`, `Linking app`), and the daemon sends it to the waiting
 command every 250 ms as a `Progress` line ahead of the answer. On a terminal that is one line
@@ -160,17 +160,8 @@ binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what `--lib`, `--
 `--example` and one `--test` name. A worker that loads the workspace with `cfg(test)` builds
 the unit tests, one that loads it without builds the rest; a test's executable is
 `target/debug/deps/<name>-<kind>`. A unit test with `harness = false`, several `--test`s and
-the other target flags fail the build and say so. The doc tests are still taken out through
-`cargo test --doc`, which runs no rustc.
-
-`test` builds whole what cargo would test: each member's library, binaries and integration
-tests with `test = true`, the examples built beside them to see that they compile, and the
-binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what `--lib`, `--bin`,
-`--example` and one `--test` name. A worker that loads the workspace with `cfg(test)` builds
-the unit tests, one that loads it without builds the rest; a test's executable is
-`target/debug/deps/<name>-<kind>`. A unit test with `harness = false`, several `--test`s and
-the other target flags fail the build and say so. The doc tests are still taken out through
-`cargo test --doc`, which runs no rustc.
+the other target flags fail the build and say so. The doc tests come after, each example
+built by blaze with no cargo, rustc or rustdoc (below).
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
@@ -329,7 +320,7 @@ the 600-test library ten to thirty times as much, so there is none. On
 macOS a stat under the interposer goes from 0.8 to 1.1 µs, and to 3 to 5 µs on a workspace
 whose overlay has been written.
 
-What is left: doctests run in rustdoc's process and are not sandboxed; Windows has no sandbox
+What is left: doctest examples run outside the sandbox; Windows has no sandbox
 yet (its CI runs with `BLAZE_SANDBOX=off`). On Linux `openat2` always counts as a write; the
 check of a Unix socket's path reads the address from the program's memory and follows its
 links before the call goes on, so a second thread that changes the address, or a link swapped
@@ -858,15 +849,25 @@ A single build goes to cargo when:
   Errors rust-analyzer does not find are not caught here; see "Known problems";
 - the daemon refused the build or failed.
 
-Doc tests go through blaze in rustdoc's place. An example blaze cannot build is left to
-rustdoc, with a line saying why. Of the test harness's flags, `-q`, `--format pretty`,
-`--format terse`, `--color never`, `--exact`, `--skip`, `--test-threads` and test filters
-are handled, and the results are shown as libtest shows them; any other flag leaves the
-library's doctests to rustdoc. Cargo's run of rustdoc for each library is only written
-down; once cargo is done, one run of blaze loads the workspace and tests the libraries'
-examples in the order cargo asked, each in the directory and with the variables cargo gave
-its rustdoc, and says `Doc-tests` and what failed as cargo does. The daemon does not run
-doctests yet.
+Doc tests are blaze's, with no cargo, rustc or rustdoc (`doctest.rs`). An example blaze
+cannot build fails, saying why; nothing is left to rustdoc. Of the test harness's flags, `-q`,
+`--format pretty`, `--format terse`, `--color never`, `--exact`, `--skip`, `--test-threads`
+and test filters are handled, and the results are shown as libtest shows them; any other flag
+fails the library's doctests with the flag named. `blaze test` writes down the run of rustdoc
+cargo would make for each library (`cargo/whole.rs`), then one run of blaze loads the
+workspace, with blaze's own build scripts and proc macros, and tests the libraries' examples
+in cargo's order, each in the directory and with the variables cargo gives its rustdoc, and
+says `Doc-tests` and what failed as cargo does. The daemon does not run doctests yet.
+
+An example marked `compile_fail` passes when blaze's front end finds an error in it that
+rustc gives too: one of the errors `blaze check` is as sure of as rustc
+(`SURE` in `lib.rs`), the borrow checker's, or a lint the example denies, and, as rustdoc
+checks, every error code it is marked with (`compile_fail,E0499`). blaze's checker is weaker
+than rustc's here: it reports errors it is not sure rustc gives (a trait bound not met,
+`E0277`, is not in `SURE`), misses others, and the borrow checker skips bodies MIR lowering does
+not support. Where it can't tell, the
+example fails with the reason and is counted in the `doctests:` line as one blaze can't tell
+fails as marked; it never passes on a guess.
 
 The fallback is per invocation or per program, not per crate. If one program of an
 invocation cannot be the daemon's, cargo builds the invocation.
@@ -993,8 +994,8 @@ build a command line is, so changing one starts from a cargo build again.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `BLAZE_BACKEND` | `cranelift` or `llvm`. `llvm` needs a blaze built with `--features llvm` | `cranelift` |
-| `BLAZE_OPT` | LLVM optimisation level, 0 to 3. Functions are still compiled one at a time | 2 |
+| `BLAZE_BACKEND` | `cranelift` or `llvm`, whatever the profile asks for. `llvm` needs a blaze built with `--features llvm`, as the released ones are | the profile's ([below](#backends)) |
+| `BLAZE_OPT` | LLVM optimisation level, 0 to 3, whatever the profile's `opt-level`. Functions are still compiled one at a time | the profile's; 2 with `BLAZE_BACKEND=llvm` set |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast` | `optimized`; `fast` at level 0 |
 | `BLAZE_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `BLAZE_SPLICE` | `0` links in full after every edit instead of splicing | splice |
@@ -1030,6 +1031,37 @@ The disk store is on by default and shared by every daemon and checkout of the u
 daemon reads `BLAZE_CACHE` once, when it starts: a daemon started by a shell without the
 variable keeps the default store whatever later shells have set, so run `blaze stop`
 before changing it.
+
+## Backends
+
+A build compiles with the backend its profile's `opt-level` asks for, as cargo resolves the
+profile: the `[profile]` tables of the root manifest, the configuration's and `--config`'s over
+them, `CARGO_PROFILE_<NAME>_OPT_LEVEL`, and `inherits`. A custom profile that inherits
+`release` is built as `release` is, unless it sets its own `opt-level`.
+
+| `opt-level` | Backend | Profiles that have it by default |
+|---|---|---|
+| `0` | Cranelift | `dev`, `test` |
+| `1` | Cranelift: rustc's `-O1` has no LLVM pipeline blaze runs to match it | |
+| `2` | LLVM at `-O2` (`BLAZE_OPT=2`) | |
+| `3` | LLVM at `-O3` (`BLAZE_OPT=3`) | `release`, `bench` |
+| `s`, `z` | LLVM at `-O2`: blaze's LLVM has no pipeline for size yet, so the code is not smaller than at `-O2` | |
+
+`BLAZE_BACKEND` set is the backend whatever the profile (`BLAZE_BACKEND=cranelift blaze build
+--release` builds a release with Cranelift), and `BLAZE_OPT` set is LLVM's level. The level
+belongs to the build as a whole, the root profile's: a `[profile.release.package.<name>]`
+`opt-level` changes nothing. A blaze built without `--features llvm` refuses a profile that
+asks for LLVM, saying so, rather than building it with Cranelift. The released binaries have
+the feature on every target.
+
+The backend and its level are part of a worker's environment, so a dev and a release build of
+one project are kept by two workers, and neither evicts the other's state. The store keys each
+function's code by the backend and level that compiled it as well: code Cranelift compiled is
+never given to a build with LLVM, nor `-O2`'s to `-O3`'s.
+
+A build with LLVM takes longer than one with Cranelift. A first build takes the most longer,
+because LLVM compiles every function then
+([#807](https://github.com/indexable-inc/blaze/issues/807)).
 
 ## Known problems
 

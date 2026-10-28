@@ -1,4 +1,4 @@
-//! rustc's MIR optimizations (`hir_ty::mir::optimize`): what they make of a body, and that
+//! rustc's MIR optimizations (`hir_ty_mir::mir::optimize`): what they make of a body, and that
 //! a program does at each level what it does without them. `eval::check_pass_and_stdio`
 //! runs `main` at every level and requires the same output of each.
 

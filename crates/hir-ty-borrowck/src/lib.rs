@@ -43,7 +43,7 @@ use hir_ty::{
     },
 };
 
-use hir_ty::mir::{
+use hir_ty_mir::mir::{
     LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, StoredPlace,
 };
 
@@ -298,7 +298,7 @@ fn check_owner<'db>(
 /// `static` item or a `const fn` drops a value of a type with drop glue, and rustc does not
 /// borrow check it. What is moved out of, in part too, is taken not to be dropped.
 fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<'_>) -> bool {
-    use hir_ty::mir::{OperandKind, TerminatorKind};
+    use hir_ty_mir::mir::{OperandKind, TerminatorKind};
     let const_context = match def {
         // A constant of a signature.
         None => true,
@@ -312,7 +312,7 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
         return false;
     }
     let mut moved = rustc_hash::FxHashSet::default();
-    let mut visit = |operand: &hir_ty::mir::Operand| {
+    let mut visit = |operand: &hir_ty_mir::mir::Operand| {
         if let OperandKind::Move(place) = &operand.kind {
             moved.insert(place.local);
         }
@@ -338,8 +338,8 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
 
 /// The coroutines `body` makes, in the order it makes them.
 fn coroutines<'db>(body: &MirBody<'db>) -> Vec<InternedCoroutineId<'db>> {
-    use hir_ty::mir::{AggregateKind, Rvalue, StatementKind};
     use hir_ty::next_solver::TyKind;
+    use hir_ty_mir::mir::{AggregateKind, Rvalue, StatementKind};
     use rustc_type_ir::inherent::IntoKind;
     let mut out = Vec::new();
     for (_, block) in body.basic_blocks.iter() {
@@ -404,7 +404,7 @@ fn nested_bodies_written<'db>(
             },
             Expr::Closure { .. } => {}
             Expr::Const(_)
-                if let Some(konst) = hir_ty::mir::inline_const_at(db, owner, infer, expr) =>
+                if let Some(konst) = hir_ty_mir::mir::inline_const_at(db, owner, infer, expr) =>
             {
                 out.push(Nested::Const(konst))
             }
@@ -420,8 +420,8 @@ fn inline_consts<'db>(
     body: &MirBody<'db>,
 ) -> Vec<hir_ty::db::AnonConstId<'db>> {
     use hir_ty::db::GeneralConstId;
-    use hir_ty::mir::{OperandKind, Rvalue, StatementKind};
     use hir_ty::next_solver::ConstKind;
+    use hir_ty_mir::mir::{OperandKind, Rvalue, StatementKind};
     use rustc_type_ir::inherent::IntoKind;
     let mut out = Vec::new();
     for (_, block) in body.basic_blocks.iter() {
@@ -593,7 +593,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
     ) -> bool {
         let MirSpan::ExprId(expr) = span else { return false };
         let Some(binding) = self.bindings.get(&local) else { return false };
-        !projection.iter().any(|it| matches!(it, hir_ty::mir::ProjectionElem::Deref))
+        !projection.iter().any(|it| matches!(it, hir_ty_mir::mir::ProjectionElem::Deref))
             && self.guard_bindings.get(&expr).is_some_and(|it| it.contains(binding))
     }
 
@@ -773,15 +773,15 @@ fn closure_kind_of(
     }
 }
 
-/// The local a body returns in, as `hir_ty::mir`'s own private `return_slot`.
+/// The local a body returns in, as `hir_ty_mir::mir`'s own private `return_slot`.
 pub(crate) fn return_slot() -> LocalId {
     LocalId::from_raw(la_arena::RawIdx::from(0))
 }
 
 /// Whether `rvalue` compares, which takes its operands by reference whatever their type:
 /// rust-analyzer lowers a constant pattern of a type that is not `Copy` to `==` on the value.
-pub(crate) fn compares(rvalue: &hir_ty::mir::Rvalue) -> bool {
-    use hir_ty::mir::{BinOp, Rvalue};
+pub(crate) fn compares(rvalue: &hir_ty_mir::mir::Rvalue) -> bool {
+    use hir_ty_mir::mir::{BinOp, Rvalue};
     match rvalue {
         Rvalue::BinaryOp(op, ..) | Rvalue::CheckedBinaryOp(op, ..) => {
             matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)

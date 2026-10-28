@@ -111,7 +111,7 @@ fn a_cold_build_off_a_terminal_is_a_line_per_step() {
         "   Compiling functions (18.5s)",
         "    Compiled anim: 5351 fns compiled, 2 kept in 33.3s",
         "     Linking anim",
-        "    Finished compiled 5351 fns in 1 crate, 2 kept; 1m14s",
+        "    Compiled 5351 fns in 1 crate, 2 kept; 1m14s",
     ];
     assert_eq!(out, expected.map(|it| format!("{it}\n")).concat());
 }
@@ -122,11 +122,24 @@ fn an_edit_says_what_it_rebuilt_and_why() {
     let out: String = edit().iter().map(|it| plain.record(it)).collect();
     assert_eq!(
         out,
-        "   Compiling functions\n   Compiling anim\n    Finished rebuilt 3 fns: render (body \
-         edited), draw, tick (calls render); 0.21s\n"
+        "   Compiling functions\n   Compiling anim\n     Rebuilt 3 fns: render (body edited), draw, \
+         tick (calls render); 0.21s\n"
     );
     let finished = plain.build().finished.clone().unwrap();
     assert!(summary_line(&finished, true).contains("\x1b["));
+}
+
+#[test]
+fn a_fresh_build_says_nothing_of_its_own() {
+    let records = [
+        at(0, Event::Began { build: 1, command: "build".into(), root: "/w/anim".into() }),
+        at(MS, Event::Finished { ok: true, summary: Summary::default() }),
+    ];
+    let mut plain = Plain::new(false);
+    assert_eq!(records.iter().map(|it| plain.record(it)).collect::<String>(), "");
+    let mut live = Live::new(80, false);
+    let drawn: String = records.iter().map(|it| live.record(it, MS)).collect();
+    assert!(!drawn.contains("Fresh"), "{drawn:?}");
 }
 
 /// On a terminal: the region is redrawn in place, each of its lines fits the width, each
@@ -161,10 +174,7 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
         drawn = if live_finished(rest) { 0 } else { region_len(&lines) };
     }
     let last = &screens.last().unwrap().1;
-    assert!(
-        last.ends_with("    Finished compiled 5351 fns in 1 crate, 2 kept; 1m14s\n"),
-        "{last:?}"
-    );
+    assert!(last.ends_with("    Compiled 5351 fns in 1 crate, 2 kept; 1m14s\n"), "{last:?}");
     // In the middle of the compile: the step, the crate under way, its count.
     let middle = &screens.iter().find(|it| it.0 == 60 * S).unwrap().1;
     let region: Vec<&str> = middle.split("\x1b[J").last().unwrap().lines().collect();
@@ -192,5 +202,5 @@ fn region_len(lines: &[&str]) -> usize {
 }
 
 fn live_finished(rest: &str) -> bool {
-    rest.contains("    Finished ")
+    rest.contains("    Compiled 5351 fns in 1 crate")
 }

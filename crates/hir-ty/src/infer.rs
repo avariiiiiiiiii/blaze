@@ -17,8 +17,8 @@
 
 mod autoderef;
 mod callee;
-pub(crate) mod cast;
-pub(crate) mod closure;
+pub mod cast;
+pub mod closure;
 mod coerce;
 pub(crate) mod diagnostics;
 mod expr;

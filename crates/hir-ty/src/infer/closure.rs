@@ -1,6 +1,6 @@
 //! Inference of closure parameter types based on the closure's expected type.
 
-pub(crate) mod analysis;
+pub mod analysis;
 
 use std::{iter, mem, ops::ControlFlow};
 

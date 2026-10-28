@@ -1229,6 +1229,58 @@ functions it reaches are compiled again for every example (10.7 s for ripgrep's 
 L is that cost, the daemon taking the examples in place of a process per library, and rustdoc
 for `-q` and a library blaze cannot load.
 
+Done third (the `nopin` lane, 2026-10-28): nothing of a doctest run is handed to rustc, rustdoc
+or cargo. `-q` and the other output flags were handled already, and a library blaze cannot load
+or whose run it cannot read fails every example with the reason; nothing goes to rustdoc. What
+was left was the doctest process's load of the workspace, which ran
+`cargo check --compile-time-deps` (and the toolchain's rustc under it) for the build scripts
+and proc macros on every `blaze test` with doctests, cold and warm. It now loads in blaze's own
+target directory (`--own-target`), as a worker of the daemon does, so the scripts and macros
+are blaze's (`cargo/compile_time.rs`). Counted with `strace -f -e trace=execve` over
+`blaze test` and the daemon it talks to (Linux x86-64, LLVM, main at bd4e567a73 against the
+lane; execs of the toolchain's rustc, rustdoc and cargo that blaze starts, not blaze's own
+`rustc` stand-in a build script is given, nor what a test program starts):
+
+| `blaze test` | main, cold | main, warm | lane, cold | lane, warm |
+|---|---|---|---|---|
+| a crate of ten examples, each kind | 1 cargo | 1 cargo | 0 | 0 |
+| ripgrep 15.2.0 (91f5d22) | 0 (no library, no doctests) | 0 | 0 | 0 |
+| ripgrep 15.2.0 `--workspace` (23 examples) | 24 rustc, 1 cargo | 1 cargo | 0 | 0 |
+| serde 1.0.229 (0db9b3b) | 0 | 0 | 0 | 0 |
+
+serde's `compiletest` is trybuild, which runs cargo itself from the test (2 cargo, on main
+and the lane); it fails under blaze, as the cargo it runs is handed blaze's rustc stand-in,
+and cargo stops before the doctests as it would.
+
+Timed on the same machine (64 cores, shared, load 6 to 15), three rounds alternating cargo,
+main and the lane; cold is no target directory and no daemon, with blaze's store kept:
+
+| ripgrep | cargo, cold | cargo, warm | main, cold | main, warm | lane, cold | lane, warm |
+|---|---|---|---|---|---|---|
+| `test` | 5.8 to 9.1 s | 0.9 s | 11.7 to 23.8 s | 1.0 to 1.2 s | 12.7 to 24.0 s | 1.0 to 1.1 s |
+| `test --workspace` | 9.6 to 10.0 s | 3.4 to 3.5 s | 56.9 to 61.5 s | 5.3 to 8.5 s | 50.4 to 53.9 s | 5.2 to 7.9 s |
+
+With an empty store, `test --workspace` cold took 55.4 s on main and 52.5 s on the lane. The
+doctests are most of blaze's time and why it is slower than cargo: each example is a whole
+program, and what it reaches of the library and its dependencies is compiled again for each
+(a library of 5 to 7 examples took about 25 s under strace), and the doctest process loads the workspace again on
+every run, warm too. Compiling the library once for all its examples, and having the daemon
+take the doctests, are what is left.
+
+An example marked `compile_fail` passes only when blaze's front end finds an error in it that
+rustc gives too, not any error rust-analyzer reports: one of `SURE` (the errors `blaze check`
+fails a build on), the borrow checker's (`BORROWCK`, unless `BLAZE_BORROWCK_REFUSE=0`), or a
+lint the example denies; and every error code it is marked with has to be among them, as
+rustdoc checks (`compile_fail,E0499` passes on the borrow checker's E0499). Where blaze's
+checker is weaker than rustc's it can't tell, and the example fails with the reason and is
+counted in the `doctests:` line ("marked `compile_fail` that blaze can't tell fail as
+marked"), never passed on a guess: only errors whose code is in neither list, which rust-analyzer
+reports where rustc need not (`E0277`, a bound not met, is one: rust-analyzer reports it, and
+`blaze check` does not trust it; a syntax error is another), no error at all (a code it does
+not check yet, a body MIR lowering does not support and the borrow checker skipped, the borrow
+checker turned off), or errors without every code marked. Before, any error passed the example
+and the codes were not checked.
+
 **M. Remove the wrapper and the fallback.** ([#93](https://github.com/indexable-inc/blaze/issues/93)) Plain cargo after `blaze enable` names blaze as
 `build.rustc`; blaze answers cargo's questions (B) and writes for each unit the files cargo
 expects, built by the daemon. Then `blaze-rustc`, `blaze-rustc-first`, the stand-ins, the

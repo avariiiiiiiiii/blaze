@@ -33,7 +33,7 @@ use crate::{
         ConstParamTypes, FieldTypes, GenericDefaults, SelfAndAssocBounds, TrackedStructToken,
         WithDefinedOpaques,
     },
-    mir::{MirBody, MirLowerError},
+    mir::{MirBody, MirEvalError, MirLowerError},
     next_solver::{
         Allocation, Clause, EarlyBinder, GenericArgs, ParamEnv, PolyFnSig, StoredEarlyBinder,
         StoredGenericArgs, StoredPolyFnSig, StoredTraitRef, StoredTy, TraitRef, Ty, VariancesOf,
@@ -56,111 +56,72 @@ pub trait HirDatabase: SourceDatabase + 'static {
     fn mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::mir_body_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn mir_body_for_closure<'db>(
         &'db self,
         def: InternedClosureId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::mir_body_for_closure_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_mir_body_query(db, def, subst, env).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_mir_body_for_closure<'db>(
         &'db self,
         def: InternedClosureId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_mir_body_for_closure_query(db, def, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn mir_body_for_coroutine<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::mir_body_for_coroutine_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn mir_body_for_coroutine_by_move<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::mir_body_for_coroutine_by_move_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_mir_body_for_coroutine_by_move<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_mir_body_for_coroutine_by_move_query(db, def, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_mir_body_for_coroutine<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_mir_body_for_coroutine_query(db, def, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     /// The body as the interpreter and the code generator run it: after drop elaboration and
     /// the other passes to `MirPhase::Runtime`. The IDE asks for [`HirDatabase::mir_body`].
     fn runtime_mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::runtime_mir_body_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn runtime_mir_body_for_closure<'db>(
         &'db self,
         def: InternedClosureId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::runtime_mir_body_for_closure_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn runtime_mir_body_for_coroutine<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::runtime_mir_body_for_coroutine_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn runtime_mir_body_for_coroutine_by_move<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::runtime_mir_body_for_coroutine_by_move_query(db, def).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     /// The runtime body after rustc's MIR optimizations at `level`
     /// (`crate::mir::MirOptLevel`). A coroutine body is the runtime body.
@@ -168,19 +129,13 @@ pub trait HirDatabase: SourceDatabase + 'static {
         &'db self,
         def: InferBodyId<'db>,
         level: crate::mir::MirOptLevel,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::optimized_mir_body_query(db, def, level).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn optimized_mir_body_for_closure<'db>(
         &'db self,
         def: InternedClosureId<'db>,
         level: crate::mir::MirOptLevel,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::optimized_mir_body_for_closure_query(db, def, level).map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_optimized_mir_body<'db>(
         &'db self,
@@ -188,11 +143,7 @@ pub trait HirDatabase: SourceDatabase + 'static {
         level: crate::mir::MirOptLevel,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_optimized_mir_body_query(db, def, level, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_optimized_mir_body_for_closure<'db>(
         &'db self,
@@ -200,55 +151,35 @@ pub trait HirDatabase: SourceDatabase + 'static {
         level: crate::mir::MirOptLevel,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_optimized_mir_body_for_closure_query(db, def, level, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_runtime_mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_runtime_mir_body_query(db, def, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_runtime_mir_body_for_closure<'db>(
         &'db self,
         def: InternedClosureId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_runtime_mir_body_for_closure_query(db, def, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_runtime_mir_body_for_coroutine<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_runtime_mir_body_for_coroutine_query(db, def, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_runtime_mir_body_for_coroutine_by_move<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
-    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        let db = self.as_dyn();
-        crate::mir::monomorphized_runtime_mir_body_for_coroutine_by_move_query(db, def, subst, env)
-            .map_err(|err| err.clone())
-    }
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn const_eval<'db>(
         &'db self,
@@ -305,6 +236,24 @@ pub trait HirDatabase: SourceDatabase + 'static {
         );
         (found, args.as_ref())
     }
+
+    /// What the interpreter (`hir_ty_mir::interpret_mir`) gives running `body`: the value it
+    /// returns.
+    fn interpret_mir<'db>(
+        &'db self,
+        body: &'db MirBody<'db>,
+        assert_placeholder_ty_is_unused: bool,
+        trait_env: Option<ParamEnvAndCrate<'db>>,
+    ) -> Result<Allocation<'db>, MirEvalError<'db>>;
+
+    /// The opaque type of the impl's method that `opaque`, the `impl Trait` a trait's method
+    /// returns, is with `args`, once they name the impl (`hir_ty_mir::opaque_of_impl`).
+    fn opaque_of_impl<'db>(
+        &'db self,
+        env: ParamEnvAndCrate<'db>,
+        opaque: InternedOpaqueTyId<'db>,
+        args: GenericArgs<'db>,
+    ) -> Option<Ty<'db>>;
 
     // endregion:mir
 
@@ -698,7 +647,7 @@ pub struct AnonConstLoc {
     pub ty: StoredEarlyBinder<StoredTy>,
     /// Whether to allow using generic params from the owner.
     /// true for array repeats, false for everything else.
-    pub(crate) allow_using_generic_params: bool,
+    pub allow_using_generic_params: bool,
 }
 
 #[salsa::interned(debug, revisions = usize::MAX, constructor = new_)]
@@ -709,11 +658,7 @@ pub struct AnonConstId {
 }
 
 impl<'db> AnonConstId<'db> {
-    pub(crate) fn new(
-        db: &'db dyn SourceDatabase,
-        loc: AnonConstLoc,
-        token: TrackedStructToken,
-    ) -> Self {
+    pub fn new(db: &'db dyn SourceDatabase, loc: AnonConstLoc, token: TrackedStructToken) -> Self {
         _ = token;
         AnonConstId::new_(db, loc)
     }

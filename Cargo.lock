@@ -730,10 +730,12 @@ dependencies = [
  "blaze-manifest",
  "blaze-metadata",
  "blaze-new",
+ "blaze-protocol",
  "blaze-registry",
  "blaze-resolve",
  "blaze-store",
  "blaze-tree",
+ "blaze-ui",
  "blaze-units",
  "blaze-wasi",
  "cargo-platform",
@@ -823,6 +825,7 @@ dependencies = [
  "blaze-lints",
  "blaze-live",
  "blaze-macro-wasm",
+ "blaze-protocol",
  "blaze-splice",
  "blaze-store",
  "blaze-wasi",
@@ -837,6 +840,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-borrowck",
  "hir-ty-codegen",
+ "hir-ty-mir",
  "ide-db",
  "ide-diagnostics",
  "intern",
@@ -2456,6 +2460,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-mir",
  "intern",
  "itertools 0.15.0",
  "la-arena",
@@ -2497,7 +2502,6 @@ dependencies = [
  "itertools 0.15.0",
  "la-arena",
  "macros",
- "oorandom",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
  "rustc-hash 2.1.2",
@@ -2517,7 +2521,6 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tree",
  "triomphe",
- "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2528,6 +2531,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-mir",
  "hir-ty-wfcheck",
  "la-arena",
  "ra-ap-rustc_ast_ir",
@@ -2554,6 +2558,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-mir",
  "indexmap",
  "inkwell",
  "intern",
@@ -2578,6 +2583,39 @@ dependencies = [
  "tracing",
  "triomphe",
  "wasm-encoder 0.244.0",
+]
+
+[[package]]
+name = "hir-ty-mir"
+version = "0.0.0"
+dependencies = [
+ "arrayvec",
+ "base-db",
+ "cfg",
+ "either",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "intern",
+ "itertools 0.15.0",
+ "la-arena",
+ "macros",
+ "oorandom",
+ "ra-ap-rustc_ast_ir",
+ "ra-ap-rustc_index",
+ "rustc-hash 2.1.2",
+ "rustc_abi",
+ "rustc_apfloat",
+ "rustc_next_trait_solver",
+ "rustc_type_ir",
+ "salsa",
+ "smallvec",
+ "span",
+ "stdx",
+ "syntax",
+ "tracing",
+ "triomphe",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

@@ -5,12 +5,11 @@ use std::{borrow::Cow, iter, mem};
 use arrayvec::ArrayVec;
 use base_db::Crate;
 use hir_def::{
-    AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, GenericParamId, HasModule,
-    ItemContainerId, LocalFieldId, Lookup, TraitId,
+    AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
+    LocalFieldId, Lookup,
     expr_store::{
         Body, ExpressionStore, HygieneId,
         body::{Param, body_syntax},
-        path::Path,
     },
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
@@ -31,12 +30,11 @@ use rustc_type_ir::{
     CoroutineArgs, CoroutineArgsParts, TypeVisitableExt,
     inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
 };
-use salsa::SalsaValue;
 use span::Edition;
 
 use crate::{
-    Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, ParamEnvAndCrate,
-    consteval::{ConstEvalError, try_const_usize},
+    Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, LoweringMode, ParamEnvAndCrate,
+    consteval::try_const_usize,
     db::{
         AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase, InternedClosure, InternedClosureId,
         InternedCoroutineId,
@@ -50,8 +48,6 @@ use crate::{
         },
     },
     inhabitedness::is_ty_uninhabited_from,
-    layout::LayoutError,
-    lower::LoweringMode,
     method_resolution::CandidateId,
     mir::{
         AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
@@ -61,13 +57,13 @@ use crate::{
         Terminator, TerminatorKind, Ty, UnOp, VariantId, return_slot,
     },
     next_solver::{
-        Const, DbInterner, ParamConst, ParamEnv, Region, StoredEarlyBinder, StoredGenericArgs,
-        StoredTy, TyKind, TypingMode, UnevaluatedConst,
+        Const, DbInterner, ParamConst, ParamEnv, Region, StoredEarlyBinder, TyKind, TypingMode,
+        UnevaluatedConst,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
 
-use super::{OperandKind, Place};
+use super::{MirLowerError, OperandKind, Place};
 
 mod as_place;
 mod deref_pattern;
@@ -225,42 +221,6 @@ struct MirLowerCtx<'a, 'db> {
     infcx: InferCtxt<'db>,
 }
 
-// FIXME: Make this smaller, its stored in database queries
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
-pub enum MirLowerError<'db> {
-    ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
-    LayoutError(LayoutError),
-    IncompleteExpr,
-    IncompletePattern,
-    /// Trying to lower a trait function, instead of an implementation
-    TraitFunctionDefinition(TraitId, Name),
-    UnresolvedName {
-        owner: ExpressionStoreOwnerId,
-        path: Path,
-    },
-    RecordLiteralWithoutPath,
-    UnresolvedMethod(String),
-    UnresolvedField,
-    MissingFunctionDefinition(InferBodyId<'db>, ExprId),
-    HasErrors,
-    /// This should never happen. Type mismatch should catch everything.
-    TypeError(&'static str),
-    NotSupported(String),
-    ContinueWithoutLoop,
-    BreakWithoutLoop,
-    Loop,
-    /// Something that should never happen and is definitely a bug, but we don't want to panic if it happened
-    ImplementationError(String),
-    LangItemNotFound,
-    MutatingRvalue,
-    UnresolvedLabel,
-    UnresolvedUpvar(StoredPlace),
-    InaccessibleLocal,
-
-    // monomorphization errors:
-    GenericArgNotProvided(GenericParamId, StoredGenericArgs),
-}
-
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
 struct DropScopeToken;
 impl DropScopeToken {
@@ -310,12 +270,6 @@ macro_rules! implementation_error {
         ::stdx::never!("MIR lower implementation bug: {}", format!($it));
         return Err(MirLowerError::ImplementationError(format!($it)));
     }};
-}
-
-impl From<LayoutError> for MirLowerError<'_> {
-    fn from(value: LayoutError) -> Self {
-        MirLowerError::LayoutError(value)
-    }
 }
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
@@ -4462,33 +4416,6 @@ pub fn mir_body_for_coroutine_by_move_query<'db>(
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
-}
-
-/// Whether a future of this type, which the `async` block `coroutine` gives, is one that owns
-/// what its `async` closure captured.
-pub fn is_by_move_coroutine<'db>(
-    db: &'db dyn HirDatabase,
-    coroutine: InternedCoroutineId<'db>,
-    args: CoroutineArgs<DbInterner<'db>>,
-) -> bool {
-    let InternedClosure { owner, expr, .. } = coroutine.loc(db);
-    let store = ExpressionStore::of(db, owner.expression_store_owner(db));
-    let Expr::Closure {
-        closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
-        ..
-    } = &store[expr]
-    else {
-        return false;
-    };
-    let closure = ExpressionStore::closure_for_coroutine(expr);
-    let TyKind::CoroutineClosure(_, closure_args) =
-        InferenceResult::of(db, owner).expr_ty(closure).kind()
-    else {
-        return false;
-    };
-    let once = rustc_type_ir::ClosureKind::FnOnce;
-    args.kind_ty().to_opt_closure_kind() == Some(once)
-        && closure_args.as_coroutine_closure().kind() != once
 }
 
 fn mir_body_for_coroutine_cycle_result<'db>(

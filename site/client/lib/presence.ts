@@ -13,7 +13,7 @@
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
  *   threads of that doc if it is the page shown;
  * - the page itself: the pointers of the others on it, and where on it each is reading (client/lib/cursors.ts, which
- *   rides this socket too).
+ *   rides this socket too), and what they say by their pointer (T).
  *
  * The socket also says which build of the site is live (a `build` frame on every connect): client/lib/update.ts takes
  * a new one in, a reload or a swap in place.
@@ -230,7 +230,7 @@ function drawHere(): void {
 	b.setAttribute('aria-expanded', String(!list.hidden));
 	b.setAttribute('aria-controls', list.id);
 	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
-	tipOn(b, `${on.length} on this page, ${total} on the site`);
+	tipOn(b, `${on.length} on this page, ${total} on the site${cursors.hint() ? '. Press T to say something here' : ''}`);
 	b.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!list.hidden) return closeList();
@@ -335,6 +335,8 @@ function drawList(): void {
 	}
 	if (people.length < total) ul.append(el('li', 'tl-head', `and ${total - people.length} more`));
 	list.append(ul);
+	const hint = cursors.hint();
+	if (hint) list.append(hint);
 }
 
 function drawMe(): void {
@@ -551,7 +553,7 @@ document.addEventListener('click', (e) => {
 
 const out = (m: object) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m));
 chat.setup({ send: out, base: BASE, face, speak });
-cursors.setup({ send: out, face, name });
+cursors.setup({ send: out, face, name, me: () => you, post: chat.post });
 onPage(() => {
 	closeList();
 	draw();

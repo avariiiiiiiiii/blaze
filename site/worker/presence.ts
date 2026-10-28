@@ -27,6 +27,9 @@
  *                     {t: "c", k, c}                            someone else on this tab's page moved their pointer:
  *                                                                  `k` their key, `c` as they sent it, or null
  *                     {t: "v", k, v}                            the same for the part of the page they are reading
+ *                     {t: "say-live", k, text, done}            someone else on this tab's page is writing a line by
+ *                                                                  their pointer (client/lib/cursors.ts): `text` as it
+ *                                                                  stands, null when they gave up; `done` once sent
  *                     {t: "build", build, assets}               on connect, last, and to every socket when a
  *                                                                  deploy's code first runs (sockets outlive a
  *                                                                  deploy): the live build (gen/build.ts's
@@ -40,12 +43,17 @@
  *                     {t: "thread", id}                         chat: asks for that message's thread
  *                     {t: "c", c: [x, block, f] | null}         the tab's pointer, or null when it left the page
  *                     {t: "v", v: [block, f, block, f] | null}  the top and bottom of the tab's viewport
+ *                     {t: "say-live", text: string | null, done?}  the line the reader is writing by their pointer (any
+ *                                                                  reader, signed in or not), at most CHAT_MAX; null to
+ *                                                                  take it back; `done` when sent (a signed-in reader
+ *                                                                  sends it to the chat too, as a `say`)
  *
  * `c` and `v` are positions in the page's text (client/lib/cursors.ts): x a fraction of the article's width, a block
  * index and a fraction of that block's height. They go only to the other people's tabs on the same page (pointers
  * not to hidden tabs), rebuilt from the numbers, never stored: nothing is written, not even to the socket's
  * attachment, so they cost a wake-up and nothing else. Each person gets MOVE_RATE a second (MOVE_BURST at once),
- * pointers and viewports together; the rest is dropped.
+ * pointers and viewports together; the rest is dropped. `say-live` goes the same way, on the same budget: passed on to
+ * the page, never stored, gone when the tab is.
  *
  * Msg is {id, key, login, avatar, text, at, parent?}; a top-level one in `chat` and `thread` frames also carries its
  * Summary, {replies, last, repliers}: how many replies, when the last came (ISO), and up to three of the latest
@@ -226,7 +234,7 @@ export class Presence extends DurableObject<Env> {
 
 	override webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
 		if (typeof message !== 'string' || message.length > MAX_FRAME) return ws.close(1009, 'Too big.');
-		let m: { t?: unknown; path?: unknown; away?: unknown; text?: unknown; id?: unknown; parent?: unknown; c?: unknown; v?: unknown };
+		let m: { t?: unknown; path?: unknown; away?: unknown; text?: unknown; done?: unknown; id?: unknown; parent?: unknown; c?: unknown; v?: unknown };
 		try {
 			m = JSON.parse(message) as typeof m;
 		} catch {
@@ -235,6 +243,7 @@ export class Presence extends DurableObject<Env> {
 		const tab = ws.deserializeAttachment() as Tab;
 		if (m.t === 'c') return this.relay(tab, 'c', m.c, 3);
 		if (m.t === 'v') return this.relay(tab, 'v', m.v, 4);
+		if (m.t === 'say-live') return this.sayLive(tab, m.text, m.done);
 		if (m.t === 'typing') {
 			const now = Date.now();
 			if (!tab.login || now - (this.typed.get(tab.key) ?? 0) < TYPING_MS) return;
@@ -290,6 +299,25 @@ export class Presence extends DurableObject<Env> {
 		const out = JSON.stringify({ t, k: tab.key, [t]: at });
 		for (const r of this.room(tab.path)) {
 			if (r.key === tab.key || (t === 'c' && r.away)) continue;
+			try {
+				r.ws.send(out);
+			} catch {
+				// Closing.
+			}
+		}
+	}
+
+	/**
+	 * Passes the line a reader is writing by their pointer on to the others on their page, as `relay` does a pointer
+	 * (not to hidden tabs: it is gone by the time they look). One line, at most CHAT_MAX; empty is the same as null.
+	 */
+	private sayLive(tab: Tab, raw: unknown, done: unknown): void {
+		if (!tab.path || (raw !== null && typeof raw !== 'string')) return;
+		const text = raw === null ? null : raw.replace(/[\r\n\t]+/g, ' ').trim() || null;
+		if ((text?.length ?? 0) > CHAT_MAX || !this.allow(tab.key)) return;
+		const out = JSON.stringify({ t: 'say-live', k: tab.key, text, done: done === true && text !== null });
+		for (const r of this.room(tab.path)) {
+			if (r.key === tab.key || r.away) continue;
 			try {
 				r.ws.send(out);
 			} catch {

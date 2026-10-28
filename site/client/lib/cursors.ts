@@ -20,6 +20,13 @@
  * when it scrolls or resizes, and again when someone comes to the page. Nothing goes while nobody else is here. A
  * pointer that rests for IDLE_MS fades. The who-is-here list has a switch that hides the others' pointers, kept per
  * browser (localStorage).
+ *
+ * Saying something by the pointer, like Figma's cursor chat or Minecraft's T: on a desk T (outside a field, no
+ * modifiers) opens a one-line composer at the reader's pointer (at the foot of the window when the pointer is off the
+ * page). What is typed goes to the others on the page as it is typed (`say-live`, at most every SAY_MS), shown as a
+ * bubble by the pointer, or by the face on the rail while the pointer is off their screen. Enter sends: the bubble
+ * stays SAY_LINGER_MS and a signed-in reader's line goes to the chat too, to be kept (client/lib/chat.ts `post`);
+ * an anonymous one's is only ever the bubble. Esc, or leaving the field, takes it back.
  */
 
 import { tipOn } from './tip';
@@ -39,6 +46,10 @@ type Remote = {
 	t: number;
 	/** Their viewport as sent ([block, f, block, f]). */
 	v: number[] | null;
+	/** The line they are writing by their pointer (`done` once sent), its bubble, and when it goes. */
+	say: { text: string; done: boolean } | null;
+	sayEl: HTMLElement | null;
+	sayTimer: ReturnType<typeof setTimeout> | undefined;
 };
 
 const MOVE_MS = 60;
@@ -55,10 +66,20 @@ const desk = matchMedia('(hover: hover) and (pointer: fine)');
 const THUMB_MIN = 28;
 const DIM_MS = 1200;
 const still = matchMedia('(prefers-reduced-motion: reduce)');
+/** A line by the pointer: as long as a chat message (worker/presence.ts CHAT_MAX), sent at most every SAY_MS while it
+ * changes and again every SAY_KEEP_MS while it rests (someone new on the page gets it); a bubble with no word from its
+ * writer for SAY_STALE_MS goes (a lost take-back), and a sent one stays SAY_LINGER_MS. */
+const SAY_MAX = 500;
+const SAY_MS = 100;
+const SAY_KEEP_MS = 4000;
+const SAY_STALE_MS = 10_000;
+const SAY_LINGER_MS = 4000;
 
 let send: (m: object) => void = () => {};
 let face: (w: Who, away?: boolean) => HTMLElement = () => document.createElement('span');
 let name: (w: Who) => string = (w) => w.key;
+let me: () => Who | null = () => null;
+let post: (text: string) => boolean = () => false;
 let path = '';
 const peers = new Map<string, Peer>();
 const remotes = new Map<string, Remote>();
@@ -78,6 +99,7 @@ function hueOf(key: string): number {
 	return (h >>> 0) % 360;
 }
 
+const colour = (key: string) => `hsl(${hueOf(key).toFixed(0)} 70% 50%)`;
 const round = (x: number) => Math.round(x * 1000) / 1000;
 const clampFrac = (x: number) => Math.max(-50, Math.min(50, x));
 
@@ -172,8 +194,10 @@ function queueView(): void {
 function resend(): void {
 	sentC = '';
 	sentV = '';
+	sentSay = '';
 	if (pointer) queueCursor();
 	queueView();
+	if (saying) queueSay();
 }
 
 // ---- What the others are doing ----------------------------------------------------------------------------------
@@ -201,7 +225,7 @@ function arrow(): SVGSVGElement {
 function cursorOf(r: Remote): HTMLElement {
 	if (r.el) return r.el;
 	const e = el('div', 'cursor');
-	e.style.setProperty('--c', `hsl(${hueOf(r.who.key).toFixed(0)} 70% 50%)`);
+	e.style.setProperty('--c', colour(r.who.key));
 	const chip = el('span', 'cursor-chip');
 	chip.append(face(r.who), el('span', '', name(r.who)));
 	e.append(arrow(), chip);
@@ -223,11 +247,12 @@ function aim(r: Remote): void {
 	r.to = hidden() || !fine.matches ? null : target(r);
 	if (!r.to) {
 		r.el?.classList.add('idle');
-		return;
+		return placeSay(r);
 	}
 	const e = cursorOf(r);
 	r.pos ??= { ...r.to };
 	e.classList.toggle('idle', Date.now() - r.t > IDLE_MS);
+	placeSay(r);
 	animate();
 }
 
@@ -266,7 +291,8 @@ function drawRail(): void {
 		const y1 = place(r.v[2], r.v[3]);
 		if (y0 === null || y1 === null) continue;
 		const band = el('span', 'reading-band');
-		band.style.setProperty('--c', `hsl(${hueOf(r.who.key).toFixed(0)} 70% 50%)`);
+		band.style.setProperty('--c', colour(r.who.key));
+		band.dataset.key = r.who.key;
 		band.style.top = `${((Math.max(0, y0) / H) * 100).toFixed(2)}%`;
 		band.style.height = `${((Math.max(0, y1 - y0) / H) * 100).toFixed(2)}%`;
 		const go = el('button', 'reading-face');
@@ -293,6 +319,7 @@ function drawRail(): void {
 	} else for (const a of ['role', 'aria-orientation', 'aria-valuemin', 'aria-valuemax', 'aria-valuenow', 'aria-label', 'aria-controls']) track.removeAttribute(a);
 	rail.classList.toggle('bar', bar);
 	rail.hidden = bar ? H - innerHeight < 1 : !bands.length;
+	for (const r of remotes.values()) placeSay(r);
 	drawMine();
 }
 
@@ -371,7 +398,188 @@ function relayout(): void {
 function forget(key: string): void {
 	const r = remotes.get(key);
 	r?.el?.remove();
+	r?.sayEl?.remove();
+	clearTimeout(r?.sayTimer);
 	remotes.delete(key);
+}
+
+// ---- Lines said by the pointer ----------------------------------------------------------------------------------
+
+/** Someone's line came (null: taken back). A pointer that is writing stays awake. */
+function hearSay(r: Remote, text: string | null, done: boolean): void {
+	clearTimeout(r.sayTimer);
+	r.say = text === null ? null : { text, done };
+	if (r.say) {
+		r.t = Date.now();
+		if (r.c) aim(r);
+		r.sayTimer = setTimeout(() => {
+			r.say = null;
+			drawSay(r);
+		}, done ? SAY_LINGER_MS : SAY_STALE_MS);
+	}
+	drawSay(r);
+}
+
+function drawSay(r: Remote): void {
+	const b = r.sayEl;
+	if (!r.say) {
+		if (!b) return;
+		r.sayEl = null;
+		if (still.matches || !b.isConnected) return b.remove();
+		b.classList.add('out');
+		setTimeout(() => b.remove(), 300);
+		return;
+	}
+	if (!b) {
+		r.sayEl = el('div', 'cursor-say');
+		r.sayEl.style.setProperty('--c', colour(r.who.key));
+	}
+	r.sayEl!.textContent = r.say.text;
+	r.sayEl!.classList.toggle('live', !r.say.done);
+	placeSay(r);
+}
+
+/** By their pointer while it is on this reader's screen, else by their face on the rail, else nowhere for now. */
+function placeSay(r: Remote): void {
+	const b = r.sayEl;
+	if (!b) return;
+	const to = r.to;
+	if (r.el && to && !r.el.classList.contains('idle') && to.y > scrollY && to.y < scrollY + innerHeight - 40) {
+		b.classList.remove('on-rail');
+		// Near the right edge it opens to the left of the pointer, so the page's clip never cuts it.
+		b.classList.toggle('flip', to.x - scrollX > innerWidth - 300);
+		if (b.parentElement !== r.el) r.el.append(b);
+		return;
+	}
+	const band = rail.hidden ? null : others.querySelector(`.reading-band[data-key="${CSS.escape(r.who.key)}"]`);
+	if (!band) return b.remove();
+	b.classList.remove('flip');
+	b.classList.add('on-rail');
+	if (b.parentElement !== band) band.append(b);
+}
+
+/** The reader's own composer: one line, in their colour, by their pointer. */
+const sayBox = el('form', 'say-live');
+sayBox.hidden = true;
+const sayField = el('input');
+sayField.type = 'text';
+sayField.maxLength = SAY_MAX;
+sayField.autocomplete = 'off';
+sayField.enterKeyHint = 'send';
+sayField.setAttribute('aria-label', 'Say something on this page');
+const sayKey = el('kbd', '', '↵');
+sayKey.setAttribute('aria-hidden', 'true');
+sayBox.append(sayField, sayKey);
+/** Whether the composer is open; what the others have of it ('' nothing); the timers that send it. */
+let saying = false;
+let sentSay = '';
+let sayQueue: ReturnType<typeof setTimeout> | undefined;
+let sayKeep: ReturnType<typeof setInterval> | undefined;
+let sayFade: ReturnType<typeof setTimeout> | undefined;
+
+const line = (v: string) => v.replace(/\s+/g, ' ').trim();
+
+function pushSay(again = false): void {
+	sayQueue = undefined;
+	const text = line(sayField.value);
+	if (!saying || !peers.size || (text === sentSay && !again) || (!text && !sentSay)) return;
+	sentSay = text;
+	send({ t: 'say-live', text: text || null });
+}
+
+function queueSay(): void {
+	sayQueue ??= setTimeout(pushSay, SAY_MS);
+}
+
+/**
+ * Beside the pointer, kept inside the window, and following it; at the foot of the window when it opened with the
+ * pointer off the page (a pointer that leaves later leaves the box where it was).
+ */
+function placeBox(): void {
+	if (sayBox.hidden) return;
+	if (!pointer) return void sayBox.classList.toggle('at-foot', !sayBox.style.left);
+	sayBox.classList.remove('at-foot');
+	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, pointer.x + 14)))}px`;
+	sayBox.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, pointer.y + 18)))}px`;
+}
+
+function openSay(): void {
+	if (saying) return sayField.focus();
+	clearTimeout(sayFade);
+	const w = me();
+	saying = true;
+	sentSay = '';
+	sayBox.classList.remove('sent', 'out');
+	sayBox.style.setProperty('--c', colour(w?.key ?? ''));
+	sayField.readOnly = false;
+	sayField.value = '';
+	sayField.placeholder = w?.login ? 'Say something on this page' : 'Say hi to this page (not kept)';
+	tipOn(sayKey, 'Enter sends, Esc cancels');
+	sayBox.style.left = sayBox.style.top = '';
+	sayBox.hidden = false;
+	placeBox();
+	sayField.focus({ preventScroll: true });
+	sayKeep = setInterval(() => sentSay && pushSay(true), SAY_KEEP_MS);
+}
+
+/** Shuts the composer: with `text` it was sent (a bubble a while, and the chat), without it taken back. */
+function closeSay(text: string | null): void {
+	if (!saying) return;
+	saying = false;
+	clearInterval(sayKeep);
+	clearTimeout(sayQueue);
+	sayQueue = undefined;
+	if (text) {
+		if (peers.size) send({ t: 'say-live', text, done: true });
+		post(text);
+		sayField.value = text;
+		sayField.readOnly = true;
+		sayBox.classList.add('sent');
+		sayField.blur();
+		sayFade = setTimeout(() => {
+			if (still.matches) return void (sayBox.hidden = true);
+			sayBox.classList.add('out');
+			sayFade = setTimeout(() => (sayBox.hidden = true), 300);
+		}, SAY_LINGER_MS);
+	} else {
+		if (sentSay) send({ t: 'say-live', text: null });
+		sayBox.hidden = true;
+	}
+	sentSay = '';
+}
+
+sayField.addEventListener('input', () => {
+	queueSay();
+	placeBox();
+});
+sayField.addEventListener('keydown', (e) => {
+	if (e.isComposing) return;
+	if (e.key === 'Enter') {
+		e.preventDefault();
+		closeSay(line(sayField.value) || null);
+	} else if (e.key === 'Escape') {
+		// Only the composer: nothing else's Esc (the chat, the who-is-here list) on the same press.
+		e.preventDefault();
+		e.stopPropagation();
+		closeSay(null);
+	}
+});
+sayField.addEventListener('blur', () => closeSay(null));
+sayBox.addEventListener('submit', (e) => e.preventDefault());
+// A press on the box (its padding, the key) keeps the field's focus.
+sayBox.addEventListener('mousedown', (e) => {
+	if (e.target !== sayField) e.preventDefault();
+});
+
+/** T, on a desk, when the key would type nothing anywhere else. */
+function sayKeyDown(e: KeyboardEvent): void {
+	if (e.defaultPrevented || e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+	if ((e.key !== 't' && e.key !== 'T') || !fine.matches) return;
+	const t = e.target instanceof HTMLElement ? e.target : null;
+	if (t && (t.isContentEditable || t.closest('input, textarea, select, [contenteditable]'))) return;
+	if (document.querySelector('dialog[open]') || document.body.classList.contains('chat-full')) return;
+	e.preventDefault();
+	openSay();
 }
 
 // ---- What client/lib/presence.ts calls ----------------------------------------------------------------------------
@@ -403,18 +611,20 @@ export function reset(): void {
 	peers.clear();
 	sentC = '';
 	sentV = '';
+	sentSay = '';
 }
 
-/** Takes a `c` or `v` frame; false for anything else. */
+/** Takes a `c`, `v` or `say-live` frame; false for anything else. */
 export function message(m: { t?: unknown }): boolean {
-	if (m.t !== 'c' && m.t !== 'v') return false;
-	const { k, c, v } = m as { k?: unknown; c?: unknown; v?: unknown };
+	if (m.t !== 'c' && m.t !== 'v' && m.t !== 'say-live') return false;
+	const { k, c, v, text, done } = m as { k?: unknown; c?: unknown; v?: unknown; text?: unknown; done?: unknown };
 	const who = typeof k === 'string' ? peers.get(k) : undefined;
 	if (!who) return true;
 	const nums = (x: unknown, n: number) => (Array.isArray(x) && x.length === n && x.every((y) => typeof y === 'number' && Number.isFinite(y)) ? (x as number[]) : null);
 	let r = remotes.get(who.key);
-	if (!r) remotes.set(who.key, (r = { who, c: null, pos: null, to: null, el: null, t: 0, v: null }));
-	if (m.t === 'v') {
+	if (!r) remotes.set(who.key, (r = { who, c: null, pos: null, to: null, el: null, t: 0, v: null, say: null, sayEl: null, sayTimer: undefined }));
+	if (m.t === 'say-live') hearSay(r, typeof text === 'string' && text ? text.slice(0, SAY_MAX) : null, done === true);
+	else if (m.t === 'v') {
 		r.v = nums(v, 4);
 		drawRail();
 	} else {
@@ -449,10 +659,27 @@ export function toggle(): HTMLElement | null {
 	return b;
 }
 
-export function setup(opts: { send: (m: object) => void; face: (w: Who, away?: boolean) => HTMLElement; name: (w: Who) => string }): void {
-	({ send, face, name } = opts);
+/** A line for the who-is-here list: how to say something by the pointer. Null on a phone, which has no T. */
+export function hint(): HTMLElement | null {
+	if (!fine.matches) return null;
+	const p = el('p', 'tl-hint');
+	p.append('Press ', el('kbd', '', 'T'), ' to say something on this page');
+	return p;
+}
+
+export function setup(opts: {
+	send: (m: object) => void;
+	face: (w: Who, away?: boolean) => HTMLElement;
+	name: (w: Who) => string;
+	/** The reader, once the socket says (for their colour and whether they can post). */
+	me: () => Who | null;
+	/** Posts a line to the chat; false when the reader can't (not signed in). */
+	post: (text: string) => boolean;
+}): void {
+	({ send, face, name, me, post } = opts);
 	rail.hidden = true;
-	document.body.append(layer, rail);
+	document.body.append(layer, rail, sayBox);
+	document.addEventListener('keydown', sayKeyDown);
 	rail.addEventListener('pointerdown', grab);
 	desk.addEventListener('change', drawRail);
 
@@ -462,6 +689,7 @@ export function setup(opts: { send: (m: object) => void; face: (w: Who, away?: b
 			if (e.pointerType === 'touch') return;
 			pointer = { x: e.clientX, y: e.clientY };
 			queueCursor();
+			placeBox();
 		},
 		{ passive: true },
 	);
@@ -477,6 +705,7 @@ export function setup(opts: { send: (m: object) => void; face: (w: Who, away?: b
 			if (pointer) queueCursor();
 			queueView();
 			moved();
+			for (const r of remotes.values()) placeSay(r);
 		},
 		{ passive: true },
 	);
@@ -492,6 +721,9 @@ export function setup(opts: { send: (m: object) => void; face: (w: Who, away?: b
 	});
 	// Leaving the page: off the others' screens now, rather than at the next who-is-here.
 	addEventListener(LEAVE, () => {
+		closeSay(null);
+		clearTimeout(sayFade);
+		sayBox.hidden = true;
 		clearTimeout(cTimer);
 		clearTimeout(vTimer);
 		cTimer = vTimer = undefined;

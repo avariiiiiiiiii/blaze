@@ -152,7 +152,9 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   in the who-is-here list turns them off) and as bands on a rail at the right edge where each is reading (click a
   face to go there). Positions are anchors in the text (a block index and a fraction of it, x a fraction of `main`'s
   width), so different window sizes line up; the object passes them only to the other tabs on the same page, rate
-  limited per person, and never stores them.
+  limited per person, and never stores them. On a desk T opens a one-line composer by the reader's pointer (Figma's
+  cursor chat): the others on the page see the line as it is typed (`say-live`, same budget, never stored), as a bubble
+  under the pointer or out of the face on the rail; Enter sends it, and a signed-in reader's goes to the chat as well.
   The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the
   object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour, replies counted), taken
   back by their author or a `COMMENT_ADMINS` id. Messages have Slack-style threads, one level deep (a `parent` column):

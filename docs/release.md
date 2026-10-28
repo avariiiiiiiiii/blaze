@@ -68,7 +68,7 @@ a newer one was promoted becomes stable but not *Latest*.
 
 By hand: `gh workflow run promote.yaml -f tag=v0.YYYYMMDD.N` tests that release again (after a
 flake, or a fix to the gate itself); `-f train-run=<id>` counts a green train run on the tag
-instead of starting another; `-f promote=false` tests without promoting. A pull request that
+instead of starting another; `-f promote=false` tests without promoting or opening an issue. A pull request that
 changes the gate (`promote.yaml`, `promote.py`, the smoke corpus) runs it against the newest
 release, without the train, the promotion or an issue.
 

@@ -12,10 +12,12 @@
  *
  *   server -> client  {t: "you", key, login, avatar, signIn}       once, on connect
  *                     {t: "here", people: [{key, login, avatar, pages: [{path, away}]}]}   on every change
+ *                     {t: "comments", doc}                      a comment on that doc was posted or deleted
  *   client -> server  {t: "at", path, away}                       the page the tab shows (a site path) and whether
  *                                                                  it is hidden; unknown paths count as no page
  *
- * A visitor with several tabs is one person with several pages. Broadcasts are coalesced (BROADCAST_MS).
+ * A visitor with several tabs is one person with several pages. Broadcasts are coalesced (BROADCAST_MS). The
+ * comment routes (worker/comments.ts) call `announce` after each write, so open pages refresh their threads live.
  */
 import { DurableObject } from 'cloudflare:workers';
 import pagesJson from '../.gen/pages.json';
@@ -50,6 +52,17 @@ export async function handlePresence(request: Request, env: Env): Promise<Respon
 	return stub.fetch(new Request(request.url, { headers }));
 }
 
+/** Tells every open tab that `doc`'s comments changed. Best effort: a failure is logged, never the comment's. */
+export async function announce(env: Env, doc: string): Promise<void> {
+	try {
+		const stub = env.PRESENCE.get(env.PRESENCE.idFromName('site'));
+		const res = await stub.fetch('https://presence.internal/comments', { method: 'POST', body: JSON.stringify({ doc }) });
+		if (!res.ok) console.warn('presence announce failed', res.status);
+	} catch (e) {
+		console.warn('presence announce failed', e instanceof Error ? e.message : String(e));
+	}
+}
+
 const avatarOf = (url: string | null): string | null =>
 	url && /^https:\/\/avatars\.githubusercontent\.com\/[\x21-\x7e]*$/.test(url) ? url : null;
 
@@ -58,6 +71,18 @@ export class Presence extends DurableObject<Env> {
 	private salt: { day: string; key: CryptoKey } | null = null;
 
 	override async fetch(request: Request): Promise<Response> {
+		if (request.method === 'POST' && new URL(request.url).pathname === '/comments') {
+			const { doc } = await request.json<{ doc: string }>();
+			const out = JSON.stringify({ t: 'comments', doc });
+			for (const ws of this.open()) {
+				try {
+					ws.send(out);
+				} catch {
+					// Closing.
+				}
+			}
+			return new Response(null, { status: 204 });
+		}
 		if (this.ctx.getWebSockets().length >= MAX_SOCKETS) return json({ error: 'Too many visitors right now.' }, 503);
 		const whoHeader = request.headers.get('x-presence-who');
 		const who: Who = whoHeader

@@ -766,6 +766,11 @@ fn lesson_attrs(ctx: &mut Ctx) -> Result<(&'static str, String), String> {
     ))
 }
 
+/// Whether a page takes comments: block by block (`Discussable`, a Doc), or as a whole (any page not `Quiet`).
+pub fn talks(e: &crate::world::Entity) -> bool {
+    e.has_tag("Discussable") || !e.has_tag("Quiet")
+}
+
 /// One page. On a discussable page, comment entities under its blocks are drawn as threads, for `discussion`'s
 /// viewer. Returns the HTML and, for a discussable page, its blocks.
 pub fn render(
@@ -774,7 +779,9 @@ pub fn render(
     discussion: &Discussion,
 ) -> Result<(String, Option<Blocks>), String> {
     let n = s.world.get(page.node);
+    // Comments per block on a Doc; every other page that talks has only the page's own thread.
     let discussable = n.has_tag("Discussable");
+    let talk = talks(n);
     let mut ctx = Ctx {
         s,
         page,
@@ -808,11 +815,16 @@ pub fn render(
         body + &refs
     };
     let mut out_blocks = None;
-    if discussable {
+    if talk {
         ctx.script("comments");
+        let hint = if discussable {
+            "Comments on the page as a whole. To comment on one paragraph, use the button beside it."
+        } else {
+            "Questions, corrections, ideas: anything about this page."
+        };
         // The page's own comments, and those whose block is gone, are children of the page entity.
         body += &format!(
-            "\n<section class=\"discussion\" data-block=\"{PAGE_BLOCK}\"><h2>Discussion</h2><p class=\"dim\">Comments on the page as a whole. To comment on one paragraph, use the button beside it.</p>{}</section>{}",
+            "\n<section class=\"discussion\" id=\"discussion\" data-block=\"{PAGE_BLOCK}\"><h2>Discussion</h2><p class=\"dim\">{hint}</p>{}</section>{}",
             comments::thread(
                 PAGE_BLOCK, s.world, page.node, &page.doc, &page.url, discussion, s.served
             ),
@@ -880,7 +892,7 @@ pub fn render(
         .collect::<Vec<_>>()
         .join("\n");
     let doc_attr =
-        if discussable { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
+        if talk { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
     let say_intro = if audio.is_some() {
         format!(" data-say=\"{}\"", crate::spoken::INTRO)
     } else {

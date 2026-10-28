@@ -1,10 +1,12 @@
 //! The doc tests of `blaze test`: the examples in the documentation of a library are
 //! taken out as rustdoc takes them, and each is a program of its own, a crate blaze adds to
 //! the graph, compiles with everything it links over the standard library's unit and links
-//! itself. No rustc or rustdoc runs: an example rust-analyzer finds an error in, or one blaze
-//! cannot build whole, fails and says why, and one marked `compile_fail` passes when
-//! rust-analyzer finds an error in it. What they print and how they end is told as rustdoc's
-//! test harness tells it. A run of the tests that asks for what is not done here fails.
+//! itself. No rustc, rustdoc or cargo runs: an example rust-analyzer finds an error in, or one
+//! blaze cannot build whole, fails and says why. One marked `compile_fail` passes when blaze's
+//! front end finds an error in it that rustc gives too, with every error code it is marked
+//! with; where blaze can't tell, it fails and says why. What they print and how they end is
+//! told as rustdoc's test harness tells it. A run of the tests that asks for what is not done
+//! here fails.
 
 pub(crate) use blaze_cargo::doctest::{
     BUILD, FAILED, REPLAY, Recorded, Replay, as_asked, in_place, var_in,
@@ -130,7 +132,8 @@ const UNUSED: [&str; 12] = [
 ];
 
 impl Asked {
-    /// Reads the arguments of a run of rustdoc. `Err` is why the run is rustdoc's.
+    /// Reads the arguments of a run of rustdoc. `Err` is why blaze does not run the
+    /// examples: they fail with it.
     fn read(recorded: &Recorded) -> Result<Asked, String> {
         let words: Vec<String> = recorded
             .args
@@ -210,13 +213,16 @@ impl Asked {
     }
 
     /// The arguments of the run of blaze that loads the library the examples are of, with
-    /// nothing of rustc's: the examples are built over the standard library's unit.
+    /// nothing of rustc's: the examples are built over the standard library's unit, and the
+    /// build scripts and proc macros are blaze's (`cargo/compile_time.rs`), as a worker of
+    /// the daemon has them, not `cargo check --compile-time-deps`.
     fn build_args(&self) -> anyhow::Result<Vec<String>> {
         std::fs::create_dir_all(&self.dir)?;
         // The package is where cargo runs the examples, not where it runs rustdoc: that is
         // the workspace's root, whose package is another one or none.
         let mut args = vec![
             self.run_in.display().to_string(),
+            "--own-target".to_owned(),
             "--crate".to_owned(),
             self.root_file(),
             "--out".to_owned(),
@@ -508,6 +514,8 @@ fn split_attrs(list: &str) -> Vec<String> {
 struct Counted {
     blaze: AtomicUsize,
     refused: AtomicUsize,
+    /// Of `refused`, the examples marked `compile_fail` that blaze can't tell fail as marked.
+    unconfirmed: AtomicUsize,
     remembered: AtomicUsize,
 }
 
@@ -536,8 +544,8 @@ struct Test {
 enum Ours {
     /// Nothing, the example being only to compile, and rust-analyzer finds no error in it.
     Checked,
-    /// Nothing, the example being marked `compile_fail`, and rust-analyzer finds an error in
-    /// it. The error codes it names are not checked: rust-analyzer's are not all rustc's.
+    /// Nothing, the example being marked `compile_fail`, and failing as marked
+    /// ([`Found::fails_as_marked`]).
     FailsToCompile,
     /// Its object and the standard library's unit, to link in `dir` with `line`. A `kept`
     /// directory is the memo's, where the program stays for the next run.
@@ -642,6 +650,9 @@ impl Test {
         let marks = &self.marks;
         let refused = |why: String| {
             counted.refused.fetch_add(1, Ordering::Relaxed);
+            if marks.compile_fail {
+                counted.unconfirmed.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(Ended::Failed(format!("blaze did not build the example: {why}")))
         };
         let binary = match ours {
@@ -781,7 +792,7 @@ enum Plan {
     Refused(String),
     /// Not at all: it is only to compile, and rust-analyzer finds no error in it.
     Checked,
-    /// Not at all: it is marked `compile_fail`, and rust-analyzer finds an error in it.
+    /// Not at all: it is marked `compile_fail`, and fails as marked.
     FailsToCompile,
     /// By blaze, from its crate of this name.
     Ours(String),
@@ -815,19 +826,17 @@ fn plan(
         let names = |name: &String| {
             source.contains(&format!("{name}::")) || source.contains(&format!("crate {name}"))
         };
-        let errors = || has_errors(db, example.root_file, denies_lints(source));
+        let found = || Found::in_file(db, example.root_file, denies_lints(source));
         if let Some(name) = mixing.iter().find(|it| names(it)) {
             let why = format!("`{name}` links another copy of the library");
             plans[at] = Plan::Refused(why);
         } else if test.marks.compile_fail {
-            plans[at] = match errors() {
-                true => Plan::FailsToCompile,
-                false => Plan::Refused(
-                    "it is marked `compile_fail`, and blaze finds no error in it".to_owned(),
-                ),
+            plans[at] = match found().fails_as_marked(&test.marks.error_codes) {
+                Ok(()) => Plan::FailsToCompile,
+                Err(why) => Plan::Refused(why),
             };
-        } else if errors() {
-            plans[at] = Plan::Refused("rust-analyzer finds an error in it".to_owned());
+        } else if let Some(error) = found().first() {
+            plans[at] = Plan::Refused(format!("blaze finds an error in it: {error}"));
         } else if test.marks.no_run {
             plans[at] = Plan::Checked;
         } else {
@@ -837,22 +846,102 @@ fn plan(
     (plans, Some(unit))
 }
 
-/// Whether rust-analyzer finds an error of any kind in the example's file: one that does not
-/// name what it uses compiles to a program that runs. Where the program denies lints, as
+/// What blaze's front end finds in an example's file. Where the program denies lints, as
 /// `#![doc(test(attr(deny(warnings))))]` has it do, a warning or a use of something
-/// deprecated is one too: rustc has lints rust-analyzer does not.
-fn has_errors(db: &RootDatabase, file: vfs::FileId, denies_lints: bool) -> bool {
-    use ide_db::Severity;
-    let config = ide_diagnostics::DiagnosticsConfig::test_sample();
-    let resolve = ide_db::assists::AssistResolveStrategy::None;
-    hir::attach_db(db, || {
-        let syntax = ide_diagnostics::syntax_diagnostics(db, &config, file);
-        let semantic = ide_diagnostics::semantic_diagnostics(db, &config, &resolve, file);
-        let mut found = syntax.into_iter().chain(semantic);
-        found.any(|it| {
-            it.severity == Severity::Error || denies_lints && it.severity == Severity::Warning
-        }) || denies_lints && uses_deprecated(db, file)
-    })
+/// deprecated is an error too: rustc has lints rust-analyzer does not.
+#[derive(Default)]
+struct Found {
+    /// The errors as rustc would give them too, by code ([`crate::SURE`], the borrow
+    /// checker's, the lints a source denies), with what they say.
+    sure: Vec<(String, String)>,
+    /// The errors rust-analyzer finds where rustc need not.
+    unsure: Vec<(String, String)>,
+    /// Why a body was not borrow checked: an error rustc's borrow checker gives in it is not
+    /// found.
+    unchecked: Vec<String>,
+    deprecated: bool,
+}
+
+impl Found {
+    fn in_file(db: &RootDatabase, file: vfs::FileId, denies_lints: bool) -> Found {
+        use ide_db::Severity;
+        let config = ide_diagnostics::DiagnosticsConfig::test_sample();
+        let resolve = ide_db::assists::AssistResolveStrategy::None;
+        let borrowck = std::env::var_os("BLAZE_BORROWCK_REFUSE").is_none_or(|it| it != "0");
+        let mut found = Found::default();
+        hir::attach_db(db, || {
+            let syntax = ide_diagnostics::syntax_diagnostics(db, &config, file);
+            let semantic = ide_diagnostics::semantic_diagnostics(db, &config, &resolve, file);
+            for it in syntax.into_iter().chain(semantic) {
+                let code = it.code.as_str();
+                if code == "borrowck-skipped" {
+                    found.unchecked.push(it.message);
+                    continue;
+                }
+                let lint = denies_lints && it.severity == Severity::Warning;
+                if it.severity != Severity::Error && !lint {
+                    continue;
+                }
+                let sure = crate::SURE.contains(&code)
+                    || borrowck && crate::BORROWCK.contains(&code)
+                    || crate::DENIED.contains(&code)
+                    || borrowck && crate::DENIED_BORROWCK.contains(&code);
+                let into = if sure { &mut found.sure } else { &mut found.unsure };
+                into.push((code.to_owned(), it.message));
+            }
+            found.deprecated = denies_lints && uses_deprecated(db, file);
+        });
+        found
+    }
+
+    /// The first error, as the example's refusal says it.
+    fn first(&self) -> Option<String> {
+        let first = self.sure.iter().chain(&self.unsure).next();
+        match first {
+            Some((code, message)) => Some(format!("`{code}`: {message}")),
+            None => self.deprecated.then(|| "it uses something `#[deprecated]`".to_owned()),
+        }
+    }
+
+    /// Whether the example fails to compile as one marked `compile_fail` with `codes` is to:
+    /// with an error rustc gives too, and every code among them, as rustdoc checks it. `Err`
+    /// is why blaze can't tell, which the example fails with.
+    fn fails_as_marked(&self, codes: &[String]) -> Result<(), String> {
+        let found = |code: &String| self.sure.iter().any(|(it, _)| it == code);
+        let missing: Vec<&String> = codes.iter().filter(|it| !found(it)).collect();
+        if !self.sure.is_empty() && missing.is_empty() {
+            return Ok(());
+        }
+        let marked = std::iter::once("compile_fail").chain(codes.iter().map(String::as_str));
+        let marked = format!("it is marked `{}`", marked.collect::<Vec<_>>().join(","));
+        if !self.sure.is_empty() {
+            let sure = quoted(self.sure.iter().map(|(code, _)| code));
+            let missing = quoted(missing);
+            return Err(format!("{marked}, and blaze finds {sure} in it but not {missing}"));
+        }
+        if let Some((code, message)) = self.unsure.first() {
+            return Err(format!(
+                "{marked}, and blaze finds only errors rustc need not give in it, as `{code}`: \
+                 {message}"
+            ));
+        }
+        let mut why = format!("{marked}, and blaze finds no error in it");
+        let checked = |it: &&String| {
+            crate::SURE.contains(&it.as_str()) || crate::BORROWCK.contains(&it.as_str())
+        };
+        let unknown: Vec<&String> = codes.iter().filter(|it| !checked(it)).collect();
+        if !unknown.is_empty() {
+            why.push_str(&format!(": blaze's checker does not find {} yet", quoted(unknown)));
+        } else if let Some(unchecked) = self.unchecked.first() {
+            why.push_str(&format!(": {unchecked}"));
+        }
+        Err(why)
+    }
+}
+
+/// Error codes as a refusal lists them.
+fn quoted<'a>(codes: impl IntoIterator<Item = &'a String>) -> String {
+    codes.into_iter().map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", ")
 }
 
 /// Whether the program has an inner attribute that denies or forbids lints.
@@ -1251,8 +1340,13 @@ fn run(
         0 => String::new(),
         n => format!(" ({n} unchanged since the last run)"),
     };
+    let unconfirmed = match counted.unconfirmed.load(Ordering::Relaxed) {
+        0 => String::new(),
+        n => format!(" ({n} marked `compile_fail` that blaze can't tell fail as marked)"),
+    };
     eprintln!(
-        "doctests: {} built by blaze, {} not built; compiling took {compiling:.1?}{remembered}",
+        "doctests: {} built by blaze, {} not built{unconfirmed}; compiling took \
+         {compiling:.1?}{remembered}",
         counted.blaze.load(Ordering::Relaxed),
         counted.refused.load(Ordering::Relaxed),
     );
@@ -1286,4 +1380,61 @@ fn run(
         start.elapsed().as_secs_f64(),
     )?;
     Ok(if failed.is_empty() { 0 } else { FAILED })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found(sure: &[&str], unsure: &[&str], unchecked: &[&str]) -> Found {
+        let errors = |codes: &[&str]| codes.iter().map(|it| (it.to_string(), "m".into())).collect();
+        Found {
+            sure: errors(sure),
+            unsure: errors(unsure),
+            unchecked: unchecked.iter().map(|it| it.to_string()).collect(),
+            deprecated: false,
+        }
+    }
+
+    fn codes(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|it| it.to_string()).collect()
+    }
+
+    #[test]
+    fn a_compile_fail_example_passes_on_an_error_rustc_gives_too() {
+        assert_eq!(found(&["E0308"], &[], &[]).fails_as_marked(&[]), Ok(()));
+        assert_eq!(found(&["E0499"], &[], &[]).fails_as_marked(&codes(&["E0499"])), Ok(()));
+    }
+
+    #[test]
+    fn every_code_it_is_marked_with_is_found() {
+        assert_eq!(
+            found(&["E0308"], &[], &[]).fails_as_marked(&codes(&["E0308", "E0599"])),
+            Err("it is marked `compile_fail,E0308,E0599`, and blaze finds `E0308` in it but not \
+                 `E0599`"
+                .to_owned())
+        );
+    }
+
+    #[test]
+    fn an_error_rustc_need_not_give_is_no_pass() {
+        let why = found(&[], &["type-mismatch"], &[]).fails_as_marked(&[]).unwrap_err();
+        assert!(why.contains("only errors rustc need not give"), "{why}");
+    }
+
+    #[test]
+    fn no_error_says_what_blaze_does_not_check() {
+        assert_eq!(
+            found(&[], &[], &[]).fails_as_marked(&codes(&["E0277"])),
+            Err("it is marked `compile_fail,E0277`, and blaze finds no error in it: blaze's \
+                 checker does not find `E0277` yet"
+                .to_owned())
+        );
+        assert_eq!(
+            found(&[], &[], &["not borrow checked: a closure"]).fails_as_marked(&[]),
+            Err("it is marked `compile_fail`, and blaze finds no error in it: not borrow \
+                 checked: a closure"
+                .to_owned())
+        );
+    }
 }

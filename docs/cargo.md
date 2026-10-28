@@ -150,17 +150,8 @@ binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what `--lib`, `--
 `--example` and one `--test` name. A worker that loads the workspace with `cfg(test)` builds
 the unit tests, one that loads it without builds the rest; a test's executable is
 `target/debug/deps/<name>-<kind>`. A unit test with `harness = false`, several `--test`s and
-the other target flags fail the build and say so. The doc tests are still taken out through
-`cargo test --doc`, which runs no rustc.
-
-`test` builds whole what cargo would test: each member's library, binaries and integration
-tests with `test = true`, the examples built beside them to see that they compile, and the
-binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what `--lib`, `--bin`,
-`--example` and one `--test` name. A worker that loads the workspace with `cfg(test)` builds
-the unit tests, one that loads it without builds the rest; a test's executable is
-`target/debug/deps/<name>-<kind>`. A unit test with `harness = false`, several `--test`s and
-the other target flags fail the build and say so. The doc tests are still taken out through
-`cargo test --doc`, which runs no rustc.
+the other target flags fail the build and say so. The doc tests come after, each example
+built by blaze with no cargo, rustc or rustdoc (below).
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
@@ -319,7 +310,7 @@ the 600-test library ten to thirty times as much, so there is none. On
 macOS a stat under the interposer goes from 0.8 to 1.1 µs, and to 3 to 5 µs on a workspace
 whose overlay has been written.
 
-What is left: doctests run in rustdoc's process and are not sandboxed; Windows has no sandbox
+What is left: doctest examples run outside the sandbox; Windows has no sandbox
 yet (its CI runs with `BLAZE_SANDBOX=off`). On Linux `openat2` always counts as a write; the
 check of a Unix socket's path reads the address from the program's memory and follows its
 links before the call goes on, so a second thread that changes the address, or a link swapped
@@ -848,15 +839,24 @@ A single build goes to cargo when:
   Errors rust-analyzer does not find are not caught here; see "Known problems";
 - the daemon refused the build or failed.
 
-Doc tests go through blaze in rustdoc's place. An example blaze cannot build is left to
-rustdoc, with a line saying why. Of the test harness's flags, `-q`, `--format pretty`,
-`--format terse`, `--color never`, `--exact`, `--skip`, `--test-threads` and test filters
-are handled, and the results are shown as libtest shows them; any other flag leaves the
-library's doctests to rustdoc. Cargo's run of rustdoc for each library is only written
-down; once cargo is done, one run of blaze loads the workspace and tests the libraries'
-examples in the order cargo asked, each in the directory and with the variables cargo gave
-its rustdoc, and says `Doc-tests` and what failed as cargo does. The daemon does not run
-doctests yet.
+Doc tests are blaze's, with no cargo, rustc or rustdoc (`doctest.rs`). An example blaze
+cannot build fails, saying why; nothing is left to rustdoc. Of the test harness's flags, `-q`,
+`--format pretty`, `--format terse`, `--color never`, `--exact`, `--skip`, `--test-threads`
+and test filters are handled, and the results are shown as libtest shows them; any other flag
+fails the library's doctests with the flag named. `blaze test` writes down the run of rustdoc
+cargo would make for each library (`cargo/whole.rs`), then one run of blaze loads the
+workspace, with blaze's own build scripts and proc macros, and tests the libraries' examples
+in cargo's order, each in the directory and with the variables cargo gives its rustdoc, and
+says `Doc-tests` and what failed as cargo does. The daemon does not run doctests yet.
+
+An example marked `compile_fail` passes when blaze's front end finds an error in it that
+rustc gives too: one of the errors `blaze check` is as sure of as rustc
+(`SURE` in `lib.rs`), the borrow checker's, or a lint the example denies, and, as rustdoc
+checks, every error code it is marked with (`compile_fail,E0499`). blaze's checker is weaker
+than rustc's here: it finds fewer errors (trait bounds not met, `E0277`, among them), finds
+some rustc does not, and skips bodies MIR lowering does not support. Where it can't tell, the
+example fails with the reason and is counted in the `doctests:` line as one blaze can't tell
+fails as marked; it never passes on a guess.
 
 The fallback is per invocation or per program, not per crate. If one program of an
 invocation cannot be the daemon's, cargo builds the invocation.

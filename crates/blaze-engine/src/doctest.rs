@@ -874,10 +874,6 @@ impl Found {
             let semantic = ide_diagnostics::semantic_diagnostics(db, &config, &resolve, file);
             for it in syntax.into_iter().chain(semantic) {
                 let code = it.code.as_str();
-                if code == "borrowck-skipped" {
-                    found.unchecked.push(it.message);
-                    continue;
-                }
                 let lint = denies_lints && it.severity == Severity::Warning;
                 if it.severity != Severity::Error && !lint {
                     continue;
@@ -890,7 +886,11 @@ impl Found {
                 into.push((code.to_owned(), it.message));
             }
             found.deprecated = denies_lints && uses_deprecated(db, file);
+            found.unchecked = unchecked(db, file);
         });
+        if !borrowck || hir_ty_borrowck::mode() == hir_ty_borrowck::Mode::Off {
+            found.unchecked.insert(0, "the borrow checker's errors are turned off".to_owned());
+        }
         found
     }
 
@@ -937,6 +937,24 @@ impl Found {
         }
         Err(why)
     }
+}
+
+/// Why each function of the file the borrow checker did not check was not.
+fn unchecked(db: &RootDatabase, file: vfs::FileId) -> Vec<String> {
+    use syntax::{AstNode as _, ast};
+    let sema = hir::Semantics::new(db);
+    let functions = sema.parse_guess_edition(file).syntax().descendants().filter_map(ast::Fn::cast);
+    let mut why = Vec::new();
+    for function in functions {
+        let Some(function) = sema.to_def(&function) else { continue };
+        let Ok(id) = hir_def::DefWithBodyId::try_from(hir::DefWithBody::from(function)) else {
+            continue;
+        };
+        if let Some(skipped) = &hir_ty_borrowck::borrowck(db, id).skipped {
+            why.push(format!("a body is not borrow checked: {skipped}"));
+        }
+    }
+    why
 }
 
 /// Error codes as a refusal lists them.

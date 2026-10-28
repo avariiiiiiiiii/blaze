@@ -95,6 +95,14 @@ fn explained(build: &blaze_ui::Build, took: u64) -> String {
             blaze_ui::took(chain_ns)
         ));
     }
+    if !build.slowest.is_empty() {
+        out.push_str("  slowest functions:\n");
+        let width =
+            build.slowest.iter().map(|it| it.name.chars().count()).max().unwrap_or(0).min(72);
+        for it in &build.slowest {
+            out.push_str(&format!("    {:<width$}  {:>6}\n", it.name, blaze_ui::took(it.ns)));
+        }
+    }
     let mut compiled: Vec<_> = build.crates.iter().filter(|it| it.fns.compiled() > 0).collect();
     compiled.sort_by_key(|it| std::cmp::Reverse(it.fns.compiled()));
     for krate in compiled.iter().take(LISTED) {

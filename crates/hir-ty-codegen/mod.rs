@@ -109,6 +109,7 @@ pub use debuginfo::Sidecar;
 mod f16_f128;
 mod float_pair;
 mod fncache;
+pub mod flight;
 pub use fncache::{Call, Found, Kind as ReachKind, Reach, tests_reach};
 mod fragment;
 mod home;
@@ -2902,6 +2903,7 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     compiles_of(func.krate(db));
+    let _flight = flight::Flight::root(db, func);
     {
         let mut recompiled = RECOMPILED.lock().unwrap_or_else(|e| e.into_inner());
         if recompiled.1 < RECOMPILED_KEPT {
@@ -3104,6 +3106,7 @@ fn compiled_instance<'db>(
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
     COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     compiles_of(env.krate);
+    let _flight = flight::Flight::instance(db, &instance, &env);
     tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
 }
 

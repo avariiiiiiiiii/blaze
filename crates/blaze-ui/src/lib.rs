@@ -19,7 +19,8 @@ pub use live::Live;
 pub use plain::Plain;
 
 use blaze_protocol::events::{
-    Cache, Cause, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, Step, Summary, Took,
+    Cache, Cause, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, SLOW_NS, Slow, Step,
+    Summary, Took,
 };
 
 /// The longest a plain rendering says nothing while a step is under way.
@@ -56,6 +57,11 @@ pub struct Build {
     /// ([`Event::Cores`]), and of how many cores.
     pub cores: Vec<(u64, u32)>,
     pub cores_of: u32,
+    /// The functions compiling longest as said last, each with since when
+    /// ([`Event::Compiling`]).
+    pub compiling: Vec<(Slow, u64)>,
+    /// The functions that took longest to compile, longest first ([`Event::Slowest`]).
+    pub slowest: Vec<Slow>,
     /// Since when no step is under way, and the step that ended then.
     idle: Option<(u64, Step)>,
 }
@@ -247,6 +253,8 @@ pub struct Finished {
     /// worker said, and of how many.
     pub cores: Vec<Option<f64>>,
     pub cores_of: u32,
+    /// The functions that took longest to compile, longest first.
+    pub slowest: Vec<Slow>,
 }
 
 /// What a record changed, for a renderer to say.
@@ -358,6 +366,8 @@ impl Build {
                 let (ok, summary, unnamed) = (*ok, summary.clone(), self.unnamed);
                 let cores = summary.slowest.iter().map(|it| self.busy_in(it, at)).collect();
                 let cores_of = self.cores_of;
+                self.compiling.clear();
+                let slowest = self.slowest.clone();
                 self.finished = Some(Finished {
                     ok,
                     summary,
@@ -367,6 +377,7 @@ impl Build {
                     unnamed,
                     cores,
                     cores_of,
+                    slowest,
                 });
                 Change::Finished
             }
@@ -379,7 +390,26 @@ impl Build {
                 self.cores_of = *of;
                 Change::Nothing
             }
+            Event::Compiling { functions } => {
+                let since = |it: &Slow| at.saturating_sub(it.ns);
+                self.compiling = functions.iter().map(|it| (it.clone(), since(it))).collect();
+                Change::Nothing
+            }
+            Event::Slowest { functions } => {
+                self.slowest.clone_from(functions);
+                Change::Nothing
+            }
         }
+    }
+
+    /// The functions of crate `krate` compiling for [`SLOW_NS`] or more by `now_ns`, longest
+    /// first: their names and for how long.
+    pub fn compiling_of(&self, krate: &str, now_ns: u64) -> Vec<(&str, u64)> {
+        let of = self.compiling.iter().filter(|(it, _)| it.krate == krate);
+        let of = of.map(|(it, since)| (it.name.as_str(), now_ns.saturating_sub(*since)));
+        let mut of: Vec<_> = of.filter(|it| it.1 >= SLOW_NS).collect();
+        of.sort_by_key(|it| std::cmp::Reverse(it.1));
+        of
     }
 
     /// A step began, or the build ended, at `at`: the time since the last step ended went
@@ -587,6 +617,16 @@ impl Build {
     }
 }
 
+/// The last `most` characters of `text`, after an ellipsis when it is longer: a function's
+/// path says which it is at its end.
+pub fn tail(text: &str, most: usize) -> String {
+    let count = text.chars().count();
+    match count > most {
+        true => ['\u{2026}'].into_iter().chain(text.chars().skip(count + 1 - most)).collect(),
+        false => text.to_owned(),
+    }
+}
+
 /// A duration as a person reads it: `0.21s`, `33.2s`, `1m17s`.
 pub fn took(ns: u64) -> String {
     let ms = ns / 1_000_000;
@@ -659,6 +699,17 @@ pub fn why_lines(finished: &Finished, color: bool) -> Vec<String> {
             })
             .collect();
         lines.push(status("Took", &format!("{}: {}", took(took_ns), steps.join(", "))));
+    }
+    if !finished.slowest.is_empty() {
+        const LISTED: usize = 5;
+        let listed = finished.slowest.iter().take(LISTED);
+        let listed: Vec<String> =
+            listed.map(|it| format!("{} {}", tail(&it.name, 48), took(it.ns))).collect();
+        let more = match finished.slowest.len().saturating_sub(LISTED) {
+            0 => String::new(),
+            more => format!(" (and {more} more)"),
+        };
+        lines.push(status("Slowest", &format!("fns: {}{more}", listed.join(", "))));
     }
     // The line before says what was compiled and kept; this says what it does not.
     if let Some(cache) = &summary.cache {

@@ -505,7 +505,9 @@ pub fn answered(
                     }
                 }
                 if dropped.len() == kinds.len()
-                    || dropped.iter().any(|it| given.crate_types.iter().filter(|k| *k == it).count() > 1)
+                    || dropped
+                        .iter()
+                        .any(|it| given.crate_types.iter().filter(|k| *k == it).count() > 1)
                 {
                     return None;
                 }
@@ -596,10 +598,13 @@ pub fn answered(
             return None;
         }
         for kind in &dropped {
-            warned += &format!("warning: dropping unsupported crate type `{kind}` for target `{tuple}`\n\n");
+            warned += &format!(
+                "warning: dropping unsupported crate type `{kind}` for target `{tuple}`\n\n"
+            );
         }
         let count = dropped.len();
-        warned += &format!("warning: {count} warning{} emitted\n\n", if count == 1 { "" } else { "s" });
+        warned +=
+            &format!("warning: {count} warning{} emitted\n\n", if count == 1 { "" } else { "s" });
     }
     Some(Answer { stdout: out.into_bytes(), stderr: warned.into_bytes() })
 }
@@ -681,7 +686,10 @@ mod tests {
                      --crate-type bin --crate-type rlib --crate-type dylib --crate-type cdylib \
                      --crate-type staticlib --crate-type proc-macro --print=crate-name -Wwarnings";
         let said = told(probe).expect("an answer of the probe");
-        assert_eq!(std::str::from_utf8(&said.stdout).unwrap(), "___.wasm\nlib___.rlib\n___.wasm\nlib___.a\n___\n");
+        assert_eq!(
+            std::str::from_utf8(&said.stdout).unwrap(),
+            "___.wasm\nlib___.rlib\n___.wasm\nlib___.a\n___\n"
+        );
         assert_eq!(
             std::str::from_utf8(&said.stderr).unwrap(),
             "warning: dropping unsupported crate type `dylib` for target `wasm32-wasip1`\n\n\

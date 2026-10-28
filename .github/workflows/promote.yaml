@@ -209,7 +209,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          export PATH="$CARGO_HOME/bin:$PATH" BLAZE_BIN="$CARGO_HOME/bin/blaze-engine" BLAZE_PROJECTS="$WORK/projects"
+          engine="$CARGO_HOME/bin/blaze-engine"
+          [ -x "$engine" ] || engine="$CARGO_HOME/bin/ra-jit" # rename: old name
+          export PATH="$CARGO_HOME/bin:$PATH" BLAZE_BIN="$engine" BLAZE_PROJECTS="$WORK/projects"
           bench="$OUT/bench-$OS-$APP.json"
           status=0
           $SHELL_OF_APP env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$APP" --backend cranelift \

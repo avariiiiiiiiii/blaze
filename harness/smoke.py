@@ -38,6 +38,8 @@ from dataclasses import dataclass, fields
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORPUS = os.path.join(HERE, "smoke")
+# A project's `prepare` is a module beside this one.
+sys.path.insert(0, HERE)
 EXE = ".exe" if os.name == "nt" else ""
 Group = typing.Literal["std", "crates", "projects", "apps"]
 Profile = typing.Literal["dev", "release"]

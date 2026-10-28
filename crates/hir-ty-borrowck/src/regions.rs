@@ -4004,7 +4004,7 @@ impl<'db> Builder<'_, '_, 'db> {
         kind.for_each_operand(&mut |operand| self.copy_bound(operand, span));
         if let StatementKind::InlineAsm(asm) = kind {
             for operand in asm.operands.iter() {
-                if let hir_ty::mir::AsmOperand::Sym(operand) = operand {
+                if let hir_ty_mir::mir::AsmOperand::Sym(operand) = operand {
                     self.asm_sym(operand, span);
                 }
             }
@@ -4054,7 +4054,7 @@ impl<'db> Builder<'_, '_, 'db> {
 
     fn assign(
         &mut self,
-        place: &hir_ty::mir::StoredPlace,
+        place: &hir_ty_mir::mir::StoredPlace,
         rvalue: &Rvalue,
         dest: Ty<'db>,
         at: At,

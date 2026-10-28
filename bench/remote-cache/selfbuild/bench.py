@@ -20,7 +20,7 @@ RB = Path("/root/rb")
 SRC, BIN, CTREE = RB / "src", RB / "bin", RB / "c"
 PATCH = {"a": None, "b": RB / "body.patch", "c": RB / "sig.patch"}
 CRATES = ["hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
-          "hir-ty", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics"]
+          "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics"]
 # Stack overflows of blaze-built hir-ide (selfhost lane's), skipped in both arms.
 SKIP = ["--", "--skip", "infer_std_crash_5", "--skip", "recursive_vars"]
 BOUND = 4 * 3600

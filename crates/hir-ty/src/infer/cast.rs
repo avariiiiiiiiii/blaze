@@ -25,7 +25,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub(crate) enum Int {
+pub enum Int {
     I,
     U(UintTy),
     Bool,
@@ -35,7 +35,7 @@ pub(crate) enum Int {
 }
 
 #[derive(Debug)]
-pub(crate) enum CastTy<'db> {
+pub enum CastTy<'db> {
     Int(Int),
     Float,
     FnPtr,
@@ -44,7 +44,7 @@ pub(crate) enum CastTy<'db> {
 }
 
 impl<'db> CastTy<'db> {
-    pub(crate) fn from_ty(db: &dyn HirDatabase, t: Ty<'db>) -> Option<Self> {
+    pub fn from_ty(db: &dyn HirDatabase, t: Ty<'db>) -> Option<Self> {
         match t.kind() {
             TyKind::Bool => Some(Self::Int(Int::Bool)),
             TyKind::Char => Some(Self::Int(Int::Char)),

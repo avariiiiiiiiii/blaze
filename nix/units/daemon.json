@@ -728,10 +728,12 @@
      "blaze-manifest",
      "blaze-metadata",
      "blaze-new",
+     "blaze-protocol",
      "blaze-registry",
      "blaze-resolve",
      "blaze-store",
      "blaze-tree",
+     "blaze-ui",
      "blaze-units",
      "blaze-wasi",
      "cargo-platform",
@@ -821,6 +823,7 @@
      "blaze-lints",
      "blaze-live",
      "blaze-macro-wasm",
+     "blaze-protocol",
      "blaze-splice",
      "blaze-store",
      "blaze-wasi",
@@ -835,6 +838,7 @@
      "hir-ty",
      "hir-ty-borrowck",
      "hir-ty-codegen",
+     "hir-ty-mir",
      "ide-db",
      "ide-diagnostics",
      "intern",
@@ -2453,6 +2457,7 @@
      "hir-def",
      "hir-expand",
      "hir-ty",
+     "hir-ty-mir",
      "intern",
      "itertools 0.15.0",
      "la-arena",
@@ -2494,7 +2499,6 @@
      "itertools 0.15.0",
      "la-arena",
      "macros",
-     "oorandom",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_index",
      "rustc-hash 2.1.2",
@@ -2513,8 +2517,7 @@
      "tracing",
      "tracing-subscriber",
      "tracing-tree",
-     "triomphe",
-     "unicode-width 0.2.2"
+     "triomphe"
     ],
     "name": "hir-ty",
     "version": "0.0.0"
@@ -2525,6 +2528,7 @@
      "hir-def",
      "hir-expand",
      "hir-ty",
+     "hir-ty-mir",
      "hir-ty-wfcheck",
      "la-arena",
      "ra-ap-rustc_ast_ir",
@@ -2551,6 +2555,7 @@
      "hir-def",
      "hir-expand",
      "hir-ty",
+     "hir-ty-mir",
      "indexmap",
      "inkwell",
      "intern",
@@ -2578,6 +2583,39 @@
     ],
     "name": "hir-ty-codegen",
     "version": "0.20261028.2"
+   },
+   {
+    "dependencies": [
+     "arrayvec",
+     "base-db",
+     "cfg",
+     "either",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "intern",
+     "itertools 0.15.0",
+     "la-arena",
+     "macros",
+     "oorandom",
+     "ra-ap-rustc_ast_ir",
+     "ra-ap-rustc_index",
+     "rustc-hash 2.1.2",
+     "rustc_abi",
+     "rustc_apfloat",
+     "rustc_next_trait_solver",
+     "rustc_type_ir",
+     "salsa",
+     "smallvec",
+     "span",
+     "stdx",
+     "syntax",
+     "tracing",
+     "triomphe",
+     "unicode-width 0.2.2"
+    ],
+    "name": "hir-ty-mir",
+    "version": "0.0.0"
    },
    {
     "dependencies": [
@@ -6755,6 +6793,10 @@
     "hir-ty-codegen": {
      "path": "crates/hir-ty-codegen"
     },
+    "hir-ty-mir": {
+     "path": "crates/hir-ty-mir",
+     "version": "0.0.0"
+    },
     "hir-ty-wfcheck": {
      "path": "crates/hir-ty-wfcheck",
      "version": "0.0.0"
@@ -10456,6 +10498,23 @@
     "kind": "path"
    },
    "version": "0.20261028.2"
+  },
+  "hir-ty-mir@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "MIR's passes over rust-analyzer's MIR: lowering, rustc's passes and optimizations, monomorphization and the interpreter.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "hir-ty-mir",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/hir-ty-mir",
+    "kind": "path"
+   },
+   "version": "0.0.0"
   },
   "hir-ty-wfcheck@0.0.0": {
    "authors": "blaze contributors",
@@ -19113,6 +19172,10 @@
        "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
@@ -19127,6 +19190,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.2 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -19467,6 +19534,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -19509,6 +19580,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -19708,6 +19783,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -19750,6 +19829,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -19949,6 +20032,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -19991,6 +20078,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -20231,6 +20322,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -20273,6 +20368,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -20972,6 +21071,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.2 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -21349,6 +21473,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.2 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
@@ -25392,6 +25541,10 @@
        "unit": "hir-expand@0.0.0 lib hir_expand build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -25499,6 +25652,10 @@
       {
        "name": "hir_expand",
        "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty_wfcheck",
@@ -25647,6 +25804,10 @@
        "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -25760,6 +25921,135 @@
      "src": "mod.rs",
      "target": "hir_ty_codegen"
     },
+    "hir-ty-mir@0.0.0 lib hir_ty_mir build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.6 lib arrayvec build"
+      },
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.16.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "itertools",
+       "unit": "itertools@0.15.0 lib itertools build"
+      },
+      {
+       "name": "la_arena",
+       "unit": "la-arena@0.3.1 lib la_arena build"
+      },
+      {
+       "name": "macros",
+       "unit": "macros@0.0.0 proc-macro macros build host"
+      },
+      {
+       "name": "oorandom",
+       "unit": "oorandom@11.1.5 lib oorandom build"
+      },
+      {
+       "name": "ra_ap_rustc_ast_ir",
+       "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
+      },
+      {
+       "name": "ra_ap_rustc_index",
+       "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.0.0 lib rustc_next_trait_solver build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.15.1 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      },
+      {
+       "name": "triomphe",
+       "unit": "triomphe@0.1.15 lib triomphe build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.2 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-mir@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_mir"
+    },
     "hir-ty-wfcheck@0.0.0 lib hir_ty_wfcheck build": {
      "crate_type": "lib",
      "deps": [
@@ -25861,10 +26151,6 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "oorandom",
-       "unit": "oorandom@11.1.5 lib oorandom build"
-      },
-      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -25939,10 +26225,6 @@
       {
        "name": "triomphe",
        "unit": "triomphe@0.1.15 lib triomphe build"
-      },
-      {
-       "name": "unicode_width",
-       "unit": "unicode-width@0.2.2 lib unicode_width build"
       }
      ],
      "edition": "2024",
@@ -40086,6 +40368,10 @@
        "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
@@ -40100,6 +40386,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.2 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -40440,6 +40730,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -40482,6 +40776,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -40681,6 +40979,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -40723,6 +41025,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -40922,6 +41228,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -40964,6 +41274,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -41204,6 +41518,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -41246,6 +41564,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -41945,6 +42267,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.2 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -42322,6 +42669,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.2 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
@@ -46265,6 +46637,10 @@
        "unit": "hir-expand@0.0.0 lib hir_expand build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -46372,6 +46748,10 @@
       {
        "name": "hir_expand",
        "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty_wfcheck",
@@ -46520,6 +46900,10 @@
        "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -46633,6 +47017,135 @@
      "src": "mod.rs",
      "target": "hir_ty_codegen"
     },
+    "hir-ty-mir@0.0.0 lib hir_ty_mir build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.6 lib arrayvec build"
+      },
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.16.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "itertools",
+       "unit": "itertools@0.15.0 lib itertools build"
+      },
+      {
+       "name": "la_arena",
+       "unit": "la-arena@0.3.1 lib la_arena build"
+      },
+      {
+       "name": "macros",
+       "unit": "macros@0.0.0 proc-macro macros build host"
+      },
+      {
+       "name": "oorandom",
+       "unit": "oorandom@11.1.5 lib oorandom build"
+      },
+      {
+       "name": "ra_ap_rustc_ast_ir",
+       "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
+      },
+      {
+       "name": "ra_ap_rustc_index",
+       "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.0.0 lib rustc_next_trait_solver build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.15.1 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      },
+      {
+       "name": "triomphe",
+       "unit": "triomphe@0.1.15 lib triomphe build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.2 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-mir@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_mir"
+    },
     "hir-ty-wfcheck@0.0.0 lib hir_ty_wfcheck build": {
      "crate_type": "lib",
      "deps": [
@@ -46734,10 +47247,6 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "oorandom",
-       "unit": "oorandom@11.1.5 lib oorandom build"
-      },
-      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -46812,10 +47321,6 @@
       {
        "name": "triomphe",
        "unit": "triomphe@0.1.15 lib triomphe build"
-      },
-      {
-       "name": "unicode_width",
-       "unit": "unicode-width@0.2.2 lib unicode_width build"
       }
      ],
      "edition": "2024",
@@ -60932,6 +61437,10 @@
        "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
@@ -60946,6 +61455,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.2 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -61286,6 +61799,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -61328,6 +61845,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -61527,6 +62048,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -61569,6 +62094,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -61768,6 +62297,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -61810,6 +62343,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -62050,6 +62587,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -62092,6 +62633,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -62791,6 +63336,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.2 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -63168,6 +63738,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.2 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
@@ -67242,6 +67837,10 @@
        "unit": "hir-expand@0.0.0 lib hir_expand build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -67349,6 +67948,10 @@
       {
        "name": "hir_expand",
        "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty_wfcheck",
@@ -67497,6 +68100,10 @@
        "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -67610,6 +68217,135 @@
      "src": "mod.rs",
      "target": "hir_ty_codegen"
     },
+    "hir-ty-mir@0.0.0 lib hir_ty_mir build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.6 lib arrayvec build"
+      },
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.16.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "itertools",
+       "unit": "itertools@0.15.0 lib itertools build"
+      },
+      {
+       "name": "la_arena",
+       "unit": "la-arena@0.3.1 lib la_arena build"
+      },
+      {
+       "name": "macros",
+       "unit": "macros@0.0.0 proc-macro macros build host"
+      },
+      {
+       "name": "oorandom",
+       "unit": "oorandom@11.1.5 lib oorandom build"
+      },
+      {
+       "name": "ra_ap_rustc_ast_ir",
+       "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
+      },
+      {
+       "name": "ra_ap_rustc_index",
+       "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.0.0 lib rustc_next_trait_solver build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.15.1 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      },
+      {
+       "name": "triomphe",
+       "unit": "triomphe@0.1.15 lib triomphe build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.2 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-mir@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_mir"
+    },
     "hir-ty-wfcheck@0.0.0 lib hir_ty_wfcheck build": {
      "crate_type": "lib",
      "deps": [
@@ -67711,10 +68447,6 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "oorandom",
-       "unit": "oorandom@11.1.5 lib oorandom build"
-      },
-      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -67789,10 +68521,6 @@
       {
        "name": "triomphe",
        "unit": "triomphe@0.1.15 lib triomphe build"
-      },
-      {
-       "name": "unicode_width",
-       "unit": "unicode-width@0.2.2 lib unicode_width build"
       }
      ],
      "edition": "2024",
@@ -81932,6 +82660,10 @@
        "unit": "blaze-new@0.20261028.2 lib blaze_new build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_registry",
        "unit": "blaze-registry@0.20261028.2 lib blaze_registry build"
       },
@@ -81946,6 +82678,10 @@
       {
        "name": "blaze_tree",
        "unit": "blaze-tree@0.20261028.2 lib blaze_tree build"
+      },
+      {
+       "name": "blaze_ui",
+       "unit": "blaze-ui@0.20261028.2 lib blaze_ui build"
       },
       {
        "name": "blaze_units",
@@ -82286,6 +83022,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -82328,6 +83068,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -82527,6 +83271,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -82569,6 +83317,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -82768,6 +83520,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -82810,6 +83566,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -83050,6 +83810,10 @@
        "unit": "blaze-macro-wasm@0.20261028.2 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      },
+      {
        "name": "blaze_splice",
        "unit": "blaze-splice@0.20261028.2 lib blaze_splice build"
       },
@@ -83092,6 +83856,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.20261028.2 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty",
@@ -83791,6 +84559,31 @@
      "src": "src/lib.rs",
      "target": "blaze_new"
     },
+    "blaze-protocol@0.20261028.2 lib blaze_protocol build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-protocol@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_protocol"
+    },
     "blaze-registry@0.20261028.2 lib blaze_registry build": {
      "crate_type": "lib",
      "deps": [
@@ -84168,6 +84961,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_tree"
+    },
+    "blaze-ui@0.20261028.2 lib blaze_ui build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.20261028.2 lib blaze_protocol build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-ui@0.20261028.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_ui"
     },
     "blaze-units@0.20261028.2 lib blaze_units build": {
      "crate_type": "lib",
@@ -88142,6 +88960,10 @@
        "unit": "hir-expand@0.0.0 lib hir_expand build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -88249,6 +89071,10 @@
       {
        "name": "hir_expand",
        "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
        "name": "hir_ty_wfcheck",
@@ -88397,6 +89223,10 @@
        "unit": "hir-ty-codegen@0.20261028.2 custom-build build-script-build run-custom-build"
       },
       {
+       "name": "hir_ty_mir",
+       "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -88510,6 +89340,135 @@
      "src": "mod.rs",
      "target": "hir_ty_codegen"
     },
+    "hir-ty-mir@0.0.0 lib hir_ty_mir build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "arrayvec",
+       "unit": "arrayvec@0.7.6 lib arrayvec build"
+      },
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.16.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "itertools",
+       "unit": "itertools@0.15.0 lib itertools build"
+      },
+      {
+       "name": "la_arena",
+       "unit": "la-arena@0.3.1 lib la_arena build"
+      },
+      {
+       "name": "macros",
+       "unit": "macros@0.0.0 proc-macro macros build host"
+      },
+      {
+       "name": "oorandom",
+       "unit": "oorandom@11.1.5 lib oorandom build"
+      },
+      {
+       "name": "ra_ap_rustc_ast_ir",
+       "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
+      },
+      {
+       "name": "ra_ap_rustc_index",
+       "unit": "ra-ap-rustc_index@0.166.0 lib ra_ap_rustc_index build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_next_trait_solver",
+       "unit": "rustc_next_trait_solver@0.0.0 lib rustc_next_trait_solver build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "salsa",
+       "unit": "salsa@0.28.5 lib salsa build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.15.1 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      },
+      {
+       "name": "triomphe",
+       "unit": "triomphe@0.1.15 lib triomphe build"
+      },
+      {
+       "name": "unicode_width",
+       "unit": "unicode-width@0.2.2 lib unicode_width build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-mir@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_mir"
+    },
     "hir-ty-wfcheck@0.0.0 lib hir_ty_wfcheck build": {
      "crate_type": "lib",
      "deps": [
@@ -88611,10 +89570,6 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
-       "name": "oorandom",
-       "unit": "oorandom@11.1.5 lib oorandom build"
-      },
-      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -88689,10 +89644,6 @@
       {
        "name": "triomphe",
        "unit": "triomphe@0.1.15 lib triomphe build"
-      },
-      {
-       "name": "unicode_width",
-       "unit": "unicode-width@0.2.2 lib unicode_width build"
       }
      ],
      "edition": "2024",

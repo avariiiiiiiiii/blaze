@@ -66,6 +66,7 @@ cargo_metadata.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
+hir-ty-mir.workspace = true
 hir-ty-codegen.workspace = true
 hir-ty-borrowck.workspace = true
 blaze-expand.workspace = true
@@ -73,6 +74,7 @@ blaze-macro-wasm.workspace = true
 blaze-store.workspace = true
 blaze-doc.workspace = true
 blaze-lints.workspace = true
+blaze-protocol.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true
@@ -118,7 +120,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 heap-profile = ["tikv-jemallocator/profiling", "blaze-cargo/heap-profile"]
 
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
-llvm = ["hir-ty-codegen/llvm"]
+llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
 
 # Runs build scripts compiled for wasm32-wasip1 under Wasmtime when a workspace asks for it
 # (`BLAZE_BUILD_SCRIPTS=wasi`, docs/cargo.md "Build scripts under WASI"): an experiment.

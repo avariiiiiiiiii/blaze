@@ -793,7 +793,7 @@ impl<'db> FunctionCx<'_, 'db> {
         &self,
         frames: &[Frame<'db>],
         outer: Option<Kind>,
-        statement: &hir_ty::mir::Statement,
+        statement: &hir_ty_mir::mir::Statement,
     ) -> Step {
         let frame = frames.last().expect("a frame");
         let facts = &frame.facts;

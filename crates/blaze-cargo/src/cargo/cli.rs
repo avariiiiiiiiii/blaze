@@ -13,6 +13,7 @@ use crate::plan::Selection;
 
 /// The flags of cargo's build commands that take their value as the next argument.
 const VALUED: &[&str] = &[
+    "--events",
     "-p",
     "--package",
     "--exclude",
@@ -59,6 +60,9 @@ const DEV_TARGETS: &[&str] =
 /// The flags of `cargo test` that are about running and not about building, and blaze's
 /// `--why` and `--json`, which say why each test runs or not instead of running them.
 const RUNNING: &[&str] = &["--no-run", "--no-fail-fast", "--why", "--json"];
+
+/// The flags blaze alone reads: none is cargo's, and none changes which build this is.
+const BLAZES: &[&str] = &["--events"];
 
 /// The flags that change only what cargo prints, with `--color`'s value: the build is the
 /// same.
@@ -205,6 +209,10 @@ pub enum Asked {
     Cache(Vec<String>),
     Status,
     Stop,
+    /// `why` and its arguments: what the last build compiled again and why.
+    Why(Vec<String>),
+    /// `watch`: every build the daemon does, as it does it, until interrupted.
+    Watch,
     /// blaze's own toolchain, downloaded first when it has none; with `--path`, its directory
     /// alone, for the installer to link.
     Toolchain {
@@ -260,6 +268,8 @@ pub struct Flags {
     pub unstable: Vec<String>,
     pub quiet: bool,
     pub verbose: bool,
+    /// `--events json` or `cbor`: the records of the build on standard output, as they come.
+    pub events: Option<String>,
     pub no_run: bool,
     pub no_fail_fast: bool,
     /// `blaze test --why`: say of each test whether it is hermetic and why not, and run none.
@@ -286,6 +296,8 @@ impl Asked {
             ("cache", _) => Asked::Cache(rest.to_vec()),
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
+            ("why", _) => Asked::Why(rest.to_vec()),
+            ("watch", _) => Asked::Watch,
             ("toolchain", _) => Asked::Toolchain { path: rest.iter().any(|it| it == "--path") },
             ("lock", _) => Asked::Lock(rest.to_vec()),
             ("pin", _) => Asked::Pin(rest.to_vec()),
@@ -322,7 +334,7 @@ impl Invocation {
                 joined => joined,
             };
             flags.read(flag, value.as_deref());
-            if RUNNING.contains(&flag) {
+            if RUNNING.contains(&flag) || BLAZES.contains(&flag) {
                 continue;
             }
             build_args.push(flag.to_owned());
@@ -475,6 +487,7 @@ impl Flags {
             "--build-plan" | "--unit-graph" => self.cargos_plan = true,
             "-Z" => self.unstable.extend(owned()),
             "-q" | "--quiet" => self.quiet = true,
+            "--events" => self.events = owned(),
             "-v" | "-vv" | "--verbose" => self.verbose = true,
             "--no-run" => self.no_run = true,
             "--no-fail-fast" => self.no_fail_fast = true,
@@ -559,6 +572,17 @@ mod tests {
         ]);
         let taken = taken_away(daemons.into_iter().map(str::to_owned), &builds);
         assert_eq!(taken, ["SDK_DIR", "RUSTFLAGS"]);
+    }
+
+    #[test]
+    fn events_are_blazes_flag_and_not_the_builds() {
+        let cwd = Path::new("/w");
+        for typed in ["--events json -p a", "--events=cbor -p a"] {
+            let asked = build("build", typed);
+            assert!(asked.flags.events.is_some(), "{typed}");
+            assert_eq!(asked.build_args, ["-p", "a"], "{typed}");
+            assert_eq!(asked.key(cwd), build("build", "-p a").key(cwd), "{typed}");
+        }
     }
 
     #[test]

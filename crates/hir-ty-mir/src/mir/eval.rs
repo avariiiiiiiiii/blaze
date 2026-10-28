@@ -7,7 +7,7 @@ use std::{
     ops::Range,
 };
 
-use base_db::{Crate, target::TargetLoadError};
+use base_db::Crate;
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -21,7 +21,6 @@ use hir_def::{
 };
 use hir_expand::{InFile, mod_path::path};
 use la_arena::ArenaMap;
-use macros::GenericTypeVisitable;
 use rustc_abi::{Size, TargetDataLayout};
 use rustc_apfloat::{
     Float, FloatConvert,
@@ -33,7 +32,6 @@ use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind, Region as _, SliceLike, Ty as _},
 };
-use salsa::SalsaValue;
 use span::FileId;
 use stdx::never;
 use syntax::{SyntaxNodePtr, TextRange};
@@ -48,7 +46,7 @@ use crate::{
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         AliasTy, Allocation, AllocationData, Const, ConstKind, DbInterner, ErrorGuaranteed,
-        GenericArgs, Region, StoredTy, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
+        GenericArgs, Region, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
@@ -57,10 +55,11 @@ use crate::{
 };
 
 use super::{
-    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError,
-    MirPhase, MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue,
-    StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
+    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirPhase, MirSpan,
+    Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
+    TerminatorKind, UnOp, return_slot,
 };
+use super::{IsSigned, MirEvalError, VTableMap, pad16};
 
 mod shim;
 
@@ -114,48 +113,20 @@ where
 
 macro_rules! not_supported {
     ($it: expr) => {
-        return Err($crate::mir::eval::MirEvalError::NotSupported(format!($it)))
+        return Err($crate::mir::MirEvalError::NotSupported(format!($it)))
     };
 }
 use not_supported;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
-pub struct VTableMap<'db> {
-    ty_to_id: FxHashMap<Ty<'db>, usize>,
-    id_to_ty: Vec<Ty<'db>>,
+/// The type a vtable's id in memory names.
+trait VTableOfBytes<'db> {
+    fn ty_of_bytes(&self, bytes: &[u8]) -> Result<'db, Ty<'db>>;
 }
 
-impl<'db> VTableMap<'db> {
-    const OFFSET: usize = 1000; // We should add some offset to ids to make 0 (null) an invalid id.
-
-    fn id(&mut self, ty: Ty<'db>) -> usize {
-        if let Some(it) = self.ty_to_id.get(&ty) {
-            return *it;
-        }
-        let id = self.id_to_ty.len() + VTableMap::OFFSET;
-        self.id_to_ty.push(ty);
-        self.ty_to_id.insert(ty, id);
-        id
-    }
-
-    pub(crate) fn ty(&self, id: usize) -> Result<'db, Ty<'db>> {
-        id.checked_sub(VTableMap::OFFSET)
-            .and_then(|id| self.id_to_ty.get(id).copied())
-            .ok_or(MirEvalError::InvalidVTableId(id))
-    }
-
+impl<'db> VTableOfBytes<'db> for VTableMap<'db> {
     fn ty_of_bytes(&self, bytes: &[u8]) -> Result<'db, Ty<'db>> {
         let id = from_bytes!(usize, bytes);
         self.ty(id)
-    }
-
-    pub fn shrink_to_fit(&mut self) {
-        self.id_to_ty.shrink_to_fit();
-        self.ty_to_id.shrink_to_fit();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.id_to_ty.is_empty() && self.ty_to_id.is_empty()
     }
 }
 
@@ -426,74 +397,6 @@ impl Address {
 
     fn offset(&self, offset: usize) -> Address {
         self.map(|it| it + offset)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, SalsaValue)]
-pub enum MirEvalError<'db> {
-    ConstEvalError(String, Box<ConstEvalError<'db>>),
-    LayoutError(LayoutError, StoredTy),
-    TargetDataLayoutNotAvailable(TargetLoadError),
-    /// Means that code had undefined behavior. We don't try to actively detect UB, but if it was detected
-    /// then use this type of error.
-    UndefinedBehavior(String),
-    Panic(String),
-    // FIXME: This should be folded into ConstEvalError?
-    MirLowerError(FunctionId, MirLowerError<'db>),
-    MirLowerErrorForClosure(InternedClosureId<'db>, MirLowerError<'db>),
-    TypeIsUnsized(StoredTy, &'static str),
-    NotSupported(String),
-    InvalidConst,
-    InFunction(
-        Box<MirEvalError<'db>>,
-        Vec<(Either<FunctionId, InternedClosureId<'db>>, MirSpan, InferBodyId<'db>)>,
-    ),
-    ExecutionLimitExceeded,
-    StackOverflow,
-    /// FIXME: Fold this into InternalError
-    InvalidVTableId(usize),
-    /// ?
-    CoerceUnsizedError(StoredTy),
-    /// These should not occur, usually indicates a bug in mir lowering.
-    InternalError(Box<str>),
-}
-
-impl std::fmt::Debug for MirEvalError<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ConstEvalError(arg0, arg1) => {
-                f.debug_tuple("ConstEvalError").field(arg0).field(arg1).finish()
-            }
-            Self::LayoutError(arg0, arg1) => {
-                f.debug_tuple("LayoutError").field(arg0).field(arg1).finish()
-            }
-            Self::UndefinedBehavior(arg0) => {
-                f.debug_tuple("UndefinedBehavior").field(arg0).finish()
-            }
-            Self::Panic(msg) => write!(f, "Panic with message:\n{msg:?}"),
-            Self::TargetDataLayoutNotAvailable(arg0) => {
-                f.debug_tuple("TargetDataLayoutNotAvailable").field(arg0).finish()
-            }
-            Self::TypeIsUnsized(ty, it) => write!(f, "{ty:?} is unsized. {it} should be sized."),
-            Self::ExecutionLimitExceeded => write!(f, "execution limit exceeded"),
-            Self::StackOverflow => write!(f, "stack overflow"),
-            Self::MirLowerError(arg0, arg1) => {
-                f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
-            }
-            Self::MirLowerErrorForClosure(arg0, arg1) => {
-                f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
-            }
-            Self::CoerceUnsizedError(arg0) => {
-                f.debug_tuple("CoerceUnsizedError").field(arg0).finish()
-            }
-            Self::InternalError(arg0) => f.debug_tuple("InternalError").field(arg0).finish(),
-            Self::InvalidVTableId(arg0) => f.debug_tuple("InvalidVTableId").field(arg0).finish(),
-            Self::NotSupported(arg0) => f.debug_tuple("NotSupported").field(arg0).finish(),
-            Self::InvalidConst => f.write_str("InvalidConst"),
-            Self::InFunction(e, stack) => {
-                f.debug_struct("WithStack").field("error", e).field("stack", &stack).finish()
-            }
-        }
     }
 }
 
@@ -3883,25 +3786,6 @@ pub fn render_const_using_debug_impl<'db>(
         .min()
         .unwrap_or(0);
     Ok(std::string::String::from_utf8_lossy(evaluator.read_memory(addr, size)?).into_owned())
-}
-
-#[derive(PartialEq, Eq)]
-pub enum IsSigned {
-    Yes,
-    No,
-}
-
-impl From<bool> for IsSigned {
-    fn from(value: bool) -> Self {
-        if value { Self::Yes } else { Self::No }
-    }
-}
-
-pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
-    let is_negative = is_signed == IsSigned::Yes && it.last().unwrap_or(&0) > &127;
-    let mut res = [if is_negative { 255 } else { 0 }; 16];
-    res[..it.len()].copy_from_slice(it);
-    res
 }
 
 macro_rules! for_each_int_type {

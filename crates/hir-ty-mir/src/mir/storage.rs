@@ -49,10 +49,19 @@ fn in_frame(place: &StoredPlace) -> bool {
     !matches!(place.projection.as_slice().first(), Some(ProjectionElem::Deref))
 }
 
-impl MirBody<'_> {
+/// What a body's storage conflicts are, for the code generator's frame layout.
+pub trait FrameStorage {
     /// Which of `locals` may hold storage at the same point of the body. Those of `scoped` hold
     /// it where their markers say, as borrowed ones do.
-    pub fn frame_storage_conflicts(
+    fn frame_storage_conflicts(
+        &self,
+        locals: &[LocalId],
+        scoped: impl Fn(LocalId) -> bool,
+    ) -> StorageConflicts;
+}
+
+impl FrameStorage for MirBody<'_> {
+    fn frame_storage_conflicts(
         &self,
         locals: &[LocalId],
         scoped: impl Fn(LocalId) -> bool,

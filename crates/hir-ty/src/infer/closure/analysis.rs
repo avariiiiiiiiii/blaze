@@ -68,7 +68,7 @@ use crate::{
     },
 };
 
-pub(crate) mod expr_use_visitor;
+pub mod expr_use_visitor;
 
 #[derive(Debug, Copy, Clone, TypeVisitable, TypeFoldable)]
 enum UpvarArgs<'db> {

@@ -251,7 +251,7 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
 
 /// The blocks a body certainly runs if it returns, rustc's `promotion_safe_blocks`: from the
 /// start on through gotos, calls, drops and asserts.
-fn certain_blocks(body: &MirBody<'_>) -> FxHashSet<hir_ty::mir::BasicBlockId> {
+fn certain_blocks(body: &MirBody<'_>) -> FxHashSet<hir_ty_mir::mir::BasicBlockId> {
     let mut found = FxHashSet::default();
     let mut block = body.start_block;
     while found.insert(block) {
@@ -317,7 +317,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
         local: LocalId,
         depth: usize,
     ) -> bool {
-        let operand = |operand: &hir_ty::mir::Operand| match &operand.kind {
+        let operand = |operand: &hir_ty_mir::mir::Operand| match &operand.kind {
             OperandKind::Constant { .. } | OperandKind::Allocation { .. } => true,
             OperandKind::Copy(place) | OperandKind::Move(place) => {
                 place.projection.is_empty() && promotable(defs, temp, place.local, depth + 1)
@@ -330,7 +330,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
                 Some(Some(Rvalue::Use(it))) => operand(it),
                 // A closure that captures nothing too, `unwrap_or(&|_| true)`.
                 Some(Some(Rvalue::Aggregate(kind, operands))) => {
-                    !matches!(kind, hir_ty::mir::AggregateKind::Union(..))
+                    !matches!(kind, hir_ty_mir::mir::AggregateKind::Union(..))
                         && operands.iter().all(operand)
                 }
                 _ => false,
@@ -726,7 +726,9 @@ impl Loans {
                 }
                 StatementKind::InlineAsm(asm) => {
                     for operand in &asm.operands {
-                        if let hir_ty::mir::AsmOperand::Reg { output: Some(output), .. } = operand {
+                        if let hir_ty_mir::mir::AsmOperand::Reg { output: Some(output), .. } =
+                            operand
+                        {
                             self.kill_on_place(
                                 ctx,
                                 body,
@@ -876,7 +878,7 @@ pub(super) fn places_conflict<'db>(
 
 fn projection_conflict<'db>(
     ctx: &Ctx<'_, 'db>,
-    base: hir_ty::mir::PlaceTy<'_>,
+    base: hir_ty_mir::mir::PlaceTy<'_>,
     borrow: PlaceElem,
     access: PlaceElem,
     bias: Bias,
@@ -962,7 +964,7 @@ fn projection_conflict<'db>(
     }
 }
 
-fn array_len(ctx: &Ctx<'_, '_>, base: hir_ty::mir::PlaceTy<'_>) -> Option<u64> {
+fn array_len(ctx: &Ctx<'_, '_>, base: hir_ty_mir::mir::PlaceTy<'_>) -> Option<u64> {
     match base.ty.kind() {
         TyKind::Array(_, len) => {
             hir_ty::consteval::try_const_usize(ctx.db, len).map(|it| it as u64)

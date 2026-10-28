@@ -55,11 +55,20 @@ published archives, installed with `install.sh --version <v>` as a user installs
 - the install checks: `blaze --version` is the release's, `blaze new` + `blaze run` prints
   `Hello, world!`;
 - the whole smoke corpus (below), dev and `--release`, `blaze run` and `blaze test`;
+- each application of the corpus (below), in two jobs of its own per platform: **works** (its
+  dev and release builds run, its tests pass under `blaze test`) and **speed** (`harness/bench.py`
+  with the release's `blaze-engine`, beside plain cargo on the same runner: the cold build, the
+  no-op build, every edit and the tests are faster with blaze than with cargo, the program and
+  its tests do the same as cargo's, and nothing is more than 25% worse than the stable release's
+  numbers, which it keeps as assets `bench-<runner>-<app>.json`; a stable release without them,
+  as the first, is not compared). Hosted runners are shared, so 25% is their noise and not a
+  benchmark: docs/benchmarks.md's numbers come from the bench machines;
 - the train (`train.yaml`, every tier on every platform), dispatched on the tag: built from the
   commit the archives were built from. A train on a tag releases nothing and opens no issue.
 
-When every job passes, `.github/scripts/promote.py` marks the release stable and *Latest* and
-appends to its notes the line `Promoted to stable on <date> after <run URL>`. When one fails the
+When every job passes, `.github/scripts/promote.py` marks the release stable and *Latest*,
+appends to its notes the line `Promoted to stable on <date> after <run URL>`, and adds the
+applications' numbers to it. When one fails the
 release stays a canary, and an issue `Canary v... is not promoted to stable` is opened (or
 commented on, for a run again) with each failed job, each failed smoke case with its platform
 and the commands that repeat it after installing that release, and the run's link. A later
@@ -68,15 +77,18 @@ a newer one was promoted becomes stable but not *Latest*.
 
 By hand: `gh workflow run promote.yaml -f tag=v0.YYYYMMDD.N` tests that release again (after a
 flake, or a fix to the gate itself); `-f train-run=<id>` counts a green train run on the tag
-instead of starting another; `-f promote=false` tests without promoting or opening an issue. A pull request that
-changes the gate (`promote.yaml`, `promote.py`, the smoke corpus) runs it against the newest
-release, without the train, the promotion or an issue.
+instead of starting another; `-f promote=false` tests without promoting or opening an issue;
+`-f train=false` leaves the train out (and promotes nothing); `-f apps=zed,cargo` tests only those
+applications. A pull request that changes the gate (`promote.yaml`, `promote.py`, the smoke
+corpus) runs it against the newest release, without the applications, the train, the promotion
+or an issue.
 
 ## The smoke corpus
 
-`tests/smoke/` holds small programs that must build and run correctly with `blaze run` and
-`blaze test`, in dev and `--release`, each with the output it must print. `harness/smoke.py`
-runs them against a blaze (`BLAZE_BIN`, or `blaze` on PATH for an installed release).
+`harness/smoke/` holds small programs that must build and run correctly with `blaze run` and
+`blaze test`, in dev and `--release`, each with the output it must print, and the projects
+(`smoke.json`). `harness/smoke.py` runs them against a blaze (its input's `blaze`, or `blaze` on
+PATH for an installed release).
 
 - **std** (no dependencies; the merge gate runs these on every pull request, under two minutes):
   `HashMap` insert and iterate, `thread::spawn` + `join`, `thread_local!`, `Mutex`/`OnceLock`/
@@ -86,8 +98,16 @@ runs them against a blaze (`BLAZE_BIN`, or `blaze` on PATH for an installed rele
   clap's derive).
 - **projects** (real repositories at pinned commits): ripgrep, indexable-inc/anim, and blaze
   itself.
+- **apps** (large applications at pinned commits, with the system libraries each builds with
+  in its entry): cargo 0.92.0 (which says `cargo 1.91.0`), zed v1.24.4 (a window it does not open: `--help`; its tests are
+  those of the crates below gpui, since the whole suite with both builds is longer than a
+  hosted runner's six hours), servo v0.7.0 (`--version`; the tests of crates without a window
+  or a GPU), and bun's Rust port (bun-v1.4.3, after `harness/bunprep.py` built its C and C++ in
+  `nix develop .#bench-bun`). Each is also measured against cargo (above).
 
-The std cases are the merge gate's; all three groups are the promotion gate.
+The std cases are the merge gate's; all four groups are the promotion gate. blaze itself is in
+the corpus but not measured against cargo here: how fast blaze builds blaze is the self-build's
+measurement.
 
 ## Installing a channel
 

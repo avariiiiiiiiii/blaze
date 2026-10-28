@@ -4,7 +4,7 @@
 use la_arena::RawIdx;
 use smallvec::SmallVec;
 
-use hir_ty::mir::{BasicBlockId, MirBody, TerminatorKind};
+use hir_ty_mir::mir::{BasicBlockId, MirBody, TerminatorKind};
 
 /// A statement of a block, or its terminator when `statement` is the number of statements.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -264,7 +264,7 @@ impl Dominators {
 #[cfg(test)]
 mod tests {
     use super::{Dominators, block, index};
-    use hir_ty::mir::BasicBlockId;
+    use hir_ty_mir::mir::BasicBlockId;
 
     /// Whether `a` dominates `b`, from each block's set of dominators found to a fixed point.
     fn naive(count: usize, preds: &[Vec<BasicBlockId>], reachable: &[bool]) -> Vec<Vec<bool>> {

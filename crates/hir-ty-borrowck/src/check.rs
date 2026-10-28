@@ -1174,7 +1174,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 self.access_place(location, place, span, Access::Read, Allowed::No, depth);
                 self.check_if_path_or_subpath_is_moved(location, InitAction::Use, place, span);
             }
-            Rvalue::Aggregate(hir_ty::mir::AggregateKind::Closure(ty), operands) => {
+            Rvalue::Aggregate(hir_ty_mir::mir::AggregateKind::Closure(ty), operands) => {
                 self.propagate_used_mut_upvars(ty.as_ref(), operands);
                 rvalue
                     .for_each_operand(&mut |operand| self.consume_operand(location, operand, span))
@@ -2715,7 +2715,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     }
 
     fn check_movable_place(&mut self, location: Location, place: PlaceRef<'_>, span: MirSpan) {
-        let mut ty = hir_ty::mir::PlaceTy::from_ty(self.body.locals[place.local].ty.as_ref());
+        let mut ty = hir_ty_mir::mir::PlaceTy::from_ty(self.body.locals[place.local].ty.as_ref());
         if ty.ty.references_non_lt_error() {
             return;
         }
@@ -2795,7 +2795,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         it.kind,
                         StatementKind::Assign(
                             _,
-                            Rvalue::Aggregate(hir_ty::mir::AggregateKind::Closure(_), _)
+                            Rvalue::Aggregate(hir_ty_mir::mir::AggregateKind::Closure(_), _)
                         )
                     )
                 })
@@ -3336,7 +3336,7 @@ fn capture_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
         for statement in &block.statements {
             if let StatementKind::Assign(
                 _,
-                Rvalue::Aggregate(hir_ty::mir::AggregateKind::Closure(_), operands),
+                Rvalue::Aggregate(hir_ty_mir::mir::AggregateKind::Closure(_), operands),
             ) = &statement.kind
             {
                 for operand in operands.iter() {

@@ -2,7 +2,7 @@
 
 use blaze_protocol::events::{CrateState, Record};
 
-use crate::{Build, CYAN, Change, DIM, GREEN, paint, staying, summary_line, took};
+use crate::{Build, CYAN, Change, DIM, GREEN, fresh, paint, staying, summary_line, took};
 
 /// The most crates the region lists by name; the rest under way are counted.
 const SHOWN: usize = 6;
@@ -57,7 +57,7 @@ impl Live {
             out.push_str(line);
             out.push('\n');
         }
-        if let Some(finished) = &self.build.finished {
+        if let Some(finished) = self.build.finished.as_ref().filter(|it| !fresh(it)) {
             out.push_str(&summary_line(finished, self.color));
             out.push('\n');
         }
@@ -126,9 +126,11 @@ impl Live {
                 true => "\u{2514}\u{2500}",
                 false => "\u{251c}\u{2500}",
             };
-            let fns = match krate.fns.total {
-                0 => String::new(),
-                total => format!("  {}/{total} fns", krate.fns.done),
+            // A compile under way knows how many it did, and not yet of how many.
+            let fns = match (krate.fns.total, krate.fns.done) {
+                (0, 0) => String::new(),
+                (0, done) => format!("  {done} fns"),
+                (total, done) => format!("  {done}/{total} fns"),
             };
             let rest = format!("{}{fns}  {}", krate.name, since(krate.began_ns));
             lines.push(self.fit(CYAN, &format!("{:>14}", branch), &rest));

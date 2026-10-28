@@ -186,7 +186,7 @@ impl<'db> Filler<'db> {
         if alias.args.has_type_flags(TypeFlags::HAS_PARAM) || references_non_lt_error(&alias.args) {
             return None;
         }
-        let hidden = crate::opaques::rpit_hidden_types(db, func).get(idx)?;
+        let hidden = crate::rpit_hidden_types(db, func).get(idx)?;
         let hidden = hidden.get().instantiate(self.infcx.interner, alias.args).skip_norm_wip();
         (in_trait || hidden.has_type_flags(TypeFlags::HAS_TY_OPAQUE)).then_some(hidden)
     }
@@ -380,7 +380,7 @@ pub fn monomorphized<'db>(
 /// The opaque type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
 /// is with `args`, once they name the impl: `None` for one of another function, or while they
 /// don't.
-pub(crate) fn opaque_of_impl<'db>(
+pub fn opaque_of_impl<'db>(
     db: &'db dyn HirDatabase,
     env: ParamEnvAndCrate<'db>,
     opaque: InternedOpaqueTyId<'db>,
@@ -398,7 +398,7 @@ pub(crate) fn opaque_of_impl<'db>(
     }
     let interner = DbInterner::new_with(db, env.krate);
     // The arguments for the lifetimes the method's parameters leave out follow its own.
-    let elided = crate::lower::elided_lifetimes(db, func).len() as usize;
+    let elided = crate::elided_lifetimes(db, func).len() as usize;
     let own = args.len().checked_sub(elided)?;
     let (own, elided_args) = args.as_slice().split_at(own);
     // Which impl it is does not depend on lifetimes, and those of a solver's own are not ours.
@@ -411,7 +411,7 @@ pub(crate) fn opaque_of_impl<'db>(
     if implemented == func {
         return None;
     }
-    let args = match crate::lower::elided_lifetimes(db, implemented).len() as usize {
+    let args = match crate::elided_lifetimes(db, implemented).len() as usize {
         len if len == elided => {
             GenericArgs::new_from_iter(args.iter().chain(elided_args.iter().copied()))
         }

@@ -4,11 +4,12 @@ and `blaze test`, in dev and --release (docs/release.md, "The smoke corpus").
 
 usage: smoke.py [INPUT]          run the corpus
        smoke.py apt [INPUT]      the Debian packages the selected projects build with
+       smoke.py brew [INPUT]     the Homebrew packages they build with on macOS
 
 INPUT is one JSON object (inline, a file's path, or `-` for stdin; none is `{}`), every field
 optional:
 
-    {"groups": ["std", "crates", "projects"], "only": [NAME, ...], "profiles": ["dev", "release"],
+    {"groups": ["std", "crates", "projects", "apps"], "only": [NAME, ...], "profiles": ["dev", "release"],
      "blaze": "path of the `blaze` to run (default: the one on PATH)", "work": DIR,
      "results": "a JSON file of every result", "blaze_rev": "the commit of the project `blaze`"}
 
@@ -17,25 +18,32 @@ project whose `blaze run` prints exactly smoke/<name>/expected.txt (given `args`
 whose `blaze test` passes `tests` tests. A project is a repository at a pinned commit (`rev`;
 `{blaze}` is --blaze-rev, by default this checkout's HEAD), whose `runs` print what they say
 (`stdout` exactly, or `contains`, or a `file` that `starts` so) and whose `blaze test` (with the
-arguments of `test`) passes. A private repository is fetched with GH_TOKEN.
+arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
+`env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
+harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
+(bun: bunprep.py, its own build of its C and C++).
 
 Groups: `std` (no dependencies: the merge gate's, every pull request), `crates` (from
-crates.io), `projects`; all three are the gate a canary passes to become stable (promote.yaml).
+crates.io), `projects` (a project's default), and `apps` (the large applications, each in a job
+of its own in promote.yaml, with bench.py's times beside cargo's); all four are the gate a canary
+passes to become stable. Without `groups`, every group but `apps` runs.
 
 A case or project with `open` (an issue) is run and reported, and its failure does not fail the
 run. Each failure is printed with the command that repeats it. `results` is every result, for
 promote.yaml's issues. Stdlib only.
 """
-import base64, json, os, shlex, shutil, subprocess, sys, tempfile, time, typing
+import base64, importlib, json, os, shlex, shutil, subprocess, sys, tempfile, time, typing
 from dataclasses import dataclass, fields
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORPUS = os.path.join(HERE, "smoke")
+# A project's `prepare` is a module beside this one.
+sys.path.insert(0, HERE)
 EXE = ".exe" if os.name == "nt" else ""
-Group = typing.Literal["std", "crates", "projects"]
+Group = typing.Literal["std", "crates", "projects", "apps"]
 Profile = typing.Literal["dev", "release"]
-GROUPS = typing.get_args(Group)
+GROUPS = ("std", "crates", "projects")
 CASE_SECS = 900
 PROJECT_SECS = 3600
 # What blaze prints when something of the build was not its own (install.yaml looks for these too).
@@ -233,6 +241,20 @@ class Smoke:
                                      why=str(e), repro=clone, stdout="", stderr=""))
             print(f"FAILED   {name} fetch\n    {e}", flush=True)
             return
+        env = dict(base_env(), **spec.get("env", {}))
+        if "prepare" in spec:
+            began = time.monotonic()
+            try:
+                cwd, prepared = importlib.import_module(spec["prepare"]).prepare(cwd)
+            except (Exception, SystemExit) as e:
+                self.results.append(dict(what=f"{name} prepare", ok=False, open=spec.get("open"),
+                                         seconds=round(time.monotonic() - began, 1), why=str(e)[-3000:],
+                                         repro=f"{clone} && python3 harness/{spec['prepare']}.py .", stdout="", stderr=""))
+                print(f"FAILED   {name} prepare\n    {str(e)[-3000:]}", flush=True)
+                return
+            env.update(prepared)
+            print(f"ok       {name} prepare ({time.monotonic() - began:.1f} s)", flush=True)
+        seconds = spec.get("seconds", PROJECT_SECS)
         places = {"{work}": out_dir, "{input}": os.path.join(out_dir, "input.txt")}
         if "input" in spec:
             with open(places["{input}"], "w") as f:
@@ -243,7 +265,6 @@ class Smoke:
                 args = [a.replace(key, value) for a in args]
             return args
 
-        env = base_env()
         for profile in self.profiles:
             p = self.profile_args(profile)
             for i, step in enumerate(spec.get("runs", [])):
@@ -267,8 +288,8 @@ class Smoke:
                                 return f"{file} does not start with {step['starts']!r}"
                     return None
 
-                self.check(f"{name} {profile} run {i}", [self.blaze, "run", *args], cwd, env, PROJECT_SECS, ran,
-                           f"{clone} && {shown(['blaze', 'run', *args])}", spec.get("open"))
+                self.check(f"{name} {profile} run {i}", [self.blaze, "run", *args], cwd, env, seconds, ran,
+                           f"{clone} && {shown(['blaze', 'run', *args], spec.get('env'))}", spec.get("open"))
             if "test" in spec:
                 args = [*p, *spec["test"]]
 
@@ -278,8 +299,8 @@ class Smoke:
                         return f"exit {code}, {passed} passed, {failed} failed"
                     return None if passed else "no test ran"
 
-                self.check(f"{name} {profile} test", [self.blaze, "test", *args], cwd, env, PROJECT_SECS, tested,
-                           f"{clone} && {shown(['blaze', 'test', *args])}", spec.get("open"))
+                self.check(f"{name} {profile} test", [self.blaze, "test", *args], cwd, env, seconds, tested,
+                           f"{clone} && {shown(['blaze', 'test', *args], spec.get('env'))}", spec.get("open"))
 
 
 def zip_longest(a, b):
@@ -302,8 +323,8 @@ def summary(results, out):
 
 def main():
     words = sys.argv[1:]
-    apt = words[:1] == ["apt"]
-    if apt:
+    packages = words[0] if words[:1] in (["apt"], ["brew"]) else None
+    if packages:
         words = words[1:]
     if len(words) > 1 or words[:1] in (["-h"], ["--help"]):
         sys.exit(__doc__)
@@ -314,9 +335,11 @@ def main():
         sys.exit(f"smoke.py: INPUT field only: no case or project {', '.join(unknown)}")
     cases = {n: s for n, s in corpus["cases"].items() if s["group"] in args.groups and (not args.only or n in args.only)}
     projects = {n: s for n, s in corpus["projects"].items()
-                if "projects" in args.groups and (not args.only or n in args.only)}
-    if apt:
-        print(" ".join(sorted({p for s in projects.values() for p in s.get("apt", [])})))
+                if s.get("group", "projects") in args.groups and (not args.only or n in args.only)}
+    if left := sorted(set(args.only) - set(cases) - set(projects)):
+        sys.exit(f"smoke.py: INPUT field only names {', '.join(left)}, which INPUT's groups ({', '.join(args.groups)}) leave out")
+    if packages:
+        print(" ".join(sorted({p for s in projects.values() for p in s.get(packages, [])})))
         return
     if not args.blaze_rev:
         rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()

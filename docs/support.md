@@ -275,7 +275,7 @@ cargo" now means one of the two, and which is unverified.
 | proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by blaze | served; an edit to the proc-macro crate itself is cargo's |
 | build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; a change to a script or its inputs is cargo's, then the daemon reloads |
 | unit tests, integration tests, examples, benches | supported | served; adding or removing a `#[test]` is cargo's |
-| doctests | supported through `blaze test --doc` (`doctests.py`, 30 crates); documentation behind `cfg(doc)` is not seen | served; an example blaze cannot build is left to rustdoc with the reason |
+| doctests | supported through `blaze test --doc` (`doctests.py`, 30 crates); documentation behind `cfg(doc)` is not seen | served; an example blaze cannot build fails with the reason, as does a `compile_fail` example whose error blaze can't confirm |
 | features, optional and weak dependencies, feature unification under resolvers 1, 2 and 3 | supported | `--features` served; `--all-features` and `--no-default-features` handed to cargo |
 | `resolver.feature-unification` (`-Zfeature-unification`) | `selected` and `workspace` supported; `package` supported for one package, and refused with a reason for several, which it builds with other features each | as for a build |
 | path, git, registry, renamed, vendored, `[patch]` and `[replace]` dependencies | supported | served |

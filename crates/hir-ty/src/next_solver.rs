@@ -63,7 +63,7 @@ pub type FxIndexMap<K, V> = rustc_type_ir::data_structures::IndexMap<K, V>;
 
 /// The solver recurses once per nested goal and once per level of a type it relates, both as
 /// deep as `recursion_limit`.
-pub(crate) use stdx::ensure_sufficient_stack;
+pub use stdx::ensure_sufficient_stack;
 
 pub struct DefaultTypes<'db> {
     pub usize: Ty<'db>,

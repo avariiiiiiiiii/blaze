@@ -30,12 +30,11 @@ on:
       - ".github/workflows/nix-live.yaml"
   workflow_dispatch:
 
-# A pull request's newer push cancels its run before. On main one run at a time, as the train:
-# a push while it runs waits, and a newer push replaces the one waiting. A run cancelled by each
-# push would never end while main takes a merge every few minutes.
+# A newer push to main or to the pull request cancels the run before it, so what it says is of
+# the newest commit; a run by hand is never cancelled.
 concurrency:
-  group: nix-live-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: nix-live-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: 0
@@ -115,14 +114,16 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/toolchain
         with:
-          workspaces: |
-            . -> target
-            demo/life -> target
+          llvm: build
+      # blaze tests blaze (AGENTS.md rule blaze-builds-blaze) from the store main's tests job pushed.
+      - uses: ./.github/actions/blaze
+        with:
+          job: tests
       # blaze-live is a stub where live edits are not supported, and says so.
-      - run: cargo test --release -p blaze-live
+      - run: nix develop --command blaze test --release -p blaze-live --locked
+      # With cargo: what this checks is that the demo builds with rustc, as a user's would.
       - run: cargo build --locked
         working-directory: demo/life
       - name: window opens and stays up
@@ -147,10 +148,18 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      # blaze tests blaze (AGENTS.md rule blaze-builds-blaze) from the store main's tests job pushed.
+      - uses: ./.github/actions/blaze
+        with:
+          job: tests
       # Where it is real code: the whole of macos.rs and the patch format.
-      - run: cargo test --release -p blaze-live
+      - run: nix develop --command blaze test --release -p blaze-live --locked
+      # The blaze that edits the program: cargo's, with no cache, since the blaze that blaze
+      # builds runs about ten times slower until it inlines one function into another
+      # (https://github.com/indexable-inc/blaze/issues/899).
       - run: cargo build --release -p blaze-engine
       - name: edit a running program
         run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_e2e.py
@@ -160,6 +169,7 @@ jobs:
           for report in "$HOME"/Library/Logs/DiagnosticReports/*; do
             case "$report" in *blaze*|*liveprobe*) echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::";; esac
           done
+      # With cargo, as in the demo job.
       - name: the demo builds on macOS
         run: cargo build --locked
         working-directory: demo/life

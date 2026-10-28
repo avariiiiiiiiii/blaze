@@ -26,9 +26,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the branch or the pull request cancels the run before it; a release, the
+# weekly run and a run by hand each have a group of their own, so nothing cancels or replaces them.
 concurrency:
-  group: install-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: install-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   shellcheck:
@@ -116,9 +118,10 @@ jobs:
           grep -F "blaze has no channel nightly." out.txt
 
   # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
-  # the glibc a release asks for, with blaze's proc-macro server beside blaze. The profile may
-  # be of older crates (no --strict); build_release.py refuses a binary that asks for a glibc
-  # newer than RHEL 9's.
+  # the glibc a release asks for, with blaze's proc-macro server beside blaze, and with no PGO,
+  # as release.yaml builds it: with a profile older than the crates the build sat silent past
+  # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
+  # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
   archive:
     name: this commit's build
     runs-on: ubuntu-22.04
@@ -126,11 +129,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component rust-src && rustup default "$tc"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: install-dist
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --server
+      # cargo and rustc, with no cache: this is the release's own recipe (build_release.py, the
+      # dist profile), and the recipe is what it checks.
+      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --no-pgo --server
+        timeout-minutes: 40
       - name: archive
         run: |
           name=blaze-commit-x86_64-unknown-linux-gnu

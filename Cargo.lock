@@ -723,6 +723,7 @@ dependencies = [
  "blaze-build-script",
  "blaze-cache",
  "blaze-fmt",
+ "blaze-in-place",
  "blaze-lints",
  "blaze-live",
  "blaze-macro-wasm",
@@ -822,6 +823,7 @@ dependencies = [
  "blaze-lints",
  "blaze-live",
  "blaze-macro-wasm",
+ "blaze-splice",
  "blaze-store",
  "blaze-wasi",
  "cargo_metadata",
@@ -845,7 +847,6 @@ dependencies = [
  "mimalloc",
  "object 0.37.3",
  "paths",
- "pdb",
  "proc-macro-api",
  "project-model",
  "pulldown-cmark",
@@ -921,6 +922,13 @@ dependencies = [
 [[package]]
 name = "blaze-fuzz"
 version = "0.20261028.1"
+
+[[package]]
+name = "blaze-in-place"
+version = "0.20261028.1"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "blaze-lints"
@@ -1083,6 +1091,23 @@ dependencies = [
  "semver",
  "serde",
  "url",
+]
+
+[[package]]
+name = "blaze-splice"
+version = "0.20261028.1"
+dependencies = [
+ "anyhow",
+ "blaze-in-place",
+ "blaze-live",
+ "libc",
+ "memmap2",
+ "object 0.37.3",
+ "pdb",
+ "rustc-hash 2.1.2",
+ "sha2 0.10.9",
+ "wasm-encoder 0.244.0",
+ "wasmparser 0.236.1",
 ]
 
 [[package]]

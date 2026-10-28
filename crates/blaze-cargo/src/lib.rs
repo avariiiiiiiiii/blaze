@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use blaze_in_place as splice;
+
 pub mod answers;
 pub mod as_rustc;
 pub mod cargo;
@@ -25,7 +27,6 @@ pub mod remote;
 pub mod renamed;
 pub mod sandbox;
 pub mod socket;
-pub mod splice;
 pub mod stub;
 pub mod symbols;
 pub mod trace;

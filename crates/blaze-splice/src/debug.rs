@@ -29,7 +29,7 @@ use rustc_hash::FxHashMap;
 use super::{Machine, Patch, Target};
 
 /// The section headers of an executable, and the sections among them a debugger reads.
-pub(super) struct Described {
+pub struct Described {
     headers: Vec<elf::SectionHeader64<Endianness>>,
     /// Where the linker put the section headers.
     table: u64,
@@ -47,19 +47,19 @@ const ROOM: u64 = 1 << 20;
 
 /// A filesystem block: a run written again as far into a block as it was can share the
 /// blocks of the original, where the filesystem shares blocks between files.
-pub(super) const BLOCK: u64 = 4096;
+pub const BLOCK: u64 = 4096;
 
 /// A run of the file that is written again further on.
 #[derive(PartialEq)]
-pub(super) struct Moved {
-    pub(super) from: u64,
-    pub(super) len: u64,
-    pub(super) to: u64,
+pub struct Moved {
+    pub from: u64,
+    pub len: u64,
+    pub to: u64,
 }
 
 /// Where each section of [`Described::laid`] is copied to, and where the room behind it ends.
 #[derive(Clone, Default)]
-pub(super) struct Copies {
+pub struct Copies {
     at: Vec<(u64, u64)>,
     /// Where the last room ends: what is behind it is written again by every splice.
     end: u64,
@@ -67,17 +67,17 @@ pub(super) struct Copies {
 
 /// What a splice writes behind everything else for a debugger.
 #[derive(Default)]
-pub(super) struct Tail {
+pub struct Tail {
     /// What is copied further on before anything else is written: what the patch outgrew or
     /// the code it appends reaches. Each run is let go of once copied.
-    pub(super) moved: Vec<Moved>,
+    pub moved: Vec<Moved>,
     /// What is copied behind the last room from where the linker left it, which stays.
-    pub(super) copied: Vec<Moved>,
-    pub(super) written: Vec<(u64, Vec<u8>)>,
+    pub copied: Vec<Moved>,
+    pub written: Vec<(u64, Vec<u8>)>,
     /// Where the section headers are and how many, when they are among what is written.
-    pub(super) headers: Option<(u64, u16)>,
+    pub headers: Option<(u64, u16)>,
     /// Where the sections are once the splice is through.
-    pub(super) copies: Copies,
+    pub copies: Copies,
 }
 
 /// What a patch adds to the sections a debugger reads.
@@ -92,7 +92,7 @@ struct Added {
 }
 
 impl Described {
-    pub(super) fn read(file: &ElfFile64<'_, Endianness>) -> anyhow::Result<Described> {
+    pub fn read(file: &ElfFile64<'_, Endianness>) -> anyhow::Result<Described> {
         let endian = file.endian();
         let headers = file.elf_header().section_headers(endian, file.data())?.to_vec();
         let mut sections = FxHashMap::default();
@@ -122,7 +122,7 @@ impl Described {
     /// The runs a splice copies behind `offset` before a patch adds anything, and where they
     /// are then: the splices that come find them there. Nothing, of an executable that tells
     /// a debugger nothing.
-    pub(super) fn laid_out(&self, offset: u64) -> (Vec<Moved>, Copies) {
+    pub fn laid_out(&self, offset: u64) -> (Vec<Moved>, Copies) {
         let mut copies = Copies { at: Vec::new(), end: offset };
         if !self.says_lines() {
             return (Vec::new(), copies);
@@ -139,7 +139,7 @@ impl Described {
 
     /// The sections where the linker left them, with no room behind any: what a splice finds
     /// when they could not be laid out.
-    pub(super) fn as_linked(&self) -> Copies {
+    pub fn as_linked(&self) -> Copies {
         let e = Endianness::Little;
         let at = (self.laid.iter())
             .map(|&it| {
@@ -152,7 +152,7 @@ impl Described {
 
     /// Where the linker put the section headers, and them with the sections where `copies`
     /// has them: what a debugger finds of a file no splice has written over.
-    pub(super) fn pointed(&self, copies: &Copies) -> (u64, Vec<u8>) {
+    pub fn pointed(&self, copies: &Copies) -> (u64, Vec<u8>) {
         let e = Endianness::Little;
         let mut headers = self.headers.clone();
         for (&index, &(at, _)) in self.laid.iter().zip(&copies.at) {

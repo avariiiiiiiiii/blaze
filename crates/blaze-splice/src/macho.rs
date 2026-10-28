@@ -107,7 +107,7 @@ fn push_uleb(out: &mut Vec<u8>, mut value: u64) {
 
 /// What a splice has to know of the executable. Nothing of the file is read again but the
 /// pages a splice writes to, for their hashes.
-pub(super) struct Image {
+pub struct Image {
     /// The header and the load commands.
     commands: Vec<u8>,
     /// Where the first section starts in the file: the load commands end before it.
@@ -363,7 +363,7 @@ impl Signature {
 
 /// What a splice appended behind what the linker wrote, and the hashes of its pages: most of
 /// it is `__LINKEDIT` as the linker wrote it, which the next splice appends again.
-pub(super) struct Appended {
+pub struct Appended {
     offset: u64,
     page: usize,
     bytes: Vec<u8>,
@@ -457,13 +457,13 @@ impl Rebases {
 impl Image {
     /// Whether a patch can call the C symbol `name`: the executable defines it, or has the
     /// address slot of the library's that defines it, as a patch reaches what it calls.
-    pub(super) fn can_call(&self, name: &str) -> bool {
+    pub fn can_call(&self, name: &str) -> bool {
         self.gives(format!("_{name}").as_bytes())
     }
 
     /// Whether a patch that refers to the symbol `name`, as its object names it, is given
     /// what it names.
-    pub(super) fn gives(&self, name: &[u8]) -> bool {
+    pub fn gives(&self, name: &[u8]) -> bool {
         match self.symbols.get(name) {
             Some(Named::One(defined)) => defined.kind != SymbolKind::Tls,
             Some(Named::Many) => false,
@@ -471,7 +471,7 @@ impl Image {
         }
     }
 
-    pub(super) fn read(bytes: &[u8]) -> anyhow::Result<Image> {
+    pub fn read(bytes: &[u8]) -> anyhow::Result<Image> {
         ensure!(
             u32_at(bytes, 0)? == macho::MH_MAGIC_64 && u32_at(bytes, 4)? == macho::CPU_TYPE_ARM64,
             "not an AArch64 executable"
@@ -702,11 +702,7 @@ impl Image {
     /// Takes the signature of `bytes`, the executable as someone else signed it again after
     /// the splice `undo` puts back. Each splice starts from the file as it was before any,
     /// so the hashes of the pages `undo` puts back are of what it puts back.
-    pub(super) fn signed_again(
-        &mut self,
-        bytes: &[u8],
-        undo: &[(u64, Vec<u8>)],
-    ) -> anyhow::Result<()> {
+    pub fn signed_again(&mut self, bytes: &[u8], undo: &[(u64, Vec<u8>)]) -> anyhow::Result<()> {
         let count = u32_at(bytes, 16)?;
         let (mut at, mut uuid, mut signature) = (HEADER, None, None);
         for _ in 0..count {
@@ -1153,7 +1149,7 @@ impl Code {
 }
 
 /// A patch object, and what of the executable it needs.
-pub(super) struct Patch<'a> {
+pub struct Patch<'a> {
     file: object::File<'a>,
     /// The sections that are loaded, by the segment they go to.
     sections: [Vec<SectionIndex>; 2],
@@ -1217,8 +1213,8 @@ impl Fixup {
     }
 }
 
-pub(super) struct Replaced<'a> {
-    pub(super) name: &'a [u8],
+pub struct Replaced<'a> {
+    pub name: &'a [u8],
     section: SectionIndex,
     offset: u64,
     /// To the next symbol of its section, or its end: no symbol has a size.
@@ -2067,7 +2063,7 @@ struct Laid {
 
 /// The patch laid out at `base` of a program that runs the executable `image` was read
 /// from, for the program to apply in its memory.
-pub(super) fn live(
+pub fn live(
     image: &Image,
     baked: &[Box<[u8]>],
     originals: &FxHashMap<u64, Vec<u8>>,
@@ -2083,7 +2079,7 @@ pub(super) fn live(
 }
 
 /// The `LC_UUID` of the executable, which names it to a running program.
-pub(super) fn uuid(image: &Image) -> Option<[u8; 16]> {
+pub fn uuid(image: &Image) -> Option<[u8; 16]> {
     uuid_of(&image.commands)
 }
 
@@ -2096,13 +2092,13 @@ pub(super) fn uuid(image: &Image) -> Option<[u8; 16]> {
 /// for the patch's frames and for the program to grow before it is short again. `None` for
 /// one that has the room,
 /// and for one that is not an AArch64 executable with unwind tables.
-pub(super) fn headerpad_short(commands: &[u8]) -> anyhow::Result<Option<u64>> {
+pub fn headerpad_short(commands: &[u8]) -> anyhow::Result<Option<u64>> {
     Ok(headerpad_wanted(commands)?.and_then(|(pad, short)| short.then_some(pad)))
 }
 
 /// The `-headerpad` of [`headerpad_short`] whether or not the executable has the room, and
 /// whether it is short of it.
-pub(super) fn headerpad_wanted(commands: &[u8]) -> anyhow::Result<Option<(u64, bool)>> {
+pub fn headerpad_wanted(commands: &[u8]) -> anyhow::Result<Option<(u64, bool)>> {
     let executable = u32_at(commands, 0)? == macho::MH_MAGIC_64
         && u32_at(commands, 4)? == macho::CPU_TYPE_ARM64
         && u32_at(commands, 12)? == macho::MH_EXECUTE;
@@ -2152,7 +2148,7 @@ fn room_wanted(len: usize, unwind: Option<usize>, frames: Option<usize>) -> Opti
 /// Where in an AArch64 object that starts with `commands`, its header and load commands, its
 /// `__eh_frame` and its `__compact_unwind` are: the offset in the file and the size of each it
 /// has. `None` for a file that is not such an object.
-pub(super) fn unwind_sections(commands: &[u8]) -> anyhow::Result<Option<[Option<(u64, u64)>; 2]>> {
+pub fn unwind_sections(commands: &[u8]) -> anyhow::Result<Option<[Option<(u64, u64)>; 2]>> {
     let object = u32_at(commands, 0)? == macho::MH_MAGIC_64
         && u32_at(commands, 4)? == macho::CPU_TYPE_ARM64
         && u32_at(commands, 12)? == macho::MH_OBJECT;
@@ -2187,14 +2183,14 @@ pub(super) fn unwind_sections(commands: &[u8]) -> anyhow::Result<Option<[Option<
 /// the room for splices at once: one whose frames are far more than the default room makes a
 /// large program be linked twice (#173).
 #[derive(Debug, Default)]
-pub(super) struct Unwinding {
+pub struct Unwinding {
     frames: usize,
     functions: usize,
 }
 
 impl Unwinding {
     /// The `__eh_frame` of an object: its bytes, and a function for each frame (FDE) in it.
-    pub(super) fn add_frames(&mut self, section: &[u8]) -> anyhow::Result<()> {
+    pub fn add_frames(&mut self, section: &[u8]) -> anyhow::Result<()> {
         self.frames += section.len();
         let mut at = 0;
         while at + 8 <= section.len() {
@@ -2212,7 +2208,7 @@ impl Unwinding {
     }
 
     /// The `__compact_unwind` of an object, `size` bytes: a function for each entry.
-    pub(super) fn add_compact(&mut self, size: u64) {
+    pub fn add_compact(&mut self, size: u64) {
         const ENTRY: u64 = 32;
         self.functions += (size / ENTRY) as usize;
     }
@@ -2223,7 +2219,7 @@ impl Unwinding {
     /// its common encodings and personalities are under 1 KB; its `__eh_frame` is at most the
     /// objects'. A link with `-no_compact_unwind` writes no table, so the frames are what
     /// moves: the larger of the two. `None` when they have no unwind information.
-    pub(super) fn headerpad(&self) -> Option<u64> {
+    pub fn headerpad(&self) -> Option<u64> {
         // The executable's load commands, which only a link knows: more than any program's
         // has, and a quarter of it is all the pad depends on.
         const COMMANDS: usize = 0x4000;
@@ -2271,7 +2267,7 @@ struct Addition {
 
 /// Brings the executable at `path` from what the linker wrote to that with `patch` in place
 /// of the functions it defines.
-pub(super) fn splice(
+pub fn splice(
     image: &Image,
     path: &Path,
     baked: &[Box<[u8]>],

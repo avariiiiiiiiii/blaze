@@ -721,6 +721,7 @@
      "blaze-build-script",
      "blaze-cache",
      "blaze-fmt",
+     "blaze-in-place",
      "blaze-lints",
      "blaze-live",
      "blaze-macro-wasm",
@@ -820,6 +821,7 @@
      "blaze-lints",
      "blaze-live",
      "blaze-macro-wasm",
+     "blaze-splice",
      "blaze-store",
      "blaze-wasi",
      "cargo_metadata",
@@ -843,7 +845,6 @@
      "mimalloc",
      "object 0.37.3",
      "paths",
-     "pdb",
      "proc-macro-api",
      "project-model",
      "pulldown-cmark",
@@ -920,6 +921,13 @@
    },
    {
     "name": "blaze-fuzz",
+    "version": "0.20261028.1"
+   },
+   {
+    "dependencies": [
+     "libc"
+    ],
+    "name": "blaze-in-place",
     "version": "0.20261028.1"
    },
    {
@@ -1083,6 +1091,23 @@
      "url"
     ],
     "name": "blaze-source",
+    "version": "0.20261028.1"
+   },
+   {
+    "dependencies": [
+     "anyhow",
+     "blaze-in-place",
+     "blaze-live",
+     "libc",
+     "memmap2",
+     "object 0.37.3",
+     "pdb",
+     "rustc-hash 2.1.2",
+     "sha2 0.10.9",
+     "wasm-encoder 0.244.0",
+     "wasmparser 0.236.1"
+    ],
+    "name": "blaze-splice",
     "version": "0.20261028.1"
    },
    {
@@ -8035,6 +8060,23 @@
    },
    "version": "0.20261028.1"
   },
+  "blaze-in-place@0.20261028.1": {
+   "authors": "blaze contributors",
+   "description": "Waiting for and copying an executable blaze splices edits into in place",
+   "homepage": "https://ix.dev/blaze",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-in-place",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-in-place",
+    "kind": "path"
+   },
+   "version": "0.20261028.1"
+  },
   "blaze-lints@0.20261028.1": {
    "authors": "blaze contributors",
    "description": "clippy's lints, owned by blaze: computed from rust-analyzer's analysis, with clippy's names, levels, groups, configuration and messages",
@@ -8201,6 +8243,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-source",
+    "kind": "path"
+   },
+   "version": "0.20261028.1"
+  },
+  "blaze-splice@0.20261028.1": {
+   "authors": "blaze contributors",
+   "description": "blaze's splice: an edit's functions written into the executable of the last link, ELF, Mach-O, PE and wasm",
+   "homepage": "https://ix.dev/blaze",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-splice",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-splice",
     "kind": "path"
    },
    "version": "0.20261028.1"
@@ -19026,6 +19085,10 @@
        "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
       },
       {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
       },
@@ -19404,6 +19467,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -19486,10 +19553,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -19645,6 +19708,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -19727,10 +19794,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -19886,6 +19949,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -19968,10 +20035,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -20168,6 +20231,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -20250,10 +20317,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -20530,6 +20593,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-in-place@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_in_place"
     },
     "blaze-lints@0.20261028.1 lib blaze_lints build": {
      "crate_type": "lib",
@@ -21110,6 +21198,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_source"
+    },
+    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      },
+      {
+       "name": "memmap2",
+       "unit": "memmap2@0.9.11 lib memmap2 build"
+      },
+      {
+       "name": "object",
+       "unit": "object@0.37.3 lib object build"
+      },
+      {
+       "name": "pdb",
+       "unit": "pdb@0.8.0 lib pdb build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha2",
+       "unit": "sha2@0.10.9 lib sha2 build"
+      },
+      {
+       "name": "wasm_encoder",
+       "unit": "wasm-encoder@0.244.0 lib wasm_encoder build"
+      },
+      {
+       "name": "wasmparser",
+       "unit": "wasmparser@0.236.1 lib wasmparser build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-splice@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_splice"
     },
     "blaze-store@0.20261028.1 lib blaze_store build": {
      "crate_type": "lib",
@@ -39905,6 +40058,10 @@
        "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
       },
       {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
       },
@@ -40283,6 +40440,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -40365,10 +40526,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -40524,6 +40681,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -40606,10 +40767,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -40765,6 +40922,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -40847,10 +41008,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -41047,6 +41204,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -41129,10 +41290,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -41409,6 +41566,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-in-place@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_in_place"
     },
     "blaze-lints@0.20261028.1 lib blaze_lints build": {
      "crate_type": "lib",
@@ -41989,6 +42171,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_source"
+    },
+    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      },
+      {
+       "name": "memmap2",
+       "unit": "memmap2@0.9.11 lib memmap2 build"
+      },
+      {
+       "name": "object",
+       "unit": "object@0.37.3 lib object build"
+      },
+      {
+       "name": "pdb",
+       "unit": "pdb@0.8.0 lib pdb build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha2",
+       "unit": "sha2@0.10.9 lib sha2 build"
+      },
+      {
+       "name": "wasm_encoder",
+       "unit": "wasm-encoder@0.244.0 lib wasm_encoder build"
+      },
+      {
+       "name": "wasmparser",
+       "unit": "wasmparser@0.236.1 lib wasmparser build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-splice@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_splice"
     },
     "blaze-store@0.20261028.1 lib blaze_store build": {
      "crate_type": "lib",
@@ -60657,6 +60904,10 @@
        "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
       },
       {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
       },
@@ -61035,6 +61286,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -61117,10 +61372,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -61276,6 +61527,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -61358,10 +61613,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -61517,6 +61768,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -61599,10 +61854,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -61799,6 +62050,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -61881,10 +62136,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -62161,6 +62412,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-in-place@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_in_place"
     },
     "blaze-lints@0.20261028.1 lib blaze_lints build": {
      "crate_type": "lib",
@@ -62741,6 +63017,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_source"
+    },
+    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      },
+      {
+       "name": "memmap2",
+       "unit": "memmap2@0.9.11 lib memmap2 build"
+      },
+      {
+       "name": "object",
+       "unit": "object@0.37.3 lib object build"
+      },
+      {
+       "name": "pdb",
+       "unit": "pdb@0.8.0 lib pdb build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha2",
+       "unit": "sha2@0.10.9 lib sha2 build"
+      },
+      {
+       "name": "wasm_encoder",
+       "unit": "wasm-encoder@0.244.0 lib wasm_encoder build"
+      },
+      {
+       "name": "wasmparser",
+       "unit": "wasmparser@0.236.1 lib wasmparser build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-splice@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_splice"
     },
     "blaze-store@0.20261028.1 lib blaze_store build": {
      "crate_type": "lib",
@@ -81563,6 +81904,10 @@
        "unit": "blaze-fmt@0.20261028.1 lib blaze_fmt build"
       },
       {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.20261028.1 lib blaze_lints build"
       },
@@ -81941,6 +82286,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -82023,10 +82372,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -82182,6 +82527,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -82264,10 +82613,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -82423,6 +82768,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -82505,10 +82854,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -82705,6 +83050,10 @@
        "unit": "blaze-macro-wasm@0.20261028.1 lib blaze_macro_wasm build"
       },
       {
+       "name": "blaze_splice",
+       "unit": "blaze-splice@0.20261028.1 lib blaze_splice build"
+      },
+      {
        "name": "blaze_store",
        "unit": "blaze-store@0.20261028.1 lib blaze_store build"
       },
@@ -82787,10 +83136,6 @@
       {
        "name": "paths",
        "unit": "paths@0.0.0 lib paths build"
-      },
-      {
-       "name": "pdb",
-       "unit": "pdb@0.8.0 lib pdb build"
       },
       {
        "name": "proc_macro_api",
@@ -83067,6 +83412,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-in-place@0.20261028.1 lib blaze_in_place build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-in-place@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_in_place"
     },
     "blaze-lints@0.20261028.1 lib blaze_lints build": {
      "crate_type": "lib",
@@ -83647,6 +84017,71 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_source"
+    },
+    "blaze-splice@0.20261028.1 lib blaze_splice build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "blaze_in_place",
+       "unit": "blaze-in-place@0.20261028.1 lib blaze_in_place build"
+      },
+      {
+       "name": "blaze_live",
+       "unit": "blaze-live@0.1.0 lib blaze_live build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.186 lib libc build"
+      },
+      {
+       "name": "memmap2",
+       "unit": "memmap2@0.9.11 lib memmap2 build"
+      },
+      {
+       "name": "object",
+       "unit": "object@0.37.3 lib object build"
+      },
+      {
+       "name": "pdb",
+       "unit": "pdb@0.8.0 lib pdb build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha2",
+       "unit": "sha2@0.10.9 lib sha2 build"
+      },
+      {
+       "name": "wasm_encoder",
+       "unit": "wasm-encoder@0.244.0 lib wasm_encoder build"
+      },
+      {
+       "name": "wasmparser",
+       "unit": "wasmparser@0.236.1 lib wasmparser build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-splice@0.20261028.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_splice"
     },
     "blaze-store@0.20261028.1 lib blaze_store build": {
      "crate_type": "lib",

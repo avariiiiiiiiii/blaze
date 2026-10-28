@@ -50,3 +50,25 @@ starts on its metadata, from 62.4 s to 80.0 s, so the two overlap by 9 s.
 `blaze-lints` (`cargo/own/clippy.rs`) and on `blaze-macro-wasm` (`compile_time`,
 `own_macro`), so it starts after the front end's metadata. With those four edges cut, it
 could compile alongside `hir-ty`.
+
+## (b, second half) the splice is a crate of its own, `blaze-splice`
+
+`splice.rs` (now `blaze-splice`'s `lib.rs`) and `splice/` moved to `crates/blaze-splice`, and
+`unwritten` and `copy_file`, which `blaze-cargo` and the splice both need, to
+`crates/blaze-in-place`. Before is (b) at 066bad223e; after is this on it. Every cold build
+starts from an empty target, ABAB.
+
+| | (b) | (b) + splice |
+|---|---:|---:|
+| cold | 80.3, 83.8 | 74.4, 74.5 |
+| edit `blaze-engine/src/lib.rs` | 20.8, 20.9 | 18.4, 18.2 |
+| edit `splice.rs` (`blaze-splice/src/lib.rs` after) | 19.7, 20.0 | 18.9, 17.8 |
+| edit `splice/macho.rs` | 19.5, 19.4 | 18.2, 18.3 |
+| edit `cargo/daemon.rs` | 28.3, 28.5 | 27.6, 27.6 |
+
+`blaze-splice` depends on none of the front end, so it compiles from 7.3 s to 11.2 s of the cold build, beside
+everything else, and the engine, 8k lines smaller, compiles in 15.9 s instead of 18.5 s.
+
+A first version had `blaze-cargo` depend on `blaze-splice` for `unwritten` and `copy_file`.
+An edit of the splice then compiled `blaze-cargo` and the engine again, one after the other:
+30.3 s, against 20.5 s before. That is why `blaze-in-place` is a crate of its own.

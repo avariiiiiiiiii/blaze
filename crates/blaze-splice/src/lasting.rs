@@ -1,5 +1,5 @@
 //! The statics a patch defines that the executable has no copy of, which every patch after
-//! defines again under the same name ([`hir_ty_codegen::LASTING_STATIC`]): patches hold all
+//! defines again under the same name ([`crate::LASTING_STATIC`]): patches hold all
 //! that differs from the base, and a static new since the base is in each. The running program
 //! keeps the first copy it was given, with what was written to it since, so that a static
 //! that counts or caches (a component's id) goes on doing so across edits.
@@ -16,15 +16,15 @@ use rustc_hash::FxHashMap;
 
 /// Whether `name`, of a symbol of a patch, is of a static a patch defines anew. A Mach-O
 /// name has `_` in front.
-pub(crate) fn is_lasting(name: &[u8]) -> bool {
+pub fn is_lasting(name: &[u8]) -> bool {
     let name = name.strip_prefix(b"_").unwrap_or(name);
-    name.starts_with(hir_ty_codegen::LASTING_STATIC.as_bytes())
+    name.starts_with(crate::LASTING_STATIC.as_bytes())
 }
 
 /// The name of the base's copy of a static that `name`, of a symbol of a patch, says the patch
-/// left behind ([`hir_ty_codegen::MOVED_STATIC`]), with the `_` of a Mach-O name in front.
-pub(crate) fn left_behind(name: &[u8]) -> Option<Vec<u8>> {
-    let prefix = hir_ty_codegen::MOVED_STATIC.as_bytes();
+/// left behind ([`crate::MOVED_STATIC`]), with the `_` of a Mach-O name in front.
+pub fn left_behind(name: &[u8]) -> Option<Vec<u8>> {
+    let prefix = crate::MOVED_STATIC.as_bytes();
     match name.strip_prefix(b"_").and_then(|it| it.strip_prefix(prefix)) {
         Some(rest) => Some([b"_", rest].concat()),
         None => name.strip_prefix(prefix).map(<[u8]>::to_vec),
@@ -33,7 +33,7 @@ pub(crate) fn left_behind(name: &[u8]) -> Option<Vec<u8>> {
 
 /// Where a running program has each static that patches defined anew, by its name.
 #[derive(Clone, Default)]
-pub(crate) struct Lasting {
+pub struct Lasting {
     at: FxHashMap<Box<[u8]>, Kept>,
     /// The lowest place given to one in the room, which they take from its end down; 0 when
     /// the program takes none there (an older `blaze-live`, or a splice's).
@@ -49,37 +49,37 @@ struct Kept {
 }
 
 /// A static a patch defines anew, where the patch has its own copy.
-pub(crate) struct Own {
-    pub(crate) name: Box<[u8]>,
-    pub(crate) size: u64,
-    pub(crate) align: u64,
+pub struct Own {
+    pub name: Box<[u8]>,
+    pub size: u64,
+    pub align: u64,
 }
 
 impl Lasting {
     /// Those a splice left in the executable, where it put them.
-    pub(crate) fn in_executable(at: impl IntoIterator<Item = (Box<[u8]>, u64)>) -> Lasting {
+    pub fn in_executable(at: impl IntoIterator<Item = (Box<[u8]>, u64)>) -> Lasting {
         let at = at.into_iter().map(|(name, address)| (name, Kept { address, in_room: false }));
         Lasting { at: at.collect(), low: 0 }
     }
 
     /// For a program whose room ends at `end`, when it takes statics there.
-    pub(crate) fn with_room(mut self, end: Option<u64>) -> Lasting {
+    pub fn with_room(mut self, end: Option<u64>) -> Lasting {
         self.low = end.unwrap_or(0);
         self
     }
 
     /// Where the room's statics start: the patches go below.
-    pub(crate) fn low(&self) -> Option<u64> {
+    pub fn low(&self) -> Option<u64> {
         (self.low != 0).then_some(self.low)
     }
 
-    pub(crate) fn address(&self, name: &[u8]) -> Option<u64> {
+    pub fn address(&self, name: &[u8]) -> Option<u64> {
         self.at.get(name).map(|it| it.address)
     }
 
     /// Gives each of `own` that has no place yet one in the room, when the program has one:
     /// without, the patch's own copy is the program's until the next patch.
-    pub(crate) fn place(&mut self, own: &[Own]) -> anyhow::Result<()> {
+    pub fn place(&mut self, own: &[Own]) -> anyhow::Result<()> {
         if self.low == 0 {
             return Ok(());
         }
@@ -97,7 +97,7 @@ impl Lasting {
     }
 
     /// Notes where those of `own` are that have no place but the patch's copy, at `copies`.
-    pub(crate) fn note(&mut self, copies: impl IntoIterator<Item = (Box<[u8]>, u64)>) {
+    pub fn note(&mut self, copies: impl IntoIterator<Item = (Box<[u8]>, u64)>) {
         for (name, address) in copies {
             self.at.entry(name).or_insert(Kept { address, in_room: false });
         }
@@ -106,7 +106,7 @@ impl Lasting {
     /// The first value of each of `own` that is in the room, from the patch's own copy where
     /// `copy` says the patch laid it out: an offset into `laid`, what the patch was laid out
     /// as from `base`, and `pointers`, where `laid` stores an address, as offsets into it.
-    pub(crate) fn first_values(
+    pub fn first_values(
         &self,
         own: &[Own],
         copy: impl Fn(&[u8]) -> Option<u64>,

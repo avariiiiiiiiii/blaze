@@ -8,6 +8,8 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+## [0.20261028.3] - 2026-10-28
+
 ### Added
 
 - Git-index registries can be resolved and fetched, including offline use of Cargo's index and archive caches; failed index updates are reported instead of using an old tree (#316).
@@ -75,6 +77,51 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   the stack that does not track its caller, under the file name the build uses (#862). A function
   with such a constant was refused. docs/support.md no longer lists it, nor `%` on floats or
   `type_id` of a type with lifetimes in a constant, which already matched rustc.
+
+### Merged
+
+- answers test: an Apple target's spec under MACOSX_DEPLOYMENT_TARGET is answered (main's gate red) (#902)
+- doctests run no cargo, rustc or rustdoc: the doctest load's build scripts and proc macros are blaze's, and a compile_fail example passes only on an error rustc gives too (else it fails with the reason) (#897)
+- build events: the daemon speaks deterministic CBOR frames, workers publish typed build events (steps, per-crate fns, every fn an edit rebuilt and why), blaze renders them live on a TTY and as cargo-like lines off one; blaze why; --events json|cbor (supersedes #851's transport) (#878)
+- promote.yaml: cargo, zed, servo and bun in the gate to stable (works, and faster than cargo) (#887)
+- hir-ty-mir: MIR's passes are a crate of their own (crate split 4c); a pass edit 54 -> 40 s (#904)
+- release profiles build with LLVM at the profile's opt-level; dev stays Cranelift (#831)
+- blaze test: hermetic tests are kept by their code by default; why each test is not, as NDJSON (tests.ndjson, --why) (#836)
+- Preserve stateful WASM proc macros within each calling crate (#830)
+- const macros design doc (#909)
+- site: the home page is a Brilliant-style course on how blaze works, with lesson sounds (#911)
+- site: wrangler names the real Cloudflare resources so deploys work after the rename (#913)
+- consteval tests of const traits, derive_const, const closures and fn pointers against nightly (#917)
+- proc macros: require bidirectional source-span queries (#889)
+- library/: the standard library's source in the repository (nightly-2026-10-27), merged by the daily bump (#922)
+- corpus case for const traits, derive_const, const closures and a const hasher; docs/const.md (#919)
+- const eval: step and memory budget per evaluation, [workspace.metadata.blaze] const-eval (#912)
+- registry: read and cache git registry indexes (#891)
+- Windows CI builds blaze with cargo's stable build-dir layout (#921)
+- const purity query (#860): fn-cache stops at const-pure const fns; blaze check warns of const fns that read mutable state (#924)
+- a failed build's error is said once; blaze_cli.py checks fit #878's build UI and #837's silence on pins (#928)
+- diagnostics: fail builds on built-in derive refusals (#895)
+- nix/units: the manifest's exclude has library (nix unit graphs check, red since #922) (#934)
+- build events: a function an edit took away is not listed as rebuilt (edits.py smoke AstIdMap panic, from #878) (#937)
+- sandbox: confine build scripts with Landlock where no user namespace can be made (stock Ubuntu 23.10+) (#925)
+- Location::caller() in a constant, as rustc evaluates it; the const-eval rows of docs/support.md go (#916)
+- const eval: unchecked_* and exact_div fail where they are undefined, as in rustc (#862) (#933)
+- const eval: the variant_count intrinsic (#862) (#936)
+- const eval: the generic simd intrinsics lane by lane, with float results that depend on no NaN payload (#935)
+- wasm proc macros: a session per calling crate only for modules seen to keep state (#908) (#918)
+- const eval: a constant's own overflow fails, as in rustc, without -C overflow-checks too (#862) (#929)
+- const traits: effect-carrying [const] bounds in hir-ty, derive_const as const impls, non-const call check (#940)
+- consteval_ui.py: blaze's const eval against rustc's tests/ui/consts and const-generics, held by the train (#862) (#941)
+- answer host-independent target specs on Windows (#942)
+- hir-expand: the gca! built-in macro (#862) (#938)
+- fuzz: generated const fns, evaluated as constants and at run time (#862) (#923)
+- a static's initializer that writes to a static fails to evaluate (#862) (#943)
+- rustc's answers under a link's flags and with the warnings of dropped crate types (#837) (#927)
+- experience: a step cargo fails and blaze passes is noted, not a P0 (#944)
+- const eval: core::arch's AES, CRC-32, CLMUL and SHA intrinsics (llvm.x86.*, llvm.aarch64.*) (#926)
+- const eval: the compare_bytes intrinsic, which <[u8] as Ord>::cmp calls. Before: basic-toml parsing in a const was refused with 'intrinsic compare_bytes is not implemented' (smoke ce_toml on #931). After: it evaluates; test compare_bytes checks -1/0/1 as rustc's evaluation gives. (#949)
+- README: the two release channels, and blaze's Rust is its own (rustup's copy only reused) (#952)
+- install.sh: unpack the archive's one folder, whatever the file is named; refuse an archive with no blaze (#951)
 
 ## [0.20261028.2] - 2026-10-28
 
@@ -2820,7 +2867,8 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.2...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.3...HEAD
+[0.20261028.3]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.3
 [0.20261028.2]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.2
 [0.20261028.1]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.1
 [0.20261028.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.0

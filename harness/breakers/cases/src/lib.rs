@@ -41,6 +41,7 @@ cases![
     simd_compare,
     sha_ni,
     whole_vectors,
+    negative_float_patterns,
     const_bytes_match,
     link_name_macro,
     promoted_closure_table,

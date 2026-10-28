@@ -9121,7 +9121,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let on_stack = PassMode::OnStack { size: size.next_multiple_of(8) as u32, padded: false };
         match layout.backend_repr {
             BackendRepr::Scalar(scalar) => return Ok(PassMode::Direct(self.scalar(scalar)?)),
-            BackendRepr::SimdVector { .. } => unsupported!("vector in the C ABI"),
+            // An `__m128` and its kin are one `Sse` eightbyte and its `SseUp` half, one XMM
+            // register whatever the lanes (wasmtime's libcalls take and return `__m128i`); a
+            // shorter vector is one `Sse` eightbyte. A longer one is in a YMM or ZMM register
+            // when the function has AVX, and in memory when not.
+            BackendRepr::SimdVector { .. } => {
+                return Ok(PassMode::Cast(match size {
+                    16 => types::I64X2,
+                    8 => types::F64,
+                    4 => types::F32,
+                    _ => unsupported!("a vector of {size} bytes in the C ABI"),
+                }));
+            }
             _ => (),
         }
         if size > 16 {

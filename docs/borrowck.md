@@ -1,7 +1,7 @@
 # The borrow checker
 
 ra-jit has its own borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree
-(`vendor/rust-analyzer/crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR rust-analyzer
+(`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR rust-analyzer
 lowers, the same MIR the code generator compiles, and it is meant to give exactly rustc's
 verdict: the same errors, on the same lines, and none where rustc gives none. It gives
 rustc's verdict on 95% of rustc's own borrow-check tests today, and on every one rustc

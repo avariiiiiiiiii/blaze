@@ -16,7 +16,7 @@ One toolchain: the dated nightly in `harness/toolchain`, `nightly-2026-10-25` to
 says `rustc 1.101.0-nightly (12433c307 2026-10-24)` (rust-lang/rust 12433c307b5a, LLVM
 23.1.4). ra-jit links against what rustc built, so it must agree with that rustc on symbol
 mangling (v0), type layout, the unstable Rust ABI, vtable layout and `TypeId` hashes, and
-everything that mirrors rustc is taken from that one commit: `vendor/rustc_abi` is its
+everything that mirrors rustc is taken from that one commit: `crates/rustc_abi` is its
 `compiler/rustc_abi`, `vendor/proc-macro-srv` its proc-macro server with ra-jit's changes,
 and the answers to rustc's questions (`crates/ra-jit/src/answers/rustc.json`) are what that
 rustc says on x86-64 Linux, AArch64 Linux and arm64 macOS. Stable Rust is not supported as a
@@ -123,7 +123,7 @@ LLVM bug is worked around by turning off a vectoriser pass (finding 6 in FUZZ.md
 
 `BLAZE_MIR_OPT=1` runs the passes rustc runs on a debug build's MIR before code is generated
 from it, `BLAZE_MIR_OPT=2` the ones it runs above `-Copt-level=0` that are ported; 0, the
-default, runs none ([mir-passes.md](../vendor/rust-analyzer/docs/mir-passes.md#optimizations),
+default, runs none ([mir-passes.md](mir-passes.md#optimizations),
 [research/mir-gap.md](research/mir-gap.md)). Coroutine bodies are never optimized.
 
 | | 0 | 1 | 2 |

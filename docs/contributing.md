@@ -31,41 +31,40 @@ you send them, including fixes you find here and want to upstream.
     docs/                     these documents
     docs/reports/             working reports, one per piece of work, as written at the time
     SECURITY.md               what to know before sharing a store, and how to report a problem
-    vendor/rust-analyzer/     the front end: crates derived from rust-analyzer, members of the root workspace
-    vendor/rust-analyzer/crates/hir-ty-borrowck/
-                              the borrow checker, a crate next to hir-ty (borrowck.md)
-    vendor/rust-analyzer/lib/rowan/
-                              rowan 0.17.0 with a flat kind of tree behind its cursor (flat-syntax.md)
-    vendor/rustc_abi/         rustc's layout crate at the pinned nightly's commit
+    crates/hir-def/, hir-ty/, syntax/, parser/, ...
+                              the front end: crates derived from rust-analyzer (below)
+    crates/hir-ty-borrowck/   the borrow checker, a crate next to hir-ty (borrowck.md)
+    crates/rowan/             rowan 0.17.0 with a flat kind of tree behind its cursor (flat-syntax.md)
+    crates/rustc_abi/         rustc's layout crate at the pinned nightly's commit
     vendor/proc-macro-srv/    the pinned nightly's proc-macro server, built by ra-jit to load
                               the proc-macro libraries ra-jit links (no-rustc.md, step J1)
     vendor/source.rev         the commit of the old development branch this tree last took from
 
 `crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
 it uses of `hir-ty` is public there. Its root is `mod.rs`, the file it was compiled from when
-it was a module of `hir-ty`. Nothing in `vendor/` depends on anything in `crates/`
-([architecture-split.md](architecture-split.md)).
+it was a module of `hir-ty`. The front end's crates depend on none of blaze's machinery
+(the code generator, the store, the daemon; [architecture-split.md](architecture-split.md)).
 
 ## rust-analyzer
 
-`vendor/rust-analyzer` started as a fork of rust-analyzer (DioxusLabs' rustd branch merged
-with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's on
-top: [mir-passes.md](../vendor/rust-analyzer/docs/mir-passes.md)). It is no longer synced with
-upstream or with a fork repository: its crates (`hir-ty`, `hir-def`, `syntax`, `parser` and the
-rest) are members of the root workspace, with the root `Cargo.toml`'s dependencies, lints and
-profiles and the one `Cargo.lock`. Edit them, build and test from the root, and commit like any
-other file. A plain clone builds:
+The front end's crates in `crates/` (`hir-ty`, `hir-def`, `hir-expand`, `syntax`, `parser`,
+`base-db`, `rowan` and the rest) started as a fork of rust-analyzer (DioxusLabs' rustd branch
+merged with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's
+on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they lived in `vendor/rust-analyzer`.
+They are no longer synced with upstream or with a fork repository, and keep rust-analyzer's crate
+names. Edit them, build and test from the root, and commit like any other file. A plain clone
+builds:
 
     git clone https://github.com/indexable-inc/blaze && cd blaze
     cargo +"$(cat harness/toolchain)" build -p ra-jit --release   # cargo +nightly-2026-10-25
 
-`vendor/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
+`crates/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
 crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
 (indexable-inc/rust-analyzer, indexable-inc/rustc_abi) are archived.
 
 ### Where new code goes
 
-New code that is the language's semantics goes in `vendor/rust-analyzer`: building MIR and
+New code that is the language's semantics goes in the front end's crates: building MIR and
 the passes over it, borrow checking, const evaluation, layout, and the hashes that say what a
 function's code is made from, as salsa queries. These are what rustc keeps in `rustc_middle`,
 `rustc_mir_transform` and `rustc_borrowck`; rust-analyzer could take them, and a query lives
@@ -73,10 +72,10 @@ with the database it reads. Where rust-analyzer's MIR differs from rustc's, the 
 the fork's lowering or in a pass of its runtime MIR queries, and the code generator relies on
 it: codegen does not compensate.
 
-Inside `vendor/rust-analyzer`, a crate of its own under `crates/` is better than growing
-`hir-ty` or `hir-def`, which are already the longest builds in the workspace.
+There, a crate of its own is better than growing `hir-ty` or `hir-def`, which are already the
+longest builds in the workspace.
 
-ra-jit's machinery stays in `crates/`: the code generator's backends, object and debug-info
+ra-jit's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
 writing, the splice, the daemon and its socket, the cargo drop-in, the store and the remote,
 tiers and sampling, the live runtime, and the harnesses. A change there is one ordinary
 commit.
@@ -107,7 +106,7 @@ one file; everything else reads it or is written from it:
   sha256 and size of each file blaze downloads as its own toolchain, the nightly's `rustc -V`
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.
-- What mirrors rustc, all from that commit: `vendor/rustc_abi` (rustc's `compiler/rustc_abi`),
+- What mirrors rustc, all from that commit: `crates/rustc_abi` (rustc's `compiler/rustc_abi`),
   `vendor/proc-macro-srv` (the nightly's proc-macro server with ra-jit's J1 changes and its
   `RUSTC_VERSION_STRING`), the answers to rustc's questions
   (`crates/ra-jit/src/answers/rustc.json`), and the code written by hand to agree with rustc:
@@ -127,7 +126,7 @@ a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly
 
 picks the nightly (the newest of the last two weeks whose manifest has every component blaze
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
-`pins.txt`, re-vendors `vendor/rustc_abi` and `vendor/proc-macro-srv` from rust-lang/rust at
+`pins.txt`, re-vendors `crates/rustc_abi` and `vendor/proc-macro-srv` from rust-lang/rust at
 the new commit (ra-jit's changes to the server carried over by a three-way apply; a conflict
 stops it and names the files), moves the pin where else it is written (`install.sh`, the
 server's version string and manifest, `Cargo.toml`, the flake's rust-overlay input) and

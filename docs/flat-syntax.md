@@ -185,7 +185,7 @@ takes: an enter pushes a node and remembers it, an exit writes where its subtree
 token pushes a token. The parser does not change.
 
 **How lowering consumes it.** Unchanged. rowan 0.17's cursor is about 35 functions over
-`NodeData` (a green pointer, a parent, an offset). A fork in `vendor/rust-analyzer/lib/rowan`
+`NodeData` (a green pointer, a parent, an offset). A fork in `crates/rowan`
 (we pin every layer; inside the subtree so that the fork builds alone) gives the cursor a second kind of tree: a `SyntaxNode` that is a flat tree's root and an
 element's number, with nothing allocated per node, and moves that are arithmetic on the
 arrays. `syntax::ast`, `AstPtr`, ast id maps, item trees and body lowering compile and run as

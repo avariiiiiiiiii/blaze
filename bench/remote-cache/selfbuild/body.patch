@@ -1,7 +1,7 @@
-diff --git a/vendor/rust-analyzer/crates/intern/src/symbol.rs b/vendor/rust-analyzer/crates/intern/src/symbol.rs
+diff --git a/crates/intern/src/symbol.rs b/crates/intern/src/symbol.rs
 index 72e3f00b40..e59add9bcc 100644
---- a/vendor/rust-analyzer/crates/intern/src/symbol.rs
-+++ b/vendor/rust-analyzer/crates/intern/src/symbol.rs
+--- a/crates/intern/src/symbol.rs
++++ b/crates/intern/src/symbol.rs
 @@ -135,6 +135,7 @@ static MAP: OnceLock<Map> = OnceLock::new();
  
  impl Symbol {

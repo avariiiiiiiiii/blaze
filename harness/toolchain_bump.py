@@ -14,7 +14,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     Windows) rustc-codegen-cranelift-preview for every host blaze ships for;
  2. writes harness/toolchain and runs toolchain_pins.py --write (pins.txt: the files' hashes,
     the nightly's `rustc -V` and its rust-lang/rust commit);
- 3. re-vendors from rust-lang/rust at the new commit: vendor/rustc_abi/src is
+ 3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
     the new commit with ra-jit's changes to them at the old commit carried over (a three-way
     apply; a conflict stops the bump and names the files);
@@ -55,7 +55,7 @@ MENTIONS = ["install.sh", "vendor/proc-macro-srv/Cargo.toml",
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
 # vendor/proc-macro-srv's manifest and lock file are ra-jit's, written from upstream's (their
 # header says how) and carried as they are; its crates are upstream's (`server_dirs`).
-ABI = ("vendor/rustc_abi/src", "compiler/rustc_abi/src")
+ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
 
 
 class Failed(Exception):

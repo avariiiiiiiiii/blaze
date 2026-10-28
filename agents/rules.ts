@@ -24,7 +24,7 @@ type Rule = {
 
 const header = `# blaze (ra-jit)
 
-How to build, test and change ra-jit, including its rust-analyzer-derived front end (vendor/rust-analyzer): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
+How to build, test and change ra-jit, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
 
 export const rules = [
 	{
@@ -69,7 +69,7 @@ export const rules = [
 	},
 	{
 		id: "semantics-in-rust-analyzer",
-		info: "Language semantics go in the front end, `vendor/rust-analyzer` (crates derived from rust-analyzer, members of the root workspace, no longer synced with upstream or a fork): MIR building and passes, borrow checking, const eval, layout and code-identity hashes as salsa queries (what rustc keeps in `rustc_middle`, `rustc_mir_transform`, `rustc_borrowck`), as a crate of its own there rather than growing `hir-ty` or `hir-def` where possible. Codegen backends, object writing, the splice, the daemon, cargo integration, the store, tiers, the live runtime and the harnesses stay in `crates/`.",
+		info: "Language semantics go in the front end's crates (`hir-ty`, `hir-def`, `hir-expand` and the rest in `crates/`, derived from rust-analyzer, no longer synced with upstream or a fork): MIR building and passes, borrow checking, const eval, layout and code-identity hashes as salsa queries (what rustc keeps in `rustc_middle`, `rustc_mir_transform`, `rustc_borrowck`), as a crate of its own there rather than growing `hir-ty` or `hir-def` where possible. Codegen backends, object writing, the splice, the daemon, cargo integration, the store, tiers, the live runtime and the harnesses stay out of the front end, in crates of their own.",
 		link: "docs/contributing.md#where-new-code-goes",
 	},
 	{

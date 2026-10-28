@@ -2,9 +2,9 @@
 
 This is a map of the code for someone who wants to read or change it. Paths are those of the
 published tree: `crates/ra-jit` is the daemon, `crates/hir-ty-codegen` is the code generator
-(a crate over `hir-ty`'s MIR, see [contributing.md](contributing.md)), and
-`vendor/rust-analyzer` is the front end, with the borrow checker as its crate `hir-ty-borrowck`
-([borrowck.md](borrowck.md)).
+(a crate over `hir-ty`'s MIR, see [contributing.md](contributing.md)), and the front end is
+the crates derived from rust-analyzer (`hir-def`, `hir-ty`, `syntax`, `parser` and the rest), with
+the borrow checker as its crate `hir-ty-borrowck` ([borrowck.md](borrowck.md)).
 
 ## The idea
 

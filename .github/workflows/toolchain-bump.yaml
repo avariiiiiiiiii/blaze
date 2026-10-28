@@ -95,7 +95,7 @@ jobs:
         with:
           ref: toolchain/bump
       - uses: ./.github/actions/toolchain
-      - run: python3 harness/answers.py --write && cp crates/blaze-engine/src/answers/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
+      - run: python3 harness/answers.py --write && cp crates/blaze-cargo/src/answers/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
       - uses: actions/upload-artifact@v7
         with:
           name: answers-${{ matrix.platform }}

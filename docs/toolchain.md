@@ -32,7 +32,7 @@ the standard library is part of a compiler.
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, `rust-std` (the host's, and `wasm32-wasip1`'s,
   which proc macros are built for) and `rust-src`, unchanged, from
   static.rust-lang.org, each checked against the sha256 compiled into blaze
-  (`crates/blaze-engine/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
+  (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
   when rustup already has it with `rust-src` (the same bytes). The installer downloads it once;

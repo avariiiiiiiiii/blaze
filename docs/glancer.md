@@ -115,7 +115,7 @@ were stable names: 665,474,913 bytes for one `helix-parsec` closure, and the lar
    (b) and (c) the compiler's parses make flat trees (arrays) behind syntax-tree's cursor.
 5. **Memory discipline.** No eviction of inference or MIR: `infer`, `mir_body` and
    blaze's monomorphized MIR have no `lru`, and blaze drops nothing. Measuring is there:
-   with `BLAZE_MEMORY=<dir>`, `crates/blaze-engine/src/memory.rs` reports resident memory after
+   with `BLAZE_MEMORY=<dir>`, `crates/blaze-cargo/src/memory.rs` reports resident memory after
    load, resolve, build, warm-up and each request answered (on macOS the physical footprint)
    and writes a table of every salsa ingredient (count,
    bytes of fields and of salsa's records; heap bytes only where an ingredient declares

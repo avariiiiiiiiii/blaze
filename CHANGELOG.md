@@ -8,9 +8,21 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Removed
+
+- `blaze enable` and `blaze disable`, and plain cargo building through blaze (#93, no-rustc.md's
+  step M): `blaze` is the only way in. A plain `cargo build` is cargo's and rustc's alone. On a
+  machine where `enable` was run, the next `blaze` takes `build.rustc-workspace-wrapper` out of
+  cargo's `config.toml` (the file as it was before, when nobody edited it since), puts back the
+  `cargo fmt` and `cargo clippy` its links replaced, and says so in one line.
+  `BLAZE_RUSTC_BASE` is gone with it: the first edits no longer patch an executable rustc
+  linked, which only that mode still had. `blaze-rustc` stays, as the wrapper of a load into
+  cargo's target directory.
+
 ### Fixed
 
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
+
 ## [0.20261028.1] - 2026-10-28
 
 ### Fixed

@@ -17,6 +17,8 @@
 //! (`autocfg` removes the `.ll` it asked for, `anyhow` the whole directory, `rustix` never
 //! reads its file), so they are empty, and the dep-info names the probe's source.
 
+pub(crate) use blaze_cargo::as_rustc::{NAME, TOOLCHAIN};
+
 use std::{
     ffi::{OsStr, OsString},
     io::{Read as _, Write as _},
@@ -24,13 +26,6 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-
-/// The variable that names, to this, the toolchain's rustc: what cargo gave the script as
-/// `RUSTC`.
-pub(crate) const TOOLCHAIN: &str = "BLAZE_SCRIPT_RUSTC";
-
-/// The name blaze is started under to be this.
-pub(crate) const NAME: &str = "rustc";
 
 /// Whether this process was started as `rustc`, which is to be this.
 pub(crate) fn is_me() -> bool {

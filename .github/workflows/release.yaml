@@ -2,7 +2,8 @@ name: release
 
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/release_notes.py) builds blaze for
 # Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS, and the
-# tag's CHANGELOG.md section as the notes. The tag must match the workspace version. A tag
+# tag's CHANGELOG.md section as the notes. The release is a prerelease, the canary channel's,
+# until promote.yaml makes it stable (docs/release.md). The tag must match the workspace version. A tag
 # pushed by hand starts it; the release train's tags start it by dispatch on the tag (pgo.yaml's
 # pin job, .github/scripts/train_release.py), since a tag the workflow's own token makes starts
 # no workflow. A manual run on a branch builds and checks the same archives without releasing.
@@ -142,7 +143,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      actions: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: out
@@ -164,7 +167,17 @@ jobs:
               text = text[: text.rfind("\n", 0, cap)] + f"\n\n... The full notes are in [CHANGELOG.md]({url}).\n"
               open(p, "w").write(text)
           EOF
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
             out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS \
             out/manifests.* out/packs.* out/keys.*
+      # A canary: the canary pointer names it (what a workspace pinned to canary reads), and
+      # promote.yaml tests the archives just published and makes this same release stable when
+      # they pass (docs/release.md). By dispatch, since a release this token publishes starts no
+      # `release:` workflow.
+      - name: Promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I .github/scripts/promote.py pointer "{\"channel\": \"canary\", \"tag\": \"$GITHUB_REF_NAME\"}"
+          gh workflow run promote.yaml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$GITHUB_REF_NAME"

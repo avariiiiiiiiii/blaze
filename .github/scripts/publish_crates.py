@@ -81,7 +81,7 @@ class Extra:
 TAKEN = {"macros"}
 
 EXTRAS: dict[str, list[Extra]] = {
-    "blaze-engine": [
+    "blaze-cargo": [
         Extra(
             "harness/toolchain",
             "toolchain",
@@ -89,8 +89,8 @@ EXTRAS: dict[str, list[Extra]] = {
             'include_str!("../../../../harness/toolchain")',
             'include_str!("../../toolchain")',
         ),
-        Extra("README.md", "README.md", "", "", ""),
     ],
+    "blaze-engine": [Extra("README.md", "README.md", "", "", "")],
 }
 
 

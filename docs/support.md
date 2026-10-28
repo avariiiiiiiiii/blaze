@@ -18,7 +18,7 @@ says `rustc 1.101.0-nightly (12433c307 2026-10-24)` (rust-lang/rust 12433c307b5a
 mangling (v0), type layout, the unstable Rust ABI, vtable layout and `TypeId` hashes, and
 everything that mirrors rustc is taken from that one commit: `crates/rustc_abi` is its
 `compiler/rustc_abi`, `vendor/proc-macro-srv` its proc-macro server with blaze's changes,
-and the answers to rustc's questions (`crates/blaze-engine/src/answers/rustc.json`) are what that
+and the answers to rustc's questions (`crates/blaze-cargo/src/answers/rustc.json`) are what that
 rustc says on x86-64 Linux, AArch64 Linux and arm64 macOS. Stable Rust is not supported as a
 toolchain of its own: a stable release's code builds because the nightly builds it. The pin
 moves to a newer nightly with `harness/toolchain_bump.py`
@@ -261,7 +261,7 @@ which 92 were supported and 5 refused.
 `blaze` is narrower. Its column was recorded while it still handed builds to cargo. Since
 2026-10-27 it hands none ([#408](https://github.com/indexable-inc/blaze/pull/408),
 [#571](https://github.com/indexable-inc/blaze/pull/571)): what it does not build fails with the
-reason (`refused` in `crates/blaze-engine/src/cargo/whole.rs`). A cell that says "cargo" or "handed to
+reason (`refused` in `crates/blaze-cargo/src/cargo/whole.rs`). A cell that says "cargo" or "handed to
 cargo" now means one of the two, and which is unverified.
 
 | Feature | Daemon (`buildmodel.py`) | `blaze` |
@@ -297,7 +297,7 @@ backend.
 The `-Z` flags cargo gives rustc, from `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `[build]` or
 `[target]` `rustflags` and a profile's `rustflags`, still reach rustc for what rustc compiles,
 and build scripts see them in `CARGO_ENCODED_RUSTFLAGS`. What blaze does with each in its own
-code is one table, `crates/blaze-engine/src/unstable.rs`, which the daemon's plan, the plan of a
+code is one table, `crates/blaze-cargo/src/unstable.rs`, which the daemon's plan, the plan of a
 program linked against rustc's libraries, the build scripts and proc macros blaze compiles and
 blaze's own answers to rustc's questions all read:
 

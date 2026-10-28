@@ -102,14 +102,14 @@ itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix 
 plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that
 one file; everything else reads it or is written from it:
 
-- `crates/blaze-engine/src/cargo/toolchain/pins.txt` (by `harness/toolchain_pins.py --write`): the
+- `crates/blaze-cargo/src/cargo/toolchain/pins.txt` (by `harness/toolchain_pins.py --write`): the
   sha256 and size of each file blaze downloads as its own toolchain, the nightly's `rustc -V`
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.
 - What mirrors rustc, all from that commit: `crates/rustc_abi` (rustc's `compiler/rustc_abi`),
   `vendor/proc-macro-srv` (the nightly's proc-macro server with blaze's J1 changes and its
   `RUSTC_VERSION_STRING`), the answers to rustc's questions
-  (`crates/blaze-engine/src/answers/rustc.json`), and the code written by hand to agree with rustc:
+  (`crates/blaze-cargo/src/answers/rustc.json`), and the code written by hand to agree with rustc:
   the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
   `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
 - `install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the
@@ -136,7 +136,7 @@ What it leaves to a person, and prints at the end:
 
 1. `python3 harness/answers.py --write` on x86-64 Linux, AArch64 Linux and arm64 macOS, each
    with that host's release build of blaze, since the target specs depend on the host rustc
-   was built for; commit `crates/blaze-engine/src/answers/rustc.json`.
+   was built for; commit `crates/blaze-cargo/src/answers/rustc.json`.
 2. `cargo build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
    ask for, and mirroring by hand what changed in rustc: the Rust ABI, vtables, `TypeId`,
    symbol names, new intrinsics and lang items. The move to `nightly-2026-10-25` needed

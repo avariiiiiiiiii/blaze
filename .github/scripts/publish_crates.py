@@ -81,7 +81,7 @@ EXTRAS: dict[str, list[Extra]] = {
         Extra(
             "harness/toolchain",
             "toolchain",
-            "src/cargo/state.rs",
+            "src/cargo/toolchain.rs",
             'include_str!("../../../../harness/toolchain")',
             'include_str!("../../toolchain")',
         ),

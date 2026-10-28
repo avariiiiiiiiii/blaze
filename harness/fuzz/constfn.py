@@ -11,8 +11,8 @@ and float arithmetic, `as`, `while` and `loop` with a counter, `if`, `match`, ar
 in bounds, tuples, `&mut` to its own locals, calls to the const fns before it, and const
 generic parameters. Nothing can panic (division and remainder are checked, shifts wrap,
 indices are taken modulo the length), every loop runs at most `LOOP` times, and no NaN's bits
-are observed: a NaN is mixed in as one value, as rustc's const eval and the hardware may give
-it different payloads.
+are observed: a NaN is mixed in as one value, and `copysign` never takes the sign of one, as
+rustc's const eval and the hardware may give it a different payload and sign.
 """
 import random
 
@@ -87,7 +87,7 @@ class ConstFns:
                 lambda: f"(-{sub(ty)})",
                 lambda: f"{sub(ty)}.abs()",
                 lambda: f"(if {sub('bool')} {{ {sub(ty)} }} else {{ {sub(ty)} }})",
-                lambda: f"{sub(ty)}.copysign({sub(ty)})",
+                lambda: f"{sub(ty)}.copysign({self.not_nan(sub(ty), ty)})",
             ]
         else:
             signed = INTS[ty][1]
@@ -107,6 +107,10 @@ class ConstFns:
             if self.fns and not self.looping:
                 options.append(lambda: self.call(scope, ty, depth))
         return r.choice(options)()
+
+    def not_nan(self, value, ty):
+        """`value`, or 1 where it is a NaN: a NaN's sign is not what a correct compiler must agree on."""
+        return f"{{ let x: {ty} = {value}; if x.is_nan() {{ 1.0 }} else {{ x }} }}"
 
     def call(self, scope, ty, depth):
         fits = [f for f in self.fns if f[2] == ty]

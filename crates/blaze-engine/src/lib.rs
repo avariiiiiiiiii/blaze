@@ -14,6 +14,7 @@ use blaze_cargo::{
 mod as_rustc;
 mod borrowck;
 mod check;
+mod consteval;
 mod content;
 mod doc;
 mod doctest;
@@ -7831,6 +7832,9 @@ pub fn main() -> anyhow::Result<()> {
     }
     if std::env::args().nth(1).as_deref() == Some("borrowck") {
         return borrowck::command(std::env::args().skip(2));
+    }
+    if std::env::args().nth(1).as_deref() == Some("consteval") {
+        return consteval::command(std::env::args().skip(2));
     }
     if std::env::args().nth(1).as_deref() == Some("compile-time-deps") {
         return compile_time_deps(std::env::args().skip(2));

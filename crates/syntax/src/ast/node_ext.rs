@@ -551,6 +551,13 @@ impl ast::Impl {
     }
 }
 
+impl ast::Trait {
+    /// The `const` of `const trait Tr`, which the parser keeps as a modifier of the item.
+    pub fn const_token(&self) -> Option<SyntaxToken> {
+        support::token(self.syntax(), T![const])
+    }
+}
+
 // [#15778](https://github.com/rust-lang/rust-analyzer/issues/15778)
 impl ast::PathSegment {
     pub fn qualifying_trait(&self) -> Option<ast::PathType> {

@@ -63,14 +63,45 @@ impl BuiltinDeriveExpander {
         span: Span,
     ) -> ExpandResult<tt::TopSubtree> {
         let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
-        if let BuiltinDeriveExpander::Clone = self
+        let expanded = if let BuiltinDeriveExpander::Clone = self
             && let MacroCallKind::Derive { ast_id, .. } = &id.loc(db).kind
             && derives_copy(&ast_id.to_node(db))
         {
-            return clone_expand_with(db, span, tt, true);
-        }
-        self.expander()(db, span, tt)
+            clone_expand_with(db, span, tt, true)
+        } else {
+            self.expander()(db, span, tt)
+        };
+        if from_derive_const(db, id) { expanded.map(as_const_impls) } else { expanded }
     }
+}
+
+/// Whether the derive is listed in a `#[derive_const(..)]`, whose impls are `const impl`s.
+fn from_derive_const(db: &dyn SourceDatabase, id: MacroCallId) -> bool {
+    let MacroCallKind::Derive { derive_macro_id, .. } = id.loc(db).kind else { return false };
+    matches!(
+        derive_macro_id.loc(db).def.kind,
+        crate::MacroDefKind::BuiltInAttr(_, crate::builtin::BuiltinAttrExpander::DeriveConst)
+    )
+}
+
+/// `impl ..` items of a derive's expansion as `const impl ..`.
+fn as_const_impls(expanded: tt::TopSubtree) -> tt::TopSubtree {
+    let mut builder = tt::TopSubtreeBuilder::new(expanded.top_subtree().delimiter);
+    let mut items = expanded.token_trees().iter();
+    while let Some(next) = items.peek() {
+        if let tt::TtElement::Leaf(tt::Leaf::Ident(ident)) = &next
+            && ident.sym == sym::kw_impl
+        {
+            builder.push(tt::Leaf::Ident(tt::Ident {
+                sym: sym::const_,
+                span: ident.span,
+                is_raw: tt::IdentIsRaw::No,
+            }));
+        }
+        let Some(item) = items.next_as_view() else { break };
+        builder.extend_with_tt(item);
+    }
+    builder.build()
 }
 
 /// Whether one of the item's `#[derive]`s lists `Copy`.

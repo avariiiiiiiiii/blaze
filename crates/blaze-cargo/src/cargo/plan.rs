@@ -89,6 +89,10 @@ pub const REACH: &str = "tests-reach";
 /// The first line of [`REACH`], which changes with what it holds.
 pub const REACH_FORMAT: &str = "tests-reach 3";
 
+/// Beside [`REACH`]: the build of blaze that wrote it, as the store names builds. A blaze of
+/// another build tells tests by other rules, so it walks the tests again.
+pub const REACH_BY: &str = "tests-reach-by";
+
 /// Whether a sandbox that records what a test reads makes what a reason of `kind` reaches part
 /// of the test's key: files, the environment, other processes and the network.
 pub fn recorded_by_a_sandbox(kind: &str) -> bool {

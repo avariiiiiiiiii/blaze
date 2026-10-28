@@ -31,6 +31,7 @@
 //! same reason.
 
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use base_db::{Crate, LangCrateOrigin};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
@@ -57,6 +58,8 @@ use hir_ty::{
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 use hir_ty_mir::mir::purity::{is_const_pure, operands, raw_use};
+
+mod dispatch;
 
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
@@ -205,24 +208,37 @@ pub fn tests_reach(
         super::target::Target::current().triple(),
         super::store::toolchain(),
     );
+    let started = std::time::Instant::now();
+    let mut took = Vec::new();
     let names = super::stable::StableNames::new(db, symbols, FxHashSet::default(), true);
+    took.push(("names", started.elapsed()));
     let store = super::store::Store::global();
     let mut walk = Walk::new(db, false);
     walk.tests = true;
     let starts: Vec<u32> = roots.iter().map(|&it| walk.reach(Node::Root(it))).collect();
     let mut sealed: FxHashMap<u32, Sealed> = FxHashMap::default();
+    let mut spent = [std::time::Duration::ZERO; 4];
     let mut next = 0;
     while let Some(node) = walk.nodes.get(next).map(|it| it.node.clone()) {
         let at = next as u32;
         next += 1;
-        let Some(name) = sealed_name(db, &names, &node) else {
+        let before = std::time::Instant::now();
+        let name = sealed_name(db, &names, &node);
+        spent[0] += before.elapsed();
+        let Some(name) = name else {
+            let before = std::time::Instant::now();
             walk.hash_node(at, &node);
+            spent[2] += before.elapsed();
             continue;
         };
         let key = below_key(&header, &name);
-        let below = store.and_then(|it| it.get(&key)).and_then(|it| Below::read(&it));
+        let before = std::time::Instant::now();
+        let below = Below::known(store, &key);
+        spent[1] += before.elapsed();
         if below.is_none() {
+            let before = std::time::Instant::now();
             walk.hash_node(at, &node);
+            spent[3] += before.elapsed();
             walk.segments.pop();
         }
         let mut hasher = rustc_stable_hash::StableSipHasher128::new();
@@ -231,20 +247,28 @@ pub fn tests_reach(
         walk.segments.push(u128::from(low) | u128::from(high) << 64);
         sealed.insert(at, Sealed { key, below });
     }
+    took.push(("nodes", started.elapsed()));
     // One found later is mostly below one found earlier, and is then taken whole by it.
     let mut walked: Vec<u32> =
         sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
     walked.sort_unstable_by(|a, b| b.cmp(a));
+    let added = walked.len();
     for at in walked {
-        let below = below_of(&walk, &sealed, at);
-        if let Some(store) = store {
-            store.insert(&sealed[&at].key, below.write().as_bytes());
-        }
+        let below = Arc::new(below_of(&walk, &sealed, at));
+        Below::keep(store, &sealed[&at].key, &below);
         sealed.get_mut(&at).unwrap().below = Some(below);
     }
+    // What a daemon adds is left in the store's open pack, which the next daemon does not
+    // read: sealed now, a daemon that starts later walks none of it again.
+    if added >= SEAL_AFTER
+        && let Some(store) = store
+    {
+        std::thread::spawn(move || store.seal());
+    }
+    took.push(("below", started.elapsed()));
     let mut local: FxHashMap<u32, u32> = FxHashMap::default();
     let mut way = Way::default();
-    starts
+    let reach = starts
         .into_iter()
         .map(|start| {
             local.clear();
@@ -293,7 +317,24 @@ pub fn tests_reach(
             found.sort_by_key(|it| it.kind);
             Reach { hash: u128::from(low) | u128::from(high) << 64, found }
         })
-        .collect()
+        .collect();
+    took.push(("roots", started.elapsed()));
+    if std::env::var_os("BLAZE_STATS").is_some() {
+        let steps: Vec<String> =
+            took.iter().map(|(name, at)| format!("{name}={}", at.as_micros())).collect();
+        eprintln!(
+            "tests-reach-steps-us: {} (naming={} store={} hashing={} sealed-hashing={}; {} roots, {} nodes, {} sealed)",
+            steps.join(" "),
+            spent[0].as_micros(),
+            spent[1].as_micros(),
+            spent[2].as_micros(),
+            spent[3].as_micros(),
+            roots.len(),
+            walk.nodes.len(),
+            sealed.len()
+        );
+    }
+    reach
 }
 
 /// The nodes a walk from one node found, in the order found, each with where in `order` the
@@ -335,7 +376,7 @@ struct Sealed {
     /// Where the store keeps what is below it.
     key: [u8; super::store::KEY],
     /// Read from the store, or found by going into it.
-    below: Option<Below>,
+    below: Option<Arc<Below>>,
 }
 
 /// What a test's hash says of what a node reaches, the node itself too: the first of each
@@ -345,8 +386,53 @@ struct Below {
     found: Vec<Found>,
 }
 
+/// What is below each sealed node this process found or read, by its key: the store gives
+/// only what its sealed packs have, and a pack is sealed once it is full, so what one build
+/// adds is not found there by the next builds of the daemon.
+static KNOWN: LazyLock<Mutex<FxHashMap<[u8; super::store::KEY], Arc<Below>>>> =
+    LazyLock::new(Default::default);
+
+/// How many sealed nodes a walk finds what is below of for the store's open pack to be sealed.
+const SEAL_AFTER: usize = 256;
+
+/// How many sealed nodes [`KNOWN`] keeps before it starts again.
+const KNOWN_AT_MOST: usize = 1 << 20;
+
 impl Below {
     const FORMAT: &str = "below 2";
+
+    /// What is below the sealed node of `key`, as this process or the store has it.
+    fn known(
+        store: Option<&super::store::Store>,
+        key: &[u8; super::store::KEY],
+    ) -> Option<Arc<Below>> {
+        if let Some(it) = KNOWN.lock().unwrap().get(key) {
+            return Some(it.clone());
+        }
+        let below = Arc::new(Below::read(&store?.get(key)?)?);
+        Below::remember(key, &below);
+        Some(below)
+    }
+
+    /// Keeps what is below the sealed node of `key`, for this process and in the store.
+    fn keep(
+        store: Option<&super::store::Store>,
+        key: &[u8; super::store::KEY],
+        below: &Arc<Below>,
+    ) {
+        if let Some(store) = store {
+            store.insert(key, below.write().as_bytes());
+        }
+        Below::remember(key, below);
+    }
+
+    fn remember(key: &[u8; super::store::KEY], below: &Arc<Below>) {
+        let mut known = KNOWN.lock().unwrap();
+        if known.len() >= KNOWN_AT_MOST {
+            known.clear();
+        }
+        known.insert(*key, below.clone());
+    }
 
     /// A line for each found: its kind, what, why and each call, all after tabs; where a
     /// call calls the next follows its name after a `\x1f`.
@@ -778,6 +864,8 @@ struct Walk<'db> {
     counted: bool,
     /// What each function of core and alloc known by its name does that is not pure.
     library: FxHashMap<FunctionId, Option<String>>,
+    /// Whether a static chooses a function by the CPU, as [`dispatch`] tells.
+    dispatch: std::cell::RefCell<FxHashMap<StaticId, bool>>,
 }
 
 /// A body of core or alloc looked through: a function's, or a closure's.
@@ -801,6 +889,7 @@ impl<'db> Walk<'db> {
             locations: Default::default(),
             counted,
             library: FxHashMap::default(),
+            dispatch: Default::default(),
         }
     }
 
@@ -1232,7 +1321,8 @@ impl<'db> Walk<'db> {
         };
         let Ok(body) = body else { return };
         if self.tests {
-            if let Some(span) = fn_from_data(db, body) {
+            let cache = |id| self.dispatch_cache(id);
+            if let Some(span) = fn_from_data(db, body, &cache) {
                 let place = location(db, body.owner, span)
                     .map(|it| format!(", at {it}"))
                     .unwrap_or_default();
@@ -1355,6 +1445,15 @@ impl<'db> Walk<'db> {
         None
     }
 
+    fn dispatch_cache(&self, id: StaticId) -> bool {
+        if let Some(&it) = self.dispatch.borrow().get(&id) {
+            return it;
+        }
+        let it = dispatch::is_cache(self.db, id);
+        self.dispatch.borrow_mut().insert(id, it);
+        it
+    }
+
     /// What a static a test reaches makes its end depend on, by kind: a foreign static, or one
     /// of a crate outside the toolchain that other tests in the process can change.
     fn static_reason(&self, id: StaticId, writable: bool) -> Option<(Kind, String, String)> {
@@ -1380,6 +1479,7 @@ impl<'db> Walk<'db> {
             || !writable
             || is_thread_local(db, id)
             || !(mutable || shared(db, db.type_for_static(id).skip_binder()))
+            || self.dispatch_cache(id)
         {
             return None;
         }
@@ -1755,17 +1855,25 @@ fn shared<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> bool {
 }
 
 /// Where `body` makes a function pointer of data, with a `transmute`: what it calls through
-/// it is no function the code reached names, and can be any.
-fn fn_from_data(db: &dyn HirDatabase, body: &MirBody<'_>) -> Option<MirSpan> {
+/// it is no function the code reached names, and can be any. Not one of what it loaded from a
+/// static `cache` says chooses a function ([`dispatch`]).
+fn fn_from_data(
+    db: &dyn HirDatabase,
+    body: &MirBody<'_>,
+    cache: &dyn Fn(StaticId) -> bool,
+) -> Option<MirSpan> {
     for (_, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };
-        let TerminatorKind::Call { func, destination, .. } = &terminator.kind else { continue };
+        let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind else {
+            continue;
+        };
         let Some((callee, _)) = fn_item(func) else { continue };
         let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
         if FunctionSignature::is_intrinsic(db, callee)
             && matches!(name.as_str(), "transmute" | "transmute_unchecked")
             && destination.projection.as_slice().is_empty()
             && matches!(body.locals[destination.local].ty.as_ref().kind(), TyKind::FnPtr(..))
+            && !args.first().is_some_and(|it| dispatch::loaded_from(db, body, it, cache))
         {
             return Some(terminator.span);
         }

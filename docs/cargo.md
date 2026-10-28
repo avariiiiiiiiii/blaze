@@ -836,6 +836,21 @@ What was decided, and why:
 - A call through a `dyn` or a function pointer is bounded: the code reached makes every vtable
   and takes the address of every function it can call through, and those are walked. What is
   not bounded is a pointer made of data (`indirect`) or handed over by foreign code (`ffi`).
+- A function chosen once by the CPU and kept in a static (memchr's runtime dispatch: `static
+  FN: AtomicPtr<()>`, set to the fastest of its versions on the first call, then loaded and
+  `transmute`d back to a `fn` on every call) is neither `global-state` nor `indirect`. What the
+  static holds is one of the functions the code stores in it, and the test's hash has each of
+  them; which one the CPU picks counts as std's own choice by the CPU does
+  (`is_x86_feature_detected!`): not at all. blaze takes a static to be one only when it is
+  sure no other value can get in: an `AtomicPtr` (not `static mut`) declared in a block of a
+  function body, its first value a function's address, and every body that can name it (that
+  function, its closures and the items in its blocks) only loads it or stores a function's
+  address in it, never one handed in as an argument or returned by a call. Otherwise it is
+  `global-state`, and the `transmute` of what is loaded from it `indirect`. On ripgrep this
+  took the tests kept from 191 of 1144 to 363.
+- What blaze made of a test is kept beside its program (`tests-reach`), with the build of blaze
+  that made it (`tests-reach-by`). Another build of blaze tells tests by its own rules, so it
+  walks every test program again the first time it builds it.
 - A test the sandbox records (a workspace that opts into sandboxed tests) that blocks only by
   `fs`, `env`, `net` or `process` is kept with what it read, as before. One that blocks by any
   other kind runs every time, sandboxed or not.

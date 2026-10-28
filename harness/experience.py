@@ -349,9 +349,7 @@ def flow(name, spec, work, env):
         shutil.rmtree(d, ignore_errors=True)
         fetch(spec, d, env)
     steps, rough = [], []
-    # Where cargo is installed `cargo blaze` is the command; on a machine with no Rust, `blaze`.
-    users_cargo = shutil.which("cargo", path=env["PATH"])
-    front = ["cargo", "blaze"] if users_cargo else ["blaze"]
+    front = ["blaze"]
 
     def blaze(step, *args, **kw):
         s = Step(step, [*front, *args], blaze_dir, env, **kw)

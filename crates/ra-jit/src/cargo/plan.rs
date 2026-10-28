@@ -656,6 +656,40 @@ pub(crate) fn headerpad_read(binary: &Path, asked: Option<u64>) -> std::io::Resu
     Ok(format!("@{}", headerpad_file(binary).display()))
 }
 
+/// Writes again each [`headerpad_file`] the link command `cmd` reads that is gone, as
+/// [`headerpad_read`] wrote it: the room the words before it ask for, its own or a response
+/// file's. A worker makes its command once, and a clean of the target directory while it
+/// runs takes the file from under it (#721).
+pub(crate) fn headerpad_again(cmd: &str) -> std::io::Result<()> {
+    if !cmd.contains(".headerpad") {
+        return Ok(());
+    }
+    let Some(args) = shlex::split(cmd) else { return Ok(()) };
+    let mut asked = None;
+    for arg in &args {
+        if let Some(pad) = headerpad_in(arg) {
+            asked = Some(pad);
+            continue;
+        }
+        let Some(file) = arg.strip_prefix('@') else { continue };
+        match file.strip_suffix(".headerpad").map(Path::new) {
+            Some(binary) if !headerpad_file(binary).exists() => {
+                if let Some(dir) = binary.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                headerpad_read(binary, asked)?;
+            }
+            Some(_) => {}
+            None => {
+                let words = std::fs::read_to_string(file).ok().and_then(|it| shlex::split(&it));
+                let mut pads = words.into_iter().flatten().filter_map(|it| headerpad_in(&it));
+                asked = pads.next_back().or(asked);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What rustc's link of a program for Apple is told besides what cargo asked, for the
 /// daemon's first edits to be spliced into it: the room after the load commands, an address
 /// slot of each function of another library (which ld64 makes of each lazy one when
@@ -881,6 +915,38 @@ mod tests {
         write_headerpad(&binary, 0x8000).unwrap();
         assert_eq!(pad(&line(r#""-Wl,-headerpad,0x0""#)), Some(0x8000));
         assert_eq!(pad(&line("")), Some(HEADERPAD));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clean of the target directory takes the file of the room that a link command made
+    /// before it reads, and the link writes it again: what the line or its response file
+    /// asks for, or the default.
+    #[test]
+    fn headerpad_written_again_after_a_clean() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-plan-again-{}", std::process::id()));
+        let (response, binary) = (dir.join("link.args"), dir.join("whole").join("bin"));
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        let line = r#""cc" "/t/a.rlib" "-arch" "arm64" "-o" "/t/a-1" "-Wl,-headerpad,0x800000""#;
+        let command = LinkLine::parse(line).unwrap().command(&[], &binary, &response).unwrap();
+        std::fs::remove_file(headerpad_file(&binary)).unwrap();
+        headerpad_again(&command).unwrap();
+        assert_eq!(headerpad_of(&binary), Some(0x800000));
+        // Kept as it is when it is there.
+        write_headerpad(&binary, 0x900000).unwrap();
+        headerpad_again(&command).unwrap();
+        assert_eq!(headerpad_of(&binary), Some(0x900000));
+        // The whole build's own line, with its directory gone too.
+        std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+        let own = format!(
+            "cc /t/a.o -Wl,-headerpad,0x200000 -o {} @{}",
+            binary.display(),
+            headerpad_file(&binary).display()
+        );
+        headerpad_again(&own).unwrap();
+        assert_eq!(headerpad_of(&binary), Some(0x200000));
+        std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+        headerpad_again(&format!("cc -o {0} @{0}.headerpad", binary.display())).unwrap();
+        assert_eq!(headerpad_of(&binary), Some(HEADERPAD));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

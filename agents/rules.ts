@@ -22,7 +22,7 @@ type Rule = {
 	link?: string;
 };
 
-const header = `# blaze (ra-jit)
+const header = `# blaze
 
 How to build, test and change ra-jit, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
 

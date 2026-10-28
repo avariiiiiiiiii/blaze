@@ -1,13 +1,13 @@
 #!/bin/sh
-# Installs blaze, so that `blaze build`, `blaze test` and `blaze run` work (and the same with
-# `cargo blaze`), on a machine with or without Rust:
+# Installs blaze, so that `blaze build`, `blaze test` and `blaze run` work, on a machine with or
+# without Rust:
 #
 #   curl -fsSL https://ix.dev/blaze | sh
 #   curl -fsSL https://ix.dev/blaze | sh -s -- --version 0.2.0
 #
 # It downloads the release built for this machine (macOS on Apple silicon, Linux on x86-64 or
-# ARM64), checks it against the checksums published with it, puts `blaze`, `cargo-blaze` and the
-# programs they run in ${CARGO_HOME:-~/.cargo}/bin, and has blaze download the Rust it builds
+# ARM64), checks it against the checksums published with it, puts `blaze` and the programs
+# it runs in ${CARGO_HOME:-~/.cargo}/bin, and has blaze download the Rust it builds
 # with, once (125 to 160 MB; none when rustup already has it). It never asks anything. Running it
 # again installs the newest release over the one there.
 #
@@ -100,7 +100,7 @@ case "$os" in
         esac
         ;;
     MINGW* | MSYS* | CYGWIN* | Windows_NT)
-        fail "this installer is for macOS and Linux." "On Windows, install with: cargo +$TOOLCHAIN install --locked cargo-blaze"
+        fail "this installer is for macOS and Linux." "On Windows, install with: cargo +$TOOLCHAIN install --locked blaze-engine"
         ;;
     *) fail "blaze has no build for $os yet." "It runs on macOS with Apple silicon and on Linux (x86-64, ARM64)." ;;
 esac
@@ -164,16 +164,9 @@ else
 $releases/download/$tag/SHA256SUMS"
     fi
 
-    # The archive's name: blaze's since the rename, ra-jit's for a release from before it, and the
-    # nightly build's without a version.
-    asset=""
-    for name in "blaze-$tag-$target.tar.gz" "ra-jit-$tag-$target.tar.gz" "ra-jit-$target.tar.gz"; do
-        if awk -v n="$name" '$2 == n || $2 == "*" n { found = 1 } END { exit !found }' "$tmp/SHA256SUMS"; then
-            asset="$name"
-            break
-        fi
-    done
-    [ -n "$asset" ] || fail "blaze release $tag has no build for $machine." "Its files: $releases/tag/$tag"
+    asset="blaze-$tag-$target.tar.gz"
+    awk -v n="$asset" '$2 == n || $2 == "*" n { found = 1 } END { exit !found }' "$tmp/SHA256SUMS" ||
+        fail "blaze release $tag has no build for $machine." "Its files: $releases/tag/$tag"
     want=$(awk -v n="$asset" '$2 == n || $2 == "*" n { print $1; exit }' "$tmp/SHA256SUMS")
 
     if [ "$tag" = nightly ]; then shown="the nightly build"; else shown="blaze ${tag#v}"; fi
@@ -194,7 +187,13 @@ mkdir "$tmp/unpacked"
 tar -xzof "$tmp/$asset" -C "$tmp/unpacked" 2>"$tmp/error" ||
     fail "the downloaded archive could not be unpacked." "$(cat "$tmp/error")"
 unpacked="$tmp/unpacked/${asset%.tar.gz}"
-[ -x "$unpacked/ra-jit" ] || fail "the archive does not have the files blaze needs." "$asset has no ${asset%.tar.gz}/ra-jit"
+# A release from before the rename (#270) has its programs' old names, by which they find each
+# other: they keep them, but for the launchers of `cargo blaze`, which is gone.
+old_release=""
+if [ ! -e "$unpacked/blaze-engine" ] && [ -x "$unpacked/ra-jit" ]; then # rename: old name
+    old_release=1
+    rm -f "$unpacked/cargo-blaze" "$unpacked/cargo-ra-jit" # rename: old name
+fi
 
 # ---------------------------------------------------------------------------------------------
 # Installing
@@ -203,10 +202,36 @@ cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 bin="$cargo_home/bin"
 mkdir -p "$bin" 2>"$tmp/error" || fail "blaze's folder could not be made." "$(cat "$tmp/error")"
 
-# What `cargo install ra-jit` put there is replaced, and cargo should no longer think it its own.
-if [ -f "$cargo_home/.crates.toml" ] && grep -q '^"ra-jit ' "$cargo_home/.crates.toml" && command -v cargo >/dev/null 2>&1; then
-    step "removing the ra-jit that cargo installed"
-    CARGO_HOME="$cargo_home" cargo uninstall --quiet ra-jit >/dev/null 2>&1 || true
+# A blaze from before its rename (#270) left its programs here under their old names. When it was
+# enabled, cargo's configuration names its wrapper: it is disabled with its own program, and this
+# blaze is enabled in its place once installed.
+enable_again=""
+old_enabled="$cargo_home/ra-jit-enabled.json" # rename: old name
+old_engine="$bin/ra-jit" # rename: old name
+if [ -f "$old_enabled" ] && [ -x "$old_engine" ]; then
+    step "disabling the blaze from before its rename, to enable this one in its place"
+    "$old_engine" disable >/dev/null 2>&1 && enable_again=1
+fi
+# `cargo blaze` (before it `cargo ra-jit`) is now `blaze`: the program cargo ran for it goes. # rename: old name
+old_launcher=""
+for old in cargo-ra-jit cargo-blaze; do # rename: old name
+    if [ -e "$bin/$old" ]; then old_launcher="$old"; fi
+done
+# What `cargo install` put there before, which cargo should no longer think its own.
+for old in ra-jit cargo-blaze; do # rename: old name
+    if [ -f "$cargo_home/.crates.toml" ] && grep -q "^\"$old " "$cargo_home/.crates.toml" && command -v cargo >/dev/null 2>&1; then
+        CARGO_HOME="$cargo_home" cargo uninstall --quiet "$old" >/dev/null 2>&1 || true
+    fi
+done
+for old in ra-jit cargo-ra-jit ra-jit-rustc ra-jit-rustc-first; do # rename: old name
+    if [ -z "$old_release" ] && [ -e "$bin/$old" ]; then
+        step "removing $old, a program of the blaze from before its rename"
+        rm -f "$bin/$old"
+    fi
+done
+rm -f "$bin/cargo-blaze" # rename: old name
+if [ -n "$old_launcher" ]; then
+    say "removed $old_launcher: \`cargo blaze\` is now \`blaze\`, with the same commands" # rename: old name
 fi
 
 # Each program is copied beside its place and renamed into it, so that a daemon running the
@@ -222,73 +247,24 @@ for program in "$unpacked"/*; do
         put "$program" "$(basename "$program")"
     fi
 done
-# A release from before the rename has no cargo-blaze; this one runs its ra-jit the same way.
-if [ ! -x "$unpacked/cargo-blaze" ]; then
-    cat >"$tmp/cargo-blaze" <<EOF
-#!/bin/sh
-# \`cargo blaze\`, for a release from before the rename: runs the ra-jit installed beside it.
-[ "\${1-}" = blaze ] && shift
-exec "$bin/ra-jit" cargo "\$@"
-EOF
-    put "$tmp/cargo-blaze" cargo-blaze
+if [ -n "$enable_again" ]; then
+    "$bin/blaze" enable >/dev/null 2>"$tmp/error" ||
+        fail "blaze is installed, but plain cargo could not be switched to it as it was to the blaze before." \
+            "$(cat "$tmp/error")
+Run: blaze enable"
+    step "plain cargo goes through blaze, as it did before"
 fi
 
 # ---------------------------------------------------------------------------------------------
 # The Rust blaze builds with
 
-rust_note=""
-if [ -x "$unpacked/blaze" ]; then
-    # blaze downloads its own copy, once, unless rustup has the one it builds with.
-    if [ -n "$NO_TOOLCHAIN" ]; then
-        step "Rust $TOOLCHAIN is downloaded at the first build"
-    elif "$bin/blaze" toolchain >"$tmp/toolchain"; then
-        step "$(cat "$tmp/toolchain")"
-    else
-        fail "blaze is installed, but the Rust it builds with could not be downloaded; the first build tries again."
-    fi
+# blaze downloads its own copy, once, unless rustup has the one it builds with.
+if [ -n "$NO_TOOLCHAIN" ]; then
+    step "Rust $TOOLCHAIN is downloaded at the first build"
+elif "$bin/blaze" toolchain >"$tmp/toolchain"; then
+    step "$(cat "$tmp/toolchain")"
 else
-    # A release from before blaze had its own copy builds with rustup's copy of the Rust it was
-    # built for, which its tag's harness/toolchain names: not $TOOLCHAIN, which is this
-    # installer's, and the binary refuses any other rustc.
-    if [ -z "$tag" ]; then
-        TOOLCHAIN=""
-        rust_note="This archive has no blaze program, so it builds with rustup's copy of the Rust named in
-harness/toolchain of the commit it was built from. Install that with:
-
-    rustup toolchain install <that toolchain> --component rust-src"
-    else
-        fetch "https://raw.githubusercontent.com/$REPO/$tag/harness/toolchain" "$tmp/toolchain" 2>"$tmp/error" ||
-            fail "blaze $tag is installed, but which Rust it builds with could not be read." \
-                "$(cat "$tmp/error")
-https://raw.githubusercontent.com/$REPO/$tag/harness/toolchain"
-        TOOLCHAIN=$(tr -d ' \r\n' <"$tmp/toolchain")
-        [ -n "$TOOLCHAIN" ] || fail "blaze $tag is installed, but its harness/toolchain names no Rust."
-    fi
-    has_toolchain() {
-        rustup run "$TOOLCHAIN" rustc --version >/dev/null 2>&1 &&
-            rustup component list --toolchain "$TOOLCHAIN" --installed 2>/dev/null | grep -q '^rust-src'
-    }
-    if [ -n "$NO_TOOLCHAIN" ] || [ -z "$TOOLCHAIN" ]; then
-        step "leaving Rust alone"
-    elif command -v rustup >/dev/null 2>&1; then
-        if has_toolchain; then
-            step "Rust $TOOLCHAIN is installed"
-        else
-            say "Installing Rust $TOOLCHAIN, which blaze builds with..."
-            # What rustup says of a step after the install, such as its own place, is no failure
-            # when the toolchain is there.
-            rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src >"$tmp/rustup" 2>&1 ||
-                has_toolchain ||
-                fail "rustup could not install Rust $TOOLCHAIN, which blaze builds with. blaze itself is installed." \
-                    "$(tail -n 5 "$tmp/rustup")
-Try: rustup toolchain install $TOOLCHAIN --component rust-src"
-        fi
-    else
-        rust_note="This release of blaze builds with Rust $TOOLCHAIN, which needs rustup (https://rustup.rs).
-Once it is installed, run:
-
-    rustup toolchain install $TOOLCHAIN --component rust-src"
-    fi
+    fail "blaze is installed, but the Rust it builds with could not be downloaded; the first build tries again."
 fi
 
 # Rust links a program with the system's C compiler, which blaze does not bring.
@@ -308,7 +284,7 @@ fi
 # ---------------------------------------------------------------------------------------------
 # What to do next
 
-if [ -x "$unpacked/blaze" ]; then run="blaze run"; else run="cargo blaze run"; fi
+run="blaze run"
 case ":${PATH}:" in
     *":$bin:"*) path_note="" ;;
     *)
@@ -328,14 +304,13 @@ case "$tag" in
     nightly) say "blaze (nightly build) is installed." ;;
     *) say "blaze ${tag#v} is installed." ;;
 esac
-if [ -n "$rust_note" ]; then say ""; say "$rust_note"; fi
 if [ -n "$linker_note" ]; then say ""; say "$linker_note"; fi
 if [ -n "$path_note" ]; then say ""; say "$path_note"; fi
 say ""
 say "In a Rust project, run:"
 say ""
 say "    $run"
-if [ "$run" = "blaze run" ] && command -v cargo >/dev/null 2>&1; then
+if command -v cargo >/dev/null 2>&1; then
     say ""
     say "(cargo blaze run is the same.)"
 fi

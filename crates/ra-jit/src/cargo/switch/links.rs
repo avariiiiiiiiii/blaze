@@ -1,6 +1,6 @@
 //! `cargo fmt` and `cargo clippy` made blaze's by `enable`. They are not built into cargo: it
 //! runs `cargo-fmt` and `cargo-clippy`, looked for in its home's `bin` ahead of `PATH`, so a
-//! link there named so, to `cargo-blaze`, has cargo run blaze's. The file that was there,
+//! link there named so, to `blaze`, has cargo run blaze's. The file that was there,
 //! rustup's proxy, is kept beside it and `disable` puts it back. An `[alias]` would do the same,
 //! but cargo warns on every run that it shadows an external command and means to refuse it
 //! (rust-lang/cargo#10049).
@@ -30,18 +30,30 @@ pub(crate) struct Link {
     made_dir: bool,
 }
 
-/// `cargo-blaze`, installed next to this ra-jit.
+/// `blaze`, installed next to this ra-jit.
 fn target() -> anyhow::Result<PathBuf> {
     let this = std::env::current_exe().context("blaze does not know where it is installed")?;
-    Ok(this.with_file_name(format!("cargo-blaze{}", std::env::consts::EXE_SUFFIX)))
+    Ok(this.with_file_name(format!("blaze{}", std::env::consts::EXE_SUFFIX)))
 }
 
-/// Whether `path` is a link to a `cargo-blaze`, this one's or one installed elsewhere since.
+/// Whether `path` is a link to a program named `name`.
+fn links_to(path: &Path, name: &str) -> bool {
+    std::fs::read_link(path).is_ok_and(|it| it.file_stem().is_some_and(|it| it == name))
+}
+
+/// Whether `path` is a link to a `blaze`, this one's or one installed elsewhere since, or an
+/// old one's.
 fn ours(path: &Path) -> bool {
-    std::fs::read_link(path).is_ok_and(|it| it.file_stem().is_some_and(|it| it == "cargo-blaze"))
+    links_to(path, "blaze") || old(path)
 }
 
-/// Links each command that is blaze's own and not in `have` to `cargo-blaze`, in cargo's home
+/// Whether `path` is a link to the program cargo ran before `blaze` was the only command, which
+/// is gone: `enable` links it again.
+fn old(path: &Path) -> bool {
+    links_to(path, crate::renamed::OLD_LAUNCHER)
+}
+
+/// Links each command that is blaze's own and not in `have` to `blaze`, in cargo's home
 /// `home`, adding each to `made` as it is made. Returns what to tell the user.
 pub(crate) fn make(
     home: &Path,
@@ -82,7 +94,7 @@ fn make_in(
     let mut lines = Vec::new();
     for name in names {
         let path = bin.join(format!("cargo-{name}{}", std::env::consts::EXE_SUFFIX));
-        if ours(&path) && have.iter().any(|it| it.path == path) {
+        if ours(&path) && !old(&path) && have.iter().any(|it| it.path == path) {
             continue;
         }
         let kept = match std::fs::symlink_metadata(&path) {
@@ -105,6 +117,9 @@ fn make_in(
         };
         let made_dir = !bin.exists();
         std::fs::create_dir_all(&bin)?;
+        if old(&path) {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
         if !ours(&path)
             && let Err(error) = link(target, &path)
         {
@@ -213,7 +228,7 @@ mod tests {
     #[test]
     fn a_proxy_is_kept_and_comes_back() {
         let home = scratch("proxy");
-        let target = home.join("install").join("cargo-blaze");
+        let target = home.join("install").join("blaze");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "blaze").unwrap();
         let proxy = home.join("bin").join("cargo-fmt");
@@ -234,9 +249,24 @@ mod tests {
     }
 
     #[test]
+    fn a_link_to_the_old_launcher_is_made_again() {
+        let home = scratch("old");
+        let target = home.join("blaze");
+        std::fs::write(&target, "blaze").unwrap();
+        let path = home.join("bin").join("cargo-fmt");
+        link(&home.join(crate::renamed::OLD_LAUNCHER), &path).unwrap();
+        let mut made = Vec::new();
+        make_in(&home, &target, &["fmt"], &[], &mut made).unwrap();
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        assert!(made[0].kept.is_none());
+        assert!(!home.join(KEPT).exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
     fn a_link_replaced_since_is_left_alone() {
         let home = scratch("replaced");
-        let target = home.join("cargo-blaze");
+        let target = home.join("blaze");
         std::fs::write(&target, "blaze").unwrap();
         let proxy = home.join("bin").join("cargo-fmt");
         std::fs::write(&proxy, "old proxy").unwrap();
@@ -253,7 +283,7 @@ mod tests {
     #[test]
     fn a_kept_file_is_never_overwritten() {
         let home = scratch("kept");
-        let target = home.join("cargo-blaze");
+        let target = home.join("blaze");
         std::fs::write(&target, "blaze").unwrap();
         std::fs::write(home.join("bin/cargo-fmt"), "proxy").unwrap();
         std::fs::create_dir_all(home.join(KEPT)).unwrap();

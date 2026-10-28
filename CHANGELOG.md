@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to ra-jit are written here. The format follows
+All notable changes to blaze are written here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions after 0.1.0 are dated,
 `0.YYYYMMDD.N` with N counting the releases of that day from 0, and the release train writes
 each one's section: what `[Unreleased]` had, and the title of each change merged since
@@ -9,6 +9,29 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 ## [Unreleased]
 
 ### Changed
+
+- `cargo blaze` is gone: run `blaze` (same subcommands and flags). The program `cargo-blaze`,
+  and `cargo-ra-jit` before it, are no longer built or shipped; install.sh removes the one it
+  finds and says so in one line.
+
+- ra-jit is blaze everywhere (#270, [docs/rename.md](docs/rename.md)). The engine `blaze` runs
+  is `blaze-engine` (was `ra-jit`), and cargo's rustc wrapper is `blaze-rustc` (was
+  `ra-jit-rustc`; `ra-jit-rustc-first` is gone). The crates are `blaze-engine` and
+  `blaze-<name>`, and crates.io gets `blaze-engine` (was `cargo-blaze`): `cargo install
+  blaze-engine`. `#[ra_jit::cache]` is `#[blaze::cache]`, `[package.metadata.ra-jit]` is
+  `[package.metadata.blaze]`, and the state directories are `~/.cache/blaze`,
+  `$XDG_RUNTIME_DIR/blaze` and `target/blaze`. blaze starts these afresh, without moving the
+  old ones: the first command that finds one says where it is and how big, and that it can be
+  deleted. install.sh over a blaze from before disables the old one when it was enabled,
+  removes its programs and enables the new one; `blaze enable` replaces the links an earlier
+  `enable` made to `cargo-blaze`.
+
+- The forks of crates.io crates take blaze's names (#270). rowan is `syntax-tree`
+  (`crates/syntax-tree`, `use syntax_tree::...`), and rust-analyzer's `ra-ap-rustc_abi`,
+  `ra-ap-rustc_type_ir` and `ra-ap-rustc_next_trait_solver` are `rustc_abi`, `rustc_type_ir`
+  and `rustc_next_trait_solver`. They are path dependencies of the workspace at its version,
+  no longer patches over crates.io, and publish as `blaze-syntax-tree`, `blaze-rustc_abi` and so
+  on.
 
 - blaze's settings are `BLAZE_<NAME>` alone (#270). A setting under its old name,
   `RA_JIT_<NAME>`, is no longer read; blaze stops when one is set, with a line for each:

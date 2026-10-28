@@ -53,6 +53,4 @@ wasmparser = "0.244"
 debug = 0
 
 [patch.crates-io]
-# As in the main workspace: rustc's layout code, from the tag of the stable it is pinned to.
-ra-ap-rustc_abi = { path = "../../crates/rustc_abi" }
 cranelift-object = { path = "../../vendor/cranelift-object" }

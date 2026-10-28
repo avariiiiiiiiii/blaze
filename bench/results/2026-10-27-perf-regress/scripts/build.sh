@@ -13,7 +13,7 @@ start=$(date +%s)
 nix develop --command cargo build -j 16 -p ra-jit --release --features llvm --locked
 nix develop --command bash -c 'export CARGO=$(command -v cargo); python3 .github/scripts/build_release.py --server-beside $CARGO_TARGET_DIR/release/ra-jit' || { echo "no server at $rev"; mkdir -p "$out"; touch "$out/no-server"; }
 mkdir -p "$out"
-for b in ra-jit cargo-ra-jit cargo-blaze blaze ra-jit-rustc ra-jit-rustc-first blaze-proc-macro-srv; do
+for b in blaze-engine blaze blaze-rustc blaze-proc-macro-srv; do
   [ -f $CARGO_TARGET_DIR/release/$b ] && cp $CARGO_TARGET_DIR/release/$b "$out/"
 done
 echo "built $rev in $(( $(date +%s) - start ))s"

@@ -186,6 +186,15 @@ impl FloatTypeWrapper {
     pub fn to_f16(&self) -> Half {
         self.0.as_str().parse().unwrap_or_default()
     }
+
+    /// The literal with its sign flipped, as `-1.0` is written in a pattern.
+    fn negate(&self) -> Self {
+        let text = self.0.as_str();
+        Self(Symbol::intern(&match text.strip_prefix('-') {
+            Some(positive) => positive.to_owned(),
+            None => format!("-{text}"),
+        }))
+    }
 }
 
 impl fmt::Display for FloatTypeWrapper {
@@ -218,7 +227,11 @@ pub enum LiteralOrConst {
 
 impl Literal {
     pub fn negate(self) -> Option<Self> {
-        if let Literal::Int(i, k) = self { Some(Literal::Int(-i, k)) } else { None }
+        match self {
+            Literal::Int(i, k) => Some(Literal::Int(-i, k)),
+            Literal::Float(f, k) => Some(Literal::Float(f.negate(), k)),
+            _ => None,
+        }
     }
 }
 

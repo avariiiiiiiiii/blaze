@@ -31,10 +31,51 @@ fn shuffled(words: [i32; 4]) -> Vec<[i32; 4]> {
             _mm_unpacklo_epi32(a, b),
             _mm_add_epi32(a, b),
             _mm_castps_si128(_mm_shuffle_ps::<0b01_00_11_10>(_mm_castsi128_ps(a), _mm_castsi128_ps(b))),
+            black_box(in_c as Mixed)(7, a, 0.5, _mm_castsi128_ps(b), a, b, a, b, a, b, _mm_set1_epi32(-9)),
         ]
         .iter()
         .map(|it| std::mem::transmute(*it))
         .collect()
+    }
+}
+
+/// Vectors in the C ABI, as wasmtime's libcalls take them: each in an XMM register until the
+/// eight are taken (`x` takes one), the last two in memory.
+#[cfg(target_arch = "x86_64")]
+#[allow(improper_ctypes_definitions)]
+type Mixed = extern "C" fn(
+    i32,
+    std::arch::x86_64::__m128i,
+    f64,
+    std::arch::x86_64::__m128,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+) -> std::arch::x86_64::__m128i;
+
+#[cfg(target_arch = "x86_64")]
+#[allow(improper_ctypes_definitions, clippy::too_many_arguments)]
+extern "C" fn in_c(
+    n: i32,
+    a: std::arch::x86_64::__m128i,
+    x: f64,
+    b: std::arch::x86_64::__m128,
+    c: std::arch::x86_64::__m128i,
+    d: std::arch::x86_64::__m128i,
+    e: std::arch::x86_64::__m128i,
+    f: std::arch::x86_64::__m128i,
+    g: std::arch::x86_64::__m128i,
+    h: std::arch::x86_64::__m128i,
+    i: std::arch::x86_64::__m128i,
+) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    unsafe {
+        let sum = [c, d, e, f, g, h].into_iter().fold(_mm_set1_epi32(n + x as i32), |it, v| _mm_add_epi32(it, v));
+        _mm_xor_si128(_mm_mullo_epi16(sum, a), _mm_xor_si128(_mm_castps_si128(b), _mm_slli_epi32::<3>(i)))
     }
 }
 

@@ -489,7 +489,7 @@ def pinned_to_a_nightly(row):
 
 # The programs of one build, which run each other from next to themselves: with one missing,
 # `cargo ra-jit` is cargo's.
-PROGRAMS = ("ra-jit", "cargo-ra-jit", "ra-jit-rustc", "ra-jit-rustc-first")
+PROGRAMS = ("blaze-engine", "blaze", "blaze-rustc")
 
 
 def another_build(source, bin):
@@ -541,7 +541,7 @@ def binary_replaced(row):
     twin = os.path.join(row.dir, "bin-twin")
     shutil.copytree(bin, twin, copy_function=shutil.copy2)
     daemon = row.status()[0]
-    os.remove(os.path.join(bin, "ra-jit"))
+    os.remove(os.path.join(bin, "blaze-engine"))
     second_ws = os.path.join(row.dir, "ws2")
     row.copy(second_ws)
     apart = {"PATH": twin + os.pathsep + path}

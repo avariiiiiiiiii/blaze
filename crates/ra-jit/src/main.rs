@@ -5973,6 +5973,9 @@ fn link(
         return Err(PatchUnlinked { why: declined }.into());
     }
     let reading = whole::read(object)?;
+    // The command was made before a clean of the target directory may have taken the file of
+    // the room it reads.
+    cargo::plan::headerpad_again(cmd).context("writing the room the link reads again")?;
     if let Some(binary) = splice {
         set_aside(binary)?;
         let objects: Vec<&Path> = [Some(object), prebuilt, patch].into_iter().flatten().collect();

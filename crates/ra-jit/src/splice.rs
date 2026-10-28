@@ -257,9 +257,10 @@ impl Baseline {
                 matches!(image.format(), object::BinaryFormat::Elf | object::BinaryFormat::MachO),
                 "only an ELF or Mach-O executable of rustc's is patched as it is"
             );
-            // A Rust symbol has no `-` in it, and every object the daemon writes defines some
-            // with one.
-            let ours = |name: &[u8]| name.windows(6).any(|it| it == b"ra-jit");
+            // Every object the daemon writes defines symbols named `blaze.<...>` (`_blaze.<...>`
+            // in Mach-O), which no Rust symbol (`_ZN`, `_R`) and no C name is.
+            let ours =
+                |name: &[u8]| name.strip_prefix(b"_").unwrap_or(name).starts_with(b"blaze.");
             ensure!(
                 !image.symbols().any(|it| it.name_bytes().is_ok_and(ours)),
                 "the executable where cargo has the program is one the daemon linked"

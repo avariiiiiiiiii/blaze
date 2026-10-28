@@ -11,5 +11,5 @@ export CARGO_TARGET_DIR=/root/perf/target-ab CARGO_INCREMENTAL=0 RUSTUP_TOOLCHAI
 s=$(date +%s)
 nix develop --command bash -c "export RUSTUP_TOOLCHAIN=$tc PATH=/nix/var/nix/profiles/default/bin:\$PATH; cargo build -j 8 -p ra-jit --release --locked"
 out=/root/perf/bin/$name; rm -rf $out; mkdir -p $out
-for b in ra-jit cargo-ra-jit cargo-blaze blaze ra-jit-rustc ra-jit-rustc-first; do cp $CARGO_TARGET_DIR/release/$b $out/ 2>/dev/null || true; done
+for b in blaze-engine blaze blaze-rustc; do cp $CARGO_TARGET_DIR/release/$b $out/ 2>/dev/null || true; done
 echo "built $name ($rev) in $(( $(date +%s) - s ))s"

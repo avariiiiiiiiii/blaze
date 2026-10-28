@@ -47,7 +47,7 @@ jobs:
       tier: full
       borrowck: true
       pinned-ui: true
-      cargo-ra-jit: true
+      blaze-cli: true
       bench: true
       bun-e2e: true
       wasm32: true
@@ -69,7 +69,7 @@ jobs:
       os: macos-15
       tier: full
       pinned-ui: true
-      cargo-ra-jit: true
+      blaze-cli: true
 
   windows:
     name: windows x64

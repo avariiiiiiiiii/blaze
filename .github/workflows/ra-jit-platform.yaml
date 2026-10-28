@@ -28,7 +28,7 @@ on:
         description: the run-pass tests of rustc's in harness/ui-pinned.txt, against this build
         type: boolean
         default: false
-      cargo-ra-jit:
+      blaze-cli:
         description: "`cargo ra-jit` against cargo on small projects at pinned commits"
         type: boolean
         default: false
@@ -136,14 +136,14 @@ jobs:
         if: runner.os != 'Windows'
         run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/ra-jit
       # The binaries run each other from next to themselves (`ra-jit enable` links `cargo fmt`
-      # and `cargo clippy` to the cargo-blaze beside it, and fails without one; a load finds
+      # and `cargo clippy` to the blaze beside it, and fails without one; a load finds
       # blaze-proc-macro-srv beside ra-jit). A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
           server=$([ -f blaze-proc-macro-srv ] && echo blaze-proc-macro-srv || true)
-          tar -cf ra-jit.tar ra-jit$exe cargo-ra-jit$exe cargo-blaze$exe blaze$exe ra-jit-rustc$exe ra-jit-rustc-first$exe $server
+          tar -cf blaze.tar blaze-engine$exe blaze$exe blaze-rustc$exe $server
       - uses: actions/upload-artifact@v7
         with:
           name: ra-jit-${{ inputs.platform }}
@@ -214,7 +214,7 @@ jobs:
         working-directory: target/release
         run: |
           tar -xf ra-jit.tar
-          if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\ra-jit.exe"; else bin="$PWD/ra-jit"; fi
+          if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\blaze-engine.exe"; else bin="$PWD/ra-jit"; fi
           echo "BLAZE_BIN=$bin" >> "$GITHUB_ENV"
       - run: $PYTHON harness/ci.py ${{ matrix.part }}
       # What the daemons said when a harness failed (each harness keeps its daemon's log in a
@@ -225,7 +225,7 @@ jobs:
           find "${TMPDIR:-/tmp}" /tmp -maxdepth 2 -name daemon.log 2>/dev/null | sort -u | while read -r log; do
             echo "::group::$log"; tail -n 60 "$log"; echo "::endgroup::"
           done
-          for report in "$HOME"/Library/Logs/DiagnosticReports/ra-jit*; do
+          for report in "$HOME"/Library/Logs/DiagnosticReports/blaze-engine*; do
             [ -f "$report" ] && { echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::"; }
           done
           true
@@ -345,9 +345,9 @@ jobs:
   # life and plain cargo after `ra-jit enable`. Incremental compilation is left to the profile,
   # as on a developer's machine: with it off the tests of every project are cargo's (the
   # harness has that case among the flags).
-  cargo-ra-jit:
+  blaze-cli:
     name: cargo ra-jit (${{ matrix.backend }}, ${{ matrix.group }})
-    if: inputs.cargo-ra-jit
+    if: inputs.blaze-cli
     needs: build
     runs-on: ${{ inputs.os }}
     timeout-minutes: 60
@@ -384,7 +384,7 @@ jobs:
       - if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: cargo-ra-jit-logs-${{ inputs.platform }}-${{ matrix.backend }}-${{ strategy.job-index }}
+          name: blaze-cli-logs-${{ inputs.platform }}-${{ matrix.backend }}-${{ strategy.job-index }}
           path: |
             /tmp/ra-jit-cargo-processes.txt
             /tmp/ra-jit-cargo-*/home-*/*.log
@@ -431,7 +431,7 @@ jobs:
           if [ "${{ matrix.projects }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.projects }}"; fi
           status=0
           BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" $PYTHON cargo_ra_jit.py $what || status=$?
-          cat CARGO-RA_JIT*.md
+          cat BLAZE-CLI*.md
           exit $status
 
   # Not required to pass yet: the baseline was measured on another machine than the runner, so

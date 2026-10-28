@@ -100,8 +100,8 @@ common, keep a function once. `BLAZE_CACHE` names another directory, or `off` fo
 The daemon reads the variable when it starts, so under `cargo blaze` it has to be set in
 the environment of the command that starts the daemon; run `cargo blaze stop` first if
 one is running. `cargo blaze status` says how much the store holds, the most it may hold,
-and where it is. A setting's old name, `RA_JIT_` for `BLAZE_`, is not read: blaze stops
-when one is set, saying what it is called now.
+and where it is. A setting under its name from before the rename stops blaze, which says what
+it is called now ([rename.md](rename.md)).
 
 | Variable | Meaning | Default |
 |---|---|---|

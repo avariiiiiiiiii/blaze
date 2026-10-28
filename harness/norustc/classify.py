@@ -45,15 +45,15 @@ def who(pc):
         return "wrapper"
     if first.endswith("/rustdoc") or first.endswith("/rustdoc.real"):
         return "rustdoc"
-    if first.endswith("/ra-jit") and " --test " in pc and "--crate-name" in pc:
+    if first.endswith("/blaze-engine") and " --test " in pc and "--crate-name" in pc:
         return "ra-jit as rustdoc"
     if "build-script" in first or "/build/" in first:
         return "build script"
-    if "ra-jit cargo" in pc or "cargo-ra-jit" in pc or "ra-jit/target/release/ra-jit cargo" in pc:
+    if "blaze-engine cargo" in pc or first.endswith("/blaze") or first == "blaze":
         return "client"
-    if "--socket" in pc or "--spare" in pc or "ra-jit daemon" in pc:
+    if "--socket" in pc or "--spare" in pc or "blaze-engine daemon" in pc:
         return "worker"
-    if "/ra-jit " in pc or pc.startswith("ra-jit"):
+    if "/blaze-engine " in pc or pc.startswith("blaze-engine"):
         return "ra-jit"
     if "cargo" in pc.split(" ")[0]:
         return "cargo"

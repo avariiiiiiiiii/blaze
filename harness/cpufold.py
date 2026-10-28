@@ -145,7 +145,7 @@ def query_of(frame):
 
 
 def caller_of(frames):
-    """The innermost frame of the ra-jit crate itself: the code that asked salsa."""
+    """The innermost frame of the blaze-engine crate itself: the code that asked salsa."""
     for frame in frames:
         found = CALLER.search(frame)
         if found:

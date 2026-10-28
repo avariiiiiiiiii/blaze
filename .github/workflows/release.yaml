@@ -84,10 +84,8 @@ jobs:
           cp LICENSE-APACHE LICENSE-MIT README.md CHANGELOG.md "$NAME"
           cp shipped/* "$NAME"
           "$NAME/ra-jit" --version | tee /dev/stderr | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          # `blaze`, what cargo runs for `cargo blaze`, and the name it had before, run the one beside them.
+          # `blaze` runs the one beside it.
           "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          "$NAME/cargo-blaze" blaze --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          "$NAME/cargo-ra-jit" ra-jit --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
           RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 "$NAME/blaze-proc-macro-srv" --version | grep -F "rust-analyzer-proc-macro-srv "
           tar czf "$NAME.tar.gz" "$NAME"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
@@ -116,7 +114,7 @@ jobs:
           path: std-assets/*
           if-no-files-found: warn
 
-  # cargo-blaze and the forks it depends on (`ra-jit-hir`, `ra-jit-rustc_abi`, ...) on crates.io, as
+  # blaze's crate and the forks it depends on (`ra-jit-hir`, `ra-jit-rustc_abi`, ...) on crates.io, as
   # its own job so it can be rerun alone: versions already published are skipped. Each crate is
   # built first; crates.io's limit on new crates is waited out (a first release takes hours).
   crates:

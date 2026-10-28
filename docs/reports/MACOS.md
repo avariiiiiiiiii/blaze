@@ -195,7 +195,7 @@ It needs two more load commands than the linker leaves room for, so the link lin
    sets a newer deployment target gets no splice until this is done or the link line gets
    `-no_fixup_chains`.
 2. Linux x86-64 was not run. There is no Linux machine in this session. `hir-ty` passes
-   `cargo check --target x86_64-unknown-linux-gnu`; the `ra-jit` crate could not be checked
+   `cargo check --target x86_64-unknown-linux-gnu`; the `blaze-engine` crate could not be checked
    that way because `ring` needs a C cross compiler. The ELF splice path is the old code
    behind a format check, and the harness link line on Linux is the old one, but that is
    reading, not testing. Please run the list on Linux before trusting this branch there.

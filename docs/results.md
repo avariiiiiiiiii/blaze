@@ -193,7 +193,7 @@ of command lines is run with both. Source: harness/BREAKERS.md. Linux x86-64, Cr
 ### `cargo ra-jit` against cargo (`cargo_ra_jit.py`)
 
 Linux x86-64, 8 CPUs, 31 GB, Rust 1.99.0, Cranelift. Report at 13054e50d6 (the head of
-the cargo branch with `ra-jit-collate` b43304222b merged). Source: harness/CARGO-RA_JIT.md.
+the cargo branch with `ra-jit-collate` b43304222b merged). Source: harness/BLAZE-CLI.md.
 Seconds, `cargo ra-jit` / plain cargo, one run each. `(c)` marks a step cargo built in the
 daemon's place. "Differences" counts steps whose output, exit status or test results were
 not cargo's.
@@ -649,7 +649,7 @@ Where the time of one edit went before, from `BLAZE_TRACE` (the median of 5 to 7
 
 | | ripgrep, a function (70 ms) | nushell, a function (252 ms) |
 |---|---:|---:|
-| cargo starting and handing over to `cargo-ra-jit` and `ra-jit` | 14 | 20 |
+| cargo starting and handing over to `cargo-ra-jit` and the engine | 14 | 20 |
 | the worker waiting for `cargo check --compile-time-deps` | 26 | 1 |
 | type-checking, MIR, translating and Cranelift of the edited function | 18 | 149 |
 | rust-analyzer taking the change | 4 | 20 |

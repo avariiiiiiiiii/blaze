@@ -913,6 +913,50 @@ fn integer_log_ilog() {
     check_number(&format!("{INTEGER_LOG}\n        const GOAL: u32 = ilog(255, 16);\n"), 1);
 }
 
+/// `core::fmt::num_buffer`'s `type Buf = [MaybeUninit<u8>; i64::MAX.ilog10() as usize + 2]`, of
+/// the signed `ilog10`.
+#[test]
+fn signed_integer_log_in_a_type_alias() {
+    check_number(
+        &format!(
+            r#"{INTEGER_LOG}
+        struct I64(i64);
+        impl I64 {{
+            const MAX: I64 = I64(9223372036854775807);
+            const fn cast_unsigned(self) -> u64 {{
+                self.0 as u64
+            }}
+            const fn ilog10(self) -> u32 {{
+                if let Some(log) = self.checked_ilog10() {{
+                    log
+                }} else {{
+                    panic!("argument of integer logarithm must be positive")
+                }}
+            }}
+            const fn checked_ilog10(self) -> Option<u32> {{
+                int_log10_i64(self.0)
+            }}
+        }}
+        const fn int_log10_i64(val: i64) -> Option<u32> {{
+            if val > 0 {{
+                let result = u64_impl(I64(val).cast_unsigned());
+                unsafe {{ assume(result <= const {{ u64_impl(I64::MAX.cast_unsigned()) }}) }};
+                Some(result)
+            }} else {{
+                None
+            }}
+        }}
+        type Buf = [u8; I64::MAX.ilog10() as usize + 2];
+        const GOAL: usize = {{
+            let buf: Buf = [0; 20];
+            I64::MAX.ilog10() as usize + 2
+        }};
+        "#
+        ),
+        20,
+    );
+}
+
 #[test]
 fn allocated_memory_may_not_be_in_the_value() {
     for value in ["__rust_alloc(4, 1)", "&*__rust_alloc(4, 1)"] {

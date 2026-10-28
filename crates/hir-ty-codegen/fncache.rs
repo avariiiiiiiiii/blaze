@@ -215,18 +215,28 @@ pub fn tests_reach(
     walk.tests = true;
     let starts: Vec<u32> = roots.iter().map(|&it| walk.reach(Node::Root(it))).collect();
     let mut sealed: FxHashMap<u32, Sealed> = FxHashMap::default();
+    let mut spent = [std::time::Duration::ZERO; 4];
     let mut next = 0;
     while let Some(node) = walk.nodes.get(next).map(|it| it.node.clone()) {
         let at = next as u32;
         next += 1;
-        let Some(name) = sealed_name(db, &names, &node) else {
+        let before = std::time::Instant::now();
+        let name = sealed_name(db, &names, &node);
+        spent[0] += before.elapsed();
+        let Some(name) = name else {
+            let before = std::time::Instant::now();
             walk.hash_node(at, &node);
+            spent[2] += before.elapsed();
             continue;
         };
         let key = below_key(&header, &name);
+        let before = std::time::Instant::now();
         let below = store.and_then(|it| it.get(&key)).and_then(|it| Below::read(&it));
+        spent[1] += before.elapsed();
         if below.is_none() {
+            let before = std::time::Instant::now();
             walk.hash_node(at, &node);
+            spent[3] += before.elapsed();
             walk.segments.pop();
         }
         let mut hasher = rustc_stable_hash::StableSipHasher128::new();
@@ -305,8 +315,12 @@ pub fn tests_reach(
         let steps: Vec<String> =
             took.iter().map(|(name, at)| format!("{name}={}", at.as_micros())).collect();
         eprintln!(
-            "tests-reach-steps-us: {} ({} roots, {} nodes, {} sealed)",
+            "tests-reach-steps-us: {} (naming={} store={} hashing={} sealed-hashing={}; {} roots, {} nodes, {} sealed)",
             steps.join(" "),
+            spent[0].as_micros(),
+            spent[1].as_micros(),
+            spent[2].as_micros(),
+            spent[3].as_micros(),
             roots.len(),
             walk.nodes.len(),
             sealed.len()

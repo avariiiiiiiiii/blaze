@@ -33,27 +33,41 @@ use rustc_type_ir::inherent::IntoKind;
 
 /// Whether `id` is a static that chooses a function, as the module says.
 pub(super) fn is_cache(db: &dyn HirDatabase, id: StaticId) -> bool {
+    let not = why_not(db, id);
+    if let Some(why) = not
+        && std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some()
+    {
+        eprintln!("fn-cache: static {id:?} chooses no function: {why}");
+    }
+    not.is_none()
+}
+
+/// Why `id` is not a static that chooses a function.
+fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
     if StaticSignature::of(db, id).flags.contains(StaticFlags::MUTABLE)
         || !is_atomic_ptr(db, db.type_for_static(id).skip_binder())
     {
-        return false;
+        return Some("mutable or not an AtomicPtr");
     }
-    let ItemContainerId::ModuleId(module) = id.lookup(db).container else { return false };
-    let Some(block) = module.block(db) else { return false };
+    let ItemContainerId::ModuleId(module) = id.lookup(db).container else { return Some("not declared in a block") };
+    let Some(block) = module.block(db) else { return Some("not of a module's block") };
     // SAFETY: the module is used in this call alone, as hir-def's own search for a block's body.
     let outer = unsafe { block.module(db).to_static() };
     if outer.block(db).is_some() {
-        return false;
+        return Some("not a module's block");
     }
     let Some(owner) = owners(db, outer)
         .into_iter()
         .find(|&it| Body::of(db, it).blocks(db).any(|(found, _)| found == block))
     else {
-        return false;
+        return Some("no body has its block");
     };
-    let Ok(init) = db.mir_body(InferBodyId::DefWithBodyId(id.into())) else { return false };
+    let Ok(init) = db.mir_body(InferBodyId::DefWithBodyId(id.into())) else { return Some("its initializer has no MIR") };
     if !made_of_fn(db, init, return_slot(), &mut FxHashSet::default()) {
-        return false;
+        if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
+            eprintln!("fn-cache: {:#?}", init.basic_blocks);
+        }
+        return Some("its first value is no function's address");
     }
     let mut bodies = vec![owner];
     let mut seen = FxHashSet::from_iter([owner]);
@@ -63,7 +77,7 @@ pub(super) fn is_cache(db: &dyn HirDatabase, id: StaticId) -> bool {
             matches!(expr, Expr::Closure { closure_kind, .. } if *closure_kind != ClosureKind::Closure)
         });
         if coroutine {
-            return false;
+            return Some("a coroutine can name it");
         }
         for (_, def_map) in store.blocks(db) {
             for (_, data) in def_map.modules(db) {
@@ -72,19 +86,22 @@ pub(super) fn is_cache(db: &dyn HirDatabase, id: StaticId) -> bool {
                 bodies.extend(found.into_iter().filter(|&it| seen.insert(it)));
             }
         }
-        let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(at)) else { return false };
+        let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(at)) else { return Some("a body that can name it has no MIR") };
         let mut mir = vec![body];
         while let Some(body) = mir.pop() {
             if !only_dispatches(db, body, id) {
-                return false;
+                if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
+                    eprintln!("fn-cache: {:?}: {:#?}", body.owner, body.basic_blocks);
+                }
+                return Some("a body uses it otherwise");
             }
             for &closure in &body.closures {
-                let Ok(it) = db.mir_body_for_closure(closure) else { return false };
+                let Ok(it) = db.mir_body_for_closure(closure) else { return Some("a closure that can name it has no MIR") };
                 mir.push(it);
             }
         }
     }
-    true
+    None
 }
 
 /// Whether `operand`, which a body of a crate outside the toolchain makes a function pointer

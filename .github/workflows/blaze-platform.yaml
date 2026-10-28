@@ -370,7 +370,7 @@ jobs:
       - name: smoke corpus (std)
         run: |
           BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
-            "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
+            "{\"groups\": [\"std\", \"crates\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
 
   # `blaze` in place of cargo on projects at pinned commits, and the flags, the daemon's
   # life and plain cargo after `blaze enable`. Incremental compilation is left to the profile,

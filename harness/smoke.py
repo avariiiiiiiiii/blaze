@@ -38,6 +38,8 @@ Profile = typing.Literal["dev", "release"]
 GROUPS = typing.get_args(Group)
 CASE_SECS = 900
 PROJECT_SECS = 3600
+# What blaze prints when something of the build was not its own (install.yaml looks for these too).
+NOT_BLAZES = ("blaze: bug:", "the daemon has no part")
 
 
 @dataclass(frozen=True)
@@ -164,7 +166,8 @@ class Smoke:
 
     def check(self, what, argv, cwd, env, timeout, judge, repro, open_issue):
         code, out, err, secs = run(argv, cwd, env, timeout)
-        why = judge(code, out)
+        not_ours = [line for line in err.splitlines() if any(it in line for it in NOT_BLAZES)]
+        why = f"the build was not blaze's: {not_ours[0].strip()}" if code == 0 and not_ours else judge(code, out)
         result = dict(what=what, ok=why is None, open=open_issue, seconds=round(secs, 1), why=why,
                       repro=repro, stdout=tail(out), stderr=tail(err))
         self.results.append(result)

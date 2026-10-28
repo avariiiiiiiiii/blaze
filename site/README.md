@@ -166,7 +166,8 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   Chat (opens the feed's history and input, as T does), the faces on this page (click for everyone and where), and the
   reader's GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
   On the page itself (`client/lib/cursors.ts`) the others there show as live pointers (desktop only; "Hide cursors"
-  in the who-is-here list turns them off) and as faces on a rail at the right edge where each one's pointer is in the
+  in the who-is-here list turns them off), a press showing as a ring at the pointer's tip (a `k` frame, relayed as a
+  pointer is), and as faces on a rail at the right edge where each one's pointer is in the
   article (click a face to go there). A pointer is sent as what it is on (`client/lib/anchor.ts`): in the
   article a block and the character in it, elsewhere a region (the sidebar, the top line, "On this page") and
   the link or button in it, with fractions of that thing's box; so it lands on the same thing whatever

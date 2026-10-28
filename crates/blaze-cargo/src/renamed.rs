@@ -4,11 +4,9 @@
 /// The prefix of the settings' names before the rename, now `BLAZE_`.
 const OLD: &str = "RA_JIT_";
 
-/// The names of the wrapper cargo ran rustc through before the rename, now `blaze-rustc`.
 /// The program cargo ran as `cargo blaze`, which `blaze enable` linked `cargo fmt` and
 /// `cargo clippy` to before `blaze` was the only command.
 pub const OLD_LAUNCHER: &str = "cargo-blaze";
-pub const OLD_WRAPPERS: [&str; 2] = ["ra-jit-rustc", "ra-jit-rustc-first"];
 
 /// Ends this process when a setting is named as it was before the rename, with a line for
 /// each saying what it is called now: a setting blaze does not read would change nothing

@@ -148,9 +148,8 @@ From [docs/machines](https://ix.dev/docs/machines), [docs/snapshots](https://ix.
 - **Workers.** A worker is keyed by repository, toolchain, target, features and `cfg(test)`
   ([architecture.md](architecture.md), **read**). It can hold several checkouts (`--also`), but
   per Andrew the runner never uses that: a daemon holds one branch, and branches are forks.
-- **The first build.** cargo's and rustc's unless `BLAZE_RUSTC_BASE=0`, which has the daemon
-  build the base itself (`lib.rs`, **read**; `harness/warmstart.py` uses it). The seed always
-  sets it.
+- **The first build.** The daemon builds the base itself (`lib.rs`, **read**), as
+  `BLAZE_RUSTC_BASE=0` asked for before the wrapper went.
 - **Per checkout today.** `tests-reach` and `tests-passed` live beside each test program in the
   target directory (`cargo/affected.rs`, **read**). Affected selection runs everything when cargo
   built the program or `tests-reach` is missing ([#227](https://github.com/indexable-inc/blaze/issues/227),
@@ -175,7 +174,7 @@ The seed is an ix machine, persistent, of the repository's architecture. It hold
   path;
 - the pinned blaze binary and toolchain, and the target directory and store on tmpfs or the
   page cache, so they are inside the memory snapshot (the guest disk was 40 MB/s, above);
-- one blaze-engine daemon for the checkout, started with `BLAZE_RUSTC_BASE=0`, `BLAZE_TESTS=affected`
+- one blaze-engine daemon for the checkout, started with `BLAZE_TESTS=affected`
   and the daemon's idle exit off (a fork resumes with a clock that jumped, and an idle timer must
   not end the daemon the job came for: **unverified** what the daemon does today);
 - after a build of `main`'s tests: the daemon's own base, the test programs built, and the test
@@ -465,8 +464,8 @@ that rule to hold on real repositories, from [no-rustc.md](no-rustc.md) and the 
 
 - [#258](https://github.com/indexable-inc/blaze/issues/258) (P1): test edits went to cargo on
   ripgrep and helix-core; three causes, fixes in flight.
-- [#91](https://github.com/indexable-inc/blaze/issues/91) (no-rustc K): the cold build is cargo's
-  unless `BLAZE_RUSTC_BASE=0`; the seed sets it, and K makes it the only path.
+- [#91](https://github.com/indexable-inc/blaze/issues/91) (no-rustc K): the cold build is blaze's
+  own, the only path since `BLAZE_RUSTC_BASE` went with the wrapper.
 - [#86](https://github.com/indexable-inc/blaze/issues/86), [#87](https://github.com/indexable-inc/blaze/issues/87),
   [#89](https://github.com/indexable-inc/blaze/issues/89), [#90](https://github.com/indexable-inc/blaze/issues/90)
   (F, G, I, J): std, every crate, build scripts and proc macros by blaze. Until they land the seed's
@@ -531,7 +530,7 @@ Linux only until the runner has macOS and Windows forks, which ix does not have.
 Ranked by what each unblocks. Blockers named; ix rollout state is ix's.
 
 1. **R1. One seed, one job, end to end, on ripgrep then nushell.** A seed recipe (clone, pinned
-   blaze, `BLAZE_RUSTC_BASE=0`, daemon warm on main, idle exit off, store and target in memory,
+   blaze, daemon warm on main, idle exit off, store and target in memory,
    snapshot), and a `crates/ci/fast` job script: fork, fetch, check out in place, `blaze
    test` under `affected`, check run, delete. Fails the job on any `building with cargo` line.
    Measures: push to green, fork time, the fork's dirty memory, whether the daemon survives the

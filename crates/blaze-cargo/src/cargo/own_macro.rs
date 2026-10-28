@@ -5,7 +5,7 @@
 //! and the libraries it links as it does a build script (`own_script.rs`), and blaze links it
 //! as a shared library where rustc would have put it, with the dep-info cargo reads. The
 //! load expands with it by that server. Cargo's own builds never read that directory, and
-//! nothing there is rustc's (`wrapper.rs`, `for_load`): the libraries a proc macro links are
+//! nothing there is rustc's (`load_wrapper.rs`, `for_load`): the libraries a proc macro links are
 //! only described, and a proc macro without a server fails the load.
 //!
 //! By default a proc macro is built as a WebAssembly module instead ([`WASM`]), which blaze
@@ -176,7 +176,7 @@ pub fn turned_off() -> bool {
 
 /// The directory in cargo's target directory of a load's own target directory when blaze
 /// links the proc macros, where libraries are only described: cargo is given empty files for
-/// them (`wrapper.rs`, `described_only`).
+/// them (`load_wrapper.rs`, `described_only`).
 pub const OWN_DIR: &str = "rust-analyzer";
 
 /// The same when [`turned_off`], where rustc builds every unit. Cargo does not fingerprint

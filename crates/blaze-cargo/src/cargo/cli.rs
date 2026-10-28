@@ -107,7 +107,6 @@ const WORKER_ENV: &[&str] = &[
     "BLAZE_SPLICE",
     "BLAZE_BUILT_IN",
     "BLAZE_LLVM_INLINE_THRESHOLD",
-    "BLAZE_RUSTC_BASE",
     super::own_macro::SERVER,
     super::own_macro::WASM,
     super::layout::NEW_LAYOUT,
@@ -205,8 +204,6 @@ pub enum Asked {
     Cache(Vec<String>),
     Status,
     Stop,
-    Enable,
-    Disable,
     /// blaze's own toolchain, downloaded first when it has none; with `--path`, its directory
     /// alone, for the installer to link.
     Toolchain {
@@ -284,39 +281,12 @@ impl Asked {
             ("cache", _) => Asked::Cache(rest.to_vec()),
             ("status", _) => Asked::Status,
             ("stop", _) => Asked::Stop,
-            ("enable", _) => Asked::Enable,
-            ("disable", _) => Asked::Disable,
             ("toolchain", _) => Asked::Toolchain { path: rest.iter().any(|it| it == "--path") },
             ("lock", _) => Asked::Lock(rest.to_vec()),
             ("pin", _) => Asked::Pin(rest.to_vec()),
             _ => Asked::Own(args),
         }
     }
-}
-
-/// The build command a cargo was run for, from its arguments. Cargo takes its own flags
-/// ahead of the subcommand as well as after it, and they are read as if they were after.
-/// `None` when the command is not one that builds programs blaze has a part in, or is one
-/// with a directory to change to first.
-pub fn of_cargo(args: &[String]) -> Option<Invocation> {
-    let mut ahead = Vec::new();
-    let mut words = args.iter();
-    let subcommand = loop {
-        let word = words.next()?;
-        if !word.starts_with('-') {
-            // rustc links nothing for `cargo check` that the daemon would load.
-            break Subcommand::named(word).filter(|it| *it != Subcommand::Check)?;
-        }
-        if word == "-C" {
-            return None;
-        }
-        ahead.push(word.clone());
-        if VALUED.contains(&word.as_str()) {
-            ahead.push(words.next()?.clone());
-        }
-    };
-    let typed: Vec<String> = ahead.into_iter().chain(words.cloned()).collect();
-    Some(Invocation::parse(subcommand, &typed))
 }
 
 impl Invocation {
@@ -389,33 +359,6 @@ impl Invocation {
             hash.update(value);
         }
         hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect()
-    }
-
-    /// Why this command is cargo's alone, when it is clear before anything is built.
-    pub fn only_cargo(&self) -> Option<String> {
-        let surroundings = match () {
-            _ if another_wrapper() => "RUSTC_WORKSPACE_WRAPPER is set to another wrapper",
-            _ if !wrapper_installed() => "`blaze-rustc` is not installed next to `blaze`",
-            _ => return self.asks_for_cargo(),
-        };
-        Some(surroundings.to_owned())
-    }
-
-    /// Why what was typed is cargo's alone, wherever it is typed. A check links nothing,
-    /// and says what the daemon finds of the source whatever the flags are, but what cargo
-    /// would do.
-    fn asks_for_cargo(&self) -> Option<String> {
-        let flags = &self.flags;
-        let reason = match () {
-            _ if flags.cargos_plan => "--build-plan and --unit-graph are cargo's to answer",
-            _ if self.subcommand == Subcommand::Check => return None,
-            _ if !flags.message_format.is_empty() => "--message-format is cargo's to answer",
-            _ if !flags.unstable.is_empty() => "unstable cargo flags",
-            _ if !flags.excludes.is_empty() => "--exclude is not loaded by the daemon yet",
-            _ if flags.targets.len() > 1 => "several targets in one build",
-            _ => return self.target().and_then(|it| unsupported_target(&it)),
-        };
-        Some(reason.to_owned())
     }
 
     /// The first flag typed that picks targets of a kind, tests or benches: `--bin` and
@@ -536,19 +479,6 @@ impl Flags {
     }
 }
 
-/// Whether the environment names a wrapper for the crates of the workspace that is not
-/// blaze's.
-fn another_wrapper() -> bool {
-    let ours = super::switch::wrapper_path().ok();
-    std::env::var_os(super::switch::VARIABLE)
-        .is_some_and(|it| !it.is_empty() && Some(Path::new(&it)) != ours.as_deref())
-}
-
-/// Whether the wrapper cargo is to run in place of rustc is where blaze looks for it.
-fn wrapper_installed() -> bool {
-    super::switch::wrapper_path().is_ok_and(|it| it.is_file())
-}
-
 /// Why blaze does not build for `triple`, when it does not.
 fn unsupported_target(triple: &str) -> Option<String> {
     use hir_ty_codegen::{ObjectFormat, Target};
@@ -659,26 +589,17 @@ mod tests {
     }
 
     #[test]
-    fn what_is_cargos_alone() {
+    fn what_is_not_a_build() {
         assert_eq!(Asked::parse(vec!["doc".to_owned()]), Asked::Own(vec!["doc".to_owned()]));
+        assert_eq!(Asked::parse(vec!["fmt".to_owned()]), Asked::Own(vec!["fmt".to_owned()]));
         assert_eq!(Asked::parse(Vec::new()), Asked::Help);
         assert_eq!(Asked::parse(vec!["--help".to_owned()]), Asked::Help);
-        for args in ["--message-format json", "--exclude a", "--target mips-unknown-none", "-Zx"] {
-            assert!(build("build", args).asks_for_cargo().is_some(), "{args}");
-            assert_eq!(build("check", args).asks_for_cargo(), None, "{args}");
-        }
-        assert_eq!(build("check", "--target a --target b").asks_for_cargo(), None);
-        assert!(build("check", "--unit-graph").asks_for_cargo().is_some());
+        assert!(build("check", "--unit-graph").flags.cargos_plan);
         let check =
             build("check", "--workspace --exclude a --exclude=b -Zx -Z y --message-format=json");
         assert_eq!(check.flags.excludes, ["a", "b"]);
         assert_eq!(check.flags.unstable, ["x", "y"]);
         assert_eq!(check.flags.message_format, ["json"]);
-        for args in
-            ["--release", "--profile bench", "-p a -p b", "--all-features", "--no-default-features"]
-        {
-            assert_eq!(build("build", args).asks_for_cargo(), None, "{args}");
-        }
         assert_eq!(build("test", "--release").profile(), "release");
         assert_eq!(build("test", "").profile(), "test");
     }
@@ -704,9 +625,8 @@ mod tests {
     }
 
     #[test]
-    fn check_asks_of_the_build_of_its_flags_and_plain_cargo_check_is_cargos() {
+    fn check_asks_of_the_build_of_its_flags() {
         let cwd = Path::new("/ws");
         assert_eq!(build("check", "--bin a").key(cwd), build("build", "--bin a").key(cwd));
-        assert_eq!(of_cargo(&["check".to_owned()]), None);
     }
 }

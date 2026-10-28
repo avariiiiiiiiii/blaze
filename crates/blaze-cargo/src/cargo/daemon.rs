@@ -514,18 +514,6 @@ impl Worker {
         if first.shared {
             args.push("--shared".into());
         }
-        if let Some(rustcs) = &first.rustc_binary {
-            args.push("--rustc-binary".into());
-            args.push(rustcs.into());
-            // A plan of rustc's executable copies the files of crates that call by symbol
-            // alone.
-            let by_symbol = dir.join("by-symbol");
-            let listed: String =
-                first.copies.iter().map(|it| format!("{}\n", it.display())).collect();
-            std::fs::write(&by_symbol, listed)?;
-            args.push("--by-symbol-in".into());
-            args.push(by_symbol.into());
-        }
         // In a file: a program of many crates has more of them than fit the command line
         // of a process on Windows.
         let symbols = dir.join("symbols");
@@ -544,7 +532,7 @@ impl Worker {
         let mut started: BTreeMap<String, String> = checkout
             .env
             .iter()
-            .filter(|(name, _)| super::wrapper::names_a_place(name))
+            .filter(|(name, _)| super::load_wrapper::names_a_place(name))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         started.extend(config.builds_env());

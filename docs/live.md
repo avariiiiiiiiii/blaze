@@ -154,12 +154,10 @@ A patch that can't be applied (`Outcome::Declined`) leaves the program as it was
 
 A type is never changed in place under a running program: a new one is added beside it under
 a name of its own, the code moved to it with the values converted, and the old one deleted,
-each edit a patch. On the daemon's own base (`BLAZE_RUSTC_BASE=0`, or once it has built one)
-an edit that adds a struct, an enum, a derive, a trait impl or a `macro_rules!` call that
-writes them, anywhere in a file with other types, is a patch of the functions it adds and the
-generic instances over the new type; taking a type away is a patch of the code that no longer
-names it. Over rustc's executable an edit that is more than bodies still takes a build in full
-and a restart ([architecture.md](architecture.md)).
+each edit a patch. An edit that adds a struct, an enum, a derive, a trait impl or a
+`macro_rules!` call that writes them, anywhere in a file with other types, is a patch of the
+functions it adds and the generic instances over the new type; taking a type away is a patch of
+the code that no longer names it.
 
 A static new since the base, as the `static INDEX: AtomicU32` that `#[derive(Component)]`
 writes in a function for each type, interior mutability or not, is in every patch after the

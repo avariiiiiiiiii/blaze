@@ -181,7 +181,7 @@ What is specific to the port:
   arguments always go on the stack.
 
 Not there: debug info is not checked on macOS (the harness reads DWARF out of ELF).
-`blaze` and plain cargo after `blaze enable` serve dev and test builds;
+`blaze` serves dev and test builds;
 `harness/blaze_cli.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
 the larger projects of that harness have not been run ([cargo.md](cargo.md#macos-arm64)).
 `buildmodel.py`,

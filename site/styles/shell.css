@@ -197,3 +197,49 @@ main.wide { max-width: none; }
    shows the progress cursor. */
 main h1[tabindex="-1"]:focus { outline: none; }
 html.nav-wait, html.nav-wait * { cursor: progress; }
+
+/* Who is here (client/lib/presence.ts): the pane's top line, its list of everyone, and faces on the sidebar's rows. */
+.topline { position: sticky; top: 0; z-index: 15; display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-height: 48px; padding: 8px clamp(12px, 2vw, 20px); border-radius: 16px 16px 0 0; background: color-mix(in srgb, var(--bg) 82%, transparent); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+.topline > span { display: contents; }
+.tl-discuss { order: 0; }
+.tl-btn { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 10px; border: 0; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--line-2); background: none; color: var(--ink-2); font: inherit; font-size: 13px; text-decoration: none; white-space: nowrap; cursor: pointer; transition: color 0.12s, background-color 0.12s; }
+.tl-btn:hover, .tl-btn[aria-expanded='true'] { color: var(--ink-1); background: var(--s-tint); }
+.tl-btn svg { width: 14px; height: 14px; fill: currentColor; }
+.tl-discuss .tl-btn { margin-right: auto; color: var(--ink-1); }
+.tl-bubble { width: 14px; height: 12px; border: 1.5px solid currentColor; border-radius: 4px 4px 4px 1px; }
+.tl-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+.tl-count { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.tl-user { padding-left: 4px; color: var(--ink-1); }
+.tl-user .face { width: 22px; height: 22px; }
+.tl-quiet { box-shadow: none; color: var(--ink-3); }
+.tl-out { display: contents; }
+.tl-signin { color: var(--ink-1); }
+.tl-list { position: sticky; top: 52px; z-index: 16; width: min(360px, calc(100% - 24px)); max-height: 60vh; overflow: auto; margin: 0 clamp(12px, 2vw, 20px) -1px auto; padding: 10px; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 16px 40px rgb(0 0 0 / 0.25); font-size: 13px; }
+.tl-list[hidden] { display: none; }
+.tl-list ul { margin: 0; padding: 0; list-style: none; }
+.tl-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 4px; border-top: 1px solid var(--line); }
+.tl-list .who { color: var(--ink-1); text-decoration: none; }
+.tl-list .tag { padding: 0 6px; border-radius: 6px; background: var(--s-tint); color: var(--ink-3); font-size: 11px; }
+.tl-list .where { display: flex; flex-wrap: wrap; gap: 4px 10px; flex-basis: 100%; padding-left: 30px; }
+.tl-list .where a { color: var(--ink-3); text-decoration: none; }
+.tl-list .where a:hover { color: var(--ink-1); }
+.tl-list .where a.away { opacity: 0.55; }
+.tl-head { margin: 0 4px 6px; color: var(--ink-3); }
+.tl-list li.tl-head { border: 0; }
+.faces { display: inline-flex; align-items: center; }
+.faces .face + .face { margin-left: -6px; }
+.face { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: var(--bg-4); box-shadow: 0 0 0 2px var(--bg); transition: opacity 0.2s; }
+.face img, .face svg { width: 100%; height: 100%; }
+.face svg { padding: 2px; background: var(--bg-3); }
+.face svg rect { fill: var(--id-ink); }
+.face.away { opacity: 0.45; }
+.face.more { width: auto; min-width: 20px; padding: 0 4px; border-radius: 10px; color: var(--ink-3); font-size: 10.5px; }
+.navlist .row > .faces { margin-left: auto; }
+.navlist .row > .faces .face { width: 16px; height: 16px; box-shadow: 0 0 0 1.5px var(--bg); }
+/* The discussion the top line jumps to: clear of the sticky line. */
+main .discussion { scroll-margin-top: 64px; }
+@media (max-width: 800px) {
+	.topline { top: 49px; margin: 0 -8px; padding: 6px 12px; border-radius: 0; border-bottom: 1px solid var(--line); }
+	.tl-count, .tl-user span:last-child { display: none; }
+	.tl-list { top: 96px; }
+}

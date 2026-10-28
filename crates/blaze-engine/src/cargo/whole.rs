@@ -79,6 +79,15 @@ struct Program {
     dir: PathBuf,
 }
 
+/// Why the workspace is newer than this blaze's Rust ([`super::toolchain::too_new`]), unless
+/// `--ignore-rust-version` says to build it anyway, as cargo does.
+fn too_new(asked: &Invocation, metadata: &Metadata) -> Option<String> {
+    if asked.typed("--ignore-rust-version") {
+        return None;
+    }
+    super::toolchain::too_new(&metadata.workspace_packages())
+}
+
 /// `build` and `run`: builds the programs of `asked` whole and runs the one `run` asks for.
 /// A build of no program, of libraries alone, is the daemon's check of them: blaze writes no
 /// library for cargo, which builds nothing.
@@ -90,6 +99,10 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
     let metadata = super::state::metadata(asked);
+    if let Some(why) = too_new(asked, &metadata) {
+        say::error(&why);
+        return Ok(FAILED);
+    }
     let mut programs = match planned(asked, &cwd, &metadata, None) {
         Ok(programs) => programs,
         Err(why) => {
@@ -150,6 +163,10 @@ pub(super) fn test(asked: &Invocation) -> anyhow::Result<i32> {
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
     let metadata = super::state::metadata(asked);
+    if let Some(why) = too_new(asked, &metadata) {
+        say::error(&why);
+        return Ok(FAILED);
+    }
     let named = asked.values_of("--test").first().copied();
     let tests = blaze_metadata::Tests { lib: asked.typed("--lib"), test: named };
     let programs = match planned(asked, &cwd, &metadata, Some(tests)) {

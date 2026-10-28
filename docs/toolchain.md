@@ -130,7 +130,11 @@ Measured 2026-10-27, on the first bump the workflow made.
 
 - A project that pins another toolchain (a stable release, an older nightly, in a
   rust-toolchain file, `rustup override` or `RUSTUP_TOOLCHAIN`) builds with blaze's. The pin is
-  not read: blaze runs nothing to learn what it names.
+  not read: blaze runs nothing to learn what it names. Under `-v`, a rust-toolchain file blaze
+  passes over gets one line: `blaze: <file> is ignored: blaze builds with its own Rust, ...`.
+- `edition` applies as cargo applies it. A workspace member whose `rust-version` is newer than
+  blaze's Rust is one error naming both versions and saying to update blaze (and pin it);
+  `--ignore-rust-version` builds it anyway, as with cargo.
 - Rust keeps building old code, so stable code builds; `#![feature(...)]` code builds too.
 - Code blaze's toolchain cannot build (a nightly feature it removed, a library item newer than
   it) fails with blaze's error. A project that needs another Rust pins another blaze.

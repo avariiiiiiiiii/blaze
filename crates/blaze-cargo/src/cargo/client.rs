@@ -169,11 +169,7 @@ pub fn why_none() -> String {
 
 /// Sends `envelope` and reads the answer, showing what the daemon says it is at until it
 /// comes ([`Reply::Progress`]), or that it is `doing` the request when it does not say.
-fn exchange(
-    stream: &mut UnixStream,
-    envelope: &str,
-    doing: &'static str,
-) -> anyhow::Result<Reply> {
+fn exchange(stream: &mut UnixStream, envelope: &str, doing: &'static str) -> anyhow::Result<Reply> {
     stream.write_all(format!("{envelope}\n").as_bytes())?;
     let mut waiting = say::Waiting::new(doing);
     let mut reader = BufReader::new(stream);

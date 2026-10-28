@@ -1,3 +1,8 @@
+---
+status: plan
+summary: The no-rustc rule and the plan to remove every rustc use, step by step, with what is done.
+date: 2026-10-22
+---
 # blaze never runs rustc
 
 ## The rule

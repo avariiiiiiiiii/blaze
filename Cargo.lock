@@ -975,6 +975,7 @@ name = "blaze-protocol"
 version = "0.20261028.0"
 dependencies = [
  "blaze-fuzz",
+ "rustc-hash 2.1.2",
  "serde",
 ]
 

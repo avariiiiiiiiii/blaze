@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashMap;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -127,11 +129,11 @@ fn map_keys_go_in_the_order_of_their_bytes() {
     encodes(map, "a261620262616101");
     // A hash map's order is its iteration's, which the encoding does not keep: unsigned
     // before negative, each by its head.
-    let hashed: HashMap<i64, ()> = (-30..30).map(|it| (it, ())).collect();
+    let hashed: FxHashMap<i64, ()> = (-30..30).map(|it| (it, ())).collect();
     let bytes = to_vec(&hashed).unwrap();
     check(&bytes).unwrap();
     assert_eq!(&hex(&bytes)[..12], "b83c00f601f6");
-    assert_eq!(from_slice::<HashMap<i64, ()>>(&bytes).unwrap(), hashed);
+    assert_eq!(from_slice::<FxHashMap<i64, ()>>(&bytes).unwrap(), hashed);
     // A struct's fields come out sorted too, whatever their order in the type.
     #[derive(Serialize)]
     struct Fields {

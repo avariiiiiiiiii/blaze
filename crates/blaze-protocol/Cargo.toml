@@ -18,6 +18,7 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 blaze-fuzz.workspace = true
+rustc-hash.workspace = true
 
 [lints]
 workspace = true

@@ -261,7 +261,8 @@ mod tests {
     use super::*;
 
     fn root_with(name: &str, manifest: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("blaze-replace-{}-{name}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("blaze-replace-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
         root
@@ -273,7 +274,8 @@ mod tests {
 
     #[test]
     fn a_name_and_version_is_a_crates_io_package_replaced_at_exactly_that_version() {
-        let replace = replace_of("crates-io", "\"foo:0.1.0\" = { path = \"vendor/../foo\" }").unwrap();
+        let replace =
+            replace_of("crates-io", "\"foo:0.1.0\" = { path = \"vendor/../foo\" }").unwrap();
         let [(spec, dep)] = &replace[..] else { panic!("{replace:?}") };
         assert_eq!(spec.name(), "foo");
         assert_eq!(spec.version(), Some(semver::Version::new(0, 1, 0)));

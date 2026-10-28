@@ -204,6 +204,7 @@ writes them again.
 | `remote.py`, `s3fake.py` | A store shared by two machines through an S3 service, with the transfer broken, objects spoiled and manifests forged |
 | `packs.py` | Not a check: the sealed pack's layout ([cache.md](cache.md)) read and written, for `remote.py`, `storeguards.py` and `bench.py` |
 | `deps.py` | cargo's builds of registry crates pushed and pulled. Builds offline from cargo's registry cache, so it does not run on a clean CI machine |
+| `netdown.py` | No build waits on the network ([cache.md](cache.md), "The standard library"): hello world built whole with the standard library's remote served fine, slowly, hung and at an address nothing answers. A warm store builds as fast as with the remote fine and prints no error; a cold one compiles the library from the start, as fast as with `RA_JIT_STD_FROM=off`, and says the fetch failed in one line at most |
 
 ### Timing
 

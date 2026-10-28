@@ -99,7 +99,7 @@
           "stdout": "True\n"
         }
       ],
-      "runs": [{ "select": ["-p", "dynamo-vllm-mocker-server", "--bin", "dynamo-vllm-mocker-server"], "args": ["--help"], "contains": "CPU-only, Mocker-backed" }],
+      "runs": [{ "select": ["-p", "dynamo-vllm-mocker", "--bin", "dynamo-vllm-mocker-server"], "args": ["--help"], "contains": "CPU-only, Mocker-backed" }],
       "test": ["-p", "dynamo-tokens", "-p", "dynamo-kv-hashing", "-p", "dynamo-truthy"],
       "excluded": {
         "dynamo-llm features cuda, nccl, testing-cuda, testing-nixl (testing-full)": "they need a GPU with CUDA, NCCL or NIXL at build or test time; the runners have none",

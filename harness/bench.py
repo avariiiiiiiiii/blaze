@@ -271,7 +271,7 @@ PROJECTS = {
     "dynamo": dict(
         repo="ai-dynamo/dynamo", tag="v1.6.1", rev="0d9c24a8bf6db13c1a1223cf15fcbee9140d1ac3",
         env=dict(RUSTUP_TOOLCHAIN="1.96.1"), named=True,
-        build=["-p", "dynamo-vllm-mocker-server", "--bin", "dynamo-vllm-mocker-server"], run=["--help"],
+        build=["-p", "dynamo-vllm-mocker", "--bin", "dynamo-vllm-mocker-server"], run=["--help"],
         edits=dict(
             body=body("lib/mocker/servers/vllm/src/main.rs", "async fn main() -> anyhow::Result<()> {"),
             leaf=body("lib/tokens/src/lib.rs", "    pub fn remaining(&self) -> usize {"),

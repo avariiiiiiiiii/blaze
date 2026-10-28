@@ -16,8 +16,7 @@ variable, and reads nothing but what the commands print and leave behind. A step
 run when it is a rough edge a user would trip on:
 
   - a command that exits other than as cargo's does (cargo exits 0 where blaze does not);
-  - a name blaze no longer has in anything printed (docs/rename.md: `ra-jit`, `RA_JIT_*`, `cargo blaze`;
-    rename: old name);
+  - a name blaze no longer has in anything printed (`DEAD_NAMES`, docs/rename.md);
   - a line that is not cargo's, the program's or the compiler's own, unless the project's
     transcript in `experience/` has it (a new message is looked at before it is accepted);
   - a build slower than cargo's of the same step, by more than `SLACK` (cold, no-op, edit);

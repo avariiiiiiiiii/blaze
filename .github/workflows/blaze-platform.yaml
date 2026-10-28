@@ -75,7 +75,10 @@ jobs:
   tests:
     name: tests
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 60
+    # A store blaze's release has not compiled into yet takes over an hour on macOS's 7 GB
+    # runner (the 16-minute step of 4-cpu Linux had not ended at 48): long enough for that one
+    # run to finish and push, which the runs after it then pull. Not in the merge gate.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 60 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
     env:
@@ -124,7 +127,8 @@ jobs:
   build:
     name: build
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 60
+    # As in the tests job.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 60 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
     env:

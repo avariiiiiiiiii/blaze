@@ -67,6 +67,7 @@ pub use crate::{
 pub use base_db::EditionedFileId;
 pub use mbe::{DeclarativeMacro, MacroCallStyle, MacroCallStyles, ValueResult};
 
+pub use syntax_bridge::parse_to_token_tree_static_span;
 pub use tt;
 
 /// This is just to ensure the types of [`MacroCallId::macro_arg_considering_derives`]

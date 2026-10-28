@@ -310,7 +310,7 @@ def configuration(top, remote, a, address, bucket):
     before = bucket.objects()
     out = a.ra_jit("cache", "push", address, "other", env={"RA_JIT_REMOTE_READONLY": "1"})
     check("a machine that only reads refuses to push and says why",
-          out.returncode != 0 and "RA_JIT_REMOTE_READONLY" in out.stderr and bucket.objects() == before, out.stderr.strip()[-80:])
+          out.returncode != 0 and "BLAZE_REMOTE_READONLY" in out.stderr and bucket.objects() == before, out.stderr.strip()[-80:])
     out = c.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_READONLY": "1"})
     check("and pulls", out.returncode == 0 and all(c.packs().values()) and c.packs(), out.stdout.strip())
     if not remote.server:
@@ -692,7 +692,7 @@ def collected(top, remote):
     check("an unlisted object cannot be given less than a push takes it as sent for",
           out.returncode != 0 and "at least 7200 seconds" in out.stderr and bucket.objects() == before)
     out, _ = gc(a, address, env={"RA_JIT_REMOTE_READONLY": "1"})
-    check("a machine that only reads collects nothing", out.returncode != 0 and "RA_JIT_REMOTE_READONLY" in out.stderr)
+    check("a machine that only reads collects nothing", out.returncode != 0 and "BLAZE_REMOTE_READONLY" in out.stderr)
     if not remote.proxy:
         print("given: the checks that need old objects are left out: they need the proxy to say they are old")
         return
@@ -963,7 +963,7 @@ def guarded(top, remote):
     for value in ("", "0", "true"):
         out = b.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_UNSIGNED": value})
         check(f"a list nobody signed is not taken with RA_JIT_REMOTE_UNSIGNED={value!r}",
-              out.returncode != 0 and "RA_JIT_REMOTE_UNSIGNED=1" in out.stderr and not b.packs() and not b.partials(),
+              out.returncode != 0 and "BLAZE_REMOTE_UNSIGNED=1" in out.stderr and not b.packs() and not b.partials(),
               out.stderr.strip()[-60:])
     out = b.ra_jit("cache", "pull", address)
     check("and is with RA_JIT_REMOTE_UNSIGNED=1", out.returncode == 0 and b.packs().get(first) is True, out.stdout.strip())
@@ -1173,7 +1173,7 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
     check("a manifest signed by a key B does not trust: refused", out.returncode == 0 and "not a key this machine trusts" in log
           and compiled(log) > 0 and b.run() == expected)
     out = c.ra_jit("cache", "push", signed_address, env={"RA_JIT_REMOTE_TRUST": public})
-    check("a machine that trusts and cannot sign does not push", out.returncode != 0 and "RA_JIT_REMOTE_SIGN" in out.stderr)
+    check("a machine that trusts and cannot sign does not push", out.returncode != 0 and "BLAZE_REMOTE_SIGN" in out.stderr)
 
     # 3. What B does with the forged manifest when it trusts nobody: said in the report.
     forge(bucket)

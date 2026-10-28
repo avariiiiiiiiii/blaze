@@ -187,7 +187,7 @@ def commands(checkout, disk, work):
     if status != 0 or files(disk.store, ".pack"):
         fail(f"gc --max 0: {out}")
     status, out = cache(disk.store, "pull", remote, env={"RA_JIT_REMOTE_UNSIGNED": ""})
-    if status == 0 or "RA_JIT_REMOTE_UNSIGNED=1" not in out or files(disk.store, ".pack"):
+    if status == 0 or "BLAZE_REMOTE_UNSIGNED=1" not in out or files(disk.store, ".pack"):
         fail(f"pull from lists nobody signed was not refused: {out}")
     disk.leave(64 << 10)
     status, out = cache(disk.store, "pull", remote, env=UNSIGNED)

@@ -134,7 +134,7 @@ def unsigned(checkout, store, work):
     names_no_checkout(checkout, remote, "the remote")
     for value in ("", "0", "true"):
         status, out = cache(second, "pull", remote, env={"RA_JIT_REMOTE_UNSIGNED": value})
-        if status == 0 or "RA_JIT_REMOTE_UNSIGNED=1" not in out or files(second, ".pack"):
+        if status == 0 or "BLAZE_REMOTE_UNSIGNED=1" not in out or files(second, ".pack"):
             fail(f"pull with RA_JIT_REMOTE_UNSIGNED={value!r} was not refused: {out}")
     status, out = cache(second, "pull", remote, env={"RA_JIT_REMOTE_UNSIGNED": "1"})
     whole, _, verified = verify(second)

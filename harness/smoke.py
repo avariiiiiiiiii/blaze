@@ -2,9 +2,15 @@
 """smoke.py: small programs and real projects that must build and run correctly with `blaze run`
 and `blaze test`, in dev and --release (docs/release.md, "The smoke corpus").
 
-usage: smoke.py [--group std,crates,projects] [--only NAME,...] [--profiles dev,release]
-                [--work DIR] [--json OUT] [--blaze-rev REV]
-       smoke.py --apt [--group ...]     the Debian packages the selected projects build with
+usage: smoke.py [INPUT]          run the corpus
+       smoke.py apt [INPUT]      the Debian packages the selected projects build with
+
+INPUT is one JSON object (inline, a file's path, or `-` for stdin; none is `{}`), every field
+optional:
+
+    {"groups": ["std", "crates", "projects"], "only": [NAME, ...], "profiles": ["dev", "release"],
+     "blaze": "path of the `blaze` to run (default: the one on PATH)", "work": DIR,
+     "results": "a JSON file of every result", "blaze_rev": "the commit of the project `blaze`"}
 
 smoke/smoke.json names the cases and projects. A case is a directory smoke/<name>: a cargo
 project whose `blaze run` prints exactly smoke/<name>/expected.txt (given `args` and `env`) and
@@ -16,29 +22,73 @@ arguments of `test`) passes. A private repository is fetched with GH_TOKEN.
 Groups: `std` (no dependencies: the merge gate's, every pull request), `crates` (from
 crates.io), `projects`; all three are the gate a canary passes to become stable (promote.yaml).
 
-The blaze is `blaze` beside BLAZE_BIN when that is set (a build of this tree), else the `blaze`
-on PATH (an installed release). A case or project with `open` (an issue) is run and reported,
-and its failure does not fail the run. Each failure is printed with the command that repeats it.
---json writes every result, for promote.yaml's issues. Stdlib only.
+A case or project with `open` (an issue) is run and reported, and its failure does not fail the
+run. Each failure is printed with the command that repeats it. `results` is every result, for
+promote.yaml's issues. Stdlib only.
 """
-import argparse, base64, json, os, shlex, shutil, subprocess, sys, tempfile, time
+import base64, json, os, shlex, shutil, subprocess, sys, tempfile, time, typing
+from dataclasses import dataclass, fields
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORPUS = os.path.join(HERE, "smoke")
 EXE = ".exe" if os.name == "nt" else ""
-GROUPS = ("std", "crates", "projects")
+Group = typing.Literal["std", "crates", "projects"]
+Profile = typing.Literal["dev", "release"]
+GROUPS = typing.get_args(Group)
 CASE_SECS = 900
 PROJECT_SECS = 3600
 
 
-def blaze_program():
-    if bin := os.environ.get("BLAZE_BIN"):
-        return os.path.join(os.path.dirname(os.path.abspath(bin)), "blaze" + EXE)
-    found = shutil.which("blaze")
-    if not found:
-        sys.exit("smoke.py: no blaze: set BLAZE_BIN to a build's blaze-engine, or put an installed blaze on PATH")
-    return found
+@dataclass(frozen=True)
+class Input:
+    groups: tuple[Group, ...] = GROUPS
+    only: tuple[str, ...] = ()
+    profiles: tuple[Profile, ...] = ("dev", "release")
+    blaze: str = ""
+    work: str = ""
+    results: str = ""
+    blaze_rev: str = ""
+
+
+def typed(text):
+    """`Input` from INPUT; exits naming the field that is wrong."""
+    if text == "-":
+        text = sys.stdin.read()
+    elif text and not text.lstrip().startswith("{"):
+        text = open(text).read()
+    try:
+        value = json.loads(text or "{}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"smoke.py: INPUT is not JSON: {e}")
+    if not isinstance(value, dict):
+        sys.exit("smoke.py: INPUT is a JSON object")
+    hints = typing.get_type_hints(Input)
+    known = {f.name for f in fields(Input)}
+    if unknown := sorted(set(value) - known):
+        sys.exit(f"smoke.py: INPUT has no field {', '.join(unknown)} (fields: {', '.join(sorted(known))})")
+    for name, given in value.items():
+        hint = hints[name]
+        if hint is str:
+            ok = isinstance(given, str)
+        else:
+            (item, _) = typing.get_args(hint)
+            allowed = typing.get_args(item) if typing.get_origin(item) is typing.Literal else None
+            ok = isinstance(given, list) and all(isinstance(it, str) and (allowed is None or it in allowed) for it in given)
+            if ok:
+                value[name] = tuple(given)
+            elif allowed:
+                sys.exit(f"smoke.py: INPUT field {name} is a list of {', '.join(map(repr, allowed))}, not {given!r}")
+        if not ok:
+            sys.exit(f"smoke.py: INPUT field {name} is a {'string' if hint is str else 'list of strings'}, not {given!r}")
+    return Input(**value)
+
+
+def blaze_program(given):
+    found = given or shutil.which("blaze")
+    if not found or not os.path.isfile(found):
+        sys.exit(f"smoke.py: no blaze {found or 'on PATH'}: INPUT's `blaze` names a build's, or an installed one is on PATH")
+    return os.path.abspath(found)
 
 
 def base_env():
@@ -106,7 +156,7 @@ def fetch(name, spec, rev, dest):
 
 class Smoke:
     def __init__(self, args):
-        self.blaze = blaze_program()
+        self.blaze = blaze_program(args.blaze)
         self.work = os.path.abspath(args.work or tempfile.mkdtemp(prefix="blaze-smoke-"))
         self.profiles = args.profiles
         self.blaze_rev = args.blaze_rev
@@ -248,27 +298,26 @@ def summary(results, out):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    split = lambda text: [it for it in text.split(",") if it]
-    parser.add_argument("--group", type=split, default=list(GROUPS))
-    parser.add_argument("--only", type=split, default=[])
-    parser.add_argument("--profiles", type=split, default=["dev", "release"])
-    parser.add_argument("--work")
-    parser.add_argument("--json")
-    parser.add_argument("--blaze-rev")
-    parser.add_argument("--apt", action="store_true")
-    args = parser.parse_args()
-    if bad := [g for g in args.group if g not in GROUPS]:
-        sys.exit(f"smoke.py: no group {', '.join(bad)} (groups: {', '.join(GROUPS)})")
+    words = sys.argv[1:]
+    apt = words[:1] == ["apt"]
+    if apt:
+        words = words[1:]
+    if len(words) > 1 or words[:1] in (["-h"], ["--help"]):
+        sys.exit(__doc__)
+    args = typed(words[0] if words else "")
     corpus = json.load(open(os.path.join(CORPUS, "smoke.json")))
-    cases = {n: s for n, s in corpus["cases"].items() if s["group"] in args.group and (not args.only or n in args.only)}
+    named = set(corpus["cases"]) | set(corpus["projects"])
+    if unknown := sorted(set(args.only) - named):
+        sys.exit(f"smoke.py: INPUT field only: no case or project {', '.join(unknown)}")
+    cases = {n: s for n, s in corpus["cases"].items() if s["group"] in args.groups and (not args.only or n in args.only)}
     projects = {n: s for n, s in corpus["projects"].items()
-                if "projects" in args.group and (not args.only or n in args.only)}
-    if args.apt:
+                if "projects" in args.groups and (not args.only or n in args.only)}
+    if apt:
         print(" ".join(sorted({p for s in projects.values() for p in s.get("apt", [])})))
         return
-    if args.blaze_rev is None:
-        args.blaze_rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    if not args.blaze_rev:
+        rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        args = Input(**{**args.__dict__, "blaze_rev": rev})
     smoke = Smoke(args)
     version = subprocess.run([smoke.blaze, "--version"], capture_output=True, text=True).stdout.strip()
     print(f"{version or smoke.blaze}: {len(cases)} cases, {len(projects)} projects, {', '.join(args.profiles)}; work {smoke.work}", flush=True)
@@ -281,8 +330,8 @@ def main():
     finally:
         subprocess.run([smoke.blaze, "stop"], capture_output=True)
     print(f"{time.monotonic() - began:.0f} s", flush=True)
-    if args.json:
-        with open(args.json, "w") as f:
+    if args.results:
+        with open(args.results, "w") as f:
             json.dump(dict(blaze=version, results=smoke.results), f, indent=1)
     failed = summary(smoke.results, sys.stdout)
     if step_summary := os.environ.get("GITHUB_STEP_SUMMARY"):

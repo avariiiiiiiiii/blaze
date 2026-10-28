@@ -70,7 +70,7 @@ pub(crate) fn build(
     let config = asked.config;
     let manifest: &Path = cargo.manifest_path().as_ref();
     let toolchain: PathBuf = asked.sysroot.root().context("the load has no toolchain")?.into();
-    let host = host_of(&toolchain)?;
+    let host = host_of()?;
     let triple = selection.target.as_deref().unwrap_or(&host);
     let for_graph = crate::plan::Asked { triple, cfg: asked.rustc_cfg, env: &config.extra_env };
     let graph = UnitGraph::asked(manifest, selection, &for_graph)?;
@@ -193,7 +193,6 @@ impl<'a> Driver<'a> {
             .iter()
             .map(|unit| by_id.get(&crate::plan::package_named(&unit.pkg_id)).copied())
             .collect();
-        let said = |args: &[&str]| said(toolchain, args);
         // cargo's own environment: this process's, with what the load asks cargo to be run
         // with, as libgit2 leaves it once cargo started.
         let mut vars: BTreeMap<String, String> = std::env::vars().collect();
@@ -731,7 +730,12 @@ impl<'a> Driver<'a> {
     fn compile(&self, crates: &[Described], made: &Made<'_>, dir: &Path) -> anyhow::Result<()> {
         let described = own_script::description(self.toolchain, crates);
         let stamp = made.exe.with_extension("described");
-        let digest = format!("{:x}", Sha256::digest(described.as_bytes()));
+        let mut digest = Sha256::new();
+        digest.update(described.as_bytes());
+        if made.wasm {
+            digest.update(super::own_macro::MODULE_CFG.as_bytes());
+        }
+        let digest = format!("{:x}", digest.finalize());
         let inputs =
             crates.iter().filter_map(|it| it.inputs.as_ref().map(|(info, _)| info.as_path()));
         if fresh(&stamp, &digest, std::iter::once(made.dep_info.as_path()).chain(inputs)) {
@@ -889,20 +893,15 @@ impl<'a> Driver<'a> {
     }
 }
 
-/// What the toolchain's rustc says to `args`, as blaze answers it: no rustc runs, and a
-/// question blaze has no answer of its own to fails the load.
-fn said(toolchain: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let rustc = toolchain.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
-    let asked: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let answer = crate::answers::own_answer_of(rustc.as_os_str(), &asked, &[]);
-    let answer = answer
-        .with_context(|| format!("blaze has no answer of its own to `rustc {}`", args.join(" ")))?;
-    Ok(String::from_utf8_lossy(&answer).into_owned())
+/// What rustc says to `args`, as blaze answers it for its release: no rustc runs, and a
+/// question blaze has no answer to fails the load.
+fn said(args: &[&str]) -> anyhow::Result<String> {
+    crate::answers::ours_said(args)
 }
 
-/// The host the toolchain's rustc builds for.
-fn host_of(toolchain: &Path) -> anyhow::Result<String> {
-    let told = said(toolchain, &["-vV"])?;
+/// The host blaze's rustc builds for.
+fn host_of() -> anyhow::Result<String> {
+    let told = said(&["-vV"])?;
     let host = told.lines().find_map(|it| it.strip_prefix("host: "));
     Ok(host.context("`rustc -vV` names no host")?.trim().to_owned())
 }

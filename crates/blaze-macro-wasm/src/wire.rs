@@ -322,6 +322,19 @@ fn top_of(trees: Vec<Tree>, call_site: Span) -> Tree {
 
 fn flatten(tree: Tree, flat: &mut Vec<TokenTree>) {
     match tree {
+        // `Literal::i32_suffixed(-1)` is one token to the macro and a minus sign and a literal
+        // to the compiler, as the native server's reader splits it (`legacy_protocol`, `flat`).
+        Tree::Leaf(Leaf::Literal(literal))
+            if matches!(literal.kind, LitKind::Integer | LitKind::Float)
+                && literal.text().starts_with('-') =>
+        {
+            let (text, suffix) = literal.text_and_suffix();
+            let span = literal.span;
+            let minus = tt::Punct { char: '-', spacing: Spacing::Alone, span };
+            let magnitude = tt::Literal::new(&text[1..], span, literal.kind, suffix);
+            flat.push(TokenTree::Leaf(Leaf::Punct(minus)));
+            flat.push(TokenTree::Leaf(Leaf::Literal(magnitude)));
+        }
         Tree::Leaf(leaf) => flat.push(TokenTree::Leaf(leaf)),
         Tree::Group { kind, open, close, entire: _, trees } => {
             let at = flat.len();

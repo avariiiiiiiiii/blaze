@@ -3313,6 +3313,14 @@ fn workspace_at(
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let described: &Path = manifest.manifest_path().as_ref();
+    if workspace.is_json()
+        && selection.target.as_deref() == Some(cargo::own_macro::WASM_TARGET)
+        && let Some(overrides) =
+            cargo::own_macro::host_side_cfg(described).map_err(anyhow::Error::msg)?
+    {
+        workspace.cfg_overrides = overrides;
+    }
     let metadata_at = start.elapsed();
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
@@ -4850,7 +4858,7 @@ fn std_unit_at(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"blaze standard library 4");
+    field(b"blaze standard library 5");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
     // A file of one of its crates whose text is blaze's, not the toolchain's.
     if args.run_tool {

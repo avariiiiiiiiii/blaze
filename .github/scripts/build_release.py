@@ -410,6 +410,7 @@ def main():
     parser.add_argument("--server-beside", type=Path, metavar="BLAZE",
                         help="only build blaze's proc-macro server, with BLAZE, beside it (CI's build of blaze)")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
+    parser.add_argument("--no-pgo", action="store_true", help="build without a profile (releases, while PGO is off)")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
     parser.add_argument("--nix", action="store_true",
                         help="the flake's build: its Linux binaries load nixpkgs' glibc, not the system's (no RHEL 9 floor)")
@@ -434,6 +435,12 @@ def main():
         print(" ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()), " ".join(argv))
         return
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+    if args.no_pgo:
+        binaries, _ = build(args.target, target_dir, "", "", args.features)
+        ship(args, binaries)
+        print(f"build_release: {', '.join(b.name for b in binaries)} in {args.out or binaries[0].parent}, "
+              "without PGO (--no-pgo)", flush=True)
+        return
     if pins()["toolchain"] != TOOLCHAIN and not args.strict:
         # The toolchain moved and the pgo workflow has not trained on it yet (it runs when
         # harness/toolchain changes on main): a build that is not a release goes without PGO.

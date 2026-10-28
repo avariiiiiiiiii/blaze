@@ -82,7 +82,6 @@ const BUILD_ENV: &[&str] = &[
     "BLAZE_SPLICE",
     "BLAZE_BUILT_IN",
     "BLAZE_LLVM_INLINE_THRESHOLD",
-    "BLAZE_OTHER_TOOLCHAIN",
     super::own_macro::SERVER,
     super::own_macro::WASM,
 ];

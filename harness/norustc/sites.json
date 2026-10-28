@@ -1,8 +1,7 @@
 {
- "crates/blaze-engine/src/answers.rs": 1,
  "crates/blaze-engine/src/bin/blaze-rustc.rs": 1,
- "crates/blaze-engine/src/cargo/script.rs": 1,
- "crates/blaze-engine/src/cargo/state.rs": 6,
+ "crates/blaze-engine/src/cargo/own_macro.rs": 1,
+ "crates/blaze-engine/src/cargo/state.rs": 2,
  "crates/blaze-engine/src/cargo/wrapper.rs": 2,
  "crates/blaze-engine/src/plan.rs": 1,
  "crates/blaze-engine/src/stub.rs": 1,

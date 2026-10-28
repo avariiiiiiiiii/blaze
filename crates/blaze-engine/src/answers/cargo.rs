@@ -152,10 +152,9 @@ fn host(rustc: &mut dyn FnMut(&[String]) -> anyhow::Result<String>) -> anyhow::R
     Ok(host.context("`rustc -vV` names no host")?.to_owned())
 }
 
-/// The cargo that would have been run: where, with which variables, and which program.
+/// The cargo that would have been run: where, and with which variables.
 struct Asker {
     cwd: PathBuf,
-    program: OsString,
     /// The variables the command sets (`Some`) or removes (`None`).
     set: Vec<(OsString, Option<OsString>)>,
 }
@@ -165,15 +164,7 @@ impl Asker {
         let cwd = command.get_current_dir().map(Path::to_owned);
         Asker {
             cwd: cwd.or_else(|| std::env::current_dir().ok()).unwrap_or_default(),
-            program: command.get_program().to_owned(),
             set: command.get_envs().map(|(k, v)| (k.to_owned(), v.map(OsStr::to_owned))).collect(),
-        }
-    }
-
-    fn var(&self, name: &str) -> Option<OsString> {
-        match self.set.iter().rev().find(|(it, _)| it == name) {
-            Some((_, value)) => value.clone(),
-            None => std::env::var_os(name),
         }
     }
 
@@ -194,21 +185,12 @@ impl Asker {
         Config::load(&self.cwd, self.vars(), &[])
     }
 
-    /// The toolchain directory of the cargo run. rustup's proxy runs the toolchain it is told
-    /// (`RUSTUP_TOOLCHAIN`, as cargo run through it has it); told none, it is blaze's release,
-    /// which blaze builds with whatever the project names (cargo/toolchain.rs, #269), from
-    /// rustup's copy of it. Neither found is an error, and nothing is run to find it.
+    /// The toolchain directory of the cargo run: blaze's release, whichever cargo was named
+    /// (cargo/toolchain.rs). Not found is an error, and nothing is run to find it.
     fn sysroot(&self) -> anyhow::Result<PathBuf> {
-        let var = |name: &str| self.var(name);
-        let found = super::toolchain_rustc(&self.program, &var);
-        let sysroot = found.as_deref().and_then(Path::parent).and_then(Path::parent);
-        let sysroot = sysroot.map(Path::to_owned).or_else(crate::cargo::toolchain::rustup_ours);
-        sysroot.with_context(|| {
+        crate::cargo::toolchain::sysroot().with_context(|| {
             format!(
-                "blaze can't tell which toolchain `{}` runs, and rustup has no copy of Rust {}: \
-                 name the toolchain's own cargo (`CARGO`), or set `RUSTUP_TOOLCHAIN` for \
-                 rustup's proxy",
-                Path::new(&self.program).display(),
+                "blaze builds with Rust {}, which is not installed: `blaze toolchain` installs it",
                 crate::cargo::toolchain::OURS.trim()
             )
         })
@@ -225,52 +207,26 @@ impl Asker {
         Ok(format!("cargo {version}\n"))
     }
 
-    /// rustc as cargo runs it to ask: the program cargo picks, the variables of the command
-    /// and `[env]`, answered by [`super::answer`].
+    /// rustc as cargo runs it to ask, answered by blaze for its release ([`super::answer`])
+    /// with the variables of the command and `[env]`: `build.rustc` and `RUSTC` name no other
+    /// rustc to blaze.
     fn rustc(
         &self,
         config: &Config,
     ) -> anyhow::Result<impl FnMut(&[String]) -> anyhow::Result<String> + use<>> {
-        let program = match config.rustc_program()? {
-            Some(program) => program,
-            None => {
-                self.sysroot()?.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
-            }
-        };
-        let mut base = Command::new(&program);
-        base.current_dir(&self.cwd);
-        for (key, value) in &self.set {
-            match value {
-                Some(value) => base.env(key, value),
-                None => base.env_remove(key),
-            };
-        }
+        let mut envs: Vec<(OsString, Option<OsString>)> = self.set.clone();
         for (key, value) in config.env_config()? {
-            base.env(key, value);
+            envs.push((key.into(), Some(value)));
         }
-        let envs: Vec<(OsString, Option<OsString>)> =
-            base.get_envs().map(|(k, v)| (k.to_owned(), v.map(OsStr::to_owned))).collect();
-        let cwd = self.cwd.clone();
         Ok(move |args: &[String]| {
-            let mut command = Command::new(&program);
-            command.current_dir(&cwd).args(args);
-            for (key, value) in &envs {
-                match value {
-                    Some(value) => command.env(key, value),
-                    None => command.env_remove(key),
-                };
-            }
-            let output = super::answer(&mut command, &[])
-                .with_context(|| format!("could not execute process `{}`", program.display()))?;
-            anyhow::ensure!(
-                output.status.success(),
-                "process didn't exit successfully: `{} {}` ({})\n--- stderr\n{}",
-                program.display(),
-                args.join(" "),
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim_end()
-            );
-            String::from_utf8(output.stdout).context("rustc's answer is not UTF-8")
+            let asked: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let var = |name: &str| match envs.iter().rev().find(|(it, _)| it == name) {
+                Some((_, value)) => value.clone(),
+                None => std::env::var_os(name),
+            };
+            let answer =
+                super::own::answer(&asked, &[], &var).ok_or_else(|| super::no_answer(&asked))?;
+            String::from_utf8(answer).context("rustc's answer is not UTF-8")
         })
     }
 

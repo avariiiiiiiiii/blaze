@@ -28,13 +28,10 @@ Reports and results dated before 2026-10-25 were measured on stable 1.99.0, and 
 ones on `nightly-2026-05-10`; they are marked where they are used and are not re-measured
 by the move.
 
-`blaze` builds every project with the pinned nightly, whatever toolchain the project
-names ([cargo.md](cargo.md)). A rustc counts as the pinned one only when its whole
-`rustc -V` line matches, since every nightly of a release says `1.101.0`. A project that
-needs its own toolchain fails with rustc's error and a note naming both.
-`BLAZE_OTHER_TOOLCHAIN=1` builds with the project's toolchain
-instead, for a project pinned to a nightly near ours. Nothing checks that the other rustc
-lays out, mangles and passes values as the pinned nightly does.
+`blaze` builds every project with the pinned nightly, whatever toolchain the project names
+([cargo.md](cargo.md)): it ignores rust-toolchain files, rustup's settings, `RUSTUP_TOOLCHAIN`
+and `RUSTC`, and runs no rustc to ask what it is. A project that needs another Rust pins
+another blaze ([toolchain.md](toolchain.md)).
 
 ## Platforms
 

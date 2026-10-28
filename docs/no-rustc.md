@@ -559,6 +559,40 @@ AArch64's target specs came from answers.py's run in CI there, and its cold buil
 `force-frame-pointers`, `force-unwind-tables`) no longer send a question to rustc: count.py's
 `RUSTFLAGS` have the first, so every question of ripgrep's went to rustc until then.
 
+Done (the `nopin` lane, 2026-10-28; Andrew 2026-10-28 03:30Z, no Rust toolchain pinning): no
+question goes to rustc at all, in any environment. Every rustc is answered as blaze's own
+release, whichever one was named (`RUSTC`, `build.rustc`, rustup's proxy, a rustc on `PATH`):
+the version and host from blaze's build, the cfgs and target specs from `rustc.json`, the
+sysroot and target libdir from where blaze's release is (`cargo/toolchain.rs`, found on disk
+with nothing run). A question `answers/own.rs` does not model (the list above) fails with
+`blaze has no answer to rustc ...`, as no-fallback says, and nothing asks rustc and keeps its
+answer any more: the cache of rustc's answers, `BLAZE_ANSWERS` and the reading of rustup's
+`RUSTUP_TOOLCHAIN`/`RUSTUP_HOME` to tell which rustc a proxy runs are gone. Nor does
+`toolchain::settle` ask the project's rustc its version and sysroot, or note that the project
+names another toolchain, which is what made main's no-op `blaze build` run 8 rustc processes
+(4 questions through rustup's proxy, #833). `rustcsites.py`: 33 places to 27. rustup is not
+run either: loading a workspace took cargo from `rustup which cargo` and ran it through rustup's
+proxy, and ran `rustup component add rust-src` when the library's source was missing; the
+sysroot's own `bin/cargo` is run now, and a missing source is an error that says to add it.
+`rustcsites.py` counts the places that start rustup too: 29 to 28. The one left,
+`cargo/own_macro.rs`'s `rustup target add wasm32-wasip1`, installs WASI's libc for proc-macro
+modules when blaze's release has none; it asks nothing.
+
+Measured (ix VM, x86_64, 64 cores; release build with `--features llvm` and the proc-macro
+server beside it; fresh project, daemon warm; median of 30 alternated no-op `blaze build -q`
+after 3 warm-up runs; execs by `strace -f -e trace=execve` over the client and the daemon):
+
+| setup | before (ee8870419e) | after |
+|---|---|---|
+| rustup, default nightly, `rust-toolchain.toml` pinning 1.80.0 | 18.4 ms, 2 rustc | 7.4 ms, 0 rustc |
+| no Rust installed (rustc, cargo, rustup hidden) | 8.6 ms, 1 rustc (not found) | 8.4 ms, 0 rustc |
+| plain `cargo build -q` with the rustup setup | 13.3 ms, 2 (cargo and rustc through rustup) | |
+
+What is left of the 7 to 8 ms is starting the binaries (`blaze-engine --version` alone takes 6 ms
+on that VM), not a question. A cold build of a project using anyhow, thiserror, rustversion,
+num-traits (autocfg), indexmap, version_check and proc-macro-error2 with no Rust installed
+runs 0 rustc: each build script's 11 runs of `$RUSTC` are blaze's stand-in.
+
 **C. `asm!` assembled in process.** ([#83](https://github.com/indexable-inc/blaze/issues/83)) The assembly text blaze already produces goes to LLVM's
 assembler (the LLVM backend links LLVM already) or to an assembler crate, in process. Risk is
 low: the cache key and the output are the same, and `harness/asmedits.py` compares.

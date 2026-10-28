@@ -1,7 +1,8 @@
 # Const macros: proc macros written inline as `const fn`
 
-Status: design, with a prototype behind `experimental = ["const-macros"]`. Nothing here is
-on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query), #867
+Status: design. Stage 0 of the prototype ([below](#the-prototype-stage-0)) is on main behind
+`experimental = ["const-macros"]`: the evaluator call and expander (#915), and the manifest key
+and loading (#959). Nothing here is on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query), #867
 (const traits, const closures, const heap, step budget), #863 (the build graph's `map`).
 
 ## What it is
@@ -249,6 +250,18 @@ before the const heap and const traits do:
 Stage 0 is not the API. It is deleted when the const `proc_macro` lands, and macros written
 for it move by changing their signature.
 
+What stage 0 does not do yet:
+
+- It doesn't require `const`. The evaluator runs the function whatever its signature says, so a
+  stage-0 macro can use `format!` and `String::push_str`. Requiring const, and so purity, is
+  the front-end purity query's job (#860, lane ccheck). Until then, the evaluator's
+  sandbox (no files, no FFI, no clock) is the only guarantee.
+- The list of macros is read when the workspace loads. Editing a macro's body re-expands
+  everything that uses it, because the expander reads the function through the database. A
+  new `#[proc_macro_derive]` function needs a reload.
+- Every output token gets the call site's span. Errors point at the derive, not into the
+  macro's output.
+
 ## Later
 
 - v2 (anywhere in the crate), above.
@@ -259,7 +272,31 @@ for it move by changing their signature.
 - Const macros in dependencies: a crates.io package that declares `const-macros` is built
   the same way; only a workspace that opts in can use one.
 - #863's `Graph::map(inputs, args, f)` with `f` a `const fn` or a const closure runs through
-  the same call path: the evaluator, keyed by `cache_code`, with no wasm instance.
+  the same call path: the evaluator, keyed by `cache_code`, with no wasm instance
+  ([below](#graphmap-with-a-const-fn)).
+
+### `Graph::map` with a const fn
+
+#863's executor runs a `map` node as `f(inputs, args)`. When `f` is const, it doesn't need a
+wasm instance:
+
+- What `f` is: when the graph-building function itself ran in the evaluator, a fn pointer
+  in its result is already a `FunctionId` (or a closure's id and its captures). When it ran
+  as wasm, the pointer is a table slot. blaze built the module, so it maps the slot to the
+  function itself, as #863 already requires.
+- The call: `call_with_strs`, generalised from text to the graph's value encoding (bytes in,
+  bytes out). Each input is written into the evaluator's heap, and the result is read back
+  from the returned words. Whether `f` is const is the purity query's answer, not its
+  signature's.
+- The key: (`cache_code` of `f`, the digests of the inputs, the digest of `args`).
+  `cache_code` is fn-cache's hash of `f`'s code and everything it reaches
+  (`crates/hir-ty-codegen/fncache.rs`), so editing a helper `f` calls changes the key, and
+  reformatting doesn't.
+- The result: in blaze's store, like any node's, not in salsa. It outlives the daemon, and a
+  second machine with the same key gets a hit.
+
+This waits on #863's `Graph` crate and executor, which don't exist yet. Until then there is
+no `map` node to run.
 
 ## Performance
 
@@ -272,5 +309,15 @@ as a proc-macro crate, on the same command:
   versus one wasm instance or server round trip. The evaluator is the risk here and is
   measured per expansion before the experiment is proposed as a default.
 - load of a fresh daemon: both are kept in the store.
+
+Measured with stage 0 (2026-10-28, ix VM, arm64, 16 CPUs, three alternating rounds, a fresh
+`BLAZE_HOME` each): harness/constmacros's derive, against the same derive (same body, taking
+`proc_macro::TokenStream`) as a proc-macro crate of the workspace. Each cell is `blaze run`'s
+time, and both print the same output at every step:
+
+| | cold | warm | the macro's output edited |
+|---|---|---|---|
+| proc-macro crate | 20.15-22.93 s | 0.01 s | 0.97-1.01 s |
+| const macro | 13.71-14.96 s | 0.01-0.03 s | 0.04-0.05 s |
 
 Nothing in this design touches a package that does not declare `const-macros`.

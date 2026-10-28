@@ -322,7 +322,7 @@ def main():
         rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         args = Input(**{**args.__dict__, "blaze_rev": rev})
     smoke = Smoke(args)
-    version = subprocess.run([smoke.blaze, "--version"], capture_output=True, text=True).stdout.strip()
+    version = (subprocess.run([smoke.blaze, "--version"], capture_output=True, text=True).stdout.strip().splitlines() or [""])[0]
     print(f"{version or smoke.blaze}: {len(cases)} cases, {len(projects)} projects, {', '.join(args.profiles)}; work {smoke.work}", flush=True)
     began = time.monotonic()
     try:

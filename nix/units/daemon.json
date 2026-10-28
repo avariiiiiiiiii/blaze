@@ -765,6 +765,7 @@
      "dunce",
      "ed25519-dalek",
      "find-msvc-tools",
+     "flate2",
      "futures-util",
      "getrandom 0.3.4",
      "gimli 0.33.0",
@@ -19083,6 +19084,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -19452,6 +19457,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -19819,6 +19828,10 @@
       {
        "name": "ed25519_dalek",
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
       },
       {
        "name": "futures_util",
@@ -40132,6 +40145,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -40501,6 +40518,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -40868,6 +40889,10 @@
       {
        "name": "ed25519_dalek",
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
       },
       {
        "name": "futures_util",
@@ -61054,6 +61079,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -61423,6 +61452,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -61790,6 +61823,10 @@
       {
        "name": "ed25519_dalek",
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
       },
       {
        "name": "futures_util",
@@ -82130,6 +82167,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -82499,6 +82540,10 @@
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
       },
       {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
        "name": "futures_util",
        "unit": "futures-util@0.3.32 lib futures_util build"
       },
@@ -82866,6 +82911,10 @@
       {
        "name": "ed25519_dalek",
        "unit": "ed25519-dalek@2.2.0 lib ed25519_dalek build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
       },
       {
        "name": "futures_util",

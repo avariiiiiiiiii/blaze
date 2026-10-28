@@ -767,6 +767,7 @@ dependencies = [
  "dunce",
  "ed25519-dalek",
  "find-msvc-tools",
+ "flate2",
  "futures-util",
  "getrandom 0.3.4",
  "gimli 0.33.0",

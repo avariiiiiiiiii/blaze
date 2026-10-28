@@ -1035,6 +1035,32 @@ fn recursion() {
 }
 
 #[test]
+fn recursion_past_the_limit() {
+    check_number(
+        r#"
+    const fn depth(k: i32) -> i32 { if k > 0 { depth(k - 1) + 1 } else { 0 } }
+    const GOAL: i32 = depth(100);
+        "#,
+        100,
+    );
+    check_fail(
+        r#"
+    const fn f<T>(x: T) { f(x); }
+    const GOAL: () = f(1);
+        "#,
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::StackOverflow)),
+    );
+    check_number(
+        r#"
+    #![recursion_limit = "300"]
+    const fn depth(k: i32) -> i32 { if k > 0 { depth(k - 1) + 1 } else { 0 } }
+    const GOAL: i32 = depth(200);
+        "#,
+        200,
+    );
+}
+
+#[test]
 fn structs() {
     check_number(
         r#"
@@ -3189,15 +3215,7 @@ fn exec_limits() {
     }
     const GOAL: i32 = f(0);
     "#,
-        |e| {
-            matches!(
-                e,
-                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
-                    spent: Budget::Steps(10_000_000),
-                    at: Some(_),
-                })
-            )
-        },
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::StackOverflow)),
     );
     // Reasonable code should still work
     check_number(

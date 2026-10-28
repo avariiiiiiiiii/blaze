@@ -1232,8 +1232,9 @@ impl<'db> Walk<'db> {
         let Ok(body) = body else { return };
         if self.tests {
             if let Some(span) = fn_from_data(db, body) {
-                let place =
-                    location(db, body, span).map(|it| format!(", at {it}")).unwrap_or_default();
+                let place = location(db, body.owner, span)
+                    .map(|it| format!(", at {it}"))
+                    .unwrap_or_default();
                 let what = describe(db, &self.nodes[at as usize].node);
                 let why = format!(
                     "it reaches {what}, which calls a function pointer made of data (a \
@@ -1245,7 +1246,7 @@ impl<'db> Walk<'db> {
             return;
         }
         if let Some((why, span)) = raw_use(body) {
-            let place = location(db, body, span);
+            let place = location(db, body.owner, span);
             self.nodes[at as usize].why = Some(Why { text: why.to_owned(), of_user: false, place });
         }
     }
@@ -1473,14 +1474,14 @@ impl<'db> Walk<'db> {
                 if let StatementKind::Assign(_, rvalue) = &statement.kind
                     && operands(rvalue).into_iter().any(refers)
                 {
-                    return location(db, body, statement.span);
+                    return location(db, body.owner, statement.span);
                 }
             }
             let Some(terminator) = &block.terminator else { continue };
             if let TerminatorKind::Call { func, args, .. } = &terminator.kind
                 && (refers(func) || args.iter().any(refers))
             {
-                return location(db, body, terminator.span);
+                return location(db, body.owner, terminator.span);
             }
         }
         None
@@ -1905,8 +1906,12 @@ fn describe(db: &dyn HirDatabase, node: &Node) -> String {
 }
 
 /// File, line and column of a place in a body, the file relative to the workspace.
-fn location(db: &dyn HirDatabase, body: &MirBody<'_>, span: MirSpan) -> Option<String> {
-    let InferBodyId::DefWithBodyId(owner) = body.owner else { return None };
+pub(super) fn location(
+    db: &dyn HirDatabase,
+    owner: InferBodyId<'_>,
+    span: MirSpan,
+) -> Option<String> {
+    let InferBodyId::DefWithBodyId(owner) = owner else { return None };
     let (file, line, column) = super::source_location(db, owner, span)?;
     let root = db.file_source_root(file).source_root_id(db);
     let root = db.source_root(root).source_root(db);

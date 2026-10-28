@@ -241,7 +241,7 @@ far:
 - `harness/live-alloc`, a program on `allocator_api` (`Vec<T, A>` and `Box<T, A>` in a bump
   arena) that takes live edits; `live_e2e.py` runs it with `LIVE_PROGRAM=live-alloc`, in the
   gate.
-- The corpus's `nightly` feature, which `toolchain_bump.py --checks` runs with `--layouts`.
+- The corpus's `nightly` feature, which `toolchain_bump.py checks '{}'` runs with `--layouts`.
 
 The nightly's own removals apply: `box` patterns are gone upstream in this nightly, replaced
 by `deref_patterns`, and blaze's support for deref patterns is being added. `-Z` flags in

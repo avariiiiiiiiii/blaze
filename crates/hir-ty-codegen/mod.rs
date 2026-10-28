@@ -38,7 +38,10 @@ use hir_def::{
     },
     hir::{BindingId, ExprId},
     layout::{BackendRepr, Primitive, Scalar, TagEncoding, Variants},
-    signatures::{FunctionSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
+    signatures::{
+        ConstSignature, FunctionSignature, StaticFlags, StaticSignature, StructFlags,
+        StructSignature,
+    },
     src::HasSource,
 };
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
@@ -58,7 +61,7 @@ use triomphe::Arc;
 use hir_def::lang_item::LangItems;
 use hir_ty::{
     InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, PointerCast,
-    consteval::try_const_usize,
+    consteval::{ConstEvalError, try_const_usize},
     db::HirDatabase,
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
     drop::{DropGlue, destructor, has_drop_glue},
@@ -84,8 +87,8 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, FrameStorage, LocalId, MirBody,
-    MirOptLevel, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue,
-    StatementKind, StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
+    MirEvalError, MirOptLevel, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
+    Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp, interpret_mir, is_builtin_index,
     location::{
         ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
         location_of, written_call, written_range,
@@ -4257,6 +4260,48 @@ fn describe_scopes(
         }
     }
     of_binding
+}
+
+/// The error the build stops with when the evaluation of `of`, or of a constant it reads, ran
+/// past its budget (`const-eval` under `[workspace.metadata.blaze]`): what it ran out of, where,
+/// and the setting that raises it. `None` for any other error.
+fn over_budget(
+    db: &dyn HirDatabase,
+    of: GeneralConstId<'_>,
+    e: &ConstEvalError<'_>,
+) -> Option<CodegenError> {
+    let name = |of: GeneralConstId<'_>| match of {
+        GeneralConstId::ConstId(id) => {
+            ConstSignature::of(db, id).name.as_ref().map(|it| format!("`{}`", it.as_str()))
+        }
+        GeneralConstId::StaticId(id) => {
+            Some(format!("`{}`", StaticSignature::of(db, id).name.as_str()))
+        }
+        GeneralConstId::AnonConstId(_) => None,
+    };
+    let mut what = name(of).unwrap_or_else(|| "a constant expression".to_owned());
+    let ConstEvalError::MirEvalError(e) = e else { return None };
+    let mut e: &MirEvalError<'_> = e;
+    let (spent, at) = loop {
+        match e {
+            MirEvalError::InFunction(inner, _) => e = &**inner,
+            MirEvalError::ConstEvalError(inner, error) => {
+                let ConstEvalError::MirEvalError(inner_error) = &**error else { return None };
+                what = format!("`{inner}`");
+                e = inner_error;
+            }
+            MirEvalError::OverBudget { spent, at } => break (*spent, *at),
+            _ => return None,
+        }
+    };
+    let at = at
+        .and_then(|(owner, span)| fncache::location(db, owner, span))
+        .map(|it| format!(" at {it}"))
+        .unwrap_or_default();
+    Some(CodegenError::Refused(format!(
+        "const eval of {what} {spent}{at} (raise {} under `[workspace.metadata.blaze]`)",
+        spent.setting()
+    )))
 }
 
 /// File, line and column of a place in a body, as rustc reports them, found from where the
@@ -10731,9 +10776,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if flags.contains(StaticFlags::EXTERN) {
             unsupported!("extern static without a rustc symbol");
         }
-        let allocation = db
-            .const_eval_static(id)
-            .map_err(|e| CodegenError::Frontend(format!("const eval: {e:?}")))?;
+        let allocation = db.const_eval_static(id).map_err(|e| {
+            over_budget(db, GeneralConstId::StaticId(id), &e)
+                .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
+        })?;
         // Nothing can be written to a static of no size.
         let writable = !allocation.memory.is_empty()
             && (flags.contains(StaticFlags::MUTABLE)
@@ -10874,7 +10920,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn eval_const(&mut self, unevaluated: UnevaluatedConst<'db>) -> Result<Allocation<'db>> {
         let db = self.cg.db;
         let UnevaluatedConst { def, args } = unevaluated;
-        let frontend = |e| CodegenError::Frontend(format!("const eval: {e:?}"));
+        let frontend = |e: ConstEvalError<'db>| {
+            over_budget(db, def.0, &e)
+                .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
+        };
         match def.0 {
             GeneralConstId::ConstId(id) => {
                 let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);

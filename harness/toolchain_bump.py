@@ -2,10 +2,12 @@
 """toolchain_bump.py: move blaze to a newer Rust nightly. blaze supports one toolchain, the
 dated nightly in harness/toolchain; everything that mirrors that rustc moves with it.
 
-    toolchain_bump.py                  the newest nightly that has every component blaze needs
-    toolchain_bump.py --date 2026-11-02
-    toolchain_bump.py --checks         after a bump, in an ix VM: build blaze and run the
-                                       checks that prove blaze and the nightly agree
+    toolchain_bump.py '{}'                     the newest nightly that has every component blaze needs
+    toolchain_bump.py '{"date": "2026-11-02"}'
+    toolchain_bump.py checks '{}'              after a bump, in an ix VM: build blaze and run the
+                                               checks that prove blaze and the nightly agree
+
+The JSON is inline, a file's path, or `-` for stdin.
 
 A bump, in order (each step names itself when it fails, and stops there):
 
@@ -18,12 +20,16 @@ A bump, in order (each step names itself when it fails, and stops there):
     compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
     the new commit with blaze's changes to them at the old commit carried over (a three-way
     apply; a conflict stops the bump and names the files);
- 4. moves the pins written down elsewhere: the old toolchain name, rustc version line and
+ 4. merges the new nightly's standard library into library/ (`library.py merge`): upstream's
+    changes since library/UPSTREAM's nightly, applied three-way, so blaze's own changes to it
+    (library/PATCHES.md) are kept; a conflict stops the bump and names the files. It runs when
+    the pin is already the nightly's too, so a bump branch made before library/ catches up;
+ 5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
     commit in install.sh and vendor/proc-macro-srv (RUSTC_VERSION_STRING, the manifest's
     header), the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
     docs/cargo.md, Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
     update rust-overlay`, when nix is on PATH);
- 5. installs the nightly with rustup.
+ 6. installs the nightly with rustup.
 
 What it leaves to you, which it prints at the end: answers.py --write on each of x86-64 Linux,
 AArch64 Linux and arm64 macOS (the target specs depend on the host rustc was built for), the
@@ -32,7 +38,8 @@ symbol names, new intrinsics and lang items: the checks find them), and `--check
 and the daemon match by the whole `rustc -V` line, so a binary built before the bump refuses
 the new nightly until it is rebuilt. docs/contributing.md, "Moving to a newer nightly".
 """
-import argparse, asyncio, datetime, hashlib, os, re, shutil, sys, tempfile, tomllib, urllib.request
+import asyncio, datetime, hashlib, json, os, re, shutil, sys, tempfile, tomllib, typing, urllib.request
+from dataclasses import dataclass, fields
 
 import ci
 
@@ -313,18 +320,27 @@ def move_mentions(old, new):
     open(cargo, "w").write(moved)
 
 
+async def library(date):
+    """library/ merged to the standard library of the nightly of `date` (library.py merge)."""
+    said = await run("library", sys.executable, os.path.join(HERE, "library.py"), "merge",
+                     json.dumps({"date": date}), bound=900)
+    print(said, end="")
+
+
 async def bump(date):
     old = pinned()
     date, channel = await pick(date)
     name = f"nightly-{date}"
     if name == old[0]:
         print(f"blaze is already on {name}")
+        await library(date)
         return
     print(f"moving {old[0]} ({old[1]}) to {name} ({channel['pkg']['rustc']['version']})")
     open(PIN, "w").write(name + "\n")
     await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), "--write", bound=900)
     new = pinned()
     await vendor(old[2], new[2])
+    await library(date)
     move_mentions(old, new)
     async with asyncio.TaskGroup() as group:
         if shutil.which("nix"):
@@ -340,7 +356,7 @@ blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`
     (with that host's release build of blaze), then commit crates/blaze-cargo/src/answers/rustc.json;
   - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
-  - `python3 harness/toolchain_bump.py --checks` in an ix VM, under Cranelift and under LLVM
+  - `python3 harness/toolchain_bump.py checks '{{}}'` in an ix VM, under Cranelift and under LLVM
     (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);
   - the full tier (uitest.py, libsuite.py, borrowck_ui.py) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
@@ -377,13 +393,56 @@ async def checks():
     print(f"blaze agrees with {name} on every check")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--date", help="the nightly's date, YYYY-MM-DD (default: the newest usable)")
-    parser.add_argument("--checks", action="store_true", help="build and run the agreement checks")
-    args = parser.parse_args()
+@dataclass(frozen=True)
+class Bump:
+    # The nightly's date, YYYY-MM-DD; empty for the newest usable.
+    date: str = ""
+
+
+@dataclass(frozen=True)
+class Checks:
+    pass
+
+
+def typed(cls, text):
+    """`cls` from the JSON `text` (inline, a path, or `-`); exits naming the field that is wrong."""
+    if text == "-":
+        text = sys.stdin.read()
+    elif text and not text.lstrip().startswith("{"):
+        text = open(text).read()
     try:
-        asyncio.run(checks() if args.checks else bump(args.date))
+        value = json.loads(text or "{}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"toolchain_bump.py: the input is not JSON: {e}")
+    if not isinstance(value, dict):
+        sys.exit("toolchain_bump.py: the input is a JSON object")
+    known = {f.name for f in fields(cls)}
+    if unknown := sorted(set(value) - known):
+        sys.exit(f"toolchain_bump.py: no field {', '.join(unknown)} (fields: {', '.join(sorted(known)) or 'none'})")
+    hints = typing.get_type_hints(cls)
+    for name, given in value.items():
+        if not isinstance(given, hints[name]):
+            sys.exit(f"toolchain_bump.py: field {name} is a {hints[name].__name__}, not {given!r}")
+    if value.get("date") and not re.fullmatch(r"\d{4}-\d\d-\d\d", value["date"]):
+        sys.exit(f"toolchain_bump.py: field date is YYYY-MM-DD, not {value['date']!r}")
+    return cls(**value)
+
+
+def main():
+    argv = sys.argv[1:]
+    checking = bool(argv) and argv[0] == "checks"
+    if checking:
+        argv = argv[1:]
+    if len(argv) > 1:
+        sys.exit(f"usage: toolchain_bump.py [checks] '<json>'\n\n{__doc__}")
+    given = argv[0] if argv else ""
+    if checking:
+        typed(Checks, given)
+        work = checks()
+    else:
+        work = bump(typed(Bump, given).date)
+    try:
+        asyncio.run(work)
     except Failed as error:
         sys.exit(f"error: toolchain_bump: {error}")
 

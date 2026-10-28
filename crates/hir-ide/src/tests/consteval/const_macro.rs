@@ -11,7 +11,9 @@ use intern::Symbol;
 use test_fixture::ChangeFixture;
 
 use super::{eval_goal, pretty_print_err};
-use crate::{const_macro::ConstMacroExpander, test_db::TestDB};
+use crate::{
+    const_macro::ConstMacroExpander, mir_pretty::MirEvalErrorPretty as _, test_db::TestDB,
+};
 
 /// A macro crate with the derive `Named`, which reads the name of the struct it is given and
 /// implements `Named` for it with `LEN`, that name's length. Its `String` is the three words
@@ -106,12 +108,11 @@ const GOAL: usize = <Point as Named>::LEN;
         .find(|&id| graph[id].basic.target_kind.is_proc_macro())
         .expect("the macro crate");
     let root = graph[macros].basic.root_file_id;
-    let name = Symbol::intern("Named");
-    let expander = ConstMacroExpander { root, name: name.clone(), kind: ProcMacroKind::CustomDerive };
+    let expander = expander_of(root);
     fixture.change.proc_macros.get_or_insert_default().insert(
         macros,
         Ok(vec![ProcMacro {
-            name,
+            name: expander.name.clone(),
             kind: ProcMacroKind::CustomDerive,
             expander: Arc::new(expander),
             disabled: false,
@@ -123,9 +124,28 @@ const GOAL: usize = <Point as Named>::LEN;
     let file_id = EditionedFileId::from_span_file_id(&db, file_id);
     crate::const_macro::enable(&db);
     crate::attach_db(&db, || {
+        let (krate, func) = expander_of(root).function(&db).expect("the macro's function");
+        let output =
+            crate::mir::call_with_strs(&db, func, &["pub struct Point { x : i32 , y : i32 }"])
+                .unwrap_or_else(|e| {
+                    let mut text = String::new();
+                    let target = crate::display::DisplayTarget::from_crate(&db, krate);
+                    _ = e.pretty_print(
+                        &mut text,
+                        &db,
+                        |file, range| format!("{file:?} {range:?}"),
+                        target,
+                    );
+                    panic!("calling the macro: {text}");
+                });
+        assert_eq!(output, "impl Named for Point { const LEN: usize = 5; }");
         let goal = eval_goal(&db, file_id).unwrap_or_else(|e| {
             panic!("evaluating GOAL: {}", pretty_print_err(e, &db));
         });
         assert_eq!(goal.memory[..], 5usize.to_le_bytes()[..goal.memory.len()]);
     });
+}
+
+fn expander_of(root: span::FileId) -> ConstMacroExpander {
+    ConstMacroExpander { root, name: Symbol::intern("Named"), kind: ProcMacroKind::CustomDerive }
 }

@@ -5,8 +5,7 @@
 use hir_def::FunctionId;
 
 use super::{
-    Address, Evaluator, Heap, Interval, IntervalOrOwned, MirEvalError, Result, from_bytes,
-    word_bytes,
+    Address, Evaluator, Heap, Interval, IntervalOrOwned, MirEvalError, Result, word_bytes,
 };
 use crate::db::HirDatabase;
 
@@ -17,7 +16,8 @@ pub fn call_with_strs<'db>(
     func: FunctionId,
     args: &[&str],
 ) -> Result<'db, String> {
-    let body = db.runtime_mir_body(func.into()).map_err(|e| MirEvalError::MirLowerError(func, e))?;
+    let body =
+        db.runtime_mir_body(func.into()).map_err(|e| MirEvalError::MirLowerError(func, e))?;
     let mut evaluator = Evaluator::new(db, func.into(), false, None)?;
     let mut slices = Vec::with_capacity(args.len());
     for arg in args {
@@ -61,6 +61,8 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
         .unwrap_or(0);
     let text = evaluator.read_memory(addr, len)?;
     String::from_utf8(text.to_vec()).map_err(|_| {
-        MirEvalError::UndefinedBehavior("a const macro returned a `String` that is not UTF-8".into())
+        MirEvalError::UndefinedBehavior(
+            "a const macro returned a `String` that is not UTF-8".into(),
+        )
     })
 }

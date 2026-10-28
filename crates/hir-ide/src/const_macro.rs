@@ -9,7 +9,7 @@
 use std::any::Any;
 
 use base_db::{Crate, Env, SourceDatabase, all_crates};
-use hir_def::{FunctionId, ModuleDefId, MacroId, nameres::crate_def_map};
+use hir_def::{FunctionId, MacroId, ModuleDefId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
     parse_to_token_tree_static_span,
@@ -49,7 +49,7 @@ fn hir_db(db: &dyn SourceDatabase) -> &dyn HirDatabase {
 
 impl ConstMacroExpander {
     /// The macro crate and the function that is the macro.
-    fn function(&self, db: &dyn SourceDatabase) -> Result<(Crate, FunctionId), String> {
+    pub(crate) fn function(&self, db: &dyn SourceDatabase) -> Result<(Crate, FunctionId), String> {
         let krate = all_crates(db)
             .iter()
             .copied()

@@ -251,10 +251,18 @@ pub fn tests_reach(
     let mut walked: Vec<u32> =
         sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
     walked.sort_unstable_by(|a, b| b.cmp(a));
+    let added = walked.len();
     for at in walked {
         let below = Arc::new(below_of(&walk, &sealed, at));
         Below::keep(store, &sealed[&at].key, &below);
         sealed.get_mut(&at).unwrap().below = Some(below);
+    }
+    // What a daemon adds is left in the store's open pack, which the next daemon does not
+    // read: sealed now, a daemon that starts later walks none of it again.
+    if added >= SEAL_AFTER
+        && let Some(store) = store
+    {
+        std::thread::spawn(move || store.seal());
     }
     took.push(("below", started.elapsed()));
     let mut local: FxHashMap<u32, u32> = FxHashMap::default();
@@ -382,6 +390,9 @@ struct Below {
 /// adds is not found there by the next builds of the daemon.
 static KNOWN: LazyLock<Mutex<FxHashMap<[u8; super::store::KEY], Arc<Below>>>> =
     LazyLock::new(Default::default);
+
+/// How many sealed nodes a walk finds what is below of for the store's open pack to be sealed.
+const SEAL_AFTER: usize = 256;
 
 /// How many sealed nodes [`KNOWN`] keeps before it starts again.
 const KNOWN_AT_MOST: usize = 1 << 20;

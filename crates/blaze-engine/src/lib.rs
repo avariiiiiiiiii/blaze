@@ -7807,10 +7807,7 @@ pub fn main() -> anyhow::Result<()> {
             println!("{}", version());
             return Ok(());
         }
-        Some("cache") => {
-            end_with_reader();
-            return remote::command(std::env::args().skip(2));
-        }
+        Some("cache") => return remote::command(std::env::args().skip(2)),
         Some("std") => return shipped::command(std::env::args().skip(2)),
         Some("version-fetch") => return versions::command(std::env::args().skip(2)),
         Some("version-resolve") => return versions::resolve_command(std::env::args().skip(2)),

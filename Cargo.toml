@@ -6,6 +6,8 @@ exclude = [
     "crates/blaze-wasm",
     "demo",
     "harness",
+    # The standard library's own workspace (library/PATCHES.md).
+    "library",
     "vendor/proc-macro-srv",
     "crates/proc-macro-srv/proc-macro-test/imp",
 ]

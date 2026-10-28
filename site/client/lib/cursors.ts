@@ -1,8 +1,8 @@
 /**
  * Where the others on this page are (worker/presence.ts passes it on; client/lib/presence.ts owns the socket and
  * hands over the frames, `message`, and who is on the page, `setPeople`): their mouse pointer, an arrow in their
- * colour with their face and name, and the part of the page each is reading, a band with their face on a thin rail
- * at the right edge (click the face to go there).
+ * colour with their face and name, and their face on a thin rail at the right edge where their pointer is on the page
+ * (click the face to go there). Where a reader has scrolled is not sent: only the pointer.
  *
  * On a desk (a mouse or a trackpad, which hovers) the rail is also the page's scrollbar, there whenever the page
  * scrolls, whoever else is here: styles/shell.css hides the browser's own, the reader's viewport is the thumb (drag
@@ -16,15 +16,15 @@
  * order, so the same place in the text is the same anchor wherever the lines wrap.
  *
  * A tab sends its pointer (a mouse or a pen; phones send none and draw none) at most every MOVE_MS while it moves,
- * nothing while it rests, and null when it leaves the window or the tab is hidden; its viewport at most every VIEW_MS
- * when it scrolls or resizes, and again when someone comes to the page. Nothing goes while nobody else is here. A
+ * nothing while it rests, and null when it leaves the window or the tab is hidden; again when someone comes to the
+ * page. Nothing goes while nobody else is here. A
  * pointer that rests for IDLE_MS fades. The who-is-here list has a switch that hides the others' pointers, kept per
  * browser (localStorage).
  *
  * Saying something by the pointer, like Figma's cursor chat or Minecraft's T: on a desk T (outside a field, no
  * modifiers) opens a one-line composer at the reader's pointer (at the foot of the window when the pointer is off the
  * page). What is typed goes to the others on the page as it is typed (`say-live`, at most every SAY_MS), shown as a
- * bubble by the pointer, or by the face on the rail while the pointer is off their screen. Enter sends: the bubble
+ * bubble by the pointer, or by the face on the rail while the pointer is off their screen (or not drawn, on a phone). Enter sends: the bubble
  * stays SAY_LINGER_MS and a signed-in reader's line goes to the chat too, to be kept (client/lib/chat.ts `post`);
  * an anonymous one's is only ever the bubble. Esc, or leaving the field, takes it back.
  */
@@ -44,8 +44,6 @@ type Remote = {
 	el: HTMLElement | null;
 	/** When their pointer last moved (ms). */
 	t: number;
-	/** Their viewport as sent ([block, f, block, f]). */
-	v: number[] | null;
 	/** The line they are writing by their pointer (`done` once sent), its bubble, and when it goes. */
 	say: { text: string; done: boolean } | null;
 	sayEl: HTMLElement | null;
@@ -53,7 +51,6 @@ type Remote = {
 };
 
 const MOVE_MS = 60;
-const VIEW_MS = 200;
 const IDLE_MS = 5000;
 const HIDE_KEY = 'blaze.cursors.hide';
 /** What counts as a block: what the text is made of, in every page's `main`. */
@@ -158,9 +155,7 @@ function place(b: number, f: number): number | null {
 /** The pointer in window px, while it is over the page. */
 let pointer: { x: number; y: number } | null = null;
 let sentC = '';
-let sentV = '';
 let cTimer: ReturnType<typeof setTimeout> | undefined;
-let vTimer: ReturnType<typeof setTimeout> | undefined;
 
 function sendCursor(): void {
 	cTimer = undefined;
@@ -181,29 +176,11 @@ function queueCursor(): void {
 	if (peers.size && fine.matches) cTimer ??= setTimeout(sendCursor, MOVE_MS);
 }
 
-function sendView(): void {
-	vTimer = undefined;
-	const y = pageTop();
-	const top = anchor(y);
-	const bottom = anchor(y + innerHeight);
-	const v = top && bottom ? [...top, ...bottom] : null;
-	const s = JSON.stringify(v);
-	if (s === sentV) return;
-	sentV = s;
-	send({ t: 'v', v });
-}
-
-function queueView(): void {
-	if (peers.size) vTimer ??= setTimeout(sendView, VIEW_MS);
-}
-
 /** Drops what was sent, so the next change goes out whatever it is (someone new is here, or the socket is new). */
 function resend(): void {
 	sentC = '';
-	sentV = '';
 	sentSay = '';
 	if (pointer) queueCursor();
-	queueView();
 	if (saying) queueSay();
 }
 
@@ -288,28 +265,34 @@ function animate(): void {
 	raf ||= requestAnimationFrame(tick);
 }
 
-/** The rail: a band and a face for each viewport sent, and the reader's own (the thumb, on a desk). */
+let railQueued = 0;
+/** drawRail at the next frame, once however many pointers moved. */
+function queueRail(): void {
+	railQueued ||= requestAnimationFrame(() => {
+		railQueued = 0;
+		drawRail();
+	});
+}
+
+/** The rail: a mark and a face where each other reader's pointer is, and the reader's own place (the thumb, on a desk). */
 function drawRail(): void {
 	const H = document.documentElement.scrollHeight || 1;
 	const bands: HTMLElement[] = [];
 	for (const r of remotes.values()) {
-		if (!r.v) continue;
-		const y0 = place(r.v[0], r.v[1]);
-		const y1 = place(r.v[2], r.v[3]);
-		if (y0 === null || y1 === null) continue;
+		const y0 = r.c ? place(r.c[1], r.c[2]) : null;
+		if (y0 === null) continue;
 		const band = el('span', 'reading-band');
 		band.style.setProperty('--c', colour(r.who.key));
 		band.dataset.key = r.who.key;
 		band.style.top = `${((Math.max(0, y0) / H) * 100).toFixed(2)}%`;
-		band.style.height = `${((Math.max(0, y1 - y0) / H) * 100).toFixed(2)}%`;
 		const go = el('button', 'reading-face');
 		go.type = 'button';
 		const f = face(r.who, r.who.away);
 		// The button's tooltip, not the face's.
 		delete f.dataset.tip;
 		go.append(f);
-		tipOn(go, `${name(r.who)} is reading here`);
-		go.addEventListener('click', () => scrollTo({ top: Math.max(0, y0 - 56), behavior: still.matches ? 'auto' : 'smooth' }));
+		tipOn(go, `${name(r.who)}'s pointer is here`);
+		go.addEventListener('click', () => scrollTo({ top: Math.max(0, y0 - innerHeight / 3), behavior: still.matches ? 'auto' : 'smooth' }));
 		band.append(go);
 		bands.push(band);
 	}
@@ -650,27 +633,24 @@ export function setPeople(at: string, list: Peer[]): void {
 export function reset(): void {
 	peers.clear();
 	sentC = '';
-	sentV = '';
 	sentSay = '';
 }
 
-/** Takes a `c`, `v` or `say-live` frame; false for anything else. */
+/** Takes a `c` or `say-live` frame; false for anything else. */
 export function message(m: { t?: unknown }): boolean {
-	if (m.t !== 'c' && m.t !== 'v' && m.t !== 'say-live') return false;
-	const { k, c, v, text, done } = m as { k?: unknown; c?: unknown; v?: unknown; text?: unknown; done?: unknown };
+	if (m.t !== 'c' && m.t !== 'say-live') return false;
+	const { k, c, text, done } = m as { k?: unknown; c?: unknown; text?: unknown; done?: unknown };
 	const who = typeof k === 'string' ? peers.get(k) : undefined;
 	if (!who) return true;
 	const nums = (x: unknown, n: number) => (Array.isArray(x) && x.length === n && x.every((y) => typeof y === 'number' && Number.isFinite(y)) ? (x as number[]) : null);
 	let r = remotes.get(who.key);
-	if (!r) remotes.set(who.key, (r = { who, c: null, pos: null, to: null, el: null, t: 0, v: null, say: null, sayEl: null, sayTimer: undefined }));
+	if (!r) remotes.set(who.key, (r = { who, c: null, pos: null, to: null, el: null, t: 0, say: null, sayEl: null, sayTimer: undefined }));
 	if (m.t === 'say-live') hearSay(r, typeof text === 'string' && text ? text.slice(0, SAY_MAX) : null, done === true);
-	else if (m.t === 'v') {
-		r.v = nums(v, 4);
-		drawRail();
-	} else {
+	else {
 		r.c = nums(c, 3);
 		r.t = Date.now();
 		aim(r);
+		queueRail();
 	}
 	return true;
 }
@@ -744,17 +724,13 @@ export function setup(opts: {
 		'scroll',
 		() => {
 			if (pointer) queueCursor();
-			queueView();
 			moved();
 			placeBox();
 			for (const r of remotes.values()) placeSay(r);
 		},
 		{ passive: true },
 	);
-	addEventListener('resize', () => {
-		relayout();
-		queueView();
-	});
+	addEventListener('resize', () => relayout());
 	document.addEventListener('visibilitychange', () => {
 		if (!document.hidden) return;
 		pointer = null;
@@ -767,11 +743,9 @@ export function setup(opts: {
 		clearTimeout(sayFade);
 		sayBox.hidden = true;
 		clearTimeout(cTimer);
-		clearTimeout(vTimer);
-		cTimer = vTimer = undefined;
+		cTimer = undefined;
 		if (sentC && sentC !== 'null') send({ t: 'c', c: null });
-		if (sentV && sentV !== 'null') send({ t: 'v', v: null });
-		sentC = sentV = '';
+		sentC = '';
 	});
 	const ro = new ResizeObserver(() => relayout());
 	const watch = () => {

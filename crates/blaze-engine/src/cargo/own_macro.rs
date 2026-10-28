@@ -42,6 +42,46 @@ pub(crate) const WASM: &str = "BLAZE_PROC_MACRO_WASM";
 /// The target a proc macro's module is built for.
 pub(crate) const WASM_TARGET: &str = "wasm32-wasip1";
 
+/// The cfgs a module is built with beyond its description ([`host_side_cfg`]), which key its
+/// build: neither a module a blaze of other cfgs built nor the expansions kept of it are taken
+/// for this one's.
+pub(crate) const MODULE_CFG: &str = "crates that link proc_macro are told no target_os or family";
+
+/// What the crates that link `proc_macro` in the build of a proc macro's module from the
+/// `rust-project.json` at `project` are not told of [`WASM_TARGET`]: its `target_os` and its
+/// `target_family`, which rustc's build of a proc macro, for the host, does not have.
+/// synstructure and syn 1 leave out `proc_macro`, and synstructure its `decl_derive!` with
+/// it, for `wasm32` with `target_os = "wasi"`, where no `proc_macro` used to work: the module
+/// then had none of the derives declared with it (#828). Every other crate is told the
+/// target, by which libc, getrandom and wasi choose what the module's standard library is.
+/// `None` when the project is not a proc macro's.
+pub(crate) fn host_side_cfg(project: &Path) -> Result<Option<project_model::CfgOverrides>, String> {
+    let text = std::fs::read_to_string(project)
+        .map_err(|it| format!("reading {}: {it}", project.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|it| it.to_string())?;
+    let crates = value["crates"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !crates.first().is_some_and(|it| it["is_proc_macro"] == true) {
+        return Ok(None);
+    }
+    let atom = |key: &str, value: &str| cfg::CfgAtom::KeyValue {
+        key: intern::Symbol::intern(key),
+        value: intern::Symbol::intern(value),
+    };
+    let target = vec![atom("target_os", "wasi"), atom("target_family", "wasm")];
+    let diff = cfg::CfgDiff::new(Vec::new(), target);
+    let mut overrides = project_model::CfgOverrides::default();
+    for krate in crates {
+        let Some(name) = krate["display_name"].as_str() else { continue };
+        let root = krate["root_module"].as_str().and_then(|it| std::fs::read_to_string(it).ok());
+        let links = krate["is_proc_macro"] == true
+            || root.is_some_and(|text| text.contains("extern crate proc_macro"));
+        if links {
+            overrides.selective.insert(name.to_owned(), diff.clone());
+        }
+    }
+    Ok(Some(overrides))
+}
+
 /// Has the toolchain at `sysroot` the WASI libc a module is linked with (`link.rs`), which
 /// comes with rustup's `wasm32-wasip1` target: rustup adds it when it is not there, once per
 /// process. Builds that start together add it once: two rustups that download one component
@@ -448,4 +488,56 @@ pub(crate) fn made(record: &Record, wasm: bool) -> Option<Made<'_>> {
         exe: out_dir.join(format!("{prefix}{name}{extra}{suffix}")),
         dep_info: out_dir.join(format!("{name}{extra}.d")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_crates_that_link_proc_macro_are_told_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = |name: &str, text: &str| {
+            let file = dir.path().join(format!("{name}.rs"));
+            std::fs::write(&file, text).unwrap();
+            file
+        };
+        let gated = "#[cfg(not(all(target_arch = \"wasm32\", target_os = \"wasi\")))]\n\
+                     extern crate proc_macro;\n";
+        let crates = [
+            ("derives", root("derives", "use synstructure::decl_derive;\n"), true),
+            ("synstructure", root("synstructure", gated), false),
+            ("getrandom", root("getrandom", "#[cfg(target_os = \"wasi\")]\nmod wasi;\n"), false),
+        ];
+        let described = |crates: &[(&str, PathBuf, bool)]| {
+            let crates = crates.iter().map(|(name, root, proc_macro)| {
+                serde_json::json!({
+                    "display_name": name, "root_module": root, "is_proc_macro": proc_macro,
+                })
+            });
+            let file = dir.path().join("rust-project.json");
+            let crates: Vec<_> = crates.collect();
+            std::fs::write(&file, serde_json::json!({ "crates": crates }).to_string()).unwrap();
+            file
+        };
+        let told = host_side_cfg(&described(&crates)).unwrap().unwrap();
+        let mut names: Vec<_> = told.selective.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["derives", "synstructure"]);
+        let mut options = cfg::CfgOptions::default();
+        let target = [("target_os", "wasi"), ("target_family", "wasm"), ("target_arch", "wasm32")];
+        for (key, value) in target {
+            options.insert_key_value(intern::Symbol::intern(key), intern::Symbol::intern(value));
+        }
+        let mut host = options.clone();
+        told.apply(&mut host, "synstructure");
+        let os = cfg::CfgAtom::KeyValue {
+            key: intern::Symbol::intern("target_os"),
+            value: intern::Symbol::intern("wasi"),
+        };
+        assert!(!host.check_atom(&os));
+        told.apply(&mut options, "getrandom");
+        assert!(options.check_atom(&os));
+        assert!(host_side_cfg(&described(&crates[1..])).unwrap().is_none());
+    }
 }

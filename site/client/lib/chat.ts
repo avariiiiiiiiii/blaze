@@ -721,6 +721,16 @@ export function setup(opts: {
 	face: (w: Who) => HTMLElement;
 	speak: (key: string, login: string, text: string | null) => void;
 }): void {
+	// A touch screen has no hover: a tap on a message (not on its links or buttons) shows its actions, one at a time.
+	if (matchMedia('(hover: none)').matches) {
+		panel.addEventListener('click', (e) => {
+			const t = e.target instanceof Element ? e.target : null;
+			if (!t || t.closest('a, button, textarea')) return;
+			const row = t.closest('.chat-msg');
+			for (const open of panel.querySelectorAll('.chat-msg.acts-open')) if (open !== row) open.classList.remove('acts-open');
+			row?.classList.toggle('acts-open');
+		});
+	}
 	send = opts.send;
 	speak = opts.speak;
 	base = opts.base;

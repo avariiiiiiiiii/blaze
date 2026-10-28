@@ -260,8 +260,11 @@ body.side-shut.chat-full .chat { left: clamp(8px, 1vw, 14px); }
 .faces .face + .face { margin-left: -6px; }
 .face { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: var(--bg-4); box-shadow: 0 0 0 2px var(--bg); transition: opacity 0.2s; }
 .face img, .face svg { width: 100%; height: 100%; }
-.face svg { padding: 2px; background: var(--bg-3); }
-.face svg rect { fill: var(--id-ink); }
+/* An anonymous reader's animal (gen/animals.ts, drawn from dist/animals.<hash>.svg): its tone slots from their hue `--h`. */
+.face.animal { --a-bg: hsl(var(--h) 30% 25%); --a1: hsl(var(--h) 55% 62%); --a2: hsl(var(--h) 40% 39%); --a3: hsl(var(--h) 75% 88%); --a-ink: hsl(var(--h) 45% 11%); background: var(--a-bg); }
+@media (prefers-color-scheme: light) {
+	.face.animal { --a-bg: hsl(var(--h) 55% 82%); --a1: hsl(var(--h) 50% 57%); --a2: hsl(var(--h) 42% 34%); --a3: hsl(var(--h) 70% 97%); --a-ink: hsl(var(--h) 45% 14%); }
+}
 .face.away { opacity: 0.45; }
 .face.more { width: auto; min-width: 20px; padding: 0 4px; border-radius: 10px; color: var(--ink-3); font-size: 10.5px; }
 .navlist .row > .faces { margin-left: auto; }

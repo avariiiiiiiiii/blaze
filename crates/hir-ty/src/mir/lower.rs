@@ -67,7 +67,7 @@ use crate::{
     },
 };
 
-use super::{OperandKind, Place};
+use super::{MirLowerError, OperandKind, Place, is_by_move_coroutine};
 
 mod as_place;
 mod deref_pattern;
@@ -225,41 +225,6 @@ struct MirLowerCtx<'a, 'db> {
     infcx: InferCtxt<'db>,
 }
 
-// FIXME: Make this smaller, its stored in database queries
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
-pub enum MirLowerError<'db> {
-    ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
-    LayoutError(LayoutError),
-    IncompleteExpr,
-    IncompletePattern,
-    /// Trying to lower a trait function, instead of an implementation
-    TraitFunctionDefinition(TraitId, Name),
-    UnresolvedName {
-        owner: ExpressionStoreOwnerId,
-        path: Path,
-    },
-    RecordLiteralWithoutPath,
-    UnresolvedMethod(String),
-    UnresolvedField,
-    MissingFunctionDefinition(InferBodyId<'db>, ExprId),
-    HasErrors,
-    /// This should never happen. Type mismatch should catch everything.
-    TypeError(&'static str),
-    NotSupported(String),
-    ContinueWithoutLoop,
-    BreakWithoutLoop,
-    Loop,
-    /// Something that should never happen and is definitely a bug, but we don't want to panic if it happened
-    ImplementationError(String),
-    LangItemNotFound,
-    MutatingRvalue,
-    UnresolvedLabel,
-    UnresolvedUpvar(StoredPlace),
-    InaccessibleLocal,
-
-    // monomorphization errors:
-    GenericArgNotProvided(GenericParamId, StoredGenericArgs),
-}
 
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
 struct DropScopeToken;
@@ -312,11 +277,6 @@ macro_rules! implementation_error {
     }};
 }
 
-impl From<LayoutError> for MirLowerError<'_> {
-    fn from(value: LayoutError) -> Self {
-        MirLowerError::LayoutError(value)
-    }
-}
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
@@ -4464,32 +4424,6 @@ pub fn mir_body_for_coroutine_by_move_query<'db>(
     lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
 }
 
-/// Whether a future of this type, which the `async` block `coroutine` gives, is one that owns
-/// what its `async` closure captured.
-pub fn is_by_move_coroutine<'db>(
-    db: &'db dyn HirDatabase,
-    coroutine: InternedCoroutineId<'db>,
-    args: CoroutineArgs<DbInterner<'db>>,
-) -> bool {
-    let InternedClosure { owner, expr, .. } = coroutine.loc(db);
-    let store = ExpressionStore::of(db, owner.expression_store_owner(db));
-    let Expr::Closure {
-        closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
-        ..
-    } = &store[expr]
-    else {
-        return false;
-    };
-    let closure = ExpressionStore::closure_for_coroutine(expr);
-    let TyKind::CoroutineClosure(_, closure_args) =
-        InferenceResult::of(db, owner).expr_ty(closure).kind()
-    else {
-        return false;
-    };
-    let once = rustc_type_ir::ClosureKind::FnOnce;
-    args.kind_ty().to_opt_closure_kind() == Some(once)
-        && closure_args.as_coroutine_closure().kind() != once
-}
 
 fn mir_body_for_coroutine_cycle_result<'db>(
     _db: &'db dyn HirDatabase,

@@ -44,26 +44,23 @@ pub mod target;
 mod transform;
 pub mod type_name;
 
-pub use eval::{
-    Evaluator, IsSigned, MirEvalError, VTableMap, interpret_mir, pad16,
-    render_const_using_debug_impl,
-};
+pub use eval::{Evaluator, interpret_mir, render_const_using_debug_impl};
 pub use held::{HeldLocals, YieldPoint};
 pub use lower::is_builtin_index;
 pub use lower::{
-    MirLowerError, inline_const_at, is_by_move_coroutine, lower_body_to_mir,
+    inline_const_at, lower_body_to_mir,
     lower_to_mir_with_store, mir_body_for_closure_query, mir_body_for_coroutine_by_move_query,
     mir_body_for_coroutine_query, mir_body_query, promoted_mir_body_query, set_mir_capacity,
 };
 pub use monomorphization::monomorphized;
-pub(crate) use monomorphization::opaque_of_impl;
+pub use monomorphization::opaque_of_impl;
 pub use monomorphization::{
     monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
     monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,
     monomorphized_promoted_mir_body_query,
 };
 pub use optimize::{
-    MirOptLevel, monomorphized_optimized_mir_body_for_closure_query,
+    monomorphized_optimized_mir_body_for_closure_query,
     monomorphized_optimized_mir_body_query, optimized_mir_body_for_closure_query,
     optimized_mir_body_query, passes_not_ported, set_interpreter_mir_opt_level,
 };
@@ -1868,6 +1865,227 @@ impl<'db> PlaceTy<'db> {
             ProjectionElem::Field(f) => {
                 PlaceTy::from_ty(handle_field(structurally_normalize(self.ty), self.variant_id, f))
             }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
+pub struct VTableMap<'db> {
+    ty_to_id: FxHashMap<Ty<'db>, usize>,
+    id_to_ty: Vec<Ty<'db>>,
+}
+
+impl<'db> VTableMap<'db> {
+    const OFFSET: usize = 1000; // We should add some offset to ids to make 0 (null) an invalid id.
+
+    pub fn id(&mut self, ty: Ty<'db>) -> usize {
+        if let Some(it) = self.ty_to_id.get(&ty) {
+            return *it;
+        }
+        let id = self.id_to_ty.len() + VTableMap::OFFSET;
+        self.id_to_ty.push(ty);
+        self.ty_to_id.insert(ty, id);
+        id
+    }
+
+    pub fn ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
+        id.checked_sub(VTableMap::OFFSET)
+            .and_then(|id| self.id_to_ty.get(id).copied())
+            .ok_or(MirEvalError::InvalidVTableId(id))
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.id_to_ty.shrink_to_fit();
+        self.ty_to_id.shrink_to_fit();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.id_to_ty.is_empty() && self.ty_to_id.is_empty()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, SalsaValue)]
+pub enum MirEvalError<'db> {
+    ConstEvalError(String, Box<ConstEvalError<'db>>),
+    LayoutError(LayoutError, StoredTy),
+    TargetDataLayoutNotAvailable(TargetLoadError),
+    /// Means that code had undefined behavior. We don't try to actively detect UB, but if it was detected
+    /// then use this type of error.
+    UndefinedBehavior(String),
+    Panic(String),
+    // FIXME: This should be folded into ConstEvalError?
+    MirLowerError(FunctionId, MirLowerError<'db>),
+    MirLowerErrorForClosure(InternedClosureId<'db>, MirLowerError<'db>),
+    TypeIsUnsized(StoredTy, &'static str),
+    NotSupported(String),
+    InvalidConst,
+    InFunction(
+        Box<MirEvalError<'db>>,
+        Vec<(Either<FunctionId, InternedClosureId<'db>>, MirSpan, InferBodyId<'db>)>,
+    ),
+    ExecutionLimitExceeded,
+    StackOverflow,
+    /// FIXME: Fold this into InternalError
+    InvalidVTableId(usize),
+    /// ?
+    CoerceUnsizedError(StoredTy),
+    /// These should not occur, usually indicates a bug in mir lowering.
+    InternalError(Box<str>),
+}
+
+impl std::fmt::Debug for MirEvalError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConstEvalError(arg0, arg1) => {
+                f.debug_tuple("ConstEvalError").field(arg0).field(arg1).finish()
+            }
+            Self::LayoutError(arg0, arg1) => {
+                f.debug_tuple("LayoutError").field(arg0).field(arg1).finish()
+            }
+            Self::UndefinedBehavior(arg0) => {
+                f.debug_tuple("UndefinedBehavior").field(arg0).finish()
+            }
+            Self::Panic(msg) => write!(f, "Panic with message:\n{msg:?}"),
+            Self::TargetDataLayoutNotAvailable(arg0) => {
+                f.debug_tuple("TargetDataLayoutNotAvailable").field(arg0).finish()
+            }
+            Self::TypeIsUnsized(ty, it) => write!(f, "{ty:?} is unsized. {it} should be sized."),
+            Self::ExecutionLimitExceeded => write!(f, "execution limit exceeded"),
+            Self::StackOverflow => write!(f, "stack overflow"),
+            Self::MirLowerError(arg0, arg1) => {
+                f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
+            }
+            Self::MirLowerErrorForClosure(arg0, arg1) => {
+                f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
+            }
+            Self::CoerceUnsizedError(arg0) => {
+                f.debug_tuple("CoerceUnsizedError").field(arg0).finish()
+            }
+            Self::InternalError(arg0) => f.debug_tuple("InternalError").field(arg0).finish(),
+            Self::InvalidVTableId(arg0) => f.debug_tuple("InvalidVTableId").field(arg0).finish(),
+            Self::NotSupported(arg0) => f.debug_tuple("NotSupported").field(arg0).finish(),
+            Self::InvalidConst => f.write_str("InvalidConst"),
+            Self::InFunction(e, stack) => {
+                f.debug_struct("WithStack").field("error", e).field("stack", &stack).finish()
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub enum IsSigned {
+    Yes,
+    No,
+}
+
+impl From<bool> for IsSigned {
+    fn from(value: bool) -> Self {
+        if value { Self::Yes } else { Self::No }
+    }
+}
+
+pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
+    let is_negative = is_signed == IsSigned::Yes && it.last().unwrap_or(&0) > &127;
+    let mut res = [if is_negative { 255 } else { 0 }; 16];
+    res[..it.len()].copy_from_slice(it);
+    res
+}
+
+// FIXME: Make this smaller, its stored in database queries
+#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+pub enum MirLowerError<'db> {
+    ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
+    LayoutError(LayoutError),
+    IncompleteExpr,
+    IncompletePattern,
+    /// Trying to lower a trait function, instead of an implementation
+    TraitFunctionDefinition(TraitId, Name),
+    UnresolvedName {
+        owner: ExpressionStoreOwnerId,
+        path: Path,
+    },
+    RecordLiteralWithoutPath,
+    UnresolvedMethod(String),
+    UnresolvedField,
+    MissingFunctionDefinition(InferBodyId<'db>, ExprId),
+    HasErrors,
+    /// This should never happen. Type mismatch should catch everything.
+    TypeError(&'static str),
+    NotSupported(String),
+    ContinueWithoutLoop,
+    BreakWithoutLoop,
+    Loop,
+    /// Something that should never happen and is definitely a bug, but we don't want to panic if it happened
+    ImplementationError(String),
+    LangItemNotFound,
+    MutatingRvalue,
+    UnresolvedLabel,
+    UnresolvedUpvar(StoredPlace),
+    InaccessibleLocal,
+
+    // monomorphization errors:
+    GenericArgNotProvided(GenericParamId, StoredGenericArgs),
+}
+
+impl From<LayoutError> for MirLowerError<'_> {
+    fn from(value: LayoutError) -> Self {
+        MirLowerError::LayoutError(value)
+    }
+}
+
+/// Whether a future of this type, which the `async` block `coroutine` gives, is one that owns
+/// what its `async` closure captured.
+pub fn is_by_move_coroutine<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    args: CoroutineArgs<DbInterner<'db>>,
+) -> bool {
+    let InternedClosure { owner, expr, .. } = coroutine.loc(db);
+    let store = ExpressionStore::of(db, owner.expression_store_owner(db));
+    let Expr::Closure {
+        closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
+        ..
+    } = &store[expr]
+    else {
+        return false;
+    };
+    let closure = ExpressionStore::closure_for_coroutine(expr);
+    let TyKind::CoroutineClosure(_, closure_args) =
+        InferenceResult::of(db, owner).expr_ty(closure).kind()
+    else {
+        return false;
+    };
+    let once = rustc_type_ir::ClosureKind::FnOnce;
+    args.kind_ty().to_opt_closure_kind() == Some(once)
+        && closure_args.as_coroutine_closure().kind() != once
+}
+
+/// How much of rustc's optimization pipeline runs: rustc's `-Zmir-opt-level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum MirOptLevel {
+    /// None: the body is the runtime body.
+    Off,
+    /// rustc's level 1, what a build at `opt-level=0` gets.
+    Debug,
+    /// rustc's level 2, what a build at any other `opt-level` gets.
+    Release,
+}
+
+impl MirOptLevel {
+    pub fn from_number(level: u8) -> Option<MirOptLevel> {
+        match level {
+            0 => Some(MirOptLevel::Off),
+            1 => Some(MirOptLevel::Debug),
+            2 => Some(MirOptLevel::Release),
+            _ => None,
+        }
+    }
+
+    pub fn number(self) -> u8 {
+        match self {
+            MirOptLevel::Off => 0,
+            MirOptLevel::Debug => 1,
+            MirOptLevel::Release => 2,
         }
     }
 }

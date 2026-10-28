@@ -380,7 +380,7 @@ pub fn monomorphized<'db>(
 /// The opaque type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
 /// is with `args`, once they name the impl: `None` for one of another function, or while they
 /// don't.
-pub(crate) fn opaque_of_impl<'db>(
+pub fn opaque_of_impl<'db>(
     db: &'db dyn HirDatabase,
     env: ParamEnvAndCrate<'db>,
     opaque: InternedOpaqueTyId<'db>,

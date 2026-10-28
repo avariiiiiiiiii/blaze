@@ -52,6 +52,8 @@ import bench, blaze_cli
 from blaze_cli import Side, difference, program_output, test_results, wait_warm
 
 LET = bench.LET
+# The longest wait for a daemon to load: one that has not loaded by then is not waited for again.
+blaze_cli.WARMUP_SECS = 600
 
 # Astral's projects, at the revisions its downstream workflow pins (downstream-tests.yaml).
 PROJECTS = {
@@ -212,7 +214,7 @@ class Runner:
             env[prefix + "HOME"] = self.home
             env[prefix + "CACHE"] = os.path.join(work, f"store-{arm.name}")
             env[prefix + "STATS"] = "1"
-        self.prefix, self.env = prefix, env
+        self.prefix, self.env, self.loads = prefix, env, bool(prefix)
         self.side = Side(ws, env, arm.kind != "cargo")
 
     def run(self, command, *args):
@@ -235,9 +237,12 @@ class Runner:
         return "daemon" if re.search(r"\[(blaze|ra-jit)\]", said) else "unknown"
 
     def ready(self):
-        if not self.prefix:
-            return 0.0, ["cargo"]
-        return wait_warm(self.side, self.ws)
+        if not self.loads:
+            return 0.0, ["cargo" if not self.prefix else "never loaded"]
+        took, states = wait_warm(self.side, self.ws)
+        if states == ["not loaded in time"]:
+            self.loads = False
+        return took, states
 
 
 def shipped_std(arm, runner, work):

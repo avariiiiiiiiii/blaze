@@ -208,9 +208,13 @@ class Repo:
             manifest = load(d / "Cargo.toml")
             package = manifest["package"]
             orig = package["name"]
-            # The crates derived from rust-analyzer keep its version, 0.0.0; rowan and rustc_abi are
-            # forks of crates on crates.io.
-            fork = package["version"] == "0.0.0" or orig in ("rowan", "ra-ap-rustc_abi")
+            # Forks: vendor/, the crates in crates/ derived from rust-analyzer (which keep its version,
+            # 0.0.0), and rowan and rustc_abi, forks of crates on crates.io.
+            fork = (
+                not d.is_relative_to(ROOT / "crates")
+                or package["version"] == "0.0.0"
+                or orig in ("rowan", "ra-ap-rustc_abi")
+            )
             if fork:
                 name, version = "ra-jit-" + orig.removeprefix("ra-ap-"), self.version
             else:

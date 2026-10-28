@@ -212,6 +212,15 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-btn:hover, .tl-btn[aria-expanded='true'] { color: var(--ink-1); background: var(--s-tint); }
 .tl-btn svg { width: 14px; height: 14px; fill: currentColor; }
 .tl-discuss .tl-btn { color: var(--ink-1); }
+/* The sidebar shut (client/lib/presence.ts): its column folds to nothing, the page takes the room. */
+.tl-side { width: 30px; padding: 0; justify-content: center; }
+.tl-side svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.4; }
+.tl-side[aria-pressed='true'] svg path { stroke-dasharray: 2 1.6; }
+.frame { transition: grid-template-columns 0.22s cubic-bezier(0.2, 0.7, 0.3, 1); }
+body.side-shut .frame { grid-template-columns: 0 minmax(0, 1fr); padding-left: clamp(8px, 1vw, 14px); gap: 0; }
+body.side-shut .frame > .side { visibility: hidden; overflow: hidden; padding: 0; }
+body.side-shut.chat-full .chat { left: clamp(8px, 1vw, 14px); }
+@media (prefers-reduced-motion: reduce) { .frame { transition: none; } }
 /* The discussion at the left, everything else at the right. */
 .topline > .tl-gap { display: block; flex: 1; }
 .tl-bubble { flex: none; width: 14px; height: 12px; border: 1.5px solid currentColor; border-radius: 4px 4px 4px 1px; }

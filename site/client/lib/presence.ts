@@ -147,7 +147,32 @@ const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
 const chatSlot = el('span', 'tl-chatslot');
 chatSlot.append(chat.button);
-bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
+// Shut the sidebar for more room to read (a wide screen's; a phone's is a drawer already). Remembered per browser.
+const SIDE_SHUT = 'blaze.side.shut';
+const sideBtn = el('button', 'tl-btn tl-side');
+sideBtn.type = 'button';
+sideBtn.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M6.5 3v10"/></svg>';
+function shutSide(shut: boolean, keep = true): void {
+	document.body.classList.toggle('side-shut', shut);
+	sideBtn.setAttribute('aria-pressed', String(shut));
+	tipOn(sideBtn, shut ? 'Show the sidebar' : 'Hide the sidebar');
+	if (!keep) return;
+	try {
+		if (shut) localStorage.setItem(SIDE_SHUT, '1');
+		else localStorage.removeItem(SIDE_SHUT);
+	} catch {
+		// Storage refused: shut for this page only.
+	}
+}
+let wasShut = false;
+try {
+	wasShut = localStorage.getItem(SIDE_SHUT) === '1';
+} catch {
+	// Storage refused: open.
+}
+shutSide(wasShut, false);
+sideBtn.addEventListener('click', () => shutSide(!document.body.classList.contains('side-shut')));
+bar.append(sideBtn, discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';

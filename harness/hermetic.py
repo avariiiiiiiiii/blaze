@@ -7,9 +7,10 @@ usage: hermetic.py    (BLAZE_BIN names the blaze engine built; `blaze` is found 
 
 A library has a test for each kind of reason (files, the environment, the network, a process
 started and one ended, foreign code, assembly, a function pointer made of data, an atomic
-static and a `static mut`; the clock, a `HashMap`'s seed and a thread, which don't block) and
-pure tests beside them (arithmetic through three calls, a sort, formatting, a `LazyLock` and a
-thread-local). Steps:
+static, a `static mut` and a function pointer kept in a static that any caller sets; the clock,
+a `HashMap`'s seed and a thread, which don't block) and pure tests beside them (arithmetic
+through three calls, a sort, formatting, a `LazyLock`, a thread-local, and a function chosen
+once and kept in a static as memchr chooses its code by the CPU). Steps:
 
 - `blaze test --why --json` runs no test and prints a line a test: each test is hermetic as
   its kind says, its reasons have that kind with a chain that starts at the test, and the
@@ -74,6 +75,49 @@ fn answer() -> u32 {
     42
 }
 
+mod dispatch {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    type Fn = *mut ();
+    type RealFn = unsafe fn(u32) -> u32;
+
+    pub fn chosen(x: u32) -> u32 {
+        static FN: AtomicPtr<()> = AtomicPtr::new(detect as Fn);
+
+        unsafe fn fast(x: u32) -> u32 {
+            x + 1
+        }
+
+        unsafe fn slow(x: u32) -> u32 {
+            x + 1
+        }
+
+        unsafe fn detect(x: u32) -> u32 {
+            let fun = if std::hint::black_box(true) { fast as RealFn } else { slow as RealFn };
+            FN.store(fun as Fn, Ordering::Relaxed);
+            unsafe { fun(x) }
+        }
+
+        let fun = FN.load(Ordering::Relaxed);
+        unsafe { std::mem::transmute::<Fn, RealFn>(fun)(x) }
+    }
+
+    pub fn hooked(f: RealFn, x: u32) -> u32 {
+        unsafe fn same(x: u32) -> u32 {
+            x
+        }
+
+        static HOOK: AtomicPtr<()> = AtomicPtr::new(same as Fn);
+        HOOK.store(f as Fn, Ordering::Relaxed);
+        let fun = HOOK.load(Ordering::Relaxed);
+        unsafe { std::mem::transmute::<Fn, RealFn>(fun)(x) }
+    }
+
+    pub unsafe fn twice(x: u32) -> u32 {
+        x * 2
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +146,17 @@ mod tests {
     fn pure_thread_local() {
         LOCAL.with(|it| it.set(it.get() + 1));
         assert_eq!(LOCAL.with(|it| it.get()), 1);
+    }
+
+    #[test]
+    fn pure_dispatch() {
+        assert_eq!(dispatch::chosen(1), 2);
+        assert_eq!(dispatch::chosen(2), 3);
+    }
+
+    #[test]
+    fn global_hook() {
+        assert_eq!(dispatch::hooked(dispatch::twice, 2), 4);
     }
 
     #[test]
@@ -183,9 +238,10 @@ FILES = {
 # Each test, by libtest's name: the kind it has to be found to reach, and whether it blocks.
 BLOCKS = {"fs": "fs", "env": "env", "net": "net", "process": "process", "exit": "process",
           "ffi": "ffi", "asm": "asm", "indirect": "indirect", "global_atomic": "global-state",
-          "global_static_mut": "global-state"}
+          "global_static_mut": "global-state", "global_hook": "global-state"}
 FLAKY_ONLY = {"clock": "clock", "random": "random", "thread": "thread"}
-PURE = {"pure_add", "pure_sort", "pure_format", "pure_lazy", "pure_thread_local"}
+PURE = {"pure_add", "pure_sort", "pure_format", "pure_lazy", "pure_thread_local",
+        "pure_dispatch"}
 ALL = {f"tests::{it}" for it in [*BLOCKS, *FLAKY_ONLY, *PURE]}
 NOT_HERMETIC = {f"tests::{it}" for it in BLOCKS}
 RAN = re.compile(r"^test (\S+) \.\.\. (ok|ignored|FAILED)", re.M)
@@ -275,7 +331,7 @@ def main():
             verdict = "tests.ndjson IS NOT WHAT --why --json PRINTED"
         elif (summary["tests"], summary["not_hermetic"]) != (len(ALL), len(NOT_HERMETIC)):
             verdict = f"SUMMARY COUNTS {summary['tests']} TESTS, {summary['not_hermetic']} NOT HERMETIC"
-        elif summary["by_kind"].get("global-state") != 2:
+        elif summary["by_kind"].get("global-state") != 3:
             verdict = f"SUMMARY BY KIND {summary['by_kind']}"
         step("tests.ndjson and tests.summary.json", verdict)
 

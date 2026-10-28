@@ -57,6 +57,8 @@ use hir_ty::{
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
+mod dispatch;
+
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
     InstanceDef, MEM, Requests, Result, SymbolResolver, compiled_instance, compiled_root,
@@ -777,6 +779,8 @@ struct Walk<'db> {
     counted: bool,
     /// What each function of core and alloc known by its name does that is not pure.
     library: FxHashMap<FunctionId, Option<String>>,
+    /// Whether a static chooses a function by the CPU, as [`dispatch`] tells.
+    dispatch: std::cell::RefCell<FxHashMap<StaticId, bool>>,
 }
 
 /// A body of core or alloc looked through: a function's, or a closure's.
@@ -800,6 +804,7 @@ impl<'db> Walk<'db> {
             locations: Default::default(),
             counted,
             library: FxHashMap::default(),
+            dispatch: Default::default(),
         }
     }
 
@@ -1231,7 +1236,8 @@ impl<'db> Walk<'db> {
         };
         let Ok(body) = body else { return };
         if self.tests {
-            if let Some(span) = fn_from_data(db, body) {
+            let cache = |id| self.dispatch_cache(id);
+            if let Some(span) = fn_from_data(db, body, &cache) {
                 let place =
                     location(db, body, span).map(|it| format!(", at {it}")).unwrap_or_default();
                 let what = describe(db, &self.nodes[at as usize].node);
@@ -1353,6 +1359,15 @@ impl<'db> Walk<'db> {
         None
     }
 
+    fn dispatch_cache(&self, id: StaticId) -> bool {
+        if let Some(&it) = self.dispatch.borrow().get(&id) {
+            return it;
+        }
+        let it = dispatch::is_cache(self.db, id);
+        self.dispatch.borrow_mut().insert(id, it);
+        it
+    }
+
     /// What a static a test reaches makes its end depend on, by kind: a foreign static, or one
     /// of a crate outside the toolchain that other tests in the process can change.
     fn static_reason(&self, id: StaticId, writable: bool) -> Option<(Kind, String, String)> {
@@ -1378,6 +1393,7 @@ impl<'db> Walk<'db> {
             || !writable
             || is_thread_local(db, id)
             || !(mutable || shared(db, db.type_for_static(id).skip_binder()))
+            || self.dispatch_cache(id)
         {
             return None;
         }
@@ -1746,17 +1762,25 @@ fn shared<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> bool {
 }
 
 /// Where `body` makes a function pointer of data, with a `transmute`: what it calls through
-/// it is no function the code reached names, and can be any.
-fn fn_from_data(db: &dyn HirDatabase, body: &MirBody<'_>) -> Option<MirSpan> {
+/// it is no function the code reached names, and can be any. Not one of what it loaded from a
+/// static `cache` says chooses a function ([`dispatch`]).
+fn fn_from_data(
+    db: &dyn HirDatabase,
+    body: &MirBody<'_>,
+    cache: &dyn Fn(StaticId) -> bool,
+) -> Option<MirSpan> {
     for (_, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };
-        let TerminatorKind::Call { func, destination, .. } = &terminator.kind else { continue };
+        let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind else {
+            continue;
+        };
         let Some((callee, _)) = fn_item(func) else { continue };
         let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
         if FunctionSignature::is_intrinsic(db, callee)
             && matches!(name.as_str(), "transmute" | "transmute_unchecked")
             && destination.projection.as_slice().is_empty()
             && matches!(body.locals[destination.local].ty.as_ref().kind(), TyKind::FnPtr(..))
+            && !args.first().is_some_and(|it| dispatch::loaded_from(db, body, it, cache))
         {
             return Some(terminator.span);
         }

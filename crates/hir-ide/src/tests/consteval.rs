@@ -25,6 +25,7 @@ use crate::{
     mir::{MirEvalError, MirLowerError},
 };
 
+mod const_traits;
 mod intrinsics;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {

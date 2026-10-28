@@ -4,13 +4,20 @@
     promote.py which '{"tag": ""}'
         the release promote.yaml tests: `tag`, or the newest dated release when it is empty;
         step outputs `tag`, `sha`, `prerelease`
-    promote.py promote '{"tag": "v0.YYYYMMDD.N", "run": "<run URL>"}'
+    promote.py promote '{"tag": "v0.YYYYMMDD.N", "run": "<run URL>", "bench": "<dir>"}'
         mark the release stable (not a prerelease) and Latest, unless a newer release is stable
-        already; append the line saying so to its notes
+        already; append the line saying so to its notes; the bench.py results under `bench`
+        (bench-<os>-<project>.json) become assets of it, what the next canary is compared with
     promote.py issue '{"tag": ..., "run": ..., "results": "<dir>", "needs": {<job>: {"result": ...}}}'
         open an issue for a canary that failed, or comment on the open one of that release: the
         jobs of `needs` (the workflow's) that failed, and each failed case of the smoke.py
         results files under `results`, with the command that repeats it
+    promote.py speed '{"tag": ..., "project": "zed", "os": ..., "bench": "<bench.py result>",
+                       "baseline": "<the stable's, or empty>", "threshold": 25, "out": "<file>"}'
+        the gate's speed check of an application: every phase of bench.py's result (cold,
+        no-op, each edit, tests) is faster with blaze than with cargo, nothing differs from
+        cargo's, and nothing is more than `threshold` percent worse than the stable release's
+        result (bench.py --compare); `out` is the verdict in smoke.py's results form
     promote.py pointer '{"channel": "canary", "tag": "v0.YYYYMMDD.N"}'
         the channel's pointer names the release (release.yaml, for canary)
 
@@ -20,13 +27,14 @@ version = "stable"`) reads it with one download. Made with the release `channels
 from what the releases are then.
 
 The JSON is inline, a file's path, or `-` for stdin. The same tag is flipped: nothing is built
-or uploaded again, so a version names the same bytes before and after. Needs gh (GH_TOKEN).
+again and no archive changes, so a version names the same bytes before and after. Needs gh (GH_TOKEN).
 Python 3.11+, stdlib.
 """
 import datetime, glob, json, os, re, subprocess, sys, tempfile, typing
 from dataclasses import dataclass, fields
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATED = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 
 
@@ -39,6 +47,7 @@ class Which:
 class Promote:
     tag: str
     run: str
+    bench: str = ""
 
 
 @dataclass(frozen=True)
@@ -55,7 +64,20 @@ class Pointer:
     tag: str
 
 
+@dataclass(frozen=True)
+class Speed:
+    tag: str
+    project: str
+    os: str
+    bench: str
+    out: str
+    baseline: str = ""
+    threshold: int = 25
+
+
 POINTERS = "channels"
+# bench.py counts no difference under 50 ms.
+FLOOR_SECS = 0.05
 
 
 def typed(cls, text):
@@ -123,7 +145,7 @@ def which(tag):
     output(tag=tag, sha=sha, prerelease=str(known[tag]["isPrerelease"]).lower())
 
 
-def promote(tag, run_url):
+def promote(tag, run_url, bench):
     known = releases()
     if not known.get(tag, {}).get("isPrerelease"):
         print(f"{tag} is stable already: nothing to do")
@@ -139,6 +161,8 @@ def promote(tag, run_url):
         line += f" {newest_stable} was stable already, so it stays Latest."
     gh("release", "edit", tag, "-R", REPO, "--prerelease=false", f"--latest={'true' if latest else 'false'}",
        "--notes-file", "-", input=f"{body}\n\n---\n\n{line}\n")
+    if numbers := sorted(glob.glob(os.path.join(bench, "**", "bench-*.json"), recursive=True)) if bench else []:
+        gh("release", "upload", tag, "-R", REPO, "--clobber", *numbers)
     if latest:
         pointer("stable", tag)
     print(line)
@@ -177,11 +201,14 @@ def issue(tag, run_url, results, needs):
         lines += ["Jobs that did not pass: " + ", ".join(f"`{j}`" for j in failed_jobs), ""]
     for path in sorted(glob.glob(os.path.join(results, "**", "*.json"), recursive=True)):
         data = json.load(open(path))
-        platform = os.path.splitext(os.path.basename(path))[0]
+        # bench.py's results sit beside smoke.py's: only these list their cases.
+        if not isinstance(data.get("results"), list):
+            continue
+        platform = os.path.splitext(os.path.relpath(path, results))[0]
         bad = [r for r in data["results"] if not r["ok"] and not r["open"]]
         if not bad:
             continue
-        lines += [f"### smoke corpus, {platform} ({data['blaze']})", ""]
+        lines += [f"### {platform} ({data['blaze']})", ""]
         for r in bad:
             lines += [f"**{r['what']}**: {r['why']}", "", f"Install it and repeat:", "", "```sh",
                       f"curl -fsSL https://ix.dev/blaze | sh -s -- --version {tag.lstrip('v')}", r["repro"], "```", ""]
@@ -199,6 +226,58 @@ def issue(tag, run_url, results, needs):
         print(gh("issue", "create", "-R", REPO, "--title", title, "--label", "bug", "--body-file", "-", input=body).strip())
 
 
+def speed(it):
+    """The speed check of `it.project` from bench.py's result, written to `it.out` as smoke.py
+    writes its results; exits 1 when it failed."""
+    data = json.load(open(it.bench))
+    repro = (f"BLAZE_BIN=\"$(dirname \"$(command -v blaze)\")/blaze-engine\" "
+             f"python3 harness/bench.py {it.project} --backend cranelift --runs 1 --cold-runs 1 --tests")
+    checks = []
+
+    def check(what, why, seconds=0):
+        checks.append(dict(what=f"{it.project} {what}", ok=why is None, open=None, seconds=seconds, why=why,
+                           repro=repro, stdout="", stderr=""))
+
+    for key, measured in data["results"].items():
+        if measured.get("failed"):
+            check("bench", f"{key}: {measured['failed'][-3000:]}")
+        for line in measured.get("wrong", []):
+            check("bench", f"{key}: blaze's build does otherwise than cargo's: {line}")
+        for label, phase in measured["phases"].items():
+            pairs = [("", phase.get("wall_s"), phase.get("cargo_s"))]
+            if "edit_s" in phase:
+                pairs.append((" after an edit", phase["edit_s"], phase.get("edit_cargo_s")))
+            for said, ours, theirs in pairs:
+                if ours is None or theirs is None:
+                    continue
+                slower = ours > theirs and ours - theirs > FLOOR_SECS
+                check(f"{label}{said}: blaze {ours:.2f} s, cargo {theirs:.2f} s",
+                      f"blaze is slower than cargo ({ours:.2f} s against {theirs:.2f} s)" if slower else None, ours)
+    if not data["results"]:
+        check("bench", "bench.py measured nothing")
+    if it.baseline and os.path.exists(it.baseline):
+        compared = subprocess.run([sys.executable, os.path.join(ROOT, "harness", "bench.py"), "--compare", it.baseline,
+                                   it.bench, "--threshold", str(it.threshold)], capture_output=True, text=True)
+        worse = [line for line in compared.stdout.splitlines() if line.strip()] if compared.returncode else []
+        if compared.returncode and not worse:
+            worse = [compared.stderr.strip()[-3000:] or f"bench.py --compare exited {compared.returncode}"]
+        stable = json.load(open(it.baseline)).get("commit") or "the stable release"
+        check(f"against stable ({it.threshold}%)", "; ".join(f"worse than stable ({stable}): {w}" for w in worse) or None)
+    else:
+        print(f"{it.project}: no result of the stable release to compare with (its first gate with this check)")
+    with open(it.out, "w") as f:
+        json.dump(dict(blaze=f"{it.tag} speed, {it.os}", results=checks), f, indent=1)
+    failed = [c for c in checks if not c["ok"]]
+    lines = [f"### {it.project} speed ({it.os})", "", "| | what |", "|---|---|"]
+    lines += [f"| {'ok' if c['ok'] else '**FAILED**'} | {c['what']} |" for c in checks]
+    lines += [f"\n**{c['what']}**: {c['why']}" for c in failed]
+    print("\n".join(lines))
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+    sys.exit(1 if failed else 0)
+
+
 def main():
     args = sys.argv[1:]
     step, given = (args + [""])[:2] if len(args) <= 2 else ("", "")
@@ -206,10 +285,12 @@ def main():
         which(typed(Which, given).tag)
     elif step == "promote":
         it = typed(Promote, given)
-        promote(it.tag, it.run)
+        promote(it.tag, it.run, it.bench)
     elif step == "issue":
         it = typed(Issue, given)
         issue(it.tag, it.run, it.results, it.needs)
+    elif step == "speed":
+        speed(typed(Speed, given))
     elif step == "pointer":
         it = typed(Pointer, given)
         pointer(it.channel, it.tag)

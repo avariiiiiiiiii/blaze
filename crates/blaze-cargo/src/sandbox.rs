@@ -437,12 +437,14 @@ fn under(path: &str, dir: &str) -> bool {
     path.strip_prefix(dir).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// `blaze sandbox SPEC -- PROGRAM ARGS...`, or `blaze sandbox --probe`: runs the program and
-/// ends as it ended. Runs before anything else in the process, which is one thread: it forks.
+/// `blaze sandbox SPEC -- PROGRAM ARGS...`, or `blaze sandbox --probe [--overlays]`: runs the
+/// program and ends as it ended. Runs before anything else in the process, which is one
+/// thread: it forks.
 pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
     let first = args.next();
     if first.as_deref() == Some("--probe".as_ref()) {
-        std::process::exit(match probe() {
+        let overlays = args.next().is_some_and(|it| it == "--overlays");
+        std::process::exit(match probe(overlays) {
             Ok(()) => 0,
             Err(why) => {
                 eprintln!("{why}");
@@ -489,11 +491,13 @@ fn backend(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     }
 }
 
-/// Whether programs can be run in a sandbox here, and why not when they can't: the probe
-/// makes one around nothing, in a process of its own, once per process that asks.
-pub fn available() -> Result<(), String> {
-    static AVAILABLE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    AVAILABLE
+/// Whether programs can be run in a sandbox here, with `overlays` (as tests are) or without
+/// (as build scripts are), and why not when they can't: the probe makes one around nothing, in
+/// a process of its own, once per process that asks.
+pub fn available(overlays: bool) -> Result<(), String> {
+    static AVAILABLE: [std::sync::OnceLock<Result<(), String>>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    AVAILABLE[usize::from(overlays)]
         .get_or_init(|| {
             if !cfg!(any(target_os = "linux", target_os = "macos")) {
                 return Err(format!("there is no sandbox on {} yet", std::env::consts::OS));
@@ -501,6 +505,7 @@ pub fn available() -> Result<(), String> {
             let exe = std::env::current_exe().map_err(|it| format!("blaze is not found ({it})"))?;
             let out = std::process::Command::new(exe)
                 .args([COMMAND, "--probe"])
+                .args(overlays.then_some("--overlays"))
                 .stdin(std::process::Stdio::null())
                 .output()
                 .map_err(|it| format!("the probe did not run ({it})"))?;
@@ -512,12 +517,15 @@ pub fn available() -> Result<(), String> {
         .clone()
 }
 
-/// Makes a sandbox around nothing: `Ok` when it could be made, why not otherwise, with what
-/// would let it be where that is known.
-fn probe() -> Result<(), String> {
+/// Makes a sandbox around nothing, with an overlay or a writable directory: `Ok` when it could
+/// be made, why not otherwise, with what would let it be where that is known.
+fn probe(overlays: bool) -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!("blaze-sandbox-probe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
-    let spec = Spec { cwd: dir.clone(), overlays: vec![dir.clone()], ..Spec::default() };
+    let spec = match overlays {
+        true => Spec { cwd: dir.clone(), overlays: vec![dir.clone()], ..Spec::default() },
+        false => Spec { cwd: dir.clone(), writable: vec![dir.clone()], ..Spec::default() },
+    };
     let ended = backend(&spec, None);
     _ = std::fs::remove_dir_all(&dir);
     let restricted =

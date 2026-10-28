@@ -41,6 +41,12 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 ### Fixed
 
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
+- Build scripts run on a stock Ubuntu 23.10 or later, where AppArmor keeps a user from making a
+  user namespace: every crate with a build script failed with `the sandbox could not be made:
+  /proc/self/setgroups: Permission denied`. Where no user namespace can be made, the sandbox is
+  confined with Landlock and the seccomp supervisor instead: writes only to `OUT_DIR` and a
+  `TMPDIR` of its own, no network, signals only to its own processes, reads recorded as before
+  (docs/cargo.md says what it does not hide). Sandboxed tests still need user namespaces.
 
 ## [0.20261028.2] - 2026-10-28
 

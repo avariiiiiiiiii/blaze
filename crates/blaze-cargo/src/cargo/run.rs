@@ -200,7 +200,7 @@ pub fn tests(
     let sandboxing = sandboxed::on();
     if sandboxing
         && opt_outs.values().any(sandboxed::OptOut::sandboxed)
-        && let Err(why) = crate::sandbox::available()
+        && let Err(why) = crate::sandbox::available(true)
     {
         say::error(&format!("the tests run in a sandbox, which can't be made here: {why}"));
         say::note(&format!(

@@ -255,8 +255,9 @@ asked for. `/run` starts empty too, but for the links at its top (NixOS's `PATH`
 `/run/current-system`), and so does the Nix daemon's socket directory: a network namespace
 hides abstract sockets but not the machine's Unix sockets (the Docker, D-Bus, systemd, Nix
 daemon and agents' sockets of `/run` and `/run/user/$UID`), which would let a test have a daemon
-outside do what it may not. It needs namespaces a user can make; Ubuntu's AppArmor stops them
-unless `kernel.apparmor_restrict_unprivileged_userns` is 0, which the error says. A filter is
+outside do what it may not. Its overlays need namespaces a user can make; Ubuntu's AppArmor
+stops them unless `kernel.apparmor_restrict_unprivileged_userns` is 0, which the error says
+(a build script, which has no overlays, is confined with Landlock there instead). A filter is
 installed on every run. It refuses `TIOCSTI` and `TIOCLINUX` (`EPERM`); `io_uring_setup`
 (`ENOSYS`, as a kernel built without it answers and as Docker's default profile refuses it:
 seccomp never sees an `io_uring` operation, so a ring would read, write and connect past the
@@ -425,18 +426,27 @@ run does, and a proc-macro server does not start and the load says why: nothing 
 outside instead, nor goes to cargo or rustc. Windows has no sandbox yet, so there a build with
 build scripts or proc macros needs `BLAZE_SANDBOX=off`.
 
-In a container the sandbox's user namespace may be refused: Docker's default seccomp profile
-refuses `unshare(CLONE_NEWUSER)` to a process without `CAP_SYS_ADMIN`, so in a plain `docker
-run` every build script and proc macro fails with
-`a user namespace (unshare): Operation not permitted`
-([#420](https://github.com/indexable-inc/blaze/issues/420)). Where the process can tell it is
-in a container (`/.dockerenv`, `/run/.containerenv`, the `container` variable, or
-`/proc/1/cgroup` naming docker, kubepods, containerd, libpod or lxc), the error says so and
-names the ways on: run the container with `--security-opt seccomp=unconfined` (or a seccomp
-profile that allows user namespaces; on Kubernetes `securityContext.seccompProfile.type:
-Unconfined`), which keeps the sandbox, or set `BLAZE_SANDBOX=off`, which runs build scripts,
-proc macros and tests outside it, as cargo does. blaze does not make a weaker sandbox there on
-its own.
+Where a user may not make a user namespace, a build script's sandbox is confined with Landlock
+instead (Linux 5.13 on). Ubuntu 23.10 on keeps users from them through AppArmor
+(`kernel.apparmor_restrict_unprivileged_userns=1`: `/proc/self/setgroups: Permission
+denied`), and Docker's default seccomp profile refuses `unshare(CLONE_NEWUSER)` to a process
+without `CAP_SYS_ADMIN` ([#420](https://github.com/indexable-inc/blaze/issues/420)). What a
+build script is promised holds the same: it writes only its `OUT_DIR` (and the per-user cache
+on macOS), reaches no network, sees exactly the environment cargo gave it, and what it read is
+recorded. Landlock refuses every write outside the writable directories, a `TMPDIR` of the
+run's own and the terminal and null devices, and every TCP `bind` and `connect`; the seccomp
+supervisor refuses every address a call names that is not a Unix socket of the sandbox's own
+(the loopback and the abstract sockets are the machine's there) and every signal to a process
+that is not the sandbox's; the sandbox's first process reaps what the program leaves and kills
+it as the program ends. What namespaces hide and this does not: the machine's `/tmp`, `/run`
+and processes are seen (read-only), and SysV IPC and a file's mode, owner and times are not
+refused. A sandboxed test's overlays need a mount namespace, so a workspace that opted into
+sandboxed tests still needs user namespaces: where they can't be made, its tests fail saying
+so, with the ways on (`sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, an
+AppArmor profile that allows `userns` for blaze; in a container `--security-opt
+seccomp=unconfined`, or on Kubernetes `securityContext.seccompProfile.type: Unconfined`) or
+`BLAZE_SANDBOX=off`, which runs them outside, as cargo does. Where neither namespaces nor
+Landlock can be had, a build script fails the same way, naming both.
 
 A sandbox can be given a view (`sandbox::View`, the spec's `view`) in place of the machine,
 which is what a build script is to see under the Nix model (Andrew, 2026-10-27): its declared

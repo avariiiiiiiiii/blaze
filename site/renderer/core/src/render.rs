@@ -268,7 +268,7 @@ fn status(e: &Entity) -> String {
 const REFERENCES: &str = "<!--references-->";
 
 /// The tags that render through a widget (render/widgets.ts), in the order the TS object lists them.
-const WIDGETS: [&str; 4] = ["RfcIndex", "References", "SignupForm", "BenchHistory"];
+const WIDGETS: [&str; 5] = ["RfcIndex", "References", "SignupForm", "BenchHistory", "Course"];
 
 const SIGNUP_FORM: &str = r#"<form method="POST" class="signup">
 <input type="hidden" name="ref" value="" />
@@ -324,6 +324,7 @@ fn widget(tag: &str, n: Id, ctx: &mut Ctx) -> Result<String, String> {
                 _ => Err(format!("{}: not baked (run the build)", ctx.e(n).path)),
             }
         }
+        "Course" => course(n, ctx),
         _ => unreachable!("WIDGETS lists the tags"),
     }
 }
@@ -458,6 +459,56 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
             a.thread
         ));
     }
+    if let Some(v) = e.value("Step") {
+        // One screen of a lesson: stacked under each other without JS, one at a time with it (client/learn.ts).
+        let title = field(Some(v), "title");
+        let id = esc(&ctx.block_id(n));
+        let a = anchor(n, ctx, &title)?;
+        let path = ctx.e(n).path.clone();
+        let t = ctx.inline(&title, &path)?;
+        let kids = children(n, ctx)?;
+        return Ok(format!(
+            "<section id=\"{id}\" class=\"step\"{}><h2>{t}</h2>\n{kids}\n</section>",
+            a.attr
+        ));
+    }
+    if e.has("Quiz") {
+        return quiz(n, ctx);
+    }
+    if let Some(v) = e.value("Tap") {
+        // Tap the parts of a diagram: client/learn.ts draws the piece with its parts as buttons and checks the picks
+        // against `right`. Without JS the answer is in the fold.
+        let [prompt, piece, right, hint, why] =
+            ["prompt", "piece", "right", "hint", "why"].map(|f| field(Some(v), f));
+        let path = ctx.e(n).path.clone();
+        if piece.is_empty() || right.split(',').all(|r| r.trim().is_empty()) {
+            return Err(format!("{path}: a Tap needs a piece and the parts that are right"));
+        }
+        let id = esc(&ctx.block_id(n));
+        let a = anchor(n, ctx, &prompt)?;
+        let p = ctx.inline(&prose(&prompt), &path)?;
+        let hint = ctx.inline(&prose(&hint), &path)?;
+        let why = ctx.inline(&prose(&why), &path)?;
+        let right: Vec<&str> = right.split(',').map(str::trim).filter(|r| !r.is_empty()).collect();
+        ctx.script("learn");
+        return Ok(format!(
+            "<div class=\"quiz tap\" id=\"{id}\" data-quiz=\"{id}\" data-right=\"{}\"{}><p class=\"prompt\">{p}</p><div class=\"diagram\" data-figure=\"{}\" data-pick=\"\"></div><p class=\"hint\">{hint}</p><details class=\"answer\"><summary>Show the answer</summary><p>{why}</p></details></div>",
+            esc(&right.join(",")),
+            a.attr,
+            esc(&piece)
+        ));
+    }
+    if let Some(v) = e.value("Figure") {
+        // A diagram client/learn.ts draws and the reader can touch; without JS its label says what it would show.
+        let (piece, label) = (esc(&field(Some(v), "piece")), field(Some(v), "label"));
+        let path = ctx.e(n).path.clone();
+        let l = ctx.inline(&prose(&label), &path)?;
+        ctx.script("learn");
+        return Ok(format!(
+            "<figure class=\"diagram\" data-figure=\"{piece}\"{}><figcaption>{l}</figcaption></figure>",
+            ctx.say_attr(n)
+        ));
+    }
     if e.has_tag("Ul") || e.has_tag("Ol") {
         let t = if e.has_tag("Ul") { "ul" } else { "ol" };
         return Ok(format!("<{t}>\n{}\n</{t}>", children(n, ctx)?));
@@ -472,6 +523,104 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         e.values.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")
     };
     Err(format!("{}: no element type (tags {tags}; components {comps})", e.path))
+}
+
+/// A multiple-choice question: the prompt, the choices (each with its one-line why, which client/learn.ts shows once
+/// the reader picks it), and the right one with its why in a fold for a reader without JS.
+fn quiz(n: Id, ctx: &mut Ctx) -> Result<String, String> {
+    let path = ctx.e(n).path.clone();
+    let prompt = field(ctx.e(n).value("Quiz"), "prompt");
+    let id = esc(&ctx.block_id(n));
+    let a = anchor(n, ctx, &prompt)?;
+    let p = ctx.inline(&prose(&prompt), &path)?;
+    let (mut items, mut answer, mut count) = (String::new(), None, 0);
+    for c in ctx.e(n).children.clone() {
+        let ce = ctx.e(c);
+        let (cpath, right) = (ce.path.clone(), ce.has_tag("Right"));
+        let Some(v) = ce.value("Choice") else {
+            return Err(format!("{cpath}: a Quiz's children are Choices"));
+        };
+        let (text, why) = (field(Some(v), "text"), field(Some(v), "why"));
+        let (t, w) = (ctx.inline(&prose(&text), &cpath)?, ctx.inline(&prose(&why), &cpath)?);
+        if right {
+            if answer.is_some() {
+                return Err(format!("{path}: a Quiz has one Right Choice"));
+            }
+            answer = Some(format!("<strong>{t}</strong> {w}"));
+        }
+        count += 1;
+        items += &format!(
+            "<li class=\"choice\"{}><span class=\"text\">{t}</span><span class=\"why\">{w}</span></li>",
+            if right { " data-right=\"\"" } else { "" }
+        );
+    }
+    let answer = answer.ok_or_else(|| format!("{path}: a Quiz needs a Right Choice"))?;
+    if count < 2 {
+        return Err(format!("{path}: a Quiz needs two Choices or more"));
+    }
+    ctx.script("learn");
+    Ok(format!(
+        "<div class=\"quiz\" id=\"{id}\" data-quiz=\"{id}\"{}><p class=\"prompt\">{p}</p><ol class=\"choices\">{items}</ol><details class=\"answer\"><summary>Show the answer</summary><p>{answer}</p></details></div>",
+        a.attr
+    ))
+}
+
+/// A lesson's steps, and the ids of its questions (Quiz and Tap blocks, as their path under the page): what the
+/// course map counts and client/learn.ts keeps answers under.
+pub fn lesson_parts(world: &World, lesson: Id) -> (usize, Vec<String>) {
+    fn walk(world: &World, n: Id, base: usize, out: &mut Vec<String>) {
+        for &c in &world.get(n).children {
+            let e = world.get(c);
+            if e.has("Quiz") || e.has("Tap") {
+                out.push(e.path[base..].to_string());
+            } else if !is_page(e) {
+                walk(world, c, base, out);
+            }
+        }
+    }
+    let e = world.get(lesson);
+    let steps = e.children.iter().filter(|&&c| world.get(c).has("Step")).count();
+    let mut quizzes = Vec::new();
+    walk(world, lesson, e.path.len() + 1, &mut quizzes);
+    (steps, quizzes)
+}
+
+/// The course map: each lesson under the page as a node on a path, numbered, with its line, steps and minutes. It is
+/// a list of links without JS; client/learn.ts lights each node with the reader's progress and adds the mastery meter.
+fn course(n: Id, ctx: &mut Ctx) -> Result<String, String> {
+    let source = ctx.s.world.course_source(n)?;
+    let lessons = ctx.s.world.lessons(source);
+    let first = lessons
+        .first()
+        .and_then(|&l| ctx.s.page_of(l))
+        .ok_or_else(|| format!("{}: a Course with no lessons", ctx.e(n).path))?;
+    // The way in: the first lesson without JS; client/learn.ts points it at the reader's next one.
+    let go = format!(
+        "<p class=\"course-go\"><a class=\"go\" href=\"{}\"><span class=\"k\">Start lesson 1</span><span class=\"t\">{}</span></a></p>",
+        esc(&ctx.s.served.href(&first.url)),
+        esc(&text(ctx.e(first.node), "Title"))
+    );
+    let mut items = String::new();
+    for (i, c) in lessons.into_iter().enumerate() {
+        let e = ctx.e(c);
+        let p =
+            ctx.s.page_of(c).ok_or_else(|| format!("{}: a Lesson that is not a page", e.path))?;
+        let (steps, quizzes) = lesson_parts(ctx.s.world, c);
+        // About 20 seconds a step: a short paragraph, or a question.
+        let minutes = (steps * 20).div_ceil(60).max(1);
+        let line = prose(&field(e.value("Lesson"), "line"));
+        items += &format!(
+            "<li class=\"node\" data-lesson=\"{}\" data-steps=\"{steps}\" data-quizzes=\"{}\"><a href=\"{}\"><span class=\"n\" aria-hidden=\"true\">{}</span><span class=\"body\"><span class=\"t\">{}</span><span class=\"l\">{}</span><span class=\"m\">{steps} steps · {minutes} min</span></span></a></li>",
+            esc(&e.name),
+            esc(&quizzes.join(" ")),
+            esc(&ctx.s.served.href(&p.url)),
+            i + 1,
+            esc(&text(e, "Title")),
+            esc(&line),
+        );
+    }
+    ctx.script("learn");
+    Ok(format!("{go}<ol class=\"course\">{items}</ol>"))
 }
 
 /// Every child of the table is a row and every child of a row a cell, comments included, as the TS has it.
@@ -569,6 +718,54 @@ fn meta(ctx: &Ctx) -> Result<String, String> {
     })
 }
 
+/// On a lesson page, what client/learn.ts needs on `<main>`: the lesson's name (its key in the reader's progress),
+/// its number, its line, its questions, and where the course map and the next lesson are.
+fn lesson_attrs(ctx: &mut Ctx) -> Result<(&'static str, String), String> {
+    let e = ctx.e(ctx.page.node);
+    let Some(v) = e.value("Lesson") else { return Ok(("", String::new())) };
+    let line = prose(&field(Some(v), "line"));
+    let name = e.name.clone();
+    let parent = e.parent.ok_or("a Lesson has no parent")?;
+    // The course map is on the page whose Course widget lists this lesson's siblings (the home page).
+    let course = ctx
+        .s
+        .pages
+        .iter()
+        .find(|p| {
+            ctx.s
+                .world
+                .course_in(p.node)
+                .is_some_and(|c| ctx.s.world.course_source(c) == Ok(parent))
+        })
+        .ok_or_else(|| format!("{}: no page's Course lists this lesson", e.path))?;
+    let lessons = ctx.s.world.lessons(parent);
+    let at = lessons
+        .iter()
+        .position(|&l| l == ctx.page.node)
+        .expect("the page is one of its parent's lessons");
+    let next = match lessons.get(at + 1).and_then(|&l| ctx.s.page_of(l)) {
+        Some(p) => format!(
+            " data-next=\"{}\" data-next-title=\"{}\"",
+            esc(&ctx.s.served.href(&p.url)),
+            esc(&text(ctx.e(p.node), "Title"))
+        ),
+        None => String::new(),
+    };
+    let (_, quizzes) = lesson_parts(ctx.s.world, ctx.page.node);
+    ctx.script("learn");
+    Ok((
+        " lesson",
+        format!(
+            " data-lesson=\"{}\" data-n=\"{}\" data-line=\"{}\" data-quizzes=\"{}\" data-course=\"{}\"{next}",
+            esc(&name),
+            at + 1,
+            esc(&line),
+            esc(&quizzes.join(" ")),
+            esc(&ctx.s.served.href(&course.url)),
+        ),
+    ))
+}
+
 /// One page. On a discussable page, comment entities under its blocks are drawn as threads, for `discussion`'s
 /// viewer. Returns the HTML and, for a discussable page, its blocks.
 pub fn render(
@@ -603,6 +800,7 @@ pub fn render(
         return Err(format!("{}: a page needs a Title", n.path));
     }
     let mut body = children(page.node, &mut ctx)?;
+    let (lesson_class, lesson_attr) = lesson_attrs(&mut ctx)?;
     let refs = references_html(&ctx);
     body = if body.contains(REFERENCES) {
         js::replace_first(&body, REFERENCES, &refs)
@@ -743,7 +941,7 @@ pub fn render(
 <div class=\"pane\">
 {}
 <div class=\"grid{width}\">
-<main class=\"doc{width}\"{doc_attr}>
+<main class=\"doc{width}{lesson_class}\"{doc_attr}{lesson_attr}>
 {head}
 {body}
 {}

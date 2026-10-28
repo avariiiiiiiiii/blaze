@@ -4,9 +4,9 @@ site {
   bench : Page {
     Wide
     Title: {"Benchmark history"}
-    Nav: {"Benchmark history", 1}
+    Nav: {"Benchmarks", 5}
     Icon: {"chart"}
-    (InGroup, nav.bench)
+    (InGroup, nav.reference)
     Description: {"blaze's build and live-edit benchmarks over every run, next to plain cargo on the same machine."}
     Intro: {"[calm] This is blaze's benchmark history: every measured run, next to plain cargo."}
     Outro: {"[warm] The charts and tables are on the page; pick a project and a platform to see its runs. Thanks for listening."}

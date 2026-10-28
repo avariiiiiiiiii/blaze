@@ -8,14 +8,15 @@
  *   /updates   the signup form (updates.ts)
  *   /charter, /rfcs/*   discussable pages, rendered with their comments (pages.ts); other paths there are assets
  *   /audio/*   narration files, from R2 when bound, with Range support (audio.ts)
- *   /          the home page, or install.sh for a client that doesn't ask for HTML (curl, wget)
+ *   /          the home page (the course), or install.sh for a client that doesn't ask for HTML (curl, wget)
+ *   /learn     a 301 to /: the course map is the home page; the lessons stay at /learn/<slug>
  *
  * Anything else is dist/ (built by `bun gen/build.ts`) through the ASSETS binding, with the headers `assetHeaders`
  * adds (Workers does not apply a `_headers` file to what a worker returns).
  */
 import { handleAudio } from './audio';
 import { handleAuth } from './auth';
-import { enter } from './base';
+import { enter, outer } from './base';
 import { handleComments } from './comments';
 import type { Env } from './env';
 import { assetHeaders, json, plain } from './http';
@@ -30,6 +31,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 	if (p === '/api/comments' || p.startsWith('/api/comments/')) return handleComments(request, env, url);
 	if (p.startsWith('/api/')) return json({ error: 'Not found.' }, 404);
 	if (p.startsWith('/audio/')) return handleAudio(request, env, url);
+	if (p === '/learn' || p === '/learn/') return new Response(null, { status: 301, headers: { location: `${outer('/')}${url.search}`, 'cache-control': 'public, max-age=3600' } });
 	if (p === '/' && !acceptsHtml(request)) return installer(request, env, url);
 	const res = (await handlePage(request, env, ctx, url)) ?? assetHeaders(await env.ASSETS.fetch(request));
 	if (p === '/') res.headers.append('vary', 'Accept');

@@ -34,7 +34,9 @@ impl Trace {
         let (_, first) = lines.next().ok_or("a trace with no config line")?;
         let config = serde_json::from_str(first).map_err(|why| format!("line 1: {why}"))?;
         let inputs = lines
-            .map(|(at, line)| serde_json::from_str(line).map_err(|why| format!("line {}: {why}", at + 1)))
+            .map(|(at, line)| {
+                serde_json::from_str(line).map_err(|why| format!("line {}: {why}", at + 1))
+            })
             .collect::<Result<_, _>>()?;
         Ok(Trace { config, inputs })
     }

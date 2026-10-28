@@ -85,32 +85,32 @@ fn a_diamond_runs_each_node_after_what_it_waits_for() {
     all.extend(machine.step(done(30, 2, Outcome::Built)).unwrap());
     all.extend(machine.step(done(40, 4, Outcome::Built)).unwrap());
     expect![[r#"
-                0 node #1 Manifest n1 deps []
-                0 #1 Ready
-                0 node #2 Names n2 deps [1]
-                0 #2 Waiting
-                0 node #3 Names n3 deps [1]
-                0 #3 Waiting
-                0 node #4 Link n4 deps [2, 3]
-                0 #4 Waiting
-                0 #1 Running
-                  run #1 on Io
-               10 #1 Built
-               10 #2 Ready
-               10 #3 Ready
-               10 #2 Running
-                  run #2 on Work
-               10 #3 Running
-                  run #3 on Work
-               20 #3 Cached { remote: true }
-               30 #2 Built
-               30 #4 Ready
-               30 #4 Running
-                  run #4 on Io
-               40 #4 Built
-               40 critical [1, 2, 4]
-                  finished ok=true
-        "#]]
+        0 node #1 Manifest n1 deps []
+        0 #1 Ready
+        0 node #2 Names n2 deps [1]
+        0 #2 Waiting
+        0 node #3 Names n3 deps [1]
+        0 #3 Waiting
+        0 node #4 Link n4 deps [2, 3]
+        0 #4 Waiting
+        0 #1 Running
+          run #1 on Io
+        10 #1 Built
+        10 #2 Ready
+        10 #3 Ready
+        10 #2 Running
+          run #2 on Work
+        10 #3 Running
+          run #3 on Work
+        20 #3 Cached { remote: true }
+        30 #2 Built
+        30 #4 Ready
+        30 #4 Running
+          run #4 on Io
+        40 #4 Built
+        40 critical [1, 2, 4]
+          finished ok=true
+    "#]]
     .assert_eq(&render(&all));
     assert!(machine.is_over());
 }

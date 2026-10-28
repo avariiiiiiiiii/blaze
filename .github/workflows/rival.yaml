@@ -10,11 +10,15 @@ on:
   schedule:
     - cron: "41 6 * * *"
   workflow_dispatch:
+    inputs:
+      ours:
+        description: "The ref measured as our blaze (a PR's branch, for its before/after against main's run)"
+        default: ""
   pull_request:
     paths: ["harness/rival.py", ".github/workflows/rival.yaml"]
 
 concurrency:
-  group: rival-${{ github.ref }}
+  group: rival-${{ github.ref }}-${{ inputs.ours }}
   cancel-in-progress: true
 
 permissions:
@@ -36,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.base.sha) || github.sha }}
           path: ours
           persist-credentials: false
       - uses: actions/checkout@v7

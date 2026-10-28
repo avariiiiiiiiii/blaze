@@ -179,6 +179,7 @@ body.chat-open .toc { display: none; }
 	.hero { padding-top: 28px; }
 	.pager { flex-direction: column; }
 	.doc .pager a { max-width: none; }
+	.pager .next { margin-left: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
 	.side, .sechead .chev, .fold > .caret .icon, .navlist .glide-hov { transition: none; }
@@ -277,6 +278,7 @@ main .discussion { scroll-margin-top: 64px; }
 	.mbar .tl-btn { height: 32px; padding: 0 9px; }
 	.mbar .tl-label, .mbar .tl-count, .mbar .tl-quiet, .mbar .tl-user > span:last-child { display: none; }
 	.mbar .tl-n { margin: 0; }
+	.mbar .tl-side { display: none; } /* The sidebar is the menu's drawer here. */
 	.mbar .tl-here .faces .face:nth-child(n + 3) { display: none; }
 	.mbar .tl-list { position: fixed; top: 52px; right: 8px; }
 }

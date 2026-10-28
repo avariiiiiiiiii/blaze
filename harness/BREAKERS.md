@@ -34,7 +34,7 @@ generic-array, in one cause, and 2 of tokio's with `--features full`.
 ## On stable 1.99
 
 The sweep again with `rustc 1.99.0` and the collated branch (`f296858ee3` plus the three fixes
-below), one run, Cranelift: `RA_JIT_BIN=.. CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out99
+below), one run, Cranelift: `BLAZE_BIN=.. CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out99
 $(versions)`, then `sweepreport.py ~/sweep/out99`.
 
 | | result |
@@ -66,7 +66,7 @@ all matching, and no function left to rustc (296,088 of 296,088, counting a func
   crates.io and runs `harness/cratetest.py` on it, which builds every test binary of the
   crate with cargo, builds it again with ra-jit's object linked in front, runs both and
   compares the result of every test by name. `sweepreport.py <out>` adds up the JSON files.
-  The final run: `RA_JIT_BIN=~/sweep/ra-jit-30 CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out15
+  The final run: `BLAZE_BIN=~/sweep/ra-jit-30 CLEAN=1 JOBS=4 harness/cratesweep.sh ~/sweep/out15
   $(cat ~/sweep/versions.txt)`, 60 minutes of wall time including base64's 1800 s timeout
   (`stat` of the log's birth and last write), with `breakers.py` just before it and nothing
   else on the machine.
@@ -115,7 +115,7 @@ already in `harness/corpus` (661 functions) and came up again only through the c
 | bat | 10 of 10 | 321 of 321 | 5806 |
 | tokei | 8 of 8 | 141 of 141 | 4870 |
 
-`RA_JIT_BIN=~/sweep/ra-jit-30 harness/bintest.py <name> --json ~/sweep/bins30/<name>.json` for
+`BLAZE_BIN=~/sweep/ra-jit-30 harness/bintest.py <name> --json ~/sweep/bins30/<name>.json` for
 each (`~/sweep/bins30.log`); the function counts and times are the sums of `compiled`,
 `roots` and `codegen_ms` over the crates in that JSON. The counts are higher than with
 ra-jit-14 (fd 143, just 553, ripgrep 1742, ...) because the second pass stopped taking generic
@@ -197,7 +197,7 @@ Open. 15 functions in one crate in the sweep, and 2 in tokio with `full` (above)
 | static_assertions | has no functions and no tests that run | sweep log: 1 test binary, 0 tests |
 | base64 (unit tests only) | did not finish in the 1800 s the sweep allows; its integration tests are the same (107 of 107 functions) | see below |
 
-tokio with `--features full` (`RA_JIT_BIN=~/sweep/ra-jit-30 cratetest.py harness/vendor/tokio
+tokio with `--features full` (`BLAZE_BIN=~/sweep/ra-jit-30 cratetest.py harness/vendor/tokio
 --features full --json ~/sweep/tokio-full30.json`, one run, after the sweep): MATCH, 155 test
 binaries, 1018 tests, none differing (8 differed with ra-jit-14, all on the size of a future),
 3271 of 3273 functions from ra-jit (`sweepreport.py` on that JSON). The 2 functions left are

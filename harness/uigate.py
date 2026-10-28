@@ -3,7 +3,7 @@
 ones named in `ui-known.txt` (one test per line, `#` for why), which differ in a way that is
 understood. A test that is listed and now matches is said too, so the list shrinks. A test
 followed by backends (`panics/x.rs llvm  # why`) is known on those alone, the one
-`RA_JIT_BACKEND` names.
+`BLAZE_BACKEND` names.
 
 usage: uigate.py results.json
 """
@@ -18,7 +18,7 @@ KNOWN = Path(__file__).with_name("ui-known.txt")
 
 def main() -> None:
     results = json.load(open(sys.argv[1]))
-    backend = os.environ.get("RA_JIT_BACKEND", "cranelift")
+    backend = os.environ.get("BLAZE_BACKEND", "cranelift")
     entries = [line.split("#")[0].split() for line in KNOWN.read_text().splitlines()]
     known = {test for test, *on in filter(None, entries) if not on or backend in on}
     counts = collections.Counter(r["outcome"] for r in results)

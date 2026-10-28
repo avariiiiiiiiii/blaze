@@ -15,7 +15,7 @@ import json, os, re, shlex, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-os.environ["RA_JIT_STATS"] = "1"
+os.environ["BLAZE_STATS"] = "1"
 import linkline
 from difftest import Fixture, RA_JIT, sysroot_rlibs
 

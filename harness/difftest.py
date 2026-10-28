@@ -6,8 +6,8 @@ usage: difftest.py <workspace> --bin <package> --crate <name> [--crate <name> ..
 Exit code 0 when stdout, stderr and exit status match. With --bisect, each ra-jit function is
 also linked in on its own to name the ones that change behaviour.
 
-RA_JIT_TARGET=wasm32-wasip1 builds both sides for that target and runs them under wasmtime
-(RA_JIT_WASM_RUNNER names another runner); the other harnesses take it the same way. See
+BLAZE_TARGET=wasm32-wasip1 builds both sides for that target and runs them under wasmtime
+(BLAZE_WASM_RUNNER names another runner); the other harnesses take it the same way. See
 WASM32.md.
 """
 import re
@@ -30,17 +30,17 @@ os.environ["RUST_BACKTRACE"] = "0"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # A sweep runs against a copy, so rebuilding ra-jit meanwhile does not change it under the sweep.
 WINDOWS = os.name == "nt"
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit" + (".exe" if WINDOWS else ""))
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit" + (".exe" if WINDOWS else ""))
 
 
 def host():
     return subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
 
 
-# RA_JIT_TARGET names the triple to build for when it is not the host. Cargo builds for it, ra-jit
-# emits for it, and the binaries run under what RA_JIT_RUNNER names (for aarch64 Linux on another
+# BLAZE_TARGET names the triple to build for when it is not the host. Cargo builds for it, ra-jit
+# emits for it, and the binaries run under what BLAZE_RUNNER names (for aarch64 Linux on another
 # machine, qemu's user mode with the sysroot the cross linker links against).
-TARGET = os.environ.get("RA_JIT_TARGET") or None
+TARGET = os.environ.get("BLAZE_TARGET") or None
 CROSS = {
     "aarch64-unknown-linux-gnu": {"linker": "aarch64-linux-gnu-gcc", "runner": "qemu-aarch64 -L /usr/aarch64-linux-gnu",
                                   "binutils": "aarch64-linux-gnu-"},
@@ -50,15 +50,15 @@ if TARGET and TARGET != host():
     if "linker" in _cross:
         os.environ.setdefault(_env + "_LINKER", _cross["linker"])
     if "runner" in _cross:
-        os.environ.setdefault("RA_JIT_RUNNER", _cross["runner"])
-        os.environ.setdefault(_env + "_RUNNER", os.environ["RA_JIT_RUNNER"])
+        os.environ.setdefault("BLAZE_RUNNER", _cross["runner"])
+        os.environ.setdefault(_env + "_RUNNER", os.environ["BLAZE_RUNNER"])
 if TARGET:
     # Every cargo a harness runs builds for the target, and so does every ra-jit.
     os.environ["CARGO_BUILD_TARGET"] = TARGET
 # What the names of strip and the like begin with for the target.
-BINUTILS = os.environ.get("RA_JIT_BINUTILS") or (CROSS.get(TARGET, {}).get("binutils", "") if TARGET and TARGET != host() else "")
+BINUTILS = os.environ.get("BLAZE_BINUTILS") or (CROSS.get(TARGET, {}).get("binutils", "") if TARGET and TARGET != host() else "")
 # What a built binary is started with.
-RUNNER = shlex.split(os.environ.get("RA_JIT_RUNNER", ""))
+RUNNER = shlex.split(os.environ.get("BLAZE_RUNNER", ""))
 # What cargo and ra-jit take to build for the target.
 TARGET_ARGS = ["--target", TARGET] if TARGET else []
 
@@ -117,7 +117,7 @@ def linker_line(output):
 WASM = bool(TARGET) and TARGET.startswith("wasm32")
 if WASM and not RUNNER:
     # What runs a wasm program, which gets the program and its arguments after it.
-    RUNNER = shlex.split(os.environ.get("RA_JIT_WASM_RUNNER", "wasmtime run -W max-wasm-stack=8388608 -S inherit-env"))
+    RUNNER = shlex.split(os.environ.get("BLAZE_WASM_RUNNER", "wasmtime run -W max-wasm-stack=8388608 -S inherit-env"))
 # What a link line gets after ra-jit's objects, which define again what rustc's do.
 AHEAD = linkline.allowing_duplicates(WASM)
 
@@ -159,7 +159,7 @@ class Fixture:
                          for t in p["targets"] if "bin" in t["kind"])
         self.touch = touch
         # Whether rustc builds stand-ins for the workspace's crates, all of their code being ra-jit's.
-        self.alone = bool(os.environ.get("RA_JIT_ALONE"))
+        self.alone = bool(os.environ.get("BLAZE_ALONE"))
 
     def rustc_build(self):
         """Builds with cargo and captures the linker line so ra-jit objects can be spliced in."""
@@ -170,7 +170,7 @@ class Fixture:
         # take each other's place (fuzz/edits.py's, all of them `fz`).
         env.pop("CARGO_TARGET_DIR", None)
         if self.alone:
-            env.update(RUSTC_WORKSPACE_WRAPPER=RA_JIT, RA_JIT_WRAPS_RUSTC="1",
+            env.update(RUSTC_WORKSPACE_WRAPPER=RA_JIT, BLAZE_WRAPS_RUSTC="1",
                        CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))
             target = ["--target", TARGET or host()]
         elif TARGET:
@@ -202,11 +202,11 @@ class Fixture:
                      "--deny", deny_file, "--isolate", os.path.join(self.work, f"{label(crate)}.isolated"),
                      *self.ra_jit_args, *TARGET_ARGS, *symbols],
                     capture_output=True, text=True, timeout=self.ra_jit_timeout,
-                    env={**os.environ, "RA_JIT_LAYOUTS": self.layout_log})
+                    env={**os.environ, "BLAZE_LAYOUTS": self.layout_log})
             except subprocess.TimeoutExpired:
                 raise SystemExit(f"ra-jit crashed on {crate}:\nerror: no result after {self.ra_jit_timeout}s")
             open(os.path.join(self.work, f"{label(crate)}.stderr"), "w").write(run.stderr)
-            if os.environ.get("RA_JIT_STDERR"): open(os.environ["RA_JIT_STDERR"], "a").write(run.stderr)
+            if os.environ.get("BLAZE_STDERR"): open(os.environ["BLAZE_STDERR"], "a").write(run.stderr)
             if run.returncode != 0:
                 raise SystemExit(f"ra-jit crashed on {crate}:\n{run.stderr[-2000:]}")
             objects.append(obj)
@@ -366,7 +366,7 @@ def compare(fx, name, do_bisect, do_memcheck=False, do_layouts=False, mixed=0):
         print(f"{label(crate)}: {n}/{total - no_symbol} functions from ra-jit")
         for r in rows:
             if r[0] == "skipped" and bucket(r[2]) != "no rustc symbol for function":
-                why = r[2] if len(r[2]) < (10**6 if os.environ.get("RA_JIT_WHY") else 400) else r[2][:100] + " ... " + r[2][-300:]
+                why = r[2] if len(r[2]) < (10**6 if os.environ.get("BLAZE_WHY") else 400) else r[2][:100] + " ... " + r[2][-300:]
                 print(f"  skipped {r[1]}: {why}")
     print("MATCH" if ok else "MISMATCH")
     if not ok:

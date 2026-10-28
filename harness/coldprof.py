@@ -3,7 +3,7 @@
 
     coldprof.py PROJECT_DIR --work DIR [--store DIR] [--edit FILE:ANCHOR] [--after S] [--max-wait S]
 
-Runs `cargo ra-jit build` in PROJECT_DIR with an empty target directory and RA_JIT_HOME, and
+Runs `cargo ra-jit build` in PROJECT_DIR with an empty target directory and BLAZE_HOME, and
 the store DIR as it is (an empty one when it does not exist), and prints, by seconds since the
 command started: every line the daemon and its workers log, when the command returned, when
 the daemon said the checkout is ready, and twice a second the cores busy in ra-jit and in
@@ -14,7 +14,7 @@ after the command returned (a fraction of a second on just and ripgrep, some 3 s
 where reading the program's symbols waits for cargo's last file).
 `--until TEXT` waits, once ready, until a line the daemon or a worker logs has TEXT in it (the
 build the daemon makes of its own after a cold start that patches what rustc linked:
-`memory after request-1` with `RA_JIT_MEMORY` set), before `--after` and `--edit`.
+`memory after request-1` with `BLAZE_MEMORY` set), before `--after` and `--edit`.
 `--memory` also follows what the command and the daemon it starts hold (harness/memory.py):
 the most they held at once until ready, the largest process's peak, and what the largest
 process (the worker of the project) holds once ready.
@@ -68,9 +68,9 @@ def main():
     for path in (home, target):
         subprocess.run(["rm", "-rf", path], check=True)
     os.makedirs(home, mode=0o700)
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_HOME=home, CARGO_TARGET_DIR=target,
-               CARGO_TERM_COLOR="never", CARGO_NET_OFFLINE="true", RA_JIT_IDLE_SECS="0",
-               RA_JIT_CACHE=store, RA_JIT_STATS="1")
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TARGET_DIR=target,
+               CARGO_TERM_COLOR="never", CARGO_NET_OFFLINE="true", BLAZE_IDLE_SECS="0",
+               BLAZE_CACHE=store, BLAZE_STATS="1")
     for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "RUST_BACKTRACE"):
         env.pop(name, None)
     events, done = [], threading.Event()

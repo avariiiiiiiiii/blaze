@@ -68,7 +68,7 @@ each crate by category, `runs.json` has one entry per run, `<project>.json` what
 
   `record` runs `cargo check -Zunstable-options --compile-time-deps --workspace --all-targets
   --keep-going` through ra-jit's wrapper with an empty store, as harness/bscache.py does, and
-  `RA_JIT_BUILD_SCRIPTS=wasi-compare`, `RA_JIT_SCRIPTS_BY_RUSTC=1`.
+  `BLAZE_BUILD_SCRIPTS=wasi-compare`, `BLAZE_SCRIPTS_BY_RUSTC=1`.
 - The projects and revisions are harness/bench.py's. bun is left out, as harness/scripts.py
   leaves it out: its workspace needs its own C and C++ build first (bunprep.py).
 
@@ -170,9 +170,9 @@ host is not found on another yet.
 
 In `nix develop .#bench` cargo gives build scripts `RUSTC=rustc`, a name, and the rustc ra-jit
 answers scripts with (script_sandbox's `with_own_rustc`, as_rustc.rs) refuses it: "blaze can't
-answer `rustc --version` for a build script: `RA_JIT_SCRIPT_RUSTC` does not name the
+answer `rustc --version` for a build script: `BLAZE_SCRIPT_RUSTC` does not name the
 toolchain's rustc". rustversion and every script that asks `rustc --version` fail natively,
-with or without `RA_JIT_ONLY_ASKS`. bswasi.py sets `RUSTC` to the absolute path of `rustc` on
+with or without `BLAZE_ONLY_ASKS`. bswasi.py sets `RUSTC` to the absolute path of `rustc` on
 PATH. The Nix toolchain of `.#bench` also has no wasm32-wasip1, so the wasm builds need
 rustup's.
 

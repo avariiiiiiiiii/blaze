@@ -15,7 +15,7 @@
 // Seatbelt (`sandbox_init`) is what enforces: everything here only redirects and records, so
 // a process it is not loaded in (a program macOS protects drops `DYLD_*`) still can't write
 // outside the run or reach the network. Its configuration is the file `config` in the
-// directory `__RA_JIT_SANDBOX` names, written by `macos.rs`:
+// directory `__BLAZE_SANDBOX` names, written by `macos.rs`:
 //
 //     O\t<index>\t<directory>\t<upper>   an overlay (one line for each way to spell it)
 //     B\t<directory>\t<target>           a directory answered from `target`
@@ -720,7 +720,7 @@ static int longer(const void *a, const void *b) {
 }
 
 __attribute__((constructor)) static void start(void) {
-    const char *dir = getenv("__RA_JIT_SANDBOX");
+    const char *dir = getenv("__BLAZE_SANDBOX");
     if (!dir || strlen(dir) + 16 >= PATH_MAX) return;
     busy = 1;
     strcpy(scratch, dir);
@@ -784,8 +784,8 @@ __attribute__((constructor)) static void start(void) {
     if (dladdr((const void *)start, &info) && info.dli_fname)
         snprintf(self, sizeof self, "%s", info.dli_fname);
     snprintf(env_insert, sizeof env_insert, "DYLD_INSERT_LIBRARIES=%s", self);
-    snprintf(env_dir, sizeof env_dir, "__RA_JIT_SANDBOX=%s", scratch);
-    const char *nonce = getenv("__RA_JIT_SANDBOX_EXEC");
+    snprintf(env_dir, sizeof env_dir, "__BLAZE_SANDBOX=%s", scratch);
+    const char *nonce = getenv("__BLAZE_SANDBOX_EXEC");
     if (nonce) emit("H", nonce, NULL, NULL);
     // The program sees the environment it was given: this library's variables go, and
     // come back in what it runs (`environment`).
@@ -793,8 +793,8 @@ __attribute__((constructor)) static void start(void) {
     const char *theirs = insert && !strncmp(insert, self, strlen(self)) ? insert + strlen(self) : NULL;
     if (theirs && *theirs == ':' && theirs[1]) setenv("DYLD_INSERT_LIBRARIES", theirs + 1, 1);
     else if (theirs) unsetenv("DYLD_INSERT_LIBRARIES");
-    unsetenv("__RA_JIT_SANDBOX");
-    unsetenv("__RA_JIT_SANDBOX_EXEC");
+    unsetenv("__BLAZE_SANDBOX");
+    unsetenv("__BLAZE_SANDBOX_EXEC");
     pthread_atfork(fork_prepare, fork_after, fork_child);
     alive = 1;
     if (record_reads) _dyld_register_func_for_add_image(image_added);
@@ -1259,7 +1259,7 @@ static void environment(char *const envp[], char **out, size_t room, char *nonce
     // Never more than `count(envp)` are kept, so the guard holds for the room it is given; it
     // keeps the additions and the terminator in bounds should it not.
     for (char *const *it = envp; it && *it && n + ADDED + 1 < room; it++) {
-        if (!strncmp(*it, "__RA_JIT_SANDBOX=", 17) || !strncmp(*it, "__RA_JIT_SANDBOX_EXEC=", 22))
+        if (!strncmp(*it, "__BLAZE_SANDBOX=", 17) || !strncmp(*it, "__BLAZE_SANDBOX_EXEC=", 22))
             continue;
         if (!strncmp(*it, "DYLD_INSERT_LIBRARIES=", 22)) {
             theirs = *it + 22;
@@ -1272,7 +1272,7 @@ static void environment(char *const envp[], char **out, size_t room, char *nonce
         snprintf(insert_var, PATH_MAX * 2, "DYLD_INSERT_LIBRARIES=%s:%s", ours, theirs);
     else
         snprintf(insert_var, PATH_MAX * 2, "%s", env_insert);
-    snprintf(nonce_var, 64, "__RA_JIT_SANDBOX_EXEC=%s", nonce);
+    snprintf(nonce_var, 64, "__BLAZE_SANDBOX_EXEC=%s", nonce);
     out[n++] = insert_var;
     out[n++] = env_dir;
     out[n++] = nonce_var;

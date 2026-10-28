@@ -1,8 +1,8 @@
 //! blaze's cache gateway (worker/remote-cache/API-v0.md): a tenant's objects at
 //! `<base>/<name>`, read with GET and HEAD and written with PUT, behind a bearer token.
 //!
-//! `RA_JIT_REMOTE=blaze+https://<gateway>/t/<tenant>/v3` names it (`blaze+http://` for a
-//! gateway on this machine). The token is `RA_JIT_REMOTE_TOKEN`, or the variable that
+//! `BLAZE_REMOTE=blaze+https://<gateway>/t/<tenant>/v3` names it (`blaze+http://` for a
+//! gateway on this machine). The token is `BLAZE_REMOTE_TOKEN`, or the variable that
 //! `?token=env:NAME` names: never the address itself, which is printed. Without one the
 //! tenant is read anonymously, which a public tenant allows, and nothing is written.
 //!
@@ -37,7 +37,7 @@ use super::{
 };
 
 /// The variable the token is read from when the address names none.
-const TOKEN_VAR: &str = "RA_JIT_REMOTE_TOKEN";
+const TOKEN_VAR: &str = "BLAZE_REMOTE_TOKEN";
 /// The most one PUT carries; a larger object goes up in parts.
 pub(crate) const PUT_MAX: u64 = 90 << 20;
 /// The size of a part: the gateway takes none above [`PUT_MAX`] or below 5 MiB but the last.

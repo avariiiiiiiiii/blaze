@@ -31,9 +31,9 @@ jobs:
       matrix:
         backend: [cranelift, llvm]
     env:
-      RA_JIT_BACKEND: ${{ matrix.backend }}
-      RA_JIT_OPT: 2
-      RA_JIT_EMIT: fast
+      BLAZE_BACKEND: ${{ matrix.backend }}
+      BLAZE_OPT: 2
+      BLAZE_EMIT: fast
       EVENT: ${{ github.event_name }}
       INPUT_LIMIT: ${{ inputs.limit }}
     steps:
@@ -56,7 +56,7 @@ jobs:
       - name: tests/ui
         working-directory: harness
         run: |
-          export RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
+          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
           LIMIT="$INPUT_LIMIT"
           python3 uitest.py "$RUNNER_TEMP/rust-pin" ${LIMIT:+--limit "$LIMIT"} --jobs 4 --work "$RUNNER_TEMP/ui" --json "$RUNNER_TEMP/ui.json" || status=$?
           python3 uigate.py "$RUNNER_TEMP/ui.json" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -75,7 +75,7 @@ jobs:
       - run: nix develop --command cargo build -p ra-jit --release --features llvm
       - name: scoreboard
         working-directory: harness
-        run: RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 scoreboard.py
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 scoreboard.py
 
   nightly:
     name: nightly issue

@@ -27,7 +27,7 @@ use super::{directives, keyed, own_script, sandboxed, script_sandbox, wasi_scrip
 use super::{hermetic, script_sandbox::InView};
 
 /// The variable that names the script itself to `ra-jit build-script`.
-pub(crate) const REAL: &str = "RA_JIT_BUILD_SCRIPT";
+pub(crate) const REAL: &str = "BLAZE_BUILD_SCRIPT";
 
 /// The file next to a script's `OUT_DIR` that says how cargo ran it.
 const RAN: &str = "ra-jit-ran.json";
@@ -202,7 +202,7 @@ pub(crate) fn run_as_cargo_does(
                 }
                 kept.restore(&out_dir)?;
                 script_sandbox::keep_reads(&out_dir, None);
-                if std::env::var_os("RA_JIT_STATS").is_some() {
+                if std::env::var_os("BLAZE_STATS").is_some() {
                     eprintln!("blaze: a run the store kept, of its closure");
                 }
                 std::io::stdout().write_all(&hermetic::for_cargo(&kept.stdout))?;
@@ -274,7 +274,7 @@ pub(crate) fn run_as_cargo_does(
             let reads = (!script_sandbox::says_what_it_reads(&kept.stdout)).then_some(&reads[..]);
             script_sandbox::keep_reads(&out_dir, reads);
             // Cargo keeps what a script printed to stderr beside its `OUT_DIR`.
-            if std::env::var_os("RA_JIT_STATS").is_some() {
+            if std::env::var_os("BLAZE_STATS").is_some() {
                 eprintln!("blaze: a run the store kept");
             }
             std::io::stdout().write_all(&kept.stdout)?;
@@ -366,7 +366,7 @@ fn same_as_kept(package: &str, kept: &Kept, made: &Kept, out_dir: &Path) {
         );
         std::process::exit(1);
     }
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!("blaze: a run the store kept is what this one did");
     }
 }
@@ -445,7 +445,7 @@ const IN_VIEW: &str = "build script runs in their closure 1";
 /// prints or writes either: a run that the sandbox refused something fails, and a failed run
 /// is not kept. Nor does where ra-jit keeps its store, its traces and its statistics, or
 /// whether it checks the store's runs.
-pub(super) const UNREAD: [&str; 14] = [
+pub(super) const UNREAD: [&str; 13] = [
     "CARGO_MAKEFLAGS",
     "MAKEFLAGS",
     "MFLAGS",
@@ -454,11 +454,10 @@ pub(super) const UNREAD: [&str; 14] = [
     "OLDPWD",
     "TMPDIR",
     sandboxed::VAR,
-    "BLAZE_SANDBOX",
-    "RA_JIT_CACHE",
-    "RA_JIT_TRACE",
-    "RA_JIT_STATS",
-    "RA_JIT_HOME",
+    "BLAZE_CACHE",
+    "BLAZE_TRACE",
+    "BLAZE_STATS",
+    "BLAZE_HOME",
     keyed::CHECK,
 ];
 

@@ -4,8 +4,8 @@ ix VM, arm64, 16 vCPU, cranelift, the flake's nightly. The corpus is one binary 
 macros of serde (Serialize, Deserialize), clap (Parser), tokio (main), thiserror (Error),
 async-trait, pin-project, derive_more (Display) and strum (EnumString), with serde_json:
 8 proc-macro modules. Each run is one `ra-jit <ws> --own-target --crate pmcorpus --out ..
---exe ..` (the build `cargo blaze build`'s daemon makes) with `RA_JIT_CACHE` set to the
-arm's own store and `RA_JIT_STATS=1`, timed whole. native is `RA_JIT_PROC_MACRO_WASM=0`
+--exe ..` (the build `cargo blaze build`'s daemon makes) with `BLAZE_CACHE` set to the
+arm's own store and `BLAZE_STATS=1`, timed whole. native is `BLAZE_PROC_MACRO_WASM=0`
 (blaze builds the macro crates as native libraries for its server).
 
 States: **cold** an empty store and target; **again** the next run with nothing changed;
@@ -61,7 +61,7 @@ corpus's cold runs, no `.cwasm` and no store: milliseconds. Every output was the
 
 One compile of serde_derive's module is 0.9 s of wall time and 5.5 s of CPU (`time`): the 8
 modules of a cold build take about 44 CPU seconds from its own units, which is the cold gap.
-`RA_JIT_WASM_OPT=none` (an experiment's `cranelift_opt_level(OptLevel::None)`) compiled and
+`BLAZE_WASM_OPT=none` (an experiment's `cranelift_opt_level(OptLevel::None)`) compiled and
 expanded within noise of `Speed`; compiling on a rayon pool of `nice 10` threads gave cold 44.54
 and 47.08 against native's 42.48 and 44.77, no better.
 

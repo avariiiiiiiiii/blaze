@@ -4,7 +4,7 @@
 cargo's do, one library after another, each example reading where it runs and the variables
 as it does under rustdoc.
 
-    RA_JIT_BIN=../target/release/ra-jit python3 doctestonce.py
+    BLAZE_BIN=../target/release/ra-jit python3 doctestonce.py
 
 The steps: every example passes; an example of the first two libraries fails, and cargo stops
 after the first; the same with `--no-fail-fast`; one of the first fails, with `--no-fail-fast`. In each, the exit status, the results of
@@ -21,7 +21,7 @@ import tempfile
 from buildmodel import doctest_report
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RA_JIT = os.path.abspath(os.environ.get("RA_JIT_BIN", os.path.join(HERE, "..", "target", "release", "ra-jit")))
+RA_JIT = os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "..", "target", "release", "ra-jit")))
 
 # An exit status, not a panic: where a panic in an example is said is not this step's to check.
 FAILS = '/// if std::env::var_os("DOCTEST_FAIL").is_some() {\n///     std::process::exit(3);\n/// }\n'

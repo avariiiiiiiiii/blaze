@@ -308,7 +308,7 @@ def ra_jit_run(binary, units, mode, jobs, work):
         files[copy] = unit.label
         cfgs = [f[6:].strip() for f in unit.flags if f.startswith(("--cfg ", "--cfg="))]
         by_edition[unit.edition].append(copy + ("\t" + " ".join(cfgs) if cfgs else ""))
-    env = dict(os.environ, RA_JIT_BORROWCK=mode)
+    env = dict(os.environ, BLAZE_BORROWCK=mode)
     env["RUST_BACKTRACE"] = "0"
     results = {}
 
@@ -393,7 +393,7 @@ def score(units, expected, actual, mode):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("rust")
-    ap.add_argument("--bin", default=os.environ.get("RA_JIT_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
     ap.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "borrowck-ui"))
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
     ap.add_argument("--filter")

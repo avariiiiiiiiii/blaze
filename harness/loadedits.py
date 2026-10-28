@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """loadedits.py: a file written while a worker loads the workspace is built as written.
 
-usage: loadedits.py [--rounds N] [--keep]   (RA_JIT_BIN names the ra-jit built; cargo-ra-jit
+usage: loadedits.py [--rounds N] [--keep]   (BLAZE_BIN names the ra-jit built; cargo-ra-jit
                                              and ra-jit-rustc are found next to it)
 
 A worker reads the workspace's files when it loads, and from then on builds a file again
@@ -10,7 +10,7 @@ timestamp was taken left the worker with the old text and the new timestamp, and
 build after that answered with the program as it was before the write (#53: fd's tests ran
 against the program from before the edit).
 
-The daemon runs with `RA_JIT_LOAD_PAUSE_MS`, which holds each worker between the two and has
+The daemon runs with `BLAZE_LOAD_PAUSE_MS`, which holds each worker between the two and has
 it say "load: paused". Each round builds with a feature no round before used, which has the
 daemon start a worker for it, writes `app/src/main.rs` while that worker is held, waits
 until it is ready, and builds again: the daemon has to serve that build, and the program
@@ -75,9 +75,9 @@ def main():
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--keep", action="store_true", help="keep the workspace and the daemon's logs")
     args = parser.parse_args()
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     # The daemon's sockets are under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start. Status names the workspace by its real path.
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-loadedits-", dir=None if os.name == "nt" else "/tmp"))
@@ -85,8 +85,8 @@ def main():
     for path, text in files(args.rounds).items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-               RA_JIT_LOAD_PAUSE_MS=str(PAUSE_MS))
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
+               BLAZE_LOAD_PAUSE_MS=str(PAUSE_MS))
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "lapp"), os.path.join(ws, "app", "src", "main.rs")

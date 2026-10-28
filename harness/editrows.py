@@ -31,7 +31,7 @@ def main():
     global binname, env
     ws, binname, runs, names = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].split(",")
     os.chdir(ws)
-    env = dict(os.environ, RA_JIT_HOME="/tmp/edit-home", PATH=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release") + ":" + os.environ["PATH"])
+    env = dict(os.environ, BLAZE_HOME="/tmp/edit-home", PATH=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release") + ":" + os.environ["PATH"])
     all_edits = genws.edits(ws)
     for name in names:
         edit = genws.scattered(ws, int(name[1:])) if name.startswith("s") and name[1:].isdigit() else all_edits[name]

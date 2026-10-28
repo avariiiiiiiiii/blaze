@@ -34,8 +34,8 @@ jobs:
         env:
           LIVE_EDITS: ${{ inputs.edits || '8' }}
           RUST_BACKTRACE: "1"
-          RA_JIT_IDLE_SECS: "0"
-        run: RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_e2e.py
+          BLAZE_IDLE_SECS: "0"
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_e2e.py
       - name: what the daemon and its workers said
         if: always()
         run: |

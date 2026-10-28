@@ -29,7 +29,7 @@ library only.
 import ctypes, os, platform, resource, stat, subprocess, sys, tempfile, threading, time
 
 DARWIN = platform.system() == "Darwin"
-INTERVAL = float(os.environ.get("RA_JIT_MEMORY_INTERVAL", "0.01"))
+INTERVAL = float(os.environ.get("BLAZE_MEMORY_INTERVAL", "0.01"))
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024 if hasattr(os, "sysconf") else 4
 
 if DARWIN:

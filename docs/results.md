@@ -30,11 +30,11 @@ documents were written against. ra-jit was built with `cargo build -p ra-jit --r
 for the LLVM column with `--features llvm` against LLVM 20.1.8.
 Source trees and scratch directories were on tmpfs.
 
-The gate, from `harness/` with `RA_JIT_BIN` set and `TMPDIR` on tmpfs:
+The gate, from `harness/` with `BLAZE_BIN` set and `TMPDIR` on tmpfs:
 
 <!-- LOCAL-GATE: replace this table when the gate is rerun. -->
 
-| Harness | Cranelift | LLVM (`RA_JIT_OPT=2 RA_JIT_EMIT=fast`) |
+| Harness | Cranelift | LLVM (`BLAZE_OPT=2 BLAZE_EMIT=fast`) |
 |---|---|---|
 | `difftest.py corpus --bin runner --crate cases --layouts` | MATCH, 822 of 822 functions from ra-jit, 0 of 893 layouts differ | MATCH, 822 of 822, 0 of 893 layouts differ |
 | `programs.py` | 22 of 22 | 22 of 22 |
@@ -63,7 +63,7 @@ By hand, with `cargo ra-jit` from that build:
 | ripgrep: one-line edit to `crates/core/main.rs`, `cargo ra-jit build` | by the daemon, 0.26 s wall; the binary prints the edit |
 | ripgrep: `cargo ra-jit test` | by the daemon; 114 and 329 tests pass, the same as cargo's |
 | ripgrep: second git worktree | first build cargo's, 16 s; joined the same worker; edit by the daemon, 0.44 s wall |
-| `RA_JIT_CACHE` set when the daemon starts | store filled: 1 pack, 26,377 records, 57,153,509 bytes; `ra-jit cache verify` exit 0 |
+| `BLAZE_CACHE` set when the daemon starts | store filled: 1 pack, 26,377 records, 57,153,509 bytes; `ra-jit cache verify` exit 0 |
 | `ra-jit cache push` and `pull` to a directory remote | 1 pack, 7,744,971 bytes compressed, sent and fetched |
 | Published layout: recursive clone, `cargo build -p ra-jit --release --locked` | builds |
 
@@ -407,12 +407,12 @@ What each row is:
 
 - **Cold.** `rm -rf` of the target directory, then the build. The cargo side is
   `CARGO_TARGET_DIR=t-cargo cargo build`. The ra-jit side is
-  `CARGO_TARGET_DIR=t-ra-jit RA_JIT_HOME=<new> RA_JIT_CACHE=<store> cargo ra-jit build`
+  `CARGO_TARGET_DIR=t-ra-jit BLAZE_HOME=<new> BLAZE_CACHE=<store> cargo ra-jit build`
   with a new daemon home each run. A first `cargo ra-jit build` is cargo's own build with
   ra-jit as the workspace wrapper, so "command returns" is that build. The daemon then loads
   the workspace and compiles every program once; "daemon ready" is when
   `cargo ra-jit status` says the checkout is ready and the background `cargo check` has
-  finished. Edits are fast only after that. "Empty store" is a new, empty `RA_JIT_CACHE`
+  finished. Edits are fast only after that. "Empty store" is a new, empty `BLAZE_CACHE`
   each run. "Warm store" is one store filled beforehand by `cargo ra-jit build` of the same
   commit in a second checkout. The three cold kinds were interleaved run by run.
 - **No-op.** The build again with nothing changed.
@@ -453,7 +453,7 @@ daemon and worker and waiting for the background check.
 Commands, on the host:
 
     RUSTUP_TOOLCHAIN=1.99.0 cargo build -p ra-jit --release
-    RA_JIT_PROJECTS=~/rajit-realproj/projects python3 -u harness/realbench.py \
+    BLAZE_PROJECTS=~/rajit-realproj/projects python3 -u harness/realbench.py \
         ripgrep just nushell --runs 5 --work ~/rajit-realproj/work
     python3 harness/realbench.py --table ~/rajit-realproj/work/realbench.json
 
@@ -499,7 +499,7 @@ the client's total, and "outside the client" is cargo and rustup starting up.
 | nushell | edit: main | 0.305 | check 209.6, apply 14.7, compile-rest 6.8, build-rest 6.8, link 6.4, object 4.9, refuse 4.9, 20 more 23.5, outside the client 27.0 |
 | | edit: lib | 0.178 | check 55.4, apply 29.4, compile-rest 9.2, refuse 8.4, reach 8.3, link 7.3, build-rest 6.8, 20 more 25.2, outside the client 27.8 |
 
-The before binary has no spans. The nushell steps before and after come from `RA_JIT_STATS=1`
+The before binary has no spans. The nushell steps before and after come from `BLAZE_STATS=1`
 on two builds of the same tree, one without the fixes and one with them. They are medians
 of edits 2 to 6, in ms of the client's total. The library edit followed the main edits in the
 same daemon.
@@ -547,7 +547,7 @@ What is left:
 
 Commands, on the host. A loop waited for a quiet host and ran this for each project and side:
 
-    RA_JIT_BIN=<before or after>/ra-jit RA_JIT_PROJECTS=~/rajit-warm/projects \
+    BLAZE_BIN=<before or after>/ra-jit BLAZE_PROJECTS=~/rajit-warm/projects \
         python3 -u harness/realbench.py <project> --runs 5 --parts noop,edits \
         --work ~/rajit-warm/work-<side>
     python3 harness/realbench.py --table ~/rajit-warm/work-<side>/realbench.json
@@ -556,7 +556,7 @@ Commands, on the host. A loop waited for a quiet host and ran this for each proj
 
 Measured on an M5 Max (18 cores, macOS 27), shared with other builds, so single runs spread
 widely; the tables are medians of runs 2 to 6 of `cargo ra-jit build` after realbench's
-edits, each step from the client's `RA_JIT_TRACE` breakdown. Before is 1dbad5b048, from
+edits, each step from the client's `BLAZE_TRACE` breakdown. Before is 1dbad5b048, from
 before the merges of `fn-incremental` and `tiers-speed`. After is the header pad (d611d65b66,
 since merged with the fix of #13, which keeps the size beside the executable and adds a quarter
 rather than a half: the same links once it is in place) and then the signature hashes
@@ -645,7 +645,7 @@ cargo takes for a source of the package, so ripgrep's, fd's and hyperfine's buil
 ripgrep with the target directory outside it, not 386; an edit of another crate of these
 workspaces had the same run of the script added to cargo's time (CHANGELOG, Fixed). Every program said what cargo's said, in both runs.
 
-Where the time of one edit went before, from `RA_JIT_TRACE` (the median of 5 to 7):
+Where the time of one edit went before, from `BLAZE_TRACE` (the median of 5 to 7):
 
 | | ripgrep, a function (70 ms) | nushell, a function (252 ms) |
 |---|---:|---:|
@@ -679,9 +679,9 @@ not at all when `cargo ra-jit` just did; cargo runs them when the script is olde
 source, read a variable while compiled that cargo does not set, or printed or wrote something
 else (CHANGELOG, commits 20708cd2da and c8f58ac7d9).
 
-Commands: for each side, `RA_JIT_BIN=<side>/ra-jit taskset -c 0-15 python3 harness/bench.py
+Commands: for each side, `BLAZE_BIN=<side>/ra-jit taskset -c 0-15 python3 harness/bench.py
 <projects> --backend cranelift --runs 5`; the after run measured both tiers (with
-`RA_JIT_LLVM_BIN` a build with the feature) and is the README's.
+`BLAZE_LLVM_BIN` a build with the feature) and is the README's.
 
 ||||||| cc22006337
 ## Disagreements

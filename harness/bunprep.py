@@ -251,7 +251,7 @@ def edit(path, old, new):
 
 def env_of(tree):
     out = build_dir(tree)
-    return {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "RA_JIT_OTHER_TOOLCHAIN": "1",
+    return {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "BLAZE_OTHER_TOOLCHAIN": "1",
             "BUN_CODEGEN_DIR": os.path.join(out, "codegen"), "BUN_NATIVE_LINK_ARGS": os.path.join(out, "ra-jit-link.args")}
 
 

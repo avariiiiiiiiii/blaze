@@ -160,7 +160,7 @@ pub struct CompiledFunction {
     pub(super) closure: Option<ExprId>,
     /// The named locals of the body a debugger can be told of, whose types are of `.0`.
     pub(super) variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
-    /// Size and alignment of every type laid out, collected when `RA_JIT_LAYOUTS` is set.
+    /// Size and alignment of every type laid out, collected when `BLAZE_LAYOUTS` is set.
     pub(super) layouts: Vec<(String, u64, u64)>,
 }
 
@@ -705,7 +705,7 @@ impl<'db> Recorder<'db> {
             wants: Wants::new(isa),
             vtables: FxHashMap::default(),
             statics: FxHashMap::default(),
-            layouts: std::env::var_os("RA_JIT_LAYOUTS").map(|_| Default::default()),
+            layouts: std::env::var_os("BLAZE_LAYOUTS").map(|_| Default::default()),
             coroutine_layouts: RefCell::default(),
             builder_ctx: FunctionBuilderContext::new(),
             naked: None,
@@ -742,7 +742,7 @@ impl<'db> Recorder<'db> {
         (wants.requests, layouts)
     }
 
-    /// What the function asks for, with the layouts `RA_JIT_LAYOUTS` collects: all that is
+    /// What the function asks for, with the layouts `BLAZE_LAYOUTS` collects: all that is
     /// kept of this without the database.
     pub(super) fn detach(self) -> (Wants, Vec<(String, u64, u64)>) {
         let mut layouts: Vec<(String, u64, u64)> = self.layouts.map_or_else(Vec::new, |layouts| {

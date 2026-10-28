@@ -148,7 +148,7 @@ From [docs/machines](https://ix.dev/docs/machines), [docs/snapshots](https://ix.
 - **Workers.** A worker is keyed by repository, toolchain, target, features and `cfg(test)`
   ([architecture.md](architecture.md), **read**). It can hold several checkouts (`--also`), but
   per Andrew the runner never uses that: a daemon holds one branch, and branches are forks.
-- **The first build.** cargo's and rustc's unless `RA_JIT_RUSTC_BASE=0`, which has the daemon
+- **The first build.** cargo's and rustc's unless `BLAZE_RUSTC_BASE=0`, which has the daemon
   build the base itself (`main.rs`, **read**; `harness/warmstart.py` uses it). The seed always
   sets it.
 - **Per checkout today.** `tests-reach` and `tests-passed` live beside each test program in the
@@ -158,7 +158,7 @@ From [docs/machines](https://ix.dev/docs/machines), [docs/snapshots](https://ix.
   (`affected.rs` lines 174 to 187, **read**). In a fork that is mostly fine (the fork inherits the
   seed's target directory and times), but none of it is shared between branches.
 - **GC.** `StoreDir::collect` evicts sealed packs least recently used (by modification time)
-  down to `RA_JIT_CACHE_MAX`, by default a tenth of the free disk between 256 MB and 32 GB, after
+  down to `BLAZE_CACHE_MAX`, by default a tenth of the free disk between 256 MB and 32 GB, after
   sealing, merging small packs and removing temporaries (`crates/ra-jit-store/src/lib.rs`,
   **read**). `ra-jit cache gc` runs it; `ra-jit cache gc --remote` takes old lines off remote
   manifests and removes unlisted objects (`crates/ra-jit/src/remote/collect.rs`, **read**).
@@ -175,7 +175,7 @@ The seed is an ix machine, persistent, of the repository's architecture. It hold
   path;
 - the pinned ra-jit binary and toolchain, and the target directory and store on tmpfs or the
   page cache, so they are inside the memory snapshot (the guest disk was 40 MB/s, above);
-- one ra-jit daemon for the checkout, started with `RA_JIT_RUSTC_BASE=0`, `RA_JIT_TESTS=affected`
+- one ra-jit daemon for the checkout, started with `BLAZE_RUSTC_BASE=0`, `BLAZE_TESTS=affected`
   and the daemon's idle exit off (a fork resumes with a clock that jumped, and an idle timer must
   not end the daemon the job came for: **unverified** what the daemon does today);
 - after a build of `main`'s tests: the daemon's own base, the test programs built, and the test
@@ -222,7 +222,7 @@ on the store gets cheaper with #41/#216 and c18d96d6's work.
 4. **Check out and edit.** `git fetch` the commit, `git checkout --detach T` in place at the seed's
    path. Only changed files are written; the daemon finds them at the next build request
    (`tree.rs`) or, better, the runner hands it the changed paths from `git diff --name-status`.
-5. **Build and test.** `cargo ra-jit test` with `RA_JIT_TESTS=affected`: only the edited
+5. **Build and test.** `cargo ra-jit test` with `BLAZE_TESTS=affected`: only the edited
    functions are compiled and patched; each test program runs the tests whose code or recorded
    inputs changed, each in its sandbox; the rest are skipped because the same key passed before,
    on main or on this branch.
@@ -267,7 +267,7 @@ vanishes with the fork unless shipped. The packs are sealed, named by the SHA-25
 and checked on fetch, and the keys are content-only after c18d96d6's work, so a pack made on any
 branch serves every branch with the same code. Shipping is the existing remote: at job end the
 fork runs `ra-jit cache push` to the repository's remote (an S3 prefix or a directory on a shared
-volume), off the push's path; the seed pulls lazily (`RA_JIT_REMOTE_LAZY`) at its next refresh,
+volume), off the push's path; the seed pulls lazily (`BLAZE_REMOTE_LAZY`) at its next refresh,
 and so do new forks.
 
 Content addressing makes the bytes safe; it does not make the key-to-code mapping safe. A pack's
@@ -276,7 +276,7 @@ compiles to. A fork runs untrusted build scripts, proc macros and tests next to 
 code that escapes the sandbox could write a well-formed pack that maps a key to other code, which
 every branch would then link. So only trusted lineages push: the seed always, forks of pull
 requests from the repository itself (members), never forks of pull requests from forked
-repositories (`trusted = false` in `github-events`). A manifest stays signed (`RA_JIT_REMOTE_SIGN`)
+repositories (`trusted = false` in `github-events`). A manifest stays signed (`BLAZE_REMOTE_SIGN`)
 by the runner, never by the fork. Later, if compiling one function is deterministic (**unverified**;
 whole-program layout is not, [#200](https://github.com/indexable-inc/ra-jit/issues/200)), the
 seed can check a sample of pushed entries by compiling them again.
@@ -370,7 +370,7 @@ So: no RPC inside the fork, ix's fork between the seed and its forks, and the ex
 between machines. "Our own protocol" here means ra-jit's pack and manifest format, which is
 already ours; the one new message is a job's report (verdicts per test key), which travels in the
 job's output over `vm.exec`. REAPI is worth one thing: letting a team that already runs
-NativeLink or BuildBuddy hold ra-jit's packs, as an `RA_JIT_REMOTE=grpc://` place mapping a pack
+NativeLink or BuildBuddy hold ra-jit's packs, as an `BLAZE_REMOTE=grpc://` place mapping a pack
 to a CAS blob and a manifest to an AC entry, exactly as #226 lays out. That is P3 and outside the
 runner. A read-only REAPI view for Bazel users, and `Execution`, are not planned.
 
@@ -441,12 +441,12 @@ difference. It does not remove the clock, threads or, by default, randomness (#2
 `getrandom` is opt-in, a virtual clock opt-in, a deterministic scheduler out of scope).
 
 - **The runner's default.** It sets the test's seed to a hash of its key (#257's
-  `RA_JIT_TEST_SEED` per test), so a rerun of the same key sees the same randomness and the seed
+  `BLAZE_TEST_SEED` per test), so a rerun of the same key sees the same randomness and the seed
   is printed on failure.
 - **A flake is defined by the key.** Two different verdicts under one key are nondeterminism, by
   construction, since everything the sandbox can see was the same. The store keeps a mark beside
   a pass for a failure under the same key; a test with both is marked flaky, never skipped again,
-  and the command warns with where it passed (done). `RA_JIT_TESTS=verify` runs the tests kept as
+  and the command warns with where it passed (done). `BLAZE_TESTS=verify` runs the tests kept as
   passed and names each that failed (done). Not done: rerunning a failure three times in fresh
   sandboxes before calling it, and a report on main's issue tracker.
 - **Who it blocks.** A flaky test whose key the pull request did not change does not fail the pull
@@ -459,14 +459,14 @@ difference. It does not remove the clock, threads or, by default, randomness (#2
 
 The runner's rule: any job in which ra-jit prints `ra-jit: bug: <reason>; building with cargo` (the
 line #258 added) fails, as a ra-jit bug with the reason and the issue, and never goes green through
-cargo. It never sets `RA_JIT_TESTS=all` or `RA_JIT_SANDBOX=off` on its own. What is missing for
+cargo. It never sets `BLAZE_TESTS=all` or `BLAZE_SANDBOX=off` on its own. What is missing for
 that rule to hold on real repositories, from [no-rustc.md](no-rustc.md) and the open issues
 (**read**):
 
 - [#258](https://github.com/indexable-inc/ra-jit/issues/258) (P1): test edits went to cargo on
   ripgrep and helix-core; three causes, fixes in flight.
 - [#91](https://github.com/indexable-inc/ra-jit/issues/91) (no-rustc K): the cold build is cargo's
-  unless `RA_JIT_RUSTC_BASE=0`; the seed sets it, and K makes it the only path.
+  unless `BLAZE_RUSTC_BASE=0`; the seed sets it, and K makes it the only path.
 - [#86](https://github.com/indexable-inc/ra-jit/issues/86), [#87](https://github.com/indexable-inc/ra-jit/issues/87),
   [#89](https://github.com/indexable-inc/ra-jit/issues/89), [#90](https://github.com/indexable-inc/ra-jit/issues/90)
   (F, G, I, J): std, every crate, build scripts and proc macros by ra-jit. Until they land the seed's
@@ -494,7 +494,7 @@ What is kept: everything reachable from a live root, then the rest by last use w
   run. A root manifest is the same kind of object as the remote's `manifests/<project>`, so the
   remote's collector can read it.
 - **The local store** inside a seed or fork needs no root logic: the fork is thrown away, and the
-  seed's store is bounded by `RA_JIT_CACHE_MAX` as today.
+  seed's store is bounded by `BLAZE_CACHE_MAX` as today.
 - **The repository's remote.** `ra-jit cache gc --remote` keeps every pack named by a live root
   manifest and applies its age rules only to the rest (a change to `remote/collect.rs`, which today
   ages manifests' lines regardless of roots). Results rows the same.
@@ -531,7 +531,7 @@ Linux only until the runner has macOS and Windows forks, which ix does not have.
 Ranked by what each unblocks. Blockers named; ix rollout state is ix's.
 
 1. **R1. One seed, one job, end to end, on ripgrep then nushell.** A seed recipe (clone, pinned
-   ra-jit, `RA_JIT_RUSTC_BASE=0`, daemon warm on main, idle exit off, store and target in memory,
+   ra-jit, `BLAZE_RUSTC_BASE=0`, daemon warm on main, idle exit off, store and target in memory,
    snapshot), and a `crates/ci/fast` job script: fork, fetch, check out in place, `cargo ra-jit
    test` under `affected`, check run, delete. Fails the job on any `building with cargo` line.
    Measures: push to green, fork time, the fork's dirty memory, whether the daemon survives the

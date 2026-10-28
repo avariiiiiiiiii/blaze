@@ -161,11 +161,11 @@ leaves to cargo (#321); bun, swc and agave cargo 1.99.0 (the oracle then) does n
 whole build builds (5.9 and 6.5 s in two runs, cargo's 6.2 and 6.1 s, on a shared host): its example no longer reaches `mime_guess`, whose
 build script its build never ran. Left: the unit graph (#335), choosing versions (#321).
 
-2026-10-25, the programs of a whole build: `cargo blaze build` with `RA_JIT_WHOLE_BUILD=1`
+2026-10-25, the programs of a whole build: `cargo blaze build` with `BLAZE_WHOLE_BUILD=1`
 takes the programs it links from blaze-metadata's `programs` (the binaries of the build's
 members whose `required-features` it has, or the `--bin` or `--example` named), for the
 target's cfg as blaze answers `rustc --print cfg` itself, instead of `cargo build
---unit-graph`. Where it cannot, it says why and asks cargo; `RA_JIT_OWN_RESOLVE=0` asks cargo
+--unit-graph`. Where it cannot, it says why and asks cargo; `BLAZE_OWN_RESOLVE=0` asks cargo
 always. `harness/own_metadata.py` compares them with the unit graph's executable roots in its
 `build` check: 321 of 321 equal over the corpus (dev-aws-14).
 
@@ -200,7 +200,7 @@ serde_derive, thiserror-impl, tokio-macros and clap_derive equal to the toolchai
 
 1. J1's wiring (landed 2026-10-25): when rust-analyzer loads a workspace, each proc macro
    cargo asks for is linked by blaze, and blaze's server expands with it, behind
-   `RA_JIT_PROC_MACRO_SERVER`. macroserver.py compares every macro call of the bench apps
+   `BLAZE_PROC_MACRO_SERVER`. macroserver.py compares every macro call of the bench apps
    ([Status](#status)).
 2. The server ships with blaze (landed 2026-10-25, Linux): built by the release workflow with
    blaze (`--exe`) beside the standard library's unit, in the archive as
@@ -225,7 +225,7 @@ K replaces cargo's build in that flow, keeping 54301ec5's lane on the rest of it
    the proc macros are J's. What blaze cannot compile and the program reaches fails the build
    with the reason: there is no build by cargo to go to. While it is shown equal on the bench
    apps (each program's runs printing what cargo's does, as `allrajit.py` checks), it is behind
-   a setting, then the default. Behind `RA_JIT_WHOLE_BUILD=1` since 2026-10-25, with the build
+   a setting, then the default. Behind `BLAZE_WHOLE_BUILD=1` since 2026-10-25, with the build
    scripts and proc macros still the load's ([Status](#status)).
 2. The first edits patch blaze's own executable, not rustc's (#11): no rustc base.
 3. `cargo blaze test` from nothing the same, with blaze's harness (H).
@@ -344,12 +344,12 @@ and zed's vendored packages 51/51 and 1533/1533. Not yet: blaze-resolve's `Regis
 registries that need credentials (#315), git indexes (#316), cargo's last-use record (#317),
 a path package's file list (#318).
 
-2026-10-25, J (proc macros): with `RA_JIT_PROC_MACRO_SERVER`, a load into ra-jit's own
+2026-10-25, J (proc macros): with `BLAZE_PROC_MACRO_SERVER`, a load into ra-jit's own
 target directory has ra-jit link the proc macros and its server expand them; over fd, bat,
 hyperfine, just, nushell and helix, 3,465 calls expanded the same as the toolchain's server
 with rustc's libraries, 12 not compared (`pest_consume_macros`,
 [#327](https://github.com/indexable-inc/blaze/issues/327)). The Linux archive has the server
-beside `ra-jit` (built by it in 30 s on dev-aws-8), and `RA_JIT_PROC_MACRO_SERVER=1` takes it
+beside `ra-jit` (built by it in 30 s on dev-aws-8), and `BLAZE_PROC_MACRO_SERVER=1` takes it
 from there: a load of fd starts no toolchain server. It is the default: the daemon's loads,
 the checker's and build scripts' expand with blaze's libraries, made from each crate's record
 and kept in the store; built again over that store, the six apps link none again and expand
@@ -367,7 +367,7 @@ project 3.8 s (the daemon's load; `Finished ... [ra-jit]`), 9.2 s from the first
 10.7 s, 91 MB and 672 MB in `~/.rustup`. All **read**. The Linux release needs glibc 2.39, so
 Debian 12 cannot run it ([#351](https://github.com/indexable-inc/blaze/issues/351)).
 
-2026-10-25, K's first part: with `RA_JIT_WHOLE_BUILD=1`, `cargo blaze build` and `run` from
+2026-10-25, K's first part: with `BLAZE_WHOLE_BUILD=1`, `cargo blaze build` and `run` from
 nothing are the whole build above, no `cargo build` ([cargo.md](cargo.md#what-a-build-does));
 `harness/coldbuild.py` holds its fixtures to cargo's, and with `bench` does bench.py's projects:
 `cargo blaze build` from nothing against `cargo build`, each program's output the same, on

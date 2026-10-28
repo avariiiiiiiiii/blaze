@@ -30,7 +30,7 @@ SIZE = 64 << 20
 # How much room the store has, in bytes. What a cold build of the workspace writes is
 # measured, and the last room is two thirds of it; only the rooms smaller than that are tried.
 ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10]
-SEALS = {"RA_JIT_CACHE_SEAL_AT": "1", "RA_JIT_CACHE_MAX": "off"}
+SEALS = {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "off"}
 NO_ROOM = "There is not enough space on the disk" if WINDOWS else "No space left on device"
 
 
@@ -173,7 +173,7 @@ def kept_again(checkout, disk):
 
 
 # The remote is a directory of this user's, whose lists nobody signs.
-UNSIGNED = {"RA_JIT_REMOTE_UNSIGNED": "1"}
+UNSIGNED = {"BLAZE_REMOTE_UNSIGNED": "1"}
 
 
 def commands(checkout, disk, work):
@@ -186,7 +186,7 @@ def commands(checkout, disk, work):
     status, out = cache(disk.store, "gc", "--max", "0")
     if status != 0 or files(disk.store, ".pack"):
         fail(f"gc --max 0: {out}")
-    status, out = cache(disk.store, "pull", remote, env={"RA_JIT_REMOTE_UNSIGNED": ""})
+    status, out = cache(disk.store, "pull", remote, env={"BLAZE_REMOTE_UNSIGNED": ""})
     if status == 0 or "BLAZE_REMOTE_UNSIGNED=1" not in out or files(disk.store, ".pack"):
         fail(f"pull from lists nobody signed was not refused: {out}")
     disk.leave(64 << 10)

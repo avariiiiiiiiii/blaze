@@ -3,7 +3,7 @@
 through code ra-jit compiles, is rustc's static. Linux and macOS: on Windows `cargo ra-jit`
 hands builds to cargo.
 
-usage: anonstatics.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are
+usage: anonstatics.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are
                           found next to it)
 
 objc2's `declare_class!` (winit 0.30's) keeps a class's ivar offsets in `static mut`s inside a
@@ -114,9 +114,9 @@ def build(ws, env, step):
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     # The daemon's sockets are under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start.
     root = tempfile.mkdtemp(prefix="ra-jit-anonstatics-", dir=None if os.name == "nt" else "/tmp")
@@ -125,8 +125,8 @@ def main():
         os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
         open(os.path.join(root, path), "w").write(text)
     # A store of its own, so that no function compiled by another build of ra-jit is found.
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-               RA_JIT_CACHE=os.path.join(root, "store"))
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
+               BLAZE_CACHE=os.path.join(root, "store"))
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "aapp"), os.path.join(ws, "app", "src", "main.rs")

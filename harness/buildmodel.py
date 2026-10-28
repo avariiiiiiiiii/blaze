@@ -38,7 +38,7 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   on        the architecture of the only hosts the case is of: it is not run on another
   env       the environment of both builds
   run       a script of the case that runs what was built in place of running it directly;
-            it is given ARTIFACT, and RA_JIT_OBJECTS with ra-jit's objects for the second build
+            it is given ARTIFACT, and BLAZE_OBJECTS with ra-jit's objects for the second build
   args      what the program is run with
   expect    "supported" (the default) or "refused"
   open      why the case is known to come out WRONG, or {"linux" | "darwin" | "windows": why} where
@@ -59,7 +59,7 @@ import errno, argparse, glob, json, os, re, shlex, shutil, subprocess, sys, temp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ.pop("RA_JIT_TARGET", None)
+os.environ.pop("BLAZE_TARGET", None)
 import linkline
 from difftest import RA_JIT, host, linker_line
 
@@ -111,9 +111,9 @@ class Case:
         if "linker" in cross:
             self.env["CARGO_TARGET_" + self.target.upper().replace("-", "_") + "_LINKER"] = cross["linker"]
         if backend == "llvm":
-            self.env.update(RA_JIT_BACKEND="llvm", RA_JIT_OPT="2", RA_JIT_EMIT="fast")
+            self.env.update(BLAZE_BACKEND="llvm", BLAZE_OPT="2", BLAZE_EMIT="fast")
         else:
-            self.env["RA_JIT_BACKEND"] = "cranelift"
+            self.env["BLAZE_BACKEND"] = "cranelift"
         self.select = ["-p", self.spec["package"], *self.spec.get("select", [])]
         self.cargo_args = [*self.spec.get("cargo", []), *(["--target", self.target] if self.target else [])]
         self.ra_jit_args = ["--package", self.spec["package"], *self.spec.get("ra-jit", []), *(["--target", self.target] if self.target else [])]
@@ -159,7 +159,7 @@ class Case:
         """What running the build prints and returns."""
         if "run" in self.spec:
             command = ["sh", self.spec["run"]]
-            env = {**env, "ARTIFACT": artifact, "RA_JIT_OBJECTS": " ".join(objects)}
+            env = {**env, "ARTIFACT": artifact, "BLAZE_OBJECTS": " ".join(objects)}
         else:
             command = [*self.runner, artifact, *self.spec.get("args", [])]
         # A program linked to a `dylib` finds it where cargo left it, as `cargo run` has it.
@@ -382,7 +382,7 @@ class Case:
 
     def mid_reload(self, step, env, daemon, ask, binary, before):
         """Catches the daemon in the middle of loading the checkout again (it waits there for
-        RA_JIT_RELOAD_PAUSE_MS and says so) and has clients ask meanwhile. Each runs the program
+        BLAZE_RELOAD_PAUSE_MS and says so) and has clients ask meanwhile. Each runs the program
         it is answered with: that is the one from before the change or cargo's of after it."""
         log = os.path.join(self.work, "daemon.log")
         pauses = lambda: open(log).read().count("reload: paused")

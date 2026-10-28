@@ -23,7 +23,7 @@ signature edits (bench.py's) against cargo's incremental build of each. The edit
 by the daemon's worker on what it loaded for the cold build. The standard library comes from
 a remote `ra-jit std` made once, as a release's does.
 
-RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, as allrajit.py;
+BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it. Linux, as allrajit.py;
 `statics` on macOS too.
 """
 import os, re, shutil, subprocess, sys, tempfile, time
@@ -184,7 +184,7 @@ def write(root, files):
 def env_for(root, remote=None):
     env = base_env(os.path.join(root, "home"))
     if remote:
-        env["RA_JIT_STD_FROM"] = remote
+        env["BLAZE_STD_FROM"] = remote
     return env
 
 

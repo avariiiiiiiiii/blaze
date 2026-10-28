@@ -61,21 +61,21 @@ def main():
         if old not in text:
             results[name] = {"error": f"leaf edit not found in {path}"}
             continue
-        env = dict(os.environ, PATH=f"{BIN}:{os.environ['PATH']}", RA_JIT_HOME=f"/tmp/rjh2-{name}",
-                   RA_JIT_CACHE=f"{APPS}/store2", RUST_BACKTRACE="0", HOME="/root",
+        env = dict(os.environ, PATH=f"{BIN}:{os.environ['PATH']}", BLAZE_HOME=f"/tmp/rjh2-{name}",
+                   BLAZE_CACHE=f"{APPS}/store2", RUST_BACKTRACE="0", HOME="/root",
                    # The build manifest (#550) parses `.md` inputs as Rust on a fresh target with a warm store.
-                   RA_JIT_MANIFEST="off", RA_JIT_TESTS_FROM=f"main of {name}")
+                   BLAZE_MANIFEST="off", BLAZE_TESTS_FROM=f"main of {name}")
         env.pop("CARGO_TARGET_DIR", None)
         args = spec.get("test", [])
         rows = {}
         fresh(ws, env)
-        rows["main"] = run(ws, dict(env, RA_JIT_TESTS="affected"), args, f"{APPS}/{name}.main.log")
+        rows["main"] = run(ws, dict(env, BLAZE_TESTS="affected"), args, f"{APPS}/{name}.main.log")
         print(name, "main", json.dumps(rows["main"]), flush=True)
         open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
-        pr_env = dict(env, RA_JIT_TESTS_FROM=f"PR of {name}")
+        pr_env = dict(env, BLAZE_TESTS_FROM=f"PR of {name}")
         for mode in ("all", "affected", "verify"):
             fresh(ws, env)
-            rows[f"pr {mode}"] = run(ws, dict(pr_env, RA_JIT_TESTS=mode), args, f"{APPS}/{name}.pr-{mode}.log")
+            rows[f"pr {mode}"] = run(ws, dict(pr_env, BLAZE_TESTS=mode), args, f"{APPS}/{name}.pr-{mode}.log")
             print(name, "pr", mode, json.dumps(rows[f"pr {mode}"]), flush=True)
         subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         subprocess.run(["git", "checkout", "-q", "--", "."], cwd=ws)

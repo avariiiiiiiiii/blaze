@@ -1,12 +1,12 @@
 # Test passes from the store on a fresh runner (lane testcache, #647)
 
-What `RA_JIT_TESTS=affected` does on the shape of a CI test job: a fresh target directory and a
+What `BLAZE_TESTS=affected` does on the shape of a CI test job: a fresh target directory and a
 fresh daemon, with a store that main's run filled (as `ra-jit cache pull` gives a runner).
 
 ix VM, arm64 Neoverse-V3, 16 vCPU, 16 GiB committed, cranelift, nightly-2026-10-25, main
 2b97b978ed (#647 merged). Each step one `cargo ra-jit test --no-fail-fast` with the project's
 `cargo_ra_jit.py` test arguments, timed whole (the build from the store and the tests), in a
-systemd unit with `MemoryMax=12G`. `RA_JIT_MANIFEST=off` throughout: with the build manifest
+systemd unit with `MemoryMax=12G`. `BLAZE_MANIFEST=off` throughout: with the build manifest
 (#550) a fresh target with a warm store fails to build fd and ripgrep (`.md` inputs parsed as
 Rust; reported to lane warmstate). The failing tests are the projects' own on this machine (the
 test executable is not in `target/debug/deps`, #595, and the same fail outside the sandbox); a
@@ -40,7 +40,7 @@ The PR's `affected` run is slower than its `all` run on every project. Timed apa
 under `all`, its tests 0.5 s either way; nushell's build 7.9 and 5.0 s against 7.2 and 4.3 s, its
 tests 12.0 and 9.0 s against 14.3 and 10.2 s. The build's extra time is the reach hash the daemon
 writes beside each test program (`tests-reach`, `hir_ty_codegen::tests_reach`): with
-`RA_JIT_STATS=1`, axum's two programs take 8.5 s and 3.6 s (`tests-reach-us`). It walks the MIR
+`BLAZE_STATS=1`, axum's two programs take 8.5 s and 3.6 s (`tests-reach-us`). It walks the MIR
 of everything each test reaches, which a build from a warm store does not otherwise lower. On
 these projects the tests themselves are short, so the walk costs more than the tests it skips.
 That walk is what to make cheaper next.
@@ -71,7 +71,7 @@ are `survey.py`, `survey2.py` and `split.py` here.
 The same one-function PR, before and after the walk hashes a dependency's function by its stable
 name and keeps what is below it in the store: two builds of one tree, differing in that change
 alone. Each project has a store of its own that main's run fills; every PR run starts from a copy
-of it, with a fresh target, daemon and `RA_JIT_HOME`, `all` and `affected` in turn, twice. The
+of it, with a fresh target, daemon and `BLAZE_HOME`, `all` and `affected` in turn, twice. The
 walk is `tests-reach-us` from the daemon's log, summed over the test programs.
 
 | project | ran / cached | `all` | `affected` before | after | walk before | after |

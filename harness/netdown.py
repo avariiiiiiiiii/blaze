@@ -12,7 +12,7 @@ never made). Each build is hello world's whole program, which starts from the st
     prints no error.
   - cold: with an empty store and the remote slow, hung or dead, the build compiles the
     standard library from the start, not after the fetch: it takes as long as a build told to
-    fetch nothing (RA_JIT_STD_FROM=off), within 5% or 0.5 s, where waiting would cost SLOW
+    fetch nothing (BLAZE_STD_FROM=off), within 5% or 0.5 s, where waiting would cost SLOW
     seconds or more, and says that the fetch failed in one line at most.
 
     netdown.py --bin target/release/ra-jit [--toolchain nightly-YYYY-MM-DD]
@@ -76,11 +76,11 @@ class Builds:
 
     def env(self, store, std_from):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR") and not k.startswith("RA_JIT")}
+               if k not in ("RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR") and not k.startswith("BLAZE_")}
         self.runs += 1
         env.update(PATH=os.path.join(self.sysroot, "bin") + os.pathsep + env.get("PATH", ""),
-                   RA_JIT_CACHE=store, RA_JIT_HOME=os.path.join(self.work, f"home-{self.runs}"),
-                   RA_JIT_STD_FROM=std_from, RUST_BACKTRACE="0")
+                   BLAZE_CACHE=store, BLAZE_HOME=os.path.join(self.work, f"home-{self.runs}"),
+                   BLAZE_STD_FROM=std_from, RUST_BACKTRACE="0")
         return env
 
     def build(self, store, std_from):

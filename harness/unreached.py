@@ -2,7 +2,7 @@
 """unreached.py: an edit that calls what the program did not call when it was linked is
 spliced all the same, or the program is built in full. Linux and macOS.
 
-usage: unreached.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: unreached.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
 A patch calls the code of the executable by name, also code the executable's own did not
 reach when it was linked: here `<u16 as Debug>::fmt` and the formatting it calls, which a
@@ -79,9 +79,9 @@ def full_builds(home):
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     # The daemon's sockets are under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start.
     root = tempfile.mkdtemp(prefix="ra-jit-unreached-", dir=None if os.name == "nt" else "/tmp")
@@ -89,7 +89,7 @@ def main():
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home)
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home)
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "uapp"), os.path.join(ws, "app", "src", "main.rs")

@@ -326,7 +326,7 @@ impl std::fmt::Display for NotPublished {
 
 impl std::error::Error for NotPublished {}
 
-/// Where the release's files come from: the Rust project's site, or what `RA_JIT_RUST_DIST`
+/// Where the release's files come from: the Rust project's site, or what `BLAZE_RUST_DIST`
 /// names, an address or a directory with the files in it (a mirror, a machine with no network).
 enum Source {
     Web(Https),
@@ -335,7 +335,7 @@ enum Source {
 
 impl Source {
     fn named(date: &str) -> anyhow::Result<Source> {
-        let given = std::env::var("RA_JIT_RUST_DIST").ok().filter(|it| !it.is_empty());
+        let given = std::env::var("BLAZE_RUST_DIST").ok().filter(|it| !it.is_empty());
         if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
             return Ok(Source::Dir(PathBuf::from(dir)));
         }

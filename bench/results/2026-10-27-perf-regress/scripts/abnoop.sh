@@ -15,8 +15,8 @@ git -C $wt checkout -q --force --detach "$rev"
 tc=$(cat $wt/harness/toolchain)
 rustup toolchain install "$tc" --profile minimal -c rust-src >/dev/null 2>&1
 std=$(ls -d /root/perf/work/$rev-cranelift/std-cranelift 2>/dev/null | head -1)
-export RA_JIT_HOME=$p/home RA_JIT_CACHE=$p/store RA_JIT_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
-export RA_JIT_STD_FROM=$std RUST_BACKTRACE=0 CARGO_TERM_COLOR=never
+export BLAZE_HOME=$p/home BLAZE_CACHE=$p/store BLAZE_BACKEND=cranelift RUSTUP_TOOLCHAIN=$tc
+export BLAZE_STD_FROM=$std RUST_BACKTRACE=0 CARGO_TERM_COLOR=never
 export PATH=$bin:$PATH
 cd $p/rg
 t() { local s=$(date +%s%N); "$@"; local e=$(date +%s%N); echo $(( (e - s) / 1000000 ))ms; }

@@ -349,7 +349,7 @@ impl Baseline {
         let object = std::fs::read(object_path)?;
         let read = start.elapsed();
         let (spliced, defined) = self.splice_as(&object, &AtomicBool::new(false), true)?;
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let us = |it: std::time::Duration| it.as_micros();
             eprintln!("splice-whole-us: read={} splice={}", us(read), us(start.elapsed() - read));
         }
@@ -383,7 +383,7 @@ impl Baseline {
         let (mut addition, len, pointed, lasting) = match &*self.image {
             Executable::Elf(image) => {
                 let patch = Patch::read(patch, image, whole)?;
-                if whole && std::env::var_os("RA_JIT_STATS").is_some() {
+                if whole && std::env::var_os("BLAZE_STATS").is_some() {
                     eprintln!("splice-us: read={}", start.elapsed().as_micros());
                 }
                 self.has_baked(patch.replaced.iter().map(|it| it.name))?;
@@ -480,7 +480,7 @@ impl Baseline {
         self.stamp = Stamp::of(&file)?;
         let redirected_at = start.elapsed();
         writing.done()?;
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let us = |it: std::time::Duration| it.as_micros();
             eprintln!(
                 "splice-us: place={} copy={} append={} write={} redirect={} close={}",
@@ -852,7 +852,7 @@ fn laid_out(path: &Path, image: &Image, lock: Option<File>) -> std::io::Result<d
     if paused {
         eprintln!("laid out: written");
     }
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         let bytes: u64 = moved.iter().map(|it| it.len).sum();
         eprintln!("laid out: {bytes} bytes of debug info in {:.1?}", start.elapsed());
     }
@@ -889,11 +889,11 @@ fn let_go(file: &File, from: u64, len: u64) {
     }
 }
 
-/// Waits for `RA_JIT_LAYOUT_PAUSE_MS` with the executable open for writing, and says so, as
+/// Waits for `BLAZE_LAYOUT_PAUSE_MS` with the executable open for writing, and says so, as
 /// `laid_out` says when the write is over: `harness/cargo_ra_jit.py` has a client be given
 /// the program meanwhile, every way a user is given one.
 fn pause_mid_write() -> bool {
-    let pause = std::env::var("RA_JIT_LAYOUT_PAUSE_MS").ok().and_then(|it| it.parse().ok());
+    let pause = std::env::var("BLAZE_LAYOUT_PAUSE_MS").ok().and_then(|it| it.parse().ok());
     if let Some(pause) = pause {
         eprintln!("laid out: paused");
         std::thread::sleep(std::time::Duration::from_millis(pause));
@@ -1516,7 +1516,7 @@ impl Image {
         };
         // For the harness: every function shorter than a jump hops, as one with none of the
         // linker's padding behind it has to.
-        let hops = std::env::var_os("RA_JIT_SPLICE_HOPS").is_some();
+        let hops = std::env::var_os("BLAZE_SPLICE_HOPS").is_some();
         for symbol in file.symbols() {
             // A global label of assembly, of no type and no size, which `object` counts as
             // no definition, is one to the linker.
@@ -2161,7 +2161,7 @@ impl<'a> Patch<'a> {
                 .filter(|name| !image.imports.contains_key(*name))
                 .map(String::from_utf8_lossy)
                 .collect();
-            if std::env::var_os("RA_JIT_STATS").is_some() {
+            if std::env::var_os("BLAZE_STATS").is_some() {
                 eprintln!("splice: not in the executable: {missing:?}");
             }
             ensure!(

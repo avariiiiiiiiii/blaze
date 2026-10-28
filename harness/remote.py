@@ -7,8 +7,8 @@ print what cargo's build prints. Then the transfer is broken in every way the pr
 s3fake.py knows, the objects are spoiled, and the lists are forged; each time B has to end
 with either the pack as A sent it or no pack, and a build that prints the same.
 
-It runs against MinIO and SeaweedFS as it finds them (`RA_JIT_MINIO`, `RA_JIT_WEED`, PATH,
-`~/s3tools`). With `RA_JIT_S3_REMOTE=s3://bucket/prefix` it runs against that instead, with
+It runs against MinIO and SeaweedFS as it finds them (`BLAZE_MINIO`, `BLAZE_WEED`, PATH,
+`~/s3tools`). With `BLAZE_S3_REMOTE=s3://bucket/prefix` it runs against that instead, with
 the credentials the AWS tools would use from the environment, and leaves out what needs the
 proxy or needs to kill the service.
 
@@ -29,7 +29,7 @@ from packs import FORMAT, sealed as pack_of, records as records_of
 MIB = 1 << 20
 # Enough for three parts of a multipart upload.
 BIG = 20 * MIB
-REAL = os.environ.get("RA_JIT_S3_REMOTE")
+REAL = os.environ.get("BLAZE_S3_REMOTE")
 # An object the harness keeps in a bucket of its own to see that the service reads again.
 PROBE = "harness-probe"
 # The longest a service may be away, in seconds, for a fetch to have to ride it out.
@@ -146,11 +146,11 @@ class Machine:
         for it in (self.home, self.out):
             os.makedirs(it)
         home = os.path.expanduser("~")
-        self.env = {**{k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "RA_JIT_REMOTE", "RA_JIT_CACHE"))},
+        self.env = {**{k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "BLAZE_REMOTE", "BLAZE_CACHE"))},
                     "HOME": self.home, "CARGO_HOME": os.environ.get("CARGO_HOME", f"{home}/.cargo"),
-                    "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", f"{home}/.rustup"), "RA_JIT_CACHE": self.store,
+                    "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", f"{home}/.rustup"), "BLAZE_CACHE": self.store,
                     # Most of what is checked here is the transfer, between machines that name no keys.
-                    "RA_JIT_REMOTE_UNSIGNED": "1",
+                    "BLAZE_REMOTE_UNSIGNED": "1",
                     **({k: os.environ[k] for k in os.environ if k.startswith("AWS_")} if not remote.server else {}),
                     **remote.env}
         self.said = ""
@@ -276,7 +276,7 @@ def round_trip(top, remote, name, crates, target, workspace):
     for machine in (a, b):
         machine.checkout(workspace)
         machine.cargo(target)
-    log, _ = a.build(crates, env={"RA_JIT_REMOTE": address})
+    log, _ = a.build(crates, env={"BLAZE_REMOTE": address})
     expected = a.run(a.reference)
     check("A compiles and its program prints what cargo's does", compiled(log) and a.run() == expected, f"{compiled(log)} compiled")
     # A store too small to seal is sent by the next thing that finds it left open.
@@ -293,7 +293,7 @@ def round_trip(top, remote, name, crates, target, workspace):
     out = a.ra_jit("cache", "push", address)
     check("a second push sends nothing", out.returncode == 0 and transferred(out).startswith("0 packs added"), out.stdout.strip())
 
-    log, _ = b.build(crates, env={"RA_JIT_REMOTE": address})
+    log, _ = b.build(crates, env={"BLAZE_REMOTE": address})
     check("B fetches and compiles nothing", compiled(log) == 0 and all(b.packs().values()) and set(a.packs()) <= set(b.packs()),
           f"{said_number(log, 'functions found')} found, {compiled(log)} compiled")
     check("B's program prints what A's and cargo's do", b.run() == expected == b.run(b.reference))
@@ -308,10 +308,10 @@ def configuration(top, remote, a, address, bucket):
     print(f"{remote.name}: credentials, addressing, reading only", flush=True)
     c = Machine(top, f"config-{remote.name}", remote)
     before = bucket.objects()
-    out = a.ra_jit("cache", "push", address, "other", env={"RA_JIT_REMOTE_READONLY": "1"})
+    out = a.ra_jit("cache", "push", address, "other", env={"BLAZE_REMOTE_READONLY": "1"})
     check("a machine that only reads refuses to push and says why",
           out.returncode != 0 and "BLAZE_REMOTE_READONLY" in out.stderr and bucket.objects() == before, out.stderr.strip()[-80:])
-    out = c.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_READONLY": "1"})
+    out = c.ra_jit("cache", "pull", address, env={"BLAZE_REMOTE_READONLY": "1"})
     check("and pulls", out.returncode == 0 and all(c.packs().values()) and c.packs(), out.stdout.strip())
     if not remote.server:
         return
@@ -368,7 +368,7 @@ def transfers(top, remote):
     """Every way the proxy can break a transfer, and the service killed under it."""
     print(f"{remote.name}: transfers that break", flush=True)
     proxy, counter = remote.proxy, [0]
-    quick = {"RA_JIT_REMOTE_TIMEOUT": "2"}
+    quick = {"BLAZE_REMOTE_TIMEOUT": "2"}
 
     def pair(what):
         counter[0] += 1
@@ -453,7 +453,7 @@ def transfers(top, remote):
     a, b, address, bucket, name = pushed("slow answer")
     proxy.hold = 4
     start = time.time()
-    out = b.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_TIMEOUT": "1", "AWS_MAX_ATTEMPTS": "2"})
+    out = b.ra_jit("cache", "pull", address, env={"BLAZE_REMOTE_TIMEOUT": "1", "AWS_MAX_ATTEMPTS": "2"})
     check("a service that takes 4s to answer with 1s of patience: given up, said",
           out.returncode != 0 and not b.packs() and time.time() - start < 45, f"{time.time() - start:.1f}s {out.stderr.strip()[-50:]}")
     proxy.hold = 0
@@ -507,10 +507,10 @@ def transfers(top, remote):
         a.add_pack(filler(f"{remote.name} small {at}", 64 << 10))
     proxy.clear()
     proxy.hold = 0.05
-    out = a.ra_jit("cache", "push", address, env={"RA_JIT_REMOTE_JOBS": "3"})
+    out = a.ra_jit("cache", "push", address, env={"BLAZE_REMOTE_JOBS": "3"})
     most = proxy.most_flying
     proxy.most_flying = 0
-    out2 = b.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_JOBS": "3"})
+    out2 = b.ra_jit("cache", "pull", address, env={"BLAZE_REMOTE_JOBS": "3"})
     check("twelve packs with three requests at a time: never more in flight",
           out.returncode == 0 and out2.returncode == 0 and 2 <= most <= 3 and 2 <= proxy.most_flying <= 3 and len(b.packs()) == 12
           and all(b.packs().values()),
@@ -599,7 +599,7 @@ def stored(top, remote):
     check("packs that were evicted are fetched again", ok and collected.get("evicted packs") == 6 and out.returncode == 0
           and whole and sorted(b.packs()) == sorted(sent) and said_number(out.stderr, "bytes received") > 6 * MIB)
 
-    limit = {"RA_JIT_CACHE_MAX": str(3 * MIB + 4096)}
+    limit = {"BLAZE_CACHE_MAX": str(3 * MIB + 4096)}
     packs_fetched(remote)
     out = c.ra_jit("cache", "pull", address, env=limit)
     _, counted, _ = c.cache("stats", env=limit)
@@ -691,7 +691,7 @@ def collected(top, remote):
     out, _ = gc(a, address, "--unlisted-after", "1h")
     check("an unlisted object cannot be given less than a push takes it as sent for",
           out.returncode != 0 and "at least 7200 seconds" in out.stderr and bucket.objects() == before)
-    out, _ = gc(a, address, env={"RA_JIT_REMOTE_READONLY": "1"})
+    out, _ = gc(a, address, env={"BLAZE_REMOTE_READONLY": "1"})
     check("a machine that only reads collects nothing", out.returncode != 0 and "BLAZE_REMOTE_READONLY" in out.stderr)
     if not remote.proxy:
         print("given: the checks that need old objects are left out: they need the proxy to say they are old")
@@ -721,7 +721,7 @@ def collected(top, remote):
     key_file = os.path.join(remote.keys, "collector")
     public = a.ra_jit("cache", "keygen", key_file).stdout.strip()
     aged(3 * DAYS)
-    out, said = gc(a, address, "--older-than", "1d", env={"RA_JIT_REMOTE_SIGN": key_file, "RA_JIT_REMOTE_TRUST": public})
+    out, said = gc(a, address, "--older-than", "1d", env={"BLAZE_REMOTE_SIGN": key_file, "BLAZE_REMOTE_TRUST": public})
     check("a list of another signer is left with its lines and what they name",
           out.returncode == 0 and said.get("manifests left that this machine does not trust") == [1]
           and said.get("objects removed") == [0] and bucket.objects() == left, out.stdout.replace("\n", "; ")[:110])
@@ -788,7 +788,7 @@ def kept(top, remote, crates, target, workspace):
     packs = lambda: [it for it in bucket.objects() if it.startswith("packs/")]
     listed = lambda: len((bucket.get("manifests/default") or b"").splitlines())
 
-    daemon, socket = a.daemon(crates, {"RA_JIT_REMOTE": address, "RA_JIT_REMOTE_PUSH_EVERY": "2s"})
+    daemon, socket = a.daemon(crates, {"BLAZE_REMOTE": address, "BLAZE_REMOTE_PUSH_EVERY": "2s"})
     try:
         check("what the first build compiled is sent without being asked, small as it is",
               until(lambda: listed() >= 1) and len(packs()) == listed(), f"{listed()} packs listed")
@@ -824,7 +824,7 @@ def kept(top, remote, crates, target, workspace):
           and counted.get("open packs") == 0 and out.returncode == 0 and transferred(out).startswith("0 packs added"),
           f"exit {ended}; {out.stdout.strip()[:40]}")
 
-    daemon, socket = a.daemon(crates, {"RA_JIT_REMOTE": address, "RA_JIT_REMOTE_PUSH_EVERY": "off"})
+    daemon, socket = a.daemon(crates, {"BLAZE_REMOTE": address, "BLAZE_REMOTE_PUSH_EVERY": "off"})
     try:
         time.sleep(1)
         before = listed()
@@ -839,7 +839,7 @@ def kept(top, remote, crates, target, workspace):
           f"{before}, {unsent}, then {listed()} packs listed")
     c = Machine(top, f"d-{remote.name}-c", remote)
     c.ws, c.link_args, c.reference = a.ws, a.link_args, a.reference
-    log, _ = c.build(crates, env={"RA_JIT_REMOTE": address})
+    log, _ = c.build(crates, env={"BLAZE_REMOTE": address})
     check("another machine builds the edited program and compiles nothing", compiled(log) == 0 and "edited with no schedule" in c.run(),
           f"{compiled(log)} compiled")
 
@@ -894,7 +894,7 @@ def over_tls(top, remote):
               and digest(bucket.get("packs/" + name)) == name[:-5], out.stdout.strip())
         b.empty()
         start = time.time()
-        out = b.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_TIMEOUT": "2"})
+        out = b.ra_jit("cache", "pull", address, env={"BLAZE_REMOTE_TIMEOUT": "2"})
         took = time.time() - start
         check("a certificate nobody vouches for: refused, said, nothing fetched",
               out.returncode != 0 and not b.packs() and not b.partials() and "ertificate" in out.stderr, out.stderr.strip()[-90:])
@@ -954,19 +954,19 @@ def spoiled(top, remote):
 def guarded(top, remote):
     """Lists nobody signed, lists that were put back, and objects longer than they are listed as."""
     print(f"{remote.name}: unsigned lists, old lists, long objects", flush=True)
-    nothing_asked = {"RA_JIT_REMOTE_UNSIGNED": ""}
+    nothing_asked = {"BLAZE_REMOTE_UNSIGNED": ""}
     address, bucket = remote.fresh()
     a, b, c, d = (Machine(top, f"u-{remote.name}-{it}", remote) for it in "abcd")
     first = a.add_pack(filler(f"{remote.name} guarded 1", MIB))
     out = a.ra_jit("cache", "push", address, env=nothing_asked)
     check("a machine with no keys pushes without being asked anything", out.returncode == 0 and "packs/" + first in bucket.objects())
     for value in ("", "0", "true"):
-        out = b.ra_jit("cache", "pull", address, env={"RA_JIT_REMOTE_UNSIGNED": value})
-        check(f"a list nobody signed is not taken with RA_JIT_REMOTE_UNSIGNED={value!r}",
+        out = b.ra_jit("cache", "pull", address, env={"BLAZE_REMOTE_UNSIGNED": value})
+        check(f"a list nobody signed is not taken with BLAZE_REMOTE_UNSIGNED={value!r}",
               out.returncode != 0 and "BLAZE_REMOTE_UNSIGNED=1" in out.stderr and not b.packs() and not b.partials(),
               out.stderr.strip()[-60:])
     out = b.ra_jit("cache", "pull", address)
-    check("and is with RA_JIT_REMOTE_UNSIGNED=1", out.returncode == 0 and b.packs().get(first) is True, out.stdout.strip())
+    check("and is with BLAZE_REMOTE_UNSIGNED=1", out.returncode == 0 and b.packs().get(first) is True, out.stdout.strip())
 
     # A pack is as long as its list says, as it is sent and as it unpacks: one byte less
     # listed of either, and it is not what was listed.
@@ -1026,7 +1026,7 @@ def guarded(top, remote):
     key_file = os.path.join(remote.keys, "guarded.key")
     public = a.ra_jit("cache", "keygen", key_file).stdout.strip()
     address, bucket = remote.fresh()
-    signing, trusting = {"RA_JIT_REMOTE_SIGN": key_file}, {"RA_JIT_REMOTE_TRUST": public, "RA_JIT_REMOTE_UNSIGNED": ""}
+    signing, trusting = {"BLAZE_REMOTE_SIGN": key_file}, {"BLAZE_REMOTE_TRUST": public, "BLAZE_REMOTE_UNSIGNED": ""}
     turn = lambda listed: int(listed.decode().splitlines()[-1].split()[2])
     a.ra_jit("cache", "push", address, env=signing)
     old = bucket.get("manifests/default")
@@ -1118,7 +1118,7 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
     sent = [change(fields) for fields in listed]
     _, _, records, changed = sent[0]
     b = machine("changed")
-    log, _ = b.build(crates, env={"RA_JIT_REMOTE": address})
+    log, _ = b.build(crates, env={"BLAZE_REMOTE": address})
     # B's own pack can be one of A's to the byte, name and all: it compiled the same code, and
     # a pack of one build is the same as another's whenever the values went in in the same
     # order. What B must not have is a changed pack, under A's name or under its own.
@@ -1135,12 +1135,12 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
     key_file = os.path.join(remote.keys, "a.key")
     public = a.ra_jit("cache", "keygen", key_file).stdout.strip()
     signed_address, signed_bucket = remote.fresh()
-    signing = {"RA_JIT_REMOTE_SIGN": key_file}
+    signing = {"BLAZE_REMOTE_SIGN": key_file}
     out = a.ra_jit("cache", "push", signed_address, env=signing)
     trusted = signed_bucket.get("manifests/default").decode()
     check("A signs its manifest", out.returncode == 0 and trusted.splitlines()[-1].startswith(f"signed {public} "))
     b = machine("signed")
-    log, _ = b.build(crates, env={"RA_JIT_REMOTE": signed_address, "RA_JIT_REMOTE_TRUST": public})
+    log, _ = b.build(crates, env={"BLAZE_REMOTE": signed_address, "BLAZE_REMOTE_TRUST": public})
     check("B, trusting A's key, fetches and compiles nothing", compiled(log) == 0 and b.run() == expected)
 
     forged_name = digest(changed)
@@ -1154,38 +1154,38 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
 
     forge(signed_bucket, trusted.splitlines()[-1] + "\n")
     b = machine("forged")
-    log, _ = b.build(crates, env={"RA_JIT_REMOTE": signed_address, "RA_JIT_REMOTE_TRUST": public})
+    log, _ = b.build(crates, env={"BLAZE_REMOTE": signed_address, "BLAZE_REMOTE_TRUST": public})
     check("a forged manifest under A's old signature: refused, nothing fetched, same program",
           "is not what" in log and not b.packs().get(forged_name + ".pack") and compiled(log) > 0 and b.run() == expected,
           f"{compiled(log)} compiled")
     forge(signed_bucket)
     b = machine("unsigned")
-    log, _ = b.build(crates, env={"RA_JIT_REMOTE": signed_address, "RA_JIT_REMOTE_TRUST": public})
+    log, _ = b.build(crates, env={"BLAZE_REMOTE": signed_address, "BLAZE_REMOTE_TRUST": public})
     check("a forged manifest with no signature: refused", "is not signed" in log and forged_name + ".pack" not in b.packs()
           and b.run() == expected)
     other_key = os.path.join(remote.keys, "other.key")
     a.ra_jit("cache", "keygen", other_key)
     c = Machine(top, f"p-{remote.name}-other", remote)
     shutil.copytree(a.store, c.store)
-    out = c.ra_jit("cache", "push", signed_address, env={"RA_JIT_REMOTE_SIGN": other_key})
+    out = c.ra_jit("cache", "push", signed_address, env={"BLAZE_REMOTE_SIGN": other_key})
     b = machine("stranger")
-    log, _ = b.build(crates, env={"RA_JIT_REMOTE": signed_address, "RA_JIT_REMOTE_TRUST": public})
+    log, _ = b.build(crates, env={"BLAZE_REMOTE": signed_address, "BLAZE_REMOTE_TRUST": public})
     check("a manifest signed by a key B does not trust: refused", out.returncode == 0 and "not a key this machine trusts" in log
           and compiled(log) > 0 and b.run() == expected)
-    out = c.ra_jit("cache", "push", signed_address, env={"RA_JIT_REMOTE_TRUST": public})
+    out = c.ra_jit("cache", "push", signed_address, env={"BLAZE_REMOTE_TRUST": public})
     check("a machine that trusts and cannot sign does not push", out.returncode != 0 and "BLAZE_REMOTE_SIGN" in out.stderr)
 
     # 3. What B does with the forged manifest when it trusts nobody: said in the report.
     forge(bucket)
     b = machine("trusting")
     try:
-        log, _ = b.build(crates, env={"RA_JIT_REMOTE": address})
+        log, _ = b.build(crates, env={"BLAZE_REMOTE": address})
         took = forged_name + ".pack" in b.packs()
         same = b.run() == expected
-        print(f"  (with RA_JIT_REMOTE_UNSIGNED=1 and no RA_JIT_REMOTE_TRUST the forged pack is {'taken' if took else 'not taken'}; "
+        print(f"  (with BLAZE_REMOTE_UNSIGNED=1 and no BLAZE_REMOTE_TRUST the forged pack is {'taken' if took else 'not taken'}; "
               f"the program prints {'the same' if same else 'something else'})")
     except (SystemExit, subprocess.TimeoutExpired) as error:
-        print(f"  (with RA_JIT_REMOTE_UNSIGNED=1 and no RA_JIT_REMOTE_TRUST the forged pack is taken and the build fails: {str(error)[-200:]!r})")
+        print(f"  (with BLAZE_REMOTE_UNSIGNED=1 and no BLAZE_REMOTE_TRUST the forged pack is taken and the build fails: {str(error)[-200:]!r})")
     bucket.put("manifests/default", manifest.encode())
 
 
@@ -1199,7 +1199,7 @@ def lazy(top, remote, a, crates, target, workspace, expected):
     b = Machine(top, f"lazy-{remote.name}", remote)
     b.checkout(workspace)
     b.cargo(target)
-    log, _ = b.build(crates, env={"RA_JIT_REMOTE": address, "RA_JIT_REMOTE_LAZY": "1"})
+    log, _ = b.build(crates, env={"BLAZE_REMOTE": address, "BLAZE_REMOTE_LAZY": "1"})
     check("B compiles nothing, and prints the same", out.returncode == 0 and compiled(log) == 0 and b.run() == expected,
           f"{compiled(log)} compiled")
     check("the pack no key was asked of is not fetched", b.packs() and unused not in b.packs() and all(b.packs().values()),
@@ -1213,7 +1213,7 @@ def checks():
     if REAL:
         remotes.append(Remote("given", None, top))
     else:
-        for kind, variable in (("minio", "RA_JIT_MINIO"), ("weed", "RA_JIT_WEED")):
+        for kind, variable in (("minio", "BLAZE_MINIO"), ("weed", "BLAZE_WEED")):
             binary = find(kind, variable)
             if binary:
                 remotes.append(Remote(kind, Server(kind, binary, top), top))
@@ -1255,7 +1255,7 @@ def measure(args):
     """A fresh machine to a running program: cargo and ra-jit alone, then with what A sent."""
     top = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-remote-measure-"))
     crates, target = args.crate.split(","), ["-p", args.package, "--bin", args.bin]
-    binary = find("minio", "RA_JIT_MINIO")
+    binary = find("minio", "BLAZE_MINIO")
     remote = Remote("given", None, top) if REAL else Remote("minio", Server("minio", binary, top), top)
     run_args = shlex.split(args.run)
 
@@ -1300,7 +1300,7 @@ def measure(args):
     try:
         remote.start()
         address, bucket = remote.fresh()
-        a, alone = fresh("a", {"RA_JIT_REMOTE": address}, None)
+        a, alone = fresh("a", {"BLAZE_REMOTE": address}, None)
         show("A, nothing anywhere, sends its store", alone)
         out = a.ra_jit("deps", "push", address, os.path.join("target", "debug"), cwd=a.ws)
         print(f"    {out.stdout.strip()} | {out.stderr.strip().splitlines()[-1]}")
@@ -1309,11 +1309,11 @@ def measure(args):
         print(f"    the bucket: {len(sizes)} objects, {sum(sizes.values())} bytes")
         _, without = fresh("without", {}, False)
         show("B without the remote", without)
-        _, with_code = fresh("code", {"RA_JIT_REMOTE": address, "RA_JIT_REMOTE_READONLY": "1"}, False)
+        _, with_code = fresh("code", {"BLAZE_REMOTE": address, "BLAZE_REMOTE_READONLY": "1"}, False)
         show("B with the store of the remote only", with_code)
-        _, with_all = fresh("all", {"RA_JIT_REMOTE": address, "RA_JIT_REMOTE_READONLY": "1"}, True)
+        _, with_all = fresh("all", {"BLAZE_REMOTE": address, "BLAZE_REMOTE_READONLY": "1"}, True)
         show("B with the store and cargo's units", with_all)
-        _, lazily = fresh("lazy", {"RA_JIT_REMOTE": address, "RA_JIT_REMOTE_READONLY": "1", "RA_JIT_REMOTE_LAZY": "1"}, True)
+        _, lazily = fresh("lazy", {"BLAZE_REMOTE": address, "BLAZE_REMOTE_READONLY": "1", "BLAZE_REMOTE_LAZY": "1"}, True)
         show("B the same, packs fetched as asked for", lazily)
         same = len({it["printed"] for it in (alone, without, with_code, with_all, lazily)}) == 1
         print("every program printed the same" if same else "THE PROGRAMS DO NOT PRINT THE SAME")

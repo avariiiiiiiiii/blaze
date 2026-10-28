@@ -59,9 +59,9 @@ jobs:
           LATENCY_ROUNDS: ${{ inputs.rounds || '1' }}
           # The file has what it ran on (commit, run, host, battery) for benchhistory.py live.
           LATENCY_JSON: ${{ runner.temp }}/latency.json
-          RA_JIT_BENCH_MACHINE: GitHub macos-15 runner
-          RA_JIT_IDLE_SECS: "0"
-        run: RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'socket burst replay' }}
+          BLAZE_BENCH_MACHINE: GitHub macos-15 runner
+          BLAZE_IDLE_SECS: "0"
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'socket burst replay' }}
       - name: what the workers said
         if: always()
         run: |

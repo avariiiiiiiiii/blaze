@@ -2,7 +2,7 @@
 """spaces.py: a workspace under a directory whose name has a space in it, built end to end by
 `cargo ra-jit build` (issue #14).
 
-usage: spaces.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are
+usage: spaces.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are
                      found next to it)
 
 The directory is also named with `$$`, `#` and a quote, which rustc's dep-info files write as
@@ -91,15 +91,15 @@ def own_names(ws):
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     root = tempfile.mkdtemp(prefix="ra-jit sp $$ #'q' ", dir="/tmp")
     ws, home = os.path.join(root, "work space"), os.path.join(root, "home")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home)
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home)
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program = os.path.join(ws, "target", "debug", "sapp")

@@ -64,14 +64,14 @@ def main():
     os.makedirs(cargo_home, exist_ok=True)
     log = f"{L}/logs/{name}.log"
     open(log, "w").close()
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("RA_JIT", "RUSTC", "CARGO"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("BLAZE_", "RUSTC", "CARGO"))}
     prefix = os.environ.get("NR_PATH_PREFIX", "")
     env.update(PATH=f"{L}/target/release:{prefix + ':' if prefix else ''}/run/current-system/sw/bin:{env['PATH']}",
                RUSTUP_TOOLCHAIN="nr-pin",
-               RA_JIT_HOME=home, RA_JIT_CACHE=store, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
-               RA_JIT_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
+               BLAZE_HOME=home, BLAZE_CACHE=store, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
+               BLAZE_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
     if base == "bun":
-        env["RA_JIT_OTHER_TOOLCHAIN"] = "1"
+        env["BLAZE_OTHER_TOOLCHAIN"] = "1"
     # A release ships the standard library its builds start from (crates/ra-jit/src/shipped.rs):
     # made here by the ra-jit under test as the release workflow makes it, from the toolchain
     # the builds use, and fetched by the first build. NR_STD=build has the builds make it.
@@ -80,7 +80,7 @@ def main():
         shipped = f"{L}/std-remote"
         # What the toolchain runs for it is the release's, not the build's: counted apart.
         subprocess.run(["ra-jit", "std", shipped, toolchain], env=dict(env, NR_LOG=f"{L}/logs/std.log"), check=True)
-        env["RA_JIT_STD_FROM"] = shipped
+        env["BLAZE_STD_FROM"] = shipped
     extra = json.loads(os.environ.get("NR_ENV", "{}"))
     env.update(extra)
     steps_out = f"{L}/logs/{name}.steps.jsonl"

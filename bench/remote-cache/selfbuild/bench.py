@@ -12,7 +12,7 @@ JOB   build (cargo build -p ra-jit --release --features llvm) or test (the unit 
       harness/unittests.py runs them: root crates, then the fork's in vendor/rust-analyzer).
 
 Blaze runs are each a fresh CI job: a fresh copy of the tree, an empty target dir, a new
-RA_JIT_HOME, and the store. Run inside `nix develop`."""
+BLAZE_HOME, and the store. Run inside `nix develop`."""
 import os, shutil, subprocess, sys, time
 from pathlib import Path
 
@@ -29,10 +29,10 @@ SPEC = "blaze+https://blaze-gateway.indexable.workers.dev/t/rcache-test/v3"
 
 def remote_env(env):
     """The gateway's token, signing key and trust, from files never printed."""
-    env = dict(env, RA_JIT_REMOTE_REQUIRED="1", RA_JIT_REMOTE_TOKEN=Path("/root/.rcache-token").read_text().strip(),
-               RA_JIT_REMOTE_TRUST=Path("/root/.rcache-pub").read_text().strip())
+    env = dict(env, BLAZE_REMOTE_REQUIRED="1", BLAZE_REMOTE_TOKEN=Path("/root/.rcache-token").read_text().strip(),
+               BLAZE_REMOTE_TRUST=Path("/root/.rcache-pub").read_text().strip())
     if Path("/root/.rcache-sign").exists():
-        env["RA_JIT_REMOTE_SIGN"] = "/root/.rcache-sign"
+        env["BLAZE_REMOTE_SIGN"] = "/root/.rcache-sign"
     return env
 
 
@@ -91,7 +91,7 @@ def main():
     run.mkdir(parents=True)
     log = run / "log"
     env = dict(os.environ, RUST_BACKTRACE="0", CARGO_INCREMENTAL="0")
-    for k in ("RUSTC_WRAPPER", "RA_JIT_WHOLE_BUILD"):
+    for k in ("RUSTC_WRAPPER", "BLAZE_WHOLE_BUILD"):
         env.pop(k, None)
     store = run / "store"
     if ARM == "cargo":
@@ -118,8 +118,8 @@ def main():
             store.mkdir()
         home = run / "home"
         home.mkdir(mode=0o700)
-        env.update(PATH=f"{BIN}:{env['PATH']}", RA_JIT_HOME=str(home), RA_JIT_CACHE=str(store),
-                   RA_JIT_CACHE_MAX="off", RA_JIT_STATS="1", RA_JIT_TRACE=str(run / "trace"),
+        env.update(PATH=f"{BIN}:{env['PATH']}", BLAZE_HOME=str(home), BLAZE_CACHE=str(store),
+                   BLAZE_CACHE_MAX="off", BLAZE_STATS="1", BLAZE_TRACE=str(run / "trace"),
                    CARGO_TARGET_DIR=str(tree / "target"))
         knobs = RB / "bench.env"
         if knobs.exists():

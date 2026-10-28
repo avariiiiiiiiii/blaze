@@ -6,7 +6,7 @@ use std::{io, process::Command, sync::OnceLock};
 
 /// What a server is started with when the caller asked for it to run outside a wrapper: the
 /// wrapper is given the command with it set, and leaves such a command as it is.
-pub const UNSANDBOXED: &str = "RA_JIT_PROC_MACROS_UNSANDBOXED";
+pub const UNSANDBOXED: &str = "BLAZE_PROC_MACROS_UNSANDBOXED";
 
 /// Makes the command a server is started with of the one it would be started with, or says
 /// why it can't: the server then does not start (there is no starting it unwrapped instead).

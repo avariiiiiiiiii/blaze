@@ -1,6 +1,6 @@
 //! Codegen units: the functions of a build of a whole program compiled by LLVM many to a
 //! module, as rustc compiles the codegen units of a crate (issue #176). A build compiles in
-//! units with `RA_JIT_UNITS=1`; otherwise each function is a module of its own.
+//! units with `BLAZE_UNITS=1`; otherwise each function is a module of its own.
 //!
 //! A compile of one function is a module of its own, and each imports what it calls
 //! ([`super::imports`]): two that call one function each link its body in and optimize it.
@@ -65,19 +65,19 @@ use super::{
 
 /// About how many instructions of IR a unit has: a function larger than [`super::LARGE`] is
 /// a unit of its own, and a build too small to give every core a few units of this size is
-/// cut finer, down to [`SMALLEST`]. `RA_JIT_UNIT_SIZE` sets it.
+/// cut finer, down to [`SMALLEST`]. `BLAZE_UNIT_SIZE` sets it.
 const UNIT: usize = 20_000;
 const SMALLEST: usize = 2_000;
 /// The most functions a unit has.
 const MEMBERS: usize = 256;
 
-/// Whether the build under way compiles in units: with `RA_JIT_UNITS=1`, one of a whole
+/// Whether the build under way compiles in units: with `BLAZE_UNITS=1`, one of a whole
 /// program whose compiles import what they call, to ELF. The code of a function of a unit
 /// is of the unit, so a build that takes edits, whose functions are compiled again one at a
 /// time, has none; the other formats are compiled a function to a module.
 pub(super) fn enabled() -> bool {
     static ASKED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("RA_JIT_UNITS").is_some_and(|it| it == "1"));
+        LazyLock::new(|| std::env::var_os("BLAZE_UNITS").is_some_and(|it| it == "1"));
     *ASKED
         && imports::enabled()
         && super::Target::selected().is_ok_and(|it| it.object_format == ObjectFormat::Elf)
@@ -85,7 +85,7 @@ pub(super) fn enabled() -> bool {
 
 fn unit_size() -> usize {
     static SIZE: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("RA_JIT_UNIT_SIZE").ok().and_then(|it| it.parse().ok()).unwrap_or(UNIT)
+        std::env::var("BLAZE_UNIT_SIZE").ok().and_then(|it| it.parse().ok()).unwrap_or(UNIT)
     });
     *SIZE
 }
@@ -311,7 +311,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             hydrate: self.hydrate,
             told: told.as_ref(),
         };
-        let stats = std::env::var_os("RA_JIT_STATS").is_some();
+        let stats = std::env::var_os("BLAZE_STATS").is_some();
         let mut codes = Vec::new();
         while !wave.is_empty() {
             let began = stdx::time::Instant::now();

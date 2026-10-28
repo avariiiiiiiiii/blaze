@@ -27,12 +27,12 @@
  },
  "backends": {
   "cranelift": {
-   "RA_JIT_BACKEND": "cranelift"
+   "BLAZE_BACKEND": "cranelift"
   },
   "llvm": {
-   "RA_JIT_BACKEND": "llvm",
-   "RA_JIT_OPT": "2",
-   "RA_JIT_EMIT": "fast"
+   "BLAZE_BACKEND": "llvm",
+   "BLAZE_OPT": "2",
+   "BLAZE_EMIT": "fast"
   }
  },
  "setups": {},

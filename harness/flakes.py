@@ -35,8 +35,8 @@ def main():
     checkout, count = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 100
     sides = sys.argv[3:] or ["cargo", "ra-jit"]
     env = dict(os.environ)
-    if "RA_JIT_BIN" in env:
-        env["PATH"] = os.path.dirname(env["RA_JIT_BIN"]) + os.pathsep + env["PATH"]
+    if "BLAZE_BIN" in env:
+        env["PATH"] = os.path.dirname(env["BLAZE_BIN"]) + os.pathsep + env["PATH"]
     for side in sides:
         failed, built = runs_of(checkout, count, side == "ra-jit", env)
         print(f"{side}: {count} runs, built by {dict(built)}; runs each test failed in: {dict(failed)}", flush=True)

@@ -137,8 +137,8 @@ can tell which producer made the code.
 
 - **Cranelift** is the default. It compiles the IR directly.
 - **LLVM** (`llvm.rs`, `llvm/lower.rs`, `llvm/emitted.rs`; behind the `llvm` cargo feature
-  and `RA_JIT_BACKEND=llvm`) translates the Cranelift IR of the function into an LLVM module
-  holding that one function, optimises it at `RA_JIT_OPT`, has LLVM write an object into
+  and `BLAZE_BACKEND=llvm`) translates the Cranelift IR of the function into an LLVM module
+  holding that one function, optimises it at `BLAZE_OPT`, has LLVM write an object into
   memory, and reads the code, constants, relocations and unwind table back out of it.
   Functions are compiled alone at every level, so nothing is inlined across functions. A
   function LLVM has no lowering for is given to Cranelift, with the reason recorded.
@@ -188,7 +188,7 @@ Each splice starts from the executable as the linker left it, so splices
 do not accumulate; a program built in full onto what rustc linked is spliced into that
 executable whole, and the patches after it start from what that left (see "The first edits
 patch what rustc linked"). Anything the splice has no answer for is an error and the daemon links in
-full; `RA_JIT_SPLICE=0` turns it off.
+full; `BLAZE_SPLICE=0` turns it off.
 
 Each object format has its own implementation:
 
@@ -233,7 +233,7 @@ Each place, and how it is covered:
 
 `crates/ra-jit-store` is a content-addressed key-value store of compiled functions,
 independent of Rust: a key is a hash of what the value was made from. There is one per user
-and machine, shared by every daemon and checkout, unless `RA_JIT_CACHE` names another
+and machine, shared by every daemon and checkout, unless `BLAZE_CACHE` names another
 directory or `off`. `stable.rs` gives function instances names that are the same in every run on
 the same sources, and `cached.rs` keeps entries under them: a function of a crate that no
 edit reaches, as it was stitched into an object. A build that finds an entry for an
@@ -303,7 +303,7 @@ and the unwind table of a program of some four hundred thousand functions, and e
 is bound at start; the daemon's own links leave both out of rustc's line
 (`cargo::plan::rustc_link_args`). The daemon starts a spare worker as it starts, which has
 the library of the toolchain loaded before it is told a build; none is started to wait once
-a workspace is loaded, unless `RA_JIT_SPARE=ready` ([cargo.md](cargo.md#environment-variables)).
+a workspace is loaded, unless `BLAZE_SPARE=ready` ([cargo.md](cargo.md#environment-variables)).
 
 A patch over rustc has no marks of before to compare with, so the daemon takes them just in
 time: before an edit's text reaches the database, `home` notes the functions written in the
@@ -340,8 +340,8 @@ of rustc's executable, unless the base has begun to link: the edit then waits fo
 and is a patch of the base, as a link once begun has replaced rustc's executable. A worker that holds more than a quarter of the machine's memory while
 it builds that base gives it up for good, logs so, and edits go on patching rustc's
 executable: what the build computed stays in the database, so the bound is on what the
-worker keeps (`RA_JIT_OWN_BASE_MEMORY`, a size such as `40G`, or `off`). The daemon's
-`RA_JIT_MEMORY_MAX` does not stand for it: that stops the worker asked longest ago, never the
+worker keeps (`BLAZE_OWN_BASE_MEMORY`, a size such as `40G`, or `off`). The daemon's
+`BLAZE_MEMORY_MAX` does not stand for it: that stops the worker asked longest ago, never the
 one asked last, which is the one building its base. zed's base outgrows it, on
 the debuginfo types of [#55](https://github.com/indexable-inc/ra-jit/issues/55).
 
@@ -356,7 +356,7 @@ more than one of is one of the new. On x86-64 a function's room for the jump run
 one field needs (`mov`, `ret`: 4 bytes). A patch's function of 2 bytes or more with no such
 room hops: a 2-byte `jmp` to 5 bytes of a run of `int3`s between two functions within 127
 bytes of it (`Image::pads`), and a `jmp` on from there, both undone with the patch;
-`RA_JIT_SPLICE_HOPS` has every short function hop, for `rustcbase.py hop`. One of a single
+`BLAZE_SPLICE_HOPS` has every short function hop, for `rustcbase.py hop`. One of a single
 byte, or with no run near it, is built in full. The executable is read again in the background with the
 object's symbols in it, the base of the patches after, which name against rustc's symbols too
 and are spliced onto what the whole splice left, an `#[inline]` function's edit too, since that
@@ -373,9 +373,9 @@ first edits' splice fails: that is what splicing can't do, and an own base links
 such an edit still links in full, and the link takes the room for splices that the executable
 there wanted (`headerpad_ahead`), so it is not linked twice.
 
-`RA_JIT_RUSTC_BASE=0` makes the first build the daemon's own, as before. `harness/rustcbase.py` checks every kind of edit against cargo.
+`BLAZE_RUSTC_BASE=0` makes the first build the daemon's own, as before. `harness/rustcbase.py` checks every kind of edit against cargo.
 
-An alternative wrapper exists in `stub.rs` (`RA_JIT_WRAPS_RUSTC`), where rustc compiles only
+An alternative wrapper exists in `stub.rs` (`BLAZE_WRAPS_RUSTC`), where rustc compiles only
 a stub for each workspace crate and all code is ra-jit's. It makes the first build faster,
 but a function ra-jit refuses then has no rustc copy to fall back on, so it is used by
 `harness/alone.py` and not by `cargo ra-jit`.

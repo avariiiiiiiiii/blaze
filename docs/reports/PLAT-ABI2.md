@@ -93,7 +93,7 @@ context. Nothing was measured there, and the jobs run -O2 with fast emit only.
 
 ## Measured
 
-LLVM is `RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`.
+LLVM is `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`.
 
 ### CI, run 39057174862
 

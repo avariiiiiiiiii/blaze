@@ -15,7 +15,7 @@ import os, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-BIN = os.path.dirname(os.path.abspath(os.environ.get("RA_JIT_BIN") or os.path.join(HERE, "../target/release/ra-jit")))
+BIN = os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN") or os.path.join(HERE, "../target/release/ra-jit")))
 
 ALLOCATOR = """\
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -71,9 +71,9 @@ class Workspace:
         self.write("app/Cargo.toml", '[package]\nname = "sapp"\nversion = "0.1.0"\nedition = "2024"\n')
         self.write("app/src/main.rs", source)
         self.env = dict(os.environ, PATH=f"{BIN}:{os.environ['PATH']}", RUSTUP_TOOLCHAIN=TOOLCHAIN,
-                        RA_JIT_HOME=os.path.join(work, "home"), RA_JIT_CACHE=os.path.join(work, "store"),
+                        BLAZE_HOME=os.path.join(work, "home"), BLAZE_CACHE=os.path.join(work, "store"),
                         CARGO_HOME=os.path.join(work, "cargo-home"), CARGO_INCREMENTAL="0", RUST_BACKTRACE="0")
-        for name in ("CARGO_TARGET_DIR", "RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "RA_JIT_RUSTC_BASE"):
+        for name in ("CARGO_TARGET_DIR", "RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "BLAZE_RUSTC_BASE"):
             self.env.pop(name, None)
 
     def write(self, path, text):

@@ -14,7 +14,7 @@ further from the code than four bytes of distance reach. Each step is compared w
 build` of the same source prints, and has to have been spliced: a function shorter than the long
 jump, one that panics through its replacement, and one added.
 
-usage: bigbinary.py   (RA_JIT_BIN names the ra-jit built). About 20 GB of disk on Linux.
+usage: bigbinary.py   (BLAZE_BIN names the ra-jit built). About 20 GB of disk on Linux.
 """
 import os, sys, tempfile
 

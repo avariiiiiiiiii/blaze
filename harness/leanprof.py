@@ -13,7 +13,7 @@ build of its own base it makes once idle), each edit of `--edits` (default `body
 from bench.py's `PROJECTS`) made and taken back `--rounds` times (default 3), and `warm` (the
 daemon stopped and started again on the same store and target directory, until ready) and
 `warm base` (left out with `--no-warm`). The first daemon's home, logs and all, is kept in
-WORK/logs-cold. `--env` is given to the daemon; `RA_JIT_MEMORY=DIR` is given as DIR/cold for the
+WORK/logs-cold. `--env` is given to the daemon; `BLAZE_MEMORY=DIR` is given as DIR/cold for the
 first daemon and DIR/warm for the second, so the reports of the two do not overwrite each
 other. Writes the phases as JSON to WORK/phases.json and on stdout's last line. Projects are
 bench.py's, fetched as it fetches them. It measures and checks nothing.
@@ -43,11 +43,11 @@ def main():
     home = os.path.join(work, "home")
     env = dict(cargo_ra_jit.base_env(home), **spec.get("env", {}), **extra_env)
     env["PATH"] = os.path.dirname(bench.ra_jit_of("cranelift")) + os.pathsep + env["PATH"]
-    env.update(bench.BACKENDS["cranelift"], RA_JIT_STATS="1", RA_JIT_CACHE=os.path.join(work, "store"))
+    env.update(bench.BACKENDS["cranelift"], BLAZE_STATS="1", BLAZE_CACHE=os.path.join(work, "store"))
     env.pop("RUSTC_WRAPPER", None)
     # As bench.py's cold start: the standard library's unit is fetched as a release fetches it.
-    env["RA_JIT_STD_FROM"], _ = bench.shipped_std(bench.ra_jit_of("cranelift"), "cranelift", work)
-    reports = env.get("RA_JIT_MEMORY")
+    env["BLAZE_STD_FROM"], _ = bench.shipped_std(bench.ra_jit_of("cranelift"), "cranelift", work)
+    reports = env.get("BLAZE_MEMORY")
     build = spec.get("build", [])
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
     phases = []
@@ -58,7 +58,7 @@ def main():
 
     def side(step):
         if reports:
-            return Side(ws, dict(env, RA_JIT_MEMORY=os.path.join(reports, step)), True)
+            return Side(ws, dict(env, BLAZE_MEMORY=os.path.join(reports, step)), True)
         return Side(ws, env, True)
 
     ours = side("cold")

@@ -25,7 +25,7 @@ def scratch(prefix):
 def cache(store, *args, env=None):
     """Runs `ra-jit cache ARGS` on the store; returns (exit status, what it printed)."""
     ran = subprocess.run([RA_JIT, "cache", *args], capture_output=True, text=True,
-                         env={**os.environ, **(env or {}), "RA_JIT_CACHE": store})
+                         env={**os.environ, **(env or {}), "BLAZE_CACHE": store})
     return ran.returncode, ran.stdout + ran.stderr
 
 
@@ -125,7 +125,7 @@ class Daemon:
         self.process = subprocess.Popen(
             [RA_JIT, c.ws, *TARGET_ARGS, *[x for k in CRATES for x in ("--crate", k)], "--out", c.obj,
              "--socket", self.socket, "--patch", c.patch, "--link-cmd", c.link, "--binary", c.bin, *c.symbols],
-            stderr=out, stdout=out, env={**os.environ, **(env or {}), "RA_JIT_CACHE": store})
+            stderr=out, stdout=out, env={**os.environ, **(env or {}), "BLAZE_CACHE": store})
         if wait:
             self.wait()
 

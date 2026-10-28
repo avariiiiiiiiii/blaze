@@ -97,7 +97,8 @@ Nix compiles blaze from source; there is no binary cache yet.
 ## The old name
 
 blaze was called ra-jit until 2026-10-24. `cargo ra-jit` keeps working as another name for
-`cargo blaze`, and its settings work as `BLAZE_*` and as `RA_JIT_*`.
+`cargo blaze`. Its settings are `BLAZE_*`: one set by its old name, `RA_JIT_*`, stops it with
+a line saying what it is called now.
 
 Building blaze itself from a checkout, and every way to build it the release way:
 [cargo.md](cargo.md#install) and [contributing.md](contributing.md).

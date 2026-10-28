@@ -341,7 +341,7 @@ ra-jit is pinned to {name} ({new[1]}). Left to do:
     (with that host's release build of ra-jit), then commit crates/ra-jit/src/answers/rustc.json;
   - `cargo build -p ra-jit --release` and fix what the new rustc_abi and std ask for;
   - `python3 harness/toolchain_bump.py --checks` in an ix VM, under Cranelift and under LLVM
-    (`nix develop -c ...` with RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast);
+    (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);
   - the full tier (uitest.py, libsuite.py, borrowck_ui.py) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
 
@@ -351,13 +351,13 @@ async def checks():
     name = open(PIN).read().strip()
     env = dict(os.environ, RUSTUP_TOOLCHAIN=name)
     await run("build", "cargo", "build", "-p", "ra-jit", "--release", env=env, bound=3600)
-    env.setdefault("RA_JIT_BIN", os.path.join(ROOT, "target/release/ra-jit"))
+    env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/ra-jit"))
     harness = [
         ["toolchain_pins.py"],
         ["answers.py"],
         ["macroserver.py"],
         ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"],
-        *(["ci.py", part] for part in ci.fast_parts(env.get("RA_JIT_BACKEND") or "cranelift")),
+        *(["ci.py", part] for part in ci.fast_parts(env.get("BLAZE_BACKEND") or "cranelift")),
     ]
     failed = []
 

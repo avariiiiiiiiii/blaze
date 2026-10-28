@@ -56,10 +56,10 @@ pub enum Mode {
     Off,
 }
 
-/// `RA_JIT_BORROWCK`: `polonius` (the default), `nll` or `off`.
+/// `BLAZE_BORROWCK`: `polonius` (the default), `nll` or `off`.
 pub fn mode() -> Mode {
     static MODE: LazyLock<Mode> =
-        LazyLock::new(|| match std::env::var("RA_JIT_BORROWCK").as_deref() {
+        LazyLock::new(|| match std::env::var("BLAZE_BORROWCK").as_deref() {
             Ok("nll") => Mode::Nll,
             Ok("off" | "0") => Mode::Off,
             _ => Mode::Polonius,
@@ -67,10 +67,10 @@ pub fn mode() -> Mode {
     *MODE
 }
 
-/// `RA_JIT_BORROWCK_DEBUG=1` prints the regions, constraints and loans of every body checked,
-/// `RA_JIT_BORROWCK_DEBUG=name` those of the functions called `name` and their closures.
+/// `BLAZE_BORROWCK_DEBUG=1` prints the regions, constraints and loans of every body checked,
+/// `BLAZE_BORROWCK_DEBUG=name` those of the functions called `name` and their closures.
 pub(crate) fn debugging(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> bool {
-    let Ok(wanted) = std::env::var("RA_JIT_BORROWCK_DEBUG") else { return false };
+    let Ok(wanted) = std::env::var("BLAZE_BORROWCK_DEBUG") else { return false };
     match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) if wanted != "1" => {
             hir_def::signatures::FunctionSignature::of(db, it).name.as_str() == wanted

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lane testcache: the tests' walk by stable names, before against after. Per app and binary: main's run on
 a store of the app's own (cold), kept as a snapshot; then a one-function PR, each run on a fresh target,
-daemon, RA_JIT_HOME and a copy of that snapshot: `all` and `affected`, twice, ABAB. Each run's
+daemon, BLAZE_HOME and a copy of that snapshot: `all` and `affected`, twice, ABAB. Each run's
 `tests-reach-us` is read from its daemon's log.
 Runs in the lane's VM: nix develop /root/tc/src -c python3 /root/tc/ab.py [names]"""
 import glob, json, os, re, shutil, subprocess, sys, time
@@ -26,7 +26,7 @@ def run(ws, env, args, log):
     subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     said = out.stdout + out.stderr
     open(log, "w").write(said)
-    logs = glob.glob(os.path.join(env["RA_JIT_HOME"], "workers", "*", "log"))
+    logs = glob.glob(os.path.join(env["BLAZE_HOME"], "workers", "*", "log"))
     reach = [int(n) for path in logs for n in REACH.findall(open(path, errors="replace").read())]
     ran = RAN.findall(said)
     return dict(code=out.returncode, secs=round(took, 1), ran=len(ran),
@@ -50,8 +50,8 @@ def main():
             store, snap = f"{APPS}/ab-store-{name}-{bin_name}", f"{APPS}/ab-snap-{name}-{bin_name}"
             for it in (store, snap):
                 shutil.rmtree(it, ignore_errors=True)
-            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", RA_JIT_CACHE=store,
-                       RUST_BACKTRACE="0", HOME="/root", RA_JIT_STATS="1", RA_JIT_MANIFEST="off")
+            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", BLAZE_CACHE=store,
+                       RUST_BACKTRACE="0", HOME="/root", BLAZE_STATS="1", BLAZE_MANIFEST="off")
             env.pop("CARGO_TARGET_DIR", None)
             count = 0
 
@@ -61,7 +61,7 @@ def main():
                 home = f"/tmp/ab-{name}-{bin_name}-{count}"
                 shutil.rmtree(home, ignore_errors=True)
                 shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
-                e = dict(env, RA_JIT_HOME=home, RA_JIT_TESTS=mode, RA_JIT_TESTS_FROM=tag)
+                e = dict(env, BLAZE_HOME=home, BLAZE_TESTS=mode, BLAZE_TESTS_FROM=tag)
                 return e
 
             subprocess.run(["git", "checkout", "-q", "--", "."], cwd=ws)

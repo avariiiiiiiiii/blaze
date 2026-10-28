@@ -9,14 +9,14 @@
 //! for one of the checkout, the version and place for one fetched, and the keys of its
 //! dependencies), the program asked for and how (`Args`: the crates, the profile, features and
 //! target, what a debugger is told, where the checkout and the outputs are), the standard
-//! library's unit it links, and the variables that change what is compiled (`RA_JIT_*`,
+//! library's unit it links, and the variables that change what is compiled (`BLAZE_*`,
 //! `RUSTFLAGS`, `CARGO_PROFILE_*`, ...). The store adds the toolchain and ra-jit's own build.
 //! What a build reads that only compiling finds out is kept with the files and checked before
 //! they are used: the variables `env!` and `option_env!` read of the process, and the files
 //! `include_bytes!` and `include_str!` read. A manifest that matches the key and not those is
 //! not used.
 //!
-//! `RA_JIT_MANIFEST` says what is done with it: by default a full build of a program the store
+//! `BLAZE_MANIFEST` says what is done with it: by default a full build of a program the store
 //! has a manifest of writes its files; `check` builds in full anyway and fails the build when
 //! what it wrote is not the manifest's; `off` neither reads nor writes one.
 
@@ -43,7 +43,7 @@ pub(crate) enum Mode {
 }
 
 pub(crate) fn mode() -> Option<Mode> {
-    match std::env::var("RA_JIT_MANIFEST").as_deref() {
+    match std::env::var("BLAZE_MANIFEST").as_deref() {
         Ok("off" | "0") => None,
         Ok("check") => Some(Mode::Check),
         _ => Some(Mode::Use),
@@ -53,16 +53,16 @@ pub(crate) fn mode() -> Option<Mode> {
 /// Variables of the process that change what a build compiles, beside those `env!` reads.
 fn configures(name: &str) -> bool {
     const NOT_OF_THE_CODE: &[&str] = &[
-        "RA_JIT_STATS",
-        "RA_JIT_TRACE",
-        "RA_JIT_MEMORY",
-        "RA_JIT_MANIFEST",
-        "RA_JIT_HOME",
-        "RA_JIT_PROJECT",
+        "BLAZE_STATS",
+        "BLAZE_TRACE",
+        "BLAZE_MEMORY",
+        "BLAZE_MANIFEST",
+        "BLAZE_HOME",
+        "BLAZE_PROJECT",
     ];
-    let ours = name.starts_with("RA_JIT_")
-        && !name.starts_with("RA_JIT_CACHE")
-        && !name.starts_with("RA_JIT_REMOTE")
+    let ours = name.starts_with("BLAZE_")
+        && !name.starts_with("BLAZE_CACHE")
+        && !name.starts_with("BLAZE_REMOTE")
         && !NOT_OF_THE_CODE.contains(&name);
     ours || name == "RUSTFLAGS"
         || name == "CARGO_ENCODED_RUSTFLAGS"
@@ -462,7 +462,7 @@ pub(crate) fn keep(
     Ok(bytes_kept)
 }
 
-/// For `RA_JIT_MANIFEST=check`: whether the files the full build wrote at `wrote` are those
+/// For `BLAZE_MANIFEST=check`: whether the files the full build wrote at `wrote` are those
 /// the manifest under `key` has, and which are not when they are not.
 pub(crate) fn check(
     db: &RootDatabase,
@@ -641,12 +641,12 @@ mod tests {
 
     #[test]
     fn variables_of_the_store_and_the_log_do_not_change_the_key() {
-        assert!(configures("RA_JIT_OPT"));
+        assert!(configures("BLAZE_OPT"));
         assert!(configures("RUSTFLAGS"));
         assert!(configures("CARGO_PROFILE_RELEASE_DEBUG"));
-        assert!(!configures("RA_JIT_STATS"));
-        assert!(!configures("RA_JIT_CACHE_MAX"));
-        assert!(!configures("RA_JIT_REMOTE"));
+        assert!(!configures("BLAZE_STATS"));
+        assert!(!configures("BLAZE_CACHE_MAX"));
+        assert!(!configures("BLAZE_REMOTE"));
         assert!(!configures("PATH"));
     }
 

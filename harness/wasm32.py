@@ -2,7 +2,7 @@
 """wasm32.py: what CI checks of wasm32 on every merge (the train's `wasm32` job), and what a
 lane runs in its VM before landing a change to the wasm lowering.
 
-Each check is a harness run with `RA_JIT_TARGET` set, in a process of its own, so that the
+Each check is a harness run with `BLAZE_TARGET` set, in a process of its own, so that the
 target reaches everything the harness imports before it reads it:
 
   - corpus: `difftest.py corpus` for wasm32-wasip1 under wasmtime, against cargo's build;
@@ -39,7 +39,7 @@ CHECKS = [
 def run(name, target, args, timeout):
     env = {**os.environ, "RUST_BACKTRACE": "0"}
     if target:
-        env["RA_JIT_TARGET"] = target
+        env["BLAZE_TARGET"] = target
     start = time.monotonic()
     try:
         ran = subprocess.run([sys.executable, *args], cwd=HERE, env=env, stdin=subprocess.DEVNULL,

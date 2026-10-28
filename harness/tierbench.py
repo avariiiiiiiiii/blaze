@@ -5,14 +5,14 @@ table of docs/tiers.md has, each run for the same time, the steady rate the mean
 half-second rates from `--from` seconds on.
 
 usage: tierbench.py [--seconds 25] [--from 15] [--rounds 1] [--together] [--only NAME,...]
-                    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+                    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
 The builds, by NAME:
 
-  cranelift  level 1: a daemon with RA_JIT_TIER=off
-  llvm       every function by LLVM at -O3, nothing built in: a daemon with RA_JIT_TIER=off,
-             RA_JIT_BACKEND=llvm and RA_JIT_OPT=3 (not one of the defaults)
-  level2     a daemon with RA_JIT_TIER=2: LLVM -O3, no counting, no PGO
+  cranelift  level 1: a daemon with BLAZE_TIER=off
+  llvm       every function by LLVM at -O3, nothing built in: a daemon with BLAZE_TIER=off,
+             BLAZE_BACKEND=llvm and BLAZE_OPT=3 (not one of the defaults)
+  level2     a daemon with BLAZE_TIER=2: LLVM -O3, no counting, no PGO
   level3     a daemon as it comes: level 2 counts, level 3 is compiled with what it counted
   checked    cargo, `-C opt-level=3 -C overflow-checks -C debug-assertions`: what the dev
              profile means, optimized
@@ -80,14 +80,14 @@ async def main() -> None:
     parser.add_argument("--events", action="store_true", help="print the tier events of each daemon run")
     args = parser.parse_args()
     names = [it for it in args.only.split(",") if it]
-    bin_dir = Path(os.environ["RA_JIT_BIN"]).resolve().parent
+    bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
     work = Path(tempfile.mkdtemp(prefix="rjb-", dir="/tmp"))
     try:
         shutil.copytree(ROOT / "crates" / "ra-jit-live", work / "crates" / "ra-jit-live")
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
         base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=tiers.PIN)
-        for name in ("CARGO_INCREMENTAL", "RA_JIT_TIER", "RA_JIT_BACKEND", "RA_JIT_OPT", "RUSTFLAGS"):
+        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER", "BLAZE_BACKEND", "BLAZE_OPT", "RUSTFLAGS"):
             base.pop(name, None)
 
         binaries: dict[str, tuple[Path, dict[str, str]]] = {}
@@ -109,13 +109,13 @@ async def main() -> None:
                 await tiers.run(f"cargo build ({name})", ["cargo", "build", "--locked", "--release"], cwd, env)
                 binaries[name] = (work / name / "release" / "lifebench", env)
                 continue
-            env["RA_JIT_HOME"] = str(work / f"home-{name}")
+            env["BLAZE_HOME"] = str(work / f"home-{name}")
             if name == "cranelift":
-                env["RA_JIT_TIER"] = "off"
+                env["BLAZE_TIER"] = "off"
             elif name == "llvm":
-                env.update(RA_JIT_TIER="off", RA_JIT_BACKEND="llvm", RA_JIT_OPT="3")
+                env.update(BLAZE_TIER="off", BLAZE_BACKEND="llvm", BLAZE_OPT="3")
             elif name == "level2":
-                env["RA_JIT_TIER"] = "2"
+                env["BLAZE_TIER"] = "2"
             await tiers.serve(project, env)
             binaries[name] = (work / name / "debug" / "lifebench", env)
 
@@ -143,7 +143,7 @@ async def main() -> None:
             home = work / f"home-{name}"
             if not home.exists():
                 continue
-            stop = dict(os.environ, RA_JIT_HOME=str(home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+            stop = dict(os.environ, BLAZE_HOME=str(home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
             try:
                 proc = await asyncio.create_subprocess_exec("cargo-ra-jit", "ra-jit", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 await asyncio.wait_for(proc.wait(), 30)

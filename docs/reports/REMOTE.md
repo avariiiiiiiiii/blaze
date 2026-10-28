@@ -11,7 +11,7 @@ run. This is what it took to make it real, what was measured, and what is still 
 **Real AWS S3 was not run.** There are no AWS credentials in the session this was done in.
 Everything below was measured against MinIO (`RELEASE.2026-09-22T19-25-18Z`) and SeaweedFS
 (4.48) on the same machine, over loopback. The harness runs against a real bucket with one
-variable, `RA_JIT_S3_REMOTE=s3://bucket/prefix`; nobody has done that yet.
+variable, `BLAZE_S3_REMOTE=s3://bucket/prefix`; nobody has done that yet.
 
 ## What changed
 
@@ -57,8 +57,8 @@ The merge put the remote on the format-2 store. What that means in the code:
   another format without fetching them ("N of another format left"). A line that claims
   this format for a pack that starts with another magic is not believed: the pack is
   rejected after the fetch and never gets its name.
-- `RA_JIT_CACHE_MAX`: a pull fetches the listed packs that fit under the limit and says how
-  many do not ("N left that do not fit under RA_JIT_CACHE_MAX"), then runs the store's
+- `BLAZE_CACHE_MAX`: a pull fetches the listed packs that fit under the limit and says how
+  many do not ("N left that do not fit under BLAZE_CACHE_MAX"), then runs the store's
   collection, which evicts the packs unused the longest if the store is now over. A pulled
   pack is a pack like any other after that. One that is evicted is missing again, so the
   next pull fetches it.
@@ -132,19 +132,19 @@ does for AWS.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `RA_JIT_REMOTE` | the remote the daemon pulls from before a build and pushes to after | none |
-| `RA_JIT_PROJECT` | which manifest | `default` |
-| `RA_JIT_REMOTE_JOBS` | requests in flight at once | 8 |
-| `RA_JIT_REMOTE_TIMEOUT` | seconds a request may go without an answer, or a body without a byte | 30 |
-| `RA_JIT_REMOTE_READONLY` | never write to the remote | off |
-| `RA_JIT_REMOTE_LAZY` | fetch a pack when a build first asks for a key in it | off |
-| `RA_JIT_REMOTE_PUSH_EVERY` | how often a daemon that stays pushes (`90s`, `5m`, `1h`), or `off` | `5m` |
-| `RA_JIT_REMOTE_SIGN` | file with the key this machine signs manifests with | none |
-| `RA_JIT_REMOTE_TRUST` | public keys this machine takes manifests from | none |
-| `RA_JIT_REMOTE_UNSIGNED` | `1`: with no keys named, take lists nobody signed | off: a pull is refused |
-| `RA_JIT_REMOTE_MAX` | the most taken of one object that is neither a list nor a pack | 512M |
+| `BLAZE_REMOTE` | the remote the daemon pulls from before a build and pushes to after | none |
+| `BLAZE_PROJECT` | which manifest | `default` |
+| `BLAZE_REMOTE_JOBS` | requests in flight at once | 8 |
+| `BLAZE_REMOTE_TIMEOUT` | seconds a request may go without an answer, or a body without a byte | 30 |
+| `BLAZE_REMOTE_READONLY` | never write to the remote | off |
+| `BLAZE_REMOTE_LAZY` | fetch a pack when a build first asks for a key in it | off |
+| `BLAZE_REMOTE_PUSH_EVERY` | how often a daemon that stays pushes (`90s`, `5m`, `1h`), or `off` | `5m` |
+| `BLAZE_REMOTE_SIGN` | file with the key this machine signs manifests with | none |
+| `BLAZE_REMOTE_TRUST` | public keys this machine takes manifests from | none |
+| `BLAZE_REMOTE_UNSIGNED` | `1`: with no keys named, take lists nobody signed | off: a pull is refused |
+| `BLAZE_REMOTE_MAX` | the most taken of one object that is neither a list nor a pack | 512M |
 
-In read-only mode `cache push` and `deps push` fail with "RA_JIT_REMOTE_READONLY is set:
+In read-only mode `cache push` and `deps push` fail with "BLAZE_REMOTE_READONLY is set:
 nothing is sent", and the daemon does not push.
 
 Credentials are never printed. ra-jit does not hold them; the SDK does. Errors are printed
@@ -181,7 +181,7 @@ nothing in it worth keeping when the disk is full. A TLS failure such as an untr
 certificate is not told apart from a network failure and takes the whole 16 s to fail.
 
 **Send.** A file of 16 MiB or more goes up as a multipart upload in 8 MiB parts, with at
-most `RA_JIT_REMOTE_JOBS` requests in flight across everything the process is doing. A part
+most `BLAZE_REMOTE_JOBS` requests in flight across everything the process is doing. A part
 that fails is sent again by the SDK (three attempts, exponential backoff with jitter). If
 the upload fails it is aborted, and a push first aborts uploads an earlier process left
 unfinished under the same key. The manifest is written last, after every pack and key list
@@ -189,7 +189,7 @@ it names is in the bucket, with `If-Match`/`If-None-Match` so that two machines 
 once do not undo each other (up to 8 rounds of read, extend, write).
 
 **Timeouts.** Connecting: 5 s at most. An attempt with no answer, or a read with no bytes:
-`RA_JIT_REMOTE_TIMEOUT`. An upload attempt gets that plus a second for every 64 KiB, so a
+`BLAZE_REMOTE_TIMEOUT`. An upload attempt gets that plus a second for every 64 KiB, so a
 slow link is not mistaken for a dead one.
 
 **Failures are counted.** Every command ends with a line like
@@ -229,14 +229,14 @@ so its name.
 **What is left is the manifest**, which is the one mutable object and says which packs to
 fetch. Somebody who can write to the bucket can upload a well-formed pack of their own
 making, with wrong code under real keys, and list it; its name is honestly the hash of its
-bytes. Content addressing cannot catch that. Signing does: with `RA_JIT_REMOTE_SIGN` a
+bytes. Content addressing cannot catch that. Signing does: with `BLAZE_REMOTE_SIGN` a
 machine signs each manifest it writes (Ed25519, over the manifest's object name, its turn
 and its body, so one project's manifest cannot be replayed as another's), and with
-`RA_JIT_REMOTE_TRUST` a machine refuses any manifest that is not signed by a key it lists.
+`BLAZE_REMOTE_TRUST` a machine refuses any manifest that is not signed by a key it lists.
 `ra-jit cache keygen FILE` makes a key and prints the public half.
 
-**A machine that names no keys pulls nothing** unless `RA_JIT_REMOTE_UNSIGNED=1` is set:
-"RA_JIT_REMOTE_TRUST names no key, and without one whoever writes to the remote says what is
+**A machine that names no keys pulls nothing** unless `BLAZE_REMOTE_UNSIGNED=1` is set:
+"BLAZE_REMOTE_TRUST names no key, and without one whoever writes to the remote says what is
 run here". Pushing asks for nothing. This is the default that was left open here; it was
 decided in the security round (`SECURITY.md`).
 
@@ -253,14 +253,14 @@ given. The design, with what it does not cover, is in `SECURITY.md`.
 **How much.** A list is read to 16 MiB, a pack to the sizes its manifest gives it (the
 object as sent to ZSIZE, and what it unpacks to to SIZE, so a small object that unpacks to
 a great deal is stopped at SIZE), the keys
-of a pack to no more than the pack, and the archive of a unit to `RA_JIT_REMOTE_MAX`; a
-`deps pull` unpacks no more than `RA_JIT_DEPS_MAX` (64G, `off` for none). An object that is
+of a pack to no more than the pack, and the archive of a unit to `BLAZE_REMOTE_MAX`; a
+`deps pull` unpacks no more than `BLAZE_DEPS_MAX` (64G, `off` for none). An object that is
 longer is rejected and counted like one with the wrong hash, with nothing of it left on
 disk.
 
-So the honest statement is: with `RA_JIT_REMOTE_TRUST` set, nobody without a trusted signing
+So the honest statement is: with `BLAZE_REMOTE_TRUST` set, nobody without a trusted signing
 key can make ra-jit emit different code than a local build, whatever they do to the bucket.
-With `RA_JIT_REMOTE_UNSIGNED=1` instead, whoever can write to the bucket is trusted, the same
+With `BLAZE_REMOTE_UNSIGNED=1` instead, whoever can write to the bucket is trusted, the same
 as with sccache or a cargo registry mirror. A trusted signer is trusted completely; ra-jit does not recompile to check
 them. One more assumption sits under all of it and predates this branch: two machines with
 the same ra-jit binary compile the same key to equivalent code. That is what the local store
@@ -276,7 +276,7 @@ Tested by the harness, on both servers:
   signed by a key B does not list are each refused, nothing is fetched, and the program is
   the same;
 - a machine that trusts keys but has none to sign with refuses to push;
-- with no keys and without `RA_JIT_REMOTE_UNSIGNED=1`: a pull is refused and fetches nothing,
+- with no keys and without `BLAZE_REMOTE_UNSIGNED=1`: a pull is refused and fetches nothing,
   a push goes through;
 - a pack listed as shorter than it is, and a manifest one byte over 16 MiB: rejected,
   nothing kept;
@@ -299,16 +299,16 @@ cargo's.
 | --- | --- | --- | --- |
 | before the merge (`7b33ead6c2`) | 81.2 s | 71.0 s | 928,617,374 bytes |
 | after the merge | 101.9 s | 91.6 s | 1,067,053,828 bytes |
-| after, `RA_JIT_DEBUGINFO=0` | 87.2 s | 77.0 s | 927,233,654 bytes |
+| after, `BLAZE_DEBUGINFO=0` | 87.2 s | 77.0 s | 927,233,654 bytes |
 | after, no sync at all (`LD_PRELOAD=libeatmydata.so`) | 101.9 s | 91.5 s | 1,067,053,828 bytes |
 | after, both | 87.2 s | 77.1 s | 927,233,654 bytes |
-| after, no store (`RA_JIT_CACHE` not set) | 73.1 s | 63.3 s | 0 |
+| after, no store (`BLAZE_CACHE` not set) | 73.1 s | 63.3 s | 0 |
 
 | ripgrep 14.1.1 | ra-jit | store |
 | --- | --- | --- |
 | before the merge | 9.2 s | 41,551,465 bytes |
 | after the merge | 10.1 s | 51,806,179 bytes |
-| after, `RA_JIT_DEBUGINFO=0` | 9.1 s | 41,452,707 bytes |
+| after, `BLAZE_DEBUGINFO=0` | 9.1 s | 41,452,707 bytes |
 | after, no sync | 10.4 s | 51,806,179 bytes |
 | after, no store | 7.3 s | 0 |
 
@@ -360,11 +360,11 @@ were compressed already. The full tables are under Measurements.
 
 ## Lazy hydration
 
-With `RA_JIT_REMOTE_LAZY=1` the daemon fetches only the key lists (32 bytes a function)
+With `BLAZE_REMOTE_LAZY=1` the daemon fetches only the key lists (32 bytes a function)
 before a build. When the store is asked for a key it lacks and a listed pack holds it, the
 compiling thread fetches that pack, verified as above, and looks again; other threads that
 want the same pack wait for that one fetch. A pack nobody asks of is never fetched; the
-harness checks that. Fetches in flight are bounded by `RA_JIT_REMOTE_JOBS` like every other
+harness checks that. Fetches in flight are bounded by `BLAZE_REMOTE_JOBS` like every other
 request, since they take a place on the same line.
 
 The unit that is fetched is a pack, not a record. A remote has no object for one key, and
@@ -427,7 +427,7 @@ A daemon given `--socket` or `--watch` used to pull when it started and push onc
 its first build. Now a thread of its own keeps the two in step
 (`crates/ra-jit/src/remote/keeper.rs`):
 
-- It pushes right after the first build, then every `RA_JIT_REMOTE_PUSH_EVERY` (five
+- It pushes right after the first build, then every `BLAZE_REMOTE_PUSH_EVERY` (five
   minutes), then once more when the daemon gets SIGTERM or SIGINT, after which the daemon
   ends by that signal as it would have. The last push is given a minute. Before a push
   the pack the store has open is sealed, however small, so an edit's one function goes.
@@ -465,9 +465,9 @@ cargo's units if any, `cargo rustc` for the dependencies and link line, ra-jit's
 the binary. Crates.io sources were already in `~/.cargo` for all of them.
 
     cd harness
-    RA_JIT_BIN=.../ra-jit python3 remote.py --measure ~/work/rg-a -p ripgrep --bin rg \
+    BLAZE_BIN=.../ra-jit python3 remote.py --measure ~/work/rg-a -p ripgrep --bin rg \
         --crate rg,grep,grep_cli,grep_matcher,grep_printer,grep_regex,grep_searcher,globset,ignore
-    RA_JIT_BIN=.../ra-jit python3 remote.py --measure ~/work/cargo-a -p cargo --bin cargo \
+    BLAZE_BIN=.../ra-jit python3 remote.py --measure ~/work/cargo-a -p cargo --bin cargo \
         --crate cargo,cargo_util,cargo_platform,cargo_util_schemas,crates_io,rustfix,cargo_credential
 
 ripgrep 14.1.1 (9 crates by ra-jit; 22,340 functions compiled cold):
@@ -523,7 +523,7 @@ and proc macros. Those are the next thing to cut and are not a remote problem.
 ## The harness
 
 `harness/remote.py` with `harness/s3fake.py`. It starts MinIO and SeaweedFS (found through
-`RA_JIT_MINIO`, `RA_JIT_WEED`, PATH or `~/s3tools`), each behind a proxy of its own that
+`BLAZE_MINIO`, `BLAZE_WEED`, PATH or `~/s3tools`), each behind a proxy of its own that
 counts requests and bytes and can answer with a status, reset the connection, cut a response
 or a request body at a byte, stall, or throttle. It builds a small generated workspace on
 machine A, and then checks, 178 checks in all across the two servers:
@@ -539,7 +539,7 @@ machine A, and then checks, 178 checks in all across the two servers:
   through `SSL_CERT_FILE`, and without it the pull is refused and says "invalid peer
   certificate", in under three seconds;
 - the store after a pull: `cache verify` and `cache stats` count exactly what was fetched;
-  packs evicted with `cache gc --max 0` are fetched again; with `RA_JIT_CACHE_MAX` a pull
+  packs evicted with `cache gc --max 0` are fetched again; with `BLAZE_CACHE_MAX` a pull
   fetches the three packs of six that fit and says so; into a store that already holds two
   old packs it fetches three and the two old ones are evicted; 24 small packs that a
   collection made one of are not fetched again; a pack of format 1 listed as format 1 is
@@ -559,7 +559,7 @@ machine A, and then checks, 178 checks in all across the two servers:
 - the poisoning and signing cases listed under Trust;
 - lazy: nothing compiled, same output, the unused pack not fetched.
 
-    cd harness && RA_JIT_BIN=../target/release/ra-jit python3 remote.py
+    cd harness && BLAZE_BIN=../target/release/ra-jit python3 remote.py
 
 Takes about eight minutes with both servers. Results of this round are under Regression
 gate. The rounds before had 111 and then 131 checks.
@@ -571,7 +571,7 @@ the 16 s ra-jit waits for a byte. So the harness times how long the server was a
 fail with no pack in the store and succeed when run again. Before that was written down the
 check failed on SeaweedFS in two runs of eight.
 
-Against a real bucket: `RA_JIT_S3_REMOTE=s3://bucket/prefix python3 remote.py`, with
+Against a real bucket: `BLAZE_S3_REMOTE=s3://bucket/prefix python3 remote.py`, with
 credentials wherever the AWS tools would find them. That runs the round trip, the
 configuration, poisoning, signing and lazy checks, and skips the ones that need the proxy
 or need to kill the server. **Not run.**
@@ -579,8 +579,8 @@ or need to kill the server. **Not run.**
 ## Regression gate
 
 Run on Linux x86-64 on the code as pushed (`ra-jit-collate` at `1547078a30` merged in),
-with the `--features llvm` binary (LLVM 20.1) under `RA_JIT_BACKEND=cranelift` and under
-`RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`. Both gave the same results:
+with the `--features llvm` binary (LLVM 20.1) under `BLAZE_BACKEND=cranelift` and under
+`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`. Both gave the same results:
 
 | Script | Result |
 | --- | --- |
@@ -646,7 +646,7 @@ is green.
 - **Six seconds of the slowdown on cargo are not explained.** They are not debug info and
   not the store; see above.
 - **Lazy hydration fetches whole packs and does not win on a fresh machine.** It is behind
-  `RA_JIT_REMOTE_LAZY`. Fetching a pack ahead of the thread that will want it, or packs
+  `BLAZE_REMOTE_LAZY`. Fetching a pack ahead of the thread that will want it, or packs
   cut by crate so that a build wants fewer of them, were not tried.
 - **A machine with an empty store can be given any list that was ever signed.** The turn
   keeps out a list older than one a machine has taken, and a machine that has taken none
@@ -670,7 +670,7 @@ is green.
   the size of cargo's.
 - **A part of a fetch kept aside lasts a day.** A collection used to remove it a minute
   after its last byte. Now `*.fetch.tmp` and `*.zst.tmp` are kept for a day and counted by
-  `cache stats` as temporary bytes meanwhile; they do not count against `RA_JIT_CACHE_MAX`.
+  `cache stats` as temporary bytes meanwhile; they do not count against `BLAZE_CACHE_MAX`.
 - **One failed pack stops the rest.** When a fetch runs out of resumes the remote is taken
   to be down and the other transfers of that process stop rather than each waiting out its
   own 16 s. The next run resumes them, and the daemon's next push or look tries afresh.

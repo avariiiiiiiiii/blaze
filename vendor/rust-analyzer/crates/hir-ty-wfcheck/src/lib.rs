@@ -80,7 +80,7 @@ pub struct WfResult {
 #[salsa::tracked(returns(ref))]
 pub fn wfcheck(db: &dyn HirDatabase, def: GenericDefId) -> WfResult {
     let mut result = WfResult::default();
-    if matches!(std::env::var("RA_JIT_BORROWCK").as_deref(), Ok("off" | "0")) {
+    if matches!(std::env::var("BLAZE_BORROWCK").as_deref(), Ok("off" | "0")) {
         return result;
     }
     let mut check = Check { db, inferred: Inferred::default(), found: &mut result.diagnostics };

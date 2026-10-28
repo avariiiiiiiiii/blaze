@@ -10,7 +10,7 @@
 //! beside its builds, keeps the code with the program, and builds a patch, which is published
 //! like an edit's. What happened is written for the program to show (`tiers`).
 //!
-//! `RA_JIT_TIER=off` starts none of it: no program is asked to sample, and every function
+//! `BLAZE_TIER=off` starts none of it: no program is asked to sample, and every function
 //! stays Cranelift's.
 
 use std::{
@@ -46,17 +46,17 @@ const AT_ONCE: usize = 4;
 /// How many events the program is told of.
 const EVENTS: usize = 12;
 
-/// Whether tiering is on: it is unless `RA_JIT_TIER=off`, where ra-jit has LLVM and programs
+/// Whether tiering is on: it is unless `BLAZE_TIER=off`, where ra-jit has LLVM and programs
 /// take edits while they run (macOS on AArch64).
 pub(crate) fn enabled() -> bool {
     cfg!(all(feature = "llvm", target_os = "macos", target_arch = "aarch64"))
-        && std::env::var("RA_JIT_TIER").as_deref() != Ok("off")
+        && std::env::var("BLAZE_TIER").as_deref() != Ok("off")
 }
 
-/// The highest level a function is compiled at: 3, or 2 with `RA_JIT_TIER=2`, where level 2
+/// The highest level a function is compiled at: 3, or 2 with `BLAZE_TIER=2`, where level 2
 /// counts nothing, as there is no level 3 to count for.
 pub(crate) fn highest() -> Level {
-    static HIGHEST: LazyLock<Level> = LazyLock::new(|| match std::env::var("RA_JIT_TIER") {
+    static HIGHEST: LazyLock<Level> = LazyLock::new(|| match std::env::var("BLAZE_TIER") {
         Ok(level) if level == "2" => Level::Llvm,
         _ => Level::Pgo,
     });
@@ -669,7 +669,7 @@ pub(crate) fn declined(binary: &Path, why: &str) {
 pub(crate) fn placed(uuid: [u8; 16], pid: u32, mut moved: Vec<(u64, u64)>, end: u64) {
     let mut state = lock(&STATE);
     let Some(program) = state.programs.get_mut(&uuid).filter(|it| it.pid == pid) else { return };
-    if std::env::var_os("RA_JIT_DUMP_TIER").is_some() {
+    if std::env::var_os("BLAZE_DUMP_TIER").is_some() {
         for (new, old) in &moved {
             let name = program.symbols.name(*old).unwrap_or("?");
             eprintln!("tier: placed {new:#x} for {old:#x} {name}");

@@ -159,7 +159,7 @@ fn settle(cargo: u32, typed: &[String]) -> anyhow::Result<()> {
 }
 
 /// `cargo ra-jit cache`: what the `#[ra_jit::cache]` functions kept, which is under the target
-/// directory unless `RA_JIT_FN_CACHE_DIR` says where; `cache clear` forgets it, and `cache clear
+/// directory unless `BLAZE_FN_CACHE_DIR` says where; `cache clear` forgets it, and `cache clear
 /// --stale` all but what each function's code computed. Any other verb is one of `ra-jit cache`,
 /// on the disk store.
 fn cache(args: Vec<String>) -> anyhow::Result<i32> {
@@ -221,7 +221,7 @@ fn size(bytes: u64) -> String {
 }
 
 fn fn_cache_dir() -> anyhow::Result<std::path::PathBuf> {
-    Ok(match std::env::var_os("RA_JIT_FN_CACHE_DIR") {
+    Ok(match std::env::var_os("BLAZE_FN_CACHE_DIR") {
         Some(dir) => std::path::PathBuf::from(dir),
         None => {
             let metadata = metadata::no_deps(None, &[]);
@@ -234,7 +234,7 @@ fn fn_cache_dir() -> anyhow::Result<std::path::PathBuf> {
 const FAILED: i32 = 101;
 
 /// What the `Finished` line says the build was: ra-jit's, and the remote's failure if the
-/// daemon's last exchange with it failed (`RA_JIT_REMOTE=off` stops using it).
+/// daemon's last exchange with it failed (`BLAZE_REMOTE=off` stops using it).
 fn blaze_tag() -> String {
     match crate::remote::noted_down() {
         Some(down) => format!("blaze, remote down: {down}"),
@@ -243,7 +243,7 @@ fn blaze_tag() -> String {
 }
 
 /// The status a build that is over ends with when the daemon's remote failed and
-/// `RA_JIT_REMOTE_REQUIRED` makes that a failure of the build.
+/// `BLAZE_REMOTE_REQUIRED` makes that a failure of the build.
 fn remote_failed_it() -> Option<i32> {
     let down = crate::remote::noted_down().filter(|_| crate::remote::required())?;
     say::error(&format!("the remote failed and BLAZE_REMOTE_REQUIRED is set: {down}"));
@@ -413,8 +413,8 @@ fn asking(checkout: &Checkout) -> Checkout {
             || name == wrapper::EVERY_CRATE
             || name == switch::VARIABLE
             || name == switch::CHAINED
-            || name == "RA_JIT_STATS"
-            || name == "RA_JIT_TRACE"
+            || name == "BLAZE_STATS"
+            || name == "BLAZE_TRACE"
     };
     let mut env: BTreeMap<String, String> =
         std::env::vars().filter(|(name, _)| !wraps(name)).collect();

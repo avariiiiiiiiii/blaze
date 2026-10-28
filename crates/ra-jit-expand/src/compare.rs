@@ -1,6 +1,6 @@
 //! The toolchain's proc-macro server held against ra-jit's (docs/no-rustc.md, step J1): with
-//! `RA_JIT_PROC_MACRO_COMPARE` naming the server built from `vendor/proc-macro-srv` and
-//! `RA_JIT_PROC_MACRO_LIBS` a directory of the libraries ra-jit linked (named as rustc's, or
+//! `BLAZE_PROC_MACRO_COMPARE` naming the server built from `vendor/proc-macro-srv` and
+//! `BLAZE_PROC_MACRO_LIBS` a directory of the libraries ra-jit linked (named as rustc's, or
 //! `lib<crate>` and the platform's suffix, with the list of their macros in them), each call the toolchain's server
 //! expands with rustc's library of a crate is expanded again by that server with ra-jit's
 //! library of the crate, given the same input, and the outputs, spans and all, are compared.
@@ -45,8 +45,8 @@ fn compare() -> Option<&'static Compare> {
     static COMPARE: OnceLock<Option<Compare>> = OnceLock::new();
     COMPARE
         .get_or_init(|| {
-            let server = std::env::var_os("RA_JIT_PROC_MACRO_COMPARE")?;
-            let libs = std::env::var_os("RA_JIT_PROC_MACRO_LIBS")?;
+            let server = std::env::var_os("BLAZE_PROC_MACRO_COMPARE")?;
+            let libs = std::env::var_os("BLAZE_PROC_MACRO_LIBS")?;
             let server = AbsPathBuf::assert_utf8(std::path::absolute(server).ok()?);
             let none: [(&str, &Option<&str>); 0] = [];
             let server = match ProcMacroClient::spawn(&server, none, None, 1) {

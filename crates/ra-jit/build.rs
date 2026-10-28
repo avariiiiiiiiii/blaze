@@ -1,4 +1,4 @@
-//! `RA_JIT_SOURCES`: what this build of ra-jit is built from, for the store to key what it
+//! `BLAZE_SOURCES`: what this build of ra-jit is built from, for the store to key what it
 //! keeps by (`ra_jit_store::built_from`). A hash of every file of the workspace's crates, the
 //! vendored ones included, of the manifest and lock file that pick the crates of crates.io, of
 //! the files outside them a crate compiles in, of the features, the target and whether debug
@@ -55,20 +55,20 @@ fn main() {
     field(std::env::var("TARGET").unwrap_or_default().as_bytes());
     field(&[u8::from(std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some())]);
     let hex: String = hash.finish().iter().map(|byte| format!("{byte:02x}")).collect();
-    println!("cargo:rustc-env=RA_JIT_SOURCES={hex}");
+    println!("cargo:rustc-env=BLAZE_SOURCES={hex}");
 }
 
 /// On macOS, the library every process of a sandbox loads (`src/sandbox/macos_interpose.c`),
 /// built with the C compiler of the system (`CC` when set), which `src/sandbox/macos.rs`
 /// carries in the executable. A C file and no build dependency: dyld loads only a dynamic
 /// library, which cargo builds from Rust only as a crate of its own.
-/// `RA_JIT_GIT_SHA`, the commit `blaze --version` names (`blaze 0.20261026.0 (fb82b09)`): what
+/// `BLAZE_GIT_SHA`, the commit `blaze --version` names (`blaze 0.20261026.0 (fb82b09)`): what
 /// the build was told (the release workflow and the flake set it, where there is no `.git`),
 /// else the checkout's HEAD in seven characters, else none, as a published crate builds. The
 /// build runs again when HEAD moves (its reflog grows with each commit and checkout).
 fn git_sha() {
-    println!("cargo:rerun-if-env-changed=RA_JIT_GIT_SHA");
-    let given = std::env::var("RA_JIT_GIT_SHA").unwrap_or_default();
+    println!("cargo:rerun-if-env-changed=BLAZE_GIT_SHA");
+    let given = std::env::var("BLAZE_GIT_SHA").unwrap_or_default();
     let sha = if given.is_empty() {
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
@@ -89,7 +89,7 @@ fn git_sha() {
         given
     };
     if !sha.is_empty() {
-        println!("cargo:rustc-env=RA_JIT_GIT_SHA={sha}");
+        println!("cargo:rustc-env=BLAZE_GIT_SHA={sha}");
     }
 }
 
@@ -127,7 +127,7 @@ fn sandbox_library() {
     let mut hash = Sha256::new();
     hash.update(&std::fs::read(&out).unwrap());
     let hex: String = hash.finish().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
-    println!("cargo:rustc-env=RA_JIT_SANDBOX_LIBRARY={hex}");
+    println!("cargo:rustc-env=BLAZE_SANDBOX_LIBRARY={hex}");
 }
 
 /// Every file below `dir`, but in hidden directories and in what cargo and npm build into.

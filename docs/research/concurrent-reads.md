@@ -33,7 +33,7 @@ from one unpacks its whole block into a cache of `UNPACKED` (32 MiB) shared by e
 under one lock, the least recently used block evicted first (**read**, `ra-jit-store`). The
 change tried: the first thread to ask for a block unpacks it and the others wait for that copy
 (a `OnceLock` per block, filled outside the lock), eviction in batches down to 7/8 of the
-size, the size from `RA_JIT_CACHE_UNPACKED`, and a line in `RA_JIT_STATS` counting blocks
+size, the size from `BLAZE_CACHE_UNPACKED`, and a line in `BLAZE_STATS` counting blocks
 unpacked and values read from blocks already unpacked. A test had 16 threads read every value
 together and asserted one unpack per block; with the per-block cell removed it failed three
 runs of three (41,936 unpacks for 6 blocks) (**read**).

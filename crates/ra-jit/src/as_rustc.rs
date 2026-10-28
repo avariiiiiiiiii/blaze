@@ -27,7 +27,7 @@ use anyhow::{Context as _, bail};
 
 /// The variable that names, to this, the toolchain's rustc: what cargo gave the script as
 /// `RUSTC`.
-pub(crate) const TOOLCHAIN: &str = "RA_JIT_SCRIPT_RUSTC";
+pub(crate) const TOOLCHAIN: &str = "BLAZE_SCRIPT_RUSTC";
 
 /// The name ra-jit is started under to be this.
 pub(crate) const NAME: &str = "rustc";
@@ -62,7 +62,7 @@ fn run(args: &[OsString]) -> anyhow::Result<i32> {
     // this.
     // SAFETY: nothing else runs yet in this process.
     unsafe {
-        std::env::set_var("RA_JIT_ANSWERS", "own");
+        std::env::set_var("BLAZE_ANSWERS", "own");
         std::env::set_var("RUSTC", &rustc);
     }
     let mut stdin = Vec::new();

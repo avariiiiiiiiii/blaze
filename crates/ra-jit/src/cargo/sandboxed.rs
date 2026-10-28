@@ -14,12 +14,12 @@
 //! directories, an address but loopback) fails, whatever it ended with, and the command says
 //! what was denied and how to take the test out: `[package.metadata.blaze.sandbox]` in its
 //! package's manifest, with `tests = false` for every test of the package or
-//! `unsandboxed-tests` for some, or `RA_JIT_SANDBOX=off` for every test of the command. A
+//! `unsandboxed-tests` for some, or `BLAZE_SANDBOX=off` for every test of the command. A
 //! test taken out runs every time and is never kept. Where no sandbox can be made the command
 //! stops before any test runs, and says why: a run that went on outside would break, unseen,
 //! the promise that a test can't change the machine or reach the network.
 //!
-//! Under `RA_JIT_TESTS=affected` the sandbox also records what each test that reaches the
+//! Under `BLAZE_TESTS=affected` the sandbox also records what each test that reaches the
 //! world outside its code read, which is part of the key its pass is kept under. What a thread
 //! no test marked read counts for every such test that ran. Its environment is cut down to
 //! what names the toolchain and the user ([`env`]), which is part of its key too.
@@ -45,11 +45,11 @@ use crate::{
 
 pub(crate) const VAR: &str = sandbox::VAR;
 
-/// Names of more variables of the environment a test keeps under `RA_JIT_TESTS=affected`, by
+/// Names of more variables of the environment a test keeps under `BLAZE_TESTS=affected`, by
 /// commas.
-pub(crate) const PASS: &str = "RA_JIT_TEST_ENV";
+pub(crate) const PASS: &str = "BLAZE_TEST_ENV";
 
-/// The variables of the environment a test keeps under `RA_JIT_TESTS=affected` besides those
+/// The variables of the environment a test keeps under `BLAZE_TESTS=affected` besides those
 /// cargo and ra-jit set for it: what finds programs and the toolchain, who and where the user
 /// is, the locale, and what decides how a failure is shown.
 pub(crate) const KEPT: &[&str] = &[
@@ -76,7 +76,7 @@ pub(crate) const KEPT: &[&str] = &[
 pub(crate) const TABLE: &str = "[package.metadata.blaze.sandbox]";
 
 /// Whether this command may run tests sandboxed, those that are opted in: unless
-/// `RA_JIT_SANDBOX` (or `BLAZE_SANDBOX`) is `off`, as [`sandbox::on`] decides for build
+/// `BLAZE_SANDBOX` is `off`, as [`sandbox::on`] decides for build
 /// scripts and proc macros too.
 pub(crate) fn on() -> bool {
     sandbox::on()
@@ -257,7 +257,7 @@ pub(crate) fn workspace_root(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 }
 
 /// The environment the test `command` runs would have, cut down to what a test keeps under
-/// `RA_JIT_TESTS=affected`: what the command sets itself, and of the rest only [`KEPT`] and
+/// `BLAZE_TESTS=affected`: what the command sets itself, and of the rest only [`KEPT`] and
 /// what [`PASS`] names.
 pub(crate) fn env(command: &Command) -> Vec<(String, String)> {
     let passed = std::env::var(PASS).unwrap_or_default();

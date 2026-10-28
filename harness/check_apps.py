@@ -34,9 +34,9 @@ PLACED_OTHERWISE = {"E0061"}
 
 
 def env(home, target, bin_dir):
-    it = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_HOME=home, RUST_BACKTRACE="0",
+    it = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, RUST_BACKTRACE="0",
               CARGO_TERM_COLOR="never", CARGO_TARGET_DIR=target)
-    it["RA_JIT_CACHE"] = os.path.join(home, "store")
+    it["BLAZE_CACHE"] = os.path.join(home, "store")
     it["PATH"] = bin_dir + os.pathsep + it["PATH"]
     for name in ("RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET"):
         it.pop(name, None)
@@ -153,7 +153,7 @@ def check(name, spec, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
-    ap.add_argument("--bin", default=os.environ.get("RA_JIT_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
     ap.add_argument("--apps-dir", default=os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps"))
     ap.add_argument("--work", default=os.path.join(os.environ.get("TMPDIR", "/tmp"), "check-apps"))
     ap.add_argument("--timeout", type=int, default=3600)

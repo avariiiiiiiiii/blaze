@@ -3,7 +3,7 @@
 code as it is and patches the first edit to it, with nothing of rustc's (#105). Linux and
 macOS: on Windows `cargo ra-jit` hands builds to cargo.
 
-usage: storetracked.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
+usage: storetracked.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc
                            are found next to it)
 
 A patch is cut from what changed since the build it patches, and it knew that by marks
@@ -28,7 +28,7 @@ the checkout may be left out of the store (#216).
 An edit of one body takes the other code from the store of that file as it was, by the items
 each entry names reading as they did then, without compiling it to tell: the second daemon has
 to take some so on those edits, and the third, which compiles everything to check
-(`RA_JIT_CHECK_ALL`), must find none of what it would have taken changed.
+(`BLAZE_CHECK_ALL`), must find none of what it would have taken changed.
 
 Python 3, stdlib only.
 """
@@ -139,7 +139,7 @@ RENAMING = {"a closure above a closure"}
 # The steps that edit one body of a file whose other code the store had: the patch takes that
 # code as it was by its items, which read as they did, and compiles none of it to tell.
 UNCHANGED = {"a generic function's body", "a closure's body"}
-# What the daemon says under RA_JIT_CHECK_ALL of code it would have taken as it was by its
+# What the daemon says under BLAZE_CHECK_ALL of code it would have taken as it was by its
 # items and that changed.
 MISSED = "its items unchanged"
 # What a call of rustc's copy of a function of the checkout was left out of the store as (#216).
@@ -207,7 +207,7 @@ def serve(ws, env, label):
             break
         time.sleep(0.5)
     else:
-        raise SystemExit(f"{label}: no build said `[blaze]`; the daemon's log is in {env['RA_JIT_HOME']}")
+        raise SystemExit(f"{label}: no build said `[blaze]`; the daemon's log is in {env['BLAZE_HOME']}")
     for _ in range(40):
         status = subprocess.run(["cargo", "ra-jit", "status"], cwd=ws, env=env, capture_output=True,
                                 text=True, timeout=120).stdout
@@ -220,7 +220,7 @@ def serve(ws, env, label):
 
 def restart(ws, env, label, steps):
     """A daemon that starts on the store: the result is how many of its checks failed."""
-    logs = Logs(env["RA_JIT_HOME"])
+    logs = Logs(env["BLAZE_HOME"])
     serve(ws, env, label)
     found = [(int(f), int(a)) for f, a in
              re.findall(r"^store: (\d+) functions found, (\d+) compiled and added$", logs.text(), re.M)]
@@ -259,7 +259,7 @@ def restart(ws, env, label, steps):
             verdict = "NEW CODE"
         elif what in RENAMING and not (anew and anew[-1]):
             verdict = "NOTHING RENAMED"
-        elif what in UNCHANGED and "RA_JIT_CHECK_ALL" not in env and not (unchanged and unchanged[-1]):
+        elif what in UNCHANGED and "BLAZE_CHECK_ALL" not in env and not (unchanged and unchanged[-1]):
             verdict = "NONE BY ITEMS"
         wrong += verdict != "ok"
         print(f"{label + ': ' + what:48} {verdict:12} {how[:100]}; {anew[-1] if anew else '?'} anew, "
@@ -277,9 +277,9 @@ def restart(ws, env, label, steps):
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not glob.glob(os.path.join(bin_dir, "cargo-ra-jit*")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     # The daemon's sockets are under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start.
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-tracked-", dir="/tmp"))
@@ -289,8 +289,8 @@ def main():
         open(os.path.join(ws, path), "w").write(text)
 
     def env_of(home):
-        env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
-                   RA_JIT_CACHE=store, RA_JIT_RUSTC_BASE="0", RA_JIT_STATS="1")
+        env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
+                   BLAZE_CACHE=store, BLAZE_RUSTC_BASE="0", BLAZE_STATS="1")
         for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
             env.pop(name, None)
         return env
@@ -303,7 +303,7 @@ def main():
         shutil.copytree(ws, copy, ignore=shutil.ignore_patterns("target"))
         wrong += restart(ws, here, "restart", STEPS)
         subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=here, capture_output=True, timeout=120)
-        wrong += restart(copy, dict(there, RA_JIT_CHECK_ALL="1"), "another checkout", STEPS)
+        wrong += restart(copy, dict(there, BLAZE_CHECK_ALL="1"), "another checkout", STEPS)
     finally:
         for at, env in ((ws, here), (copy, there)):
             if os.path.isdir(at):

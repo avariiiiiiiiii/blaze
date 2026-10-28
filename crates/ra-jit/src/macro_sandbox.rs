@@ -7,7 +7,7 @@
 //!
 //! A package named in `unsandboxed-proc-macros` of the workspace's root manifest
 //! ([`sandboxed::WORKSPACE_TABLE`]) has its macros expanded by servers of their own, started
-//! outside; `RA_JIT_SANDBOX=off` starts every server outside.
+//! outside; `BLAZE_SANDBOX=off` starts every server outside.
 
 use std::{
     collections::BTreeSet,
@@ -51,7 +51,7 @@ pub(crate) fn install() {
 /// `server`, the command a proc-macro server is started with, as `ra-jit sandbox SPEC --
 /// SERVER`. When the sandbox can't be made the server does not start, and the load says why
 /// (`ra-jit sandbox` prints it); when the command can't be made either, this says why. A server
-/// never starts outside instead: only a package taken out, or `RA_JIT_SANDBOX=off`, runs one
+/// never starts outside instead: only a package taken out, or `BLAZE_SANDBOX=off`, runs one
 /// outside.
 fn wrapped(server: Command) -> std::io::Result<Command> {
     let outside = server
@@ -64,7 +64,7 @@ fn wrapped(server: Command) -> std::io::Result<Command> {
         std::io::Error::other(format!(
             "a proc-macro server runs in a sandbox, which can't be made for it: {why}; `{}=off` \
              runs proc-macro servers, build scripts and tests outside a sandbox",
-            crate::sandbox::VAR_BLAZE
+            crate::sandbox::VAR
         ))
     };
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -99,7 +99,7 @@ mod tests {
             "PATH",
             "HOME",
             "RUSTUP_TOOLCHAIN",
-            "RA_JIT_CACHE",
+            "BLAZE_CACHE",
             "RUST_ANALYZER_INTERNALS_DO_NOT_USE",
         ] {
             assert!(super::given_to_server(name), "{name}");
@@ -111,13 +111,13 @@ mod tests {
 }
 
 /// Whether the variable `name` of this process's environment is given to a proc-macro server:
-/// what finds the toolchain and how a failure is shown ([`sandboxed::KEPT`]) and ra-jit's and
+/// what finds the toolchain and how a failure is shown ([`sandboxed::KEPT`]) and blaze's and
 /// rust-analyzer's own. Nothing else (a CI's secrets): what a macro reads with `env!` or
 /// `std::env::var` is its crate's environment (`CARGO_*`, `OUT_DIR`, a build script's
 /// `rustc-env`), which each expansion is sent with.
 fn given_to_server(name: &str) -> bool {
     sandboxed::KEPT.contains(&name)
-        || name.starts_with("RA_JIT_")
+        || name.starts_with("BLAZE_")
         || name.starts_with("RUST_ANALYZER_")
 }
 

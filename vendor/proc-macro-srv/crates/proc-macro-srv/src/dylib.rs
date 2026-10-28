@@ -84,7 +84,7 @@ struct Macro {
 }
 
 /// The name of the list in the library's symbol table.
-const SYMBOL: &std::ffi::CStr = c"RA_JIT_PROC_MACROS";
+const SYMBOL: &std::ffi::CStr = c"BLAZE_PROC_MACROS";
 
 impl ProcMacroLibrary {
     /// Loads the library and reads ra-jit's list of its macros. The library is never
@@ -125,12 +125,12 @@ impl ProcMacroLibrary {
         unsafe { Self::from_list(&shown.to_string(), list) }
     }
 
-    /// The library behind `list`, the address of ra-jit's `static RA_JIT_PROC_MACROS: &[Macro]`.
+    /// The library behind `list`, the address of ra-jit's `static BLAZE_PROC_MACROS: &[Macro]`.
     ///
     /// # Safety
     /// `list` is that static, in a library that stays loaded for as long as the process runs.
     unsafe fn from_list(shown: &str, list: *mut std::ffi::c_void) -> io::Result<Self> {
-        // SAFETY: ra-jit exports the list as a `static RA_JIT_PROC_MACROS: &[Macro]`, and the
+        // SAFETY: ra-jit exports the list as a `static BLAZE_PROC_MACROS: &[Macro]`, and the
         // library stays loaded for as long as the process runs.
         let list: &'static [Macro] = unsafe { *list.cast::<&'static [Macro]>() };
         let mut macros = Vec::with_capacity(list.len());

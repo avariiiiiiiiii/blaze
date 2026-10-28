@@ -80,7 +80,7 @@
    "out_dir": "/root/bsw/work/target/biome/debug/build/biome_aria_metadata/48af6c0bccfb6884/out",
    "real": "/root/bsw/work/target/biome/debug/build/biome_aria_metadata/7cd681b4e0ec49af/out/build_script_build.real",
    "result": {
-    "error": "ra-jit did not build the build script of `biome_aria_metadata` for wasm32-wasip1: ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::main: frontend: mir: UnresolvedMethod(\"merge_with\") (a macro of the crate did not expand: proc macro server error: a proc-macro server runs in a sandbox, which can't be made for it: no RA_JIT_HOME, XDG_RUNTIME_DIR or HOME; `RA_JIT_SANDBOX=off` runs proc-macro servers, build scripts and tests outside a sandbox)",
+    "error": "ra-jit did not build the build script of `biome_aria_metadata` for wasm32-wasip1: ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::main: frontend: mir: UnresolvedMethod(\"merge_with\") (a macro of the crate did not expand: proc macro server error: a proc-macro server runs in a sandbox, which can't be made for it: no BLAZE_HOME, XDG_RUNTIME_DIR or HOME; `BLAZE_SANDBOX=off` runs proc-macro servers, build scripts and tests outside a sandbox)",
     "tools": [],
     "tools_by_program": {}
    },
@@ -641,7 +641,7 @@
    "out_dir": "/root/bsw/work/target/biome/debug/build/encoding_rs/98f5a5c4b6c4cc53/out",
    "real": "/root/bsw/work/target/biome/debug/build/encoding_rs/e58c29594347494d/out/build_script_build.real",
    "result": {
-    "error": "ra-jit did not build the build script of `encoding_rs` for wasm32-wasip1: ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::main: frontend: mir: NotSupported(\"macro call that failed to expand: proc macro server error: a proc-macro server runs in a sandbox, which can't be made for it: no RA_JIT_HOME, XDG_RUNTIME_DIR or HOME; `RA_JIT_SANDBOX=off` runs proc-macro servers, build scripts and tests outside a sandbox\")",
+    "error": "ra-jit did not build the build script of `encoding_rs` for wasm32-wasip1: ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::main: frontend: mir: NotSupported(\"macro call that failed to expand: proc macro server error: a proc-macro server runs in a sandbox, which can't be made for it: no BLAZE_HOME, XDG_RUNTIME_DIR or HOME; `BLAZE_SANDBOX=off` runs proc-macro servers, build scripts and tests outside a sandbox\")",
     "tools": [],
     "tools_by_program": {}
    },
@@ -2343,7 +2343,7 @@
    "out_dir": "/root/bsw/work/target/biome/debug/build/wasm-bindgen/7080e4931bec7c7c/out",
    "real": "/root/bsw/work/target/biome/debug/build/wasm-bindgen/7284fae452e9d9a8/out/build_script_build.real",
    "result": {
-    "error": "ra-jit did not build the build script of `wasm-bindgen` for wasm32-wasip1: ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::main: frontend: mir: NotSupported(\"macro call that failed to expand: proc macro server error: a proc-macro server runs in a sandbox, which can't be made for it: no RA_JIT_HOME, XDG_RUNTIME_DIR or HOME; `RA_JIT_SANDBOX=off` runs proc-macro servers, build scripts and tests outside a sandbox\")",
+    "error": "ra-jit did not build the build script of `wasm-bindgen` for wasm32-wasip1: ra-jit did not build it (exit status: 1): Error: `build_script_build` reaches 1 function ra-jit could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n  build_script_build::main: frontend: mir: NotSupported(\"macro call that failed to expand: proc macro server error: a proc-macro server runs in a sandbox, which can't be made for it: no BLAZE_HOME, XDG_RUNTIME_DIR or HOME; `BLAZE_SANDBOX=off` runs proc-macro servers, build scripts and tests outside a sandbox\")",
     "tools": [],
     "tools_by_program": {}
    },

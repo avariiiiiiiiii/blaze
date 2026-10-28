@@ -31,7 +31,7 @@ jobs:
       - name: Fuzz
         working-directory: harness
         run: |
-          export RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
+          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
           python3 fuzz/fuzz.py run --seed "${{ inputs.seed || github.run_number }}" \
             --rounds "${{ inputs.rounds || '200' }}" --backends cranelift,llvm \
             --out "$RUNNER_TEMP/fuzz-out" || status=$?

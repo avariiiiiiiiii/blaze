@@ -589,7 +589,7 @@ impl Wasm {
         let bytes = || module_bytes(path, &digest, given, &read);
         let key = code_key(&digest);
         let file = code_file(path, &key);
-        let stats = std::env::var_os("RA_JIT_STATS").is_some();
+        let stats = std::env::var_os("BLAZE_STATS").is_some();
         // SAFETY: the file beside the module and what the store has under the key are what
         // `serialize` wrote for this key, the store's checked against its checksum when read;
         // Wasmtime refuses code of another version, configuration or CPU.
@@ -651,7 +651,7 @@ impl Wasm {
         if let Ok(code) = self.pre.module().serialize() {
             store.insert_lasting(&code_key(&self.digest), &code);
             store.flush();
-            if std::env::var_os("RA_JIT_STATS").is_some() {
+            if std::env::var_os("BLAZE_STATS").is_some() {
                 eprintln!("blaze: the store keeps the machine code of {}", self.path.display());
             }
         }
@@ -894,7 +894,7 @@ pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), S
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
     let wasm = Wasm::known(path, known, Some(&bytes), store)?;
     list(path, &wasm, &wasm.list()?);
-    if std::env::var_os("RA_JIT_STATS").is_some() {
+    if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!(
             "blaze: the proc-macro module {} ready in {:.1?}",
             path.display(),
@@ -926,7 +926,7 @@ pub fn prepare_soon(
     std::thread::spawn(move || {
         let start = Instant::now();
         let done = Wasm::known(&path, known, Some(&bytes), store);
-        if std::env::var_os("RA_JIT_STATS").is_some() {
+        if std::env::var_os("BLAZE_STATS").is_some() {
             let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
             eprintln!(
                 "blaze: the proc-macro module {} {how} in {:.1?}",
@@ -1244,7 +1244,7 @@ pub fn flush() {
 
 /// The store, once the daemon has told it the toolchain.
 fn store() -> Option<&'static ra_jit_store::Store> {
-    if matches!(std::env::var("RA_JIT_PROC_MACRO_CACHE").as_deref(), Ok("off" | "0")) {
+    if matches!(std::env::var("BLAZE_PROC_MACRO_CACHE").as_deref(), Ok("off" | "0")) {
         return None;
     }
     ra_jit_store::toolchain()?;

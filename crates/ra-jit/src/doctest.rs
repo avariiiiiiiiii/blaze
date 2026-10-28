@@ -32,7 +32,7 @@ use program::{Frame, Program};
 /// The variable that tells the run of the doc tests the build `cargo blaze test` was asked
 /// for, as JSON: the libraries the examples link against are built with its features, which a
 /// package shares with the others it selects, not with those of a build of the package alone.
-pub(crate) const BUILD: &str = "RA_JIT_DOCTEST_BUILD";
+pub(crate) const BUILD: &str = "BLAZE_DOCTEST_BUILD";
 
 /// The argument that has ra-jit make the runs [`write_run`] wrote down, before a [`Replay`] as
 /// JSON.

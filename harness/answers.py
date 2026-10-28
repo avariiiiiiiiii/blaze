@@ -19,7 +19,7 @@ import norustc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-RA_JIT = os.environ.get("RA_JIT_BIN") or os.path.join(ROOT, "target/release/ra-jit")
+RA_JIT = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/ra-jit")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 DATA = os.path.join(ROOT, "crates/ra-jit/src/answers", "rustc.json")
 TARGETS = [
@@ -53,7 +53,7 @@ def rustc():
 
 def env(extra):
     clean = {k: v for k, v in os.environ.items()
-             if not k.startswith(("RUSTC", "RA_JIT", "MACOSX_", "IPHONEOS_", "SDKROOT"))}
+             if not k.startswith(("RUSTC", "BLAZE_", "MACOSX_", "IPHONEOS_", "SDKROOT"))}
     clean.pop("RUST_TARGET_PATH", None)
     return {**clean, **extra}
 
@@ -266,7 +266,7 @@ def check():
                 # rustc is asked, once per toolchain.
                 return "unknown", target, want[1]
         got = ask([RA_JIT, "rustc-wrapper", rust, *args],
-                  {**variables, "RA_JIT_HOME": home, "RA_JIT_ANSWERS": "own"}, stdin)
+                  {**variables, "BLAZE_HOME": home, "BLAZE_ANSWERS": "own"}, stdin)
         return "asked", (args, variables, want[1], got), got[:2] == want[:2]
 
     work = tempfile.mkdtemp(prefix="ra-jit-answers-", dir="/tmp" if sys.platform == "darwin" else None)

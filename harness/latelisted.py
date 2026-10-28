@@ -2,7 +2,7 @@
 """latelisted.py: what a file an `include!` names declares is listed in its crate, though the
 file is loaded only once the names are resolved.
 
-usage: latelisted.py    (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
+usage: latelisted.py    (BLAZE_BIN names the ra-jit built; cargo-ra-jit is found next to it)
 
 bun's crates `include!` the code its generators write, from a directory a build script names in
 a variable (`BUN_CODEGEN_DIR`). The VFS has none of those files when the daemon first lists a
@@ -65,9 +65,9 @@ def build(side, step, home):
 
 
 def main():
-    bin_dir = os.path.dirname(os.path.abspath(os.environ["RA_JIT_BIN"]))
+    bin_dir = os.path.dirname(os.path.abspath(os.environ["BLAZE_BIN"]))
     if not os.path.exists(os.path.join(bin_dir, "cargo-ra-jit")):
-        raise SystemExit(f"no cargo-ra-jit beside {os.environ['RA_JIT_BIN']}")
+        raise SystemExit(f"no cargo-ra-jit beside {os.environ['BLAZE_BIN']}")
     # Short, for the daemon's sockets under its home.
     root = os.path.realpath(tempfile.mkdtemp(prefix="ra-jit-ll-", dir="/tmp"))
     ws, home = (os.path.join(root, n) for n in ("ws", "home"))

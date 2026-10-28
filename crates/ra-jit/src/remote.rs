@@ -1,5 +1,5 @@
 //! Keeping a store in step with a place other machines reach: `ra-jit cache push REMOTE` and
-//! `ra-jit cache pull REMOTE`, and the same done by the daemon when `RA_JIT_REMOTE` names one.
+//! `ra-jit cache pull REMOTE`, and the same done by the daemon when `BLAZE_REMOTE` names one.
 //! The commands on the local store alone, `ra-jit cache stats|gc|verify`, are here with them.
 //!
 //! A remote is a directory, `s3://bucket/prefix`, an `https://` address that is read from
@@ -8,21 +8,21 @@
 //! their bytes, the keys of each pack under the hash of those, and one manifest a project:
 //! the packs its builds were served from. A push sends the packs the manifest lacks and
 //! adds them to it; a pull fetches the ones it lists that are not here. With
-//! `RA_JIT_REMOTE_LAZY` the daemon fetches the keys only, and a pack when a build first asks
+//! `BLAZE_REMOTE_LAZY` the daemon fetches the keys only, and a pack when a build first asks
 //! for a key it holds. A daemon that stays goes on in `keeper.rs`: it pulls again when a
 //! build lacked something and the manifest has changed, and pushes on a schedule and when
 //! it is told to end.
 //!
 //! What is fetched becomes a pack of the store like any other: it is written the way the
-//! store writes its own, counts toward `RA_JIT_CACHE_MAX`, and can be evicted and fetched
+//! store writes its own, counts toward `BLAZE_CACHE_MAX`, and can be evicted and fetched
 //! again. A pull fetches no more than fits under that limit.
 //!
 //! Nothing fetched is used before its bytes hash to the name it was listed under, so a
 //! remote can withhold code and cannot change it. What it could change is the list, which
-//! is what `signed.rs` is for. `RA_JIT_REMOTE_READONLY` keeps a machine from writing at all.
+//! is what `signed.rs` is for. `BLAZE_REMOTE_READONLY` keeps a machine from writing at all.
 //!
 //! Nor does a remote say how much is taken from it. A list is read to [`LIST_MAX`] bytes,
-//! a pack to the size its list gives it, anything else to `RA_JIT_REMOTE_MAX`, and what is
+//! a pack to the size its list gives it, anything else to `BLAZE_REMOTE_MAX`, and what is
 //! longer is refused with nothing of it kept.
 
 mod collect;
@@ -73,7 +73,7 @@ const REUSE_FOR: Duration = Duration::from_secs(60 * 60);
 pub(crate) const LIST_MAX: u64 = 16 << 20;
 
 /// The most that is taken of one object that is neither a list nor a pack, unless
-/// `RA_JIT_REMOTE_MAX` says: the archive of a unit, and the keys of the packs a daemon
+/// `BLAZE_REMOTE_MAX` says: the archive of a unit, and the keys of the packs a daemon
 /// fetches from when asked.
 const OBJECT_MAX: u64 = 512 << 20;
 
@@ -85,7 +85,7 @@ pub(crate) struct Remote {
     read_only: bool,
     trust: Trust,
     turns: Turns,
-    /// `RA_JIT_REMOTE_MAX`, or [`OBJECT_MAX`].
+    /// `BLAZE_REMOTE_MAX`, or [`OBJECT_MAX`].
     object_max: u64,
 }
 
@@ -101,8 +101,8 @@ enum Place {
 
 impl Remote {
     /// The remote `spec` names, as the environment has this machine use it:
-    /// `RA_JIT_REMOTE_JOBS` requests at a time (8), `RA_JIT_REMOTE_TIMEOUT` seconds without
-    /// an answer (30), `RA_JIT_REMOTE_READONLY` to never write, `RA_JIT_REMOTE_MAX` bytes of
+    /// `BLAZE_REMOTE_JOBS` requests at a time (8), `BLAZE_REMOTE_TIMEOUT` seconds without
+    /// an answer (30), `BLAZE_REMOTE_READONLY` to never write, `BLAZE_REMOTE_MAX` bytes of
     /// one object, and the keys of `signed.rs`. The turns of its lists are remembered in
     /// `kept_in`, the directory that what is fetched goes to.
     pub(crate) async fn open(spec: &str, kept_in: &Path) -> anyhow::Result<Remote> {
@@ -110,8 +110,8 @@ impl Remote {
             Ok(value) => value.parse().with_context(|| format!("{name} is not a number")),
             Err(_) => Ok(default),
         };
-        let traffic = Arc::new(Traffic::new(number("RA_JIT_REMOTE_JOBS", 8)? as usize));
-        let patience = Duration::from_secs(number("RA_JIT_REMOTE_TIMEOUT", 30)?.max(1));
+        let traffic = Arc::new(Traffic::new(number("BLAZE_REMOTE_JOBS", 8)? as usize));
+        let patience = Duration::from_secs(number("BLAZE_REMOTE_TIMEOUT", 30)?.max(1));
         let place = if spec.starts_with("blaze+") {
             Place::Gateway(Box::new(Gateway::open(spec, patience, traffic.clone())?))
         } else if spec.starts_with("s3://") {
@@ -124,8 +124,8 @@ impl Remote {
             Place::Dir(PathBuf::from(spec))
         };
         let read_only = matches!(place, Place::Https(_))
-            || std::env::var_os("RA_JIT_REMOTE_READONLY").is_some_and(|it| it != "0");
-        let object_max = match std::env::var("RA_JIT_REMOTE_MAX") {
+            || std::env::var_os("BLAZE_REMOTE_READONLY").is_some_and(|it| it != "0");
+        let object_max = match std::env::var("BLAZE_REMOTE_MAX") {
             Ok(text) => parse_size(&text)
                 .with_context(|| format!("BLAZE_REMOTE_MAX=`{text}` is not a size"))?,
             Err(_) => OBJECT_MAX,
@@ -942,7 +942,7 @@ pub(crate) async fn lists(remote: &Remote, project: &str) -> anyhow::Result<bool
 }
 
 /// Fetches the packs of the project's manifest that are not in the local store, as far as
-/// they fit under `RA_JIT_CACHE_MAX`. A pack of another format than this build reads is left
+/// they fit under `BLAZE_CACHE_MAX`. A pack of another format than this build reads is left
 /// where it is, and one that is longer than the manifest says is rejected.
 pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
     let limit = limit_for(store).map_err(anyhow::Error::msg)?;
@@ -1031,11 +1031,11 @@ fn transfer_command(
     Ok(())
 }
 
-/// Whether a remote that fails fails what it was used for: `RA_JIT_REMOTE_REQUIRED=1`, which
+/// Whether a remote that fails fails what it was used for: `BLAZE_REMOTE_REQUIRED=1`, which
 /// CI sets so that a cache that stopped working is not a slowdown nobody sees. Without it the
 /// failure is said on every build's `Finished` line and the build goes on.
 pub(crate) fn required() -> bool {
-    std::env::var_os("RA_JIT_REMOTE_REQUIRED").is_some_and(|it| it != "0" && !it.is_empty())
+    std::env::var_os("BLAZE_REMOTE_REQUIRED").is_some_and(|it| it != "0" && !it.is_empty())
 }
 
 /// The file in a store's directory that says how the daemon's last exchange with its remote
@@ -1104,7 +1104,7 @@ fn collect_remote(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> 
     let start = Instant::now();
     // A machine that signs remembers the turns of the lists it writes where it keeps its
     // store, and without one where the daemon keeps what is its own.
-    let kept_in = match std::env::var_os("RA_JIT_CACHE") {
+    let kept_in = match std::env::var_os("BLAZE_CACHE") {
         Some(store) => PathBuf::from(store),
         None => crate::cargo::daemon::home()?,
     };
@@ -1152,7 +1152,7 @@ fn stats(store: &Path) -> anyhow::Result<()> {
 }
 
 /// `ra-jit cache gc [--max SIZE]`: collects garbage now, down to the size given or the one
-/// `RA_JIT_CACHE_MAX` names.
+/// `BLAZE_CACHE_MAX` names.
 fn collect(store: &Path, mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let limit = match (args.next().as_deref(), args.next()) {
         (None, _) => limit_for(store).map_err(anyhow::Error::msg)?,
@@ -1215,8 +1215,8 @@ pub(crate) fn runtime() -> anyhow::Result<Runtime> {
     Ok(runtime.worker_threads(2).thread_name("ra-jit-remote").enable_all().build()?)
 }
 
-/// The remote the daemon keeps its store in step with: `RA_JIT_REMOTE`, and the project
-/// `RA_JIT_PROJECT` names in it.
+/// The remote the daemon keeps its store in step with: `BLAZE_REMOTE`, and the project
+/// `BLAZE_PROJECT` names in it.
 pub(crate) struct Shared {
     store: PathBuf,
     remote: Arc<Remote>,
@@ -1230,22 +1230,22 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// `None` without a store or a remote, or with `RA_JIT_REMOTE=off`. A remote that
+    /// `None` without a store or a remote, or with `BLAZE_REMOTE=off`. A remote that
     /// cannot be reached is not an error to the build, unless [`required`]: it compiles
     /// what it would have fetched, and its `Finished` line says so.
     pub(crate) fn from_env() -> anyhow::Result<Option<Shared>> {
-        let Some(store) = std::env::var_os("RA_JIT_CACHE").map(PathBuf::from) else {
+        let Some(store) = std::env::var_os("BLAZE_CACHE").map(PathBuf::from) else {
             return Ok(None);
         };
-        let remote = match std::env::var("RA_JIT_REMOTE") {
+        let remote = match std::env::var("BLAZE_REMOTE") {
             Ok(remote) if !remote.is_empty() && remote != "off" => remote,
             _ => return Ok(None),
         };
         let opened = runtime().and_then(|runtime| {
-            let project = project_name(std::env::var("RA_JIT_PROJECT").ok())?;
+            let project = project_name(std::env::var("BLAZE_PROJECT").ok())?;
             let push_every = keeper::push_every_from_env()?;
             let remote = Arc::new(runtime.block_on(Remote::open(&remote, &store))?);
-            let lazy = std::env::var_os("RA_JIT_REMOTE_LAZY").is_some_and(|it| it != "0");
+            let lazy = std::env::var_os("BLAZE_REMOTE_LAZY").is_some_and(|it| it != "0");
             let (runtime, asked) = (Arc::new(runtime), Arc::default());
             Ok(Shared { store: store.clone(), remote, project, runtime, lazy, push_every, asked })
         });
@@ -1281,7 +1281,7 @@ impl Shared {
         })
     }
 
-    /// Fetches what the project's manifest lists, or with `RA_JIT_REMOTE_LAZY` only what
+    /// Fetches what the project's manifest lists, or with `BLAZE_REMOTE_LAZY` only what
     /// tells which pack holds which key, leaving each pack to the first build that asks.
     /// From here on the store asks this remote for the keys it lacks. An error only when
     /// [`required`].
@@ -1452,7 +1452,7 @@ impl Lazy {
                         true
                     }
                     Ok(Fetched::Elsewhere) => false,
-                    // The build compiles what the pack held; with RA_JIT_REMOTE_REQUIRED the
+                    // The build compiles what the pack held; with BLAZE_REMOTE_REQUIRED the
                     // client fails it once it is over.
                     Err(e) => {
                         let why = format!("{e:#}");

@@ -6,8 +6,8 @@ nothing but the checkout and the remote does. ix VM `bscache-fw2`, arm64, 16 cpu
 committed, `CARGO_BUILD_JOBS=8`, ra-jit of this branch (43671a2aac, origin/main 0ef4868a15
 merged), the rustup toolchain nightly-2026-10-25 first on `PATH`.
 
-- before: build scripts as on main (`RA_JIT_SCRIPT_VIEW` unset).
-- after: `RA_JIT_SCRIPT_VIEW=on`, the closure taken from `RA_JIT_REMOTE` (project
+- before: build scripts as on main (`BLAZE_SCRIPT_VIEW` unset).
+- after: `BLAZE_SCRIPT_VIEW=on`, the closure taken from `BLAZE_REMOTE` (project
   `nix-closure`, pushed by `ra-jit closure fetch` + `ra-jit cache push` once: 37.9 s, 0.58 s).
   `BLAZE_HOME` is one per project for both steps, so the fresh step finds the closure laid out
   (`ra-jit closure materialize` from the remote into an empty home: 36 s for all 203 paths).

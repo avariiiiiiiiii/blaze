@@ -2,11 +2,11 @@
 """Save-to-running latency of live edits (macOS on AArch64, Windows on x86-64), step by step.
 
 usage: live_latency.py [--program probe|life|bevy|egui] [cargo|socket|burst|replay|restart ...]
-       (RA_JIT_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are found next to it)
+       (BLAZE_BIN names the ra-jit built; cargo-ra-jit and ra-jit-rustc are found next to it)
 
 The program is harness/live (`probe`, the default: a few functions and ra-jit-live), the Game
 of Life demo (`life`: demo/life with eframe, a 38 MB debug executable, run without its window
-with RA_JIT_LIFE_HEADLESS=1), a bevy app (`bevy`: harness/live-bevy, a simulation of ships,
+with BLAZE_LIFE_HEADLESS=1), a bevy app (`bevy`: harness/live-bevy, a simulation of ships,
 rocks and shots on bevy's ECS with generic systems, without a window, one 600-line file, 21 MB)
 or an egui app (`egui`: harness/live-egui, a ledger whose whole UI egui lays out and tessellates
 every frame without a window, generic widgets, one 580-line file). Each applies each patch as it
@@ -75,7 +75,7 @@ set. $LATENCY_JSON, when set, gets every edit's numbers with what was measured w
 {"program", "date", "commit", "run_url", "host": {"name", "cpu", "cores", "memory_gib", "os",
 "battery"}, "modes": {mode: [row, ...]}, "counts": {mode: {...}}}, a row having at least
 "total" in ms; harness/benchhistory.py `live` reads it. A mode that fails leaves the modes
-before it in the JSON, and its error under counts.failed. The host's name is $RA_JIT_BENCH_MACHINE
+before it in the JSON, and its error under counts.failed. The host's name is $BLAZE_BENCH_MACHINE
 or the Mac's model; "battery" is what `pmset -g batt` says ("AC" or "battery 87%").
 LATENCY_TARGET_DIR keeps the programs' target directory across runs (bevy's dependencies take
 minutes to build). Python 3.13, stdlib only.
@@ -302,7 +302,7 @@ def copy_program(name: str, work: Path) -> Program:
             return Program(name, work / "harness" / "live", "liveprobe", "answer", 1, {}, probe_scripts, PROBE_SESSION)
         case "life":
             shutil.copytree(ROOT / "demo" / "life", work / "demo" / "life", ignore=ignore)
-            env = {"RA_JIT_LIFE_HEADLESS": "1"}
+            env = {"BLAZE_LIFE_HEADLESS": "1"}
             return Program(name, work / "demo" / "life", "life", "step_ms", 80, env, life_scripts, LIFE_SESSION)
         case "bevy" | "egui":
             shutil.copytree(HERE / f"live-{name}", work / "harness" / f"live-{name}", ignore=ignore)
@@ -1039,7 +1039,7 @@ def run(*cmd: str) -> str:
 
 def host() -> dict:
     """What the numbers were measured on, and whether it ran on its battery."""
-    info = {"name": os.environ.get("RA_JIT_BENCH_MACHINE"), "cpu": None, "cores": os.cpu_count(), "memory_gib": None,
+    info = {"name": os.environ.get("BLAZE_BENCH_MACHINE"), "cpu": None, "cores": os.cpu_count(), "memory_gib": None,
             "os": f"{platform.system()} {platform.release()}", "battery": None}
     if sys.platform == "darwin":
         model = run("sysctl", "-n", "hw.model")
@@ -1075,7 +1075,7 @@ async def main(program_name: str, modes: list[str]) -> None:
     # Lines as they happen, in order with the errors, also into a pipe.
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(line_buffering=True)
-    bin_dir = Path(os.environ["RA_JIT_BIN"]).resolve().parent
+    bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
     work = Path(tempfile.mkdtemp(prefix="ra-jit-live-latency-"))
     target = Path(os.environ.get("LATENCY_TARGET_DIR") or work / "target").resolve()
     meta = metadata(program_name)
@@ -1091,7 +1091,7 @@ async def main(program_name: str, modes: list[str]) -> None:
             os.environ,
             PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             CARGO_TARGET_DIR=str(target),
-            RA_JIT_STATS="1",
+            BLAZE_STATS="1",
         )
         env.pop("CARGO_INCREMENTAL", None)
 

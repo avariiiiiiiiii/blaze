@@ -5,7 +5,7 @@ Branch `fn-incremental`, from main at 46aff2550e, 2026-10-20. Measured on a load
 time the daemon spends on an edit is the steadier measure of work.
 
 `harness/fnincr.py` starts the daemon in watch mode with salsa's execution counts on
-(`RUSTD_TRACE`, `RA_JIT_TRACE`), edits, and prints how often each query ran for the edit. Its
+(`RUSTD_TRACE`, `BLAZE_TRACE`), edits, and prints how often each query ran for the edit. Its
 file is `harness/genbig.py`'s: 500 functions of 27 lines (a loop, a match, a closure, a
 `panic!`) in one 13,500-line file, and the same functions in 50 files of 10 as the control.
 `--workspace` takes a real file; here ripgrep 15.1.0's `crates/core/flags/defs.rs` (7,775 lines,
@@ -78,7 +78,7 @@ Each step is a commit, measured on its own:
    `Body::relative`, the anchor's text, and spans left unresolved
    (`map_node_range_up_rooted_span`); where the anchor begins is a query per body
    (`anchor_location`) added when a place is asked for. A place outside the anchor (a macro
-   of the crate defined elsewhere) is found as before. `RA_JIT_CHECK_PLACES` compares every
+   of the crate defined elsewhere) is found as before. `BLAZE_CHECK_PLACES` compares every
    place with the old way.
 
 `harness/movedlines.py` checks the result end to end: one function panics in seven ways
@@ -130,7 +130,7 @@ Tests: `cargo test --release -p hir-ide` fails the 18 tests it failed before
 `typing_inside_a_function_should_not_invalidate_types_in_another` the untouched function now
 runs `body_syntax` and no longer `Body::with_source_map` and `Body::of`. `difftest.py corpus
 --mixed 8`, `difftest.py mixfutures --mixed 16 --layouts` and `growth.py` pass as before; the
-corpus also passes with `RA_JIT_CHECK_PLACES=1 RA_CHECK_RELATIVE_BODIES=1` with no difference.
+corpus also passes with `BLAZE_CHECK_PLACES=1 RA_CHECK_RELATIVE_BODIES=1` with no difference.
 
 ## What is left
 

@@ -128,7 +128,7 @@ function has no unwinding entry and no line, and the script took the row that en
 sequence of the function before it, which is at the address the naked one begins at, for a
 line of the naked one. `ra-jit-collate` has the script from before that fix. Measured here by
 building the corpus for `aarch64-unknown-linux-gnu` with Cranelift on the x86-64 host
-(`RA_JIT_TARGET=aarch64-unknown-linux-gnu python3 debuginfo.py --only corpus`) and running
+(`BLAZE_TARGET=aarch64-unknown-linux-gnu python3 debuginfo.py --only corpus`) and running
 this branch's script on it: `11735 functions, 0 without an entry, ... 6 of assembly alone`,
 the same 11,735 functions and the same six. It was not run on the runner itself; the rows of
 that cross run that execute the program (panics, gdb) do not apply under qemu and are not
@@ -250,7 +250,7 @@ inferred and not measured.
 `cargo ra-jit` in the dev profile, and compares:
 
     cd harness
-    RA_JIT_BIN=$PWD/../target/release/ra-jit python3 realdebug.py ripgrep axum
+    BLAZE_BIN=$PWD/../target/release/ra-jit python3 realdebug.py ripgrep axum
 
 | | ripgrep | axum hello-world |
 |---|---|---|
@@ -263,7 +263,7 @@ inferred and not measured.
 
 These are Cranelift numbers, taken at this head.
 
-Under LLVM (`RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast`), at this head:
+Under LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`), at this head:
 
 | | ripgrep | axum hello-world |
 |---|---|---|
@@ -303,7 +303,7 @@ functions have none, as under `rustc -g`.
 ### Cost
 
 `debuginfo.py --only cost`: compile and link of the corpus `cases` object, best of three,
-with `RA_JIT_DEBUGINFO=0` and without.
+with `BLAZE_DEBUGINFO=0` and without.
 
 | | Cranelift | LLVM -O2 |
 |---|---:|---:|
@@ -452,7 +452,7 @@ not done by this code.
 
 When several packages are built with different profiles, the most any of the packages cargo
 was asked to build wants is used for all of ra-jit's code. The harness changes the setting
-nine times in one workspace and checks the object after each. `RA_JIT_DEBUGINFO=0|lines|1`
+nine times in one workspace and checks the object after each. `BLAZE_DEBUGINFO=0|lines|1`
 overrides it for measuring. Since the build model's second round `profile.rs` is gone: the
 setting is a `plan::Described` read from the unit graph and kept through a reload, and a
 project cargo does not plan gets no debug info.
@@ -550,8 +550,8 @@ All on one machine, Linux x86-64, Rust 1.99.0, LLVM 20, at the head of this bran
     cargo build -p ra-jit --release
     LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p ra-jit --release --features llvm --target-dir target-llvm
     cd harness
-    RA_JIT_BIN=$PWD/../target/release/ra-jit python3 debuginfo.py
-    RA_JIT_BACKEND=llvm RA_JIT_OPT=2 RA_JIT_EMIT=fast RA_JIT_BIN=$PWD/../target-llvm/release/ra-jit python3 debuginfo.py
+    BLAZE_BIN=$PWD/../target/release/ra-jit python3 debuginfo.py
+    BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast BLAZE_BIN=$PWD/../target-llvm/release/ra-jit python3 debuginfo.py
 
 `debuginfo.py` exits 0 under both backends ("all right").
 `--only corpus|stress|rung2|edits|callers|locals|types|scopes|rich|profile|cost` runs one part. The
@@ -638,7 +638,7 @@ breakpoint on a line stopped, `frame variable` printed parameters and locals, `n
 to the next line.
 
 Cost (`cost`), corpus runner, best of three, compile and link of the `cases` crate object
-(11,647 functions), with `RA_JIT_DEBUGINFO=0` and without it:
+(11,647 functions), with `BLAZE_DEBUGINFO=0` and without it:
 
 | | Cranelift | LLVM -O2 |
 |---|---|---|

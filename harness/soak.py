@@ -355,12 +355,12 @@ class Soak:
         self.reference = threading.Lock()
         self.state_path = os.path.join(self.work, "state.json")
         self.home, self.store = os.path.join(self.work, "home"), os.path.join(self.work, "store")
-        self.env = dict(base_env(self.home), RA_JIT_CACHE=self.store, SOAK_REPORT="1", RA_JIT_IDLE_SECS=str(args.idle))
+        self.env = dict(base_env(self.home), BLAZE_CACHE=self.store, SOAK_REPORT="1", BLAZE_IDLE_SECS=str(args.idle))
         if not args.debuginfo:
             # A tenth of the disk, for cargo and the daemon alike; the switch of profile to
             # release and back is a step of its own.
             self.env.update(CARGO_PROFILE_DEV_DEBUG="0", CARGO_PROFILE_TEST_DEBUG="0", CARGO_INCREMENTAL="0")
-        self.env.pop("RA_JIT_REMOTE", None)
+        self.env.pop("BLAZE_REMOTE", None)
         self.metrics = open(os.path.join(self.work, "metrics.jsonl"), "a")
         self.requests, self.touched, self.killed, self.log_at = [], [], False, {}
         if os.path.exists(self.state_path):
@@ -847,7 +847,7 @@ class Soak:
         self.keep_logs(where)
 
     def keep_logs(self, where):
-        home = self.env["RA_JIT_HOME"]
+        home = self.env["BLAZE_HOME"]
         for log in [os.path.join(home, "daemon.log"), *glob.glob(os.path.join(home, "workers", "*", "log"))]:
             if os.path.exists(log):
                 shutil.copy(log, os.path.join(where, os.path.relpath(log, home).replace(os.sep, "_")))
@@ -932,8 +932,8 @@ def process(pid):
 
 
 def backend():
-    name = os.environ.get("RA_JIT_BACKEND", "cranelift")
-    return name if name != "llvm" else f"llvm opt {os.environ.get('RA_JIT_OPT', '?')} emit {os.environ.get('RA_JIT_EMIT', '?')}"
+    name = os.environ.get("BLAZE_BACKEND", "cranelift")
+    return name if name != "llvm" else f"llvm opt {os.environ.get('BLAZE_OPT', '?')} emit {os.environ.get('BLAZE_EMIT', '?')}"
 
 
 def head():
@@ -998,7 +998,7 @@ def main():
     parser.add_argument("--worktrees", type=int, default=3)
     parser.add_argument("--sample", type=float, default=0.5, help="the share of requests compared with cargo")
     parser.add_argument("--warm", type=float, default=0.7, help="the share of builds that wait for the daemon to have loaded")
-    parser.add_argument("--idle", type=int, default=1800, help="RA_JIT_IDLE_SECS of the daemon")
+    parser.add_argument("--idle", type=int, default=1800, help="BLAZE_IDLE_SECS of the daemon")
     parser.add_argument("--debuginfo", action="store_true", help="build with the debug info of the profiles, which takes the disk for it")
     parser.add_argument("--stop", action="store_true", help="stop at the first failure")
     parser.add_argument("--quiet", action="store_true", help="a line every 25 steps and for every failure")
@@ -1017,7 +1017,7 @@ def main():
     print(f"seed {args.seed}, {backend()}, in {args.work}", flush=True)
     soak = Soak(args)
     if not shutil.which("cargo-ra-jit", path=soak.env["PATH"].split(os.pathsep)[0]):
-        sys.exit("no cargo-ra-jit beside the ra-jit of RA_JIT_BIN")
+        sys.exit("no cargo-ra-jit beside the ra-jit of BLAZE_BIN")
     if args.resume:
         for tree in soak.trees():
             tree.write(tree.model())

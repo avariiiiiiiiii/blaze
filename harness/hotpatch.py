@@ -2,7 +2,7 @@
 """hotpatch.py: edit to running on one small program, hot-patched or built and started again (issue #8).
 
     hotpatch.py [--edits N] [--tools subsecond,ra-jit,cargo] [--out FILE]
-    (RA_JIT_BIN names the ra-jit built; `dx` on PATH for subsecond: the bench shell has it)
+    (BLAZE_BIN names the ra-jit built; `dx` on PATH for subsecond: the bench shell has it)
 
 harness/hotpatch is a program that calls `answer()` every millisecond through
 `subsecond::call` and writes to a file each time the number changes, with when (`at_us`) and

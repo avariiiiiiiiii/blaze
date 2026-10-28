@@ -75,14 +75,14 @@ const BUILD_ENV: &[&str] = &[
     "CARGO_BUILD_",
     "CARGO_PROFILE_",
     "CARGO_INCREMENTAL",
-    "RA_JIT_BACKEND",
-    "RA_JIT_OPT",
-    "RA_JIT_MIR_OPT",
-    "RA_JIT_EMIT",
-    "RA_JIT_SPLICE",
-    "RA_JIT_BUILT_IN",
-    "RA_JIT_LLVM_INLINE_THRESHOLD",
-    "RA_JIT_OTHER_TOOLCHAIN",
+    "BLAZE_BACKEND",
+    "BLAZE_OPT",
+    "BLAZE_MIR_OPT",
+    "BLAZE_EMIT",
+    "BLAZE_SPLICE",
+    "BLAZE_BUILT_IN",
+    "BLAZE_LLVM_INLINE_THRESHOLD",
+    "BLAZE_OTHER_TOOLCHAIN",
     super::own_macro::SERVER,
     super::own_macro::WASM,
 ];
@@ -101,14 +101,14 @@ const WORKER_ENV: &[&str] = &[
     "RUSTUP_HOME",
     "CARGO_HOME",
     "PATH",
-    "RA_JIT_BACKEND",
-    "RA_JIT_OPT",
-    "RA_JIT_MIR_OPT",
-    "RA_JIT_EMIT",
-    "RA_JIT_SPLICE",
-    "RA_JIT_BUILT_IN",
-    "RA_JIT_LLVM_INLINE_THRESHOLD",
-    "RA_JIT_RUSTC_BASE",
+    "BLAZE_BACKEND",
+    "BLAZE_OPT",
+    "BLAZE_MIR_OPT",
+    "BLAZE_EMIT",
+    "BLAZE_SPLICE",
+    "BLAZE_BUILT_IN",
+    "BLAZE_LLVM_INLINE_THRESHOLD",
+    "BLAZE_RUSTC_BASE",
     super::own_macro::SERVER,
     super::own_macro::WASM,
 ];
@@ -146,7 +146,7 @@ fn worker_named(name: &str) -> bool {
 /// Whether the variable `name` is blaze's own: where the daemon keeps its files, the store,
 /// its traces. The daemon's are what its workers run with.
 fn blazes(name: &str) -> bool {
-    name.starts_with("RA_JIT_") || name.starts_with("BLAZE_")
+    name.starts_with("BLAZE_")
 }
 
 /// The variables of this process that a worker of the build whose variables are `env`
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn what_a_script_reads_is_the_commands() {
-        let daemons = ["SDK_DIR", "RUSTFLAGS", "PATH", "RUSTUP_TOOLCHAIN", "RA_JIT_CACHE", "CC"];
+        let daemons = ["SDK_DIR", "RUSTFLAGS", "PATH", "RUSTUP_TOOLCHAIN", "BLAZE_CACHE", "CC"];
         let builds = BTreeMap::from([
             ("PATH".to_owned(), "/bin".to_owned()),
             ("CC".to_owned(), "cc".to_owned()),

@@ -85,7 +85,7 @@ class Build:
         self.home = os.path.join(work, f"home-{project}-{name}")
         self.env = base_env(self.home)
         self.env["PATH"] = self.bindir + os.pathsep + self.env["PATH"]
-        self.env.update(extra, RA_JIT_BACKEND="cranelift", RA_JIT_STATS="1", RA_JIT_CACHE=os.path.join(work, f"store-{project}-{name}"))
+        self.env.update(extra, BLAZE_BACKEND="cranelift", BLAZE_STATS="1", BLAZE_CACHE=os.path.join(work, f"store-{project}-{name}"))
         self.env.pop("RUSTC_WRAPPER", None)
         self.side = Side(self.ws, self.env, True)
         self.samples, self.train = {}, False
@@ -98,7 +98,7 @@ class Build:
         side, build = self.side, self.spec.get("build", [])
         side.cargo("stop")
         # A store and home from nothing: the cold start is a first start.
-        for path in (self.home, self.env["RA_JIT_CACHE"]):
+        for path in (self.home, self.env["BLAZE_CACHE"]):
             shutil.rmtree(path, ignore_errors=True)
         daemon = Daemon(side)
         took, ran = side.cargo("build", *build)

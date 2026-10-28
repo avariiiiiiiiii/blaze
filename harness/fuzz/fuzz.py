@@ -13,7 +13,7 @@ to rustc, or a build ra-jit did not finish. Each finding is reduced (the cases, 
 the one case left) and written to `found/` with the seed that makes it again; a cause already
 found in the run is counted and not reduced a second time.
 
-RA_JIT_BIN names the ra-jit under test. The exit status is 1 when there is a finding.
+BLAZE_BIN names the ra-jit under test. The exit status is 1 when there is a finding.
 """
 import argparse, collections, contextlib, json, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -35,10 +35,10 @@ SMOKE = {"seed": "smoke", "rounds": 2, "cases": 25}
 # What `--backends` can name. `llvm` is the pair the other harnesses run; the two after it are
 # the other ends: no passes, and the passes with LLVM's own instruction selection.
 BACKENDS = {
-    "cranelift": {"RA_JIT_BACKEND": "cranelift"},
-    "llvm": {"RA_JIT_BACKEND": "llvm", "RA_JIT_OPT": "2", "RA_JIT_EMIT": "fast"},
-    "llvm-O0": {"RA_JIT_BACKEND": "llvm", "RA_JIT_OPT": "0", "RA_JIT_EMIT": "fast"},
-    "llvm-full": {"RA_JIT_BACKEND": "llvm", "RA_JIT_OPT": "2", "RA_JIT_EMIT": "optimized"},
+    "cranelift": {"BLAZE_BACKEND": "cranelift"},
+    "llvm": {"BLAZE_BACKEND": "llvm", "BLAZE_OPT": "2", "BLAZE_EMIT": "fast"},
+    "llvm-O0": {"BLAZE_BACKEND": "llvm", "BLAZE_OPT": "0", "BLAZE_EMIT": "fast"},
+    "llvm-full": {"BLAZE_BACKEND": "llvm", "BLAZE_OPT": "2", "BLAZE_EMIT": "optimized"},
 }
 MANIFEST = """[package]
 name = "fz"

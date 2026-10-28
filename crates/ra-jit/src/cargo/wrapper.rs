@@ -34,11 +34,11 @@ use crate::{
 
 /// The variable `cargo ra-jit` sets for the cargo it runs: the wrapper records what rustc
 /// builds and leaves the rest to the command that drives cargo.
-pub(crate) const DRIVEN: &str = "RA_JIT_CARGO_DRIVES";
+pub(crate) const DRIVEN: &str = "BLAZE_CARGO_DRIVES";
 
 /// The variable that says cargo runs every crate's rustc through this wrapper, and the
 /// workspace's through it twice.
-pub(crate) const EVERY_CRATE: &str = "RA_JIT_EVERY_CRATE";
+pub(crate) const EVERY_CRATE: &str = "BLAZE_EVERY_CRATE";
 /// The file in the record of a unit that says rustc built what stands in for the crate.
 pub(crate) const STANDS_IN: &str = "stands-in";
 

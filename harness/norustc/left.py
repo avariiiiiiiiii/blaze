@@ -3,7 +3,7 @@
 
     left.py NAME
 
-Reads the workers' logs under the run's RA_JIT_HOME and the RA_JIT_SKIPPED file.
+Reads the workers' logs under the run's BLAZE_HOME and the BLAZE_SKIPPED file.
 """
 import glob
 import os

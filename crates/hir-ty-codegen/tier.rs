@@ -56,11 +56,11 @@ const SEEN_BUDGET: usize = 10_000;
 /// function calls first does not use up [`BUDGET`] before its loops are reached.
 const BUILT_IN: usize = 120;
 
-/// [`BUILT_IN`], or what `RA_JIT_BUILT_IN` says, to measure another: `0` builds nothing in, so
+/// [`BUILT_IN`], or what `BLAZE_BUILT_IN` says, to measure another: `0` builds nothing in, so
 /// that every body a build's compile has goes to LLVM to be built in by its own inliner.
 fn built_in() -> usize {
     static ASKED: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("RA_JIT_BUILT_IN").map_or(BUILT_IN, |it| {
+        std::env::var("BLAZE_BUILT_IN").map_or(BUILT_IN, |it| {
             it.parse().unwrap_or_else(|_| panic!("BLAZE_BUILT_IN={it} is not a number"))
         })
     });
@@ -351,7 +351,7 @@ pub(super) fn plain<T>(work: impl FnOnce() -> T) -> T {
 }
 
 /// As [`plain`], for the compile of a function of a build. In a build of a whole program or
-/// with `RA_JIT_INLINE=all` (see [`across`]), and LLVM at `-O2` or above, `work` builds in
+/// with `BLAZE_INLINE=all` (see [`across`]), and LLVM at `-O2` or above, `work` builds in
 /// and shows LLVM what the function calls of any crate, as a compile at a level above 1
 /// does with no function hot: what it builds in then depends on the database alone. A build
 /// whose compiles import what they call ([`super::imports`]) builds nothing in here.
@@ -380,15 +380,15 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
 }
 
 /// Whether a build's compiles build in what they call across crates: in a build of a whole
-/// program unless `RA_JIT_INLINE=crate` (or `0`, which builds nothing in), and in any build
-/// with `RA_JIT_INLINE=all`.
+/// program unless `BLAZE_INLINE=crate` (or `0`, which builds nothing in), and in any build
+/// with `BLAZE_INLINE=all`.
 /// The builds of a process that builds edits of them do not, whatever it says: an entry of
 /// the store, and a function an edit's patch compares with the build before, is keyed by its
 /// own function alone, so a body built into a function of another crate would outlive an
 /// edit of it.
 pub(super) fn across() -> bool {
     static ASKED: std::sync::LazyLock<Option<bool>> =
-        std::sync::LazyLock::new(|| match std::env::var("RA_JIT_INLINE").as_deref() {
+        std::sync::LazyLock::new(|| match std::env::var("BLAZE_INLINE").as_deref() {
             Ok("all") => Some(true),
             Ok("crate" | "0") => Some(false),
             _ => None,
@@ -437,7 +437,7 @@ pub(super) fn inline_limit(db: &dyn HirDatabase, instance: &Instance) -> Option<
     })
 }
 
-/// Whether the compile under way is a build's that builds nothing in (`RA_JIT_BUILT_IN=0`),
+/// Whether the compile under way is a build's that builds nothing in (`BLAZE_BUILT_IN=0`),
 /// the library's `#[inline]` and generic functions neither: LLVM's inliner has every body.
 pub(super) fn builds_in_nothing() -> bool {
     built_in() == 0 && INLINING.with(|it| it.borrow().as_ref().is_some_and(|it| it.whole))
@@ -726,9 +726,9 @@ fn spend(instance: &Instance, env: &StoredParamEnvAndCrate, body: &super::fragme
     });
 }
 
-/// Says why a body is not built in, with `RA_JIT_DUMP_TIER`.
+/// Says why a body is not built in, with `BLAZE_DUMP_TIER`.
 fn refused(db: &dyn HirDatabase, instance: &Instance, why: &str) {
-    if std::env::var_os("RA_JIT_DUMP_TIER").is_none() {
+    if std::env::var_os("BLAZE_DUMP_TIER").is_none() {
         return;
     }
     let name = match instance.def {
@@ -868,7 +868,7 @@ pub fn prepare(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Prepa
             }
         }
     }
-    if std::env::var_os("RA_JIT_DUMP_TIER").is_some() {
+    if std::env::var_os("BLAZE_DUMP_TIER").is_some() {
         eprintln!(
             "tier: {:?} at {:?}: {} roots and {} instances may be built in",
             asked.node,
@@ -1018,7 +1018,7 @@ pub(super) fn emit(
     if let Some(first) = request.counters {
         count(recorder, func, first, &found)?;
     }
-    if std::env::var_os("RA_JIT_DUMP_TIER").is_some() {
+    if std::env::var_os("BLAZE_DUMP_TIER").is_some() {
         eprintln!("tier {:?}:\n{}", request.level, func.display());
     }
     produce(recorder, named, func, weights.as_ref())

@@ -1,13 +1,13 @@
-//! `RA_JIT_TESTS=affected`: `cargo ra-jit test` runs, of each program of tests the daemon
+//! `BLAZE_TESTS=affected`: `cargo ra-jit test` runs, of each program of tests the daemon
 //! built, the tests that have not passed with what they are a function of as it is now, and
 //! says how many passed before and where ([`results`]). The daemon writes beside the program a
 //! hash of each test's code with all it reaches ([`plan::REACH`]). A test that reaches the
 //! world outside its code runs in the sandbox every test runs in, which records what it read,
 //! and that is part of its key too ([`results::Results::find`]); outside the sandbox
-//! (`RA_JIT_SANDBOX=off`, or a test its package takes out of it) it runs every time, as does a
+//! (`BLAZE_SANDBOX=off`, or a test its package takes out of it) it runs every time, as does a
 //! test that reaches code ra-jit can't compile. Unset, or `all`, runs every test, as cargo does.
 //!
-//! `RA_JIT_TESTS=verify` picks the same, runs every test anyway and says of each that had a
+//! `BLAZE_TESTS=verify` picks the same, runs every test anyway and says of each that had a
 //! pass whether it passed again: one that failed is flaky, or its key misses something it is a
 //! function of, which is a bug.
 
@@ -24,7 +24,7 @@ use super::{
 };
 use crate::sandbox::Line;
 
-pub(crate) const VAR: &str = "RA_JIT_TESTS";
+pub(crate) const VAR: &str = "BLAZE_TESTS";
 
 /// The most bytes of names a program of tests is given to pick its tests by; past it, it runs
 /// them all.

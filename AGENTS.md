@@ -61,7 +61,7 @@ agents/rules.ts --write` for AGENTS.md).
    The only ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`,
    `unsandboxed-tests`, `build-script = false`), the root manifest's
    `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`) and
-   `RA_JIT_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by
+   `BLAZE_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by
    default; tests do until the experiment ends. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
    Why: "Everything should by default be in sandbox and yea it should have sandbox support macos"

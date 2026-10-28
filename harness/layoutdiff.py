@@ -1,7 +1,7 @@
 """Compares the size and alignment rust-analyzer computes for types against rustc's, and for
 the futures of `async fn`s where each variant keeps what it keeps.
 
-rustc's side is `-Zprint-type-sizes`; ra-jit's is the `RA_JIT_LAYOUTS` log of every type its
+rustc's side is `-Zprint-type-sizes`; ra-jit's is the `BLAZE_LAYOUTS` log of every type its
 backend laid out. The two print types differently, so both are reduced to a common spelling
 and only types that reduce to one unambiguous rustc layout are compared. A mismatch here is a
 miscompile found without running anything.

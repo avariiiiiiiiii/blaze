@@ -46,17 +46,13 @@ pub(crate) const MARK: &str = "/.ra-jit-test/";
 pub(crate) const COULD_NOT: i32 = 125;
 
 /// The variable that turns sandboxes off (`off` or `0`), for tests, build scripts and
-/// proc-macro servers alike. [`VAR_BLAZE`], when it is set, wins over it.
-pub(crate) const VAR: &str = "RA_JIT_SANDBOX";
+/// proc-macro servers alike.
+pub(crate) const VAR: &str = "BLAZE_SANDBOX";
 
-/// The other name of [`VAR`], which wins when both are set.
-pub(crate) const VAR_BLAZE: &str = "BLAZE_SANDBOX";
-
-/// Whether sandboxes are on, with `var` looking a variable up: unless [`VAR_BLAZE`], or
-/// [`VAR`] when that is not set, is `off` or `0`. The one rule tests, build scripts and
-/// proc-macro servers decide by.
+/// Whether sandboxes are on, with `var` looking a variable up: unless [`VAR`] is `off` or
+/// `0`. The one rule tests, build scripts and proc-macro servers decide by.
 pub(crate) fn on_with(var: impl Fn(&str) -> Option<String>) -> bool {
-    let value = var(VAR_BLAZE).or_else(|| var(VAR));
+    let value = var(VAR);
     !matches!(value.as_deref(), Some("off" | "0"))
 }
 
@@ -571,7 +567,7 @@ pub(crate) fn container_hint(known: &str) -> String {
         "; this runs in a container ({known}), and its seccomp profile (Docker's default) refuses \
          `unshare(CLONE_NEWUSER)`: run the container with `--security-opt seccomp=unconfined` \
          (or a seccomp profile that allows user namespaces; on Kubernetes \
-         `securityContext.seccompProfile.type: Unconfined`), or set `{VAR_BLAZE}=off` to run \
+         `securityContext.seccompProfile.type: Unconfined`), or set `{VAR}=off` to run \
          build scripts, proc macros and tests outside a sandbox, as cargo does"
     )
 }
@@ -594,14 +590,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blaze_sandbox_wins_over_ra_jit_sandbox() {
+    fn blaze_sandbox_off_or_0_turns_sandboxes_off() {
         let with = |vars: &'static [(&str, &str)]| {
             on_with(|name| vars.iter().find(|it| it.0 == name).map(|it| it.1.to_owned()))
         };
-        assert!(with(&[]));
-        assert!(!with(&[("RA_JIT_SANDBOX", "off")]) && !with(&[("RA_JIT_SANDBOX", "0")]));
-        assert!(with(&[("RA_JIT_SANDBOX", "off"), ("BLAZE_SANDBOX", "on")]));
-        assert!(!with(&[("RA_JIT_SANDBOX", "on"), ("BLAZE_SANDBOX", "off")]));
+        assert!(with(&[]) && with(&[("BLAZE_SANDBOX", "on")]));
+        assert!(!with(&[("BLAZE_SANDBOX", "off")]) && !with(&[("BLAZE_SANDBOX", "0")]));
     }
 
     // The paths a sandbox records are a Unix machine's: there is one on Linux and macOS alone.

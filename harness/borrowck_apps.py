@@ -92,7 +92,7 @@ async def check(name, spec, args, gate) -> dict[str, Any]:
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
-    ap.add_argument("--bin", default=os.environ.get("RA_JIT_BIN", "ra-jit"))
+    ap.add_argument("--bin", default=os.environ.get("BLAZE_BIN", "ra-jit"))
     ap.add_argument("--apps-dir", default=os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps"))
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=3600)

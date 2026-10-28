@@ -125,7 +125,7 @@ def main():
         store, first = os.path.join(at, "store"), os.path.join(at, "first")
         os.makedirs(store)
         shutil.copytree(os.path.join(HERE, "keys"), first, ignore=shutil.ignore_patterns("target"))
-        env, args = {"RA_JIT_CACHE": store}, []
+        env, args = {"BLAZE_CACHE": store}, []
         want, got, _ = build(first, env, args)
         problems = [] if want == got else ["the first build differs"]
         filled = size(store)

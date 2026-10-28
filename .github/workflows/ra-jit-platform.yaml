@@ -54,7 +54,7 @@ env:
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
   # Every test `cargo ra-jit test` runs is in a sandbox, which Windows does not have yet.
-  RA_JIT_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
+  BLAZE_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
   # Git Bash on Windows has `python` and no `python3`.
   PYTHON: ${{ startsWith(inputs.os, 'windows') && 'python' || 'python3' }}
   # sccache keeps what rustc compiled in the Actions cache, for the steps that set RUSTC_WRAPPER:
@@ -165,9 +165,9 @@ jobs:
       # {"include": [{"backend", "part", "apt"}, ...]}: each backend has parts of its own.
       matrix: ${{ fromJSON(needs.build.outputs.parts) }}
     env:
-      RA_JIT_BACKEND: ${{ matrix.backend }}
-      RA_JIT_OPT: 2
-      RA_JIT_EMIT: fast
+      BLAZE_BACKEND: ${{ matrix.backend }}
+      BLAZE_OPT: 2
+      BLAZE_EMIT: fast
     steps:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
@@ -215,7 +215,7 @@ jobs:
         run: |
           tar -xf ra-jit.tar
           if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\ra-jit.exe"; else bin="$PWD/ra-jit"; fi
-          echo "RA_JIT_BIN=$bin" >> "$GITHUB_ENV"
+          echo "BLAZE_BIN=$bin" >> "$GITHUB_ENV"
       - run: $PYTHON harness/ci.py ${{ matrix.part }}
       # What the daemons said when a harness failed (each harness keeps its daemon's log in a
       # temporary directory of its own), and the report of a process that crashed on macOS.
@@ -249,7 +249,7 @@ jobs:
         working-directory: target/release
         run: |
           tar -xf ra-jit.tar
-          echo "RA_JIT_BIN=$PWD/ra-jit" >> "$GITHUB_ENV"
+          echo "BLAZE_BIN=$PWD/ra-jit" >> "$GITHUB_ENV"
       - run: $PYTHON harness/bun_repros.py
 
   # wasm32 with ra-jit's own wasm lowering (docs/platforms.md, "wasm32"): this build compiles for
@@ -274,7 +274,7 @@ jobs:
         working-directory: target/release
         run: |
           tar -xf ra-jit.tar
-          echo "RA_JIT_BIN=$PWD/ra-jit" >> "$GITHUB_ENV"
+          echo "BLAZE_BIN=$PWD/ra-jit" >> "$GITHUB_ENV"
       - run: nix develop .#wasm --command python3 harness/wasm32.py
 
   # The borrow checker against rustc's own borrow-check tests (docs/borrowck.md), at the
@@ -339,7 +339,7 @@ jobs:
           ln -s "$RUNNER_TEMP/ui-real" "$RUNNER_TEMP/ui"
           cd "$GITHUB_WORKSPACE"
           cd harness
-          RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 uitest.py "$RUNNER_TEMP/rust" --tests ui-pinned.txt --jobs 4 --work "$RUNNER_TEMP/ui"
+          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 uitest.py "$RUNNER_TEMP/rust" --tests ui-pinned.txt --jobs 4 --work "$RUNNER_TEMP/ui"
 
   # `cargo ra-jit` in place of cargo on projects at pinned commits, and the flags, the daemon's
   # life and plain cargo after `ra-jit enable`. Incremental compilation is left to the profile,
@@ -357,9 +357,9 @@ jobs:
         backend: [cranelift, llvm]
         group: ["ripgrep hyperfine", "fd", "checks"]
     env:
-      RA_JIT_BACKEND: ${{ matrix.backend }}
-      RA_JIT_OPT: 2
-      RA_JIT_EMIT: fast
+      BLAZE_BACKEND: ${{ matrix.backend }}
+      BLAZE_OPT: 2
+      BLAZE_EMIT: fast
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -377,7 +377,7 @@ jobs:
         timeout-minutes: 40
         run: |
           if [ "${{ matrix.group }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.group }}"; fi
-          RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" env -u CARGO_INCREMENTAL $PYTHON cargo_ra_jit.py $what
+          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" env -u CARGO_INCREMENTAL $PYTHON cargo_ra_jit.py $what
       - name: what was running, and the daemons' logs
         if: failure()
         run: ps -eo pid,ppid,etime,args > /tmp/ra-jit-cargo-processes.txt
@@ -411,9 +411,9 @@ jobs:
         backend: [cranelift, llvm]
         projects: ["ripgrep fd", "bat hyperfine", "just", "axum", "nushell", "checks"]
     env:
-      RA_JIT_BACKEND: ${{ matrix.backend }}
-      RA_JIT_OPT: 2
-      RA_JIT_EMIT: fast
+      BLAZE_BACKEND: ${{ matrix.backend }}
+      BLAZE_OPT: 2
+      BLAZE_EMIT: fast
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -430,7 +430,7 @@ jobs:
         run: |
           if [ "${{ matrix.projects }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.projects }}"; fi
           status=0
-          RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" $PYTHON cargo_ra_jit.py $what || status=$?
+          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" $PYTHON cargo_ra_jit.py $what || status=$?
           cat CARGO-RA_JIT*.md
           exit $status
 
@@ -458,7 +458,7 @@ jobs:
       - name: Bench
         working-directory: harness
         run: |
-          export RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" RA_JIT_LLVM_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
+          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" BLAZE_LLVM_BIN="$GITHUB_WORKSPACE/target/release/ra-jit"
           $PYTHON bench.py ripgrep --out "$RUNNER_TEMP/bench.json"
           $PYTHON bench.py --compare bench-baseline.json "$RUNNER_TEMP/bench.json" --threshold 200
       - uses: actions/upload-artifact@v7

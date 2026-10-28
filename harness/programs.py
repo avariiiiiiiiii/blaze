@@ -63,7 +63,7 @@ STEPS = [
 
 
 def splice(program):
-    """Edits are added to the linked binary where that can be done; RA_JIT_SPLICE=0 links each in full."""
+    """Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full."""
     return ["--binary", program["bin"]]
 
 

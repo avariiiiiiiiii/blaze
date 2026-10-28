@@ -154,7 +154,7 @@ jobs:
       - run: cargo test --release -p ra-jit-live
       - run: cargo build --release -p ra-jit
       - name: edit a running program
-        run: RA_JIT_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_e2e.py
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/ra-jit" python3 harness/live_e2e.py
       - name: crash reports
         if: failure()
         run: |

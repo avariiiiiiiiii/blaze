@@ -70,5 +70,7 @@ export const GLYPHS: Record<string, Glyph> = {
 export function glyphSvg(name: string): string {
 	const g = GLYPHS[name];
 	if (!g) throw new Error(`gen/glyphs.ts: no glyph "${name}" (have ${Object.keys(GLYPHS).join(', ')})`);
-	return `<svg class="glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${g.join('')}</svg>`;
+	// Each stroke measures 1 (`pathLength`), so styles/learn.css can draw the glyph again when its lesson is hovered.
+	const shapes = g.map((sh) => (sh.includes('g-cell') ? sh : sh.replace(/^<(\w+) /, '<$1 pathLength="1" ')));
+	return `<svg class="glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${shapes.join('')}</svg>`;
 }

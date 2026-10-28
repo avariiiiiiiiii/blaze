@@ -63,9 +63,10 @@ fn run(args: &[OsString]) -> anyhow::Result<i32> {
         std::io::stdin().read_to_end(&mut stdin).context("reading standard input")?;
     }
     if crate::answers::is_question(args) {
-        let answer =
-            crate::answers::ours(args, &stdin).context("blaze has no answer to this question")?;
-        std::io::stdout().write_all(&answer)?;
+        let answer = crate::answers::ours_told(args, &stdin)
+            .context("blaze has no answer to this question")?;
+        std::io::stderr().write_all(&answer.stderr)?;
+        std::io::stdout().write_all(&answer.stdout)?;
         return Ok(0);
     }
     let args: Vec<&str> = args

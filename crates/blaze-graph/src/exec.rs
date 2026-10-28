@@ -47,7 +47,7 @@ pub fn drive<W>(
     nodes: Vec<Spec>,
     work: &W,
     said: &mut dyn FnMut(&Record),
-    mut trace: Option<&mut Vec<Input>>,
+    trace: Option<&mut Vec<Input>>,
 ) -> Result<bool, Error>
 where
     W: Fn(NodeId) -> Did + Sync,
@@ -75,7 +75,7 @@ where
             pools.push(tx);
         }
         drop(done_tx);
-        let over = run(machine, nodes, &pools, &done_rx, &now, said, trace.as_deref_mut());
+        let over = run(machine, nodes, &pools, &done_rx, &now, said, trace);
         // The threads end once nothing more can be sent them, whether the build ended or not.
         drop(pools);
         over

@@ -22,6 +22,7 @@ use crate::{
     next_solver::Region,
 };
 
+mod arch;
 mod reflection;
 mod simd;
 
@@ -61,6 +62,13 @@ impl<'db> Evaluator<'db> {
                 !function_data.has_body()
                     || attrs.contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN),
             );
+        }
+        if let ItemContainerId::ExternBlockId(_) = def.lookup(self.db).container
+            && let Some(link_name) = AttrFlags::link_name(self.db, def.into())
+            && let Some(name) = link_name.as_str().strip_prefix("llvm.")
+        {
+            self.exec_llvm_intrinsic(name, args, destination)?;
+            return Ok(true);
         }
         let is_extern_c = match def.lookup(self.db).container {
             hir_def::ItemContainerId::ExternBlockId(block) => {

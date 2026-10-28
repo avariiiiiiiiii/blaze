@@ -25,6 +25,7 @@ use crate::{
     mir::{MirEvalError, MirLowerError},
 };
 
+mod arch;
 mod const_traits;
 mod intrinsics;
 

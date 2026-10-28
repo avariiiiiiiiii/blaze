@@ -282,7 +282,15 @@ fn staying(build: &Build, change: &Change, color: bool, live: bool) -> Vec<Strin
             let krate = &build.crates[*at];
             let took_ns = krate.ended_ns.unwrap_or(krate.began_ns) - krate.began_ns;
             match krate.state {
-                CrateState::Running if !live => vec![status("Compiling", &krate.name)],
+                // The step of compiling it said so already.
+                CrateState::Running
+                    if !live
+                        && !build.running().any(|it| {
+                            it.step == Step::Codegen && it.of.as_deref() == Some(&krate.name)
+                        }) =>
+                {
+                    vec![status("Compiling", &krate.name)]
+                }
                 CrateState::Built if live || took_ns >= NEWS_NS => {
                     let fns = match krate.fns.total {
                         0 => String::new(),

@@ -2463,6 +2463,14 @@ fn closure_number(
 /// library and its binary may share the name, and both are being built. A `krate` that is the
 /// path of a `.rs` file is the one target with that root file, which tells a test from an
 /// example of the same name.
+/// What the records of a build call the crate `args` builds ([`events`]): its name, or what
+/// `--crate` says.
+fn shown_crate(db: &RootDatabase, args: &Args) -> String {
+    let named = crates_named(db, &args.krate, args).unwrap_or_default();
+    let name = named.first().and_then(|it| it.display_name(db));
+    name.map_or_else(|| args.krate.clone(), |it| it.to_string())
+}
+
 fn crates_named(db: &RootDatabase, krate: &str, args: &Args) -> anyhow::Result<Vec<Crate>> {
     let mut found = crates_called(db, krate, args);
     if args.library {
@@ -9337,7 +9345,7 @@ fn run_holding(
                     cold
                 }
                 None => {
-                    let _compiling = events::compiling(&args.krate);
+                    let _compiling = events::compiling(&shown_crate(&db, &args));
                     let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                     // An `include!` in a body is first seen when the body is compiled.
                     if WatchedFile::include_sources(&mut files, &mut tree, &mut db)
@@ -9428,8 +9436,9 @@ fn run_holding(
             }
             memory::report(&mut db, "build")?;
             report_stats(&known.stats);
-            events::built(&db, &args.krate, &known.stats, None);
-            events::at(events::Step::Link, Some(&args.krate));
+            let named = shown_crate(&db, &args);
+            events::built(&db, &named, &known.stats, None);
+            events::at(events::Step::Link, Some(&named));
             link(
                 args.link_cmd.as_deref(),
                 args.splice.as_deref(),
@@ -11226,7 +11235,8 @@ impl Program {
             }
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
-        let compiling = events::compiling(&args.krate);
+        let named = shown_crate(db, args);
+        let compiling = events::compiling(&named);
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
@@ -11320,7 +11330,7 @@ impl Program {
                 Some((*file, path.strip_prefix(&args.checkout).unwrap_or(path).to_owned()))
             })
             .collect();
-        events::built(db, &args.krate, &known.stats, Some(&edited_paths));
+        events::built(db, &named, &known.stats, Some(&edited_paths));
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let dated = start.elapsed();
@@ -11392,7 +11402,7 @@ impl Program {
             let cmd = args.link_cmd.as_deref().filter(|_| failed.is_none() && link_it);
             let (over_rustc, onto) = (known.stats.over_rustc, known.stats.onto_rustcs);
             begin_link();
-            events::at(events::Step::Link, Some(&args.krate));
+            events::at(events::Step::Link, Some(&named));
             let packs = packs_whole(args);
             let own_line = args.exe.is_some();
             let unlinked = link(

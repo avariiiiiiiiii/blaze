@@ -989,6 +989,10 @@ def own_toolchain(work, check):
     sysroot = subprocess.run(["rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip() if shutil.which("rustup") else ""
     if WINDOWS or not os.path.exists(os.path.join(sysroot, "lib/rustlib/multirust-channel-manifest.toml")):
         return
+    # Blaze's own copy has every component it pins (harness/toolchain_pins.py), wasm32-wasip1's
+    # standard library among them; a copy without one is downloaded again.
+    if not os.path.isdir(os.path.join(sysroot, "lib/rustlib/wasm32-wasip1")):
+        subprocess.run(["rustup", "target", "add", "--toolchain", TOOLCHAIN, "wasm32-wasip1"], capture_output=True)
     home = os.path.join(work, "home-own")
     os.makedirs(home, mode=0o700)
     host = subprocess.run([os.path.join(sysroot, "bin", "rustc"), "-vV"], capture_output=True, text=True).stdout.split("host: ")[1].split()[0]

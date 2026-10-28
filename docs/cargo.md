@@ -38,21 +38,19 @@ same LLVM. `cargo build -p blaze-engine --release` is the quicker build the harn
 working on blaze; it is not what ships.
 
 `blaze` builds with the one toolchain blaze compiles, the dated nightly in
-`harness/toolchain` (`nightly-2026-10-27`), whatever toolchain the project names (a
-`rust-toolchain.toml`, `rustup override`, `+toolchain`, `RUSTUP_TOOLCHAIN` or rustup's
-default): it runs cargo, rustc and the daemon under that nightly by naming it in
-`RUSTUP_TOOLCHAIN` and `CARGO`. The nightly builds what older releases built, so a project on a
-stable release or an older nightly builds as it is, `#![feature(...)]` included. Code only the
-project's own toolchain builds (a feature the pinned nightly removed, a newer nightly's
-library) fails with rustc's error and a note naming both toolchains. Plain `cargo` still builds with the project's toolchain, in the same target
-directory: cargo keys what it builds by the rustc, so neither rebuilds the other's.
-`BLAZE_OTHER_TOOLCHAIN=1` builds with the project's toolchain instead
-([support.md](support.md#toolchain)).
+`harness/toolchain` (`nightly-2026-10-27`): the language and standard library are the ones this
+blaze ships. It ignores `rust-toolchain`/`rust-toolchain.toml`, `rustup override`,
+`+toolchain`, `RUSTUP_TOOLCHAIN`, rustup's default and `RUSTC`, and never runs or asks a rustc
+to learn anything ([toolchain.md](toolchain.md)): it runs cargo and the daemon under its own
+release by naming it in `CARGO`, `RUSTC`, `RUSTDOC` and `RUSTUP_TOOLCHAIN`. The nightly builds
+what older releases built, so a project on a stable release or an older nightly builds as it
+is, `#![feature(...)]` included. A project that needs another Rust pins another blaze. Plain
+`cargo` still builds with the project's toolchain, in the same target directory: cargo keys
+what it builds by the rustc, so neither rebuilds the other's.
 
-Where the nightly comes from, in this order: `RUSTC` naming a rustc whose `rustc -V` line is
-the pinned one's (`rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`: the whole line, since every
-nightly of a release says `1.101.0`) with its library's source; rustup's `nightly-2026-10-27`
-with `rust-src`, when rustup has it; else blaze's own copy in
+Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`
+with `rust-src`, when rustup has it (only as a copy of the same files; what rustup would pick
+is not asked); else blaze's own copy in
 `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
 out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
 stderr while it does: rustc, cargo, the standard library and its source from the Rust project's
@@ -965,7 +963,6 @@ build a command line is, so changing one starts from a cargo build again.
 | `BLAZE_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `BLAZE_SPLICE` | `0` links in full after every edit instead of splicing | splice |
 | `BLAZE_PROC_MACRO_WASM` | `0` expands proc macros natively, with rustc's libraries, rather than as WebAssembly ([above](#proc-macros-run-as-webassembly)) | WebAssembly |
-| `BLAZE_OTHER_TOOLCHAIN` | `1` builds with the project's toolchain when it is not the pinned nightly, rather than with the pinned nightly, for a project pinned to a nightly near it; nothing checks that it agrees ([support.md](support.md#toolchain)) | not set |
 
 `BLAZE_BUILD_SCRIPTS` (`wasi`, `wasi-compare`, `native`) is read by the wrapper and by each
 run of a build script ([above](#build-scripts-under-wasi-an-experiment-off-by-default)).

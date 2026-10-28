@@ -70,10 +70,15 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         layout::first_unless_chosen(&cwd, &asked.flags.config, &asked.flags.unstable);
     }
     if let Asked::Build(_) = asked
-        && let Err(why) = toolchain::settle(true)
+        && let Err(why) = toolchain::settle()
     {
         say::error(&why);
         std::process::exit(FAILED);
+    }
+    if let Asked::Build(build) = &asked
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        toolchain::say_toolchain_file(&cwd, build.flags.verbose);
     }
     let code = match asked {
         Asked::Build(asked) if matches!(asked.subcommand, Subcommand::Build | Subcommand::Run) => {
@@ -87,7 +92,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Stop => stop()?,
         Asked::Enable => switch::enable()?,
         Asked::Disable => switch::disable()?,
-        Asked::Toolchain { path } => match toolchain::settle(false) {
+        Asked::Toolchain { path } => match toolchain::settle() {
             Ok(chosen) if path => {
                 println!("{}", chosen.dir().display());
                 0
@@ -285,7 +290,6 @@ fn check(asked: &Invocation) -> anyhow::Result<i32> {
     };
     let turned_down = |said: &[crate::errors::Said]| -> anyhow::Result<i32> {
         messages::turned_down(format, said, &state::metadata(asked));
-        toolchain::note_failed();
         Ok(FAILED)
     };
     if asked.subcommand == Subcommand::Check

@@ -3,7 +3,6 @@
 //! 1.99.0 prints them.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Context as _;
 use blaze_manifest::metadata::{export_no_deps, root_manifest};
@@ -150,16 +149,11 @@ fn resolved(read: &Read, manifest_path: Option<&Path>) -> anyhow::Result<String>
     blaze_metadata::metadata(&asked)
 }
 
-/// What the toolchain's rustc would print for `args`, as blaze answers it itself, or none
-/// when blaze has no answer of its own.
+/// What rustc would print for `args`, as blaze answers it for its release, or none when blaze
+/// has no answer.
 fn own_rustc(args: &[&str]) -> anyhow::Result<Option<String>> {
-    use super::super::toolchain::Chosen;
-    let (Chosen::Given(sysroot) | Chosen::Rustup(sysroot) | Chosen::Own(sysroot)) =
-        super::super::toolchain::settle(false).map_err(anyhow::Error::msg)?;
-    let rustc = format!("rustc{}", std::env::consts::EXE_SUFFIX);
-    let mut asked = Command::new(sysroot.join("bin").join(rustc));
-    asked.args(args);
-    let printed = crate::answers::own_answer(&asked, &[]).map(String::from_utf8).transpose();
+    let asked: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+    let printed = crate::answers::ours(&asked, &[]).map(String::from_utf8).transpose();
     printed.context("rustc's answer")
 }
 

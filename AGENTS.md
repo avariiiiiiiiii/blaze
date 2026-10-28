@@ -45,11 +45,14 @@ AGENTS.md).
    release train on the bump's branch (docs/toolchain.md, "The daily bump"), and a bump that is not
    green is an open issue, not a skipped day. It is the language and std definition blaze matches
    while rustc is still in the tree, not a rustc blaze maintains; every rustc use left is removed on
-   the way to none. Users keep their own toolchain and CI as the final word: blaze says so rather
-   than switching toolchains. See [docs/no-rustc.md](docs/no-rustc.md).
+   the way to none. blaze ignores rust-toolchain files, rustup's settings, `RUSTUP_TOOLCHAIN` and
+   `RUSTC`, and never runs or asks rustc to learn anything: projects pin the blaze version
+   (`[workspace.metadata.blaze] version`), not Rust's. Users keep their own toolchain and CI as the
+   final word. See [docs/no-rustc.md](docs/no-rustc.md).
    Why: "You should use your own nightly that you control since you are trying to replace rustc"
    (Andrew, 2026-10-26). "blaze should be the latest-nightly equivalent" (Andrew, 2026-10-27, #404).
-   We are moving off rustc entirely ("no rustc", Andrew).
+   We are moving off rustc entirely ("no rustc", Andrew). "ZERO Rust toolchain pinning" (Andrew,
+   2026-10-28).
 6. **sandbox-everything**: Every build script and proc macro runs in a sandbox, by default, on every
    platform: every build script, cargo's runs and the daemon's, runs in one through
    `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in

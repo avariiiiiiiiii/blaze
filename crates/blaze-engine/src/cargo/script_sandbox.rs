@@ -143,18 +143,23 @@ const OWN_RUSTC_FOR: [&str; 4] =
     ["RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", crate::as_rustc::TOOLCHAIN];
 
 /// `env`, cargo's for a script, with `RUSTC` naming blaze as rustc ([`crate::as_rustc`]),
-/// linked in `scratch`, and the toolchain's rustc in [`crate::as_rustc::TOOLCHAIN`]: what
-/// the script asks rustc, its version, the cfgs, whether a probe compiles, is blaze's to
-/// answer, and no rustc runs. Cargo's wrappers are taken out, as with no `build.rustc-wrapper`
-/// configured: a script runs `$RUSTC_WRAPPER $RUSTC`, and blaze's wrapper would run rustc.
-/// A script cargo gave no `RUSTC` is left as it is.
+/// linked in `scratch`, and the rustc of blaze's release in [`crate::as_rustc::TOOLCHAIN`],
+/// whichever rustc cargo named: what the script asks rustc, its version, the cfgs, whether a
+/// probe compiles, is blaze's to answer, and no rustc runs. Cargo's wrappers are taken out,
+/// as with no `build.rustc-wrapper` configured: a script runs `$RUSTC_WRAPPER $RUSTC`, and
+/// blaze's wrapper would run rustc. A script cargo gave no `RUSTC` is left as it is.
 fn with_own_rustc(
     env: &[(String, String)],
     scratch: &Path,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let Some(rustc) = env.iter().find(|it| it.0 == "RUSTC").map(|it| it.1.clone()) else {
+    if !env.iter().any(|it| it.0 == "RUSTC") {
         return Ok(env.to_vec());
-    };
+    }
+    let sysroot = super::toolchain::sysroot().with_context(|| {
+        format!("blaze's toolchain, Rust {}, is not installed", super::toolchain::OURS.trim())
+    })?;
+    let rustc = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    let rustc = rustc.to_str().context("a toolchain whose path is not text")?.to_owned();
     let dir = scratch.join(OWN_RUSTC);
     std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
     let link = dir.join(format!("{}{}", crate::as_rustc::NAME, std::env::consts::EXE_SUFFIX));
@@ -303,17 +308,6 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         };
         let version = script.var("CARGO_PKG_VERSION").unwrap_or("0.0.0");
         let closure = hermetic::closure_for(package, version, &overrides)?;
-        // Cargo names the toolchain's rustc as it found it, often by name on `PATH`, which the
-        // run's `PATH` is not: it is named where it is.
-        let mut env = env;
-        let var = |name: &str| env.iter().find(|it| it.0 == name).map(|it| OsString::from(&it.1));
-        let rustc = var(crate::as_rustc::TOOLCHAIN)
-            .and_then(|it| crate::answers::toolchain_rustc(&it, &var))
-            .and_then(|it| it.into_os_string().into_string().ok());
-        if let Some(rustc) = rustc {
-            env.retain(|it| it.0 != crate::as_rustc::TOOLCHAIN);
-            env.push((crate::as_rustc::TOOLCHAIN.to_owned(), rustc));
-        }
         let mut also = also;
         also.extend(script.declared.iter().cloned());
         let mut env = hermetic::env_in(&env, &also, &closure);

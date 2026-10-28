@@ -222,7 +222,7 @@ mapped (**unverified** until built).
   from `FileId` (an interned path) to bytes with a change log that salsa drains; no versions, no
   roots, no hashes; IO and watching are a separate `loader::Handle`. It stays as the front end's
   file table, fed from the Merkle VFS, until the front end reads nodes directly.
-- **blaze's own** (**read**, `tree.rs`, `main.rs`): every watched file's mtime is stat-ed in a
+- **blaze's own** (**read**, `tree.rs`, `lib.rs`): every watched file's mtime is stat-ed in a
   loop with 20 ms sleeps until a pass finds nothing new; `tree.rs` lists directories whose mtime
   moved; an `edit\t` request carries one file's whole text (`Request::Edit`); `content.rs` names
   crates by content so checkouts share crates. The heap profile's "blaze's own (vfs, symbol

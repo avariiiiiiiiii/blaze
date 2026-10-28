@@ -11,7 +11,6 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -177,7 +176,6 @@ impl Asked<'_> {
 /// compiler cargo named, whose toolchain has the standard library's source. `Err` is why rustc
 /// is to compile it.
 pub(crate) fn compile(
-    rustc: &OsStr,
     args: &[String],
     cwd: &Path,
     source: &Path,
@@ -192,14 +190,13 @@ pub(crate) fn compile(
         exe: exe.to_owned(),
         dep_info: exe.with_extension("d"),
     };
-    compile_as(rustc, args, cwd, source, &made, dir)
+    compile_as(args, cwd, source, &made, dir)
 }
 
 /// [`compile`] for wasm32-wasip1 into `module`, with blaze's `std::process`, to run under
 /// WASI (`wasi_script.rs`). The libraries it links are described from their records as for
 /// [`compile`]: what their own build scripts printed was printed for the host.
 pub(crate) fn compile_wasi(
-    rustc: &OsStr,
     args: &[String],
     cwd: &Path,
     source: &Path,
@@ -214,23 +211,21 @@ pub(crate) fn compile_wasi(
         exe: module.to_owned(),
         dep_info: module.with_extension("wasm.d"),
     };
-    compile_as(rustc, args, cwd, source, &made, dir)
+    compile_as(args, cwd, source, &made, dir)
 }
 
 /// [`compile`] of the crate cargo asked rustc for, made as `made` says.
 pub(crate) fn compile_as(
-    rustc: &OsStr,
     args: &[String],
     cwd: &Path,
     source: &Path,
     made: &Made<'_>,
     dir: &Path,
 ) -> Result<(), String> {
-    let rustc = crate::answers::toolchain_rustc_of(rustc).ok_or("its toolchain is not known")?;
-    let sysroot = rustc.parent().and_then(Path::parent).ok_or("its toolchain is not known")?;
+    let sysroot = super::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
     let env = crate_env();
     let asked = Asked { args, cwd };
-    compile_in(sysroot, &asked, source, env, made, dir, &|name| std::env::var(name).ok())
+    compile_in(&sysroot, &asked, source, env, made, dir, &|name| std::env::var(name).ok())
 }
 
 /// [`compile_as`] of the crate rustc compiled as `record` says, over the standard library of

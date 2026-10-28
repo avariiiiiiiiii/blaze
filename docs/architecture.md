@@ -60,7 +60,8 @@ The **daemon** (`cargo/daemon.rs`) is one process per user on a Unix socket
 (`socket.rs`). It loads nothing. It starts workers, passes requests to them, and stops them
 and itself when idle. Requests and answers are one JSON object per line.
 
-A **worker** is `blaze <project> --socket <path>`, the long-running mode of `main.rs`. It
+A **worker** is `blaze <project> --socket <path>`, the long-running mode of `blaze-engine`
+(`crates/blaze-engine/src/lib.rs`). It
 holds one rust-analyzer database. A worker is keyed by repository, toolchain, target,
 feature set and whether libraries are built with `cfg(test)`, because those are inputs of
 loading. Checkouts of one repository join the same worker; another repository gets its own,
@@ -70,7 +71,7 @@ daemon's end of its standard input closes.
 The same worker binary is what the harnesses drive directly, without cargo's wrapper:
 `blaze <project> --crate <name> --out <object> --symbols <rlib>... --link-cmd <cmd>
 --socket <path>`, then `blaze sync <socket>` to ask for a build. There is no `--help`; the
-flags are parsed in `main.rs`.
+flags are parsed in `lib.rs`.
 
 ## The database and what worktrees share
 

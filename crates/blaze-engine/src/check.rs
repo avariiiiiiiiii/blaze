@@ -153,7 +153,8 @@ impl Picked {
         // A library and a binary have their unit tests as a crate of their own (cargo's
         // `checked_as_test`); every other target is one crate, with `cfg(test)` or not as the
         // load has it.
-        let test = test && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin);
+        let test =
+            test && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin);
         Picked { root, kind, test }
     }
 }

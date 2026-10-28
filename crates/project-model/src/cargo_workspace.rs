@@ -636,7 +636,12 @@ impl CargoWorkspace {
             pkg_by_id.insert(id, pkg);
             for meta_tgt in meta_targets {
                 let cargo_metadata::Target {
-                    name, kind, required_features, src_path, test: tested, ..
+                    name,
+                    kind,
+                    required_features,
+                    src_path,
+                    test: tested,
+                    ..
                 } = meta_tgt;
                 let kind = convert_target_kind(&kind);
                 let tgt = targets.alloc(TargetData {

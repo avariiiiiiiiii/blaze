@@ -313,7 +313,7 @@ main .discussion { scroll-margin-top: 64px; }
 /* Full screen: over the whole content pane, beside the sidebar (the frame's grid, above). */
 body.chat-full .chat { left: calc(var(--side-w) + 4px); width: auto; box-shadow: inset 0 0 0 1px var(--line-2); }
 /* Full screen, the chat takes the page's place: the page under it neither shows at its edges nor scrolls. */
-body.chat-full .frame > .pane, body.chat-full .cursors { visibility: hidden; }
+body.chat-full .frame > .pane, body.chat-full .cursors:not(.cursors-fixed) { visibility: hidden; }
 html:has(body.chat-full) { overflow: hidden; }
 body.chat-full .chat > .resizer { display: none; }
 body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typing { width: 100%; max-width: 860px; margin-inline: auto; }
@@ -511,9 +511,12 @@ body.chat-full .chat-back { order: 1; }
 @media (prefers-reduced-motion: reduce) { .say-bubble, .chat-toast, .dots i, .chat-tr.pending { animation: none; } }
 
 /* The others on this page (client/lib/cursors.ts). Their pointers: an arrow in their colour (--c) and a chip with
-   their face and name, in a box over the whole document so they scroll with the page; below the sticky top line,
-   the chat and the drawer, and never in the way of a click. A pointer that rests fades. */
+   their face and name. One in the article is in a box over the whole document, so it scrolls with the page, below
+   the sticky top line, the chat and the drawer; one on the sidebar, the top line, the chat or "On this page" is in a
+   box over the window, above them, since they stay put as the page scrolls. Never in the way of a click. A pointer
+   that rests fades. */
 .cursors { position: absolute; top: 0; left: 0; z-index: 14; width: 100%; overflow: clip; pointer-events: none; }
+.cursors-fixed { position: fixed; z-index: 36; inset: 0; width: auto; }
 .cursor { position: absolute; top: 0; left: 0; display: flex; align-items: flex-start; transition: opacity 0.4s; will-change: transform; }
 .cursor.idle { opacity: 0; transition-duration: 1s; }
 .cursor svg { width: 16px; height: 20px; flex: none; fill: var(--c); stroke: var(--bg); stroke-width: 1.2; stroke-linejoin: round; filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.3)); }
@@ -525,6 +528,7 @@ body.chat-full .chat-back { order: 1; }
 .say-live { position: absolute; z-index: 46; display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; border-radius: 4px 14px 14px 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), inset 0 0 0 1.5px var(--c), 0 10px 28px rgb(0 0 0 / 0.28); animation: say-live-in 0.15s ease-out; transition: opacity 0.3s; }
 .say-live[hidden] { display: none; }
 .say-live > .face { flex: none; width: 20px; height: 20px; margin-left: -4px; box-shadow: none; }
+.say-live.fixed { position: fixed; }
 .say-live.at-foot { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); border-radius: 14px; }
 .say-live input, .say-live input:focus { field-sizing: content; width: auto; min-width: 24ch; max-width: min(420px, calc(100vw - 72px)); height: 24px; padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; color: var(--ink-1); font: inherit; font-size: 13.5px; outline: none; }
 .say-live input::placeholder { color: var(--ink-4); }

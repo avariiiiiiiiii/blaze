@@ -10,10 +10,12 @@
  * takes no focus, so the keys scroll the page as ever. On a phone the browser's scrollbar stays and the rail shows
  * only the others, while there are any.
  *
- * Positions are in the page's text, not the window, so readers with other window sizes line up: x is a fraction of
- * `main`'s width, y a block (the index of a heading, paragraph, list item, ... in `main`, in document order, comment
- * threads left out) and how far down it, as a fraction of its height. Every reader has the same blocks in the same
- * order, so the same place in the text is the same anchor wherever the lines wrap.
+ * A pointer is sent as what it is on, so it lands on the same thing for every reader whatever their window and layout
+ * (client/lib/anchor.ts): a block of the article and the character in it, or a link, a chat message, a button, ... in
+ * the sidebar, the top line, the chat or "On this page". A pointer on one of those regions is drawn over the window
+ * (`fixedLayer`), since they stay put while the page scrolls; one in the article on the page (`layer`). A reader who
+ * doesn't have that thing on screen (the sidebar shut, the chat closed) doesn't see the pointer until it moves to
+ * something they have, and only a pointer in the article has a face on the rail.
  *
  * A tab sends its pointer (a mouse or a pen; phones send none and draw none) at most every MOVE_MS while it moves,
  * nothing while it rests, and null when it leaves the window or the tab is hidden; again when someone comes to the
@@ -31,14 +33,16 @@
 
 import { tipOn } from './tip';
 import { LEAVE, PAGE } from './page';
+import { SHELL, fixedAt, pageTop, placeOf, remeasure, spotAt, spotOf, type Place, type Spot } from './anchor';
 
 type Who = { key: string; login: string | null; avatar: string | null };
 /** Someone else on this page; `away` while every tab of theirs here is hidden. */
 type Peer = Who & { away: boolean };
 type Remote = {
 	who: Peer;
-	/** Their pointer as sent ([x, block, f]), where it is drawn (document px) and where it is going. */
-	c: number[] | null;
+	/** Their pointer as sent, which layer it is drawn in, and where it is drawn and where it is going, in that layer's px. */
+	c: Spot | null;
+	fixed: boolean;
 	pos: { x: number; y: number } | null;
 	to: { x: number; y: number } | null;
 	el: HTMLElement | null;
@@ -53,8 +57,6 @@ type Remote = {
 const MOVE_MS = 60;
 const IDLE_MS = 5000;
 const HIDE_KEY = 'blaze.cursors.hide';
-/** What counts as a block: what the text is made of, in every page's `main`. */
-const BLOCKS = 'h1, h2, h3, h4, h5, h6, p, li, pre, table, tr, figure, blockquote, dt, dd, img, details, summary';
 const SVG = 'http://www.w3.org/2000/svg';
 const fine = matchMedia('(pointer: fine)');
 /** Where the rail is the page's scrollbar; the same query hides the browser's in styles/shell.css. */
@@ -97,8 +99,6 @@ function hueOf(key: string): number {
 }
 
 const colour = (key: string) => `hsl(${hueOf(key).toFixed(0)} 70% 50%)`;
-const round = (x: number) => Math.round(x * 1000) / 1000;
-const clampFrac = (x: number) => Math.max(-50, Math.min(50, x));
 
 function hidden(): boolean {
 	try {
@@ -106,48 +106,6 @@ function hidden(): boolean {
 	} catch {
 		return false;
 	}
-}
-
-// ---- Where things are -------------------------------------------------------------------------------------------
-
-/**
- * How far down the page the window shows (document px), as drawn: during a rubber-band bounce `scrollY` stays put (or
- * goes past the ends, in Safari) while the page moves, so positions measured or placed against it would be off.
- */
-const pageTop = () => -document.documentElement.getBoundingClientRect().top;
-
-/** Each block's top (document px) and height, -1 for one not shown (in a shut `<details>`). Dropped when it moves. */
-let blocks: { top: number; h: number }[] | null = null;
-
-function layout(): { top: number; h: number }[] {
-	if (blocks) return blocks;
-	const main = document.querySelector('main');
-	const sy = pageTop();
-	blocks = main
-		? [...main.querySelectorAll<HTMLElement>(BLOCKS)]
-				.filter((e) => !e.closest('.c-thread'))
-				.map((e) => {
-					const r = e.getBoundingClientRect();
-					return { top: r.top + sy, h: e.getClientRects().length ? r.height : -1 };
-				})
-		: [];
-	return blocks;
-}
-
-/** The anchor for document y: the shown block that starts last at or above it (the innermost, on a tie). */
-function anchor(y: number): [number, number] | null {
-	const bs = layout();
-	let best = -1;
-	for (let i = 0; i < bs.length; i++) if (bs[i].h > 0 && bs[i].top <= y && (best < 0 || bs[i].top >= bs[best].top)) best = i;
-	if (best < 0) best = bs.findIndex((b) => b.h > 0);
-	if (best < 0) return null;
-	return [best, round(clampFrac((y - bs[best].top) / bs[best].h))];
-}
-
-/** Document y for an anchor, or null when this reader doesn't have that block shown. */
-function place(b: number, f: number): number | null {
-	const x = layout()[b];
-	return x && x.h > 0 ? x.top + f * x.h : null;
 }
 
 // ---- What this tab sends ----------------------------------------------------------------------------------------
@@ -159,13 +117,7 @@ let cTimer: ReturnType<typeof setTimeout> | undefined;
 
 function sendCursor(): void {
 	cTimer = undefined;
-	let c: number[] | null = null;
-	const main = document.querySelector('main');
-	const a = pointer && !document.hidden && main ? anchor(pointer.y + pageTop()) : null;
-	if (pointer && main && a) {
-		const r = main.getBoundingClientRect();
-		c = [round(clampFrac((pointer.x - r.left) / (r.width || 1))), ...a];
-	}
+	const c = pointer && !document.hidden ? spotAt(pointer.x, pointer.y, mineOnly) : null;
 	const s = JSON.stringify(c);
 	if (s === sentC || (!sentC && !c)) return;
 	sentC = s;
@@ -186,9 +138,12 @@ function resend(): void {
 
 // ---- What the others are doing ----------------------------------------------------------------------------------
 
-/** Over the page, scrolling with it: an absolute box as tall as the body, clipped so a pointer never widens it. */
+/** Over the page, scrolling with it: an absolute box as tall as the body, clipped so a pointer never widens it. The
+ * pointers in the article are drawn there; those on the regions beside it in `fixedLayer`, over the window. */
 const layer = el('div', 'cursors');
 layer.setAttribute('aria-hidden', 'true');
+const fixedLayer = el('div', 'cursors cursors-fixed');
+fixedLayer.setAttribute('aria-hidden', 'true');
 const rail = el('div', 'reading');
 /** The others' bands, under the track; the track (the scrollbar, on a desk) holds the reader's own, the thumb. */
 const others = el('div', 'reading-others');
@@ -196,6 +151,17 @@ const track = el('div', 'reading-track');
 const mine = el('span', 'reading-me');
 track.append(mine);
 rail.append(others, track);
+
+/** This tab's own overlays, which a pointer is never on as far as the others go: what is under them is. */
+const mineOnly: Element[] = [];
+
+/** Where a layer's px start in the window's: the fixed layer is the window, the page's layer is off by the scroll. */
+const origin = (fixed: boolean) => (fixed ? { x: 0, y: 0 } : { x: -scrollX, y: -pageTop() });
+/** A place in its layer's px. */
+function onLayer(p: Place): { x: number; y: number } {
+	const o = origin(p.fixed);
+	return { x: p.x - o.x, y: p.y - o.y };
+}
 
 function arrow(): SVGSVGElement {
 	const svg = document.createElementNS(SVG, 'svg');
@@ -217,24 +183,30 @@ function cursorOf(r: Remote): HTMLElement {
 	return (r.el = e);
 }
 
-/** Where `r`'s pointer goes on this reader's page, or null. */
-function target(r: Remote): { x: number; y: number } | null {
-	const main = document.querySelector('main');
-	if (!r.c || !main) return null;
-	const y = place(r.c[1], r.c[2]);
-	if (y === null) return null;
-	const m = main.getBoundingClientRect();
-	return { x: m.left + scrollX + r.c[0] * m.width, y };
-}
-
-function aim(r: Remote): void {
-	r.to = hidden() || !fine.matches ? null : target(r);
-	if (!r.to) {
+/**
+ * Points `r`'s pointer where it now is on this reader's screen, or fades it while they don't have that. Moving between
+ * the article and a region, it changes layers and keeps its place on screen, so it still glides; `snap` puts it there
+ * at once (a region's pointer while the page or the region scrolls, which must not trail).
+ */
+function aim(r: Remote, snap = false): void {
+	const at = hidden() || !fine.matches || !r.c ? null : placeOf(r.c);
+	if (!at) {
+		r.to = null;
 		r.el?.classList.add('idle');
 		return placeSay(r);
 	}
+	const to = (r.to = onLayer(at));
 	const e = cursorOf(r);
-	r.pos ??= { ...r.to };
+	if (r.fixed !== at.fixed) {
+		(at.fixed ? fixedLayer : layer).append(e);
+		const [a, b] = [origin(r.fixed), origin(at.fixed)];
+		if (r.pos) r.pos = { x: r.pos.x + a.x - b.x, y: r.pos.y + a.y - b.y };
+		r.fixed = at.fixed;
+	}
+	if (snap || !r.pos) {
+		r.pos = { ...to };
+		e.style.transform = `translate(${to.x.toFixed(1)}px, ${to.y.toFixed(1)}px)`;
+	}
 	e.classList.toggle('idle', Date.now() - r.t > IDLE_MS);
 	placeSay(r);
 	animate();
@@ -279,8 +251,10 @@ function drawRail(): void {
 	const H = document.documentElement.scrollHeight || 1;
 	const bands: HTMLElement[] = [];
 	for (const r of remotes.values()) {
-		const y0 = r.c ? place(r.c[1], r.c[2]) : null;
-		if (y0 === null) continue;
+		// Only a pointer in the article has a place on the page.
+		const at = r.c && placeOf(r.c);
+		if (!at || at.fixed) continue;
+		const y0 = onLayer(at).y;
 		const band = el('span', 'reading-band');
 		band.style.setProperty('--c', colour(r.who.key));
 		band.dataset.key = r.who.key;
@@ -375,7 +349,7 @@ function grab(e: PointerEvent): void {
 
 /** The page moved under the anchors (a resize, a fold, a thread opened): place everything again. */
 function relayout(): void {
-	blocks = null;
+	remeasure();
 	layer.style.height = `${document.body.offsetHeight}px`;
 	for (const r of remotes.values()) {
 		if (!r.c) continue;
@@ -445,21 +419,24 @@ function placeSay(r: Remote): void {
 	const b = r.sayEl;
 	if (!b || b.classList.contains('pinned')) return;
 	if (r.say?.done && b.parentElement === r.el && r.el) {
+		// Into the pointer's layer: on the page for one in the article, in the window for one on a region, which stays put.
+		const into = r.fixed ? fixedLayer : layer;
 		const at = b.getBoundingClientRect();
-		const to = layer.getBoundingClientRect();
+		const to = into.getBoundingClientRect();
 		b.classList.remove('flip');
 		b.classList.add('pinned');
 		b.style.left = `${Math.round(at.left - to.left)}px`;
 		b.style.top = `${Math.round(at.top - to.top)}px`;
-		layer.append(b);
+		into.append(b);
 		return;
 	}
-	const to = r.to;
-	const y = pageTop();
-	if (r.el && to && !r.el.classList.contains('idle') && to.y > y && to.y < y + innerHeight - 40) {
+	// In the window.
+	const o = origin(r.fixed);
+	const to = r.to && { x: r.to.x + o.x, y: r.to.y + o.y };
+	if (r.el && to && !r.el.classList.contains('idle') && to.y > 0 && to.y < innerHeight - 40) {
 		b.classList.remove('on-rail');
 		// Near the right edge it opens to the left of the pointer, so the page's clip never cuts it.
-		b.classList.toggle('flip', to.x - scrollX > innerWidth - 300);
+		b.classList.toggle('flip', to.x > innerWidth - 300);
 		if (b.parentElement !== r.el) r.el.append(b);
 		return;
 	}
@@ -488,8 +465,10 @@ let sentSay = '';
 let sayQueue: ReturnType<typeof setTimeout> | undefined;
 let sayKeep: ReturnType<typeof setInterval> | undefined;
 let sayFade: ReturnType<typeof setTimeout> | undefined;
-/** Where on the page (document px) the composer is: the pointer's place while it is written, kept once sent; null at the foot of the window. */
-let sayAt: { x: number; y: number } | null = null;
+/** Where the composer is: the pointer's place while it is written, kept once sent; on the page (document px), or in the
+ * window (px) while `fixed`, over a region beside the article, which stays put as the page scrolls; null at the foot
+ * of the window. */
+let sayAt: { x: number; y: number; fixed: boolean } | null = null;
 
 const line = (v: string) => v.replace(/\s+/g, ' ').trim();
 
@@ -506,18 +485,22 @@ function queueSay(): void {
 }
 
 /**
- * Beside the pointer while the line is written, and where it was sent once it is (scrolling with the page), kept inside
- * the window; at the foot of the window while the pointer is off the page.
+ * Beside the pointer while the line is written, and where it was sent once it is (scrolling with the page, or staying
+ * with the region it is on), kept inside the window; at the foot of the window while the pointer is off the page.
  */
 function placeBox(): void {
 	if (sayBox.hidden) return;
-	const y = pageTop();
-	if (saying) sayAt = pointer ? { x: pointer.x + scrollX, y: pointer.y + y } : sayAt;
+	if (saying && pointer) {
+		const fixed = fixedAt(pointer.x, pointer.y, mineOnly);
+		sayAt = { ...onLayer({ ...pointer, fixed }), fixed };
+	}
 	sayBox.classList.toggle('at-foot', !sayAt);
+	sayBox.classList.toggle('fixed', !!sayAt?.fixed);
 	if (!sayAt) return void (sayBox.style.left = sayBox.style.top = '');
-	sayBox.style.left = `${Math.round(scrollX + Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x - scrollX + 14)))}px`;
+	const { x, y } = origin(sayAt.fixed);
+	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x + x + 14)) - x)}px`;
 	// On the page (absolute), so a bounce moves it with the text; kept inside the window as it was when placed.
-	sayBox.style.top = `${Math.round(y + Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, sayAt.y - y + 18)))}px`;
+	sayBox.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, sayAt.y + y + 18)) - y)}px`;
 }
 
 function openSay(): void {
@@ -613,7 +596,7 @@ export function setPeople(at: string, list: Peer[]): void {
 		path = at;
 		peers.clear();
 		for (const k of [...remotes.keys()]) forget(k);
-		blocks = null;
+		remeasure();
 	}
 	let fresh = false;
 	const now = new Set(list.map((p) => p.key));
@@ -642,12 +625,11 @@ export function message(m: { t?: unknown }): boolean {
 	const { k, c, text, done } = m as { k?: unknown; c?: unknown; text?: unknown; done?: unknown };
 	const who = typeof k === 'string' ? peers.get(k) : undefined;
 	if (!who) return true;
-	const nums = (x: unknown, n: number) => (Array.isArray(x) && x.length === n && x.every((y) => typeof y === 'number' && Number.isFinite(y)) ? (x as number[]) : null);
 	let r = remotes.get(who.key);
-	if (!r) remotes.set(who.key, (r = { who, c: null, pos: null, to: null, el: null, t: 0, say: null, sayEl: null, sayTimer: undefined }));
+	if (!r) remotes.set(who.key, (r = { who, c: null, fixed: false, pos: null, to: null, el: null, t: 0, say: null, sayEl: null, sayTimer: undefined }));
 	if (m.t === 'say-live') hearSay(r, typeof text === 'string' && text ? text.slice(0, SAY_MAX) : null, done === true);
 	else {
-		r.c = nums(c, 3);
+		r.c = spotOf(c);
 		r.t = Date.now();
 		aim(r);
 		queueRail();
@@ -699,7 +681,8 @@ export function setup(opts: {
 }): void {
 	({ send, face, name, me, post } = opts);
 	rail.hidden = true;
-	document.body.append(layer, rail, sayBox);
+	document.body.append(layer, fixedLayer, rail, sayBox);
+	mineOnly.push(rail, sayBox);
 	document.addEventListener('keydown', sayKeyDown);
 	rail.addEventListener('pointerdown', grab);
 	desk.addEventListener('change', drawRail);
@@ -720,15 +703,20 @@ export function setup(opts: {
 		pointer = null;
 		queueCursor();
 	});
-	addEventListener(
+	// The page or anything in it scrolled (captured, since a list's scroll doesn't bubble): what the pointer is on may be
+	// another thing, and the others' pointers on a region go with what they are on.
+	document.addEventListener(
 		'scroll',
-		() => {
+		(e) => {
 			if (pointer) queueCursor();
-			moved();
+			if (e.target === document) moved();
 			placeBox();
-			for (const r of remotes.values()) placeSay(r);
+			for (const r of remotes.values()) {
+				if (r.c && (r.fixed || !r.to)) aim(r, true);
+				else placeSay(r);
+			}
 		},
-		{ passive: true },
+		{ capture: true, passive: true },
 	);
 	addEventListener('resize', () => relayout());
 	document.addEventListener('visibilitychange', () => {
@@ -751,8 +739,8 @@ export function setup(opts: {
 	const watch = () => {
 		ro.disconnect();
 		ro.observe(document.body);
-		const main = document.querySelector('main');
-		if (main) ro.observe(main);
+		// The article, and the regions beside it, which open, shut and move with no change to the body.
+		for (const e of document.querySelectorAll(SHELL)) ro.observe(e);
 	};
 	addEventListener(PAGE, watch);
 	watch();

@@ -469,10 +469,10 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     }
     for comp in ["BarChart", "LineChart"] {
         if let Some(v) = e.value(comp) {
-            // The tip under the pointer (client/chart.ts); the chart reads whole without it.
-            ctx.script("chart");
             let note = prose(&field(Some(v), "note"));
             let path = e.path.clone();
+            // The tip under the pointer (client/chart.ts); the chart reads whole without it.
+            ctx.script("chart");
             let note = ctx.inline(&note, &path)?;
             let id = ctx.block_id(n);
             let html = if comp == "BarChart" {

@@ -3,7 +3,9 @@
 Both define the same names, and ra-jit's have to be the ones that stay. An ELF linker keeps the
 first definition when told to, and so does a linker of the `link.exe` kind. Apple's linker has no flag for it, so there rustc's objects and
 archives are replaced by copies whose definitions are weak (`ra-jit weaken`): a weak definition
-gives way to one that is not, and to a weak one before it on the line.
+gives way to one that is not, and to a weak one before it on the line. On ELF they are replaced
+by the copies the daemon links (`ra-jit weaken --shared`), whose statics private to an object
+ra-jit's code can refer to.
 """
 import os, shlex, subprocess, sys
 
@@ -67,15 +69,21 @@ def ahead(link, objects, ra_jit):
     if msvc(link):
         link[first:first] = [*objects, "/FORCE:MULTIPLE", "/IGNORE:4006"]
         return link
-    if not MACHO or wasm(link):
-        link[first:first] = [*objects, *allowing_duplicates(wasm(link))]
+    if wasm(link):
+        link[first:first] = [*objects, *allowing_duplicates(True)]
         return link
     # The library of the toolchain defines nothing a workspace crate does.
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
     theirs = [i for i, a in enumerate(link) if a.endswith(THEIRS) and not a.startswith(sysroot)]
-    copies = subprocess.check_output([ra_jit, "weaken", *(link[i] for i in theirs)], text=True).splitlines()
+    # On ELF, copies whose statics private to an object are ones ra-jit's code can refer to,
+    # as the daemon links them (`weaken::shared`); ra-jit takes rustc's copy to be linkable.
+    weaken = [ra_jit, "weaken"] if MACHO else [ra_jit, "weaken", "--shared"]
+    copies = subprocess.check_output([*weaken, *(link[i] for i in theirs)], text=True).splitlines()
     for i, copy in zip(theirs, copies):
         link[i] = copy
+    if not MACHO:
+        link[first:first] = [*objects, *allowing_duplicates(False)]
+        return link
     # A splice adds two segments to the header, and the unwind table behind it, which the
     # linker leaves no room for. It reads and writes the loader's fixups as tables, which
     # the linker gives as chains for a deployment target of macOS 12 or later.

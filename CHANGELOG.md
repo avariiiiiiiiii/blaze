@@ -10,11 +10,39 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Added
 
-- A build or check that waits for the daemon says what it waits for: on a terminal one status
-  line, written over as the worker loads the workspace, resolves names, compiles, checks and
-  links (`Loading workspace (38 s)`), and cleared when it is done; off a terminal one line per
-  step. Before, a first build of a large workspace printed nothing for a minute. `-q` shows
-  none.
+- A build shows what it does while it does it. The daemon and its workers speak deterministic
+  CBOR frames (RFC 8949 §4.2.1) instead of JSON lines, and a worker publishes the build as
+  events: each step (loading the workspace, resolving names, compiling, checking, linking),
+  each crate's functions compiled and reused, and every function an edit rebuilt with why (its
+  body was edited, or it uses what was). On a terminal a live region is redrawn, never silent
+  for more than a second, and the build ends with one line (`Rebuilt 3 fns: render
+  (src/main.rs edited), draw, tick (uses what changed); 0.21s`); off a terminal cargo-like
+  lines. `-q` shows none. Before, a first build of a large workspace printed nothing for a minute.
+- `blaze why [fn|crate]` says what the last build rebuilt and why.
+- `--events json|cbor` writes the build's events to stdout, one record a line or frame.
+
+## [0.20261028.1] - 2026-10-28
+
+### Fixed
+
+- A program that spawns a thread or makes a `HashMap` builds with the standard library a
+  release ships (#840, #224). Its build was refused with "writable static `MIN` (or
+  `__RUST_STD_INTERNAL_VAL`) without a rustc symbol": a static declared in a body of std
+  (`thread::min_stack`'s `MIN`, each `thread_local!`'s, `RandomState::new`'s `KEYS`) is named
+  after where it is written, and the name had the path of std's sources on the machine that
+  built the unit (CI's runner, `/Users/runner/.rustup/...`), so a program built anywhere else
+  asked for names the unit does not define. The place now names a file of the standard library
+  from `library/` on, and one cargo fetched under `/cargo`, the same on every machine, and the
+  program links to the unit's one copy of each static. The unit's store key changes, so it is
+  built or fetched once again. `harness/stdstatics.py` makes the unit from std's sources in
+  another directory and runs the three programs, dev and `--release`.
+
+### Merged
+
+- std statics in bodies: name their place by a path every machine shares (#840) (#857)
+- experience.py flags the names blaze no longer has, not every mention of blaze (#869)
+- nix/units: blaze-protocol and blaze-ui (main's unit-graph check, stale since #855/#856) (#871)
+- agents: scripts take one typed JSON input, not flags (#874)
 
 ## [0.20261028.0] - 2026-10-28
 
@@ -2697,7 +2725,8 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.0...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.1...HEAD
+[0.20261028.1]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.1
 [0.20261028.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.0
 [0.20261027.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261027.0
 [0.1.0]: https://github.com/indexable-inc/ra-jit/releases/tag/v0.1.0

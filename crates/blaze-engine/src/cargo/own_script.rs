@@ -359,6 +359,9 @@ fn built(
     if made.wasi {
         first.field(crate::RUN_TOOL_TARGET.as_bytes());
     }
+    if made.wasm {
+        first.field(super::own_macro::MODULE_CFG.as_bytes());
+    }
     let first = first.done();
     let store = store();
     let found = store.and_then(|it| keyed::find(it, &first, &keyed::digest));

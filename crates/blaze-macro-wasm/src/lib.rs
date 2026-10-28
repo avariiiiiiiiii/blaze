@@ -1552,6 +1552,20 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_number_comes_out_as_a_minus_and_a_number() {
+        let number = |text: &str, kind: tt::LitKind, suffix: &str| {
+            Tree::Leaf(tt::Leaf::Literal(tt::Literal::new(text, span(0, 0), kind, suffix)))
+        };
+        let trees = vec![
+            number("-1", tt::LitKind::Integer, "i8"),
+            number("-1.5", tt::LitKind::Float, ""),
+            number("2", tt::LitKind::Integer, ""),
+        ];
+        let want = tokens("-1i8 -1.5 2", span(0, 0)).unwrap();
+        assert_eq!(wire::top_subtree(trees, span(0, 0)).to_string(), want.to_string());
+    }
+
+    #[test]
     fn a_module_carries_its_list_in_a_custom_section() {
         let custom = |name: &str, payload: &[u8]| {
             let mut body = vec![name.len() as u8];

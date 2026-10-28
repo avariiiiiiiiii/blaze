@@ -74,6 +74,7 @@ says which Rust blaze builds with, downloading its copy first when there is none
     blaze status
     blaze stop
     blaze toolchain
+    blaze pin
 
 `blaze <command>` is the same as `blaze <command>`, for a machine where blaze brought
 its own Rust and there is no `cargo` on the path.
@@ -949,6 +950,31 @@ is.
 Cargo keeps what it builds through a workspace wrapper apart from what it builds without
 one. `cargo build` and `blaze build` in one checkout therefore each compile the
 workspace's crates once, and share the dependencies.
+
+## Pinning a release of blaze
+
+A project pins blaze, not Rust: each release of blaze builds with the Rust it ships, and
+`rust-toolchain` files are not read ([toolchain.md](toolchain.md)). `blaze pin` writes the
+version of the blaze it is into the workspace's root `Cargo.toml`:
+
+    [workspace.metadata.blaze]
+    version = "0.20261027.0"
+
+(the rest of the manifest is kept as it was; in a package with no `[workspace]` that adds
+one, which makes it the root of its own workspace, as it is anyway when no other is above
+it). From then on the `blaze` (or `blaze`) anyone runs in that workspace runs that
+release, as Bazelisk runs the Bazel a `.bazelversion` names: when it is another release
+itself, it runs `~/.blaze/versions/<version>/blaze` (`$BLAZE_HOME/versions` with `BLAZE_HOME`)
+with the same arguments, and when that is not there it first downloads
+`blaze-v<version>-<host>.tar.gz` from the release on GitHub, checks its sha256 against the
+release's `SHA256SUMS` and unpacks it there. The network is used only then, once per
+release. A pinned release that can't be fetched (offline, no such release, no build for
+this host, another sha256) is an error, and no other blaze builds in its place.
+`BLAZE_RELEASES` names a mirror laid out as
+`https://github.com/indexable-inc/blaze/releases/download` (`<mirror>/v<version>/<asset>`),
+or a directory of `v<version>` directories of the assets. `blaze --version` says which
+blaze runs and why: as the workspace pins it, or as nothing pins one. `--manifest-path`
+picks the workspace a command is for, as it does for cargo.
 
 ## Environment variables
 

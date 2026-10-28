@@ -115,11 +115,6 @@ export const rules = [
 		link: "docs/contributing.md#documents",
 	},
 	{
-		id: "narration-is-a-script",
-		info: "Each page in `site/content/` has a spoken script written for the ear, not the article read aloud, and a change to a page changes its script in the same commit.",
-		link: "site/audio/README.md",
-	},
-	{
 		id: "scripts-take-typed-input",
 		info: "A script takes one JSON value (a file path, `-` or inline), parsed into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment variables. An existing script moves to this when next changed.",
 		reason: "Andrew, 2026-10-28: \"for parser things it should be typed like json instead of cli args, json through a file or stdin or a single value\". Flags drift and are untyped; one JSON value is checkable and the same from a workflow, a person or another script.",

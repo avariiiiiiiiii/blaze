@@ -67,10 +67,7 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
     plans and records as of their date. A change that makes a current doc untrue fixes it or marks
     it superseded in the same change; `python3 tools/docs.py check` holds them to the tree. See
     [docs/contributing.md#documents](docs/contributing.md#documents).
-17. **narration-is-a-script**: Each page in `site/content/` has a spoken script written for the ear, not
-    the article read aloud, and a change to a page changes its script in the same commit. See
-    [site/audio/README.md](site/audio/README.md).
-18. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
+17. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
     into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment
     variables. An existing script moves to this when next changed.
 

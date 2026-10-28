@@ -400,10 +400,11 @@ class Case:
             if not said.startswith("ok"):
                 return said
             # Another client's answer may be linking over the file: taken once it holds still.
-            mine = f"{binary}.client{n}"
-            for _ in range(200):
-                shutil.copy(binary, mine)
+            for attempt in range(200):
+                # A file of its own each time: an earlier copy may still be held by a child.
+                mine = f"{binary}.client{n}.{attempt}"
                 try:
+                    shutil.copy(binary, mine)
                     ran = self.behaviour(mine, env)
                 except OSError as busy:
                     # Another thread's child, forked while the copy was open, holds it for a moment.

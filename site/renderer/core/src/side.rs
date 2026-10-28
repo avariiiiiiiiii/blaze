@@ -163,8 +163,27 @@ fn svg(name: &str) -> String {
 /// The logo (`Brand {dark, light, width, height}` on `site`): the dark file by default, the light one when the
 /// reader's system is light. `alt` is empty where the words sit beside it.
 pub fn picture(world: &World, site: Id, served: &Served, class: &str, alt: &str) -> String {
+    picture_of(world, site, served, ("dark", "light"), class, alt)
+}
+
+/// The logo where it is small (the sidebar, the phone bar): the still first frame, and the fire only while the
+/// pointer is on it or it has keyboard focus (shell.css swaps `.still` for `.anim`). Without `Brand`'s still files
+/// it is the animated logo.
+pub fn hover_picture(world: &World, site: Id, served: &Served) -> String {
+    if field(world.get(site), "Brand", "still_dark").is_empty() {
+        return picture(world, site, served, "logo", "");
+    }
+    format!(
+        "{}{}",
+        picture_of(world, site, served, ("still_dark", "still_light"), "logo still", ""),
+        picture(world, site, served, "logo anim", "")
+    )
+}
+
+/// The logo from `Brand`'s two file fields `keys` (dark, light).
+fn picture_of(world: &World, site: Id, served: &Served, keys: (&str, &str), class: &str, alt: &str) -> String {
     let e = world.get(site);
-    let (dark, light) = (field(e, "Brand", "dark"), field(e, "Brand", "light"));
+    let (dark, light) = (field(e, "Brand", keys.0), field(e, "Brand", keys.1));
     if dark.is_empty() {
         return format!("<span class=\"{}\">blaze</span>", esc(class));
     }
@@ -246,7 +265,7 @@ pub fn sidebar(groups: &[Group], page: &Page, served: &Served, world: &World, si
 </aside>
 <a class=\"scrim\" href=\"#\" aria-label=\"Close the menu\" tabindex=\"-1\"></a>",
         home = esc(&served.href("/")),
-        logo = picture(world, site, served, "logo", ""),
+        logo = hover_picture(world, site, served),
         close = svg("close"),
         search = svg("search"),
     )
@@ -258,7 +277,7 @@ pub fn mobile_bar(served: &Served, world: &World, site: Id) -> String {
         "<div class=\"mbar\"><a class=\"menubtn\" href=\"#menu\" aria-controls=\"menu\">{}<span>Menu</span></a><a class=\"mbrand\" href=\"{}\" aria-label=\"blaze, home\">{}</a><button type=\"button\" class=\"menubtn msearch\" data-search hidden aria-label=\"Search\">{}</button></div>",
         svg("menu"),
         esc(&served.href("/")),
-        picture(world, site, served, "logo", ""),
+        hover_picture(world, site, served),
         svg("search")
     )
 }

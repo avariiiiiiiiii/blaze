@@ -16,6 +16,12 @@
 .brand:hover { background: var(--s-tint); }
 .logo, .logo img { display: block; }
 .brand .logo img { width: 92px; height: auto; }
+/* The small logo burns only while the pointer is on it (or it has focus): the still first frame until then. */
+.logo.anim { display: none; }
+@media (prefers-reduced-motion: no-preference) {
+	.brand:hover .logo.still, .brand:focus-visible .logo.still, .mbrand:hover .logo.still, .mbrand:focus-visible .logo.still { display: none; }
+	.brand:hover .logo.anim, .brand:focus-visible .logo.anim, .mbrand:hover .logo.anim, .mbrand:focus-visible .logo.anim { display: block; }
+}
 .closebtn { display: none; }
 .searchbtn { display: flex; align-items: center; gap: 8px; flex: none; height: 34px; margin: 0 8px 10px 0; padding: 0 8px 0 10px; border: 0; border-radius: 999px; background: var(--s-tint); color: var(--ink-3); font: inherit; font-size: 13.5px; cursor: pointer; transition: background-color 0.15s, color 0.15s; }
 .searchbtn[hidden] { display: none; }
@@ -85,19 +91,21 @@ main.wide { max-width: none; }
 .hero .listen { margin: 16px 0 8px; }
 .hero ~ .lede { max-width: 34em; font-size: clamp(19px, 2.1vw, 22px); line-height: 1.45; color: var(--ink-1); letter-spacing: -0.015em; }
 
-/* A goal: a card with its icon, title and where it stands. */
-.goal { margin: 0 0 14px; padding: 18px 20px 6px; border-radius: 14px; background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line); }
-.goal header { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; }
-.goal-icon { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 9px; background: var(--s-tint); color: var(--ink-1); }
-.goal-icon .icon { width: 18px; height: 18px; }
-.doc .goal h3 { flex: 1; margin: 0; font-size: 18px; }
-.goal p { font-size: 15px; line-height: 1.65; }
-.goal .status { flex: none; }
-.status-shipped { color: var(--ok); }
-.status-underway { color: var(--ink-1); }
-.status-planned { color: var(--ink-3); }
+/* A goal: a row with its title and one line, folded; open, its few paragraphs. */
+.goal { border-top: 1px solid var(--line); }
+.goal:last-of-type { border-bottom: 1px solid var(--line); }
+.goal > summary { display: flex; align-items: center; gap: 16px; padding: 16px 2px; list-style: none; cursor: pointer; }
+.goal > summary::-webkit-details-marker { display: none; }
+.goal-head { flex: 1; min-width: 0; }
+.doc .goal h3 { margin: 0; font-size: 17px; }
+.goal-line { display: block; margin-top: 2px; font-size: 15px; color: var(--ink-3); }
+.goal > summary:hover .goal-line { color: var(--ink-2); }
+.goal .chev { width: 14px; height: 14px; flex: none; color: var(--ink-3); transform: rotate(-90deg); transition: transform 0.18s; }
+.goal[open] .chev { transform: none; }
+.goal-body { max-width: 36em; padding: 0 2px 8px; }
+.goal-body p { font-size: 15px; line-height: 1.65; }
+@media (prefers-reduced-motion: reduce) { .goal .chev { transition: none; } }
 .status::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: currentColor; vertical-align: 0.1em; }
-.status-planned::before { background: none; box-shadow: inset 0 0 0 1.25px currentColor; }
 
 /* On this page. */
 .toc { position: sticky; top: 28px; align-self: start; max-height: calc(100svh - 56px); overflow-y: auto; padding: 108px 0 24px; font-size: 13px; scrollbar-width: thin; }
@@ -158,7 +166,6 @@ main.wide { max-width: none; }
 	.hero { padding-top: 28px; }
 	.pager { flex-direction: column; }
 	.doc .pager a { max-width: none; }
-	.goal { padding: 16px 16px 4px; }
 }
 @media (prefers-reduced-motion: reduce) {
 	.side, .sechead .chev, .fold > .caret .icon { transition: none; }

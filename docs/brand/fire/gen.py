@@ -4,7 +4,8 @@
 # ///
 """gen.py: the README's animated header, "blaze" in pixel letters, on fire.
 
-    uv run docs/brand/fire/gen.py                 # writes header-{dark,light}.webp next to this file
+    uv run docs/brand/fire/gen.py                 # writes header-{dark,light}.webp next to this file, and
+                                                  # header-{dark,light}-still.webp, its first frame
     uv run docs/brand/fire/gen.py --preview DIR   # instead, DIR/preview-{dark,light}.png: four
                                                   # frames on GitHub's backgrounds, to look at
 
@@ -269,6 +270,10 @@ def main():
                        background=(0, 0, 0, 0), lossless=True, quality=80, method=4)
         print(f"{os.path.relpath(out)}: {w}x{h}, shown at {w // 2}x{h // 2}, {FRAMES} frames, "
               f"{os.path.getsize(out) / 1024:.1f} KiB")
+        # The site's sidebar shows this until the pointer is on the logo.
+        still = os.path.join(HERE, f"header-{theme}-still.webp")
+        images[0].save(still, lossless=True, quality=80, method=4)
+        print(f"{os.path.relpath(still)}: the first frame, {os.path.getsize(still) / 1024:.1f} KiB")
 
 
 if __name__ == "__main__":

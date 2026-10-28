@@ -433,25 +433,19 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         ));
     }
     if let Some(v) = e.value("Goal") {
-        // A card: an icon, the title and where it stands, then its paragraphs.
-        let title = field(Some(v), "title");
+        // Folded: the title and its one line, and the paragraphs when the reader opens it.
+        let (title, line) = (field(Some(v), "title"), field(Some(v), "line"));
         let id = esc(&ctx.block_id(n));
         let a = anchor(n, ctx, &title)?;
         let path = ctx.e(n).path.clone();
-        let t = ctx.inline(&title, &path)?;
-        let st = status(ctx.e(n));
-        let icon = match field(ctx.e(n).value("Icon"), "name") {
-            i if i.is_empty() => String::new(),
-            i => format!(
-                "<span class=\"goal-icon\">{}</span>",
-                crate::icons::svg(&i)
-                    .ok_or_else(|| format!("{path}: Icon {i:?} is not in icons.rs"))?
-            ),
-        };
+        let (t, l) = (ctx.inline(&title, &path)?, ctx.inline(&line, &path)?);
         let kids = children(n, ctx)?;
         return Ok(format!(
-            "<article class=\"goal\" id=\"{id}\"><header>{icon}<h3{}>{t}{}</h3>{st}</header>{}\n{kids}\n</article>",
-            a.attr, a.button, a.thread
+            "<details class=\"goal\" id=\"{id}\"><summary><span class=\"goal-head\"><h3{}>{t}</h3><span class=\"goal-line\">{l}</span></span>{}</summary>{}{}<div class=\"goal-body\">\n{kids}\n</div></details>",
+            a.attr,
+            crate::icons::svg("caret").unwrap_or_default().replace("class=\"icon\"", "class=\"icon chev\""),
+            a.button,
+            a.thread
         ));
     }
     if e.has_tag("Ul") || e.has_tag("Ol") {

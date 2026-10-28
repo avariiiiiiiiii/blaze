@@ -5,7 +5,7 @@
 //!   its label, a reference its label without an identifier before a colon, and a parenthesis of bare references
 //!   (`([[a]], [[b]])`, a citation) is dropped;
 //! - a Section's title becomes a transition ("Next: Prior art."), an H3 its title, an Issue "Open question: ...", a
-//!   Goal its title and status;
+//!   Goal its title and its line;
 //! - a Table is read row by row against its header ("Function in the main crate: cargo 1.76 seconds, ...");
 //! - an Img is its alt text ("On screen: ...");
 //! - Code and Command blocks are skipped, citations are never read, References, the signup form and the bench widget
@@ -213,9 +213,8 @@ fn derive(n: Id, ctx: &mut Ctx) -> Result<Option<String>, String> {
         return Ok(Some(format!("{status}: {title}")));
     }
     if let Some(v) = e.value("Goal") {
-        let title = ctx.plain(&js::string(v.get("title")), n)?;
-        let status = e.targets("Status").and_then(|t| t.first()).map(String::as_str).unwrap_or("");
-        return Ok(Some(if status.is_empty() { title } else { format!("{title}. {status}") }));
+        let (title, line) = (ctx.plain(&js::string(v.get("title")), n)?, ctx.plain(&js::string(v.get("line")), n)?);
+        return Ok(Some(if line.is_empty() { title } else { format!("{title}. {line}") }));
     }
     if e.has_tag("Table") {
         return table(n, ctx).map(Some);

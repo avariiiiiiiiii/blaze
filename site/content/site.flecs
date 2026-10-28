@@ -6,7 +6,7 @@ site {
   // https://ix.dev/blaze/ (the worker answers there; ra-jit.ix.dev and blaze.ix.dev redirect to it).
   Served: {"https://ix.dev", "/blaze"}
   // The pixel-fire wordmark (docs/brand/fire/gen.py), copied to static/brand/.
-  Brand: {"/brand/blaze-dark.webp", "/brand/blaze-light.webp", 688, 368}
+  Brand: {"/brand/blaze-dark.webp", "/brand/blaze-light.webp", 688, 368, "/brand/blaze-dark-still.webp", "/brand/blaze-light-still.webp"}
 
   index : Page {
     Hero
@@ -15,7 +15,7 @@ site {
     Icon: {"house"}
     (InGroup, nav.overview)
     Intro: {"[warm, welcoming] Hey, welcome. [short pause] This is blaze: a Rust build that keeps cargo's commands and rebuilds in milliseconds. Here's what it's for."}
-    Outro: {"[warm] So, the short version. Proc macros already run as cached, sandboxed WebAssembly. Builds are on their way to hermetic. An edit rebuilds only what it changed, in milliseconds, and the affected tests are next. And remote execution is still a plan. [breath] Same commands as cargo, one line to install. Thanks for listening."}
+    Outro: {"[warm] So, the short version: cacheable proc macros, hermetic builds, fast rebuilds and tests, and remote execution. [breath] Same commands as cargo, one line to install. Thanks for listening."}
     Tab: {"blaze: Rust builds you can cache, in milliseconds"}
     Description: {"A Rust build with cargo's commands: proc macros as cached, sandboxed WebAssembly, hermetic builds, edits rebuilt in milliseconds, and remote execution to come."}
 
@@ -30,44 +30,26 @@ site {
     }
 
     Section goals(title: "Goals") {
-      P intro("What blaze is for, and where each part stands. **Shipped** works today, **Underway** works in part, **Planned** is not built yet.") {
-        Say: {"[thoughtful] So, the goals. For each one: what it is, why it matters, and where it honestly stands today. Some of it works now, some of it in part, and one is still a plan."}
+      Say: {"[thoughtful] So, what is blaze for? Four things. [pause] One: proc macros you can cache. blaze runs each one as sandboxed WebAssembly, so it sees only its own package and gives the same answer every time, and then its output can be kept. [short pause] Two: hermetic builds. Same inputs, same output, whatever else is on the machine. Build scripts and proc macros already run in a sandbox. [short pause] Three: fast rebuilds and tests. An edit recompiles only the functions it changed, and reruns only the tests it touched. [short pause] And four: remote execution. Long builds and test suites sent to other machines, over the protocol Bazel's build farms speak. The shared cache comes first; running the work remotely comes after. [calm] Each one opens up on the page if you want the detail."}
+
+      Goal proc_macros(title: "Cacheable proc macros", line: "Proc macros run as sandboxed WebAssembly, so their output can be kept.") {
+        P why("A normal proc macro is native code that can read anything and answer differently each run, so nothing can safely keep what it produced.")
+        P how("blaze builds each one to WebAssembly and runs it seeing only its own package and cargo's variables, with a fixed clock and fixed randomness. An expansion becomes a pure function, and blaze's store keeps it. For now the cache is per checkout. [More](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#proc-macros-run-as-webassembly)")
       }
 
-      Goal proc_macros(title: "Cacheable proc macros") {
-        Icon: {"cube"}
-        (Status, Shipped)
-        Say: {"[confident] Goal one: proc macros you can cache. [short pause] blaze builds each proc macro from its source as a WebAssembly module, and runs it in its own process. The macro can read its own package and the variables cargo sets, and nothing else. Its clock reads zero, and its random numbers are the same every run. [pause] Why bother? A normal proc macro is native code that can touch anything and answer differently each time, so nothing can safely keep its output. A sandboxed, deterministic one can be cached like a pure function. [warm] And that's on by default today. Each expansion is kept in blaze's store, and so is the compiled module. [short pause] What's missing: for now only the same checkout finds the cache, and a macro that can't run as WebAssembly fails the build unless you list it as native."}
-        P what("**What.** blaze builds each proc macro from its source as a WebAssembly module and expands it in its own process, under Wasmtime. The module can read its package directory and the variables cargo sets, nothing more; its clock reads 0 and its random bytes are the same on every run.")
-        P why("**Why it matters.** A native proc macro can read and write anything and answer differently each time, so nothing can safely keep its output. A sandboxed, deterministic one can be cached like a pure function, and it stays out of the rest of the machine.")
-        P now("**Where it stands.** On by default. Each expansion is kept in blaze's store, keyed on the module, the macro, its input and the files it read, and the compiled module is kept too, so a new process loads one in about 3 ms. Not yet: only the same checkout finds the cache, and an expansion that asked the compiler about a span is not kept. A macro that cannot run as wasm fails the build unless its package is listed in `native-proc-macros` ([details](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#proc-macros-run-as-webassembly)).")
+      Goal hermetic(title: "Hermetic builds", line: "Same inputs, same output, whatever else is on the machine.") {
+        P why("A build should depend only on your source, your locked dependencies and blaze's pinned toolchain. That is what makes it safe to cache and share.")
+        P how("Build scripts and proc macros run in a sandbox and write only their own output. Tests, Windows and the standard library are the parts still to close. [More](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)")
       }
 
-      Goal hermetic(title: "Hermetic builds") {
-        Icon: {"shield"}
-        (Status, Underway)
-        Say: {"[thoughtful] Goal two: hermetic builds. A build's output should depend only on its inputs: your source, your dependencies at their locked versions, and blaze's own pinned toolchain. Never on whatever else happens to be on the machine. [pause] That's what makes a build safe to cache and share, and it means a build script can't quietly read your home directory or call the network. [short pause] Where is it? Build scripts and proc macros run in a sandbox by default, on Linux and on macOS, and a build script writes only its own output directory. Every project builds with blaze's pinned nightly, whatever it pins. [serious] Not done yet: tests run sandboxed only as an opt-in experiment, Windows has no sandbox, and the Rust compiler still does part of the work, like the standard library."}
-        P what("**What.** A build's output depends only on its inputs: the source, the dependencies at their locked versions and blaze's own pinned toolchain, never on what else is on the machine.")
-        P why("**Why it matters.** The same inputs giving the same output is what lets a build be cached and shared, and a sandbox means a build script cannot quietly read your home directory or the network.")
-        P now("**Where it stands.** Build scripts and proc macros run in a sandbox by default: Linux namespaces with a seccomp filter, macOS Seatbelt. A build script sees the machine read-only and writes only its `OUT_DIR` ([details](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)). Every project builds with blaze's pinned nightly, whatever it pins. Not yet: tests run sandboxed only in an opt-in experiment, Windows has no sandbox, and rustc still does part of the work, such as the standard library ([the plan](https://github.com/indexable-inc/blaze/blob/main/docs/no-rustc.md)).")
+      Goal incremental(title: "Fast rebuilds and tests", line: "An edit recompiles only the functions it changed, and reruns only the tests it touched.") {
+        P why("The wait between an edit and a result is where the time goes, for people and for agents building in a loop.")
+        P how("blaze patches the changed functions into the program already built instead of linking it again ([numbers](#speed)). Rerunning only the affected tests is opt-in for now, with `BLAZE_TESTS=affected`. [More](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#running-only-the-tests-that-have-not-passed)")
       }
 
-      Goal incremental(title: "Fast incremental builds and tests") {
-        Icon: {"timer"}
-        (Status, Shipped)
-        Say: {"[upbeat] Goal three: fast incremental builds, and fast test runs. After the first build, an edit recompiles only the functions it changed, and writes them into the program that's already built, instead of linking it all over again. And a test run should rerun only the tests the edit could affect. [pause] Why? Because the wait between an edit and a result is where the time goes, for people, and for agents running builds in a loop. [excited] Function-level rebuilds are on by default today; you'll see the numbers in a moment. [short pause] Running only the affected tests works too, when you ask for it. The catch: a test's pass is only kept when the test ran in the sandbox, so for now that needs the sandboxed tests experiment. Otherwise every test runs, every time."}
-        P what("**What.** After the first build, an edit recompiles only the functions it changed and writes them into the program already built, instead of linking it again. A test run reruns only the tests the edit could have changed.")
-        P why("**Why it matters.** The wait between an edit and a result is where the time goes, for people and for agents running builds in a loop. Milliseconds instead of seconds changes how you work.")
-        P now("**Where it stands.** Function-level rebuilds are on by default ([numbers below](#speed)). Running only the affected tests works with `BLAZE_TESTS=affected`, but a pass is kept only for a test that ran sandboxed, so for now it needs the sandboxed-tests experiment; otherwise every test runs every time ([details](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#running-only-the-tests-that-have-not-passed)).")
-      }
-
-      Goal remote(title: "Remote execution") {
-        Icon: {"cloud"}
-        (Status, Planned)
-        Say: {"[thoughtful] And goal four: remote execution. The long-running work, full builds and big test suites, sent to other machines over the remote execution protocol that Bazel and its build farms speak. [pause] A cold build of a large workspace shouldn't be bound by one laptop, and work some machine has already done shouldn't be done again. [calm] This one is planned, not built. What comes first is the remote cache: its server is up, and blaze can push to it and pull from it, though C I doesn't use it yet. It speaks blaze's own protocol for now. Remote execution itself is still to come."}
-        P what("**What.** Long-running work, full builds and test suites, sent to other machines over the Remote Execution API (REAPI), the protocol Bazel and its build farms speak.")
-        P why("**Why it matters.** A cold build of a large workspace or a long test suite should not be bound by one laptop, and work some machine already did should not be done again.")
-        P now("**Where it stands.** Planned. The remote cache comes first: its gateway is deployed, and blaze pushes to it and pulls from it (`BLAZE_REMOTE`), though CI does not use it yet ([design](https://github.com/indexable-inc/blaze/blob/main/docs/remote-cache.md)). It speaks blaze's own protocol; remote execution over REAPI is not built ([#226](https://github.com/indexable-inc/blaze/issues/226)).")
+      Goal remote(title: "Remote execution", line: "Long builds and test suites run on other machines, over Bazel's remote execution protocol.") {
+        P why("A cold build of a big workspace should not be bound by one laptop, and work some machine already did should not be done twice.")
+        P how("The shared cache comes first, and blaze can already push to it and pull from it. Running the work remotely, over REAPI, comes after. [Design](https://github.com/indexable-inc/blaze/blob/main/docs/remote-cache.md)")
       }
     }
 

@@ -22,9 +22,10 @@ struct Link(label: string, href: string, order: i32) // a sidebar row that goes 
 // The sidebar (nav.flecs; renderer core side.rs): its sections are the children of `nav`, each with a Group and an
 // Icon. A page joins one with Nav, Icon and (InGroup, nav.<section>); its RFCs are its row's kids.
 struct Group(title: string, order: i32) // a sidebar section, top to bottom by order
-struct Icon(name: string)               // a row's, section's or goal's icon: a key of renderer/core/src/icons.rs
+struct Icon(name: string)               // a row's or section's icon: a key of renderer/core/src/icons.rs
 // The logo, set on `site`: animated pixel-fire WebP, the dark file on a dark page, the light one on a light page.
-struct Brand(dark: string, light: string, width: i32, height: i32)
+// The still files are its first frame, which the sidebar shows until the pointer is on it.
+struct Brand(dark: string, light: string, width: i32, height: i32, still_dark: string, still_light: string)
 // Where the site is served, set on `site`: the origin and the path every page sits under (no trailing slash, or
 // empty for the root). A link written /rfcs/x becomes <base>/rfcs/x; canonical and og:url are origin + base + path.
 struct Served(origin: string, base: string)
@@ -44,7 +45,7 @@ struct Img(src: string, alt: string, width: i32, height: i32)
 // Containers: their children are their content, in order.
 struct Section(title: string)           // <section> with an <h2>
 struct Issue(title: string)             // an open question in an RFC, with (Status, Open|Resolved)
-struct Goal(title: string)              // a card for one of blaze's goals, with an Icon and (Status, Shipped|Underway|Planned)
+struct Goal(title: string, line: string) // one of blaze's goals, folded to its title and one line until opened
 Ul {}
 Ol {}
 Table {}
@@ -84,9 +85,6 @@ Accepted {}
 Rejected {}
 Open {}                                 // an issue nobody has settled
 Resolved {}
-Shipped {}                              // a goal: works today
-Underway {}                             // a goal: part of it works today
-Planned {}                              // a goal: designed or wanted, not built
 Cites {}                                // (Cites, ref): a block leans on that reference
 DependsOn {}                            // (DependsOn, page): read that page first
 InGroup { Exclusive }                   // (InGroup, nav.<section>): the page's sidebar row is in that section

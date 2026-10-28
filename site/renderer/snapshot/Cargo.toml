@@ -1,6 +1,6 @@
 [package]
 name = "site-snapshot"
-description = "The build's step from content/*.flecs (and the HTML the TS build baked) to the snapshot, as a wasm module with a small C ABI: Flecs's C inside, no imports."
+description = "The build's step from content/*.flecs (and the highlighted code the TS build baked) to the snapshot, as a wasm module with a small C ABI: Flecs's C inside, no imports."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

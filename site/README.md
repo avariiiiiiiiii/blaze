@@ -8,8 +8,8 @@ headers, and the browser scripts.
 ## Architecture: Rust core, TS host
 
 ```
-content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js, bench widget ──┐
-                 └───────────────────────────────── site-snapshot.wasm ◀────────────────┘
+content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js; generated: bench charts ──┐
+                 └──────────────────────────────────────────── site-snapshot.wasm ◀────────────────┘
                                                             │ snapshot (.gen/site.cbor)
                                                             ▼
                  gen/build.ts ── site.wasm ──▶ dist/*.html (every page, no comments)
@@ -21,7 +21,8 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `site.wasm` (the renderer) and `site-snapshot.wasm` (the content scripts run in Flecs, compiled in, to the snapshot;
   build time only). Both are platform-independent build outputs, never checked in.
 - `gen/build.ts`: the build, under Bun, with no native code. It runs the scripts under `flecs/flecs-doc.wasm` to bake
-  what the renderer leaves to TS (highlighted code, the bench widget), gets the snapshot from `site-snapshot.wasm`,
+  what the renderer leaves to TS (highlighted code) and to write the scripts the content asks for (the benchmark
+  charts, `gen/bench/`), gets the snapshot from `site-snapshot.wasm`,
   renders every page with `site.wasm` into `dist/`, bundles `client/*.ts`, concatenates `styles/` and copies `static/`.
   For the worker it writes `.gen/`: `site.wasm`, `site.cbor` (the snapshot), `pages.json`, `discussable.json` and
   `build.json` (a hash of the module, the snapshot and the client scripts).
@@ -37,7 +38,7 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `(InGroup, nav.x)`; `renderer/core/src/side.rs` draws the sidebar, crumb, pager and outline from them, in the ix
   docs' layout.
 - `client/`: browser scripts (the sidebar's folds, drawer, search over `dist/search.json` and outline in `side.ts`;
-  comment enhancements, the signup form, /bench, copy buttons). `nav.ts` is the client router: a click on a link to
+  comment enhancements, the signup form, the charts' tooltips, copy buttons). `nav.ts` is the client router: a click on a link to
   another page fetches it (fetched ahead on hover) and swaps only the page column, the head's tags and the sidebar's
   open row, without a load, as the ix docs move between pages; anything unexpected falls back to a plain load. Each
   page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
@@ -116,10 +117,14 @@ details, and the steps for serving the files from R2.
 
 ## Benchmark history (`/bench`)
 
-Prerendered from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
-`harness/benchhistory.py` (its docstring describes a line). `gen/bench/index.ts` reads the files when the site is
-built, so a new line shows after the next deploy; the `site` workflow deploys on a
-change under `docs/benchmarks/`. Lines are grouped by machine, and the charts keep each machine's last 120 runs.
+Built from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
+`harness/benchhistory.py` (its docstring describes a line). `content/bench.flecs` names the directory with
+`BenchHistory history(dir: ...)`; at build time `gen/bench/` reads it and writes a Flecs script of Sections, Pickers
+and charts (`BarChart`, `LineChart`, `Charts`, schema in `content/schema.flecs`) under that entity, which runs after the
+content. The renderer draws each chart as inline SVG with its numbers in a table under it (`renderer/core/src/chart.rs`),
+coloured by `--series-N` (`styles/tokens.css`); `client/chart.ts` adds only the hover tooltip, and the pickers are radio
+buttons that work without JS. A new line shows after the next deploy; the `site` workflow deploys on a change under
+`docs/benchmarks/`. Lines are grouped by machine, and the charts over time keep each machine's last 60 runs.
 
 To look at the page with other data, point `BENCH_HISTORY` at a directory of `.jsonl` files:
 `BENCH_HISTORY=/tmp/history bun run build`.

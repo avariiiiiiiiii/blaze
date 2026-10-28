@@ -247,12 +247,12 @@ function fade(t: Element, ms: number): void {
  * A word from the site itself (not a chat message) in the pop-up stack: shown whether the chat is open or muted, with
  * an optional button. It fades after `ms`, or stays until the returned function is called.
  */
-export function notice(title: string, text: string, opts: { ms?: number; action?: { label: string; run: () => void } } = {}): () => void {
+export function notice(title: string, text: string, opts: { ms?: number; icon?: string; action?: { label: string; run: () => void } } = {}): () => void {
 	const t = el('div', 'chat-toast chat-notice');
 	t.setAttribute('role', 'status');
 	const words = el('span', 'chat-toast-words');
 	words.append(el('b', '', title), el('span', '', text));
-	t.append(icon(REFRESH), words);
+	t.append(icon(opts.icon ?? REFRESH), words);
 	if (opts.action) {
 		const b = el('button', 'chat-notice-act', opts.action.label);
 		b.type = 'button';
@@ -773,6 +773,18 @@ function arrow(): SVGSVGElement {
 	return svg;
 }
 
+/**
+ * Posts a top-level message as the reader, from outside the panel (client/lib/cursors.ts: a line said by the pointer
+ * with T); false when the reader can't talk. A refusal shows under the panel's composer, and in a pop-up while the
+ * panel is shut.
+ */
+export function post(text: string): boolean {
+	if (!you?.login) return false;
+	send({ t: 'say', text });
+	errAt = null;
+	return true;
+}
+
 /** Wires the chat to the presence socket and the page. Called once. */
 export function setup(opts: {
 	send: (m: object) => void;
@@ -947,10 +959,13 @@ export function message(m: { t?: unknown }): boolean {
 		}
 	} else if (m.t === 'error') {
 		const err = errAt?.isConnected ? errAt : foot.querySelector<HTMLElement>('.chat-err');
+		const why = String((m as { text?: unknown }).text ?? 'Not sent.');
 		if (err) {
-			err.textContent = String((m as { text?: unknown }).text ?? 'Not sent.');
+			err.textContent = why;
 			err.hidden = false;
 		}
+		// Shut, so it came from outside the panel (`post`): the reader would never see the line under the composer.
+		if (panel.hidden) notice('Not sent to the chat', why, { ms: TOAST_MS, icon: CROSS });
 	} else return false;
 	return true;
 }

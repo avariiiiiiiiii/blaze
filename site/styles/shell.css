@@ -466,6 +466,26 @@ body.chat-full .chat-back { order: 1; }
 .cursor svg { width: 16px; height: 20px; flex: none; fill: var(--c); stroke: var(--bg); stroke-width: 1.2; stroke-linejoin: round; filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.3)); }
 .cursor-chip { display: inline-flex; align-items: center; gap: 4px; margin: 14px 0 0 -4px; padding: 2px 7px 2px 2px; border-radius: 10px; background: var(--c); color: #fff; font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.2); }
 .cursor-chip .face { width: 16px; height: 16px; box-shadow: none; }
+/* A line said by the pointer (T; client/lib/cursors.ts), in its sayer's colour (--c): the reader's own composer, fixed
+   beside their pointer (or at the window's foot), and the others' as bubbles under their name, or out of their face on
+   the rail while their pointer is off this screen. A caret blinks while they write; a sent one fades after a while. */
+.say-live { position: fixed; z-index: 46; display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; border-radius: 4px 14px 14px 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), inset 0 0 0 1.5px var(--c), 0 10px 28px rgb(0 0 0 / 0.28); animation: say-live-in 0.15s ease-out; transition: opacity 0.3s; }
+.say-live[hidden] { display: none; }
+.say-live.at-foot { left: 50%; bottom: 28px; transform: translateX(-50%); border-radius: 14px; }
+.say-live input, .say-live input:focus { field-sizing: content; width: auto; min-width: 24ch; max-width: min(420px, calc(100vw - 72px)); height: 24px; padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; color: var(--ink-1); font: inherit; font-size: 13.5px; outline: none; }
+.say-live input::placeholder { color: var(--ink-4); }
+.say-live.sent kbd { visibility: hidden; }
+.say-live.out { opacity: 0; }
+.say-live kbd, .tl-hint kbd { padding: 0 5px; border-radius: 5px; box-shadow: inset 0 0 0 1px var(--line-2); font-family: var(--font-mono); font-size: 11px; line-height: 17px; color: var(--ink-3); }
+.cursor-say { position: absolute; top: 38px; left: 12px; width: max-content; max-width: 260px; padding: 5px 10px; border-radius: 4px 12px 12px 12px; background: var(--pop-bg); box-shadow: var(--pop-ring), inset 0 0 0 1.5px var(--c), 0 8px 24px rgb(0 0 0 / 0.25); color: var(--ink-1); font-size: 12.5px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; pointer-events: none; animation: say-live-in 0.15s ease-out; transition: opacity 0.3s; }
+.cursor-say.flip { left: 8px; transform: translateX(-100%); border-radius: 12px 4px 12px 12px; }
+.cursor-say.on-rail { top: -4px; left: auto; right: 30px; border-radius: 12px 4px 12px 12px; }
+.cursor-say.live::after { content: ""; display: inline-block; width: 1.5px; height: 1.05em; margin-left: 1px; vertical-align: -2px; background: var(--c); animation: say-caret 1s steps(1) infinite; }
+.cursor-say.out { opacity: 0; }
+@keyframes say-live-in { from { opacity: 0; } }
+@keyframes say-caret { 50% { opacity: 0; } }
+.tl-list .tl-hint { margin: 8px 4px 0; padding-top: 8px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { .say-live, .cursor-say, .cursor-say.live::after { animation: none; transition: none; } }
 /* Where each is reading: a thin rail at the right edge, the page's length top to bottom, a band in their colour for
    each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. Beside a
    chat it sits at the page's right edge, clear of the chat's resize handle; over a full-screen or phone chat it goes.

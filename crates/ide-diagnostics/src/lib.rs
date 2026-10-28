@@ -35,6 +35,7 @@ mod handlers {
     pub(crate) mod binary_operator_cannot_be_applied;
     pub(crate) mod borrowck;
     pub(crate) mod break_outside_of_loop;
+    pub(crate) mod const_check;
     pub(crate) mod cannot_be_dereferenced;
     pub(crate) mod cannot_implicitly_deref_trait_object;
     pub(crate) mod cannot_index_into;
@@ -599,6 +600,8 @@ fn semantic_diagnostics_asked(
             AnyDiagnostic::MissingBody(d) => handlers::missing_body::missing_body(&ctx, &d),
             AnyDiagnostic::BorrowckError(d) => handlers::borrowck::borrowck_error(&ctx, &d),
             AnyDiagnostic::BorrowckSkipped(d) => handlers::borrowck::borrowck_skipped(&ctx, &d),
+            AnyDiagnostic::ConstCheckError(d) => handlers::const_check::const_check_error(&ctx, &d),
+            AnyDiagnostic::ConstImpure(d) => handlers::const_check::const_impure(&ctx, &d),
             AnyDiagnostic::ExplicitDropMethodUse(d) => handlers::explicit_drop_method_use::explicit_drop_method_use(&ctx, &d),
             AnyDiagnostic::YieldOutsideCoroutine(d) => handlers::yield_outside_coroutine::yield_outside_coroutine(&ctx, &d),
             AnyDiagnostic::ReturnOutsideFunction(d) => handlers::return_outside_function::return_outside_function(&ctx, &d),

@@ -457,13 +457,33 @@ body.chat-full .chat-back { order: 1; }
 .cursor-chip { display: inline-flex; align-items: center; gap: 4px; margin: 14px 0 0 -4px; padding: 2px 7px 2px 2px; border-radius: 10px; background: var(--c); color: #fff; font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.2); }
 .cursor-chip .face { width: 16px; height: 16px; box-shadow: none; }
 /* Where each is reading: a thin rail at the right edge, the page's length top to bottom, a band in their colour for
-   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. */
-.reading { position: fixed; z-index: 14; top: 0; right: 0; bottom: 0; width: 6px; pointer-events: none; }
+   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. Beside a
+   chat it sits at the page's right edge, clear of the chat's resize handle; over a full-screen or phone chat it goes.
+   Above the sticky top line (a scrollbar runs the window's height), under the chat, the drawer and pop-ups. */
+.reading { position: fixed; z-index: 16; top: 6px; right: 0; bottom: 10px; width: 6px; pointer-events: none; user-select: none; -webkit-user-select: none; }
 .reading[hidden] { display: none; }
+.reading-others, .reading-track { position: absolute; inset: 0; }
 .reading-me, .reading-band { position: absolute; right: 1px; width: 4px; min-height: 4px; border-radius: 2px; }
 .reading-me { background: color-mix(in srgb, var(--ink-1) 10%, transparent); }
 .reading-band { background: color-mix(in srgb, var(--c) 55%, transparent); }
-.reading-face { position: absolute; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
+.reading-face { position: absolute; z-index: 1; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
 .reading-face .face { width: 18px; height: 18px; box-shadow: 0 0 0 2px var(--c); }
 .reading-face:hover .face { opacity: 1; transform: scale(1.15); }
-@media (min-width: 1280px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }
+@media (min-width: 801px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }
+@media (max-width: 800px) { body.chat-open .reading { display: none; } }
+body.chat-full .reading { display: none; }
+/* On a desk the rail is the page's scrollbar (client/lib/cursors.ts, the same media query), so the browser's goes:
+   one scrollbar, inside the page rather than beyond the chat. A wider track to aim at; the thumb dims while the page
+   rests and brightens as it scrolls, under the pointer and while dragged. Inner scroll areas keep their own. */
+@media (hover: hover) and (pointer: fine) {
+	html { scrollbar-width: none; }
+	html::-webkit-scrollbar { display: none; }
+	.reading.bar { width: 12px; pointer-events: auto; }
+	.reading.bar :is(.reading-me, .reading-band) { right: 3px; width: 5px; border-radius: 3px; transition: width 0.15s, right 0.15s, background-color 0.3s; }
+	.reading.bar .reading-me { background: color-mix(in srgb, var(--ink-1) 12%, transparent); }
+	.reading.bar.live .reading-me { background: color-mix(in srgb, var(--ink-1) 28%, transparent); transition-duration: 0.15s, 0.15s, 0.1s; }
+	.reading.bar:hover .reading-me { background: color-mix(in srgb, var(--ink-1) 36%, transparent); }
+	.reading.bar.drag .reading-me { background: color-mix(in srgb, var(--ink-1) 46%, transparent); }
+	.reading.bar:is(:hover, .drag) :is(.reading-me, .reading-band) { right: 2px; width: 8px; border-radius: 4px; }
+}
+@media (prefers-reduced-motion: reduce) { .reading-me, .reading-band { transition: none !important; } }

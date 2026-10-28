@@ -108,10 +108,10 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     };
     compiler.args(&args);
     if only_asks {
-        std::process::exit(for_load(compiler, &rustc, &args)?);
+        std::process::exit(for_load(compiler, &args)?);
     }
     if outside {
-        std::process::exit(self::outside(compiler, &rustc, &args)?);
+        std::process::exit(self::outside(compiler, &args)?);
     }
     let Some(unit) = Unit::of(&args) else {
         std::process::exit(compiler.status()?.code().unwrap_or(1));
@@ -119,10 +119,10 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     let plain = unit.linked && std::env::var_os(DRIVEN).is_none();
     let dir = unit.records.join(&unit.id);
     if unit.script {
-        unit.for_wasi(&rustc, &dir)?;
+        unit.for_wasi(&dir)?;
     }
     if unit.script && std::env::var_os(own_script::BY_RUSTC).is_none() {
-        match unit.by_blaze(&rustc, &dir) {
+        match unit.by_blaze(&dir) {
             Ok(()) => std::process::exit(0),
             Err(why) => unit.script_to_rustc(&why),
         }
@@ -187,15 +187,15 @@ fn rustc_of(rustc: &OsStr) -> Command {
 /// Builds a crate of a package outside the workspace as cargo asked: its build script by
 /// blaze where it can be, the rest by `compiler`, rustc, whose libraries and proc macros are
 /// described for the scripts that link them. The code to end with.
-fn outside(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow::Result<i32> {
+fn outside(mut compiler: Command, args: &[OsString]) -> anyhow::Result<i32> {
     let unit = Unit::of(args);
     if let Some(unit) = unit.as_ref().filter(|it| it.script) {
-        unit.for_wasi(rustc, &unit.records.join(&unit.id))?;
+        unit.for_wasi(&unit.records.join(&unit.id))?;
     }
     if let Some(unit) = unit.as_ref().filter(|it| it.script)
         && std::env::var_os(own_script::BY_RUSTC).is_none()
     {
-        match unit.by_blaze(rustc, &unit.records.join(&unit.id)) {
+        match unit.by_blaze(&unit.records.join(&unit.id)) {
             Ok(()) => return Ok(0),
             Err(why) => unit.script_to_rustc(&why),
         }
@@ -220,7 +220,7 @@ fn outside(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow
 /// with why. Into cargo's target directory, or with blaze's proc macros turned off for the
 /// harness's reference builds ([`own_macro::turned_off`]), `compiler`, rustc, builds it as
 /// without blaze. The code to end with.
-fn for_load(compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow::Result<i32> {
+fn for_load(compiler: Command, args: &[OsString]) -> anyhow::Result<i32> {
     let own = std::env::var_os(own_macro::OWN_TARGET).is_some() && !own_macro::turned_off();
     let unit = match Unit::of(args) {
         Some(unit) if own => unit,
@@ -233,7 +233,7 @@ fn for_load(compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow::R
     };
     if unit.script {
         let dir = unit.records.join(&unit.id);
-        unit.by_blaze(rustc, &dir).map_err(|why| failed("the build script".to_owned(), why))?;
+        unit.by_blaze(&dir).map_err(|why| failed("the build script".to_owned(), why))?;
         return Ok(0);
     }
     let named = || format!("`{}`", unit.crate_name);
@@ -247,7 +247,7 @@ fn for_load(compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow::R
         let dir = unit.records.join(&unit.id).join(record.stamp.to_string());
         built
             .and_then(|made| {
-                own_script::compile_as(rustc, &unit.args, &unit.cwd, &unit.source, &made, &dir)
+                own_script::compile_as(&unit.args, &unit.cwd, &unit.source, &made, &dir)
             })
             .map_err(|why| failed(format!("the proc macro {}", named()), why))?;
         record.write_described(&unit.records)?;
@@ -489,18 +489,18 @@ impl Unit {
     /// Has blaze compile and link the build script, where rustc would have put it, and
     /// records it as [`Unit::record`] does a script of rustc's. `dir` is where the unit is
     /// recorded. `Err` is why rustc is to compile it.
-    fn by_blaze(&self, rustc: &OsString, dir: &Path) -> Result<(), String> {
+    fn by_blaze(&self, dir: &Path) -> Result<(), String> {
         let stamp = stamp_now();
         let copies = dir.join(stamp.to_string());
         let record = self.as_record(0, Vec::new(), None);
         let exe = record.outputs().into_iter().next().ok_or("rustc names no executable")?;
-        own_script::compile(rustc, &self.args, &self.cwd, &self.source, &exe, &copies)?;
+        own_script::compile(&self.args, &self.cwd, &self.source, &exe, &copies)?;
         self.record(stamp, &copies, None, &self.source).map_err(|it| format!("{it:#}"))
     }
 
     /// Builds the build script for wasm32-wasip1 beside where rustc links it, when its package
     /// runs its script under WASI ([`wasi_script::mode`]), whoever builds the executable.
-    fn for_wasi(&self, rustc: &OsString, dir: &Path) -> anyhow::Result<()> {
+    fn for_wasi(&self, dir: &Path) -> anyhow::Result<()> {
         let package = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
         let record = self.as_record(0, Vec::new(), None);
         let out_dir = record.out_dir();
@@ -509,7 +509,7 @@ impl Unit {
         };
         let exe = record.outputs().into_iter().next().context("rustc names no executable")?;
         let dir = dir.join("wasi");
-        wasi_script::compile(mode, &package, rustc, &self.args, &self.cwd, &self.source, &exe, &dir)
+        wasi_script::compile(mode, &package, &self.args, &self.cwd, &self.source, &exe, &dir)
     }
 
     /// Gives cargo what rustc would have written of the library `record` is of, which the

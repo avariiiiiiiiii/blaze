@@ -470,15 +470,15 @@ def toolchains_in_turn(row):
 
 
 def pinned_to_a_nightly(row):
-    """A project pinned to a nightly of the next release, built anyway
-    (`BLAZE_OTHER_TOOLCHAIN=1`), as bun is: nightly cargo passes every crate
+    """A project pinned to a nightly of the next release, built with blaze's own Rust
+    (the pin is ignored), as bun is: nightly cargo passes every crate
     `-Z embed-metadata=no` and writes its build directory in its second layout, where the
     build script's output is. Each sent the build to cargo."""
     if shutil.which("rustup"):
         subprocess.run(["rustup", "toolchain", "install", NIGHTLY, "--profile", "minimal", "-c", "rust-src"],
                        check=True, capture_output=True)
     says_its_rustc(row)
-    row.env.update(RUSTUP_TOOLCHAIN=NIGHTLY, BLAZE_OTHER_TOOLCHAIN="1")
+    row.env.update(RUSTUP_TOOLCHAIN=NIGHTLY)
     row.warm()
     row.both("warm", want="-nightly")
     row.edit()

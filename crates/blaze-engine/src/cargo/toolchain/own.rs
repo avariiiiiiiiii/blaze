@@ -157,7 +157,7 @@ pub(crate) fn commit() -> &'static str {
 }
 
 /// The host's tuple, as the Rust project names its builds.
-fn host() -> Option<&'static str> {
+pub(crate) fn host() -> Option<&'static str> {
     Some(match (std::env::consts::ARCH, std::env::consts::OS) {
         ("aarch64", "macos") => "aarch64-apple-darwin",
         ("x86_64", "linux") if cfg!(target_env = "gnu") => "x86_64-unknown-linux-gnu",

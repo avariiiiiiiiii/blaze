@@ -114,7 +114,7 @@ impl Sysroot {
     pub fn discover(dir: &AbsPath, extra_env: &FxHashMap<String, Option<String>>) -> Sysroot {
         let sysroot_dir = discover_sysroot_dir(dir, extra_env);
         let rust_lib_src_dir = sysroot_dir.as_ref().ok().map(|sysroot_dir| {
-            discover_rust_lib_src_dir_or_add_component(sysroot_dir, dir, extra_env)
+            rust_lib_src_dir_of(sysroot_dir)
         });
         Sysroot::assemble(Some(sysroot_dir), rust_lib_src_dir)
     }
@@ -142,7 +142,7 @@ impl Sysroot {
         Self::assemble(sysroot_dir.map(Ok), rust_lib_src_dir.map(Ok))
     }
 
-    /// Returns a command to run a tool preferring the cargo proxies if the sysroot exists.
+    /// Returns a command to run a tool: the sysroot's own when it has one, else the cargo proxy.
     pub fn tool(
         &self,
         tool: Tool,
@@ -151,12 +151,9 @@ impl Sysroot {
     ) -> Command {
         match self.root() {
             Some(root) => {
-                // special case rustc, we can look that up directly in the sysroot's bin folder
-                // as it should never invoke another cargo binary
-                if let Tool::Rustc = tool
-                    && let Some(path) =
-                        probe_for_binary(root.join("bin").join(Tool::Rustc.name()).into())
-                {
+                // blaze: every tool the sysroot has is run from its bin folder, not through
+                // rustup's proxy (docs/no-rustc.md).
+                if let Some(path) = probe_for_binary(root.join("bin").join(tool.name()).into()) {
                     return toolchain::command(path, current_dir, envs);
                 }
 
@@ -173,34 +170,12 @@ impl Sysroot {
         }
     }
 
-    pub fn tool_path(&self, tool: Tool, current_dir: impl AsRef<Path>, envs: &Env) -> Utf8PathBuf {
-        match self.root() {
-            Some(root) => {
-                let mut cmd = toolchain::command(
-                    Tool::Rustup.path(),
-                    current_dir,
-                    &envs
-                        .into_iter()
-                        .map(|(k, v)| (k.clone(), Some(v.clone())))
-                        .collect::<FxHashMap<_, _>>(),
-                );
-                if !envs.contains_key("RUSTUP_TOOLCHAIN")
-                    && std::env::var_os("RUSTUP_TOOLCHAIN").is_none()
-                {
-                    cmd.env("RUSTUP_TOOLCHAIN", AsRef::<std::path::Path>::as_ref(root));
-                }
-
-                cmd.arg("which");
-                cmd.arg(tool.name());
-                (|| {
-                    Some(Utf8PathBuf::from(
-                        String::from_utf8(cmd.output().ok()?.stdout).ok()?.trim_end(),
-                    ))
-                })()
-                .unwrap_or_else(|| Utf8PathBuf::from(tool.name()))
-            }
-            _ => tool.path(),
-        }
+    /// The sysroot's own `tool`, else the one on the path. blaze: rustup is not asked which
+    /// it would run (docs/no-rustc.md).
+    pub fn tool_path(&self, tool: Tool, _current_dir: impl AsRef<Path>, _envs: &Env) -> Utf8PathBuf {
+        self.root()
+            .and_then(|root| probe_for_binary(root.join("bin").join(tool.name()).into()))
+            .unwrap_or_else(|| tool.path())
     }
 
     pub fn discover_proc_macro_srv(&self) -> Option<anyhow::Result<AbsPathBuf>> {
@@ -524,19 +499,10 @@ fn discover_rust_lib_src_dir(sysroot_path: &AbsPathBuf) -> Option<AbsPathBuf> {
     get_rust_lib_src(sysroot_path)
 }
 
-fn discover_rust_lib_src_dir_or_add_component(
-    sysroot_path: &AbsPathBuf,
-    current_dir: &AbsPath,
-    extra_env: &FxHashMap<String, Option<String>>,
-) -> Result<AbsPathBuf> {
+/// blaze: a sysroot without the library's source is an error; rustup is not run to add it
+/// (docs/no-rustc.md).
+fn rust_lib_src_dir_of(sysroot_path: &AbsPathBuf) -> Result<AbsPathBuf> {
     discover_rust_lib_src_dir(sysroot_path)
-        .or_else(|| {
-            let mut rustup = toolchain::command(Tool::Rustup.prefer_proxy(), current_dir, extra_env);
-            rustup.args(["component", "add", "rust-src"]);
-            tracing::info!("adding rust-src component by {:?}", rustup);
-            utf8_stdout(&mut rustup).ok()?;
-            get_rust_lib_src(sysroot_path)
-        })
         .ok_or_else(|| {
             tracing::error!(%sysroot_path, "can't load standard library, try installing `rust-src`");
             format_err!(

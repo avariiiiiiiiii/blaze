@@ -160,18 +160,11 @@ fn library_read(
             (features.clone(), false, *no_default_features)
         }
     };
-    // `--filter-platform`: the target's `cfg`, as the toolchain's rustc answers it.
+    // `--filter-platform`: the target's `cfg`, as blaze answers it for its release.
     let cfg = match triple {
         None => Vec::new(),
         Some(triple) => {
-            let sysroot = manifest.ancestors().nth(6).context("a library not in a toolchain")?;
-            let rustc = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
-            let args = ["--print", "cfg", "--target", triple];
-            let printed = super::state::rustc_says(rustc.as_os_str(), &args)
-                .filter(|it| !it.is_empty())
-                .with_context(|| {
-                    format!("`{} {}` says nothing", rustc.display(), args.join(" "))
-                })?;
+            let printed = crate::answers::ours_said(&["--print", "cfg", "--target", triple])?;
             let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {
                 use std::str::FromStr;
                 cargo_platform::Cfg::from_str(it).with_context(|| format!("the cfg {it}"))
@@ -249,15 +242,13 @@ fn plan_key(
         .filter(|(name, _)| name.starts_with("CARGO") || name.starts_with("RUST") || name == "HOME")
         .collect();
     vars.sort_unstable();
-    let rustc = super::state::rustc_path();
     let asked = serde_json::json!({
         "selection": selection,
         "cwd": cwd,
         "manifest": manifest,
         "targets": format!("{named:?}"),
         "vars": vars,
-        "rustc": rustc.to_string_lossy(),
-        "release": crate::cargo::toolchain::ours_release(),
+        "release": crate::cargo::toolchain::ours_says(),
     });
     let digest = Sha256::digest(asked.to_string().as_bytes());
     digest[..8].iter().map(|it| format!("{it:02x}")).collect()
@@ -287,8 +278,8 @@ impl Plan {
     /// What a plan made with the metadata `json`, asked for in `cwd`, is made of: the lock
     /// file and root manifest of the workspace; of each package not from a registry or git,
     /// its manifest and the directories cargo finds its targets in, and the directory it is
-    /// in, which a `members` glob reads; the configuration and toolchain files cargo and
-    /// rustup read from `cwd` up and in cargo's home; and rustc.
+    /// in, which a `members` glob reads; and the configuration files cargo reads from `cwd` up
+    /// and in cargo's home.
     fn made_of(json: &str, cwd: &Path) -> Vec<(PathBuf, Stamp)> {
         let metadata: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
         let mut files = Vec::new();
@@ -310,17 +301,12 @@ impl Plan {
         }
         for dir in cwd.ancestors() {
             files.extend([".cargo/config", ".cargo/config.toml"].map(|it| dir.join(it)));
-            files.extend(["rust-toolchain", "rust-toolchain.toml"].map(|it| dir.join(it)));
         }
         let home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|it| PathBuf::from(it).join(".cargo")));
         if let Some(home) = home {
             files.extend(["config", "config.toml"].map(|it| home.join(it)));
-        }
-        let rustc = PathBuf::from(super::state::rustc_path());
-        if rustc.is_absolute() {
-            files.push(rustc);
         }
         files.sort_unstable();
         files.dedup();
@@ -342,11 +328,7 @@ fn resolved_programs(
     targets: blaze_metadata::Targets<'_>,
 ) -> anyhow::Result<(String, Vec<blaze_metadata::Program>)> {
     {
-        let rustc = super::state::rustc_path();
-        let asked = |args: &[&str]| {
-            let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
-            said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
-        };
+        let asked = |args: &[&str]| crate::answers::ours_said(args);
         let triple = match &selection.target {
             Some(triple) => triple.clone(),
             None => {
@@ -413,11 +395,7 @@ pub(crate) fn units(
     let host = match &target {
         None => built_for,
         Some(_) => {
-            let rustc = super::state::rustc_path();
-            let said = |args: &[&str]| {
-                let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
-                said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
-            };
+            let said = |args: &[&str]| crate::answers::ours_said(args);
             let told = said(&["-vV"])?;
             let host = told.lines().find_map(|it| it.strip_prefix("host: "));
             let host = host.context("rustc names no host")?.to_owned();
@@ -522,11 +500,7 @@ pub(crate) fn checked(
     if let Some(flag) = selection.unstable.first() {
         anyhow::bail!("blaze's unit graph is not made for cargo's unstable flag `-Z {flag}`");
     }
-    let rustc = super::state::rustc_path();
-    let said = |args: &[&str]| {
-        let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
-        said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
-    };
+    let said = |args: &[&str]| crate::answers::ours_said(args);
     let platformed = |triple: &str| -> anyhow::Result<blaze_units::Platformed> {
         let printed = said(&["--print", "cfg", "--target", triple])?;
         let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {

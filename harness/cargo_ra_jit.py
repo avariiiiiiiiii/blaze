@@ -267,7 +267,11 @@ class Side:
 
     def __init__(self, ws, env, ra_jit):
         self.ws, self.ra_jit, self.plain = ws, bool(ra_jit), ra_jit == "plain"
-        self.env = env if ra_jit else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
+        # The reference is laid out as stable cargo lays out a build, which is what a user compares
+        # with and where blaze puts a test: in nightly's second layout a test is in its unit's
+        # directory, from where fd's, ripgrep's and just's tests find no program beside them.
+        self.env = env if ra_jit else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"),
+                                           CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT="false")
         self.tally = os.path.join(env["BLAZE_HOME"], "plain-cargo.log")
         self.read = 0
 

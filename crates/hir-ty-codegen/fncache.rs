@@ -31,6 +31,7 @@
 //! same reason.
 
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use base_db::{Crate, LangCrateOrigin};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
@@ -231,7 +232,7 @@ pub fn tests_reach(
         };
         let key = below_key(&header, &name);
         let before = std::time::Instant::now();
-        let below = store.and_then(|it| it.get(&key)).and_then(|it| Below::read(&it));
+        let below = Below::known(store, &key);
         spent[1] += before.elapsed();
         if below.is_none() {
             let before = std::time::Instant::now();
@@ -251,10 +252,8 @@ pub fn tests_reach(
         sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
     walked.sort_unstable_by(|a, b| b.cmp(a));
     for at in walked {
-        let below = below_of(&walk, &sealed, at);
-        if let Some(store) = store {
-            store.insert(&sealed[&at].key, below.write().as_bytes());
-        }
+        let below = Arc::new(below_of(&walk, &sealed, at));
+        Below::keep(store, &sealed[&at].key, &below);
         sealed.get_mut(&at).unwrap().below = Some(below);
     }
     took.push(("below", started.elapsed()));
@@ -368,7 +367,7 @@ struct Sealed {
     /// Where the store keeps what is below it.
     key: [u8; super::store::KEY],
     /// Read from the store, or found by going into it.
-    below: Option<Below>,
+    below: Option<Arc<Below>>,
 }
 
 /// What a test's hash says of what a node reaches, the node itself too: the first of each
@@ -378,8 +377,43 @@ struct Below {
     found: Vec<Found>,
 }
 
+/// What is below each sealed node this process found or read, by its key: the store gives
+/// only what its sealed packs have, and a pack is sealed once it is full, so what one build
+/// adds is not found there by the next builds of the daemon.
+static KNOWN: LazyLock<Mutex<FxHashMap<[u8; super::store::KEY], Arc<Below>>>> =
+    LazyLock::new(Default::default);
+
+/// How many sealed nodes [`KNOWN`] keeps before it starts again.
+const KNOWN_AT_MOST: usize = 1 << 20;
+
 impl Below {
     const FORMAT: &str = "below 2";
+
+    /// What is below the sealed node of `key`, as this process or the store has it.
+    fn known(store: Option<&super::store::Store>, key: &[u8; super::store::KEY]) -> Option<Arc<Below>> {
+        if let Some(it) = KNOWN.lock().unwrap().get(key) {
+            return Some(it.clone());
+        }
+        let below = Arc::new(Below::read(&store?.get(key)?)?);
+        Below::remember(key, &below);
+        Some(below)
+    }
+
+    /// Keeps what is below the sealed node of `key`, for this process and in the store.
+    fn keep(store: Option<&super::store::Store>, key: &[u8; super::store::KEY], below: &Arc<Below>) {
+        if let Some(store) = store {
+            store.insert(key, below.write().as_bytes());
+        }
+        Below::remember(key, below);
+    }
+
+    fn remember(key: &[u8; super::store::KEY], below: &Arc<Below>) {
+        let mut known = KNOWN.lock().unwrap();
+        if known.len() >= KNOWN_AT_MOST {
+            known.clear();
+        }
+        known.insert(*key, below.clone());
+    }
 
     /// A line for each found: its kind, what, why and each call, all after tabs; where a
     /// call calls the next follows its name after a `\x1f`.

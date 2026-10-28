@@ -29,7 +29,7 @@ use hir_ty::{
     next_solver::TyKind,
 };
 use rustc_hash::FxHashSet;
-use rustc_type_ir::inherent::IntoKind;
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
 /// Whether `id` is a static that chooses a function, as the module says.
 pub(super) fn is_cache(db: &dyn HirDatabase, id: StaticId) -> bool {
@@ -490,9 +490,24 @@ fn atomic_ptr_method(db: &dyn HirDatabase, func: &Operand) -> Option<&'static st
     }
 }
 
+/// Whether `ty` is core's `AtomicPtr`: a struct of its own, or `Atomic<*mut T>` it is an
+/// alias of.
 fn is_atomic_ptr(db: &dyn HirDatabase, ty: hir_ty::next_solver::Ty<'_>) -> bool {
-    let TyKind::Adt(def, _) = ty.kind() else { return false };
+    let TyKind::Adt(def, args) = ty.kind() else { return false };
     let AdtId::StructId(id) = def.def_id() else { return false };
-    matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Core))
-        && StructSignature::of(db, id).name.as_str() == "AtomicPtr"
+    if !matches!(
+        id.krate(db).data(db).origin,
+        base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Core)
+    ) {
+        return false;
+    }
+    match StructSignature::of(db, id).name.as_str() {
+        "AtomicPtr" => true,
+        "Atomic" => args
+            .as_slice()
+            .first()
+            .and_then(|it| it.ty())
+            .is_some_and(|it| matches!(it.kind(), TyKind::RawPtr(..))),
+        _ => false,
+    }
 }

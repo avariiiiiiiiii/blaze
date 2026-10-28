@@ -24,6 +24,13 @@ As in the pinned nightly, under `#![feature(const_trait_impl, const_closures, de
 - `const |x| ..` closures, called in const directly or passed as `impl [const] Fn(..)`,
   `[const] FnMut` and `[const] FnOnce`; a `const fn` item passed the same way.
 
+Whether a call in a const body is const is decided as rustc decides it, by proving the callee's
+`[const]` bounds const (`crates/hir-ty/src/effects.rs`): `T: [const] Tr` holds in a const fn
+that has the bound, a `const impl` holds for its type when its own `[const]` bounds do, and a
+closure or fn item is `[const] Fn` when it is const. `non_const_calls` lists the calls that are
+not, for the const checker (#860) to refuse; ordinary type checking does not prove effects, so
+it costs nothing outside const bodies. Tests: `crates/hir-ide/src/tests/const_effects.rs`.
+
 Tests: `crates/hir-ide/src/tests/consteval/const_traits.rs` (values from rustc on the same
 programs) and the corpus module `const_traits` (`harness/corpus`), which evaluates each of the
 above in a `const`, calls the same functions at run time and compares both with rustc's build.

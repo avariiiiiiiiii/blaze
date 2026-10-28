@@ -1276,9 +1276,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 })
                 .0
             }
-            &TypeBound::Path(path, TraitBoundModifier::None) => {
-                self.with_elision(false, |ctx| lower_path_bound(ctx, path))
-            }
+            &TypeBound::Path(
+                path,
+                TraitBoundModifier::None
+                | TraitBoundModifier::Const
+                | TraitBoundModifier::MaybeConst,
+            ) => self.with_elision(false, |ctx| lower_path_bound(ctx, path)),
             &TypeBound::Path(path, TraitBoundModifier::Maybe) => {
                 let sized_trait = self.lang_items.Sized;
                 // Don't lower associated type bindings as the only possible relaxed trait bound
@@ -1335,7 +1338,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             for b in bounds {
                 let db = self.db;
                 match b {
-                    TypeBound::Path(_, TraitBoundModifier::None) => {
+                    TypeBound::Path(
+                        _,
+                        TraitBoundModifier::None
+                        | TraitBoundModifier::Const
+                        | TraitBoundModifier::MaybeConst,
+                    ) => {
                         // `dyn Trait<'a>` is an existential predicate that introduces a binder.
                         self.with_shifted_in(&[], |ctx| {
                             ctx.lower_type_bound(b, dummy_self_ty, false)
@@ -2352,7 +2360,12 @@ impl SupertraitsInfo {
                 let WherePredicate::TypeBound { lifetimes: _, target, bound } = pred else {
                     continue;
                 };
-                let (TypeBound::Path(bounded_trait, TraitBoundModifier::None)
+                let (TypeBound::Path(
+                    bounded_trait,
+                    TraitBoundModifier::None
+                    | TraitBoundModifier::Const
+                    | TraitBoundModifier::MaybeConst,
+                )
                 | TypeBound::ForLifetime(_, bounded_trait)) = *bound
                 else {
                     continue;
@@ -2468,7 +2481,12 @@ fn resolve_type_param_assoc_type_shorthand(
             let WherePredicate::TypeBound { lifetimes: _, target, bound } = pred else {
                 continue;
             };
-            let (TypeBound::Path(bounded_trait_path, TraitBoundModifier::None)
+            let (TypeBound::Path(
+                bounded_trait_path,
+                TraitBoundModifier::None
+                | TraitBoundModifier::Const
+                | TraitBoundModifier::MaybeConst,
+            )
             | TypeBound::ForLifetime(_, bounded_trait_path)) = *bound
             else {
                 continue;
@@ -3082,6 +3100,71 @@ pub(crate) fn trait_environment<'db>(db: &'db dyn HirDatabase, def: GenericDefId
         let interner = DbInterner::new_with(db, module.krate(db));
         let predicates = GenericPredicates::query(db, def);
         param_env_from_predicates(interner, predicates).clauses.store()
+    }
+}
+
+/// What a use of `def` in a const context has to prove const: its `[const]` bounds, its parent's,
+/// and for a trait `Self: [const] Trait`, as `HostEffect(Maybe)` clauses (rustc's
+/// `const_conditions`). Empty unless `def` is conditionally const.
+pub(crate) fn const_conditions<'db>(
+    db: &'db dyn HirDatabase,
+    def: GenericDefId,
+) -> EarlyBinder<'db, &'db [Clause<'db>]> {
+    return const_conditions_query(db, def).get().map_bound(|it| it.as_slice());
+
+    #[salsa::tracked(returns(ref))]
+    fn const_conditions_query(
+        db: &dyn HirDatabase,
+        def: GenericDefId,
+    ) -> StoredEarlyBinder<StoredClauses> {
+        let interner = DbInterner::new_no_crate(db);
+        let mut conditions = Vec::new();
+        if crate::effects::is_conditionally_const(db, def) {
+            let generics = generics(db, def);
+            if let Some(parent) = generics.parent() {
+                conditions.extend(const_conditions(db, parent.def()).skip_binder().iter().copied());
+            }
+            if let GenericDefId::TraitId(trait_) = def {
+                conditions.push(maybe_const(interner, TraitRef::identity(interner, trait_.into())));
+            }
+            let store = generics.store();
+            let generics = &OnceCell::from(generics);
+            let resolver = def.resolver(db);
+            let mut ctx = TyLoweringContext::new(
+                db,
+                &resolver,
+                store,
+                ExpressionStoreOwnerId::Signature(def),
+                def,
+                generics,
+                LifetimeElisionKind::AnonymousReportError,
+                LifetimeLoweringMode::Bound,
+            );
+            for pred in generics.get().unwrap().owner().where_predicates() {
+                let WherePredicate::TypeBound {
+                    lifetimes: None,
+                    target,
+                    bound: TypeBound::Path(path, TraitBoundModifier::MaybeConst),
+                } = pred
+                else {
+                    continue;
+                };
+                let self_ty = ctx.lower_ty(*target);
+                let mut ctx = ctx.at_path(*path);
+                let Some(TypeNs::TraitId(bounded)) = ctx.resolve_path_in_type_ns_fully() else {
+                    continue;
+                };
+                let trait_ref =
+                    ctx.lower_trait_ref_from_resolved_path(bounded, self_ty, false, Span::Dummy);
+                conditions.push(maybe_const(interner, trait_ref));
+            }
+        }
+        StoredEarlyBinder::bind(Clauses::new_from_iter(conditions).store())
+    }
+
+    fn maybe_const<'db>(interner: DbInterner<'db>, trait_ref: TraitRef<'db>) -> Clause<'db> {
+        Binder::dummy(trait_ref)
+            .to_host_effect_clause(interner, rustc_type_ir::BoundConstness::Maybe)
     }
 }
 

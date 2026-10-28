@@ -1418,9 +1418,14 @@ impl<'db> ExprCollector<'db> {
         match kind {
             ast::TypeBoundKind::PathType(binder, path_type) => {
                 let binder = self.lower_for_binder_opt(binder);
-                let m = match node.question_mark_token() {
-                    Some(_) => TraitBoundModifier::Maybe,
-                    None => TraitBoundModifier::None,
+                let m = if node.question_mark_token().is_some() {
+                    TraitBoundModifier::Maybe
+                } else if node.const_token().is_none() {
+                    TraitBoundModifier::None
+                } else if node.tilde_token().is_some() || node.l_brack_token().is_some() {
+                    TraitBoundModifier::MaybeConst
+                } else {
+                    TraitBoundModifier::Const
                 };
                 self.lower_path_type(&path_type, impl_trait_lower_fn)
                     .map(|p| {

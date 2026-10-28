@@ -1372,6 +1372,8 @@ impl Printer<'_> {
                     match modifier {
                         TraitBoundModifier::None => (),
                         TraitBoundModifier::Maybe => w!(self, "?"),
+                        TraitBoundModifier::Const => w!(self, "const "),
+                        TraitBoundModifier::MaybeConst => w!(self, "[const] "),
                     }
                     self.print_path(&self.store[*path]);
                 }

@@ -33,8 +33,7 @@ built. Where they differ, blaze is wrong.
 
 **Never guess; refuse visibly.** The code generator returns "unsupported" with a reason for
 anything it has no explicit lowering for. Under `blaze` a refused function fails the
-build, which names it (`cargo/whole.rs`); plain cargo after `blaze enable` still has rustc
-build what blaze does not ([no-rustc.md](no-rustc.md#today)). A refusal is printed, counted
+build, which names it (`cargo/whole.rs`). A refusal is printed, counted
 and listed (`--report`, `blaze status`); it is treated as a bug to fix, not as a
 normal path. What must not happen is a best-effort lowering of input the generator does not
 understand, because that is wrong code nobody sees.
@@ -265,8 +264,9 @@ Since 2026-10-27 ([#408](https://github.com/indexable-inc/blaze/pull/408),
 are whole builds: every crate is compiled from source over the shipped standard library and
 linked by blaze, with no cargo build and no rustc (`cargo/whole.rs`). This section and the next
 describe the model `blaze` had before, a first build by cargo and rustc that the daemon
-took over from. The wrapper part of it remains for plain cargo after `blaze enable`, until step
-M of [no-rustc.md](no-rustc.md#the-plan) removes it.
+took over from. Step M of [no-rustc.md](no-rustc.md#the-plan) removed the rest of it
+(2026-10-27): the wrapper behind plain cargo after `blaze enable` (`cargo/wrapper.rs`) and the
+patches of rustc's executable (`patch::Base::of_rustc`) are gone.
 
 `blaze` needs three things from cargo for every program: the rlibs and objects rustc
 built, the line rustc ran the linker with, and which workspace crates are in the program.
@@ -360,7 +360,7 @@ more than one of is one of the new. On x86-64 a function's room for the jump run
 one field needs (`mov`, `ret`: 4 bytes). A patch's function of 2 bytes or more with no such
 room hops: a 2-byte `jmp` to 5 bytes of a run of `int3`s between two functions within 127
 bytes of it (`Image::pads`), and a `jmp` on from there, both undone with the patch;
-`BLAZE_SPLICE_HOPS` has every short function hop, for `rustcbase.py hop`. One of a single
+`BLAZE_SPLICE_HOPS` has every short function hop. One of a single
 byte, or with no run near it, is built in full. The executable is read again in the background with the
 object's symbols in it, the base of the patches after, which name against rustc's symbols too
 and are spliced onto what the whole splice left, an `#[inline]` function's edit too, since that
@@ -377,7 +377,8 @@ first edits' splice fails: that is what splicing can't do, and an own base links
 such an edit still links in full, and the link takes the room for splices that the executable
 there wanted (`headerpad_ahead`), so it is not linked twice.
 
-`BLAZE_RUSTC_BASE=0` makes the first build the daemon's own, as before. `harness/rustcbase.py` checks every kind of edit against cargo.
+`BLAZE_RUSTC_BASE=0` made the first build the daemon's own, and `harness/rustcbase.py` checked
+every kind of edit against cargo, until both went with the wrapper.
 
 An alternative wrapper exists in `stub.rs` (`BLAZE_WRAPS_RUSTC`), where rustc compiles only
 a stub for each workspace crate and all code is blaze's. It makes the first build faster,

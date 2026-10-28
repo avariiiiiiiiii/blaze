@@ -16,10 +16,7 @@ use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 use uds_windows::UnixStream;
 
-use super::{
-    daemon::{Envelope, Reply, Request, SPARE, home, socket_in, version},
-    switch, wrapper,
-};
+use super::daemon::{Envelope, Reply, Request, SPARE, home, socket_in, version};
 use crate::socket::{connect, private_dir, private_file};
 
 /// How long a daemon that was started is waited for, and one that was told to exit.
@@ -183,11 +180,7 @@ fn started(home: &Path, spares: bool) -> anyhow::Result<UnixStream> {
     private_dir(home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let log = private_file(OpenOptions::new().create(true).append(true), &home.join("daemon.log"))?;
     let mut daemon = Command::new(std::env::current_exe()?);
-    daemon
-        .arg("daemon")
-        .env_remove(wrapper::DRIVEN)
-        .env_remove(switch::VARIABLE)
-        .env_remove(switch::CHAINED);
+    daemon.arg("daemon");
     if !spares && std::env::var_os(SPARE).is_none() {
         daemon.env(SPARE, "0");
     }

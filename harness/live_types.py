@@ -5,9 +5,6 @@ place ([live.md](../docs/live.md#types)).
 
 usage: live_types.py        (BLAZE_BIN names the blaze built; blaze is found next to it)
 
-The daemon builds its own base (BLAZE_RUSTC_BASE=0): over rustc's executable an edit that is more
-than function bodies takes a build in full.
-
 harness/live-types keeps values of `V1` in a world that erases their type, each type with an id
 in a static of its own handed out from a pool every type shares, as flecs_ecs registers its
 components. It is built by the daemon, started, and given the texts of harness/live-types/stages
@@ -134,8 +131,6 @@ async def main() -> None:
             PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             CARGO_TARGET_DIR=str(work / "target"),
             RUST_BACKTRACE="full",
-            # Over rustc's executable an edit that adds a type takes a build in full.
-            BLAZE_RUSTC_BASE="0",
         )
         env.pop("CARGO_INCREMENTAL", None)
         # The first edit after the daemon starts writes the whole object again: it is made

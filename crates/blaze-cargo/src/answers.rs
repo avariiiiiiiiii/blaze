@@ -206,7 +206,7 @@ pub fn ready_cargo(command: &mut Command) {
         command.get_envs().any(|(it, value)| it == *name && value.is_some())
             || std::env::var_os(name).is_some_and(|it| !it.is_empty())
     });
-    let wrapper = crate::cargo::switch::wrapper_path().ok().filter(|it| it.is_file());
+    let wrapper = crate::cargo::load_wrapper::path().ok().filter(|it| it.is_file());
     if let Some(wrapper) = wrapper
         && !named
     {
@@ -291,6 +291,40 @@ mod tests {
             assert_eq!(said.trim(), format!("rustc {}", crate::cargo::toolchain::ours_says()));
         }
         assert_eq!(answered_as(OsStr::new("clippy-driver"), &version, &[], &var), None);
+    }
+
+    /// What rust-analyzer asks for the data layout of the target a proc macro's module is
+    /// built for (`project-model`'s `target_data`), as it asks it, with a deployment target
+    /// set as the release workflow sets it for every host: it says nothing of wasm's spec.
+    #[test]
+    fn the_spec_of_the_wasm_target_is_answered() {
+        let spec_of = |target: &str, deployment: Option<&str>| {
+            let program = Path::new("/no/such/toolchain/bin/rustc");
+            let mut asked = Command::new(program);
+            asked.current_dir("/").env("RUSTC_BOOTSTRAP", "1").env("RUSTUP_AUTO_INSTALL", "0");
+            asked.env_remove("SDKROOT");
+            match deployment {
+                Some(it) => asked.env("MACOSX_DEPLOYMENT_TARGET", it),
+                None => asked.env_remove("MACOSX_DEPLOYMENT_TARGET"),
+            };
+            asked.args(["-Z", "unstable-options", "--print", "target-spec-json"]);
+            asked.args(["--target", target]);
+            ask(&mut asked).expect("a question")
+        };
+        // The specs are recorded by the host rustc ran on, and not of every host.
+        let Some(host) = crate::cargo::toolchain::host() else { return };
+        if spec_of(host, None).is_err() {
+            return;
+        }
+        let output =
+            spec_of(crate::cargo::own_macro::WASM_TARGET, Some("13.0")).expect("an answer");
+        let spec: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(spec["arch"], "wasm32");
+        assert!(spec["data-layout"].as_str().is_some_and(|it| it.starts_with("e-m:e-p:32:32")));
+        assert!(spec_of("x86_64-unknown-linux-gnu", Some("13.0")).is_ok());
+        // An Apple target's spec says the deployment target, which blaze has not recorded.
+        assert!(spec_of("aarch64-apple-darwin", Some("13.0")).is_err());
+        assert!(spec_of("aarch64-apple-darwin", None).is_ok());
     }
 
     #[test]

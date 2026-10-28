@@ -108,33 +108,6 @@ impl Linked {
         Baseline::parse(&binary, None, object, false)?.laid_out(binary, lock)
     }
 
-    /// As [`Linked::read`], of what rustc linked, which `binary` is another name of: it is
-    /// made a copy of its own first, for a splice to write. One the daemon linked is refused:
-    /// cargo's place for the program has a copy of the daemon's once it served one.
-    pub fn read_rustcs(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
-        let (patch, object) = (std::fs::read(patch), object.to_owned());
-        Linked(std::thread::spawn(move || {
-            let patch = patch?;
-            let mut copy = binary.clone().into_os_string();
-            copy.push(".copy");
-            // The executable is read as the copy is written, which takes as long for a large
-            // one: a filesystem that shares the blocks first writes out what the linker wrote.
-            let copying = {
-                let (binary, copy) = (binary.clone(), copy.clone());
-                std::thread::spawn(move || std::fs::copy(binary, copy))
-            };
-            let parsed = Baseline::parse(&binary, Some(&patch), &object, true);
-            copying.join().map_err(|_| anyhow::anyhow!("copying the executable panicked"))??;
-            let mut parsed = parsed?;
-            // Whoever takes the file meanwhile takes either, which are the same, and waits for
-            // the write of the copy.
-            let lock = Writing::ahead(copy.as_ref());
-            std::fs::rename(&copy, &binary)?;
-            parsed.stamp = Stamp::of(&File::open(&binary)?)?;
-            parsed.laid_out(binary, lock)
-        }))
-    }
-
     pub fn baseline(self) -> anyhow::Result<Baseline> {
         self.0.join().map_err(|_| anyhow::anyhow!("reading the executable panicked"))?
     }
@@ -348,66 +321,18 @@ impl Baseline {
     /// and what is known of it as they were.
     pub fn splice(&mut self, patch: &[u8], give_up: &AtomicBool) -> anyhow::Result<Spliced> {
         let before = file_key(&self.path);
-        let spliced = self.splice_as(patch, give_up, false)?.0;
+        let spliced = self.splice_as(patch, give_up)?;
         names_spliced(&self.path, before);
         Ok(spliced)
     }
 
-    /// Splices `object`, all of a program the daemon built, into the executable rustc linked,
-    /// and starts reading what that leaves as an executable the daemon linked with `patch`
-    /// ahead of `object` ([`Linked::read`]): the next edits are patches of the object, spliced
-    /// into it. So a build in full is not linked in full. Only of ELF executables; anything
-    /// else, and whatever the splice declines, is an error.
-    pub fn spliced_whole(
-        mut self,
-        object_path: &Path,
-        patch: &Path,
-    ) -> anyhow::Result<(Linked, Spliced)> {
-        ensure!(
-            matches!(*self.image, Executable::Elf(_)),
-            "only an ELF executable takes all of a program spliced"
-        );
-        let start = std::time::Instant::now();
-        let object = std::fs::read(object_path)?;
-        let read = start.elapsed();
-        let (spliced, defined) = self.splice_as(&object, &AtomicBool::new(false), true)?;
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            let us = |it: std::time::Duration| it.as_micros();
-            eprintln!("splice-whole-us: read={} splice={}", us(read), us(start.elapsed() - read));
-        }
-        let (path, object) = (self.path.clone(), object_path.to_owned());
-        let patch = std::fs::read(patch);
-        let lock = Writing::ahead(&path);
-        let linked = Linked(std::thread::spawn(move || {
-            let mut parsed = Baseline::parse(&path, Some(&patch?), &object, false)?;
-            let Executable::Elf(image) = &mut parsed.image else {
-                bail!("the executable is ELF no more")
-            };
-            // What the object adds is in no symbol table, and is what the next patch refers to.
-            for (name, defined) in defined {
-                image.symbols.insert(name, Named::One(defined));
-            }
-            parsed.laid_out(path, lock)
-        }));
-        Ok((linked, spliced))
-    }
-
-    /// [`Baseline::splice`], and with `whole` of all of a program ([`Patch::read`]); with where
-    /// the patch has each symbol it defines now, of an ELF executable.
-    fn splice_as(
-        &mut self,
-        patch: &[u8],
-        give_up: &AtomicBool,
-        whole: bool,
-    ) -> anyhow::Result<(Spliced, Vec<(Box<[u8]>, Defined)>)> {
+    /// [`Baseline::splice`].
+    fn splice_as(&mut self, patch: &[u8], give_up: &AtomicBool) -> anyhow::Result<Spliced> {
         self.read_again_if_signed()?;
         let start = std::time::Instant::now();
-        let (mut addition, len, pointed, lasting) = match &*self.image {
+        let (addition, len, pointed, lasting) = match &*self.image {
             Executable::Elf(image) => {
-                let patch = Patch::read(patch, image, whole)?;
-                if whole && std::env::var_os("BLAZE_STATS").is_some() {
-                    eprintln!("splice-us: read={}", start.elapsed().as_micros());
-                }
+                let patch = Patch::read(patch, image)?;
                 self.has_baked(patch.replaced.iter().map(|it| it.name))?;
                 let addition = patch.place(image, &self.copies)?;
                 let moves = !addition.described.moved.is_empty();
@@ -424,7 +349,7 @@ impl Baseline {
                 let (bytes, spliced) = self.rewrite(module, patch)?;
                 std::fs::write(&self.path, bytes)?;
                 self.stamp = Stamp::of(&File::open(&self.path)?)?;
-                return Ok((spliced, Vec::new()));
+                return Ok(spliced);
             }
             Executable::MachO(image) => {
                 let Baseline { path, baked, undo, originals, stamp, appended, .. } = self;
@@ -432,10 +357,9 @@ impl Baseline {
                     image, path, baked, undo, originals, stamp, appended, patch, give_up,
                 )?;
                 self.spliced_with(lasting);
-                return Ok((spliced, Vec::new()));
+                return Ok(spliced);
             }
         };
-        let defined = std::mem::take(&mut addition.defined);
         let placed = start.elapsed();
 
         let writing = Writing::open(&self.path)?;
@@ -486,14 +410,7 @@ impl Baseline {
             file.set_len(end.max(len))?;
         }
         let written_at = start.elapsed();
-        // What a whole program is spliced over is read again as linked: nothing undoes it.
-        // Its jumps are written a run of the file at a time, for a file whose blocks another
-        // shares (a copy on XFS or Btrfs) takes a write as long as it takes the block's copy.
-        if whole {
-            addition.overwritten.sort_by_key(|it| it.0);
-            write_runs(&file, &addition.overwritten)?;
-        }
-        for (offset, bytes) in addition.overwritten.iter().filter(|_| !whole) {
+        for (offset, bytes) in &addition.overwritten {
             let mut old = vec![0; bytes.len()];
             read_exact_at(&file, &mut old, *offset)?;
             self.undo.push((*offset, old));
@@ -517,7 +434,7 @@ impl Baseline {
         let appended = addition.appended.len();
         self.left = Left { appended: Some((addition.offset, addition.appended)) };
         self.spliced_with(lasting);
-        Ok((Spliced { redirected: addition.redirected, appended, copied }, defined))
+        Ok(Spliced { redirected: addition.redirected, appended, copied })
     }
 
     /// Notes that a splice was just written with `lasting` in it.
@@ -556,7 +473,7 @@ impl Baseline {
             Executable::Elf(image) => {
                 ensure!(image.machine == Machine::X86_64, "live edits support Linux x86-64 only");
                 let uuid = image.id.context("the executable has no GNU build ID")?;
-                let mut patch = Patch::read(patch, image, false)?;
+                let mut patch = Patch::read(patch, image)?;
                 self.has_baked(patch.replaced.iter().map(|it| it.name))?;
                 lasting.place(&patch.lasting_own()?)?;
                 patch.keep_lasting(|name| lasting.address(name))?;
@@ -1036,31 +953,6 @@ pub fn move_aside(path: &Path) -> std::io::Result<()> {
     let mut moved = path.as_os_str().to_owned();
     moved.push(format!(".{}-{aside}.running", std::process::id()));
     std::fs::rename(path, &moved)
-}
-
-/// Writes `writes`, in the order of the file, each run of them with no more than `GAP` between
-/// two at once: the run is read, written over and written back.
-fn write_runs(file: &File, writes: &[(u64, Vec<u8>)]) -> std::io::Result<()> {
-    const GAP: u64 = 256 << 10;
-    let mut at = 0;
-    while at < writes.len() {
-        let start = writes[at].0;
-        let mut end = start + writes[at].1.len() as u64;
-        let mut next = at + 1;
-        while let Some((offset, bytes)) = writes.get(next).filter(|it| it.0 <= end + GAP) {
-            end = end.max(offset + bytes.len() as u64);
-            next += 1;
-        }
-        let mut run = vec![0; (end - start) as usize];
-        read_exact_at(file, &mut run, start)?;
-        for (offset, bytes) in &writes[at..next] {
-            let from = (offset - start) as usize;
-            run[from..from + bytes.len()].copy_from_slice(bytes);
-        }
-        write_all_at(file, &run, start)?;
-        at = next;
-    }
-    Ok(())
 }
 
 /// Writes a run of the file again behind where it is.
@@ -2066,11 +1958,7 @@ impl<'a> Patch<'a> {
     /// What a table of the executable is given to grow into before what follows it moves.
     const ROOM: u64 = 1 << 20;
 
-    /// With `whole`, the patch is an object with all of the program, which replaces every
-    /// function of the executable it defines that can be jumped from: one that can't, or
-    /// whose name the executable has several of, is rustc's still where rustc's code that the
-    /// object leaves calls it, as the linker would leave it there too.
-    fn read(bytes: &'a [u8], image: &Image, whole: bool) -> anyhow::Result<Patch<'a>> {
+    fn read(bytes: &'a [u8], image: &Image) -> anyhow::Result<Patch<'a>> {
         let file = ElfFile64::<Endianness>::parse(bytes)?;
         let mut patch = Patch {
             file,
@@ -2101,25 +1989,6 @@ impl<'a> Patch<'a> {
                 patch.frames += Self::frames_in(section.data()?, 0)?.len();
             }
         }
-        if whole {
-            let missing: Vec<_> = (patch.file.symbols())
-                .filter(|it| it.is_undefined())
-                .filter_map(|it| it.name_bytes().ok())
-                .filter(|name| !name.is_empty() && *name != b"__tls_get_addr")
-                .filter(|name| !image.symbols.contains_key(*name))
-                .filter(|name| !image.imports.contains_key(*name))
-                .map(String::from_utf8_lossy)
-                .collect();
-            if std::env::var_os("BLAZE_STATS").is_some() {
-                eprintln!("splice: not in the executable: {missing:?}");
-            }
-            ensure!(
-                missing.is_empty(),
-                "{} of what it refers to are not in the executable, as {}",
-                missing.len(),
-                missing.iter().take(3).map(|it| it.as_ref()).collect::<Vec<_>>().join(", ")
-            );
-        }
         let loaded: FxHashSet<SectionIndex> = patch.sections.iter().flatten().copied().collect();
         let code: FxHashSet<SectionIndex> =
             patch.sections[Segment::Code as usize].iter().copied().collect();
@@ -2137,15 +2006,6 @@ impl<'a> Patch<'a> {
                 // One that says what a patch left behind is of that patch, which the executable
                 // was linked with, and says nothing of this one's.
                 Some(_) if left_behind(name).is_some() => None,
-                Some(Named::One(old))
-                    if whole
-                        && old.kind == SymbolKind::Text
-                        && code.contains(&section)
-                        && old.room < image.machine.jump() as u64 =>
-                {
-                    None
-                }
-                Some(Named::Many) if whole && code.contains(&section) => None,
                 Some(Named::One(old))
                     if old.kind == SymbolKind::Text && code.contains(&section) =>
                 {

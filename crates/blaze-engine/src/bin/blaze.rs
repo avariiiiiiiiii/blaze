@@ -1,8 +1,7 @@
 //! `blaze build|run|test|check|stop ...`, which becomes `blaze-engine cargo ...`, the `blaze` being
-//! the one installed next to it. Cargo runs it the same way as `cargo fmt` and `cargo clippy`
-//! once `blaze enable` has linked them to it (`cargo-fmt fmt ...` is `blaze fmt ...`). In a
-//! workspace that pins another release of blaze (`[workspace.metadata.blaze] version`), it runs
-//! that release instead, fetched once when it is not there (`pin.rs`).
+//! the one installed next to it. In a workspace that pins another release of blaze
+//! (`[workspace.metadata.blaze] version`), it runs that release instead, fetched once when it
+//! is not there (`pin.rs`).
 
 use std::{
     ffi::OsString,

@@ -2,8 +2,7 @@
 """warmstart.py PROJECT [--work DIR] [--env NAME=VALUE]...: what a start costs when the store
 already has every function, with nothing of rustc's to start from (#41).
 
-Every step has `BLAZE_RUSTC_BASE=0`, so the first build of a daemon is its own, as it is
-without rustc (docs/no-rustc.md, step K):
+The first build of a daemon is its own, with nothing of rustc's (docs/no-rustc.md, step K):
   first    a checkout and an empty store: `blaze build` and the wait until ready
   warm     a second checkout of the same commit with a home of its own and the store the first
            filled
@@ -52,7 +51,7 @@ def main():
         ws = os.path.join(work, label)
         shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
         env = dict(blaze_cli.base_env(os.path.join(work, f"home-{label}")), **spec.get("env", {}), **extra_env)
-        env.update(BLAZE_CACHE=store, BLAZE_RUSTC_BASE="0", BLAZE_STATS="1")
+        env.update(BLAZE_CACHE=store, BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
         return Side(ws, env, True)
 

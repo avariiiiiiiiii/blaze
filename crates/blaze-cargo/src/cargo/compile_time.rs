@@ -623,7 +623,7 @@ impl<'a> Driver<'a> {
         let root = unit.target.src_path.parent().context("a crate root without a directory")?;
         let manifest = AsRef::<Path>::as_ref(self.package(at)?.manifest.parent()).to_owned();
         let mut files = vec![unit.target.src_path.clone()];
-        super::wrapper::rust_files(root, Some(&manifest), &mut files)
+        super::load_wrapper::rust_files(root, Some(&manifest), &mut files)
             .with_context(|| format!("reading {}", root.display()))?;
         files.sort();
         files.dedup();

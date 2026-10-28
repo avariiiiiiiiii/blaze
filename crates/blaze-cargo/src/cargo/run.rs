@@ -15,7 +15,7 @@ use super::{
     experimental,
     results::Results,
     sandboxed, say,
-    state::{Held, Kind, Program, State, as_built},
+    state::{Held, Kind, Program, State},
 };
 
 /// The exit status of cargo when a test fails or a program can't be run.
@@ -239,7 +239,6 @@ pub fn tests(
             configured(&mut command, state);
             command.envs(test.env.iter().cloned());
             command.current_dir(&test.package_dir);
-            as_built(&mut command)?;
             Ok(command)
         };
         let env = match (sandboxed_here, affected::on()) {

@@ -243,14 +243,13 @@ bin="$cargo_home/bin"
 mkdir -p "$bin" 2>"$tmp/error" || fail "blaze's folder could not be made." "$(cat "$tmp/error")"
 
 # A blaze from before its rename (#270) left its programs here under their old names. When it was
-# enabled, cargo's configuration names its wrapper: it is disabled with its own program, and this
-# blaze is enabled in its place once installed.
-enable_again=""
+# enabled, cargo's configuration names its wrapper: it is disabled with its own program. Plain
+# cargo builds through no blaze since; `blaze` takes back what a later `blaze enable` wrote.
 old_enabled="$cargo_home/ra-jit-enabled.json" # rename: old name
 old_engine="$bin/ra-jit" # rename: old name
 if [ -f "$old_enabled" ] && [ -x "$old_engine" ]; then
-    step "disabling the blaze from before its rename, to enable this one in its place"
-    "$old_engine" disable >/dev/null 2>&1 && enable_again=1
+    step "disabling the blaze from before its rename: plain cargo no longer builds through blaze"
+    "$old_engine" disable >/dev/null 2>&1 || true
 fi
 # `cargo blaze` (before it `cargo ra-jit`) is now `blaze`: the program cargo ran for it goes. # rename: old name
 old_launcher=""
@@ -287,13 +286,6 @@ for program in "$unpacked"/*; do
         put "$program" "$(basename "$program")"
     fi
 done
-if [ -n "$enable_again" ]; then
-    "$bin/blaze" enable >/dev/null 2>"$tmp/error" ||
-        fail "blaze is installed, but plain cargo could not be switched to it as it was to the blaze before." \
-            "$(cat "$tmp/error")
-Run: blaze enable"
-    step "plain cargo goes through blaze, as it did before"
-fi
 
 # ---------------------------------------------------------------------------------------------
 # The Rust blaze builds with

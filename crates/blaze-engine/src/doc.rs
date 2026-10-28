@@ -431,7 +431,7 @@ fn describe(db: &RootDatabase, vfs: &vfs::Vfs, documented: &Documented) -> Strin
         .map(|it| Path::new(it.as_str()))
         .and_then(|it| it.ancestors().skip(1).find(|dir| dir.join("Cargo.toml").is_file()));
     let fetched =
-        crate::cargo::switch::cargo_home().map(|home| [home.join("registry"), home.join("git")]);
+        crate::cargo::home::cargo_home().map(|home| [home.join("registry"), home.join("git")]);
     match dir {
         Some(dir) if !fetched.iter().flatten().any(|it| dir.starts_with(it)) => {
             format!("{name}{version} ({})", dir.display())

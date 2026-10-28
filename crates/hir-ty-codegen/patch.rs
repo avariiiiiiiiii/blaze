@@ -1571,51 +1571,6 @@ impl Base {
         })
     }
 
-    /// The executable rustc linked as a base, before anything of it is known: `home` takes
-    /// in the files an edit is about to change. `debug` is whether a patch says which lines
-    /// its code is of.
-    pub(super) fn of_rustc(debug: bool) -> Base {
-        Base {
-            debug,
-            entries: Vec::new(),
-            compiled: Vec::new(),
-            marks: Vec::new(),
-            crates: Vec::new(),
-            files: Vec::new(),
-            touched: Touched::default(),
-            skipped: Vec::new(),
-            left: Vec::new(),
-            from_rustc: Vec::new(),
-            their_statics: TheirStatics::default(),
-            their_walk: TheirWalk::default(),
-            reached: Vec::new(),
-            instances: FxIndexMap::default(),
-            homes: Homes::default(),
-            statics: FxHashMap::default(),
-            found: FxHashMap::default(),
-            found_instances: FxHashMap::default(),
-            untracked: false,
-            hydrated: Vec::new(),
-            hydrated_homes: HydratedHomes::default(),
-            stored_marks: FxHashMap::default(),
-            stored_items: FxHashMap::default(),
-            ids: FxHashMap::default(),
-            owned: FxHashSet::default(),
-            reached_from_store: FxHashSet::default(),
-            outdated: false,
-            outdated_by: None,
-            rejected: Vec::new(),
-            bodies: 0,
-            cached_roots: Vec::new(),
-            cached_instances: Vec::new(),
-            rustc: true,
-            homed: FxHashSet::default(),
-            unnamed: Vec::new(),
-            closures: Vec::new(),
-            copies_homed: FxHashMap::default(),
-        }
-    }
-
     /// Takes in what rustc compiled of `file` before an edit changes it: the `functions`
     /// written in it that rustc has a symbol for, and the `statics` declared in it or in their
     /// bodies. The source is what rustc compiled until then, so the marks are of rustc's copies.

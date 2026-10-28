@@ -35,12 +35,6 @@ site {
       Code watchexec(lang: "bash", text: "watchexec -e rs -- blaze build")
     }
 
-    Section enable(title: "Make plain cargo use blaze") {
-      Say: {"[thoughtful] For editors, scripts and agents that run cargo build themselves, there's blaze enable. From then on, plain cargo build, run, test and check go through blaze, in every project of your user. It adds one setting to your cargo config, and blaze disable puts the file back. [short pause] One honest caveat: edits are slower this way than with blaze, and on some projects slower than plain cargo."}
-      Code on(lang: "bash", text: "blaze enable")
-      P what("From then on plain `cargo build`, `run`, `test` and `check` go through blaze, in every project of your user. It adds one setting to `~/.cargo/config.toml`; `blaze disable` puts the file back as it was. Edits are slower this way than with `blaze`, and on some projects slower than plain cargo ([why](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#plain-cargo-switched-on-globally)).")
-    }
-
     Section live(title: "Change a running program") {
       Say: {"[warm] Now the fun part: changing a program while it runs. Add the live edits crate, start a live handle once, and poll it every frame. Run your program with blaze run, and in another terminal build after each edit. The next poll swaps in the functions that changed, usually in under a millisecond, and keeps the program's state. [short pause] An edit that changes a type the program is holding, like a struct's fields, can't apply to data that already exists, so the poll asks for a restart instead. [calm] It works on macOS on Apple silicon; Linux and Windows support comes with the next release."}
       Code dep(lang: "toml", text: `[dependencies]

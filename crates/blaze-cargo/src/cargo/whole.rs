@@ -24,7 +24,7 @@ use super::{
     daemon::{Checkout, NotBuilt, Reply, Request, WorkerConfig},
     plan::Plan as Linked,
     run, say,
-    state::{as_built, configured_env, library_path, place, repository, run_env},
+    state::{configured_env, library_path, place, repository, run_env},
 };
 
 /// How many of the functions blaze could not compile a failed build names.
@@ -550,7 +550,6 @@ fn checkout(
             object: dir.join(format!("{name}.o")),
             patch: dir.join(format!("{name}.patch.o")),
             binary: dir.join(&name),
-            rustc_binary: None,
             link_cmd: String::new(),
             symbol_files: Vec::new(),
             unit_test: unit_tests,
@@ -749,7 +748,6 @@ fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i
     }
     command.args(asked.program_args()).envs(run_env(&program.package, &[]));
     command.envs(library_path(&program.executable, None));
-    as_built(&mut command)?;
     let status = command.status().with_context(|| format!("could not execute {shown}"))?;
     Ok(run::exit_code(status))
 }

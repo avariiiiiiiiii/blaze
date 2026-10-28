@@ -27,6 +27,13 @@ moves is two pointers:
 Canary is the newest release of either kind: every stable release was a canary first, so when
 the newest canary is promoted the two channels name the same release.
 
+Each channel also has a pointer, for what reads a channel without GitHub's API (a workspace
+pinned to `"stable"` or `"canary"`): the assets `stable` and `canary` of the release `channels`,
+each the channel's version and a newline,
+`https://github.com/indexable-inc/blaze/releases/download/channels/stable`. release.yaml moves
+`canary` when it has published a release, and promote.yaml moves `stable` when it makes a
+release stable and *Latest* (`.github/scripts/promote.py pointer`).
+
 A release older than this scheme (`v0.20261027.0`, the `nightly` build of 2026-10-20) was
 published as a full release and counts as stable.
 

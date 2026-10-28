@@ -145,6 +145,7 @@ jobs:
       contents: write
       actions: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: out
@@ -170,10 +171,13 @@ jobs:
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
             out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS \
             out/manifests.* out/packs.* out/keys.*
-      # A canary: promote.yaml tests the archives just published and makes this same release
-      # stable when they pass (docs/release.md). By dispatch, since a release this token
-      # publishes starts no `release:` workflow.
+      # A canary: the canary pointer names it (what a workspace pinned to canary reads), and
+      # promote.yaml tests the archives just published and makes this same release stable when
+      # they pass (docs/release.md). By dispatch, since a release this token publishes starts no
+      # `release:` workflow.
       - name: Promotion
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run promote.yaml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$GITHUB_REF_NAME"
+        run: |
+          python3 -I .github/scripts/promote.py pointer "{\"channel\": \"canary\", \"tag\": \"$GITHUB_REF_NAME\"}"
+          gh workflow run promote.yaml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$GITHUB_REF_NAME"

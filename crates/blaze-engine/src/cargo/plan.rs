@@ -937,15 +937,24 @@ mod tests {
         assert_eq!(headerpad_of(&binary), Some(0x900000));
         // The whole build's own line, with its directory gone too.
         std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+        // Quoted as a command quotes them: a Windows path's backslashes are not escapes.
+        let quoted = |it: String| shlex::try_quote(&it).unwrap().into_owned();
+        let (out, file) =
+            (binary.display().to_string(), headerpad_file(&binary).display().to_string());
         let own = format!(
-            "cc /t/a.o -Wl,-headerpad,0x200000 -o {} @{}",
-            binary.display(),
-            headerpad_file(&binary).display()
+            "cc /t/a.o -Wl,-headerpad,0x200000 -o {} {}",
+            quoted(out.clone()),
+            quoted(format!("@{file}"))
         );
         headerpad_again(&own).unwrap();
         assert_eq!(headerpad_of(&binary), Some(0x200000));
         std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
-        headerpad_again(&format!("cc -o {0} @{0}.headerpad", binary.display())).unwrap();
+        headerpad_again(&format!(
+            "cc -o {} {}",
+            quoted(out.clone()),
+            quoted(format!("@{out}.headerpad"))
+        ))
+        .unwrap();
         assert_eq!(headerpad_of(&binary), Some(HEADERPAD));
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -8,6 +8,8 @@
 .sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 :root { --side-w: 268px; --chat-w: 340px; --thread-w: 380px; }
+/* What floats over the page (tooltips, the who-is-here list, speech bubbles, chat pop-ups): one raised surface. */
+:root { --pop-bg: var(--bg-4); --pop-ring: inset 0 0 0 1px var(--line-2); }
 .frame { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); gap: 4px; min-height: 100svh; padding: 6px clamp(8px, 1vw, 14px) 10px 0; }
 
 /* The sidebar. */
@@ -218,7 +220,7 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-quiet { box-shadow: none; color: var(--ink-3); }
 .tl-out { display: contents; }
 .tl-signin { color: var(--ink-1); }
-.tl-list { position: absolute; top: calc(100% + 2px); right: clamp(12px, 2vw, 20px); width: min(360px, calc(100vw - 24px)); max-height: min(60vh, 480px); overflow: auto; padding: 10px; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 16px 40px rgb(0 0 0 / 0.25); font-size: 13px; }
+.tl-list { position: absolute; top: calc(100% + 2px); right: clamp(12px, 2vw, 20px); width: min(360px, calc(100vw - 24px)); max-height: min(60vh, 480px); overflow: auto; padding: 10px; border-radius: 12px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 16px 40px rgb(0 0 0 / 0.25); font-size: 13px; }
 .tl-list[hidden] { display: none; }
 .tl-list ul { margin: 0; padding: 0; list-style: none; }
 .tl-list li { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-top: 1px solid var(--line); }
@@ -236,8 +238,8 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-list .face, .tl-list .flag, .tl-list .tag { flex: none; }
 .tl-av { position: relative; flex: none; display: inline-grid; }
 .tl-av .face { width: 22px; height: 22px; }
-.tl-av .dot { position: absolute; right: -2px; bottom: -2px; width: 9px; height: 9px; border-radius: 50%; background: var(--bg-3); box-shadow: inset 0 0 0 1.5px var(--ink-4), 0 0 0 2px var(--bg-3); }
-.tl-av .dot.on { background: var(--ok); box-shadow: 0 0 0 2px var(--bg-3); }
+.tl-av .dot { position: absolute; right: -2px; bottom: -2px; width: 9px; height: 9px; border-radius: 50%; background: var(--pop-bg); box-shadow: inset 0 0 0 1.5px var(--ink-4), 0 0 0 2px var(--pop-bg); }
+.tl-av .dot.on { background: var(--ok); box-shadow: 0 0 0 2px var(--pop-bg); }
 .tl-list .more { margin-left: 6px; color: var(--ink-4); cursor: default; }
 .tl-list .for { flex: none; min-width: 26px; color: var(--ink-4); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
 .faces { display: inline-flex; align-items: center; }
@@ -305,8 +307,8 @@ body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typin
 @keyframes dot { 0%, 60%, 100% { opacity: 0.3; transform: none; } 30% { opacity: 1; transform: translateY(-2px); } }
 /* Pop-ups for messages while the chat is shut, at the bottom right. */
 .chat-toasts { position: fixed; z-index: 46; right: clamp(8px, 1vw, 14px); bottom: 14px; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 24px)); pointer-events: none; }
-.chat-toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 0; border-radius: 14px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 12px 32px rgb(0 0 0 / 0.3); color: var(--ink-2); font: inherit; font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; pointer-events: auto; animation: toast-in 0.2s ease-out; }
-.chat-toast:hover { background: var(--bg-4); }
+.chat-toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 0; border-radius: 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 12px 32px rgb(0 0 0 / 0.3); color: var(--ink-2); font: inherit; font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; pointer-events: auto; animation: toast-in 0.2s ease-out; }
+.chat-toast:hover { background: var(--bg-3); }
 .chat-toast .face { width: 26px; height: 26px; }
 .chat-toast-words { min-width: 0; }
 .chat-toast-words b { display: block; color: var(--ink-1); font-weight: 500; }
@@ -398,12 +400,13 @@ body.chat-full .chat-back { order: 1; }
 
 /* What someone just said in the chat, out of their face in the sidebar (client/lib/presence.ts), for a few seconds. */
 /* The site's tooltips (client/lib/tip.ts). */
-.tip { position: fixed; z-index: 60; max-width: 280px; padding: 4px 8px; border-radius: 7px; background: var(--ink-1); color: var(--bg); font-size: 12px; line-height: 1.35; pointer-events: none; animation: tip-in 0.1s ease-out; }
+/* The same raised surface as the speech bubbles and chat pop-ups, so they follow the theme. */
+.tip { position: fixed; z-index: 60; max-width: 280px; padding: 4px 8px; border-radius: 7px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 6px 18px rgb(0 0 0 / 0.22); color: var(--ink-1); font-size: 12px; line-height: 1.35; pointer-events: none; animation: tip-in 0.1s ease-out; }
 .tip[hidden] { display: none; }
 @keyframes tip-in { from { opacity: 0; transform: translateY(2px); } }
 .tip.below { animation-name: tip-in-below; }
 @keyframes tip-in-below { from { opacity: 0; transform: translateY(-2px); } }
-.say-bubble { position: fixed; z-index: 45; max-width: 240px; padding: 7px 10px; border-radius: 12px 12px 12px 4px; background: var(--bg-4); box-shadow: inset 0 0 0 1px var(--line-2), 0 8px 24px rgb(0 0 0 / 0.25); color: var(--ink-1); font-size: 12.5px; line-height: 1.35; pointer-events: none; animation: say-in 0.18s ease-out; }
+.say-bubble { position: fixed; z-index: 45; max-width: 240px; padding: 7px 10px; border-radius: 12px 12px 12px 4px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 8px 24px rgb(0 0 0 / 0.25); color: var(--ink-1); font-size: 12.5px; line-height: 1.35; pointer-events: none; animation: say-in 0.18s ease-out; }
 .say-bubble b { display: block; margin-bottom: 1px; color: var(--ink-3); font-size: 11px; font-weight: 500; }
 .say-bubble span { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
 .say-bubble.out { opacity: 0; transform: translateY(-4px); transition: opacity 0.3s, transform 0.3s; }

@@ -20,6 +20,7 @@
  * mentions the reader is marked, and pops up and counts while the chat is shut, even when muted.
  */
 
+import { tipOn } from './tip';
 import { CHAT, handle } from './resize';
 import * as tr from './translate';
 
@@ -162,8 +163,7 @@ function drawMute(): void {
 	const m = muted();
 	mute.replaceChildren(icon(m ? BELL_OFF : BELL));
 	mute.classList.toggle('on', m);
-	mute.title = m ? 'Muted: no pop-ups while the chat is shut, except mentions of you' : 'Mute pop-ups while the chat is shut';
-	mute.setAttribute('aria-label', mute.title);
+	tipOn(mute, m ? 'Muted: no pop-ups while the chat is shut, except mentions of you' : 'Mute pop-ups while the chat is shut');
 	mute.setAttribute('aria-pressed', String(m));
 }
 function setMuted(m: boolean): void {
@@ -181,13 +181,11 @@ function setMuted(m: boolean): void {
 function setFull(on: boolean): void {
 	document.body.classList.toggle('chat-full', on);
 	full.replaceChildren(icon(on ? SHRINK : GROW));
-	full.title = on ? 'Leave full screen' : 'Full screen';
-	full.setAttribute('aria-label', full.title);
+	tipOn(full, on ? 'Leave full screen' : 'Full screen');
 	full.setAttribute('aria-pressed', String(on));
 	// The thread is a column beside the list there, so it closes rather than goes back.
 	back.replaceChildren(icon(on ? CROSS : BACK));
-	back.title = on ? 'Close the thread' : 'Back to the chat';
-	back.setAttribute('aria-label', back.title);
+	tipOn(back, on ? 'Close the thread' : 'Back to the chat');
 	if (on) toBottom();
 }
 
@@ -202,7 +200,7 @@ function toast(m: Msg, mention: boolean): void {
 	const words = el('span', 'chat-toast-words');
 	words.append(el('b', '', m.parent === undefined ? m.login : `${m.login} in a thread`), el('span', '', m.text));
 	t.append(face(m), words);
-	t.title = 'Open the chat';
+	tipOn(t, 'Open the chat');
 	t.addEventListener('click', () => {
 		setOpen(true);
 		if (m.parent !== undefined) openThread(m.parent);
@@ -306,7 +304,7 @@ function text(m: Msg): HTMLElement[] {
 	if (t.s === 'ask') {
 		const go = el('button', '', 'Translate');
 		go.type = 'button';
-		go.title = 'Downloads the translator once (about 1.2 GB), then translates on this computer';
+		tipOn(go, 'Downloads the translator once (about 1.2 GB), then translates on this computer');
 		go.addEventListener('click', () => tr.allow());
 		note.append(`${tr.languageName(t.from)} · `, go, el('span', 'chat-tr-size', ' (1.2 GB, once)'));
 		return [body(m.text), note];
@@ -323,7 +321,7 @@ function text(m: Msg): HTMLElement[] {
 		redraw(m);
 	});
 	const label = el('span', '', `Translated from ${tr.languageName(t.from)}`);
-	label.title = 'Translated on this computer by HY-MT1.5 (Tencent). It can be wrong.';
+	tipOn(label, 'Translated on this computer by HY-MT1.5 (Tencent). It can be wrong.');
 	note.append(label, ' · ', flip);
 	return [body(t.original ? m.text : t.text), note];
 }
@@ -337,7 +335,7 @@ function pendingText(from: string): Node {
 		f.append(`Getting the translator, once:${pct} · `);
 		const no = el('button', '', 'Stop');
 		no.type = 'button';
-		no.title = 'Stop the download and do not translate on this computer';
+		tipOn(no, 'Stop the download and do not translate on this computer');
 		no.addEventListener('click', () => tr.stop());
 		f.append(no);
 	} else f.append(`Translating from ${lang}…`);
@@ -414,7 +412,7 @@ function stoppedTyping(key: string): void {
 function summary(m: Msg): HTMLElement {
 	const b = el('button', 'chat-replies');
 	b.type = 'button';
-	b.title = 'Open the thread';
+	tipOn(b, 'Open the thread');
 	const faces = el('span', 'chat-replies-faces');
 	for (const w of (m.repliers ?? []).slice(0, 3)) faces.append(face(w));
 	const n = m.replies ?? 0;
@@ -440,7 +438,7 @@ function item(m: Msg, prev: Msg | undefined, where: 'list' | 'root' | 'reply' = 
 		name.rel = 'nofollow noopener';
 		const t = el('time', 'chat-when', when(m.at));
 		t.dateTime = m.at;
-		t.title = new Date(m.at).toLocaleString();
+		tipOn(t, new Date(m.at).toLocaleString());
 		who.append(face(m), name, t);
 		row.append(who);
 	}
@@ -450,8 +448,7 @@ function item(m: Msg, prev: Msg | undefined, where: 'list' | 'root' | 'reply' = 
 	if (where === 'list') {
 		const r = el('button', 'chat-act');
 		r.type = 'button';
-		r.title = 'Reply in thread';
-		r.setAttribute('aria-label', r.title);
+		tipOn(r, 'Reply in thread');
 		r.append(icon(BUBBLE));
 		r.addEventListener('click', () => openThread(m.id));
 		acts.append(r);
@@ -459,7 +456,7 @@ function item(m: Msg, prev: Msg | undefined, where: 'list' | 'root' | 'reply' = 
 	if (you && (you.key === m.key || you.admin)) {
 		const del = el('button', 'chat-act chat-del', '×');
 		del.type = 'button';
-		del.title = where === 'reply' || !m.replies ? 'Delete' : 'Delete, with its thread';
+		tipOn(del, where === 'reply' || !m.replies ? 'Delete' : 'Delete, with its thread');
 		del.setAttribute('aria-label', 'Delete message');
 		del.addEventListener('click', () => send({ t: 'unsay', id: m.id }));
 		acts.append(del);
@@ -580,7 +577,7 @@ function composer(placeholder: string, parent: number | null): HTMLElement {
 	const go = el('button', 'chat-send');
 	go.type = 'submit';
 	go.setAttribute('aria-label', 'Send');
-	go.title = 'Send (Enter)';
+	tipOn(go, 'Send (Enter)');
 	go.disabled = true;
 	go.append(arrow());
 	const grow = () => {

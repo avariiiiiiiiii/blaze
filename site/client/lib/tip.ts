@@ -2,10 +2,18 @@
  * The site's own tooltips, in place of the browser's (slow, and drawn in the system's style). Hovering anything with
  * a `title` moves it to `data-tip`, so the native one never shows, and shows it after TIP_MS above the element (below
  * when there is no room). An element with no other name keeps the text as its `aria-label`. Keyboard focus shows it
- * too. Loaded on every page by client/side.ts.
+ * too. Loaded on every page by client/side.ts; what it draws itself sets `tipOn` instead of a title, since an element
+ * redrawn under a resting pointer gets no hover event and would show the native tooltip.
  */
 
 const TIP_MS = 80;
+
+/** Gives `e` a tooltip, and the same text as its name when it has no text of its own (a face, an icon button). */
+export function tipOn(e: HTMLElement, text: string): void {
+	e.removeAttribute('title');
+	e.dataset.tip = text;
+	if (!e.textContent?.trim()) e.setAttribute('aria-label', text);
+}
 const tip = document.createElement('div');
 tip.className = 'tip';
 tip.setAttribute('role', 'tooltip');
@@ -27,8 +35,15 @@ function target(n: EventTarget | null): HTMLElement | null {
 	return t.dataset.tip ? t : null;
 }
 
+let watch: ReturnType<typeof setInterval> | undefined;
+
 function show(t: HTMLElement): void {
 	if (!t.isConnected || !t.dataset.tip) return;
+	// Redrawn away (the presence lists redraw on every change): go with it.
+	clearInterval(watch);
+	watch = setInterval(() => {
+		if (!t.isConnected) hide();
+	}, 200);
 	if (!tip.isConnected) document.body.append(tip);
 	tip.textContent = t.dataset.tip;
 	tip.hidden = false;
@@ -43,6 +58,7 @@ function show(t: HTMLElement): void {
 
 function hide(): void {
 	clearTimeout(timer);
+	clearInterval(watch);
 	cur = null;
 	tip.hidden = true;
 }

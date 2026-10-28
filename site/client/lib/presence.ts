@@ -19,6 +19,7 @@
  * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
  */
 
+import { tipOn } from './tip';
 import * as chat from './chat';
 import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
@@ -87,7 +88,7 @@ function identicon(key: string): SVGSVGElement {
 function face(w: Who, away = false): HTMLElement {
 	const f = el('span', `face${away ? ' away' : ''}`);
 	f.dataset.key = w.key;
-	f.title = away ? `${name(w)} (away)` : name(w);
+	tipOn(f, away ? `${name(w)} (away)` : name(w));
 	if (w.avatar && w.avatar.startsWith('https://avatars.githubusercontent.com/')) {
 		const img = el('img');
 		img.src = `${w.avatar}${w.avatar.includes('?') ? '&' : '?'}s=48`;
@@ -109,7 +110,7 @@ function stack(list: Person[], max: number, path: string): HTMLElement {
 /** The sidebar's label for a site path, else the path. */
 function titleOf(path: string): string {
 	const a = document.querySelector<HTMLAnchorElement>(`.navlist a.row[href="${CSS.escape(href(path))}"]`);
-	return a?.title || a?.textContent?.trim() || path;
+	return a?.title || a?.dataset.tip || a?.textContent?.trim() || path;
 }
 
 // ---- The top line -------------------------------------------------------------------------------------------------
@@ -151,7 +152,7 @@ function drawDiscuss(): void {
 	const n = document.querySelectorAll('main .c-item').length;
 	const a = el('a', 'tl-btn');
 	a.href = '#discussion';
-	a.title = n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`;
+	tipOn(a, n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`);
 	a.append(el('span', 'tl-bubble'), el('span', 'tl-label', n === 0 ? 'Discuss' : n === 1 ? 'comment' : 'comments'));
 	if (n > 0) a.insertBefore(el('span', 'tl-n', String(n)), a.lastChild);
 	discussSlot.append(a);
@@ -167,7 +168,7 @@ function drawHere(): void {
 	b.setAttribute('aria-expanded', String(!list.hidden));
 	b.setAttribute('aria-controls', list.id);
 	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
-	b.title = `${on.length} on this page, ${total} on the site`;
+	tipOn(b, `${on.length} on this page, ${total} on the site`);
 	b.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!list.hidden) return closeList();
@@ -190,7 +191,7 @@ const regions = (() => {
 function flag(cc: string): HTMLElement {
 	const f = el('span', 'flag', String.fromCodePoint(...[...cc].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)));
 	const n = regions?.of(cc) ?? cc;
-	f.title = n;
+	tipOn(f, n);
 	f.setAttribute('aria-label', n);
 	return f;
 }
@@ -218,7 +219,7 @@ function drawList(): void {
 		const active = p.pages.some((x) => !x.away);
 		const av = el('span', 'tl-av');
 		const dot = el('span', active ? 'dot on' : 'dot');
-		dot.title = active ? 'Here now' : 'Tab in the background';
+		tipOn(dot, active ? 'Here now' : 'Tab in the background');
 		av.append(face(p, !active), dot);
 		li.append(av, who);
 		if (p.country) li.append(flag(p.country));
@@ -233,13 +234,13 @@ function drawList(): void {
 		}
 		if (rest.length) {
 			const more = el('span', 'more', `+${rest.length}`);
-			more.title = rest.map((x) => titleOf(x.path)).join(', ');
+			tipOn(more, rest.map((x) => titleOf(x.path)).join(', '));
 			where.append(more);
 		}
 		li.append(where);
 		if (p.since) {
 			const t = el('span', 'for', ago(p.since));
-			t.title = `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+			tipOn(t, `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
 			li.append(t);
 		}
 		ul.append(li);
@@ -256,7 +257,7 @@ function drawMe(): void {
 		a.setAttribute('aria-label', `Signed in as ${you.login}`);
 		a.href = `https://github.com/${encodeURIComponent(you.login)}`;
 		a.rel = 'noopener';
-		a.title = 'Your GitHub profile';
+		tipOn(a, 'Your GitHub profile');
 		a.append(face(you), el('span', '', you.login));
 		const form = el('form', 'tl-out');
 		form.method = 'post';
@@ -310,7 +311,7 @@ function drawSide(): void {
 		const row = document.querySelector<HTMLAnchorElement>(`.navlist a.row[href="${CSS.escape(href(path))}"]`);
 		if (!row) continue;
 		const s = stack(list, ROW_FACES, path);
-		s.title = `${list.map(name).join(', ')} reading this`;
+		tipOn(s, `${list.map(name).join(', ')} reading this`);
 		row.append(s);
 	}
 }

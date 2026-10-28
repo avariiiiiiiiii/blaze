@@ -1066,7 +1066,11 @@ mod tests {
     use super::{CrateGraphBuilder, CrateName, CrateOrigin, Edition::Edition2018, Env, FileId};
 
     fn empty_ws_data() -> Arc<CrateWorkspaceData> {
-        Arc::new(CrateWorkspaceData { target: Err("".into()), toolchain: None })
+        Arc::new(CrateWorkspaceData {
+            target: Err("".into()),
+            toolchain: None,
+            const_eval: Default::default(),
+        })
     }
 
     #[test]

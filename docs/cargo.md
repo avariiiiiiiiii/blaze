@@ -1089,6 +1089,22 @@ when last read runs, with a line saying so; with none read before, it is an erro
 version stays on that release, whose bytes never change: promotion from canary to stable flips
 the same release.
 
+## How far a constant's evaluation may go
+
+Every evaluation of a constant, static, array length or other compile-time code has a budget
+of steps (basic blocks run, as rustc counts them) and of memory (its stack and heap together),
+1 000 000 000 steps and 1 GiB unless the workspace's root `Cargo.toml` says otherwise:
+
+    [workspace.metadata.blaze]
+    const-eval = { steps = 4_000_000_000, memory = 4_294_967_296 }
+
+An evaluation that reaches either stops the build with what it ran out of, where it was and
+the setting to raise, as in ``const eval of `TABLE` exceeded 1000000000 steps at
+src/lib.rs:12:9 (raise `const-eval.steps` under `[workspace.metadata.blaze]`)``. rustc's own
+limit is its `long_running_const_eval` lint, an error at 2 000 000 steps unless the lint is
+allowed (then it only warns, and runs on); the default here is 500 times that, so the budget
+ends a loop that never would rather than refusing code rustc takes.
+
 ## Environment variables
 
 These are read by `blaze` and passed to the worker it starts. They are part of which

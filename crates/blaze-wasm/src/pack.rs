@@ -203,6 +203,7 @@ impl Pack {
         let workspace = triomphe::Arc::new(CrateWorkspaceData {
             target: Ok(TargetData { data_layout: self.data_layout.into(), arch: Arch::Wasm32 }),
             toolchain: None,
+            const_eval: Default::default(),
         });
         let cwd = triomphe::Arc::new(AbsPathBuf::assert("/".into()));
         let expansions: Arc<Expansions> =

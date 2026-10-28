@@ -273,11 +273,12 @@ function drawSide(): void {
 	const byPath = new Map<string, Person[]>();
 	for (const p of people) {
 		if (p.key === you?.key) continue;
-		for (const pg of p.pages) {
-			const l = byPath.get(pg.path) ?? [];
-			if (!l.includes(p)) l.push(p);
-			byPath.set(pg.path, l);
-		}
+		// One face a person, on the page in front of them (the presence object sends that page first).
+		const pg = p.pages[0];
+		if (!pg) continue;
+		const l = byPath.get(pg.path) ?? [];
+		l.push(p);
+		byPath.set(pg.path, l);
 	}
 	for (const [path, list] of byPath) {
 		const row = document.querySelector<HTMLAnchorElement>(`.navlist a.row[href="${CSS.escape(href(path))}"]`);
@@ -297,8 +298,7 @@ function speak(key: string, login: string, text: string): void {
 	const p = people.find((x) => x.key === key);
 	// The page they are looking at first, then any other tab of theirs.
 	let at: Element | null = null;
-	const pages = p ? [...p.pages].sort((a, b) => Number(a.away) - Number(b.away)) : [];
-	for (const pg of pages) {
+	for (const pg of p?.pages ?? []) {
 		const row = `.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`;
 		at = document.querySelector(`${row} > .face[data-key="${CSS.escape(key)}"]`) ?? document.querySelector(row);
 		if (at) break;

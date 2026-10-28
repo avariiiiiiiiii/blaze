@@ -49,7 +49,7 @@ const MAX_PEOPLE = 300;
 type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean };
 type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string };
 /** Kept on each socket (`serializeAttachment`), so it survives hibernation. */
-type Tab = Who & { path: string | null; away: boolean; country: string | null };
+type Tab = Who & { path: string | null; away: boolean; country: string | null; seen?: number };
 /** `country` is Cloudflare's two-letter guess from the IP (`request.cf.country`), shown as a flag; null when unknown or Tor. */
 type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
 
@@ -135,7 +135,7 @@ export class Presence extends DurableObject<Env> {
 		const path = typeof m.path === 'string' && PATHS.has(m.path) ? m.path : null;
 		const away = m.away === true;
 		if (tab.path === path && tab.away === away) return;
-		ws.serializeAttachment({ ...tab, path, away } satisfies Tab);
+		ws.serializeAttachment({ ...tab, path, away, seen: Date.now() } satisfies Tab);
 		this.schedule();
 	}
 
@@ -212,6 +212,7 @@ export class Presence extends DurableObject<Env> {
 	/** Everyone, one entry per person (their tabs' pages), signed-in readers first, then by key. */
 	private snapshot(): string {
 		const people = new Map<string, Person>();
+		const seen = new Map<Person['pages'][number], number>();
 		for (const ws of this.open()) {
 			const tab = ws.deserializeAttachment() as Tab | null;
 			if (!tab) continue;
@@ -220,8 +221,17 @@ export class Presence extends DurableObject<Env> {
 				p = { key: tab.key, login: tab.login, avatar: tab.avatar, country: tab.country ?? null, pages: [] };
 				people.set(tab.key, p);
 			}
-			if (tab.path && !p.pages.some((x) => x.path === tab.path && x.away === tab.away)) p.pages.push({ path: tab.path, away: tab.away });
+			if (!tab.path) continue;
+			const same = p.pages.find((x) => x.path === tab.path && x.away === tab.away);
+			if (same) seen.set(same, Math.max(seen.get(same) ?? 0, tab.seen ?? 0));
+			else {
+				const pg = { path: tab.path, away: tab.away };
+				p.pages.push(pg);
+				seen.set(pg, tab.seen ?? 0);
+			}
 		}
+		// Each person's pages, the one in front of them first: in view before hidden, then the latest moved to.
+		for (const p of people.values()) p.pages.sort((a, b) => Number(a.away) - Number(b.away) || (seen.get(b) ?? 0) - (seen.get(a) ?? 0));
 		const list = [...people.values()]
 			.sort((a, b) => Number(!a.login) - Number(!b.login) || a.key.localeCompare(b.key))
 			.slice(0, MAX_PEOPLE);

@@ -240,9 +240,9 @@ impl Shown {
         };
         match self.held.take() {
             Some(_) => {
-                let last = live.build().finished.as_ref().filter(|it| !blaze_ui::fresh(it));
-                let last = last.map(|it| blaze_ui::summary_line(it, colored()) + "\n");
-                eprint!("{}", last.unwrap_or_default());
+                let finished = live.build().finished.as_ref();
+                let last = finished.and_then(|it| blaze_ui::last_line(it, colored(), asked()));
+                eprint!("{}", last.map(|it| it + "\n").unwrap_or_default());
             }
             None => eprint!("{out}"),
         }
@@ -264,15 +264,18 @@ impl Shown {
 }
 
 /// How a command shows a build: on a terminal a region drawn again, elsewhere cargo's
-/// lines, nothing when quiet.
+/// lines, nothing when quiet. The command that asked for the build says its errors itself.
 fn rendering() -> Option<Rendering> {
     match () {
         () if QUIET.load(Ordering::Relaxed) => None,
         () if std::io::stderr().is_terminal() => {
-            let width = terminal_width().unwrap_or(80);
-            Some(Rendering::Live(blaze_ui::Live::new(width, colored())))
+            let live = blaze_ui::Live::new(terminal_width().unwrap_or(80), colored());
+            Some(Rendering::Live(if asked() { live.errors_said() } else { live }))
         }
-        () => Some(Rendering::Plain(blaze_ui::Plain::new(colored()))),
+        () => {
+            let plain = blaze_ui::Plain::new(colored());
+            Some(Rendering::Plain(if asked() { plain.errors_said() } else { plain }))
+        }
     }
 }
 
@@ -282,6 +285,11 @@ static WATCHING: AtomicBool = AtomicBool::new(false);
 
 pub fn watching() {
     WATCHING.store(true, Ordering::Relaxed);
+}
+
+/// Whether this command asked for the build it shows, and so says its errors after it.
+fn asked() -> bool {
+    !WATCHING.load(Ordering::Relaxed)
 }
 
 impl Drop for Shown {

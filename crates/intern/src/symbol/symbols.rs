@@ -359,6 +359,7 @@ define_symbols! {
     future,
     future_output,
     Future,
+    gca,
     ge,
     generic_associated_type_extended,
     get_context,

@@ -108,6 +108,9 @@ HARNESSES = [
     # `blaze check`'s diagnostics, in each `--message-format`, against rustc's.
     ("core", ["check_json.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     ("core", ["checktargets.py"], {}, on("linux", "macos", backend="cranelift"), 2),
+    ("core", ["nativespans.py"], {}, on("linux", "macos"), 2),
+    ("core", ["gitindex.py"], {}, on("linux", "macos", backend="cranelift"), 2),
+    ("core", ["deriveerrors.py"], {}, on("linux", "macos"), 2),
     # blaze answers what is asked of rustc as rustc answers it, on every target it knows.
     ("core", ["answers.py"], {}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["worktrees.py"], {}, EVERYWHERE, 2),
@@ -185,6 +188,9 @@ FAST = {
     "norustc.py": (253, (X64,)),
     "check_json.py": (38, (X64,)),
     "checktargets.py": (40, (X64,)),
+    "nativespans.py": (90, (X64,)),
+    "gitindex.py": (3, (X64,)),
+    "deriveerrors.py": (65, (X64,)),
     "answers.py": (17, (X64,)),
     "worktrees.py": (26, (X64, MAC)),
     "worktrees.py --join --together": (28, ()),

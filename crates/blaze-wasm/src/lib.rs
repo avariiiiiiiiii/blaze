@@ -302,6 +302,7 @@ impl Compiler {
         let workspace = Arc::new(CrateWorkspaceData {
             target: Ok(TargetData { data_layout: DATA_LAYOUT.into(), arch: Arch::Wasm32 }),
             toolchain: None,
+            const_eval: Default::default(),
         });
         let cwd = Arc::new(AbsPathBuf::assert("/".into()));
         let mut graph = CrateGraphBuilder::default();

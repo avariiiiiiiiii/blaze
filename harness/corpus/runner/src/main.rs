@@ -548,6 +548,8 @@ fn main() {
     println!("array_map {:?}", cases::array_map::run());
     #[cfg(feature = "nightly")]
     println!("deref_patterns {:?}", cases::deref_patterns::run());
+    #[cfg(feature = "nightly")]
+    println!("const_traits {}", cases::const_traits::run());
     println!("promoted_call {:?}", cases::promoted_call::run());
     println!("type_ids {:?}", cases::type_ids::run());
     #[cfg(panic = "unwind")]

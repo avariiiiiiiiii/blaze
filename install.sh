@@ -226,7 +226,16 @@ mkdir "$tmp/unpacked"
 # -o: as root, tar gives files the archive's owner, which a container's user namespace may not have.
 tar -xzof "$tmp/$asset" -C "$tmp/unpacked" 2>"$tmp/error" ||
     fail "the downloaded archive could not be unpacked." "$(cat "$tmp/error")"
-unpacked="$tmp/unpacked/${asset%.tar.gz}"
+# The archive's one folder, whatever the file is named.
+set -- "$tmp/unpacked"/*/
+if [ $# -ne 1 ] || [ ! -d "$1" ]; then
+    fail "$asset is not a blaze release's archive: it does not hold one folder of programs." \
+        "Download blaze-<version>-$target.tar.gz from https://github.com/$REPO/releases and name it in BLAZE_ARCHIVE."
+fi
+unpacked="${1%/}"
+[ -x "$unpacked/blaze" ] || [ -x "$unpacked/ra-jit" ] || # rename: old name
+    fail "$asset is not a blaze release's archive: it has no blaze in $(basename "$unpacked")." \
+        "Download blaze-<version>-$target.tar.gz from https://github.com/$REPO/releases and name it in BLAZE_ARCHIVE."
 # A release from before the rename (#270) has its programs' old names, by which they find each
 # other: they keep them, but for the launchers of `blaze`, which is gone.
 old_release=""

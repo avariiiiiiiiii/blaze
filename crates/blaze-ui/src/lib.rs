@@ -212,6 +212,14 @@ pub fn fresh(finished: &Finished) -> bool {
     finished.ok && summary.rebuilt.is_empty() && summary.fns.compiled() == 0
 }
 
+/// The last line said of a build, if any: none of a fresh build, nor of a failed one when the
+/// errors are said in full after it (`errors_said`), as the command that asked for the build
+/// says them with cargo's `could not compile`, the one line of failure cargo has.
+pub fn last_line(finished: &Finished, color: bool, errors_said: bool) -> Option<String> {
+    let said = fresh(finished) || !finished.ok && errors_said;
+    (!said).then(|| summary_line(finished, color))
+}
+
 /// The last line of a build: what it rebuilt and why, or why it failed, and how long it took.
 /// Not cargo's `Finished`, which `blaze` says after it.
 pub fn summary_line(finished: &Finished, color: bool) -> String {
@@ -264,7 +272,13 @@ const NEWS_NS: u64 = 500_000_000;
 
 /// The lines `change` adds that stay: on a terminal (`live`) above the region, elsewhere all
 /// there is.
-fn staying(build: &Build, change: &Change, color: bool, live: bool) -> Vec<String> {
+fn staying(
+    build: &Build,
+    change: &Change,
+    color: bool,
+    live: bool,
+    errors_said: bool,
+) -> Vec<String> {
     let status =
         |word: &str, rest: &str| format!("{} {rest}", paint(GREEN, &format!("{word:>12}"), color));
     match change {
@@ -317,12 +331,9 @@ fn staying(build: &Build, change: &Change, color: bool, live: bool) -> Vec<Strin
             let (name, why) = &build.refused[*at];
             vec![said_line(Level::Error, &format!("blaze does not build `{name}`: {why}"), color)]
         }
-        Change::Finished if !live => build
-            .finished
-            .iter()
-            .filter(|it| !fresh(it))
-            .map(|it| summary_line(it, color))
-            .collect(),
+        Change::Finished if !live => {
+            build.finished.iter().filter_map(|it| last_line(it, color, errors_said)).collect()
+        }
         _ => Vec::new(),
     }
 }

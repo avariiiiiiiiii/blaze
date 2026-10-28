@@ -12,7 +12,7 @@ use syntax_bridge::DocCommentDesugarMode;
 use tracing::debug;
 
 use crate::{
-    ExpandError, ExpandResult, MacroCallId, MacroCallKind,
+    ExpandError, ExpandErrorKind, ExpandResult, MacroCallId, MacroCallKind,
     builtin::quote::dollar_crate,
     hygiene::span_with_def_site_ctxt,
     name::{self, AsName, Name},
@@ -63,14 +63,45 @@ impl BuiltinDeriveExpander {
         span: Span,
     ) -> ExpandResult<tt::TopSubtree> {
         let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
-        if let BuiltinDeriveExpander::Clone = self
+        let expanded = if let BuiltinDeriveExpander::Clone = self
             && let MacroCallKind::Derive { ast_id, .. } = &id.loc(db).kind
             && derives_copy(&ast_id.to_node(db))
         {
-            return clone_expand_with(db, span, tt, true);
-        }
-        self.expander()(db, span, tt)
+            clone_expand_with(db, span, tt, true)
+        } else {
+            self.expander()(db, span, tt)
+        };
+        if from_derive_const(db, id) { expanded.map(as_const_impls) } else { expanded }
     }
+}
+
+/// Whether the derive is listed in a `#[derive_const(..)]`, whose impls are `const impl`s.
+fn from_derive_const(db: &dyn SourceDatabase, id: MacroCallId) -> bool {
+    let MacroCallKind::Derive { derive_macro_id, .. } = id.loc(db).kind else { return false };
+    matches!(
+        derive_macro_id.loc(db).def.kind,
+        crate::MacroDefKind::BuiltInAttr(_, crate::builtin::BuiltinAttrExpander::DeriveConst)
+    )
+}
+
+/// `impl ..` items of a derive's expansion as `const impl ..`.
+fn as_const_impls(expanded: tt::TopSubtree) -> tt::TopSubtree {
+    let mut builder = tt::TopSubtreeBuilder::new(expanded.top_subtree().delimiter);
+    let mut items = expanded.token_trees().iter();
+    while let Some(next) = items.peek() {
+        if let tt::TtElement::Leaf(tt::Leaf::Ident(ident)) = &next
+            && ident.sym == sym::kw_impl
+        {
+            builder.push(tt::Leaf::Ident(tt::Ident {
+                sym: sym::const_,
+                span: ident.span,
+                is_raw: tt::IdentIsRaw::No,
+            }));
+        }
+        let Some(item) = items.next_as_view() else { break };
+        builder.extend_with_tt(item);
+    }
+    builder.build()
 }
 
 /// Whether one of the item's `#[derive]`s lists `Copy`.
@@ -637,7 +668,7 @@ fn expand_simple_derive(
     if !allow_unions && matches!(info.shape, AdtShape::Union) {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(invoc_span)),
-            ExpandError::other(invoc_span, "this trait cannot be derived for unions"),
+            ExpandError::builtin_derive(invoc_span, "this trait cannot be derived for unions"),
         );
     }
     if info.packed && copy_if_packed {
@@ -770,13 +801,13 @@ fn from_expand(
         ast::Adt::Enum(_) => {
             return ExpandResult::new(
                 empty(),
-                ExpandError::other(span, "`#[derive(From)]` used on an enum"),
+                ExpandError::builtin_derive(span, "`#[derive(From)]` used on an enum"),
             );
         }
         ast::Adt::Union(_) => {
             return ExpandResult::new(
                 empty(),
-                ExpandError::other(span, "`#[derive(From)]` used on a union"),
+                ExpandError::builtin_derive(span, "`#[derive(From)]` used on a union"),
             );
         }
     };
@@ -799,7 +830,7 @@ fn from_expand(
             let count = if fields.is_empty() { "no fields" } else { "multiple fields" };
             return ExpandResult::new(
                 empty(),
-                ExpandError::other(
+                ExpandError::builtin_derive(
                     span,
                     format!("`#[derive(From)]` used on a struct with {count}"),
                 ),
@@ -871,13 +902,13 @@ fn coerce_shared_expand(
     let ast::Adt::Struct(strukt) = &adt else {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::other(span, "`CoerceShared` can only be derived on `struct`s"),
+            ExpandError::builtin_derive(span, "`CoerceShared` can only be derived on `struct`s"),
         );
     };
     let Some(target) = coerce_shared_target(db, span, strukt) else {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::other(
+            ExpandError::builtin_derive(
                 span,
                 "`derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute",
             ),
@@ -917,7 +948,10 @@ fn expand_reborrow_marker_derive(
     if !matches!(info.shape, AdtShape::Struct(_)) {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::other(span, format!("`{trait_name}` can only be derived on `struct`s")),
+            ExpandError::builtin_derive(
+                span,
+                format!("`{trait_name}` can only be derived on `struct`s"),
+            ),
         );
     }
 
@@ -1085,14 +1119,14 @@ fn default_expand(
             } else {
                 return ExpandResult::new(
                     tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                    ExpandError::other(span, "`#[derive(Default)]` on enum with no `#[default]`"),
+                    ExpandError::new(span, ExpandErrorKind::DefaultNoVariant),
                 );
             }
         }
         AdtShape::Union => {
             return ExpandResult::new(
                 tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                ExpandError::other(span, "this trait cannot be derived for unions"),
+                ExpandError::builtin_derive(span, "this trait cannot be derived for unions"),
             );
         }
     };
@@ -1504,7 +1538,7 @@ fn coerce_pointee_expand(
     let ast::Adt::Struct(strukt) = &adt else {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::other(span, "`CoercePointee` can only be derived on `struct`s"),
+            ExpandError::builtin_derive(span, "`CoercePointee` can only be derived on `struct`s"),
         );
     };
     let has_at_least_one_field = strukt
@@ -1517,7 +1551,7 @@ fn coerce_pointee_expand(
     if !has_at_least_one_field {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::other(
+            ExpandError::builtin_derive(
                 span,
                 "`CoercePointee` can only be derived on `struct`s with at least one field",
             ),
@@ -1536,7 +1570,7 @@ fn coerce_pointee_expand(
     if !is_repr_transparent {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::other(
+            ExpandError::builtin_derive(
                 span,
                 "`CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`",
             ),
@@ -1555,7 +1589,7 @@ fn coerce_pointee_expand(
     if type_params.is_empty() {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::other(
+            ExpandError::builtin_derive(
                 span,
                 "`CoercePointee` can only be derived on `struct`s that are generic over at least one type",
             ),
@@ -1581,7 +1615,7 @@ fn coerce_pointee_expand(
             (None, _) => {
                 return ExpandResult::new(
                     tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                    ExpandError::other(
+                    ExpandError::builtin_derive(
                         span,
                         "exactly one generic type parameter must be marked \
                                 as `#[pointee]` to derive `CoercePointee` traits",
@@ -1591,7 +1625,7 @@ fn coerce_pointee_expand(
             (Some(_), Some(_)) => {
                 return ExpandResult::new(
                     tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                    ExpandError::other(
+                    ExpandError::builtin_derive(
                         span,
                         "only one type parameter can be marked as `#[pointee]` \
                                 when deriving `CoercePointee` traits",
@@ -1632,7 +1666,7 @@ fn coerce_pointee_expand(
         if !pointee_has_maybe_sized_bound {
             return ExpandResult::new(
                 tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                ExpandError::other(
+                ExpandError::builtin_derive(
                     span,
                     format!(
                         "`derive(CoercePointee)` requires `{pointee_param_name}` to be marked `?Sized`"

@@ -562,7 +562,7 @@ pub fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Result<Ran
     let package = script.package();
     if output.status.code() == Some(sandbox::COULD_NOT)
         && lines.is_none()
-        && let Err(why) = sandbox::available()
+        && let Err(why) = sandbox::available(false)
     {
         output.stderr.extend(
             format!(

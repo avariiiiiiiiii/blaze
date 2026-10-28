@@ -62,6 +62,25 @@ struct Target {
 }
 
 impl Target {
+    /// Whether `-C target-feature=crt-static` changes how the target links, as its spec says.
+    fn respects_crt_static(&self) -> Option<bool> {
+        let spec: serde_json::Value =
+            serde_json::from_str(self.target_spec_json.values().next()?).ok()?;
+        Some(spec.get("crt-static-respected").and_then(|it| it.as_bool()).unwrap_or(false))
+    }
+
+    /// The spec rustc on `host` prints: its own, or on a host not recorded (Windows) the one
+    /// every recorded host prints. A spec the hosts differ on (x86-64 Linux's, whose own rustc
+    /// links with its lld) is the build's, so not known for another host.
+    fn spec_on(&self, host: &str) -> Option<&str> {
+        if let Some(spec) = self.target_spec_json.get(host) {
+            return Some(spec);
+        }
+        let mut specs = self.target_spec_json.values();
+        let spec = specs.next()?;
+        specs.all(|it| it == spec).then_some(spec)
+    }
+
     /// The `target_feature`s of `cpu` with `features` turned on (`true`) and off in order,
     /// starting from `have`, the target's own; `None` for a CPU or feature rustc warns of or
     /// does not have.
@@ -189,7 +208,32 @@ struct Given<'a> {
     unstable_options: bool,
     from_stdin: bool,
     extra_filename: bool,
+    /// Whether a flag changes which warnings rustc shows, or how: its warnings are answered
+    /// only as they are shown with none, or when none are shown.
+    diagnostics_set: bool,
+    /// `--cap-lints allow`, or `-A warnings` last of what is said of `warnings`: rustc shows
+    /// no warning at all.
+    warnings_hidden: bool,
+    lints_capped: bool,
 }
+
+/// The flags that change which warnings rustc shows, or how it shows them, but `-A` and
+/// `-W` of `warnings` and `--cap-lints allow`.
+const DIAGNOSTICS: [&str; 10] = [
+    "-D",
+    "-F",
+    "--deny",
+    "--forbid",
+    "--force-warn",
+    "--cap-lints",
+    "--error-format",
+    "--json",
+    "--color",
+    "--diagnostic-width",
+];
+
+/// The prints rustc makes only as it links, so none when it compiles nothing.
+pub(crate) const WHEN_LINKING: [&str; 2] = ["link-args", "native-static-libs"];
 
 /// The flags that take a value and change no answer.
 const IGNORED_VALUED: [&str; 12] = [
@@ -223,8 +267,9 @@ const LINTS: [&str; 10] = [
 
 /// The codegen options that change no answer. `linker-features` is how
 /// rustc links (cargo's `-Clinker-features=-lld`), not the target it prints;
-/// `symbol-mangling-version` how it names symbols (zed's `-C symbol-mangling-version=v0`).
-const IGNORED_CODEGEN: [&str; 18] = [
+/// `symbol-mangling-version` how it names symbols (zed's `-C symbol-mangling-version=v0`),
+/// `save-temps` which of its files it keeps (uitest.py's RUSTFLAGS).
+const IGNORED_CODEGEN: [&str; 19] = [
     "embed-bitcode",
     "debuginfo",
     "metadata",
@@ -243,6 +288,7 @@ const IGNORED_CODEGEN: [&str; 18] = [
     "force-frame-pointers",
     "force-unwind-tables",
     "symbol-mangling-version",
+    "save-temps",
 ];
 
 fn yes(value: Option<&str>) -> Option<bool> {
@@ -307,12 +353,15 @@ impl<'a> Given<'a> {
                 }
                 "-Z" => match crate::unstable::flag(value()?) {
                     flag if flag.name == "unstable-options" => given.unstable_options = true,
-                    // One that changes only how rustc works changes no answer.
-                    flag if matches!(flag.treatment(), crate::unstable::Treatment::Ignored(_)) => {}
+                    // One that changes only how rustc works changes no answer, but may how
+                    // it warns.
+                    flag if matches!(flag.treatment(), crate::unstable::Treatment::Ignored(_)) => {
+                        given.diagnostics_set = true;
+                    }
                     _ => return None,
                 },
                 _ if LINTS.contains(&flag) || IGNORED_VALUED.contains(&flag) => {
-                    value()?;
+                    given.lint(flag, value()?);
                 }
                 // An input rustc does not read for what it is asked.
                 _ if !flag.starts_with('-') => {}
@@ -320,6 +369,16 @@ impl<'a> Given<'a> {
             }
         }
         Some(given)
+    }
+
+    fn lint(&mut self, flag: &str, value: &str) {
+        match (flag, value) {
+            ("--cap-lints", "allow") => self.lints_capped = true,
+            ("-A" | "--allow", "warnings") => self.warnings_hidden = true,
+            ("-W" | "--warn", "warnings") => self.warnings_hidden = false,
+            _ if DIAGNOSTICS.contains(&flag) => self.diagnostics_set = true,
+            _ => {}
+        }
     }
 
     fn debug_assertions(&self) -> bool {
@@ -372,13 +431,32 @@ fn is_plain_cfg(cfg: &str) -> bool {
     plain_name && !builtin && plain_value
 }
 
-/// What rustc of blaze's release prints for `args` with `stdin`, with the variables `var`
-/// reads; `None` for what this does not answer.
+/// What rustc prints, answering.
+#[derive(Debug, PartialEq)]
+pub struct Answer {
+    pub stdout: Vec<u8>,
+    /// Its warnings, as it shows them to a pipe.
+    pub stderr: Vec<u8>,
+}
+
+/// What rustc of blaze's release prints to standard output for `args` with `stdin`, with
+/// the variables `var` reads; `None` for what this does not answer, and for an answer with
+/// warnings, which only [`answered`] tells.
 pub fn answer(
     args: &[OsString],
     stdin: &[u8],
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Option<Vec<u8>> {
+    answered(args, stdin, var).filter(|it| it.stderr.is_empty()).map(|it| it.stdout)
+}
+
+/// What rustc of blaze's release prints for `args` with `stdin`, with the variables `var`
+/// reads; `None` for what this does not answer.
+pub fn answered(
+    args: &[OsString],
+    stdin: &[u8],
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<Answer> {
     if UNSET.iter().any(|it| var(it).is_some()) {
         return None;
     }
@@ -403,17 +481,23 @@ pub fn answer(
         } else {
             format!("rustc {}\n", release.version)
         };
-        return Some(text.into_bytes());
+        return Some(Answer { stdout: text.into_bytes(), stderr: Vec::new() });
     }
     let given = Given::of(&args)?;
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
+    if given.prints.iter().all(|it| WHEN_LINKING.contains(it)) {
+        return None;
+    }
     let tuple = given.target.unwrap_or(toolchain.host);
     let target = release.targets.get(tuple)?;
     let mut out = String::new();
+    let mut dropped: Vec<&str> = Vec::new();
     for print in &given.prints {
         match *print {
+            // Beside another print rustc stops before it links.
+            print if WHEN_LINKING.contains(&print) => {}
             "sysroot" => out += &format!("{}\n", sysroot()?.to_str()?),
             "target-libdir" => {
                 let dir = sysroot()?.join("lib/rustlib").join(tuple).join("lib");
@@ -441,9 +525,20 @@ pub fn answer(
                 if kinds.contains(&"lib") && kinds.contains(&"rlib") {
                     return None;
                 }
-                for kind in kinds {
-                    let file = target.file_names.get(kind)?.as_deref()?;
-                    out += &format!("{}\n", file.replace("___", name));
+                // A kind the target does not have is dropped with a warning, which cargo reads
+                // to tell it from the others.
+                for kind in &kinds {
+                    match target.file_names.get(*kind)? {
+                        Some(file) => out += &format!("{}\n", file.replace("___", name)),
+                        None => dropped.push(*kind),
+                    }
+                }
+                if dropped.len() == kinds.len()
+                    || dropped
+                        .iter()
+                        .any(|it| given.crate_types.iter().filter(|k| *k == it).count() > 1)
+                {
+                    return None;
                 }
             }
             "cfg" => {
@@ -506,6 +601,13 @@ pub fn answer(
                 cfgs.push(format!("panic=\"{panic}\""));
                 if given.crate_types.contains(&"proc-macro") {
                     cfgs.push("proc_macro".to_owned());
+                    // A proc macro is a dynamic library, which a target that respects
+                    // `crt-static` builds without it unless it is asked for.
+                    if !given.features.iter().any(|&(_, name)| name == "crt-static")
+                        && target.respects_crt_static()?
+                    {
+                        cfgs.retain(|it| it != "target_feature=\"crt-static\"");
+                    }
                 }
                 for cfg in &given.cfgs {
                     if !is_plain_cfg(cfg) {
@@ -521,12 +623,26 @@ pub fn answer(
             // are read to link: an Apple target's spec names no deployment target
             // (`"llvm-target": "arm64-apple-macosx"`).
             "target-spec-json" if given.unstable_options && nightly => {
-                out += target.target_spec_json.get(toolchain.host)?;
+                out += target.spec_on(toolchain.host)?;
             }
             _ => return None,
         }
     }
-    Some(out.into_bytes())
+    let mut warned = String::new();
+    if !dropped.is_empty() && !given.lints_capped && !given.warnings_hidden {
+        if given.diagnostics_set {
+            return None;
+        }
+        for kind in &dropped {
+            warned += &format!(
+                "warning: dropping unsupported crate type `{kind}` for target `{tuple}`\n\n"
+            );
+        }
+        let count = dropped.len();
+        warned +=
+            &format!("warning: {count} warning{} emitted\n\n", if count == 1 { "" } else { "s" });
+    }
+    Some(Answer { stdout: out.into_bytes(), stderr: warned.into_bytes() })
 }
 
 #[cfg(test)]
@@ -576,6 +692,67 @@ mod tests {
         assert_eq!(given.cfgs, ["tokio_unstable"]);
     }
 
+    fn told(args: &str) -> Option<Answer> {
+        let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
+        answered(&args, &[], &|_| None)
+    }
+
+    /// uitest.py's RUSTFLAGS: a print of what is linked and kept files change nothing that is
+    /// printed when nothing links; `--cfg` adds its cfg.
+    #[test]
+    fn flags_of_a_link_are_answered() {
+        let plain = told("--target x86_64-unknown-linux-gnu --print cfg").expect("an answer");
+        let ui = told(
+            "--print link-args -C save-temps -C link-dead-code --cap-lints allow \
+             -L native=/ui/native --cfg e2024 --target x86_64-unknown-linux-gnu --print cfg",
+        )
+        .expect("an answer under uitest.py's flags");
+        let mut cfgs: Vec<&str> = std::str::from_utf8(&plain.stdout).unwrap().lines().collect();
+        cfgs.push("e2024");
+        cfgs.sort();
+        assert_eq!(std::str::from_utf8(&ui.stdout).unwrap().lines().collect::<Vec<_>>(), cfgs);
+        assert!(told("--print link-args").is_none());
+    }
+
+    /// cargo's probe of a target that has no `dylib` or `proc-macro`: rustc drops them with
+    /// a warning, which cargo reads.
+    #[test]
+    fn kinds_a_target_lacks_are_dropped_with_a_warning() {
+        let probe = "- --crate-name ___ --print=file-names --target wasm32-wasip1 \
+                     --crate-type bin --crate-type rlib --crate-type dylib --crate-type cdylib \
+                     --crate-type staticlib --crate-type proc-macro --print=crate-name -Wwarnings";
+        let said = told(probe).expect("an answer of the probe");
+        assert_eq!(
+            std::str::from_utf8(&said.stdout).unwrap(),
+            "___.wasm\nlib___.rlib\n___.wasm\nlib___.a\n___\n"
+        );
+        assert_eq!(
+            std::str::from_utf8(&said.stderr).unwrap(),
+            "warning: dropping unsupported crate type `dylib` for target `wasm32-wasip1`\n\n\
+             warning: dropping unsupported crate type `proc-macro` for target `wasm32-wasip1`\n\n\
+             warning: 2 warnings emitted\n\n"
+        );
+        let args: Vec<OsString> = probe.split_whitespace().map(OsString::from).collect();
+        assert_eq!(answer(&args, &[], &|_| None), None);
+        for hidden in ["-A warnings", "--cap-lints allow", "-Wwarnings -Awarnings"] {
+            let said = told(&format!("{probe} {hidden}")).expect("an answer with no warnings");
+            assert_eq!(said.stderr, b"");
+        }
+        assert!(told(&format!("{probe} -D warnings")).is_none());
+        assert!(
+            told(&format!("{probe} -A warnings -W warnings"))
+                .is_some_and(|it| !it.stderr.is_empty())
+        );
+        // A proc macro of a target that links statically by default has no `crt-static`.
+        let static_of = |kinds: &str| {
+            let said = told(&format!("--print cfg --target x86_64-unknown-linux-musl {kinds}"));
+            String::from_utf8(said.unwrap().stdout).unwrap().contains("\"crt-static\"")
+        };
+        assert!(static_of("--crate-type bin"));
+        assert!(!static_of("--crate-type bin --crate-type proc-macro"));
+        assert!(static_of("--crate-type proc-macro -C target-feature=+crt-static"));
+    }
+
     #[test]
     fn a_spec_is_answered_in_a_shell_of_the_sdk() {
         let spec = |target: &str, sdk: bool| {
@@ -592,5 +769,15 @@ mod tests {
         assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
         let apple = spec("aarch64-apple-darwin", true).expect("an Apple spec under SDKROOT");
         assert_eq!(Some(apple), spec("aarch64-apple-darwin", false));
+    }
+
+    #[test]
+    fn a_spec_the_hosts_agree_on_is_answered_on_any_host() {
+        let release = &releases()[0];
+        let wasm = &release.targets["wasm32-wasip1"];
+        let windows = wasm.spec_on("x86_64-pc-windows-msvc").expect("wasm32-wasip1's spec");
+        assert_eq!(Some(windows), wasm.spec_on("aarch64-apple-darwin"));
+        let linux = &release.targets["x86_64-unknown-linux-gnu"];
+        assert_eq!(linux.spec_on("x86_64-pc-windows-msvc"), None);
     }
 }

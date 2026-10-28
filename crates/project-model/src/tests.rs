@@ -49,6 +49,7 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
         target: Err("target_data_layout not loaded".into()),
         extra_includes: Vec::new(),
         set_test: true,
+        const_eval: Default::default(),
     }
 }
 
@@ -65,6 +66,7 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
         cfg_overrides: Default::default(),
         extra_includes: Vec::new(),
         set_test: true,
+        const_eval: Default::default(),
     };
     to_crate_graph(project_workspace, &mut Default::default())
 }
@@ -275,6 +277,7 @@ fn smoke_test_real_sysroot_cargo() {
         target: Err("target_data_layout not loaded".into()),
         extra_includes: Vec::new(),
         set_test: true,
+        const_eval: Default::default(),
     };
     project_workspace.to_crate_graph(
         &mut {
@@ -284,5 +287,35 @@ fn smoke_test_real_sysroot_cargo() {
             }
         },
         &Default::default(),
+    );
+}
+
+#[test]
+fn const_eval_budget_of_workspace_metadata() {
+    use crate::cargo_workspace::const_eval_budget;
+    let of = |json: &str| const_eval_budget(&serde_json::from_str(json).unwrap());
+    let default = base_db::ConstEvalBudget::default();
+    assert_eq!(of("null").unwrap(), default);
+    assert_eq!(of(r#"{"blaze": {"version": "stable"}}"#).unwrap(), default);
+    let budget = of(r#"{"blaze": {"const-eval": {"steps": 5000}}}"#).unwrap();
+    assert_eq!(budget, base_db::ConstEvalBudget { steps: 5000, ..default });
+    let budget = of(r#"{"blaze": {"const-eval": {"steps": 7, "memory": 4096}}}"#).unwrap();
+    assert_eq!(budget, base_db::ConstEvalBudget { steps: 7, memory: 4096 });
+    let error = |json: &str| of(json).unwrap_err().to_string();
+    assert_eq!(
+        error(r#"{"blaze": {"const-eval": {"stpes": 7}}}"#),
+        "`const-eval.stpes` is not a setting (known: `steps`, `memory`)"
+    );
+    assert_eq!(
+        error(r#"{"blaze": {"const-eval": {"steps": 0}}}"#),
+        "`const-eval.steps` is a positive integer, not `0`"
+    );
+    assert_eq!(
+        error(r#"{"blaze": {"const-eval": {"memory": "1GiB"}}}"#),
+        "`const-eval.memory` is a positive integer, not `\"1GiB\"`"
+    );
+    assert_eq!(
+        error(r#"{"blaze": {"const-eval": 3}}"#),
+        "`const-eval` is a table: `const-eval = { steps = N, memory = BYTES }`"
     );
 }

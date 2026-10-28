@@ -93,6 +93,8 @@ pub fn is_question(args: &[OsString]) -> bool {
         let mut value = || joined.or_else(|| words.next());
         match flag {
             "--print" => match value() {
+                // Beside another print rustc stops before it links, so prints nothing of it.
+                Some(kind) if own::WHEN_LINKING.contains(&kind) => {}
                 // A print to a file writes it.
                 Some(kind) if !kind.contains('=') => kinds.push(kind),
                 _ => return false,
@@ -121,7 +123,7 @@ pub fn is_question(args: &[OsString]) -> bool {
 
 /// What blaze answers to what `command` asks rustc, given `stdin`, with the variables
 /// `command` has; `None` when it has no answer. Nothing runs.
-pub fn own_answer(command: &Command, stdin: &[u8]) -> Option<Vec<u8>> {
+pub fn own_answer(command: &Command, stdin: &[u8]) -> Option<own::Answer> {
     let var = |name: &str| var_of(command, name);
     let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
     answered_as(command.get_program(), &args, stdin, &var)
@@ -131,6 +133,11 @@ pub fn own_answer(command: &Command, stdin: &[u8]) -> Option<Vec<u8>> {
 /// `None` when it has no answer. Nothing runs.
 pub fn ours(args: &[OsString], stdin: &[u8]) -> Option<Vec<u8>> {
     own::answer(args, stdin, &|name| std::env::var_os(name))
+}
+
+/// [`ours`] with the warnings rustc shows answering.
+pub fn ours_told(args: &[OsString], stdin: &[u8]) -> Option<own::Answer> {
+    own::answered(args, stdin, &|name| std::env::var_os(name))
 }
 
 /// [`ours`] of text arguments, as text, failing with the question blaze has no answer to.
@@ -147,11 +154,11 @@ fn answered_as(
     args: &[OsString],
     stdin: &[u8],
     var: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<Vec<u8>> {
+) -> Option<own::Answer> {
     if Path::new(program).file_stem()? != "rustc" {
         return None;
     }
-    own::answer(args, stdin, var)
+    own::answered(args, stdin, var)
 }
 
 fn no_answer(args: &[OsString]) -> anyhow::Error {
@@ -166,7 +173,9 @@ fn no_answer(args: &[OsString]) -> anyhow::Error {
 /// asks a question ([`is_question`]); one blaze has no answer to is an error, and nothing runs.
 pub fn answer(command: &Command, stdin: &[u8]) -> io::Result<Output> {
     match own_answer(command, stdin) {
-        Some(stdout) => Ok(Output { status: ExitStatus::default(), stdout, stderr: Vec::new() }),
+        Some(own::Answer { stdout, stderr }) => {
+            Ok(Output { status: ExitStatus::default(), stdout, stderr })
+        }
         None => {
             let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
             Err(io::Error::other(no_answer(&args).to_string()))
@@ -228,7 +237,10 @@ pub fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>> {
     }
     let var = |name: &str| std::env::var_os(name);
     Some(match answered_as(rustc, args, &stdin, &var) {
-        Some(answer) => io::stdout().write_all(&answer).map(|()| 0),
+        Some(answer) => io::stderr()
+            .write_all(&answer.stderr)
+            .and_then(|()| io::stdout().write_all(&answer.stdout))
+            .map(|()| 0),
         None => {
             eprintln!("error: {}", no_answer(args));
             Ok(1)
@@ -267,6 +279,11 @@ mod tests {
             "- --crate-name ___ --print=file-names --crate-type bin --crate-type rlib \
              --print=sysroot --print=split-debuginfo --print=crate-name --print=cfg -Wwarnings"
         ));
+        // cargo's `--print cfg` under uitest.py's RUSTFLAGS.
+        assert!(question(
+            "--print link-args -C save-temps -C link-dead-code --cap-lints allow \
+             -L native=/ui/native --cfg e2024 --target x86_64-unknown-linux-gnu --print cfg"
+        ));
         // rust-analyzer's `cargo rustc -- --print cfg` names the library, which rustc does
         // not read for that.
         assert!(question(
@@ -287,7 +304,7 @@ mod tests {
         let version = [OsString::from("--version")];
         for program in ["rustc", "/no/such/toolchain/bin/rustc", "/usr/bin/rustc"] {
             let said = answered_as(OsStr::new(program), &version, &[], &var).unwrap();
-            let said = String::from_utf8(said).unwrap();
+            let said = String::from_utf8(said.stdout).unwrap();
             assert_eq!(said.trim(), format!("rustc {}", crate::cargo::toolchain::ours_says()));
         }
         assert_eq!(answered_as(OsStr::new("clippy-driver"), &version, &[], &var), None);
@@ -333,6 +350,7 @@ mod tests {
         assert!(!question("--crate-name p src/lib.rs --crate-type lib --emit=link"));
         assert!(!question("src/lib.rs --print file-names"));
         assert!(!question("--print link-args src/main.rs"));
+        assert!(!question("--print link-args"));
         assert!(!question("--print=link-args=out.txt src/main.rs"));
         assert!(!question("--print cfg --target my-target.json"));
         assert!(!question("@args.txt"));

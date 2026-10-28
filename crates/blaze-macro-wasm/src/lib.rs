@@ -4,13 +4,27 @@
 //! blaze compiles a proc-macro crate for `wasm32-wasip1` with [`GUEST`] in place of the
 //! standard library's `proc_macro`: the same API, whose token streams live in the module's
 //! memory and whose spans are numbers the host gives out, so syn, quote and proc-macro2 build
-//! against it unchanged. Each calling crate has its own instance for one database revision.
-//! Guest statics, stored tokens and their spans survive its calls. Source changes start a
-//! fresh session and rerun demanded expansions, including unchanged registration attributes.
+//! against it unchanged. An expansion is given its input encoded ([`wire`]), asks the host
+//! what only the host knows (what a span joins to, a string lexed), and hands back its output,
+//! encoded the same way.
 //!
-//! A module sees only its package, cargo's variables and the compiler information it asks
-//! for. Compiled modules are cached; expansion outputs are not, because an output alone
-//! cannot reproduce changes to guest statics.
+//! Whether a module keeps state between expansions is seen, not guessed: the guest's
+//! allocator counts the bytes live, and an expansion that leaves some behind tells the host
+//! ([`Verdict`]). A module none of whose expansions did is stateless: each expansion is a
+//! fresh instance ([`expand`]), kept under what it was given and what it read ([`keyed`]),
+//! and crates that call it are frozen as any other. A module one of whose expansions did, or
+//! one not seen yet, keeps an instance per calling crate for one database revision
+//! ([`Session`]): its statics, stored tokens and their spans survive its calls, a source
+//! change starts a fresh session and reruns demanded expansions, and nothing it makes is kept.
+//!
+//! What a module can learn of the machine is what it is given: its package's directory to
+//! read, at a path that is the same everywhere ([`wasi::PACKAGE`]), and cargo's variables for
+//! its package. Every read of the package is recorded, so that what one machine expanded
+//! every other finds, whatever it runs on: neither the module, which is the same bytes for
+//! every host, nor its expansions are kept under anything of the host's. What an expansion
+//! asked the database of a span of its input (its text, file, line or bytes) is kept with it,
+//! each question with its answer, and it is found while the database answers each the same.
+//! One that was given a span it was not ([`Value`]) is not kept.
 
 pub mod bench;
 mod keyed;
@@ -25,7 +39,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -70,6 +84,10 @@ pub mod exports {
 /// The host's functions the module imports.
 const HOST: &str = "blaze_proc_macro";
 
+/// What the first key of an expansion starts with: another when the key or the value is made
+/// otherwise.
+const DOMAIN: &str = "blaze wasm proc-macro expansion 2";
+
 /// The most memory one instance may have.
 const MEMORY: usize = 4 << 30;
 
@@ -102,6 +120,17 @@ pub(crate) struct State {
     buffer: Vec<u8>,
     output: Option<Vec<u8>>,
     panic: Option<String>,
+    /// Whether the expansion left what it allocated live for a later one.
+    retained: bool,
+    /// Whether the expansion learned of a span what neither its key nor [`State::asks`] says:
+    /// then it is not kept.
+    asked: bool,
+    /// The anchors and contexts of the input's spans, which a question is written against.
+    anchors: Vec<SpanAnchor>,
+    contexts: Vec<SyntaxContext>,
+    /// Each question the expansion asked of a span of its input and what it was answered, as a
+    /// read set has them ([`Value::read`]).
+    asks: Vec<(String, String)>,
     db: Option<Db>,
     limits: StoreLimits,
 }
@@ -116,15 +145,40 @@ impl State {
             buffer: Vec::new(),
             output: None,
             panic: None,
+            retained: false,
+            asked: false,
+            anchors: Vec::new(),
+            contexts: Vec::new(),
+            asks: Vec::new(),
             db: None,
             limits: StoreLimitsBuilder::new().memory_size(MEMORY).build(),
         }
     }
 
     fn ask(&mut self, req: SubRequest) -> Option<SubResponse> {
+        self.asked = true;
         let db = self.db?;
         // SAFETY: see `Db`.
         Some(load_cargo::answer(unsafe { &*db.0 }, req))
+    }
+
+    /// Asks the database `value` of `span`, and notes the question and its answer, or that
+    /// the expansion is not to be kept when the span has an anchor or a context the input has
+    /// not.
+    fn ask_value(&mut self, value: Value, span: Span) -> Option<SubResponse> {
+        // SAFETY: see `Db`.
+        let answer = self.db.map(|db| load_cargo::answer(unsafe { &*db.0 }, value.request(span)));
+        let anchor = self.anchors.iter().position(|it| *it == span.anchor);
+        let context = self.contexts.iter().position(|it| *it == span.ctx);
+        match anchor.zip(context) {
+            Some((anchor, context)) => {
+                let (start, end) = (span.range.start().into(), span.range.end().into());
+                let read = value.read([start, end, anchor as u32, context as u32]);
+                self.asks.push((read, value.said(answer.as_ref())));
+            }
+            None => self.asked = true,
+        }
+        answer
     }
 
     fn span(&self, number: u32) -> Option<Span> {
@@ -153,6 +207,14 @@ enum Value {
 }
 
 impl Value {
+    const ALL: [(Value, char); 5] = [
+        (Value::LineColumn, 'l'),
+        (Value::SourceText, 't'),
+        (Value::ByteRange, 'b'),
+        (Value::File, 'f'),
+        (Value::LocalFile, 'p'),
+    ];
+
     fn request(self, span: Span) -> SubRequest {
         let (file_id, ast_id) = (span.anchor.file_id.as_u32(), span.anchor.ast_id.into_raw());
         let (start, end) = (span.range.start().into(), span.range.end().into());
@@ -164,6 +226,48 @@ impl Value {
             Value::LocalFile => {
                 SubRequest::LocalFilePath { file_id: span.anchor.file_id.file_id().index() }
             }
+        }
+    }
+
+    /// The question of the span of `shape` (as [`Shapes`] writes one) as a read set has it:
+    /// a NUL first, which no path read has.
+    fn read(self, [start, end, anchor, context]: [u32; 4]) -> String {
+        let letter = Value::ALL.iter().find(|it| it.0 == self).map_or('?', |it| it.1);
+        format!("\0{letter}{start},{end},{anchor},{context}")
+    }
+
+    /// The question `read` (as [`Value::read`] wrote it) of the input that has the anchors and
+    /// contexts of `shapes`.
+    fn parse(read: &str, shapes: &Shapes) -> Option<(Value, Span)> {
+        let mut chars = read.strip_prefix('\0')?.chars();
+        let letter = chars.next()?;
+        let value = Value::ALL.iter().find(|it| it.1 == letter)?.0;
+        let mut fields = chars.as_str().split(',').map(|it| it.parse::<u32>().ok());
+        let mut next = || fields.next().flatten();
+        let (start, end, anchor, context) = (next()?, next()?, next()?, next()?);
+        let span = Span {
+            range: range(start, end),
+            anchor: *shapes.anchors.get(anchor as usize)?,
+            ctx: *shapes.contexts.get(context as usize)?,
+        };
+        Some((value, span))
+    }
+
+    /// What a read set has of `answer`: the same for the same answer, short.
+    fn said(self, answer: Option<&SubResponse>) -> String {
+        match answer {
+            Some(SubResponse::LineColumnResult { line, column }) => format!("{line}:{column}"),
+            Some(SubResponse::SourceTextResult { text: Some(text) }) => {
+                keyed::digest_bytes(text.as_bytes())
+            }
+            Some(SubResponse::ByteRangeResult { range }) => {
+                format!("{}..{}", range.start, range.end)
+            }
+            Some(SubResponse::FilePathResult { name }) => keyed::digest_bytes(name.as_bytes()),
+            Some(SubResponse::LocalFilePathResult { name: Some(name) }) => {
+                keyed::digest_bytes(name.as_bytes())
+            }
+            _ => "-".to_owned(),
         }
     }
 }
@@ -269,7 +373,7 @@ fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Span {
 }
 
 fn line_column(state: &mut State, span: Span) -> Option<(u32, u32)> {
-    match state.ask(Value::LineColumn.request(span))? {
+    match state.ask_value(Value::LineColumn, span)? {
         SubResponse::LineColumnResult { line, column } => Some((line, column)),
         _ => None,
     }
@@ -368,7 +472,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, a: u32, out: u32| -> wasmtime::Result<()> {
             let state = caller.data_mut();
             let Some(span) = state.span(a) else { return Ok(()) };
-            let range = match state.ask(Value::ByteRange.request(span)) {
+            let range = match state.ask_value(Value::ByteRange, span) {
                 Some(SubResponse::ByteRangeResult { range }) => range,
                 _ => usize::from(span.range.start())..usize::from(span.range.end()),
             };
@@ -392,14 +496,15 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     })?;
     linker.func_wrap(HOST, "span_debug", |mut caller: Caller<'_, State>, a: u32| {
         let state = caller.data_mut();
-        // Debug output uses this database's span numbering.
+        // What it says is of the database's numbering, which the key does not have.
+        state.asked = true;
         let text = state.span(a).map(|it| format!("{it:?}"));
         state.give(text)
     })?;
     linker.func_wrap(HOST, "span_file", |mut caller: Caller<'_, State>, a: u32| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
-        let name = match state.ask(Value::File.request(span)) {
+        let name = match state.ask_value(Value::File, span) {
             Some(SubResponse::FilePathResult { name }) => name,
             _ => String::new(),
         };
@@ -408,7 +513,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "span_local_file", |mut caller: Caller<'_, State>, a: u32| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
-        let name = match state.ask(Value::LocalFile.request(span)) {
+        let name = match state.ask_value(Value::LocalFile, span) {
             Some(SubResponse::LocalFilePathResult { name }) => name,
             _ => None,
         };
@@ -417,7 +522,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "span_source_text", |mut caller: Caller<'_, State>, a: u32| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
-        let text = match state.ask(Value::SourceText.request(span)) {
+        let text = match state.ask_value(Value::SourceText, span) {
             Some(SubResponse::SourceTextResult { text }) => text,
             _ => None,
         };
@@ -495,6 +600,9 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             Ok(())
         },
     )?;
+    linker.func_wrap(HOST, "retained", |mut caller: Caller<'_, State>, _bytes: u32| {
+        caller.data_mut().retained = true;
+    })?;
     Ok(())
 }
 
@@ -535,9 +643,12 @@ pub struct Call<'a> {
     pub mixed_site: Span,
 }
 
-/// What an expansion made and how long it took.
+/// How an expansion went: what it made, whether it was found kept, whether it left what it
+/// allocated live for a later one, and the time.
 pub struct Ran {
     pub output: Result<tt::TopSubtree, ProcMacroExpansionError>,
+    pub found: bool,
+    pub retained: bool,
     pub took: Duration,
 }
 
@@ -714,12 +825,35 @@ impl Wasm {
         let mut state = State::empty();
         state.files = wasi::Files::new(root.as_deref());
         state.env = guest_env(env);
+        self.instance_with(state, root)
+    }
+
+    /// A fresh instance whose host side starts as `state`.
+    fn instance_with(
+        &self,
+        state: State,
+        root: Option<PathBuf>,
+    ) -> Result<Session, ProcMacroExpansionError> {
         let mut store = Store::new(engine(), state);
         store.limiter(|state| &mut state.limits);
         let instance = self
             .instance(&mut store)
             .map_err(|e| ProcMacroExpansionError::System(format!("{e:#}")))?;
         Ok(Session { store, instance, root, failed: false })
+    }
+
+    /// Expands the macro at `index` of [`Wasm::macros`] in a fresh instance: what is kept of
+    /// it when the store has it, else by running it, and keeps what it made unless `store` is
+    /// `None` or the expansion left state behind.
+    pub fn expand(
+        &self,
+        index: u32,
+        listed: &Listed,
+        db: Option<&dyn SourceDatabase>,
+        call: &Call<'_>,
+        store: Option<&blaze_store::Store>,
+    ) -> Ran {
+        expand(&self.identity, &|| Ok(self), index, listed, db, call, store)
     }
 }
 
@@ -738,6 +872,8 @@ impl Session {
                 output: Err(ProcMacroExpansionError::System(
                     "an earlier expansion failed; the macro session cannot continue in this revision".to_owned(),
                 )),
+                found: false,
+                retained: false,
                 took: start.elapsed(),
             };
         }
@@ -747,6 +883,7 @@ impl Session {
         state.buffer.clear();
         state.output = None;
         state.panic = None;
+        state.retained = false;
         state.files.output.clear();
         let mut writer = Writer { out: Vec::new(), spans: &mut state.spans };
         writer.top(call.subtree);
@@ -774,7 +911,7 @@ impl Session {
         }
         let took = start.elapsed();
         RAN.add(took);
-        Ran { output, took }
+        Ran { output, found: false, retained: self.store.data().retained, took }
     }
 
     fn run(
@@ -1124,6 +1261,206 @@ fn placed(trees: Vec<Tree>, root: &Path) -> Vec<Tree> {
         .collect()
 }
 
+/// The spans of an expansion's input as its key has them: each its byte range and which of
+/// the input's anchors and contexts it has, numbered as they first appear. A kept output's
+/// spans are written the same way, so the next call, with other anchors and contexts in the
+/// same places, is given them back as its own.
+struct Shapes {
+    anchors: Vec<SpanAnchor>,
+    contexts: Vec<SyntaxContext>,
+    bytes: Vec<u8>,
+}
+
+fn position<T: PartialEq>(all: &mut Vec<T>, it: T) -> u32 {
+    let at = all.iter().position(|known| *known == it).unwrap_or_else(|| {
+        all.push(it);
+        all.len() - 1
+    });
+    at as u32
+}
+
+impl Shapes {
+    fn of(spans: &[Span]) -> Shapes {
+        let mut shapes = Shapes { anchors: Vec::new(), contexts: Vec::new(), bytes: Vec::new() };
+        for span in spans {
+            let anchor = position(&mut shapes.anchors, span.anchor);
+            let context = position(&mut shapes.contexts, span.ctx);
+            for it in [span.range.start().into(), span.range.end().into(), anchor, context] {
+                shapes.bytes.extend_from_slice(&u32::to_le_bytes(it));
+            }
+        }
+        shapes
+    }
+
+    /// What is kept of an output: the shapes of every span the expansion numbered, then the
+    /// output. `None` when one has an anchor or a context the input has not.
+    fn written(&self, spans: &Spans, output: &[u8]) -> Option<Vec<u8>> {
+        let mut value = Vec::new();
+        value.extend_from_slice(&(spans.all().len() as u32).to_le_bytes());
+        for span in spans.all() {
+            let anchor = self.anchors.iter().position(|it| *it == span.anchor)? as u32;
+            let context = self.contexts.iter().position(|it| *it == span.ctx)? as u32;
+            for it in [span.range.start().into(), span.range.end().into(), anchor, context] {
+                value.extend_from_slice(&u32::to_le_bytes(it));
+            }
+        }
+        value.extend_from_slice(output);
+        Some(value)
+    }
+
+    fn read(&self, value: &[u8]) -> Option<Vec<Tree>> {
+        let count = u32::from_le_bytes(value.get(..4)?.try_into().ok()?) as usize;
+        let table = value.get(4..4 + count.checked_mul(16)?)?;
+        let mut spans = Spans::default();
+        for shape in table.as_chunks::<16>().0 {
+            let field = |at: usize| u32::from_le_bytes(shape[at..at + 4].try_into().unwrap());
+            let span = Span {
+                range: range(field(0), field(4)),
+                anchor: *self.anchors.get(field(8) as usize)?,
+                ctx: *self.contexts.get(field(12) as usize)?,
+            };
+            spans.push(span);
+        }
+        Reader::new(&value[4 + count * 16..], &spans).stream().ok()
+    }
+}
+
+/// Expands the macro at `index` of a module whose expansions are kept under `identity` in a
+/// fresh instance: what is kept of it when the store has it, else by running it in what
+/// `wasm` gives, which is asked for only then, and keeps what it made unless `store` is `None`
+/// or the expansion left state behind.
+#[allow(clippy::too_many_arguments)]
+fn expand<'a>(
+    identity: &[u8; 32],
+    wasm: &dyn Fn() -> Result<&'a Wasm, String>,
+    index: u32,
+    listed: &Listed,
+    db: Option<&dyn SourceDatabase>,
+    call: &Call<'_>,
+    store: Option<&blaze_store::Store>,
+) -> Ran {
+    let start = Instant::now();
+    let root = package_dir(call.env);
+    let env = guest_env(call.env);
+    // The module's `def_site`, `call_site` and `mixed_site` are 1, 2 and 3, the same
+    // spans or not.
+    let mut spans = Spans::default();
+    for span in [call.def_site, call.call_site, call.mixed_site] {
+        spans.push(span);
+    }
+    let mut writer = Writer { out: Vec::new(), spans: &mut spans };
+    writer.top(call.subtree);
+    let input = std::mem::take(&mut writer.out);
+    let attr = call.attrs.map(|it| {
+        writer.top(it);
+        std::mem::take(&mut writer.out)
+    });
+    // rust-analyzer gives an attribute written without arguments (`#[twice]`) none.
+    let attr = match listed.kind {
+        ProcMacroKind::Attr => Some(attr.unwrap_or_else(|| 0u32.to_le_bytes().to_vec())),
+        _ => attr,
+    };
+    let shapes = Shapes::of(spans.all());
+    let mut first = keyed::Key::new(DOMAIN);
+    first.field(identity).field(listed.name.as_bytes()).field(&[listed.kind as u8]);
+    first.field(&input).field(attr.as_deref().unwrap_or(b"-")).field(&shapes.bytes);
+    for (name, value) in &env {
+        first.field(name.as_bytes()).field(value.as_bytes());
+    }
+    let first = first.done();
+    let restore = |trees: Vec<Tree>| {
+        let trees = match &root {
+            Some(root) => placed(trees, root),
+            None => trees,
+        };
+        wire::top_subtree(trees, call.call_site)
+    };
+    // A module given no package has nothing to read. A question asked of a span is asked of
+    // this call's span in its place.
+    let now = |read: &str| match Value::parse(read, &shapes) {
+        Some((value, span)) => {
+            value.said(db.map(|db| load_cargo::answer(db, value.request(span))).as_ref())
+        }
+        None if read.starts_with('\0') => "?".to_owned(),
+        None => root.as_deref().map_or("-".to_owned(), |it| keyed::now(it, read)),
+    };
+    if let Some(store) = store
+        && let Some(kept) = keyed::find(store, &first, &now)
+        && let Some(trees) = shapes.read(&kept)
+    {
+        FOUND.add(start.elapsed());
+        let took = start.elapsed();
+        return Ran { output: Ok(restore(trees)), found: true, retained: false, took };
+    }
+    let ran = wasm().map_err(ProcMacroExpansionError::System).and_then(|wasm| {
+        let mut state = State::empty();
+        state.anchors = shapes.anchors.clone();
+        state.contexts = shapes.contexts.clone();
+        state.spans = spans;
+        state.sites = [1, 2, 3];
+        state.files = wasi::Files::new(root.as_deref());
+        state.env = env;
+        let mut instance = wasm.instance_with(state, root.clone())?;
+        let output = instance.run(index, db, &input, attr.as_deref())?;
+        Ok((instance.store.into_data(), output))
+    });
+    let mut retained = false;
+    let output = ran.and_then(|(state, output)| {
+        let trees = Reader::new(&output, &state.spans)
+            .stream()
+            .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
+        retained = state.retained;
+        if state.asked {
+            ASKED.add(Duration::ZERO);
+        }
+        if let Some(store) = store
+            && !state.asked
+            && !state.retained
+            && let Some(value) = shapes.written(&state.spans, &output)
+        {
+            let mut reads: Vec<(String, String)> = state.files.reads.into_iter().collect();
+            reads.extend(state.asks);
+            keyed::keep(store, &first, &reads, &value);
+            KEPT.store(true, Ordering::Relaxed);
+        }
+        Ok(restore(trees))
+    });
+    RAN.add(start.elapsed());
+    Ran { output, found: false, retained, took: start.elapsed() }
+}
+
+/// What blaze has seen of a module's expansions, kept in the store under the module's digest
+/// ([`verdict_key`]) for every process and machine that loads the same module.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Verdict {
+    /// None has run in any process that told the store.
+    Unseen,
+    /// Some ran, in a build, and none left what it allocated live.
+    Stateless,
+    /// One left what it allocated live, for a later one to find.
+    Stateful,
+}
+
+const STATELESS: &[u8] = b"stateless";
+const STATEFUL: &[u8] = b"stateful";
+
+fn verdict_key(digest: &[u8; 32]) -> [u8; 32] {
+    let mut key = keyed::Key::new("whether a proc-macro module keeps state 1");
+    key.field(digest);
+    key.done()
+}
+
+fn verdict(digest: &[u8; 32]) -> Verdict {
+    match store().and_then(|it| it.get_lasting(&verdict_key(digest))).as_deref() {
+        Some(STATELESS) => Verdict::Stateless,
+        Some(STATEFUL) => Verdict::Stateful,
+        _ => Verdict::Unseen,
+    }
+}
+
+/// The modules loaded in this process, for [`flush`] to tell the store what it saw of them.
+static MODULES: Mutex<Vec<std::sync::Weak<Lazy>>> = Mutex::new(Vec::new());
+
 /// A macro of a module, as rust-analyzer expands it.
 pub struct Expander {
     wasm: AssertUnwindSafe<Arc<Lazy>>,
@@ -1136,6 +1473,13 @@ struct Lazy {
     path: PathBuf,
     known: Known,
     compiled: OnceLock<Result<Arc<Wasm>, String>>,
+    /// What the store said of it when it was loaded, which decides for as long as it is:
+    /// whether a macro needs a session is asked of the database's queries, which must not
+    /// see it change.
+    verdict: Verdict,
+    /// Whether one of its expansions ran in this process, and whether one left state.
+    ran: AtomicBool,
+    retained: AtomicBool,
     /// Each crate's session has its own lock, so crates expand the library at once.
     sessions: Mutex<FxHashMap<(Nonce, Crate), (salsa::Revision, Slot)>>,
 }
@@ -1144,12 +1488,56 @@ struct Lazy {
 type Slot = Arc<Mutex<Option<Result<Session, String>>>>;
 
 impl Lazy {
+    fn new(path: &Path, known: Known) -> Lazy {
+        Lazy {
+            path: path.to_owned(),
+            known,
+            compiled: OnceLock::new(),
+            verdict: verdict(&known.digest),
+            ran: AtomicBool::new(false),
+            retained: AtomicBool::new(false),
+            sessions: Mutex::new(FxHashMap::default()),
+        }
+    }
+
     fn get(&self) -> Result<&Arc<Wasm>, String> {
         let compiled =
             self.compiled.get_or_init(|| Wasm::known(&self.path, self.known, None, store()));
         let wasm = compiled.as_ref().map_err(Clone::clone)?;
         wasm.keep_code(store());
         Ok(wasm)
+    }
+
+    /// Whether its macros expand in a session: unless the store says none of its expansions
+    /// left state.
+    fn stateful(&self) -> bool {
+        self.verdict != Verdict::Stateless
+    }
+
+    /// Notes what an expansion that ran did. One that left state is told the store at once;
+    /// that none did, by [`flush`], once a build has run them.
+    fn saw(&self, ran: &Ran) {
+        if ran.found || ran.output.is_err() {
+            return;
+        }
+        if !ran.retained {
+            self.ran.store(true, Ordering::Relaxed);
+            return;
+        }
+        if self.retained.swap(true, Ordering::Relaxed) || self.verdict == Verdict::Stateful {
+            return;
+        }
+        if let Some(store) = store() {
+            store.insert_lasting(&verdict_key(&self.known.digest), STATEFUL);
+            store.flush();
+        }
+        if !self.stateful() {
+            eprintln!(
+                "blaze: the proc macros of {} keep state between expansions, which the store \
+                 said they did not: they expand in a session from the next load",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -1189,20 +1577,65 @@ impl Count {
     }
 }
 
+/// Whether an expansion was kept since [`flush`].
+static KEPT: AtomicBool = AtomicBool::new(false);
+
+/// Expansions run in a module, with the time each took from its call.
 static RAN: Count = Count::new();
+/// Expansions the store had, with the time each took from its call.
+static FOUND: Count = Count::new();
+/// Expansions run that were not kept, as they asked the database.
+static ASKED: Count = Count::new();
+/// Modules made ready to run in this process (machine code loaded or compiled, linked).
 static LOADED: Count = Count::new();
 
-/// Expansion and module-loading statistics, absent before the first expansion.
+/// The expansions so far, for the daemon's log: `None` before the first.
 pub fn report() -> Option<String> {
     let (ran, running) = RAN.get();
-    if ran == 0 {
+    let (found, finding) = FOUND.get();
+    if ran + found == 0 {
         return None;
     }
     let (loaded, loading) = LOADED.get();
-    Some(format!(
-        "wasm proc macros: {ran} ran in {running:.3}s, 0 from the store in 0.000s, \
-         {loaded} modules loaded in {loading:.3}s"
-    ))
+    let mut said = format!(
+        "wasm proc macros: {ran} ran in {running:.3}s, {found} from the store in \
+         {finding:.3}s, {loaded} modules loaded in {loading:.3}s"
+    );
+    let (asked, _) = ASKED.get();
+    if asked != 0 {
+        said += &format!("; {asked} not kept, as they asked the database");
+    }
+    let modules = MODULES.lock().unwrap_or_else(|e| e.into_inner());
+    let sessions = modules.iter().filter_map(std::sync::Weak::upgrade).filter(|it| it.stateful());
+    let sessions = sessions.count();
+    if sessions != 0 {
+        said += &format!("; {sessions} modules expand in sessions (keep state or not seen yet)");
+    }
+    Some(said)
+}
+
+/// Writes out the expansions kept since the last call, and that a module whose expansions
+/// ran and none of which left state is stateless, for the next process to find: the store
+/// holds what is added in memory until it is flushed.
+pub fn flush() {
+    let Some(store) = store() else { return };
+    let mut told = KEPT.swap(false, Ordering::Relaxed);
+    let mut modules = MODULES.lock().unwrap_or_else(|e| e.into_inner());
+    modules.retain(|it| it.strong_count() != 0);
+    for lazy in modules.iter().filter_map(std::sync::Weak::upgrade) {
+        // Another process that saw one leave state may have told the store since the load.
+        if lazy.verdict == Verdict::Unseen
+            && lazy.ran.swap(false, Ordering::Relaxed)
+            && !lazy.retained.load(Ordering::Relaxed)
+            && verdict(&lazy.known.digest) == Verdict::Unseen
+        {
+            store.insert_lasting(&verdict_key(&lazy.known.digest), STATELESS);
+            told = true;
+        }
+    }
+    if told {
+        store.flush();
+    }
 }
 
 /// The store, once the daemon has told it the toolchain.
@@ -1216,21 +1649,40 @@ fn store() -> Option<&'static blaze_store::Store> {
 
 impl ProcMacroExpander for Expander {
     fn requires_session(&self) -> bool {
-        true
+        self.wasm.stateful()
     }
 
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
-        _: &tt::TopSubtree,
-        _: Option<&tt::TopSubtree>,
-        _: &Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        db: &dyn SourceDatabase,
+        subtree: &tt::TopSubtree,
+        attrs: Option<&tt::TopSubtree>,
+        env: &Env,
+        def_site: Span,
+        call_site: Span,
+        mixed_site: Span,
+        _current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
-        Err(ProcMacroExpansionError::System("WASM expansion requires a calling crate".to_owned()))
+        if self.wasm.stateful() {
+            return Err(ProcMacroExpansionError::System(
+                "a proc macro that keeps state expands only for a calling crate".to_owned(),
+            ));
+        }
+        let call = Call { subtree, attrs, env, def_site, call_site, mixed_site };
+        // What its expansions are kept under is known without the module when the list file
+        // says: then one the store has neither loads nor compiles it.
+        let wasm = || self.wasm.get().map(|it| &**it);
+        let ran = match self.wasm.known.identity {
+            Some(identity) => {
+                expand(&identity, &wasm, self.index, &self.listed, Some(db), &call, store())
+            }
+            None => match wasm() {
+                Ok(wasm) => wasm.expand(self.index, &self.listed, Some(db), &call, store()),
+                Err(e) => return Err(ProcMacroExpansionError::System(e)),
+            },
+        };
+        self.wasm.saw(&ran);
+        ran.output
     }
 
     fn expand_in(
@@ -1243,8 +1695,20 @@ impl ProcMacroExpander for Expander {
         def_site: Span,
         call_site: Span,
         mixed_site: Span,
-        _current_dir: String,
+        current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        if !self.wasm.stateful() {
+            return self.expand(
+                db,
+                subtree,
+                attrs,
+                env,
+                def_site,
+                call_site,
+                mixed_site,
+                current_dir,
+            );
+        }
         // A new revision must rerun unchanged registrations before changed uses.
         db.report_untracked_read();
         let (nonce, revision) = db.nonce_and_revision();
@@ -1263,7 +1727,9 @@ impl ProcMacroExpander for Expander {
         });
         let session = session.as_mut().map_err(|e| ProcMacroExpansionError::System(e.clone()))?;
         let call = Call { subtree, attrs, env, def_site, call_site, mixed_site };
-        session.expand(self.index, &self.listed, Some(db), &call).output
+        let ran = session.expand(self.index, &self.listed, Some(db), &call);
+        self.wasm.saw(&ran);
+        ran.output
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
@@ -1289,31 +1755,19 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
     };
     let path: &Path = path.as_ref();
     let (lazy, text) = match listing(path) {
-        Some((known, text)) => (
-            Lazy {
-                path: path.to_owned(),
-                known,
-                compiled: OnceLock::new(),
-                sessions: Mutex::new(FxHashMap::default()),
-            },
-            text,
-        ),
+        Some((known, text)) => (Lazy::new(path, known), text),
         None => {
             let wasm = Wasm::at(path, store()).map_err(failed)?;
             let text = wasm.list().map_err(failed)?;
             list(path, &wasm, &text);
             let known = Known { digest: wasm.digest, identity: Some(wasm.identity) };
-            let lazy = Lazy {
-                path: path.to_owned(),
-                known,
-                compiled: OnceLock::new(),
-                sessions: Mutex::new(FxHashMap::default()),
-            };
+            let lazy = Lazy::new(path, known);
             _ = lazy.compiled.set(Ok(wasm));
             (lazy, text)
         }
     };
     let lazy = Arc::new(lazy);
+    MODULES.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&lazy));
     Ok(listed(&text)
         .into_iter()
         .enumerate()
@@ -1447,6 +1901,24 @@ mod tests {
     }
 
     #[test]
+    fn a_question_of_a_span_is_asked_again_of_the_span_in_its_place() {
+        let asked = span(3, 9);
+        let read = Value::LineColumn.read([3, 9, 0, 0]);
+        let (value, again) = Value::parse(&read, &Shapes::of(&[asked])).unwrap();
+        assert!(value == Value::LineColumn);
+        assert_eq!(again, asked);
+        // The next call's span in the same place, of another anchor.
+        let mut moved = asked;
+        moved.anchor.ast_id = ErasedFileAstId::from_raw(5);
+        assert_eq!(Value::parse(&read, &Shapes::of(&[moved])).unwrap().1, moved);
+        assert!(Value::parse(&Value::File.read([0, 0, 1, 0]), &Shapes::of(&[asked])).is_none());
+        assert!(Value::parse("src/lib.rs", &Shapes::of(&[asked])).is_none());
+        let answer = SubResponse::LineColumnResult { line: 3, column: 4 };
+        assert_eq!(Value::LineColumn.said(Some(&answer)), "3:4");
+        assert_eq!(Value::SourceText.said(None), "-");
+    }
+
+    #[test]
     fn a_subspan_is_of_the_span_and_within_it() {
         let it = span(10, 20);
         // Unbounded, included and excluded bounds as the module writes them.
@@ -1479,6 +1951,41 @@ mod tests {
 
     fn files_resolve(files: &wasi::Files, rel: &str, path: &str) -> Result<String, i32> {
         files.resolve_for_test(rel, path)
+    }
+
+    #[test]
+    fn an_expansion_is_found_while_what_it_read_is_as_it_was() {
+        let dir = scratch("keyed");
+        let package = dir.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("schema.json"), "1").unwrap();
+        blaze_store::compiles_against("blaze-macro-wasm tests");
+        let open = || blaze_store::Store::open_at(&dir.join("store")).unwrap();
+        let first = keyed::Key::new("test").done();
+        let now = |read: &str| keyed::now(&package, read);
+        let reads = vec![
+            ("schema.json".to_owned(), keyed::digest_of(&package.join("schema.json"))),
+            (keyed::kind("missing"), "-".to_owned()),
+        ];
+        {
+            let store = open();
+            assert!(keyed::find(&store, &first, &now).is_none());
+            keyed::keep(&store, &first, &reads, b"one");
+            store.flush();
+        }
+        assert_eq!(keyed::find(&open(), &first, &now).unwrap(), b"one");
+        std::fs::write(package.join("schema.json"), "2").unwrap();
+        assert!(keyed::find(&open(), &first, &now).is_none(), "a file it read changed");
+        std::fs::write(package.join("schema.json"), "1").unwrap();
+        std::fs::create_dir_all(package.join("missing")).unwrap();
+        assert!(keyed::find(&open(), &first, &now).is_none(), "what it found missing is there");
+        std::fs::remove_dir_all(package.join("missing")).unwrap();
+        // The same package elsewhere, as on another machine, finds it.
+        let moved = dir.join("moved");
+        std::fs::rename(&package, &moved).unwrap();
+        let now = |read: &str| keyed::now(&moved, read);
+        assert_eq!(keyed::find(&open(), &first, &now).unwrap(), b"one");
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

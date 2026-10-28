@@ -14,6 +14,30 @@ fn size_of() {
 }
 
 #[test]
+fn variant_count() {
+    let fixture = |goal: &str| {
+        format!(
+            r#"
+        #[rustc_intrinsic]
+        pub fn variant_count<T>() -> usize;
+
+        enum Three {{ A, B(u8), C {{ c: i32 }} }}
+        enum Never {{}}
+        struct One(u8);
+        union Both {{ a: u8, b: u16 }}
+
+        {goal}
+        "#
+        )
+    };
+    check_number(&fixture("const GOAL: usize = variant_count::<Three>();"), 3);
+    check_number(&fixture("const GOAL: usize = variant_count::<Never>();"), 0);
+    check_number(&fixture("const GOAL: usize = variant_count::<One>();"), 1);
+    check_number(&fixture("const GOAL: usize = variant_count::<Both>();"), 1);
+    check_number(&fixture("const GOAL: usize = variant_count::<u8>();"), 0);
+}
+
+#[test]
 fn size_of_val() {
     check_number(
         r#"
@@ -498,6 +522,27 @@ fn wrapping_add() {
 }
 
 #[test]
+fn compare_bytes() {
+    check_number(
+        r#"
+        #[rustc_intrinsic]
+        pub const unsafe fn compare_bytes(left: *const u8, right: *const u8, bytes: usize) -> i32;
+
+        const GOAL: i32 = unsafe {
+            let a = [1u8, 2, 3, 4];
+            let b = [1u8, 2, 4, 0];
+            let lt = compare_bytes(&a as *const [u8; 4] as *const u8, &b as *const [u8; 4] as *const u8, 4);
+            let eq = compare_bytes(&a as *const [u8; 4] as *const u8, &b as *const [u8; 4] as *const u8, 2);
+            let gt = compare_bytes(&b as *const [u8; 4] as *const u8, &a as *const [u8; 4] as *const u8, 3);
+            let none = compare_bytes(&a as *const [u8; 4] as *const u8, &b as *const [u8; 4] as *const u8, 0);
+            (lt + 2) * 1000 + (eq + 2) * 100 + (gt + 2) * 10 + none + 2
+        };
+        "#,
+        1232,
+    );
+}
+
+#[test]
 fn ptr_offset_from() {
     check_number(
         r#"
@@ -579,6 +624,48 @@ fn allocator() {
         "#,
         55,
     );
+}
+
+#[test]
+fn unchecked_arithmetic() {
+    let fixture = |goal: &str| {
+        format!(
+            r#"
+        #[rustc_intrinsic]
+        pub fn unchecked_add<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_mul<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_div<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_rem<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn exact_div<T>(x: T, y: T) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_shl<T, U>(x: T, y: U) -> T;
+        #[rustc_intrinsic]
+        pub fn unchecked_shr<T, U>(x: T, y: U) -> T;
+
+        {goal}
+        "#
+        )
+    };
+    let undefined = |e: ConstEvalError<'_>| {
+        matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_)))
+    };
+    check_number(&fixture("const GOAL: u8 = unchecked_add(200u8, 55);"), 255);
+    check_number(&fixture("const GOAL: i8 = unchecked_mul(-64i8, 2);"), -128);
+    check_number(&fixture("const GOAL: i32 = exact_div(-6i32, 3);"), -2);
+    check_number(&fixture("const GOAL: u8 = unchecked_shl(1u8, 7u32);"), 128);
+    check_number(&fixture("const GOAL: i8 = unchecked_shr(-128i8, 7u32);"), -1);
+    check_number(&fixture("const GOAL: u8 = unchecked_rem(7u8, 4);"), 3);
+    check_fail(&fixture("const GOAL: u8 = unchecked_add(200u8, 56);"), undefined);
+    check_fail(&fixture("const GOAL: i8 = unchecked_mul(-64i8, -2);"), undefined);
+    check_fail(&fixture("const GOAL: i8 = unchecked_div(-128i8, -1);"), undefined);
+    check_fail(&fixture("const GOAL: i32 = exact_div(7i32, 2);"), undefined);
+    check_fail(&fixture("const GOAL: u8 = unchecked_rem(7u8, 0);"), undefined);
+    check_fail(&fixture("const GOAL: u8 = unchecked_shl(1u8, 8u32);"), undefined);
+    check_fail(&fixture("const GOAL: u8 = unchecked_shr(1u8, -1i32);"), undefined);
 }
 
 #[test]
@@ -1031,7 +1118,7 @@ fn simd() {
         #[rustc_intrinsic]
         pub fn simd_bitmask<T, U>(x: T) -> U;
         const GOAL: u16 = simd_bitmask(i8x16(
-            0, 1, 0, 0, 2, 255, 100, 0, 50, 0, 1, 1, 0, 0, 0, 0
+            0, -1, 0, 0, -1, -1, -1, 0, -1, 0, -1, -1, 0, 0, 0, 0
         ));
         "#,
         0b0000110101110010,
@@ -1055,5 +1142,638 @@ fn simd() {
         ));
         "#,
         0xFFFF,
+    );
+}
+
+const SIMD: &str = r#"
+    #[repr(simd)] pub struct i8x4([i8; 4]);
+    #[repr(simd)] pub struct u8x4([u8; 4]);
+    #[repr(simd)] pub struct i8x16([i8; 16]);
+    #[repr(simd)] pub struct i32x4([i32; 4]);
+    #[repr(simd)] pub struct u32x4([u32; 4]);
+    #[repr(simd)] pub struct f32x2([f32; 2]);
+    #[repr(simd)] pub struct f32x4([f32; 4]);
+    #[repr(simd)] pub struct f64x2([f64; 2]);
+    #[repr(simd)] pub struct usizex2([usize; 2]);
+    #[repr(simd)] pub struct isizex2([isize; 2]);
+    #[repr(simd)] pub struct isizex4([isize; 4]);
+    #[repr(simd)] pub struct ptrx2([*const i32; 2]);
+    #[repr(simd)] pub struct bptrx2([*const u8; 2]);
+    #[repr(simd)] pub struct ptrx4([*const i32; 4]);
+    #[repr(simd)] pub struct mptrx4([*mut i32; 4]);
+    pub enum SimdAlign { Unaligned = 0, Element = 1, Vector = 2 }
+
+    #[rustc_intrinsic] pub const unsafe fn simd_add<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_sub<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_mul<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_div<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_rem<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_shl<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_shr<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_funnel_shl<T>(a: T, b: T, shift: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_funnel_shr<T>(a: T, b: T, shift: T) -> T;
+    #[rustc_intrinsic] pub unsafe fn simd_carryless_mul<T>(a: T, b: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_neg<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_saturating_add<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_saturating_sub<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_bswap<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_bitreverse<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_ctlz<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_cttz<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_ctpop<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_fabs<T>(x: T) -> T;
+    #[rustc_intrinsic] pub unsafe fn simd_fsqrt<T>(x: T) -> T;
+    #[rustc_intrinsic] pub unsafe fn simd_fsin<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_ceil<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_floor<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_round<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_round_ties_even<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_trunc<T>(x: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_fma<T>(x: T, y: T, z: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_relaxed_fma<T>(x: T, y: T, z: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_minimum_number_nsz<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_maximum_number_nsz<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_fmin<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_eq<T, U>(x: T, y: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_ne<T, U>(x: T, y: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_lt<T, U>(x: T, y: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_le<T, U>(x: T, y: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_gt<T, U>(x: T, y: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_ge<T, U>(x: T, y: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_cast<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_as<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_cast_ptr<T, U>(ptr: T) -> U;
+    #[rustc_intrinsic] pub unsafe fn simd_expose_provenance<T, U>(ptr: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_with_exposed_provenance<T, U>(addr: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_arith_offset<T, U>(ptr: T, offset: U) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_select<M, T>(mask: M, yes: T, no: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_select_bitmask<M, T>(m: M, yes: T, no: T) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_bitmask<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_extract<T, U>(x: T, idx: u32) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_extract_dyn<T, U>(x: T, idx: u32) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_insert<T, U>(x: T, idx: u32, val: U) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_insert_dyn<T, U>(x: T, idx: u32, val: U) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_add_ordered<T, U>(x: T, y: U) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_mul_ordered<T, U>(x: T, y: U) -> U;
+    #[rustc_intrinsic] pub unsafe fn simd_reduce_add_unordered<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub unsafe fn simd_reduce_mul_unordered<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_and<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_or<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_xor<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_min<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_max<T, U>(x: T) -> U;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_all<T>(x: T) -> bool;
+    #[rustc_intrinsic] pub const unsafe fn simd_reduce_any<T>(x: T) -> bool;
+    #[rustc_intrinsic] pub const unsafe fn simd_shuffle<T, U, V>(x: T, y: T, idx: U) -> V;
+    #[rustc_intrinsic] pub const unsafe fn simd_splat<T, U>(value: U) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_gather<T, U, V>(val: T, ptr: U, mask: V) -> T;
+    #[rustc_intrinsic] pub const unsafe fn simd_scatter<T, U, V>(val: T, ptr: U, mask: V);
+    #[rustc_intrinsic]
+    pub const unsafe fn simd_masked_load<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T) -> T;
+    #[rustc_intrinsic]
+    pub const unsafe fn simd_masked_store<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T);
+"#;
+
+fn with_simd(goal: &str) -> String {
+    format!("{SIMD}\n    {goal}")
+}
+
+/// What `check_number` compares a vector with: the number whose little-endian bytes are its
+/// lanes'.
+fn lanes<const N: usize, const B: usize>(lanes: [[u8; B]; N]) -> i128 {
+    let mut bytes = [0; 16];
+    bytes[..N * B].copy_from_slice(lanes.as_flattened());
+    i128::from_le_bytes(bytes)
+}
+
+fn i8s(it: [i8; 4]) -> i128 {
+    lanes(it.map(i8::to_le_bytes))
+}
+
+fn u8s(it: [u8; 4]) -> i128 {
+    lanes(it.map(u8::to_le_bytes))
+}
+
+fn i32s(it: [i32; 4]) -> i128 {
+    lanes(it.map(i32::to_le_bytes))
+}
+
+fn u32s(it: [u32; 4]) -> i128 {
+    lanes(it.map(u32::to_le_bytes))
+}
+
+fn f32s(it: [f32; 4]) -> i128 {
+    lanes(it.map(f32::to_le_bytes))
+}
+
+fn f64s(it: [f64; 2]) -> i128 {
+    lanes(it.map(f64::to_le_bytes))
+}
+
+const NAN32: f32 = f32::from_bits(0x7fc0_0000);
+const NAN64: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
+
+fn is_ub(e: ConstEvalError<'_>) -> bool {
+    matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_)))
+}
+
+#[test]
+fn simd_int_arithmetic() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    check(
+        "const GOAL: i32x4 = unsafe { simd_add(i32x4([1, 2, 3, 2147483647]), i32x4([4, 5, 6, 1])) };",
+        i32s([5, 7, 9, i32::MIN]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_sub(i32x4([1, 2, 3, -2147483647 - 1]), i32x4([4, 5, 6, 1])) };",
+        i32s([-3, -3, -3, i32::MAX]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_mul(i32x4([3, -4, 65536, 7]), i32x4([5, 6, 65536, -1])) };",
+        i32s([15, -24, 0, -7]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_div(i32x4([7, -7, 7, -7]), i32x4([2, 2, -2, -2])) };",
+        i32s([3, -3, -3, 3]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_rem(i32x4([7, -7, 7, -7]), i32x4([2, 2, -2, -2])) };",
+        i32s([1, -1, 1, -1]),
+    );
+    check(
+        "const GOAL: u32x4 = unsafe { simd_div(u32x4([4294967295, 7, 0, 9]), u32x4([2, 7, 3, 10])) };",
+        u32s([2147483647, 1, 0, 0]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_neg(i32x4([1, -2, 0, -2147483647 - 1])) };",
+        i32s([-1, 2, 0, i32::MIN]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_shl(i32x4([1, -1, 3, 1]), i32x4([0, 4, 30, 31])) };",
+        i32s([1, -16, -1073741824, i32::MIN]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_shr(i32x4([-16, 16, -1, -2147483647 - 1]), i32x4([2, 2, 31, 31])) };",
+        i32s([-4, 4, -1, -1]),
+    );
+    check(
+        "const GOAL: u32x4 = unsafe { simd_shr(u32x4([2147483648, 16, 4294967295, 1]), u32x4([31, 2, 28, 0])) };",
+        u32s([1, 4, 15, 1]),
+    );
+    check(
+        "const GOAL: i8x4 = unsafe { simd_saturating_add(i8x4([100, -100, 1, 127]), i8x4([100, -100, 2, 0])) };",
+        i8s([127, -128, 3, 127]),
+    );
+    check(
+        "const GOAL: i8x4 = unsafe { simd_saturating_sub(i8x4([-100, 100, 5, -127 - 1]), i8x4([100, -100, 7, 1])) };",
+        i8s([-128, 127, -2, -128]),
+    );
+    check(
+        "const GOAL: u8x4 = unsafe { simd_saturating_add(u8x4([200, 1, 255, 0]), u8x4([100, 2, 1, 0])) };",
+        u8s([255, 3, 255, 0]),
+    );
+    check(
+        "const GOAL: u8x4 = unsafe { simd_saturating_sub(u8x4([5, 1, 0, 255]), u8x4([10, 1, 1, 0])) };",
+        u8s([0, 0, 0, 255]),
+    );
+    check(
+        "const GOAL: u8x4 = unsafe { simd_funnel_shl(u8x4([18, 255, 128, 1]), u8x4([52, 0, 1, 128]), u8x4([4, 0, 7, 1])) };",
+        u8s([0x23, 0xff, 0x00, 0x03]),
+    );
+    check(
+        "const GOAL: u8x4 = unsafe { simd_funnel_shr(u8x4([18, 255, 128, 1]), u8x4([52, 0, 1, 128]), u8x4([4, 0, 7, 1])) };",
+        u8s([0x23, 0x00, 0x00, 0xc0]),
+    );
+    check(
+        "const GOAL: u8x4 = unsafe { simd_carryless_mul(u8x4([3, 255, 128, 5]), u8x4([3, 2, 2, 5])) };",
+        u8s([5, 0xfe, 0, 17]),
+    );
+}
+
+#[test]
+fn simd_int_undefined_behavior() {
+    let check = |goal: &str| check_fail(&with_simd(goal), is_ub);
+    check("const GOAL: i32x4 = unsafe { simd_div(i32x4([1, 1, 1, 1]), i32x4([1, 0, 1, 1])) };");
+    check("const GOAL: u32x4 = unsafe { simd_rem(u32x4([1, 1, 1, 1]), u32x4([1, 1, 1, 0])) };");
+    check(
+        "const GOAL: i32x4 = unsafe { simd_div(i32x4([-2147483647 - 1, 1, 1, 1]), i32x4([-1, 1, 1, 1])) };",
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_rem(i32x4([1, -2147483647 - 1, 1, 1]), i32x4([1, -1, 1, 1])) };",
+    );
+    check("const GOAL: i32x4 = unsafe { simd_shl(i32x4([1, 1, 1, 1]), i32x4([0, 32, 0, 0])) };");
+    check("const GOAL: i32x4 = unsafe { simd_shr(i32x4([1, 1, 1, 1]), i32x4([0, 0, -1, 0])) };");
+    check("const GOAL: u8x4 = unsafe { simd_shr(u8x4([1, 1, 1, 1]), u8x4([8, 0, 0, 0])) };");
+    check(
+        "const GOAL: u8x4 = unsafe { simd_funnel_shl(u8x4([1, 1, 1, 1]), u8x4([1, 1, 1, 1]), u8x4([0, 8, 0, 0])) };",
+    );
+}
+
+#[test]
+fn simd_int_bits() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    check(
+        "const GOAL: u32x4 = unsafe { simd_bswap(u32x4([0x12345678, 0, 0xff, 1])) };",
+        u32s([0x78563412, 0, 0xff000000, 0x01000000]),
+    );
+    check(
+        "const GOAL: u8x4 = unsafe { simd_bitreverse(u8x4([1, 0x80, 0x0f, 0x16])) };",
+        u8s([0x80, 1, 0xf0, 0x68]),
+    );
+    check(
+        "const GOAL: u32x4 = unsafe { simd_ctlz(u32x4([0, 1, 0x80000000, 0xffff])) };",
+        u32s([32, 31, 0, 16]),
+    );
+    check(
+        "const GOAL: u32x4 = unsafe { simd_cttz(u32x4([0, 1, 0x80000000, 0x100])) };",
+        u32s([32, 0, 31, 8]),
+    );
+    check(
+        "const GOAL: i8x4 = unsafe { simd_ctpop(i8x4([-1, 0, 7, -127 - 1])) };",
+        i8s([8, 0, 3, 1]),
+    );
+}
+
+#[test]
+fn simd_float_arithmetic() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    let args = "f32x4([1.5, 0.1, 1e30, 0.0]), f32x4([2.25, 0.2, 1e30, 0.0])";
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_add({args}) }};"),
+        f32s([1.5 + 2.25, 0.1 + 0.2, 1e30 + 1e30, 0.0]),
+    );
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_sub({args}) }};"),
+        f32s([1.5 - 2.25, 0.1 - 0.2, 0.0, 0.0]),
+    );
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_mul({args}) }};"),
+        f32s([1.5 * 2.25, 0.1 * 0.2, f32::INFINITY, 0.0]),
+    );
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_div({args}) }};"),
+        f32s([1.5 / 2.25, 0.1 / 0.2, 1.0, NAN32]),
+    );
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_rem({args}) }};"),
+        f32s([1.5, 0.1, 0.0, NAN32]),
+    );
+    check(
+        "const GOAL: f64x2 = unsafe { simd_add(f64x2([0.1, 1e308]), f64x2([0.2, 1e308])) };",
+        f64s([0.1 + 0.2, f64::INFINITY]),
+    );
+    check(
+        "const GOAL: f32x4 = unsafe { simd_fsqrt(f32x4([2.0, 4.0, -1.0, 0.0])) };",
+        f32s([f32::from_bits(0x3fb5_04f3), 2.0, NAN32, 0.0]),
+    );
+    check(
+        "const GOAL: f64x2 = unsafe { simd_fsqrt(f64x2([2.0, -0.0])) };",
+        f64s([2f64.sqrt(), -0.0]),
+    );
+    let fma =
+        "f32x4([0.1, 2.0, 1e30, 1.0]), f32x4([10.0, 3.0, 1e30, 0.0]), f32x4([-1.0, 1.0, 1.0, 5.0])";
+    let fused = f32s([0.1f32.mul_add(10.0, -1.0), 7.0, f32::INFINITY, 5.0]);
+    check(&format!("const GOAL: f32x4 = unsafe {{ simd_fma({fma}) }};"), fused);
+    check(&format!("const GOAL: f32x4 = unsafe {{ simd_relaxed_fma({fma}) }};"), fused);
+    let nans = "f32x4([0.0 / 0.0, 1.0, -3.0, 0.0 / 0.0]), f32x4([1.0, 0.0 / 0.0, 2.0, 0.0 / 0.0])";
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_minimum_number_nsz({nans}) }};"),
+        f32s([1.0, 1.0, -3.0, NAN32]),
+    );
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_maximum_number_nsz({nans}) }};"),
+        f32s([1.0, 1.0, 2.0, NAN32]),
+    );
+    check(
+        &format!("const GOAL: f32x4 = unsafe {{ simd_fmin({nans}) }};"),
+        f32s([1.0, 1.0, -3.0, NAN32]),
+    );
+    check(
+        "const GOAL: f32x4 = unsafe { simd_neg(f32x4([1.0, -0.0, 2.5, 1.0 / 0.0])) };",
+        f32s([-1.0, 0.0, -2.5, f32::NEG_INFINITY]),
+    );
+    check(
+        "const GOAL: f32x4 = unsafe { simd_fabs(f32x4([-1.5, -0.0, 2.0, -1.0 / 0.0])) };",
+        f32s([1.5, 0.0, 2.0, f32::INFINITY]),
+    );
+}
+
+#[test]
+fn simd_float_rounding() {
+    let check = |name: &str, answer| {
+        check_number(
+            &with_simd(&format!(
+                "const GOAL: f32x4 = unsafe {{ simd_{name}(f32x4([2.5, -2.5, 1.4, -0.5])) }};"
+            )),
+            f32s(answer),
+        )
+    };
+    check("ceil", [3.0, -2.0, 2.0, -0.0]);
+    check("floor", [2.0, -3.0, 1.0, -1.0]);
+    check("round", [3.0, -3.0, 1.0, -1.0]);
+    check("round_ties_even", [2.0, -2.0, 1.0, -0.0]);
+    check("trunc", [2.0, -2.0, 1.0, -0.0]);
+}
+
+#[test]
+fn simd_transcendental_is_refused() {
+    check_fail(
+        &with_simd("const GOAL: f32x4 = unsafe { simd_fsin(f32x4([1.0, 2.0, 3.0, 4.0])) };"),
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::NotSupported(_))),
+    );
+}
+
+#[test]
+fn simd_compare() {
+    let check = |name: &str, args: &str, answer| {
+        check_number(
+            &with_simd(&format!("const GOAL: i32x4 = unsafe {{ simd_{name}({args}) }};")),
+            i32s(answer),
+        )
+    };
+    let floats = "f32x4([1.0, 0.0 / 0.0, -0.0, 3.0]), f32x4([2.0, 1.0, 0.0, 3.0])";
+    check("lt", floats, [-1, 0, 0, 0]);
+    check("le", floats, [-1, 0, -1, -1]);
+    check("gt", floats, [0, 0, 0, 0]);
+    check("ge", floats, [0, 0, -1, -1]);
+    check("eq", floats, [0, 0, -1, -1]);
+    check("ne", floats, [-1, -1, 0, 0]);
+    check(
+        "lt",
+        "i32x4([-1, 5, -2147483647 - 1, 0]), i32x4([0, -5, 2147483647, 0])",
+        [-1, 0, -1, 0],
+    );
+    check("lt", "u32x4([4294967295, 1, 0, 5]), u32x4([0, 2, 0, 6])", [0, -1, 0, -1]);
+    check("ge", "u32x4([4294967295, 1, 0, 5]), u32x4([0, 2, 0, 6])", [-1, 0, -1, 0]);
+}
+
+#[test]
+fn simd_cast() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    check(
+        "const GOAL: i32x4 = unsafe { simd_as::<f32x4, i32x4>(f32x4([1e10, 0.0 / 0.0, -1e10, -1.9])) };",
+        i32s([i32::MAX, 0, i32::MIN, -1]),
+    );
+    check(
+        "const GOAL: u8x4 = unsafe { simd_as::<f32x4, u8x4>(f32x4([300.0, -5.0, 255.9, 0.0 / 0.0])) };",
+        u8s([255, 0, 255, 0]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_cast::<f32x4, i32x4>(f32x4([1.9, -1.9, 0.5, -2147483648.0])) };",
+        i32s([1, -1, 0, i32::MIN]),
+    );
+    check(
+        "const GOAL: f32x4 = unsafe { simd_cast::<i32x4, f32x4>(i32x4([16777217, -1, 0, 3])) };",
+        f32s([16777216.0, -1.0, 0.0, 3.0]),
+    );
+    check(
+        "const GOAL: i8x4 = unsafe { simd_cast::<i32x4, i8x4>(i32x4([300, -1, 127, -129])) };",
+        i8s([44, -1, 127, 127]),
+    );
+    check(
+        "const GOAL: u32x4 = unsafe { simd_cast::<i8x4, u32x4>(i8x4([-1, 1, -127 - 1, 0])) };",
+        u32s([0xffffffff, 1, 0xffffff80, 0]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_as::<u8x4, i32x4>(u8x4([255, 0, 128, 1])) };",
+        i32s([255, 0, 128, 1]),
+    );
+    check(
+        "const GOAL: f64x2 = unsafe { simd_cast::<f32x2, f64x2>(f32x2([0.1, 0.0 / 0.0])) };",
+        f64s([f64::from(0.1f32), NAN64]),
+    );
+    check(
+        "const GOAL: f32x2 = unsafe { simd_cast::<f64x2, f32x2>(f64x2([0.1, 1e300])) };",
+        lanes([0.1f64 as f32, f32::INFINITY].map(f32::to_le_bytes)),
+    );
+    check_fail(
+        &with_simd(
+            "const GOAL: i32x4 = unsafe { simd_cast::<f32x4, i32x4>(f32x4([1.0, 1e10, 0.0, 0.0])) };",
+        ),
+        is_ub,
+    );
+    check_fail(
+        &with_simd(
+            "const GOAL: u8x4 = unsafe { simd_cast::<f32x4, u8x4>(f32x4([0.0 / 0.0, 1.0, 0.0, 0.0])) };",
+        ),
+        is_ub,
+    );
+}
+
+#[test]
+fn simd_pointers() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    let ptrs = "simd_with_exposed_provenance::<usizex2, ptrx2>(usizex2([8, 16]))";
+    check(
+        &format!(
+            "const GOAL: usizex2 = unsafe {{ simd_expose_provenance::<ptrx2, usizex2>({ptrs}) }};"
+        ),
+        lanes([8usize, 16].map(usize::to_le_bytes)),
+    );
+    check(
+        &format!(
+            "const GOAL: usizex2 = unsafe {{
+                simd_expose_provenance::<ptrx2, usizex2>(simd_arith_offset({ptrs}, isizex2([1, -2])))
+            }};"
+        ),
+        lanes([12usize, 8].map(usize::to_le_bytes)),
+    );
+    check(
+        &format!(
+            "const GOAL: usizex2 = unsafe {{
+                let bytes = simd_cast_ptr::<ptrx2, bptrx2>({ptrs});
+                simd_expose_provenance::<bptrx2, usizex2>(simd_arith_offset(bytes, isizex2([1, 1])))
+            }};"
+        ),
+        lanes([9usize, 17].map(usize::to_le_bytes)),
+    );
+}
+
+#[test]
+fn simd_memory() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    check(
+        "const GOAL: i32x4 = unsafe {
+            let arr = [10, 20, 30, 40];
+            let base = simd_splat::<ptrx4, *const i32>(&arr as *const [i32; 4] as *const i32);
+            let ptrs = simd_arith_offset(base, isizex4([3, 0, 1000000, 2]));
+            simd_gather(i32x4([-1, -1, -1, -1]), ptrs, i32x4([-1, -1, 0, -1]))
+        };",
+        i32s([40, 10, -1, 30]),
+    );
+    check(
+        "const GOAL: [i32; 4] = unsafe {
+            let mut arr = [0, 0, 0, 0];
+            let base = simd_splat::<mptrx4, *mut i32>(&mut arr as *mut [i32; 4] as *mut i32);
+            let ptrs = simd_arith_offset(base, isizex4([3, 2, 1, 0]));
+            simd_scatter(i32x4([1, 2, 3, 4]), ptrs, i32x4([-1, -1, 0, -1]));
+            arr
+        };",
+        i32s([4, 0, 2, 1]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe {
+            let arr = [10, 20, 30, 40];
+            simd_masked_load::<i32x4, *const i32, i32x4, { SimdAlign::Element }>(
+                i32x4([-1, 0, -1, 0]),
+                &arr as *const [i32; 4] as *const i32,
+                i32x4([7, 7, 7, 7]),
+            )
+        };",
+        i32s([10, 7, 30, 7]),
+    );
+    check(
+        "const GOAL: [i32; 4] = unsafe {
+            let mut arr = [0, 0, 0, 0];
+            simd_masked_store::<i32x4, *mut i32, i32x4, { SimdAlign::Unaligned }>(
+                i32x4([0, -1, -1, 0]),
+                &mut arr as *mut [i32; 4] as *mut i32,
+                i32x4([1, 2, 3, 4]),
+            );
+            arr
+        };",
+        i32s([0, 2, 3, 0]),
+    );
+}
+
+#[test]
+fn simd_masks() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    let pair = "i32x4([1, 2, 3, 4]), i32x4([5, 6, 7, 8])";
+    check(
+        &format!("const GOAL: i32x4 = unsafe {{ simd_select(i32x4([-1, 0, -1, 0]), {pair}) }};"),
+        i32s([1, 6, 3, 8]),
+    );
+    check(
+        &format!("const GOAL: i32x4 = unsafe {{ simd_select(i8x4([0, -1, 0, -1]), {pair}) }};"),
+        i32s([5, 2, 7, 4]),
+    );
+    check(
+        &format!("const GOAL: i32x4 = unsafe {{ simd_select_bitmask(0b0101u8, {pair}) }};"),
+        i32s([1, 6, 3, 8]),
+    );
+    check(
+        &format!("const GOAL: i32x4 = unsafe {{ simd_select_bitmask([0b1010u8], {pair}) }};"),
+        i32s([5, 2, 7, 4]),
+    );
+    check("const GOAL: u8 = unsafe { simd_bitmask::<i32x4, u8>(i32x4([-1, 0, -1, -1])) };", 0b1101);
+    check(
+        "const GOAL: [u8; 2] = unsafe {
+            simd_bitmask::<i8x16, [u8; 2]>(i8x16([-1, 0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, -1, 0]))
+        };",
+        0b0100001100000001,
+    );
+    check_fail(
+        &with_simd(&format!(
+            "const GOAL: i32x4 = unsafe {{ simd_select(i32x4([1, 0, 0, 0]), {pair}) }};"
+        )),
+        is_ub,
+    );
+    check_fail(
+        &with_simd("const GOAL: u8 = unsafe { simd_bitmask::<i32x4, u8>(i32x4([0, 2, 0, 0])) };"),
+        is_ub,
+    );
+}
+
+#[test]
+fn simd_lanes() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    check("const GOAL: i32 = unsafe { simd_extract::<i32x4, i32>(i32x4([1, 2, 3, 4]), 2) };", 3);
+    check(
+        "const GOAL: i32 = unsafe { simd_extract_dyn::<i32x4, i32>(i32x4([1, 2, 3, 4]), 3) };",
+        4,
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_insert::<i32x4, i32>(i32x4([1, 2, 3, 4]), 1, 9) };",
+        i32s([1, 9, 3, 4]),
+    );
+    check(
+        "const GOAL: i32x4 = unsafe { simd_insert_dyn::<i32x4, i32>(i32x4([1, 2, 3, 4]), 3, -5) };",
+        i32s([1, 2, 3, -5]),
+    );
+    check("const GOAL: i32x4 = unsafe { simd_splat::<i32x4, i32>(7) };", i32s([7, 7, 7, 7]));
+    let pair = "i32x4([1, 2, 3, 4]), i32x4([5, 6, 7, 8])";
+    check(
+        &format!(
+            "const GOAL: i32x4 = unsafe {{ simd_shuffle::<i32x4, [u32; 4], i32x4>({pair}, [7, 0, 5, 2]) }};"
+        ),
+        i32s([8, 1, 6, 3]),
+    );
+    check(
+        &format!(
+            "const GOAL: i32x4 = unsafe {{ simd_shuffle::<i32x4, u32x4, i32x4>({pair}, u32x4([3, 3, 4, 4])) }};"
+        ),
+        i32s([4, 4, 5, 5]),
+    );
+    let fail = |goal: &str| check_fail(&with_simd(goal), is_ub);
+    fail("const GOAL: i32 = unsafe { simd_extract::<i32x4, i32>(i32x4([1, 2, 3, 4]), 4) };");
+    fail(
+        "const GOAL: i32x4 = unsafe { simd_insert_dyn::<i32x4, i32>(i32x4([1, 2, 3, 4]), 7, 0) };",
+    );
+    fail(&format!(
+        "const GOAL: i32x4 = unsafe {{ simd_shuffle::<i32x4, [u32; 4], i32x4>({pair}, [0, 8, 0, 0]) }};"
+    ));
+}
+
+#[test]
+fn simd_reduce() {
+    let check = |goal: &str, answer| check_number(&with_simd(goal), answer);
+    check(
+        "const GOAL: i32 = unsafe { simd_reduce_add_ordered(i32x4([1, 2, 3, 2147483647]), 10) };",
+        -2147483633,
+    );
+    check("const GOAL: i32 = unsafe { simd_reduce_mul_ordered(i32x4([2, 3, 4, 5]), -1) };", -120);
+    check(
+        "const GOAL: i32 = unsafe { simd_reduce_add_unordered::<i32x4, i32>(i32x4([1, 2, 3, 4])) };",
+        10,
+    );
+    check(
+        "const GOAL: i32 = unsafe { simd_reduce_mul_unordered::<i32x4, i32>(i32x4([1, 2, 3, 4])) };",
+        24,
+    );
+    check(
+        "const GOAL: f32 = unsafe { simd_reduce_add_ordered(f32x4([1e8, 1.0, -1e8, 1.0]), 0.5) };",
+        i128::from(((((0.5f32 + 1e8) + 1.0) + -1e8) + 1.0).to_bits()),
+    );
+    check(
+        "const GOAL: f32 = unsafe { simd_reduce_add_unordered::<f32x4, f32>(f32x4([1e8, 1.0, -1e8, 1.0])) };",
+        i128::from((((1e8f32 + 1.0) + -1e8) + 1.0).to_bits()),
+    );
+    check(
+        "const GOAL: f32 = unsafe { simd_reduce_mul_ordered(f32x4([2.0, 0.5, 3.0, 1.0]), 1.5) };",
+        i128::from(4.5f32.to_bits()),
+    );
+    let bits = "u32x4([0xff, 0x0f, 0xf3, 0x1f])";
+    check(&format!("const GOAL: u32 = unsafe {{ simd_reduce_and::<u32x4, u32>({bits}) }};"), 0x03);
+    check(&format!("const GOAL: u32 = unsafe {{ simd_reduce_or::<u32x4, u32>({bits}) }};"), 0xff);
+    check(&format!("const GOAL: u32 = unsafe {{ simd_reduce_xor::<u32x4, u32>({bits}) }};"), 0x1c);
+    let signed = "i32x4([3, -7, 2147483647, 0])";
+    check(&format!("const GOAL: i32 = unsafe {{ simd_reduce_min::<i32x4, i32>({signed}) }};"), -7);
+    check(
+        &format!("const GOAL: i32 = unsafe {{ simd_reduce_max::<i32x4, i32>({signed}) }};"),
+        2147483647,
+    );
+    let unsigned = "u32x4([3, 4294967295, 1, 7])";
+    check(&format!("const GOAL: u32 = unsafe {{ simd_reduce_min::<u32x4, u32>({unsigned}) }};"), 1);
+    check(
+        &format!("const GOAL: u32 = unsafe {{ simd_reduce_max::<u32x4, u32>({unsigned}) }};"),
+        0xffffffff,
+    );
+    let floats = "f32x4([0.0 / 0.0, 2.0, -1.0, 5.0])";
+    check(
+        &format!("const GOAL: f32 = unsafe {{ simd_reduce_min::<f32x4, f32>({floats}) }};"),
+        i128::from((-1.0f32).to_bits()),
+    );
+    check(
+        &format!("const GOAL: f32 = unsafe {{ simd_reduce_max::<f32x4, f32>({floats}) }};"),
+        i128::from(5.0f32.to_bits()),
+    );
+    check("const GOAL: bool = unsafe { simd_reduce_all(i32x4([-1, -1, -1, 0])) };", 0);
+    check("const GOAL: bool = unsafe { simd_reduce_all(i32x4([-1, -1, -1, -1])) };", 1);
+    check("const GOAL: bool = unsafe { simd_reduce_any(i32x4([0, 0, -1, 0])) };", 1);
+    check("const GOAL: bool = unsafe { simd_reduce_any(i32x4([0, 0, 0, 0])) };", 0);
+    check_fail(
+        &with_simd("const GOAL: bool = unsafe { simd_reduce_any(i32x4([2, 0, 0, 0])) };"),
+        is_ub,
     );
 }

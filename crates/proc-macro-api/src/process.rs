@@ -55,8 +55,86 @@ pub(crate) enum Protocol {
     BidirectionalPostcardPrototype { mode: SpanMode },
 }
 
+impl From<ProtocolFormat> for Protocol {
+    fn from(format: ProtocolFormat) -> Protocol {
+        match format {
+            ProtocolFormat::JsonLegacy => Protocol::LegacyJson { mode: SpanMode::Id },
+            ProtocolFormat::BidirectionalPostcardPrototype => {
+                Protocol::BidirectionalPostcardPrototype { mode: SpanMode::Id }
+            }
+        }
+    }
+}
+
 pub trait ProcessExit: Send + Sync {
     fn exit_err(&mut self) -> Option<ServerError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        bidirectional_protocol::msg::Response,
+        legacy_protocol::msg::{Message as _, ServerConfig},
+    };
+    use std::{io::Cursor, sync::atomic::AtomicUsize};
+
+    struct Running;
+    impl ProcessExit for Running {
+        fn exit_err(&mut self) -> Option<ServerError> {
+            None
+        }
+    }
+
+    fn connect(responses: Vec<Response>) -> io::Result<ProcMacroServerProcess> {
+        let mut bytes = Vec::new();
+        for response in responses {
+            BidirectionalMessage::Response(response).write(&mut bytes).unwrap();
+        }
+        let attempts = AtomicUsize::new(0);
+        let result = ProcMacroServerProcess::run(
+            |format| {
+                assert_eq!(attempts.fetch_add(1, Ordering::Relaxed), 0, "no protocol retry");
+                assert_eq!(format, Some(ProtocolFormat::BidirectionalPostcardPrototype));
+                Ok((Box::new(Running), Box::new(io::sink()), Box::new(Cursor::new(bytes.clone()))))
+            },
+            None,
+            || "test server".to_owned(),
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        result
+    }
+
+    #[test]
+    fn a_native_server_uses_source_spans_without_a_version_hint_or_an_environment_opt_in() {
+        let srv = connect(vec![
+            Response::ApiVersionCheck(version::CURRENT_API_VERSION),
+            Response::SetConfig(ServerConfig { span_mode: SpanMode::RustAnalyzer }),
+        ])
+        .unwrap();
+        assert!(srv.rust_analyzer_spans());
+        assert!(matches!(srv.protocol, Protocol::BidirectionalPostcardPrototype { .. }));
+    }
+
+    #[test]
+    fn failed_handshakes_are_not_retried_in_legacy_json() {
+        assert!(connect(vec![]).unwrap_err().to_string().contains("version check failed"));
+        assert!(
+            connect(vec![Response::ApiVersionCheck(version::CURRENT_API_VERSION + 1)])
+                .unwrap_err()
+                .to_string()
+                .contains("too new")
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_enable_source_spans_is_refused() {
+        for config in [None, Some(ServerConfig { span_mode: SpanMode::Id })] {
+            let mut responses = vec![Response::ApiVersionCheck(version::CURRENT_API_VERSION)];
+            responses.extend(config.map(Response::SetConfig));
+            assert!(connect(responses).is_err());
+        }
+    }
 }
 
 impl ProcessExit for Process {
@@ -130,81 +208,49 @@ impl ProcMacroServerProcess {
             Box<dyn Write + Send + Sync>,
             Box<dyn BufRead + Send + Sync>,
         )>,
-        version: Option<&Version>,
+        _version: Option<&Version>,
         binary_server_version: impl Fn() -> String,
     ) -> io::Result<ProcMacroServerProcess> {
-        const VERSION: Version = Version::new(1, 93, 0);
-        // we do `>` for nightly as this started working in the middle of the 1.93 nightly release, so we dont want to break on half of the nightlies
-        let has_working_format_flag = version.map_or(false, |v| {
-            if v.pre.as_str() == "nightly" { *v > VERSION } else { *v >= VERSION }
-        });
-
-        let formats: &[_] = if std::env::var_os("RUST_ANALYZER_USE_POSTCARD").is_some()
-            && has_working_format_flag
-        {
-            &[
-                Some(ProtocolFormat::BidirectionalPostcardPrototype),
-                Some(ProtocolFormat::JsonLegacy),
-            ]
-        } else {
-            &[None]
+        // Blaze owns the pinned server. Source queries need its bidirectional protocol:
+        // JSON cannot ask for a span's text, file or position and would return placeholders.
+        let format = ProtocolFormat::BidirectionalPostcardPrototype;
+        let (process, stdin, stdout) = spawn(Some(format))?;
+        let mut srv = ProcMacroServerProcess {
+            state: Mutex::new(ProcessSrvState { process, stdin, stdout }),
+            version: 0,
+            protocol: Protocol::from(format),
+            exited: OnceLock::new(),
+            active: AtomicU32::new(0),
         };
-
-        let mut err = None;
-        for &format in formats {
-            let create_srv = || {
-                let (process, stdin, stdout) = spawn(format)?;
-
-                io::Result::Ok(ProcMacroServerProcess {
-                    state: Mutex::new(ProcessSrvState { process, stdin, stdout }),
-                    version: 0,
-                    protocol: match format {
-                        Some(ProtocolFormat::BidirectionalPostcardPrototype) => {
-                            Protocol::BidirectionalPostcardPrototype { mode: SpanMode::Id }
-                        }
-                        Some(ProtocolFormat::JsonLegacy) | None => {
-                            Protocol::LegacyJson { mode: SpanMode::Id }
-                        }
-                    },
-                    exited: OnceLock::new(),
-                    active: AtomicU32::new(0),
-                })
-            };
-            let mut srv = create_srv()?;
-            tracing::info!("sending proc-macro server version check");
-            match srv.version_check(Some(&reject_subrequests)) {
-                Ok(v) if v > version::CURRENT_API_VERSION => {
-                    let process_version = binary_server_version();
-                    err = Some(io::Error::other(format!(
-                        "Your installed proc-macro server is too new for your rust-analyzer. API version: {}, server version: {process_version}. \
-                        This will prevent proc-macro expansion from working. Please consider updating your rust-analyzer to ensure compatibility with your current toolchain.",
-                        version::CURRENT_API_VERSION
-                    )));
-                }
-                Ok(v) => {
-                    tracing::info!("Proc-macro server version: {v}");
-                    srv.version = v;
-                    if srv.version >= version::RUST_ANALYZER_SPAN_SUPPORT
-                        && let Ok(new_mode) =
-                            srv.enable_rust_analyzer_spans(Some(&reject_subrequests))
-                    {
-                        match &mut srv.protocol {
-                            Protocol::LegacyJson { mode }
-                            | Protocol::BidirectionalPostcardPrototype { mode } => *mode = new_mode,
-                        }
-                    }
-                    tracing::info!("Proc-macro server protocol: {:?}", srv.protocol);
-                    return Ok(srv);
-                }
-                Err(e) => {
-                    tracing::info!(%e, "proc-macro version check failed");
-                    err = Some(io::Error::other(format!(
-                        "proc-macro server version check failed: {e}"
-                    )))
-                }
+        let v = srv.version_check(Some(&reject_subrequests)).map_err(|e| {
+            io::Error::other(format!("proc-macro server version check failed: {e}"))
+        })?;
+        if v > version::CURRENT_API_VERSION {
+            return Err(io::Error::other(format!(
+                "proc-macro server is too new for blaze: API {v}, supported API {}, server {}",
+                version::CURRENT_API_VERSION,
+                binary_server_version()
+            )));
+        }
+        if v < version::RUST_ANALYZER_SPAN_SUPPORT {
+            return Err(io::Error::other(format!(
+                "proc-macro server API {v} does not support source spans"
+            )));
+        }
+        srv.version = v;
+        let new_mode = srv
+            .enable_rust_analyzer_spans(Some(&reject_subrequests))
+            .map_err(|e| io::Error::other(format!("proc-macro source-span setup failed: {e}")))?;
+        if new_mode != SpanMode::RustAnalyzer {
+            return Err(io::Error::other("proc-macro server did not enable source spans"));
+        }
+        match &mut srv.protocol {
+            Protocol::LegacyJson { mode } | Protocol::BidirectionalPostcardPrototype { mode } => {
+                *mode = new_mode;
             }
         }
-        Err(err.unwrap())
+        tracing::info!("Proc-macro server API {v}, protocol: {:?}", srv.protocol);
+        Ok(srv)
     }
 
     /// Finds proc-macros in a given dynamic library.

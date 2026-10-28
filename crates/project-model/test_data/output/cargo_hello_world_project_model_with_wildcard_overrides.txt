@@ -76,6 +76,10 @@
                 "target_data_layout not loaded",
             ),
             toolchain: None,
+            const_eval: ConstEvalBudget {
+                steps: 1000000000,
+                memory: 1073741824,
+            },
         },
     },
     1: CrateBuilder {
@@ -162,6 +166,10 @@
                 "target_data_layout not loaded",
             ),
             toolchain: None,
+            const_eval: ConstEvalBudget {
+                steps: 1000000000,
+                memory: 1073741824,
+            },
         },
     },
     2: CrateBuilder {
@@ -248,6 +256,10 @@
                 "target_data_layout not loaded",
             ),
             toolchain: None,
+            const_eval: ConstEvalBudget {
+                steps: 1000000000,
+                memory: 1073741824,
+            },
         },
     },
     3: CrateBuilder {
@@ -333,6 +345,10 @@
                 "target_data_layout not loaded",
             ),
             toolchain: None,
+            const_eval: ConstEvalBudget {
+                steps: 1000000000,
+                memory: 1073741824,
+            },
         },
     },
     4: CrateBuilder {
@@ -417,6 +433,10 @@
                 "target_data_layout not loaded",
             ),
             toolchain: None,
+            const_eval: ConstEvalBudget {
+                steps: 1000000000,
+                memory: 1073741824,
+            },
         },
     },
 }

@@ -80,10 +80,6 @@ fn main() -> anyhow::Result<()> {
             checksum: checksum.unwrap_or_default().to_owned(),
         };
         let from = sources.map().replacement(source)?;
-        if from.is_remote_registry() && !from.is_sparse() {
-            *counts.entry("git index").or_default() += 1;
-            continue;
-        }
         // A lock file of cargo before 1.53 may name no checksum: the index's.
         if checksum.is_none() && from.is_remote_registry() {
             package.checksum = sources.registry(from)?.checksum(&package.name, &package.version)?;

@@ -4,6 +4,12 @@
  * colour with their face and name, and the part of the page each is reading, a band with their face on a thin rail
  * at the right edge (click the face to go there).
  *
+ * On a desk (a mouse or a trackpad, which hovers) the rail is also the page's scrollbar, there whenever the page
+ * scrolls, whoever else is here: styles/shell.css hides the browser's own, the reader's viewport is the thumb (drag
+ * it, or press the track to jump there and drag on), and it dims while nothing moves, like an overlay scrollbar. It
+ * takes no focus, so the keys scroll the page as ever. On a phone the browser's scrollbar stays and the rail shows
+ * only the others, while there are any.
+ *
  * Positions are in the page's text, not the window, so readers with other window sizes line up: x is a fraction of
  * `main`'s width, y a block (the index of a heading, paragraph, list item, ... in `main`, in document order, comment
  * threads left out) and how far down it, as a fraction of its height. Every reader has the same blocks in the same
@@ -43,6 +49,11 @@ const HIDE_KEY = 'blaze.cursors.hide';
 const BLOCKS = 'h1, h2, h3, h4, h5, h6, p, li, pre, table, tr, figure, blockquote, dt, dd, img, details, summary';
 const SVG = 'http://www.w3.org/2000/svg';
 const fine = matchMedia('(pointer: fine)');
+/** Where the rail is the page's scrollbar; the same query hides the browser's in styles/shell.css. */
+const desk = matchMedia('(hover: hover) and (pointer: fine)');
+/** The thumb's least length (px), and how long the rail stays bright after the page last moved (ms). */
+const THUMB_MIN = 28;
+const DIM_MS = 1200;
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 
 let send: (m: object) => void = () => {};
@@ -59,7 +70,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''):
 	return e;
 }
 
-/** A person's colour: an anonymous key's is its identicon's hue (client/lib/presence.ts), anyone else's a hash. */
+/** A person's colour: an anonymous key's is its animal's hue (client/lib/presence.ts), anyone else's a hash. */
 function hueOf(key: string): number {
 	if (/^a[0-9a-f]{12}$/.test(key)) return parseInt(key.slice(1, 3), 16) * (360 / 256);
 	let h = 2166136261;
@@ -171,7 +182,12 @@ function resend(): void {
 const layer = el('div', 'cursors');
 layer.setAttribute('aria-hidden', 'true');
 const rail = el('div', 'reading');
+/** The others' bands, under the track; the track (the scrollbar, on a desk) holds the reader's own, the thumb. */
+const others = el('div', 'reading-others');
+const track = el('div', 'reading-track');
 const mine = el('span', 'reading-me');
+track.append(mine);
+rail.append(others, track);
 
 function arrow(): SVGSVGElement {
 	const svg = document.createElementNS(SVG, 'svg');
@@ -240,7 +256,7 @@ function animate(): void {
 	raf ||= requestAnimationFrame(tick);
 }
 
-/** The rail: a band and a face for each viewport sent, and a faint band for this reader's own. */
+/** The rail: a band and a face for each viewport sent, and the reader's own (the thumb, on a desk). */
 function drawRail(): void {
 	const H = document.documentElement.scrollHeight || 1;
 	const bands: HTMLElement[] = [];
@@ -264,16 +280,80 @@ function drawRail(): void {
 		band.append(go);
 		bands.push(band);
 	}
-	rail.replaceChildren(...(bands.length ? [mine, ...bands] : []));
-	rail.hidden = !bands.length;
+	others.replaceChildren(...bands);
+	const bar = desk.matches;
+	if (bar) {
+		track.setAttribute('role', 'scrollbar');
+		track.setAttribute('aria-orientation', 'vertical');
+		track.setAttribute('aria-valuemin', '0');
+		track.setAttribute('aria-valuemax', '100');
+		track.setAttribute('aria-label', 'Page');
+		const pane = document.querySelector<HTMLElement>('.pane');
+		if (pane) track.setAttribute('aria-controls', (pane.id ||= 'pane'));
+	} else for (const a of ['role', 'aria-orientation', 'aria-valuemin', 'aria-valuemax', 'aria-valuenow', 'aria-label', 'aria-controls']) track.removeAttribute(a);
+	rail.classList.toggle('bar', bar);
+	rail.hidden = bar ? H - innerHeight < 1 : !bands.length;
 	drawMine();
 }
 
+/** The thumb where the page is: proportional, but never shorter than THUMB_MIN, so the rest of the track maps on. */
 function drawMine(): void {
 	if (rail.hidden) return;
-	const H = document.documentElement.scrollHeight || 1;
-	mine.style.top = `${((scrollY / H) * 100).toFixed(2)}%`;
-	mine.style.height = `${((innerHeight / H) * 100).toFixed(2)}%`;
+	const T = track.clientHeight;
+	const room = Math.max(1, document.documentElement.scrollHeight - innerHeight);
+	const t = Math.min(T, Math.max(THUMB_MIN, (innerHeight / (room + innerHeight)) * T));
+	const at = Math.max(0, Math.min(1, scrollY / room));
+	mine.style.top = `${(at * (T - t)).toFixed(1)}px`;
+	mine.style.height = `${t.toFixed(1)}px`;
+	const now = String(Math.round(at * 100));
+	if (rail.classList.contains('bar') && track.getAttribute('aria-valuenow') !== now) track.setAttribute('aria-valuenow', now);
+}
+
+let mineRaf = 0;
+let dimTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** The page moved: the thumb follows at the next frame, and the rail brightens for a while. */
+function moved(): void {
+	mineRaf ||= requestAnimationFrame(() => {
+		mineRaf = 0;
+		drawMine();
+	});
+	rail.classList.add('live');
+	clearTimeout(dimTimer);
+	dimTimer = setTimeout(() => rail.classList.remove('live'), DIM_MS);
+}
+
+/**
+ * Pressing the rail (a desk only; the faces are buttons of their own): on the thumb it drags, anywhere else on the
+ * track the page jumps so the thumb is centred there and the drag goes on from that point. The rail keeps the pointer
+ * (capture) until it is let go, wherever it goes.
+ */
+function grab(e: PointerEvent): void {
+	if (!rail.classList.contains('bar') || e.button !== 0 || (e.target as Element).closest('.reading-face')) return;
+	e.preventDefault();
+	const T = track.clientHeight;
+	const room = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+	const t = mine.offsetHeight;
+	// Page px per track px.
+	const per = room / Math.max(1, T - t);
+	let from = scrollY;
+	if (e.target !== mine) {
+		from = Math.max(0, Math.min(room, (e.clientY - track.getBoundingClientRect().top - t / 2) * per));
+		scrollTo(scrollX, from);
+	}
+	const y0 = e.clientY;
+	const move = (m: PointerEvent) => scrollTo(scrollX, from + (m.clientY - y0) * per);
+	rail.setPointerCapture(e.pointerId);
+	rail.classList.add('drag');
+	rail.addEventListener('pointermove', move);
+	rail.addEventListener(
+		'lostpointercapture',
+		() => {
+			rail.classList.remove('drag');
+			rail.removeEventListener('pointermove', move);
+		},
+		{ once: true },
+	);
 }
 
 /** The page moved under the anchors (a resize, a fold, a thread opened): place everything again. */
@@ -373,6 +453,8 @@ export function setup(opts: { send: (m: object) => void; face: (w: Who, away?: b
 	({ send, face, name } = opts);
 	rail.hidden = true;
 	document.body.append(layer, rail);
+	rail.addEventListener('pointerdown', grab);
+	desk.addEventListener('change', drawRail);
 
 	document.addEventListener(
 		'pointermove',
@@ -394,7 +476,7 @@ export function setup(opts: { send: (m: object) => void; face: (w: Who, away?: b
 		() => {
 			if (pointer) queueCursor();
 			queueView();
-			drawMine();
+			moved();
 		},
 		{ passive: true },
 	);

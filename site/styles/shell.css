@@ -212,6 +212,15 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-btn:hover, .tl-btn[aria-expanded='true'] { color: var(--ink-1); background: var(--s-tint); }
 .tl-btn svg { width: 14px; height: 14px; fill: currentColor; }
 .tl-discuss .tl-btn { color: var(--ink-1); }
+/* The sidebar shut (client/lib/presence.ts): its column folds to nothing, the page takes the room. */
+.tl-side { width: 30px; padding: 0; justify-content: center; }
+.tl-side svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.4; }
+.tl-side[aria-pressed='true'] svg path { stroke-dasharray: 2 1.6; }
+.frame { transition: grid-template-columns 0.22s cubic-bezier(0.2, 0.7, 0.3, 1); }
+body.side-shut .frame { grid-template-columns: 0 minmax(0, 1fr); padding-left: clamp(8px, 1vw, 14px); gap: 0; }
+body.side-shut .frame > .side { visibility: hidden; overflow: hidden; padding: 0; }
+body.side-shut.chat-full .chat { left: clamp(8px, 1vw, 14px); }
+@media (prefers-reduced-motion: reduce) { .frame { transition: none; } }
 /* The discussion at the left, everything else at the right. */
 .topline > .tl-gap { display: block; flex: 1; }
 .tl-bubble { flex: none; width: 14px; height: 12px; border: 1.5px solid currentColor; border-radius: 4px 4px 4px 1px; }
@@ -251,8 +260,11 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .faces .face + .face { margin-left: -6px; }
 .face { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: var(--bg-4); box-shadow: 0 0 0 2px var(--bg); transition: opacity 0.2s; }
 .face img, .face svg { width: 100%; height: 100%; }
-.face svg { padding: 2px; background: var(--bg-3); }
-.face svg rect { fill: var(--id-ink); }
+/* An anonymous reader's animal (gen/animals.ts, drawn from dist/animals.<hash>.svg): its tone slots from their hue `--h`. */
+.face.animal { --a-bg: hsl(var(--h) 30% 25%); --a1: hsl(var(--h) 55% 62%); --a2: hsl(var(--h) 40% 39%); --a3: hsl(var(--h) 75% 88%); --a-ink: hsl(var(--h) 45% 11%); background: var(--a-bg); }
+@media (prefers-color-scheme: light) {
+	.face.animal { --a-bg: hsl(var(--h) 55% 82%); --a1: hsl(var(--h) 50% 57%); --a2: hsl(var(--h) 42% 34%); --a3: hsl(var(--h) 70% 97%); --a-ink: hsl(var(--h) 45% 14%); }
+}
 .face.away { opacity: 0.45; }
 .face.more { width: auto; min-width: 20px; padding: 0 4px; border-radius: 10px; color: var(--ink-3); font-size: 10.5px; }
 .navlist .row > .faces { margin-left: auto; }
@@ -298,6 +310,9 @@ main .discussion { scroll-margin-top: 64px; }
 .chat-mute.on { color: var(--ink-1); }
 /* Full screen: over the whole content pane, beside the sidebar (the frame's grid, above). */
 body.chat-full .chat { left: calc(var(--side-w) + 4px); width: auto; box-shadow: inset 0 0 0 1px var(--line-2); }
+/* Full screen, the chat takes the page's place: the page under it neither shows at its edges nor scrolls. */
+body.chat-full .frame > .pane, body.chat-full .cursors { visibility: hidden; }
+html:has(body.chat-full) { overflow: hidden; }
 body.chat-full .chat > .resizer { display: none; }
 body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typing { width: 100%; max-width: 860px; margin-inline: auto; }
 @media (max-width: 800px) { .chat-full { display: none; } }
@@ -321,6 +336,10 @@ body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typin
 /* Pop-ups for messages while the chat is shut, at the bottom right. */
 .chat-toasts { position: fixed; z-index: 46; right: clamp(8px, 1vw, 14px); bottom: 14px; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 24px)); pointer-events: none; }
 .chat-toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 0; border-radius: 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 12px 32px rgb(0 0 0 / 0.3); color: var(--ink-2); font: inherit; font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; pointer-events: auto; animation: toast-in 0.2s ease-out; }
+a.chat-toast { text-decoration: none; }
+.tl-list .devices { display: inline-flex; gap: 2px; color: var(--ink-3); }
+.tl-list .device { display: inline-grid; width: 14px; height: 14px; }
+.tl-list .device svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
 .chat-toast:hover { background: var(--bg-3); }
 .chat-toast .face { width: 26px; height: 26px; }
 .chat-toast-words { min-width: 0; }
@@ -448,13 +467,33 @@ body.chat-full .chat-back { order: 1; }
 .cursor-chip { display: inline-flex; align-items: center; gap: 4px; margin: 14px 0 0 -4px; padding: 2px 7px 2px 2px; border-radius: 10px; background: var(--c); color: #fff; font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.2); }
 .cursor-chip .face { width: 16px; height: 16px; box-shadow: none; }
 /* Where each is reading: a thin rail at the right edge, the page's length top to bottom, a band in their colour for
-   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. */
-.reading { position: fixed; z-index: 14; top: 0; right: 0; bottom: 0; width: 6px; pointer-events: none; }
+   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. Beside a
+   chat it sits at the page's right edge, clear of the chat's resize handle; over a full-screen or phone chat it goes.
+   Above the sticky top line (a scrollbar runs the window's height), under the chat, the drawer and pop-ups. */
+.reading { position: fixed; z-index: 16; top: 6px; right: 0; bottom: 10px; width: 6px; pointer-events: none; user-select: none; -webkit-user-select: none; }
 .reading[hidden] { display: none; }
+.reading-others, .reading-track { position: absolute; inset: 0; }
 .reading-me, .reading-band { position: absolute; right: 1px; width: 4px; min-height: 4px; border-radius: 2px; }
 .reading-me { background: color-mix(in srgb, var(--ink-1) 10%, transparent); }
 .reading-band { background: color-mix(in srgb, var(--c) 55%, transparent); }
-.reading-face { position: absolute; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
+.reading-face { position: absolute; z-index: 1; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
 .reading-face .face { width: 18px; height: 18px; box-shadow: 0 0 0 2px var(--c); }
 .reading-face:hover .face { opacity: 1; transform: scale(1.15); }
-@media (min-width: 1280px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }
+@media (min-width: 801px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }
+@media (max-width: 800px) { body.chat-open .reading { display: none; } }
+body.chat-full .reading { display: none; }
+/* On a desk the rail is the page's scrollbar (client/lib/cursors.ts, the same media query), so the browser's goes:
+   one scrollbar, inside the page rather than beyond the chat. A wider track to aim at; the thumb dims while the page
+   rests and brightens as it scrolls, under the pointer and while dragged. Inner scroll areas keep their own. */
+@media (hover: hover) and (pointer: fine) {
+	html { scrollbar-width: none; }
+	html::-webkit-scrollbar { display: none; }
+	.reading.bar { width: 12px; pointer-events: auto; }
+	.reading.bar :is(.reading-me, .reading-band) { right: 3px; width: 5px; border-radius: 3px; transition: width 0.15s, right 0.15s, background-color 0.3s; }
+	.reading.bar .reading-me { background: color-mix(in srgb, var(--ink-1) 12%, transparent); }
+	.reading.bar.live .reading-me { background: color-mix(in srgb, var(--ink-1) 28%, transparent); transition-duration: 0.15s, 0.15s, 0.1s; }
+	.reading.bar:hover .reading-me { background: color-mix(in srgb, var(--ink-1) 36%, transparent); }
+	.reading.bar.drag .reading-me { background: color-mix(in srgb, var(--ink-1) 46%, transparent); }
+	.reading.bar:is(:hover, .drag) :is(.reading-me, .reading-band) { right: 2px; width: 8px; border-radius: 4px; }
+}
+@media (prefers-reduced-motion: reduce) { .reading-me, .reading-band { transition: none !important; } }

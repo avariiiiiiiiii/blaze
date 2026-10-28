@@ -2845,15 +2845,39 @@ pub struct Recompiled {
 }
 
 /// The functions of the source compiled since the last call, the first 64 of them, and how
-/// many there were in all.
+/// many there were in all. Salsa also runs [`compiled_root`] of a function an edit took away,
+/// to verify what read it before the edit: that one is not of the source, and has no name in it.
 pub fn take_recompiled(db: &dyn HirDatabase) -> (Vec<Recompiled>, usize) {
     let (funcs, all) = std::mem::take(&mut *RECOMPILED.lock().unwrap_or_else(|e| e.into_inner()));
-    let named = funcs.into_iter().map(|func| Recompiled {
-        name: FunctionSignature::of(db, func).name.as_str().to_owned(),
-        krate: fncache::crate_name(db, func.krate(db)),
-        file: func.lookup(db).id.file_id.original_file(db).file_id(db),
-    });
-    (named.collect(), all)
+    let kept = funcs.len();
+    let named: Vec<_> = funcs
+        .into_iter()
+        .filter(|&func| {
+            let id = func.lookup(db).id;
+            in_source(db, InFile::new(id.file_id, id.value.erase()))
+        })
+        .map(|func| Recompiled {
+            name: FunctionSignature::of(db, func).name.as_str().to_owned(),
+            krate: fncache::crate_name(db, func.krate(db)),
+            file: func.lookup(db).id.file_id.original_file(db).file_id(db),
+        })
+        .collect();
+    let gone = kept - named.len();
+    (named, all - gone)
+}
+
+/// Whether the item `id` is in the source as it is now, and so is every macro call it was
+/// expanded from and the macro's definition. The map of an expansion is made by expanding
+/// it, which looks for its call: a call the source no longer has is checked before.
+fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
+    if let Some(call) = id.file_id.macro_file() {
+        let loc = call.loc(db);
+        let called = InFile::new(loc.kind.file_id(), loc.kind.erased_ast_id());
+        if !in_source(db, called) || !in_source(db, loc.def.kind.erased_ast_id()) {
+            return false;
+        }
+    }
+    id.file_id.ast_id_map(db).try_get_erased(id.value).is_some()
 }
 
 /// The code of a non-generic function.

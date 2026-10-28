@@ -298,7 +298,8 @@ impl Gateway {
         let roots = HttpsConnectorBuilder::new()
             .with_native_roots()
             .context("the machine's certificates cannot be read")?;
-        let connector = roots.https_or_http().enable_http1().build();
+        let connector =
+            roots.https_or_http().enable_http1().wrap_connector(super::https::connector(patience));
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Ok(Gateway { client, spec, token, patience, traffic })
     }

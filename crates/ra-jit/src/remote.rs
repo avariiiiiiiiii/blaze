@@ -37,7 +37,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, atomic::Ordering},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -1351,14 +1354,28 @@ impl Shared {
     }
 }
 
+/// How long a thread that compiles waits for the pack of a key it lacks, while the remote
+/// brings packs within it: a key that comes in that time is not compiled. Once one takes
+/// longer, no thread of this process waits on the remote again.
+const WAIT_AT_MOST: Duration = Duration::from_millis(250);
+
+/// A pack being fetched: whether it came, once that is known.
+#[derive(Default)]
+struct Arriving {
+    came: std::sync::Mutex<Option<bool>>,
+    known: std::sync::Condvar,
+}
+
 /// The packs of a manifest that are not here yet, and which of them holds each key.
 struct Lazy {
     store: PathBuf,
     remote: Arc<Remote>,
     runtime: Arc<Runtime>,
-    /// Each pack and whether it arrived, once it was asked for.
-    packs: Vec<(Digest, Listed, OnceLock<bool>)>,
+    /// Each pack and, once a key of it was asked for, its fetch.
+    packs: Vec<(Digest, Listed, OnceLock<Arc<Arriving>>)>,
     holder: FxHashMap<[u8; 32], u32>,
+    /// Whether every pack waited for came within [`WAIT_AT_MOST`].
+    in_time: AtomicBool,
 }
 
 impl Lazy {
@@ -1392,6 +1409,7 @@ impl Lazy {
             runtime: shared.runtime.clone(),
             packs: Vec::new(),
             holder: FxHashMap::default(),
+            in_time: AtomicBool::new(true),
         };
         for fetched in fetched {
             match fetched {
@@ -1411,29 +1429,63 @@ impl Lazy {
         }
     }
 
-    /// Whether the pack that holds `key` is in the store now. Called by the threads that
-    /// compile, which wait here for the pack: the first to ask fetches it.
+    /// Whether the pack that holds `key` is in the store now. The first key of a pack that is
+    /// asked for starts fetching it; the thread that asked waits for it [`WAIT_AT_MOST`], while
+    /// the remote keeps within that, and otherwise compiles the key rather than wait on the
+    /// network. A pack that comes later is read by the store then, and the keys asked for
+    /// after that are found.
     fn fetch(&self, key: &[u8; 32]) -> bool {
         let Some(&at) = self.holder.get(key) else { return false };
-        let (pack, listed, arrived) = &self.packs[at as usize];
-        *arrived.get_or_init(|| {
-            let fetched =
-                self.runtime.block_on(fetch_pack(&self.remote, &self.store, pack, listed));
-            match fetched {
-                Ok(Fetched::Whole(bytes)) => {
-                    eprintln!("remote: {pack}.pack fetched for a build, {bytes} bytes");
-                    true
+        let (pack, listed, asked) = &self.packs[at as usize];
+        let mut first = false;
+        let arriving = asked.get_or_init(|| {
+            first = true;
+            Arc::default()
+        });
+        if first {
+            let (pack, listed, arriving) = (*pack, *listed, arriving.clone());
+            let (remote, store) = (self.remote.clone(), self.store.clone());
+            self.runtime.spawn(async move {
+                let came = match fetch_pack(&remote, &store, &pack, &listed).await {
+                    Ok(Fetched::Whole(bytes)) => {
+                        eprintln!("remote: {pack}.pack fetched for a build, {bytes} bytes");
+                        true
+                    }
+                    Ok(Fetched::Elsewhere) => false,
+                    // The build compiles what the pack held; with RA_JIT_REMOTE_REQUIRED the
+                    // client fails it once it is over.
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        eprintln!("remote: {}", why.lines().next().unwrap_or_default());
+                        note_down(&store, &remote.place.name(), Some(&e));
+                        false
+                    }
+                };
+                *arriving.came.lock().unwrap_or_else(|it| it.into_inner()) = Some(came);
+                arriving.known.notify_all();
+                if came && let Some(store) = ra_jit_store::Store::global() {
+                    store.refresh();
                 }
-                Ok(Fetched::Elsewhere) => false,
-                // The build compiles what the pack held; with RA_JIT_REMOTE_REQUIRED the
-                // client fails it once it is over.
-                Err(e) => {
-                    eprintln!("remote: {e:#}");
-                    note_down(&self.store, &self.remote.place.name(), Some(&e));
-                    false
+            });
+        }
+        if !self.in_time.load(Ordering::Relaxed) {
+            return false;
+        }
+        let came = arriving.came.lock().unwrap_or_else(|it| it.into_inner());
+        let waited = arriving.known.wait_timeout_while(came, WAIT_AT_MOST, |it| it.is_none());
+        let (came, _) = waited.unwrap_or_else(|it| it.into_inner());
+        match *came {
+            Some(came) => came,
+            None => {
+                if self.in_time.swap(false, Ordering::Relaxed) {
+                    eprintln!(
+                        "remote: a pack took over {WAIT_AT_MOST:?}: what is not here is compiled \
+                         while the packs come"
+                    );
                 }
+                false
             }
-        })
+        }
     }
 }
 

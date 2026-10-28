@@ -467,16 +467,18 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     if e.has("Quiz") {
         return quiz(n, ctx);
     }
-    for comp in ["BarChart", "LineChart"] {
+    for comp in ["RowChart", "LineChart"] {
         if let Some(v) = e.value(comp) {
             let note = prose(&field(Some(v), "note"));
             let path = e.path.clone();
-            // The tip under the pointer (client/chart.ts); the chart reads whole without it.
-            ctx.script("chart");
+            if comp == "LineChart" {
+                // The run under the pointer (client/chart.ts); the chart reads whole without it.
+                ctx.script("chart");
+            }
             let note = ctx.inline(&note, &path)?;
             let id = ctx.block_id(n);
-            let html = if comp == "BarChart" {
-                crate::chart::bar_chart(ctx.s.world, n, &id, &note)?
+            let html = if comp == "RowChart" {
+                crate::chart::row_chart(ctx.s.world, n, &id, &note)?
             } else {
                 crate::chart::line_chart(ctx.s.world, n, &id, &note)?
             };
@@ -498,7 +500,7 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         let buttons = crate::chart::picker_buttons(ctx.s.world, n, &id, &picks)?;
         let mut panels = String::new();
         for p in picks {
-            panels += &format!("<div class=\"pick\">\n{}\n</div>", children(p, ctx)?);
+            panels += &format!("<div class=\"panel\">\n{}\n</div>", children(p, ctx)?);
         }
         return Ok(format!("<div class=\"picker\">{buttons}{panels}</div>"));
     }
@@ -620,7 +622,9 @@ pub fn lesson_parts(world: &World, lesson: Id) -> (usize, Vec<String>) {
 fn glyph(ctx: &Ctx, lesson: Id) -> Result<String, String> {
     match ctx.e(lesson).value("Baked").and_then(|v| v.get("html")) {
         Some(crate::world::Scalar::Str(h)) if !h.is_empty() => Ok(h.clone()),
-        _ => Err(format!("{}: the lesson's glyph is not baked (run the build)", ctx.e(lesson).path)),
+        _ => {
+            Err(format!("{}: the lesson's glyph is not baked (run the build)", ctx.e(lesson).path))
+        }
     }
 }
 

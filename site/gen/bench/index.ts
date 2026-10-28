@@ -1,6 +1,6 @@
 // /bench's charts, from the benchmark history. The page names where they go and where the history is
 // (`BenchHistory: {dir}` in content/bench.flecs); this writes them as a Flecs script of Sections, Pickers and charts
-// (BarChart, LineChart: content/schema.flecs) under that entity, which gen/build.ts runs after the content. The
+// (RowChart, LineChart: content/schema.flecs) under that entity, which gen/build.ts runs after the content. The
 // renderer draws them like any other block. The subjects charts compare (subjects.blaze, ...) are defined on the page.
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -39,7 +39,19 @@ function fastestSetup(setups: Record<string, number> | undefined): [number, stri
 	return [v, SETUPS[name]];
 }
 
-const bar = (subject: string, value: number, note = '') => ent('Bar', subject, { value, note }, [plots(subject)]);
+const value = (subject: string, v: number, note = '') => ent('Value', subject, { value: v, note }, [plots(subject)]);
+
+/** The edits that build (not the test runs), in the README's order: what a project's mean over its edits is over. */
+const BUILD_EDITS = EDIT_ORDER.filter((p) => p !== 'cold' && p !== 'test' && p !== 'test-edit');
+
+/** The geometric mean of `field` over `phases` of `e`, or undefined when there are none. */
+function mean(e: Entry | undefined, phases: string[], field: 'wall_s' | 'cargo_s') {
+	if (!e || !phases.length) return undefined;
+	return Math.exp(phases.reduce((a, p) => a + Math.log(e.phases[p][field]!), 0) / phases.length);
+}
+
+/** The build edits of `e` with both blaze's and cargo's time. */
+const bothTimed = (e: Entry) => BUILD_EDITS.filter((p) => e.phases[p]?.wall_s !== undefined && e.phases[p]?.cargo_s !== undefined);
 
 /** One project's edits in one run: blaze and cargo per edit, the speedup on each row. */
 function editsChart(key: string, e: Entry): Ent | null {
@@ -48,30 +60,68 @@ function editsChart(key: string, e: Entry): Ent | null {
 		.sort(ranked(EDIT_ORDER))
 		.flatMap((p) => {
 			const ph = e.phases[p];
-			const bars: Ent[] = [];
-			if (ph.wall_s !== undefined) bars.push(bar('blaze', ph.wall_s, ph.built && ph.built !== 'daemon' ? 'the daemon handed this edit to cargo, so it took about cargo\'s time' : ''));
-			if (ph.cargo_s !== undefined) bars.push(bar('cargo', ph.cargo_s));
+			const vals: Ent[] = [];
+			if (ph.wall_s !== undefined) vals.push(value('blaze', ph.wall_s, ph.built && ph.built !== 'daemon' ? "the daemon handed this edit to cargo, so it took about cargo's time" : ''));
+			if (ph.cargo_s !== undefined) vals.push(value('cargo', ph.cargo_s));
 			const setup = fastestSetup(ph.setups);
-			if (setup) bars.push(bar('setup', setup[0], `the fastest other setup here is ${setup[1]}`));
-			return bars.length ? [ent('Row', slug(p), { label: EDITS[p] ?? p }, bars)] : [];
+			if (setup) vals.push(value('setup', setup[0], `the fastest other setup here is ${setup[1]}`));
+			return vals.length ? [ent('Row', slug(p), { label: EDITS[p] ?? p }, vals)] : [];
 		});
 	if (!rows.length) return null;
-	return ent('BarChart', slug(project(key)), { title: projectName(project(key), e.tag), unit: 's', note: '' }, ['(Baseline, subjects.cargo)', ...rows]);
+	return ent('RowChart', 'edits', { title: `${projectName(project(key), e.tag)}, edit by edit`, unit: 's', scale: 'log', note: '' }, ['(Baseline, subjects.cargo)', ...rows]);
 }
 
 /** Every project of one run on one chart: a row per project. */
-function acrossChart(name: string, title: string, unit: string, note: string, entries: [string, Entry][], bars: (e: Entry) => Ent[], baseline = false): Ent | null {
+function acrossChart(name: string, title: string, unit: string, scale: 'linear' | 'log', note: string, entries: [string, Entry][], values: (e: Entry) => Ent[], baseline = false): Ent | null {
 	const rows = entries.flatMap(([key, e]) => {
-		const b = bars(e);
-		return b.length ? [ent('Row', slug(project(key)), { label: projectName(project(key), e.tag) }, b)] : [];
+		const v = values(e);
+		return v.length ? [ent('Row', slug(project(key)), { label: projectName(project(key), e.tag) }, v)] : [];
 	});
-	return rows.length ? ent('BarChart', name, { title, unit, note }, [...(baseline ? ['(Baseline, subjects.cargo)'] : []), ...rows]) : null;
+	return rows.length ? ent('RowChart', name, { title, unit, scale, note }, [...(baseline ? ['(Baseline, subjects.cargo)'] : []), ...rows]) : null;
 }
 
 const peak = (e: Entry, field: 'mem_mb' | 'cargo_mem_mb') => {
 	const all = Object.entries(e.phases).filter(([p]) => p !== 'cold').flatMap(([, ph]) => (ph[field] === undefined ? [] : [ph[field]!]));
 	return all.length ? Math.max(...all) : undefined;
 };
+
+/** A run's charts for one backend: every project's edits, then one project's, cold builds, memory and disk. */
+function latestCharts(entries: [string, Entry][], tries: number | undefined): Ent[] {
+	const medians = tries ? `the median of ${tries} tries each` : 'the median of its tries each';
+	const summary = acrossChart('edits', 'Edit, then build: every project', 's', 'log', `Each project's edits in one number: the geometric mean of the edits it measured (${medians}), for blaze and for cargo. Pick a project below for its edits one by one.`, entries, (e) => {
+		const both = bothTimed(e);
+		const [ours, theirs] = [mean(e, both, 'wall_s'), mean(e, both, 'cargo_s')];
+		return ours === undefined || theirs === undefined ? [] : [value('blaze', ours), value('cargo', theirs)];
+	}, true);
+	const projects = entries.flatMap(([k, e]) => {
+		const c = editsChart(k, e);
+		return c ? [{ name: project(k), label: project(k), body: [c] }] : [];
+	});
+	const cold = acrossChart('cold', 'Cold build, until ready', 's', 'linear', 'From nothing built to ready: cargo builds everything; blaze builds and starts its daemon. A second checkout of the same commit starts from the store the first one filled.', entries, (e) => {
+		const c = e.phases.cold;
+		if (!c) return [];
+		return [
+			...(c.wall_s !== undefined ? [value('blaze', c.wall_s)] : []),
+			...(c.warm_store_s !== undefined ? [value('warm', c.warm_store_s)] : []),
+			...(c.cargo_s !== undefined ? [value('cargo', c.cargo_s)] : []),
+		];
+	}, true);
+	const memory = acrossChart('memory', 'Memory while editing', 'MB', 'linear', 'The most every process doing the work held at once over the edits: for blaze the daemon, its workers and the command; for cargo, cargo, rustc and the linker ([how](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md#memory-and-disk)).', entries, (e) => {
+		const [ours, theirs] = [peak(e, 'mem_mb'), peak(e, 'cargo_mem_mb')];
+		return [...(ours !== undefined ? [value('blaze', ours)] : []), ...(theirs !== undefined ? [value('cargo', theirs)] : [])];
+	});
+	const disk = acrossChart('disk', 'On disk', 'MB', 'linear', 'blaze: its target directory, store and home. cargo: its target directory.', entries, (e) => [
+		...(e.disk_mb !== undefined ? [value('blaze', e.disk_mb)] : []),
+		...(e.cargo_disk_mb !== undefined ? [value('cargo', e.cargo_disk_mb)] : []),
+	]);
+	const pair = [memory, disk].filter((c): c is Ent => c !== null);
+	return [
+		...(summary ? [summary] : []),
+		...(projects.length ? [picker('project', 'Project', projects, projects[0].name)] : []),
+		...(cold ? [cold] : []),
+		...(pair.length ? [ent('Charts', 'resources', undefined, pair)] : []),
+	];
+}
 
 /** The newest run of each platform: a Picker of platforms, then of backends. */
 function latest(build: BuildMachine[]): Ent[] {
@@ -86,39 +136,11 @@ function latest(build: BuildMachine[]): Ent[] {
 	const items = platforms.map((platform) => {
 		const { run, results } = newest.get(platform)!;
 		const keys = Object.keys(results).sort((a, b) => projectOrder(project(a), project(b)) || backendOrder(backend(a), backend(b)));
-		const backends = unique(keys.map(backend)).sort(backendOrder).map((b) => {
-			const entries = keys.filter((k) => backend(k) === b).map((k) => [k, results[k]] as [string, Entry]);
-			const charts = [
-				acrossChart('cold', 'Cold build, until ready', 's', 'From nothing built to ready: cargo builds everything; blaze builds and starts its daemon. A second checkout of the same commit starts from the store the first one filled.', entries, (e) => {
-					const c = e.phases.cold;
-					if (!c) return [];
-					return [
-						...(c.wall_s !== undefined ? [bar('blaze', c.wall_s)] : []),
-						...(c.warm_store_s !== undefined ? [bar('warm', c.warm_store_s)] : []),
-						...(c.cargo_s !== undefined ? [bar('cargo', c.cargo_s)] : []),
-					];
-				}, true),
-				acrossChart('memory', 'Memory while editing', 'MB', 'The most every process doing the work held at once over the edits: for blaze the daemon, its workers and the command; for cargo, cargo, rustc and the linker ([how](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md#memory-and-disk)).', entries, (e) => {
-					const [ours, theirs] = [peak(e, 'mem_mb'), peak(e, 'cargo_mem_mb')];
-					return [...(ours !== undefined ? [bar('blaze', ours)] : []), ...(theirs !== undefined ? [bar('cargo', theirs)] : [])];
-				}),
-				acrossChart('disk', 'On disk', 'MB', 'blaze: its target directory, store and home. cargo: its target directory.', entries, (e) => [
-					...(e.disk_mb !== undefined ? [bar('blaze', e.disk_mb)] : []),
-					...(e.cargo_disk_mb !== undefined ? [bar('cargo', e.cargo_disk_mb)] : []),
-				]),
-			].filter((c): c is Ent => c !== null);
-			const edits = entries.map(([k, e]) => editsChart(k, e)).filter((c): c is Ent => c !== null);
-			return {
-				name: b,
-				label: BACKEND_NAMES[b] ?? b,
-				body: [
-					ent('H3', 'edits', { text: 'Edit, then build' }),
-					ent('Charts', 'projects', undefined, edits),
-					ent('H3', 'projects_side_by_side', { text: 'Every project' }),
-					ent('Charts', 'across', undefined, charts),
-				],
-			};
-		});
+		const backends = unique(keys.map(backend)).sort(backendOrder).map((b) => ({
+			name: b,
+			label: BACKEND_NAMES[b] ?? b,
+			body: latestCharts(keys.filter((k) => backend(k) === b).map((k) => [k, results[k]] as [string, Entry]), run.runs),
+		}));
 		return {
 			name: platform,
 			label: platform,
@@ -126,7 +148,7 @@ function latest(build: BuildMachine[]): Ent[] {
 		};
 	});
 	return [
-		ent('P', 'how', { text: "Each bar is the median of the run's edits; the label on the right of an edit is how much faster blaze was than plain cargo. Open a chart's numbers for the table." }),
+		ent('P', 'how', { text: "Times are on a log scale, so 25 ms and 1.3 s both read: each step of the axis is ten times the last. Beside each row are its numbers and how much faster blaze was than plain cargo; open a chart's numbers for the table." }),
 		picker('platform', 'Platform', items, platforms.includes(FIRST_PLATFORM) ? FIRST_PLATFORM : platforms.at(-1)),
 	];
 }
@@ -136,18 +158,31 @@ const values = (xs: (number | undefined)[]) => xs.map((v) => (v === undefined ||
 const runs = (rs: { run: Run }[]) => `Runs: {dates: "${rs.map((r) => r.run.date).join(' ')}", commits: "${rs.map((r) => r.run.commit ?? '-').join(' ')}"}`;
 const series = (subject: string, xs: (number | undefined)[]) => ent('Series', subject, { values: values(xs), lo: '', hi: '' }, [plots(subject)]);
 
-/** The geometric mean of the edits a run measured, over the edits every one of `entries` measured. */
-function editMean(entries: (Entry | undefined)[], field: 'wall_s' | 'cargo_s') {
-	const sets = entries.filter((e): e is Entry => !!e).map((e) => Object.keys(e.phases).filter((p) => p !== 'cold' && e.phases[p][field] !== undefined));
-	const common = sets.length ? sets.reduce((a, b) => a.filter((p) => b.includes(p))) : [];
-	return entries.map((e) => {
-		if (!e || !common.length) return undefined;
-		const logs = common.map((p) => Math.log(e.phases[p][field]!));
-		return Math.exp(logs.reduce((a, b) => a + b, 0) / logs.length);
-	});
+type Line = [subject: string, values: (number | undefined)[]];
+
+/**
+ * A LineChart over the runs where any of `lines` has a value (a mode a run left out is no gap in the chart, and a
+ * chart with one such run shows its values): null when no run has one. A line whose values are all missing there
+ * is left out.
+ */
+function lineChart(name: string, fields: { title: string; unit: string; scale: 'linear' | 'log'; note: string }, all: { run: Run }[], lines: Line[]): Ent | null {
+	const kept = all.map((_, i) => i).filter((i) => lines.some(([, xs]) => xs[i] !== undefined));
+	if (!kept.length) return null;
+	const drawn = lines.filter(([, xs]) => kept.some((i) => xs[i] !== undefined));
+	return ent('LineChart', name, fields, [runs(kept.map((i) => all[i])), ...drawn.map(([s, xs]) => series(s, kept.map((i) => xs[i])))]);
 }
 
-/** Each machine's runs over time: a Picker of machines, then of backends, then a chart per project. */
+/** Per run, the geometric mean of the build edits that every run in `entries` timed for both blaze and cargo. */
+function editMeans(entries: (Entry | undefined)[]) {
+	const sets = entries.filter((e): e is Entry => !!e).map(bothTimed);
+	const common = sets.length ? sets.reduce((a, b) => a.filter((p) => b.includes(p))) : [];
+	return (field: 'wall_s' | 'cargo_s') => entries.map((e) => mean(e, common, field));
+}
+
+/** A machine's name without what follows it: "AWS c7a.48xlarge (dev-aws-8), pinned ..." is "c7a.48xlarge". */
+const shortMachine = (m: string) => machineName(m).replace(/\s*\([^)]*\)/g, '').split(',')[0].replace(/^AWS /, '').trim();
+
+/** Each machine's runs over time: a Picker of machines, then of backends, then of projects. */
 function overTime(build: BuildMachine[]): Ent[] {
 	if (!build.length) return [ent('Dim', 'none', { text: 'No benchmark runs recorded yet.' })];
 	const newestOf = (platform: string) => build.filter((m) => m.platform === platform).at(-1);
@@ -155,73 +190,66 @@ function overTime(build: BuildMachine[]): Ent[] {
 	const items = build.map((m) => {
 		const keys = unique(m.runs.flatMap((r) => Object.keys(r.results))).sort((a, b) => projectOrder(project(a), project(b)));
 		const backends = unique(keys.map(backend)).sort(backendOrder).map((b) => {
-			const ofBackend = keys.filter((k) => backend(k) === b);
-			const tag = (k: string) => m.runs.map((r) => r.results[k]?.tag).findLast(Boolean);
-			const edits = ofBackend.map((k) => {
+			const projects = keys.filter((k) => backend(k) === b).flatMap((k) => {
 				const entries = m.runs.map((r) => r.results[k]);
-				return ent('LineChart', slug(project(k)), { title: projectName(project(k), tag(k)), unit: 's', note: '' }, [
-					runs(m.runs),
-					series('blaze', editMean(entries, 'wall_s')),
-					series('cargo', editMean(entries, 'cargo_s')),
-				]);
+				const means = editMeans(entries);
+				const [ours, theirs] = [means('wall_s'), means('cargo_s')];
+				const cold = entries.map((e) => e?.phases.cold);
+				const charts = [
+					lineChart('edits', { title: 'Edit, then build', unit: 's', scale: 'log', note: 'The geometric mean of the edits every run measured.' }, m.runs, [
+						['blaze', ours],
+						['cargo', theirs],
+					]),
+					lineChart('cold', { title: 'Cold build, until ready', unit: 's', scale: 'linear', note: '' }, m.runs, [
+						['blaze', cold.map((c) => c?.wall_s)],
+						['warm', cold.map((c) => c?.warm_store_s)],
+						['cargo', cold.map((c) => c?.cargo_s)],
+					]),
+				].filter((c): c is Ent => c !== null);
+				return charts.length ? [{ name: project(k), label: project(k), body: [ent('Charts', 'charts', undefined, charts)] }] : [];
 			});
-			const cold = ofBackend.flatMap((k) => {
-				const entries = m.runs.map((r) => r.results[k]?.phases.cold);
-				if (!entries.some((c) => c?.wall_s !== undefined || c?.cargo_s !== undefined)) return [];
-				return [ent('LineChart', slug(project(k)), { title: projectName(project(k), tag(k)), unit: 's', note: '' }, [
-					runs(m.runs),
-					series('blaze', entries.map((c) => c?.wall_s)),
-					...(entries.some((c) => c?.warm_store_s !== undefined) ? [series('warm', entries.map((c) => c?.warm_store_s))] : []),
-					series('cargo', entries.map((c) => c?.cargo_s)),
-				])];
-			});
-			return {
-				name: b,
-				label: BACKEND_NAMES[b] ?? b,
-				body: [
-					ent('H3', 'edits', { text: 'Edit, then build' }),
-					ent('Charts', 'edits_charts', undefined, edits),
-					...(cold.length ? [ent('H3', 'cold', { text: 'Cold build, until ready' }), ent('Charts', 'cold_charts', undefined, cold)] : []),
-				],
-			};
+			return { name: b, label: BACKEND_NAMES[b] ?? b, body: projects.length ? [picker('project', 'Project', projects, projects[0].name)] : [] };
 		});
 		const [a, z] = [m.runs[0].run, m.runs.at(-1)!.run];
-		const span = m.runs.length === 1 ? `One run, on ${when(a.date)}.` : `${m.runs.length} runs, from ${when(a.date)} to ${when(z.date)}.`;
+		const span = m.runs.length === 1 ? `one run, on ${when(a.date)}` : `${m.runs.length} runs, from ${when(a.date)} to ${when(z.date)}`;
 		return {
 			name: `${m.platform} ${m.machine}`,
-			label: `${m.platform}: ${machineName(m.machine)}`,
-			body: [ent('Dim', 'runs', { text: span }), picker('backend', 'Backend', backends, backends[0]?.name)],
+			label: `${m.platform}, ${shortMachine(m.machine)}`,
+			body: [ent('Dim', 'runs', { text: `${machineName(m.machine)}: ${span}.` }), picker('backend', 'Backend', backends, backends[0]?.name)],
 		};
 	});
 	return [
-		ent('P', 'how', { text: "A machine's runs, oldest to newest. Edit, then build is the geometric mean of the medians of the edits every run measured, so one number per run that moves when any edit does; each edit's own numbers are in the latest run above. Point at a chart to read a run." }),
+		ent('P', 'how', { text: "A machine's runs, oldest to newest. Edit, then build is one number per run, the geometric mean of the edits every run measured, so it moves when any edit does (on a log scale, where a step is the same share at any height); each edit's own numbers are in the latest run above. Point at a chart to read a run." }),
 		picker('machine', 'Machine', items, `${first.platform} ${first.machine}`),
 	];
 }
 
-/** Live edits over time: a Picker of machines, then a chart per program and mode. */
+/** Live edits over time: a Picker of machines, then of programs, then a chart per mode. */
 function live(machines: LiveMachine[]): Ent[] {
 	if (!machines.length) return [ent('Dim', 'none', { text: 'No live-edit runs recorded yet.' })];
 	const newest = [...machines].sort((a, b) => Date.parse(a.runs.at(-1)!.run.date) - Date.parse(b.runs.at(-1)!.run.date)).at(-1)!;
 	const items = machines.map((m) => {
-		const programs = unique(m.runs.flatMap((r) => Object.keys(r.results))).sort(ranked(PROGRAM_ORDER));
-		const body: Ent[] = [ent('Dim', 'runs', { text: m.runs.length === 1 ? `One run, on ${when(m.runs[0].run.date)}.` : `${m.runs.length} runs, from ${when(m.runs[0].run.date)} to ${when(m.runs.at(-1)!.run.date)}.` })];
-		for (const program of programs) {
+		const programs = unique(m.runs.flatMap((r) => Object.keys(r.results))).sort(ranked(PROGRAM_ORDER)).flatMap((program) => {
 			const modes = unique(m.runs.flatMap((r) => Object.keys(r.results[program] ?? {}))).sort(ranked(MODE_ORDER));
-			const charts = modes.map((mode) => {
+			const charts = modes.flatMap((mode) => {
 				const stat = m.runs.map((r) => r.results[program]?.[mode]);
-				return ent('LineChart', slug(mode), { title: MODES[mode] ?? mode, unit: 'ms', note: '' }, [
-					runs(m.runs),
-					series('median', stat.map((s) => s?.p50)),
-					series('p90', stat.map((s) => s?.p90)),
+				const chart = lineChart(slug(mode), { title: MODES[mode] ?? mode, unit: 'ms', scale: 'log', note: '' }, m.runs, [
+					['median', stat.map((s) => s?.p50)],
+					['p90', stat.map((s) => s?.p90)],
 				]);
+				return chart ? [chart] : [];
 			});
-			body.push(ent('H3', slug(program), { text: PROGRAMS[program] ?? program }), ent('Charts', `${slug(program)}_charts`, undefined, charts));
-		}
-		return { name: m.machine || 'unnamed', label: machineName(m.machine), body };
+			return charts.length ? [{ name: program, label: PROGRAMS[program] ?? program, body: [ent('Charts', 'charts', undefined, charts)] }] : [];
+		});
+		const span = m.runs.length === 1 ? `One run, on ${when(m.runs[0].run.date)}.` : `${m.runs.length} runs, from ${when(m.runs[0].run.date)} to ${when(m.runs.at(-1)!.run.date)}.`;
+		return {
+			name: m.machine || 'unnamed',
+			label: machineName(m.machine),
+			body: [ent('Dim', 'runs', { text: span }), ...(programs.length ? [picker('program', 'Program', programs, programs[0].name)] : [])],
+		};
 	});
 	return [
-		ent('P', 'how', { text: 'Edit to running: from the edit leaving the editor to the new code running in the program. Solid is the median edit, dashed the 90th percentile.' }),
+		ent('P', 'how', { text: 'Edit to running: from the edit leaving the editor to the new code running in the program, on a log scale. Solid is the median edit, dashed the 90th percentile. A chart counts only the runs that measured it.' }),
 		picker('machine', 'Machine', items, newest.machine || 'unnamed'),
 	];
 }

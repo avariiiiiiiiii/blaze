@@ -1,12 +1,13 @@
-//! Charts (content/schema.flecs, "Charts"): `BarChart` and `LineChart` drawn as inline SVG at build time, and the
-//! `Picker` that shows one of several panels.
+//! Charts (content/schema.flecs, "Charts"): `RowChart` and `LineChart` drawn at build time, and the `Picker` that
+//! shows one of several panels.
 //!
-//! The SVG has no viewBox: its height is in pixels and every x is a percentage of its width, so the text stays the
-//! page's size at any width (a phone does not shrink it) and the marks stretch. A line chart's paths, which take no
-//! percentages, sit in a nested SVG whose viewBox is stretched along x only (`preserveAspectRatio="none"`), with
-//! strokes that do not scale. Colours are the subjects' slots (`--series-N` in styles/tokens.css, light and dark);
-//! text is in the ink tokens, never a series colour. Each chart carries its numbers as a table under it, which is
-//! also what client/chart.ts reads for the tip under the pointer.
+//! The SVGs have no viewBox: heights are in pixels and every x is a percentage of the width, so text keeps the page's
+//! size at any width (a phone does not shrink it) and the marks stretch. A row chart is HTML rows (label, an SVG track
+//! with the marks, the values written out, the ratio), laid out by styles/site.css on a wide card and on a phone. A
+//! line chart's paths, which take no percentages, sit in a nested SVG whose viewBox is stretched along x only
+//! (`preserveAspectRatio="none"`), with strokes that do not scale. Colours are the subjects' slots (`--series-N` in
+//! styles/tokens.css, light and dark); text is in the ink tokens, never a series colour. Each chart carries its
+//! numbers as a table under it, which is also what client/chart.ts reads for a line chart's tip.
 
 use crate::inline::esc;
 use crate::js;
@@ -54,6 +55,12 @@ fn subject_at(world: &World, path: &str, wher: &str) -> Result<Subject, String> 
     })
 }
 
+/// `v` rounded to the nearest `1 / per`, halves away from zero as a reader rounds them (5.25 is 5.3), not by the
+/// float's binary value as `{:.1}` would (5.2).
+fn half_up(v: f64, per: f64) -> f64 {
+    (v * per).round() / per
+}
+
 /// The units a chart may be in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Unit {
@@ -76,11 +83,11 @@ impl Unit {
     fn format(self, v: f64) -> String {
         match self {
             Unit::Seconds if v < 1.0 => format!("{} ms", (v * 1000.0).round()),
-            Unit::Seconds => format!("{v:.2} s"),
+            Unit::Seconds => format!("{:.2} s", half_up(v, 100.0)),
             Unit::Millis if v >= 1000.0 => Unit::Seconds.format(v / 1000.0),
-            Unit::Millis if v < 10.0 => format!("{v:.1} ms"),
+            Unit::Millis if v < 10.0 => format!("{:.1} ms", half_up(v, 10.0)),
             Unit::Millis => format!("{} ms", v.round()),
-            Unit::Megabytes if v >= 1000.0 => format!("{:.2} GB", v / 1000.0),
+            Unit::Megabytes if v >= 1000.0 => format!("{:.2} GB", half_up(v / 1000.0, 100.0)),
             Unit::Megabytes => format!("{} MB", v.round()),
         }
     }
@@ -96,6 +103,30 @@ impl Unit {
             Unit::Millis => format!("{} ms", trim(v)),
             Unit::Megabytes if v >= 1000.0 => format!("{} GB", trim(v / 1000.0)),
             Unit::Megabytes => format!("{} MB", trim(v)),
+        }
+    }
+}
+
+/// A chart's `scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Scale {
+    Linear,
+    Log,
+}
+
+impl Scale {
+    fn of(e: &Entity, comp: &str) -> Result<Scale, String> {
+        match js::string(e.value(comp).and_then(|v| v.get("scale"))).as_str() {
+            "linear" => Ok(Scale::Linear),
+            "log" => Ok(Scale::Log),
+            s => Err(format!("{}: scale {s:?} is not linear or log", e.path)),
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Scale::Linear => "linear",
+            Scale::Log => "log",
         }
     }
 }
@@ -118,19 +149,86 @@ fn nice_step(rough: f64) -> f64 {
     k * power
 }
 
-/// The axis: zero to a round number at or above the largest value, and its ticks (about four steps).
-fn axis(max: f64) -> (f64, Vec<f64>) {
-    if !(max > 0.0) {
-        return (1.0, vec![0.0, 1.0]);
+/// The values `m × 10^k` for each `m` in `mantissas`, from the one at or below `lo` to the one at or above `hi`.
+fn ladder(lo: f64, hi: f64, mantissas: &[f64]) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut k = lo.log10().floor() as i32 - 1;
+    while out.last().is_none_or(|&v| v < hi * (1.0 - 1e-9)) {
+        for &m in mantissas {
+            out.push(m * 10f64.powi(k));
+        }
+        k += 1;
     }
-    let step = nice_step(max / 4.0);
-    let top = (max / step - 1e-9).ceil().max(1.0) * step;
-    let ticks = (0..=((top / step).round() as usize)).map(|i| i as f64 * step).collect();
-    (top, ticks)
+    let first = out.iter().rposition(|&v| v <= lo * (1.0 + 1e-9)).unwrap_or(0);
+    let last = out.iter().position(|&v| v >= hi * (1.0 - 1e-9)).unwrap_or(out.len() - 1);
+    out[first..=last].to_vec()
+}
+
+/// An axis: where a value sits along it (0 to 1), and its ticks.
+#[derive(Clone, Debug, PartialEq)]
+struct Axis {
+    scale: Scale,
+    lo: f64,
+    hi: f64,
+    ticks: Vec<f64>,
+}
+
+impl Axis {
+    /// Linear: zero to a round number at or above the largest value, about three steps. Log: from the 1-2-5 value at
+    /// or below the smallest to the one at or above the largest, ticked at as fine a 1-2-5, 1-3 or decade ladder as
+    /// keeps to five ticks. A log axis takes values above zero only.
+    fn new(scale: Scale, values: impl Iterator<Item = f64>, wher: &str) -> Result<Axis, String> {
+        let (mut min, mut max) = (f64::INFINITY, 0.0f64);
+        for v in values {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        match scale {
+            Scale::Linear => {
+                if !(max > 0.0) {
+                    return Ok(Axis { scale, lo: 0.0, hi: 1.0, ticks: vec![0.0, 1.0] });
+                }
+                let step = nice_step(max / 3.0);
+                let hi = (max / step - 1e-9).ceil().max(1.0) * step;
+                let ticks = (0..=((hi / step).round() as usize)).map(|i| i as f64 * step).collect();
+                Ok(Axis { scale, lo: 0.0, hi, ticks })
+            }
+            Scale::Log => {
+                if !(min > 0.0) {
+                    return Err(format!("{wher}: a log scale takes values above zero only"));
+                }
+                let mut ends = ladder(min, max, &[1.0, 2.0, 5.0]);
+                if ends.len() < 2 {
+                    ends = ladder(min / 2.0, max * 2.0, &[1.0, 2.0, 5.0]);
+                }
+                let (lo, hi) = (ends[0], ends[ends.len() - 1]);
+                let inside = |m: &[f64]| -> Vec<f64> {
+                    ladder(lo, hi, m)
+                        .into_iter()
+                        .filter(|&v| v >= lo * (1.0 - 1e-9) && v <= hi * (1.0 + 1e-9))
+                        .collect()
+                };
+                let ticks = [&[1.0, 2.0, 5.0][..], &[1.0, 3.0], &[1.0]]
+                    .iter()
+                    .map(|m| inside(m))
+                    .find(|t| t.len() <= 5)
+                    .unwrap_or_else(|| inside(&[1.0]));
+                Ok(Axis { scale, lo, hi, ticks })
+            }
+        }
+    }
+
+    fn at(&self, v: f64) -> f64 {
+        let f = match self.scale {
+            Scale::Linear => (v - self.lo) / (self.hi - self.lo),
+            Scale::Log => (v / self.lo).ln() / (self.hi / self.lo).ln(),
+        };
+        f.clamp(0.0, 1.0)
+    }
 }
 
 fn pct(x: f64) -> String {
-    format!("{}%", js::number((x * 100.0).round() / 100.0))
+    format!("{}%", js::number((x * 10000.0).round() / 100.0))
 }
 
 fn f1(v: f64) -> String {
@@ -153,29 +251,52 @@ fn speedup(baseline: f64, lead: f64) -> Option<String> {
     })
 }
 
-/// The key beside a subject's name: a bar swatch, or a line (dashed or not).
-fn key(s: &Subject, line: bool) -> String {
+/// How a subject is drawn, for its key.
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    Bar,
+    Dot,
+    Line,
+}
+
+/// The key beside a subject's name: a bar swatch, a dot, or a line (dashed or not).
+fn key(s: &Subject, mark: Mark) -> String {
     let dash = if s.dashed { " dashed" } else { "" };
-    let mark = if line {
-        format!("<line x1=\"1\" y1=\"5\" x2=\"17\" y2=\"5\" class=\"stroke s{}{dash}\" />", s.slot)
-    } else {
-        format!("<rect x=\"0\" y=\"1\" width=\"12\" height=\"8\" rx=\"2\" class=\"fill s{}\" />", s.slot)
+    let (w, shape) = match mark {
+        Mark::Bar => (
+            12,
+            format!(
+                "<rect x=\"0\" y=\"1\" width=\"12\" height=\"8\" rx=\"2\" class=\"fill s{}\" />",
+                s.slot
+            ),
+        ),
+        Mark::Dot => {
+            (10, format!("<circle cx=\"5\" cy=\"5\" r=\"4.5\" class=\"fill s{}\" />", s.slot))
+        }
+        Mark::Line => (
+            18,
+            format!(
+                "<line x1=\"1\" y1=\"5\" x2=\"17\" y2=\"5\" class=\"stroke s{}{dash}\" />",
+                s.slot
+            ),
+        ),
     };
-    format!("<svg class=\"key\" width=\"18\" height=\"10\" aria-hidden=\"true\">{mark}</svg>")
+    format!("<svg class=\"key\" width=\"{w}\" height=\"10\" aria-hidden=\"true\">{shape}</svg>")
 }
 
 /// The caption: title, note, and a legend when the chart compares two subjects or more.
-fn caption(title: &str, note: &str, subjects: &[Subject], line: bool) -> String {
+fn caption(title: &str, note: &str, subjects: &[Subject], mark: Mark) -> String {
     let legend = if subjects.len() > 1 {
         let items: String = subjects
             .iter()
-            .map(|s| format!("<li>{}{}</li>", key(s, line), esc(&s.label)))
+            .map(|s| format!("<li>{}{}</li>", key(s, mark), esc(&s.label)))
             .collect();
         format!("<ul class=\"legend\">{items}</ul>")
     } else {
         String::new()
     };
-    let note = if note.is_empty() { String::new() } else { format!("<p class=\"note\">{note}</p>") };
+    let note =
+        if note.is_empty() { String::new() } else { format!("<p class=\"note\">{note}</p>") };
     format!("<figcaption><span class=\"title\">{}</span>{note}{legend}</figcaption>", esc(title))
 }
 
@@ -228,22 +349,34 @@ impl Notes {
     }
 }
 
-/// Bar geometry, in pixels.
-const LABEL_H: f64 = 20.0;
+/// Row geometry, in pixels: a line per subject (its bar, and its value beside the track), and the track's padding
+/// above and below, inside the SVG so that the grid runs on from row to row.
+const LINE: f64 = 17.0;
+const PAD: f64 = 5.0;
 const BAR_H: f64 = 10.0;
-const BAR_GAP: f64 = 3.0;
-const ROW_GAP: f64 = 14.0;
-const AXIS_H: f64 = 22.0;
-/// The share of the width the bars may take; the rest is for the value after the longest.
-const BAR_SPAN: f64 = 0.8;
+const DOT_R: f64 = 5.0;
+const AXIS_H: f64 = 16.0;
 
-/// A `BarChart`: one group per `Row`, a bar per subject in it, each labelled with its value, and the row's speedup
-/// over the chart's `Baseline` on the right of its label.
-pub fn bar_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, String> {
+/// The anchor of a tick label at `f` along a track: the ends keep inside it.
+fn anchor(f: f64) -> &'static str {
+    if f < 0.04 {
+        "start"
+    } else if f > 0.96 {
+        "end"
+    } else {
+        "middle"
+    }
+}
+
+/// A `RowChart`: per `Row` its label, an SVG track with its values (bars from zero on a linear scale, dots joined
+/// from the smallest to the largest on a log one), the values written out, and its speedup over the chart's
+/// `Baseline`. The rows share one axis, under them.
+pub fn row_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, String> {
     let e = world.get(n);
-    let v = e.value("BarChart").expect("a BarChart");
+    let v = e.value("RowChart").expect("a RowChart");
     let title = js::string(v.get("title"));
-    let unit = Unit::of(e, "BarChart")?;
+    let unit = Unit::of(e, "RowChart")?;
+    let scale = Scale::of(e, "RowChart")?;
     let baseline = match e.targets("Baseline").and_then(|t| t.first()) {
         Some(p) => Some(subject_at(world, p, &e.path)?),
         None => None,
@@ -251,7 +384,7 @@ pub fn bar_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, S
 
     struct Row {
         label: String,
-        bars: Vec<(Subject, f64, String)>,
+        values: Vec<(Subject, f64, String)>,
     }
     let mut rows = Vec::new();
     let mut subjects: Vec<Subject> = Vec::new();
@@ -259,119 +392,140 @@ pub fn bar_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, S
         let re = world.get(r);
         let label = js::string(
             re.value("Row")
-                .ok_or_else(|| format!("{}: a BarChart's children are Rows", re.path))?
+                .ok_or_else(|| format!("{}: a RowChart's children are Rows", re.path))?
                 .get("label"),
         );
-        let mut bars = Vec::new();
+        let mut values = Vec::new();
         for &b in &re.children {
             let be = world.get(b);
-            let bv = be.value("Bar").ok_or_else(|| format!("{}: a Row's children are Bars", be.path))?;
+            let bv = be
+                .value("Value")
+                .ok_or_else(|| format!("{}: a Row's children are Values", be.path))?;
             let value = js::to_number(bv.get("value"));
             if !value.is_finite() || value < 0.0 {
-                return Err(format!("{}: a Bar's value must be zero or more", be.path));
+                return Err(format!("{}: a Value must be zero or more", be.path));
             }
             let s = subject(world, be)?;
-            if bars.iter().any(|(x, _, _): &(Subject, f64, String)| x.path == s.path) {
-                return Err(format!("{}: two Bars for {} in one Row", be.path, s.path));
+            if values.iter().any(|(x, _, _): &(Subject, f64, String)| x.path == s.path) {
+                return Err(format!("{}: two Values for {} in one Row", be.path, s.path));
             }
             if !subjects.iter().any(|x| x.path == s.path) {
                 subjects.push(s.clone());
             }
-            bars.push((s, value, js::string(bv.get("note"))));
+            values.push((s, value, js::string(bv.get("note"))));
         }
-        rows.push(Row { label, bars });
+        rows.push(Row { label, values });
     }
     if rows.is_empty() {
-        return Err(format!("{}: a BarChart with no Rows", e.path));
+        return Err(format!("{}: a RowChart with no Rows", e.path));
     }
-    // Every row draws its bars in the legend's order, so a colour sits in the same place in every group.
+    // Every row lists its values in the legend's order, so a colour sits in the same place in every row.
     for r in &mut rows {
-        r.bars.sort_by_key(|(s, _, _)| subjects.iter().position(|x| x.path == s.path));
+        r.values.sort_by_key(|(s, _, _)| subjects.iter().position(|x| x.path == s.path));
     }
-    let max = rows.iter().flat_map(|r| r.bars.iter().map(|b| b.1)).fold(0.0, f64::max);
-    let (top, ticks) = axis(max);
-    let x = |v: f64| v / top * BAR_SPAN;
+    let axis = Axis::new(scale, rows.iter().flat_map(|r| r.values.iter().map(|b| b.1)), &e.path)?;
     let ratio = |r: &Row| {
         let b = baseline.as_ref()?;
-        let base = r.bars.iter().find(|(s, _, _)| s.path == b.path)?.1;
-        let lead = r.bars.iter().find(|(s, _, _)| s.path != b.path)?.1;
+        let base = r.values.iter().find(|(s, _, _)| s.path == b.path)?.1;
+        let lead = r.values.iter().find(|(s, _, _)| s.path != b.path)?.1;
         speedup(base, lead)
     };
+    let mark_of = if scale == Scale::Log { Mark::Dot } else { Mark::Bar };
+    let track_h = subjects.len() as f64 * LINE + 2.0 * PAD;
+    let grid: String = axis
+        .ticks
+        .iter()
+        .map(|&t| {
+            let x = pct(axis.at(t));
+            let zero = if scale == Scale::Linear && t == 0.0 { " zero" } else { "" };
+            format!("<line class=\"grid{zero}\" x1=\"{x}\" x2=\"{x}\" y1=\"0\" y2=\"100%\" />")
+        })
+        .collect();
 
     let mut notes = Notes::default();
     let mut body = String::new();
-    let mut y = 0.0;
     let mut table_rows = Vec::new();
-    for (i, r) in rows.iter().enumerate() {
-        let h = LABEL_H + r.bars.len() as f64 * (BAR_H + BAR_GAP) - BAR_GAP;
+    for r in &rows {
         let speed = ratio(r);
-        let mut g = format!(
-            "<rect class=\"hit\" x=\"0\" y=\"{}\" width=\"100%\" height=\"{}\" rx=\"4\" />",
-            f1(y - 4.0),
-            f1(h + 8.0)
-        );
-        g += &format!("<text class=\"label\" x=\"0\" y=\"{}\">{}</text>", f1(y + 13.0), esc(&r.label));
-        if let Some(sp) = &speed {
-            g += &format!(
-                "<text class=\"ratio\" x=\"100%\" y=\"{}\" text-anchor=\"end\">{}</text>",
-                f1(y + 13.0),
-                esc(sp)
-            );
-        }
+        let mut marks = String::new();
+        let mut vals = String::new();
         let mut cells = vec![esc(&r.label)];
-        for s in &subjects {
-            cells.push(match r.bars.iter().find(|(b, _, _)| b.path == s.path) {
+        for (k, s) in subjects.iter().enumerate() {
+            let found = r.values.iter().find(|(b, _, _)| b.path == s.path);
+            let text = match found {
                 Some((_, v, note)) => format!("{}{}", esc(&unit.format(*v)), notes.mark(note)),
                 None => "–".into(),
-            });
+            };
+            vals += &format!("<span>{}{text}</span>", key(s, mark_of));
+            cells.push(text);
+            if let (Some((_, v, _)), Scale::Linear) = (found, scale) {
+                marks += &format!(
+                    "<rect class=\"fill s{}\" x=\"0\" y=\"{}\" width=\"{}\" height=\"{BAR_H}\" rx=\"2\" />",
+                    s.slot,
+                    f1(PAD + k as f64 * LINE + (LINE - BAR_H) / 2.0),
+                    pct(axis.at(*v))
+                );
+            }
+        }
+        if scale == Scale::Log {
+            let cy = f1(track_h / 2.0);
+            let xs: Vec<f64> = r.values.iter().map(|(_, v, _)| axis.at(*v)).collect();
+            let (a, b) = xs.iter().fold((1.0f64, 0.0f64), |(a, b), &x| (a.min(x), b.max(x)));
+            if xs.len() > 1 {
+                marks += &format!(
+                    "<line class=\"rc-span\" x1=\"{}\" x2=\"{}\" y1=\"{cy}\" y2=\"{cy}\" />",
+                    pct(a),
+                    pct(b)
+                );
+            }
+            // The first subject last, so that it is on top where dots meet.
+            for (s, v, _) in r.values.iter().rev() {
+                marks += &format!(
+                    "<circle class=\"dot s{}\" cx=\"{}\" cy=\"{cy}\" r=\"{DOT_R}\" />",
+                    s.slot,
+                    pct(axis.at(*v))
+                );
+            }
         }
         if baseline.is_some() {
             cells.push(speed.as_deref().map(esc).unwrap_or_else(|| "–".into()));
         }
         table_rows.push(cells);
-        for (k, (s, v, note)) in r.bars.iter().enumerate() {
-            let by = y + LABEL_H + k as f64 * (BAR_H + BAR_GAP);
-            // A bar too short to see still shows where it starts.
-            g += &format!(
-                "<rect class=\"fill s{}\" x=\"0\" y=\"{}\" width=\"{}\" height=\"{BAR_H}\" rx=\"2\" />",
-                s.slot,
-                f1(by),
-                pct(x(*v).max(0.002))
-            );
-            g += &format!(
-                "<text class=\"value\" x=\"{}\" dx=\"6\" y=\"{}\" dy=\"0.35em\">{}{}</text>",
-                pct(x(*v)),
-                f1(by + BAR_H / 2.0),
-                esc(&unit.format(*v)),
-                notes.mark(note)
-            );
-        }
-        body += &format!("<g class=\"row\" data-row=\"{i}\">{g}</g>");
-        y += h + ROW_GAP;
-    }
-    let plot_h = y - ROW_GAP;
-    let mut grid = String::new();
-    for t in &ticks {
-        let tx = pct(x(*t));
-        grid += &format!(
-            "<line class=\"grid{}\" x1=\"{tx}\" x2=\"{tx}\" y1=\"{}\" y2=\"{}\" />",
-            if *t == 0.0 { " zero" } else { "" },
-            f1(LABEL_H - 4.0),
-            f1(plot_h + 4.0)
-        );
-        grid += &format!(
-            "<text class=\"tick\" x=\"{tx}\" y=\"{}\" text-anchor=\"{}\">{}</text>",
-            f1(plot_h + AXIS_H - 4.0),
-            if *t == 0.0 { "start" } else { "middle" },
-            esc(&unit.tick(*t))
+        let ratio_html = match (&baseline, &speed) {
+            (None, _) => String::new(),
+            (Some(_), sp) => format!(
+                "<span class=\"rc-ratio\">{}</span>",
+                sp.as_deref().map(esc).unwrap_or_default()
+            ),
+        };
+        body += &format!(
+            "<div class=\"rc-row\"><span class=\"rc-label\">{}</span><svg class=\"rc-track\" width=\"100%\" height=\"{}\" aria-hidden=\"true\">{grid}{marks}</svg><span class=\"rc-vals\">{vals}</span>{ratio_html}</div>",
+            esc(&r.label),
+            f1(track_h)
         );
     }
-    let height = plot_h + AXIS_H;
+    let ticks: String = axis
+        .ticks
+        .iter()
+        .map(|&t| {
+            let f = axis.at(t);
+            format!(
+                "<text class=\"tick\" x=\"{}\" y=\"11\" text-anchor=\"{}\">{}</text>",
+                pct(f),
+                anchor(f),
+                esc(&unit.tick(t))
+            )
+        })
+        .collect();
+    let axis_row = format!(
+        "<div class=\"rc-row rc-axis\" aria-hidden=\"true\"><svg class=\"rc-track\" width=\"100%\" height=\"{AXIS_H}\">{ticks}</svg></div>"
+    );
     let names: Vec<&str> = subjects.iter().map(|s| s.label.as_str()).collect();
     let label = format!(
-        "{title}: bars for {} in each of {} rows; the numbers are in the table below.",
+        "{title}: {} for each of {} rows, on a {} scale; the numbers are in the table below.",
         names.join(" and "),
-        rows.len()
+        rows.len(),
+        scale.class()
     );
     let mut head = vec![String::new()];
     head.extend(subjects.iter().map(|s| esc(&s.label)));
@@ -379,10 +533,11 @@ pub fn bar_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, S
         head.push(format!("vs {}", esc(&b.label)));
     }
     Ok(format!(
-        "<figure class=\"chart bars\" id=\"{}\">{}<svg class=\"plot\" width=\"100%\" height=\"{}\" role=\"img\" aria-label=\"{}\">{grid}{body}</svg>{}{}</figure>",
+        "<figure class=\"chart rows {}{}\" id=\"{}\">{}<div class=\"plot\" role=\"img\" aria-label=\"{}\">{body}{axis_row}</div>{}{}</figure>",
+        scale.class(),
+        if baseline.is_some() { " ratios" } else { "" },
         esc(id),
-        caption(&title, note, &subjects, false),
-        f1(height),
+        caption(&title, note, &subjects, mark_of),
         esc(&label),
         notes_html(&notes.0),
         table(&head, &table_rows)
@@ -390,7 +545,7 @@ pub fn bar_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, S
 }
 
 /// Line geometry, in pixels.
-const LINE_H: f64 = 156.0;
+const LINE_H: f64 = 168.0;
 const TOP: f64 = 14.0;
 const BOTTOM: f64 = 22.0;
 /// The share of the width at each side kept clear, so the first and last points are whole.
@@ -442,12 +597,28 @@ fn day(iso: &str) -> String {
     }
 }
 
-/// A `LineChart`: a line per `Series` over the chart's `Runs`, with its band when it has one.
+/// A run as the table and a one-run chart name it: its day and a link to its commit.
+fn run_html(date: &str, commit: &str) -> String {
+    if commit == "-" {
+        return esc(&day(date));
+    }
+    let short: String = commit.chars().take(10).collect();
+    format!(
+        "{} <a href=\"https://github.com/indexable-inc/blaze/commit/{}\"><code>{}</code></a>",
+        esc(&day(date)),
+        esc(commit),
+        esc(&short)
+    )
+}
+
+/// A `LineChart`: a line per `Series` over the chart's `Runs`, with its band when it has one. With one run there is
+/// no line to draw: each subject's value is written out instead.
 pub fn line_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, String> {
     let e = world.get(n);
     let v = e.value("LineChart").expect("a LineChart");
     let title = js::string(v.get("title"));
     let unit = Unit::of(e, "LineChart")?;
+    let scale = Scale::of(e, "LineChart")?;
     let runs = e.value("Runs").ok_or_else(|| format!("{}: a LineChart needs Runs", e.path))?;
     let dates: Vec<String> =
         js::string(runs.get("dates")).split_whitespace().map(str::to_string).collect();
@@ -455,11 +626,7 @@ pub fn line_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, 
         js::string(runs.get("commits")).split_whitespace().map(str::to_string).collect();
     let n_runs = dates.len();
     if n_runs == 0 || commits.len() != n_runs {
-        return Err(format!(
-            "{}: Runs has {n_runs} dates and {} commits",
-            e.path,
-            commits.len()
-        ));
+        return Err(format!("{}: Runs has {n_runs} dates and {} commits", e.path, commits.len()));
     }
 
     struct Line {
@@ -491,54 +658,72 @@ pub fn line_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, 
     if lines.is_empty() {
         return Err(format!("{}: a LineChart with no Series", e.path));
     }
-    let max = lines
-        .iter()
-        .flat_map(|l| {
-            l.values.iter().chain(l.band.iter().flat_map(|(_, hi)| hi.iter())).flatten().copied()
-        })
-        .fold(0.0, f64::max);
-    let (top, ticks) = axis(max);
+    let subjects: Vec<Subject> = lines.iter().map(|l| l.s.clone()).collect();
+
+    if n_runs == 1 {
+        let stats: String = lines
+            .iter()
+            .map(|l| {
+                let value = l.values[0].map(|v| esc(&unit.format(v))).unwrap_or_else(|| "–".into());
+                format!(
+                    "<div><dt>{}{}</dt><dd>{value}</dd></div>",
+                    key(&l.s, Mark::Line),
+                    esc(&l.s.label)
+                )
+            })
+            .collect();
+        return Ok(format!(
+            "<figure class=\"chart lines one\" id=\"{}\">{}<dl class=\"stats\">{stats}</dl><p class=\"note\">One run so far: {}. A line starts with the next.</p></figure>",
+            esc(id),
+            caption(&title, note, &[], Mark::Line),
+            run_html(&dates[0], &commits[0])
+        ));
+    }
+
+    let axis = Axis::new(
+        scale,
+        lines.iter().flat_map(|l| {
+            l.values
+                .iter()
+                .chain(l.band.iter().flat_map(|(lo, hi)| lo.iter().chain(hi.iter())))
+                .flatten()
+                .copied()
+        }),
+        &e.path,
+    )?;
     let ph = LINE_H - TOP - BOTTOM;
     // x as a share of the width; y in pixels inside the plot.
-    let x = |i: usize| {
-        if n_runs <= 1 { 0.5 } else { EDGE + i as f64 / (n_runs - 1) as f64 * (1.0 - 2.0 * EDGE) }
-    };
-    let y = |v: f64| ph - (v / top).clamp(0.0, 1.0) * ph;
+    let x = |i: usize| EDGE + i as f64 / (n_runs - 1) as f64 * (1.0 - 2.0 * EDGE);
+    let y = |v: f64| ph - axis.at(v) * ph;
     // In the stretched inner SVG, x runs 0 to 1000.
     let ix = |i: usize| f1(x(i) * 1000.0);
 
     let mut grid = String::new();
-    for t in &ticks {
-        let ty = TOP + y(*t);
+    for &t in &axis.ticks {
+        let ty = TOP + y(t);
+        let zero = scale == Scale::Linear && t == 0.0;
         grid += &format!(
             "<line class=\"grid{}\" x1=\"0\" x2=\"100%\" y1=\"{}\" y2=\"{}\" />",
-            if *t == 0.0 { " zero" } else { "" },
+            if zero { " zero" } else { "" },
             f1(ty),
             f1(ty)
         );
-        if *t != 0.0 {
+        if !zero {
             grid += &format!(
                 "<text class=\"tick\" x=\"0\" y=\"{}\">{}</text>",
                 f1(ty - 4.0),
-                esc(&unit.tick(*t))
+                esc(&unit.tick(t))
             );
         }
     }
     let base = f1(LINE_H - 6.0);
-    if n_runs > 1 {
-        grid += &format!(
-            "<text class=\"tick\" x=\"{}\" y=\"{base}\">{}</text><text class=\"tick\" x=\"{}\" y=\"{base}\" text-anchor=\"end\">{}</text>",
-            pct(x(0)),
-            esc(&day(&dates[0])),
-            pct(x(n_runs - 1)),
-            esc(&day(&dates[n_runs - 1]))
-        );
-    } else {
-        grid += &format!(
-            "<text class=\"tick\" x=\"50%\" y=\"{base}\" text-anchor=\"middle\">{}</text>",
-            esc(&day(&dates[0]))
-        );
-    }
+    grid += &format!(
+        "<text class=\"tick\" x=\"{}\" y=\"{base}\">{}</text><text class=\"tick\" x=\"{}\" y=\"{base}\" text-anchor=\"end\">{}</text>",
+        pct(x(0)),
+        esc(&day(&dates[0])),
+        pct(x(n_runs - 1)),
+        esc(&day(&dates[n_runs - 1]))
+    );
 
     // Bands first, then the lines, the first subject last so that it is on top.
     let mut inner = String::new();
@@ -613,24 +798,12 @@ pub fn line_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, 
         }
     }
 
-    let subjects: Vec<Subject> = lines.iter().map(|l| l.s.clone()).collect();
     let mut head = vec!["Run".to_string()];
     head.extend(subjects.iter().map(|s| esc(&s.label)));
     let rows: Vec<Vec<String>> = (0..n_runs)
         .rev()
         .map(|i| {
-            let short: String = commits[i].chars().take(10).collect();
-            let run = if commits[i] == "-" {
-                esc(&day(&dates[i]))
-            } else {
-                format!(
-                    "{} <a href=\"https://github.com/indexable-inc/blaze/commit/{}\"><code>{}</code></a>",
-                    esc(&day(&dates[i])),
-                    esc(&commits[i]),
-                    esc(&short)
-                )
-            };
-            let mut r = vec![run];
+            let mut r = vec![run_html(&dates[i], &commits[i])];
             for l in &lines {
                 let band = l.band.as_ref().and_then(|(lo, hi)| Some((lo[i]?, hi[i]?)));
                 r.push(match (l.values[i], band) {
@@ -649,16 +822,16 @@ pub fn line_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, 
         .collect();
     let names: Vec<&str> = subjects.iter().map(|s| s.label.as_str()).collect();
     let label = format!(
-        "{title}: {} over {n_runs} run{}, from {} to {}; the numbers are in the table below.",
+        "{title}: {} over {n_runs} runs, from {} to {}, on a {} scale; the numbers are in the table below.",
         names.join(" and "),
-        if n_runs == 1 { "" } else { "s" },
         day(&dates[0]),
-        day(&dates[n_runs - 1])
+        day(&dates[n_runs - 1]),
+        scale.class()
     );
     Ok(format!(
         "<figure class=\"chart lines\" id=\"{}\">{}<svg class=\"plot\" width=\"100%\" height=\"{LINE_H}\" role=\"img\" aria-label=\"{}\" data-runs=\"{n_runs}\" data-edge=\"{EDGE}\">{grid}<svg y=\"{TOP}\" width=\"100%\" height=\"{}\" viewBox=\"0 0 1000 {}\" preserveAspectRatio=\"none\" overflow=\"visible\">{inner}</svg><line class=\"guide\" x1=\"0\" x2=\"0\" y1=\"{TOP}\" y2=\"{}\" />{dots}</svg>{}</figure>",
         esc(id),
-        caption(&title, note, &subjects, true),
+        caption(&title, note, &subjects, Mark::Line),
         esc(&label),
         f1(ph),
         f1(ph),
@@ -671,12 +844,17 @@ pub fn line_chart(world: &World, n: Id, id: &str, note: &str) -> Result<String, 
 /// with a rule per place.
 pub const MAX_PICKS: usize = 16;
 
-/// A `Picker`'s buttons: radio inputs named for the picker, so it needs no JS; the panels follow (render.rs).
+/// A `Picker`'s buttons, after its label: radio inputs named for the picker, so it needs no JS; the panels follow
+/// (render.rs).
 pub fn picker_buttons(world: &World, n: Id, id: &str, picks: &[Id]) -> Result<String, String> {
     let e = world.get(n);
     let label = js::string(e.value("Picker").and_then(|v| v.get("label")));
     if picks.is_empty() || picks.len() > MAX_PICKS {
-        return Err(format!("{}: a Picker has 1 to {MAX_PICKS} Picks, not {}", e.path, picks.len()));
+        return Err(format!(
+            "{}: a Picker has 1 to {MAX_PICKS} Picks, not {}",
+            e.path,
+            picks.len()
+        ));
     }
     let chosen = picks.iter().position(|&p| world.get(p).has_tag("Picked")).unwrap_or(0);
     let mut buttons = String::new();
@@ -690,8 +868,8 @@ pub fn picker_buttons(world: &World, n: Id, id: &str, picks: &[Id]) -> Result<St
         );
     }
     Ok(format!(
-        "<fieldset class=\"picks\"><legend class=\"sr\">{}</legend>{buttons}</fieldset>",
-        esc(&label)
+        "<fieldset class=\"picks\"><legend class=\"sr\">{l}</legend><span class=\"what\" aria-hidden=\"true\">{l}</span>{buttons}</fieldset>",
+        l = esc(&label)
     ))
 }
 
@@ -711,12 +889,36 @@ mod tests {
         assert_eq!(Unit::Megabytes.tick(2500.0), "2.5 GB");
     }
 
+    fn close(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-9 * y.abs().max(1.0))
+    }
+
     #[test]
-    fn axes_start_at_zero_and_end_round() {
-        let (top, ticks) = axis(0.787);
-        assert!((top - 0.8).abs() < 1e-9 && ticks.len() == 5 && ticks[0] == 0.0);
-        assert_eq!(axis(8.0).0, 8.0);
-        assert_eq!(axis(0.0), (1.0, vec![0.0, 1.0]));
+    fn linear_axes_start_at_zero_and_end_round() {
+        let a = Axis::new(Scale::Linear, [0.787].into_iter(), "t").unwrap();
+        assert!(close(&a.ticks, &[0.0, 0.5, 1.0]) && a.hi == 1.0);
+        assert_eq!(
+            Axis::new(Scale::Linear, [133.9].into_iter(), "t").unwrap().ticks,
+            vec![0.0, 50.0, 100.0, 150.0]
+        );
+        assert_eq!(Axis::new(Scale::Linear, [0.0].into_iter(), "t").unwrap().ticks, vec![0.0, 1.0]);
+        assert_eq!(pct(0.787), "78.7%");
+    }
+
+    #[test]
+    fn log_axes_hold_every_value_on_round_ends() {
+        // 25 ms beside 1.31 s: 20 ms to 2 s, ticked 30 ms, 100 ms, 300 ms, 1 s.
+        let a = Axis::new(Scale::Log, [0.025, 1.31].into_iter(), "t").unwrap();
+        assert!(close(&[a.lo, a.hi], &[0.02, 2.0]));
+        assert!(close(&a.ticks, &[0.03, 0.1, 0.3, 1.0]));
+        assert!((a.at(0.2) - 0.5).abs() < 1e-9);
+        // Close together: the 1-2-5 ladder.
+        let b = Axis::new(Scale::Log, [0.025, 0.036].into_iter(), "t").unwrap();
+        assert!(close(&[b.lo, b.hi], &[0.02, 0.05]) && close(&b.ticks, &[0.02, 0.05]));
+        // One value on a rung: widened to the rungs around it.
+        let c = Axis::new(Scale::Log, [0.1].into_iter(), "t").unwrap();
+        assert!(close(&[c.lo, c.hi], &[0.05, 0.2]));
+        assert!(Axis::new(Scale::Log, [0.0, 1.0].into_iter(), "t").is_err());
     }
 
     #[test]

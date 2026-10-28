@@ -120,10 +120,13 @@ details, and the steps for serving the files from R2.
 Built from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
 `harness/benchhistory.py` (its docstring describes a line). `content/bench.flecs` names the directory with
 `BenchHistory history(dir: ...)`; at build time `gen/bench/` reads it and writes a Flecs script of Sections, Pickers
-and charts (`BarChart`, `LineChart`, `Charts`, schema in `content/schema.flecs`) under that entity, which runs after the
-content. The renderer draws each chart as inline SVG with its numbers in a table under it (`renderer/core/src/chart.rs`),
-coloured by `--series-N` (`styles/tokens.css`); `client/chart.ts` adds only the hover tooltip, and the pickers are radio
-buttons that work without JS. A new line shows after the next deploy; the `site` workflow deploys on a change under
+and charts (`RowChart`, `LineChart`, `Charts`, schema in `content/schema.flecs`) under that entity, which runs after the
+content. The renderer draws them in `renderer/core/src/chart.rs`, coloured by `--series-N` (`styles/tokens.css`), each
+with its numbers in a table under it. A row chart is one row per project or edit with its values written beside it: bars
+on a linear axis from zero, or dots on a shared log axis (1-2-5 ticks) when the values span orders of magnitude, with the
+speedup over the baseline. A line chart is inline SVG on a linear or log axis; with one run so far it shows that run as
+numbers instead of a lone dot. `client/chart.ts` adds only the line charts' hover tooltip, and the pickers (platform,
+backend, project, machine) are labelled radio buttons that work without JS. A new line shows after the next deploy; the `site` workflow deploys on a change under
 `docs/benchmarks/`. Lines are grouped by machine, and the charts over time keep each machine's last 60 runs.
 
 To look at the page with other data, point `BENCH_HISTORY` at a directory of `.jsonl` files:

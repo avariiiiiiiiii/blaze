@@ -132,24 +132,24 @@ main.c-live .c-compose .row > span { display: none; }
 .c-form .error { font-size: 13.5px; }
 .c-empty { margin: 0; color: var(--ink-3); font-size: 13.5px; }
 
-/* Charts (renderer core chart.rs, schema.flecs): inline SVG drawn at build time. Text keeps the page's size at any
-   width: x is in percent, the height in pixels. Marks wear --series-N (tokens.css), text the ink tokens; the hover
-   tooltip is client/chart.ts. */
-.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0 0 1.3em; }
-.chart { margin: 0; padding: 14px 14px 8px; border-radius: 12px; background: var(--bg); box-shadow: inset 0 0 0 1px var(--line); min-width: 0; }
-.chart figcaption { display: flex; flex-direction: column; gap: 4px; margin: 0 0 10px; }
-.chart .title { color: var(--ink-1); font-size: 14px; font-weight: 600; line-height: 1.35; }
+/* Charts (renderer core chart.rs, schema.flecs), drawn at build time. Text keeps the page's size at any width: SVG x
+   is in percent, heights in pixels. Marks wear --series-N (tokens.css), text the ink tokens; a line chart's tip is
+   client/chart.ts. A row chart is HTML rows over a shared axis: label | track | values | ratio on a card wide enough,
+   label and ratio over track and values on a narrow one (a container query, so two cards side by side narrow too). */
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0 0 16px; }
+.chart { margin: 0 0 16px; padding: 16px 16px 10px; border-radius: 12px; background: var(--bg); box-shadow: inset 0 0 0 1px var(--line); min-width: 0; container-type: inline-size; }
+.charts > .chart { margin: 0; }
+.chart figcaption { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; }
+.chart .title { color: var(--ink-1); font-size: 14.5px; font-weight: 600; line-height: 1.35; }
 .chart .note { margin: 0; color: var(--ink-3); font-size: 12.5px; line-height: 1.45; }
-.chart .legend { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 0; padding: 0; list-style: none; color: var(--ink-2); font-size: 12.5px; line-height: 1.5; }
+.chart .legend { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 2px 0 0; padding: 0; list-style: none; color: var(--ink-2); font-size: 12.5px; line-height: 1.5; }
 .chart .legend li { margin: 0; padding: 0; white-space: nowrap; }
 .chart .legend li::before { content: none; }
 .chart .key { display: inline-block; margin-right: 6px; vertical-align: -1px; overflow: visible; }
-.chart .plot { display: block; overflow: visible; font-family: var(--font-sans); font-size: 12px; font-variant-numeric: tabular-nums; }
-.chart .plot text { fill: var(--ink-2); }
-.chart .plot .label { fill: var(--ink-1); font-size: 12.5px; }
-.chart .plot .value { fill: var(--ink-2); }
-.chart .plot .ratio { fill: var(--ink-3); }
-.chart .plot .tick { fill: var(--ink-3); font-size: 11px; }
+.chart svg text { font-family: var(--font-sans); font-variant-numeric: tabular-nums; }
+.chart .tick { fill: var(--ink-3); font-size: 11px; }
+/* A line chart's y labels sit on the plot: a halo in the card's colour keeps them clear of the lines. */
+.chart svg.plot .tick { paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
 .chart .grid { stroke: var(--line); stroke-width: 1; }
 .chart .grid.zero { stroke: var(--line-2); }
 .chart .fill.s1, .chart .dot.s1 { fill: var(--series-1); }
@@ -169,57 +169,87 @@ main.c-live .c-compose .row > span { display: none; }
 .chart .band.s4 { fill: color-mix(in srgb, var(--series-4) 16%, transparent); }
 .chart .whisker { stroke-width: 1.5; opacity: 0.6; }
 .chart .dot { stroke: var(--bg); stroke-width: 2; }
-.chart .row .hit { fill: transparent; }
-.chart .row:hover .hit, .chart .row.on .hit { fill: var(--s-tint); }
-.chart .guide { stroke: var(--line-2); stroke-width: 1; visibility: hidden; }
+.chart .rc-span { stroke: var(--line-2); stroke-width: 2; stroke-linecap: round; }
+/* Row charts. A row is as tall as its values, one 17px line each (chart.rs LINE); the track's grid runs on through
+   the rows. */
+.chart.rows .plot { display: grid; grid-template-columns: minmax(7rem, 13rem) minmax(0, 1fr) max-content; column-gap: 14px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.chart.rows.ratios .plot { grid-template-columns: minmax(7rem, 13rem) minmax(0, 1fr) max-content 6.5rem; }
+.chart.rows .rc-row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: center; margin: 0 -8px; padding: 0 8px; border-radius: 6px; }
+.chart.rows .rc-row:not(.rc-axis):hover { background: var(--s-tint); }
+.chart.rows .rc-label { grid-column: 1; color: var(--ink-1); line-height: 1.35; }
+.chart.rows .rc-track { grid-column: 2; display: block; overflow: visible; }
+.chart.rows .rc-vals { grid-column: 3; display: flex; flex-direction: column; color: var(--ink-2); line-height: 17px; white-space: nowrap; }
+.chart.rows .rc-vals .key { margin-right: 5px; vertical-align: 0; }
+.chart.rows .rc-ratio { grid-column: 4; color: var(--ink-3); font-size: 12.5px; text-align: right; white-space: nowrap; }
+.chart.rows .rc-axis .rc-track { margin-top: 2px; }
+@container (max-width: 560px) {
+	.chart.rows .plot, .chart.rows.ratios .plot { grid-template-columns: minmax(0, 1fr) max-content; column-gap: 12px; }
+	.chart.rows .rc-row { padding-top: 6px; }
+	.chart.rows .rc-label { grid-column: 1; grid-row: 1; font-size: 12.5px; }
+	.chart.rows .rc-ratio { grid-column: 2; grid-row: 1; }
+	.chart.rows .rc-track { grid-column: 1; grid-row: 2; }
+	.chart.rows .rc-vals { grid-column: 2; grid-row: 2; font-size: 12.5px; }
+	.chart.rows .rc-axis { padding-top: 0; }
+}
+/* A line chart with one run: its values, until a line can be drawn. */
+.chart .stats { display: flex; flex-wrap: wrap; gap: 10px 28px; margin: 0 0 10px; }
+.chart .stats div { margin: 0; }
+.chart .stats dt { color: var(--ink-2); font-size: 12.5px; }
+.chart .stats dd { margin: 2px 0 0; color: var(--ink-1); font-size: 22px; font-weight: 500; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
 .chart .plot.on .guide { visibility: visible; }
+.chart .guide { stroke: var(--line-2); stroke-width: 1; visibility: hidden; }
+.chart svg.plot { display: block; overflow: visible; }
 .chart .numbers { margin: 8px 0 0; }
 .chart .numbers summary { display: inline-block; padding: 2px 0; color: var(--ink-3); font-size: 12.5px; cursor: pointer; list-style: none; }
 .chart .numbers summary::-webkit-details-marker { display: none; }
 .chart .numbers summary::before { content: '\25B8'; display: inline-block; width: 1em; transition: transform 0.15s; }
 .chart .numbers[open] summary::before { transform: rotate(90deg); }
 .chart .numbers summary:hover { color: var(--ink-1); }
+.chart > .note { margin: 8px 0 0; }
 .chart .ref { overflow-x: auto; }
 .chart .ref table { margin: 6px 0 0; font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .chart .ref th, .chart .ref td { white-space: nowrap; }
 .chart .ref .num { text-align: right; }
 .chart .ref .dim { color: var(--ink-3); }
-/* The chart tooltip (client/chart.ts): the hovered row or run, in ink, each value beside its subject's key. */
+/* The line chart tooltip (client/chart.ts): the run under the pointer, in ink, each value beside its subject's key. */
 .chart-tip { position: fixed; z-index: 60; max-width: 260px; padding: 6px 9px; border-radius: 8px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 6px 18px rgb(0 0 0 / 0.22); color: var(--ink-1); font-size: 12px; line-height: 1.45; font-variant-numeric: tabular-nums; pointer-events: none; }
 .chart-tip[hidden] { display: none; }
 .chart-tip b { display: block; font-weight: 600; }
 .chart-tip span { display: block; color: var(--ink-2); white-space: nowrap; }
 .chart-tip .key { margin-right: 6px; vertical-align: -1px; }
-.chart-tip .dim { color: var(--ink-3); }
 
-/* Picker (schema.flecs, render.rs): radio buttons over panels, one panel shown, with no JS. */
-.picks { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; padding: 0; border: 0; min-width: 0; }
+/* Picker (schema.flecs, render.rs): radio buttons over panels, one panel shown, with no JS. Its label leads the row;
+   a picker inside another's panel is a step smaller. */
+.picks { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 14px; padding: 0; border: 0; min-width: 0; }
+.picks .what { min-width: 4.6rem; margin-right: 4px; color: var(--ink-3); font-size: 12.5px; }
 .picks label { position: relative; display: inline-flex; }
 .picks input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
-.picks span { padding: 5px 12px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); font-size: 14px; line-height: 1.4; transition: background 0.15s, color 0.15s, box-shadow 0.15s; }
+.picks label span { padding: 5px 12px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); font-size: 14px; line-height: 1.4; transition: background 0.15s, color 0.15s, box-shadow 0.15s; }
+.panel .picks label span { padding: 3px 10px; font-size: 13px; }
 .picks label:hover span { box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-1); }
 .picks input:checked + span { background: var(--ink-1); box-shadow: none; color: var(--bg); font-weight: 500; }
 .picks input:focus-visible + span { outline: 2px solid var(--ink-2); outline-offset: 2px; }
-.picker > .pick { display: none; }
-.picker:has(> .picks > label:nth-of-type(1) > input:checked) > .pick:nth-of-type(1) { display: block; }
-.picker:has(> .picks > label:nth-of-type(2) > input:checked) > .pick:nth-of-type(2) { display: block; }
-.picker:has(> .picks > label:nth-of-type(3) > input:checked) > .pick:nth-of-type(3) { display: block; }
-.picker:has(> .picks > label:nth-of-type(4) > input:checked) > .pick:nth-of-type(4) { display: block; }
-.picker:has(> .picks > label:nth-of-type(5) > input:checked) > .pick:nth-of-type(5) { display: block; }
-.picker:has(> .picks > label:nth-of-type(6) > input:checked) > .pick:nth-of-type(6) { display: block; }
-.picker:has(> .picks > label:nth-of-type(7) > input:checked) > .pick:nth-of-type(7) { display: block; }
-.picker:has(> .picks > label:nth-of-type(8) > input:checked) > .pick:nth-of-type(8) { display: block; }
-.picker:has(> .picks > label:nth-of-type(9) > input:checked) > .pick:nth-of-type(9) { display: block; }
-.picker:has(> .picks > label:nth-of-type(10) > input:checked) > .pick:nth-of-type(10) { display: block; }
-.picker:has(> .picks > label:nth-of-type(11) > input:checked) > .pick:nth-of-type(11) { display: block; }
-.picker:has(> .picks > label:nth-of-type(12) > input:checked) > .pick:nth-of-type(12) { display: block; }
-.picker:has(> .picks > label:nth-of-type(13) > input:checked) > .pick:nth-of-type(13) { display: block; }
-.picker:has(> .picks > label:nth-of-type(14) > input:checked) > .pick:nth-of-type(14) { display: block; }
-.picker:has(> .picks > label:nth-of-type(15) > input:checked) > .pick:nth-of-type(15) { display: block; }
-.picker:has(> .picks > label:nth-of-type(16) > input:checked) > .pick:nth-of-type(16) { display: block; }
+.picker > .panel { display: none; }
+.picker:has(> .picks > label:nth-of-type(1) > input:checked) > .panel:nth-of-type(1) { display: block; }
+.picker:has(> .picks > label:nth-of-type(2) > input:checked) > .panel:nth-of-type(2) { display: block; }
+.picker:has(> .picks > label:nth-of-type(3) > input:checked) > .panel:nth-of-type(3) { display: block; }
+.picker:has(> .picks > label:nth-of-type(4) > input:checked) > .panel:nth-of-type(4) { display: block; }
+.picker:has(> .picks > label:nth-of-type(5) > input:checked) > .panel:nth-of-type(5) { display: block; }
+.picker:has(> .picks > label:nth-of-type(6) > input:checked) > .panel:nth-of-type(6) { display: block; }
+.picker:has(> .picks > label:nth-of-type(7) > input:checked) > .panel:nth-of-type(7) { display: block; }
+.picker:has(> .picks > label:nth-of-type(8) > input:checked) > .panel:nth-of-type(8) { display: block; }
+.picker:has(> .picks > label:nth-of-type(9) > input:checked) > .panel:nth-of-type(9) { display: block; }
+.picker:has(> .picks > label:nth-of-type(10) > input:checked) > .panel:nth-of-type(10) { display: block; }
+.picker:has(> .picks > label:nth-of-type(11) > input:checked) > .panel:nth-of-type(11) { display: block; }
+.picker:has(> .picks > label:nth-of-type(12) > input:checked) > .panel:nth-of-type(12) { display: block; }
+.picker:has(> .picks > label:nth-of-type(13) > input:checked) > .panel:nth-of-type(13) { display: block; }
+.picker:has(> .picks > label:nth-of-type(14) > input:checked) > .panel:nth-of-type(14) { display: block; }
+.picker:has(> .picks > label:nth-of-type(15) > input:checked) > .panel:nth-of-type(15) { display: block; }
+.picker:has(> .picks > label:nth-of-type(16) > input:checked) > .panel:nth-of-type(16) { display: block; }
 .bench .dim, .bench p { font-variant-numeric: tabular-nums; }
 @media (max-width: 620px) {
 	.charts { grid-template-columns: minmax(0, 1fr); }
+	.picks .what { flex-basis: 100%; }
 	.chart { padding: 12px 12px 6px; }
 }
 

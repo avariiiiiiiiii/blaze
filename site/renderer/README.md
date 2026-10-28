@@ -93,8 +93,8 @@ the error), `snap_output_ptr`, `snap_output_len`, `snap_drop`. The input is JSON
 and the snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (a
 lesson page). The core embeds it unchanged, so the core has no highlighter.
 
-Charts are elements like any other (`BarChart`, `LineChart`, `Charts`, `Picker` in `content/schema.flecs`), drawn by
-`core/src/chart.rs` as inline SVG with a table of their numbers. The benchmark page's are written by the build from the
+Charts are elements like any other (`RowChart`, `LineChart`, `Charts`, `Picker` in `content/schema.flecs`), drawn by
+`core/src/chart.rs` as HTML rows and inline SVG with a table of their numbers. The benchmark page's are written by the build from the
 history files (`gen/bench/`) as a Flecs script that runs after the content.
 
 ## wasi:http host

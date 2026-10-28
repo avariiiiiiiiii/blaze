@@ -22,6 +22,7 @@ import contextlib, os, random, sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from constfn import ConstFns
 from scenes import Scenes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2521,6 +2522,10 @@ class Gen(Scenes):
             self.make_fn()
         self.phase("run")
         self.make_run()
+        const_fns = ConstFns(self.key)
+        self.lines += const_fns.case()
+        self.lines.insert(self.lines.index("    pub fn run() {") + 1, "        const_fns();")
+        self.cov["const.fn"] += len(const_fns.fns)
         return self.lines
 
     def phase(self, name):

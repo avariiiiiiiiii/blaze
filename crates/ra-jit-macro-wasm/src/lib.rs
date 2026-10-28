@@ -1229,9 +1229,9 @@ impl Shapes {
 /// is kept of it when the store has it, else by running it in what `wasm` gives, which is
 /// asked for only then, and keeps what it made unless `store` is `None`.
 #[allow(clippy::too_many_arguments)]
-fn expand(
+fn expand<'a>(
     identity: &[u8; 32],
-    wasm: &dyn Fn() -> Result<&Wasm, String>,
+    wasm: &dyn Fn() -> Result<&'a Wasm, String>,
     index: u32,
     listed: &Listed,
     db: Option<&dyn SourceDatabase>,

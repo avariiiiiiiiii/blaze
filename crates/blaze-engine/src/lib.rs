@@ -8683,6 +8683,7 @@ fn run_holding(
         events::said_beside(socket);
     }
     events::at(events::Step::LoadWorkspace, None);
+    events::cache_ahead();
     let start = Instant::now();
     let selection = args.selection.clone();
     blaze_store::identify_ahead();

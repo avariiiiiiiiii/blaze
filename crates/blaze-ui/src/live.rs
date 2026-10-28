@@ -10,6 +10,9 @@ const SHOWN: usize = 6;
 /// The most lines of the tree of crates ([`Live::tree`]).
 const TREE: usize = 10;
 
+/// How many half seconds the line of how busy the cores were shows ([`Live::cores`]).
+const SPARK: usize = 20;
+
 /// Clears the region and draws it again as records come and time passes. What it returns is
 /// written to the terminal as it is.
 pub struct Live {
@@ -116,6 +119,7 @@ impl Live {
         }
         let mut lines = vec![self.header(now_ns)];
         lines.extend(self.strip(now_ns));
+        lines.extend(self.cores(now_ns));
         lines.extend(self.under_way(now_ns));
         lines
     }
@@ -176,6 +180,30 @@ impl Live {
             line.push_str(&texts[at][mark(it).len()..]);
         }
         Some(line)
+    }
+
+    /// How busy the worker's cores were over the last [`SPARK`] half seconds, and now:
+    /// `cores ▁▂▇█████▇▆▃▁▁▁ 1.0/16 busy`, so that a build on one core shows at once.
+    fn cores(&self, now_ns: u64) -> Option<String> {
+        const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let build = &self.build;
+        let now = build.busy_at(now_ns)?;
+        let of = build.cores_of.max(1);
+        let spark: String = (0..SPARK)
+            .map(|at| {
+                let back = (SPARK - 1 - at) as u64 * 500_000_000;
+                match now_ns.checked_sub(back).and_then(|it| build.busy_at(it)) {
+                    Some(busy) => {
+                        let level =
+                            (u64::from(busy) * 7 + u64::from(of) * 50) / (u64::from(of) * 100);
+                        BLOCKS[level.min(7) as usize]
+                    }
+                    None => ' ',
+                }
+            })
+            .collect();
+        let rest = format!("{spark} {}.{}/{of} busy", now / 100, now % 100 / 10);
+        Some(self.fit(DIM, "cores", &rest))
     }
 
     /// The step under way and what it does, and the crates under way.

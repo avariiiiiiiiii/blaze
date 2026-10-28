@@ -50,6 +50,9 @@ pub enum Event {
     /// What held the build up: each node of it is the one the next waited for last, from the
     /// first to the one that finished last.
     Critical { path: Vec<u32> },
+    /// How busy the process was since it said this last, while at a step: `busy` hundredths
+    /// of a core, of the `of` cores it may run on. Said when it moved by a tenth of a core.
+    Cores { busy: u32, of: u32 },
 }
 
 /// What a node of the build's graph does (docs/driver.md, "The graph").

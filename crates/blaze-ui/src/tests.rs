@@ -339,9 +339,17 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
     ));
     build.apply(&at(17 * S, crate_is("anim", CrateState::Built, 77917)));
     let summary = build.summary(117_400 * MS, None);
-    let (chain, chain_ns, unnamed) = (Vec::new(), 0, None);
-    let finished =
-        crate::Finished { ok: true, summary, at_ns: 117_400 * MS, chain, chain_ns, unnamed };
+    let (chain, chain_ns, unnamed, cores) = (Vec::new(), 0, None, Vec::new());
+    let finished = crate::Finished {
+        ok: true,
+        summary,
+        at_ns: 117_400 * MS,
+        chain,
+        chain_ns,
+        unnamed,
+        cores,
+        cores_of: 0,
+    };
     let lines = crate::last_lines(&finished, false, true);
     assert_eq!(
         lines,
@@ -381,6 +389,41 @@ fn a_long_build_says_what_held_it_up_and_time_no_step_named() {
             "warning: 1.50s with no step named, after names",
             "             `blaze why` says more",
         ]
+    );
+}
+
+/// How busy the worker's cores were shows as it goes, the last ten seconds a block each half
+/// second, and the end says how many cores each slow step kept busy: a step on one core of
+/// eight is why a build is slow.
+#[test]
+fn the_cores_kept_busy_show_as_it_goes_and_at_the_end() {
+    let took = crate::Took { step: Step::Std, of: None, took_ns: 4 * S };
+    let summary = Summary { took_ns: 4 * S, slowest: vec![took], ..Summary::default() };
+    let records = [
+        at(0, Event::Began { build: 1, command: "build".into(), root: "/w/rg".into() }),
+        at(0, Event::Started { step: Step::Std, of: None }),
+        at(500 * MS, Event::Cores { busy: 100, of: 8 }),
+        at(3 * S, Event::Cores { busy: 790, of: 8 }),
+    ];
+    let mut live = Live::new(120, false);
+    for record in &records {
+        live.record(record, record.at_ns);
+    }
+    let drawn = live.tick(4 * S);
+    let region: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    let spark = format!(
+        "cores {:12}\u{2582}\u{2582}\u{2582}\u{2582}\u{2582}\u{2588}\u{2588}\u{2588} 7.9/8 busy",
+        ""
+    );
+    assert_eq!(region[2], spark);
+    let end = [
+        at(4 * S, Event::Ended { step: Step::Std, of: None }),
+        at(4 * S, Event::Finished { ok: true, summary }),
+    ];
+    let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
+    assert!(
+        drawn.contains("Took 4.00s: compiling the standard library (once, kept in the store) 4.00s (2.7/8 cores)"),
+        "{drawn:?}"
     );
 }
 

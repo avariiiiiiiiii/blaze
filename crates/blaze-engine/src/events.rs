@@ -123,26 +123,48 @@ pub(crate) fn crate_is(krate: Crate, state: CrateState) {
     }
 }
 
+/// Why the store has nothing for this blaze, when it can say so before a build: there is
+/// none, nothing was added to it, or another blaze added to it last, whose keys are not this
+/// one's.
+fn cold_ahead(store: Option<&blaze_store::Store>, this: &str) -> Option<String> {
+    let Some(store) = store else {
+        return Some(format!("there is no store ({})", blaze_cargo::cargo::daemon::no_store()));
+    };
+    match store.last_writer() {
+        Some(other) if other != this => {
+            let mut parts = other.split('-');
+            let release = parts.next().unwrap_or_default();
+            Some(match parts.next() {
+                Some(commit) => format!("cache keys changed since blaze {release} ({commit})"),
+                None => format!("cache keys changed since blaze {release}"),
+            })
+        }
+        Some(_) => None,
+        None => Some("the store is empty".to_owned()),
+    }
+}
+
+/// Says, as the workspace starts loading, why the build will find nothing in the store when
+/// the store says so already, so that the view says it is cold from the start. Nothing before
+/// the toolchain is known: a store opened then is none for good.
+pub(crate) fn cache_ahead() {
+    if !heard() || blaze_store::toolchain().is_none() {
+        return;
+    }
+    let cold = cold_ahead(blaze_store::Store::global(), &crate::version());
+    if let Some(cold) = cold {
+        say(Event::Cache { cache: Cache { found: 0, fetched: 0, compiled: 0, cold: Some(cold) } });
+    }
+}
+
 /// Says what the store had of the compile `stats` counted, and of one that found nothing in
 /// it, why; then has the store say this blaze added to it last.
 pub(crate) fn cache(stats: &hir_ty_codegen::BuildStats) {
     let store = blaze_store::Store::global();
     let this = crate::version();
     let (found, compiled) = (stats.reused as u64, stats.compiled as u64);
-    let cold = (compiled > 0 && found == 0).then(|| match store {
-        None => format!("there is no store ({})", blaze_cargo::cargo::daemon::no_store()),
-        Some(store) => match store.last_writer() {
-            Some(other) if other != this => {
-                let mut parts = other.split('-');
-                let release = parts.next().unwrap_or_default();
-                match parts.next() {
-                    Some(commit) => format!("cache keys changed since blaze {release} ({commit})"),
-                    None => format!("cache keys changed since blaze {release}"),
-                }
-            }
-            Some(_) => "the store has none of this build".to_owned(),
-            None => "the store is empty".to_owned(),
-        },
+    let cold = (compiled > 0 && found == 0).then(|| {
+        cold_ahead(store, &this).unwrap_or_else(|| "the store has none of this build".to_owned())
     });
     if let Some(store) = store.filter(|_| compiled > 0) {
         let _ = store.note_writer(&this);

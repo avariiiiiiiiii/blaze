@@ -1,0 +1,103 @@
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+
+// Diagnostic: const-check
+//
+// An error of rustc's const checker: a `const fn`, a `const` or a `static` calls a function
+// that is not `const` or a function pointer, casts a pointer to an integer, compares pointers,
+// or has inline assembly.
+pub(crate) fn const_check_error(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::ConstCheckError,
+) -> Diagnostic {
+    let code = match d.code {
+        "" => DiagnosticCode::Ra("const-check", crate::Severity::Error),
+        code => DiagnosticCode::RustcHardError(code),
+    };
+    Diagnostic::new_with_syntax_node_ptr(ctx, code, d.message.clone(), d.node).stable()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::check_diagnostics;
+
+    #[test]
+    fn non_const_calls_in_const_contexts() {
+        check_diagnostics(
+            r#"
+fn regular() -> u32 { 1 }
+const fn constant() -> u32 { 2 }
+mod m {
+    pub fn inner() -> u32 { 3 }
+}
+struct S;
+impl S {
+    fn new() -> S { S }
+    fn get(&self) -> u32 { 4 }
+    const fn made() -> S { S }
+}
+const fn f() -> u32 {
+    let s = S::made();
+    constant();
+    regular();
+  //^^^^^^^^^ error: cannot call non-const function `regular` in constant functions
+    m::inner();
+  //^^^^^^^^^^ error: cannot call non-const function `m::inner` in constant functions
+    s.get()
+  //^^^^^^^ error: cannot call non-const method `S::get` in constant functions
+}
+const C: u32 = regular();
+             //^^^^^^^^^ error: cannot call non-const function `regular` in constants
+static X: S = S::new();
+            //^^^^^^^^ error: cannot call non-const associated function `S::new` in statics
+fn runtime() -> u32 { regular() }
+"#,
+        );
+    }
+
+    #[test]
+    fn trait_methods_and_unreachable_calls_are_left_to_rustc() {
+        check_diagnostics(
+            r#"
+//- minicore: default, panic
+trait T { fn t() -> u32; }
+impl T for () { fn t() -> u32 { 0 } }
+fn regular() -> u32 { 1 }
+const fn generic<X: T>() -> u32 { X::t() }
+const fn dead() -> u32 {
+    return 0;
+    regular()
+}
+const fn panics() -> u32 {
+    panic!("no")
+}
+struct Tuple(u32);
+const fn built() -> Tuple { Tuple(1) }
+"#,
+        );
+    }
+
+    #[test]
+    fn pointers_in_const_fns() {
+        check_diagnostics(
+            r#"
+//- minicore: eq, fn
+const fn address(p: *const u8) -> usize {
+    p as usize
+  //^^^^^^^^^^ error: pointers cannot be cast to integers during const eval
+}
+const fn same(p: *const u8, q: *const u8) -> bool {
+    p == q
+  //^^^^^^ error: pointers cannot be reliably compared during const eval
+}
+const fn call(f: fn() -> u32) -> u32 {
+    f()
+  //^^^ error: function pointer calls are not allowed in constant functions
+}
+fn runtime(p: *const u8, f: fn() -> u32) -> usize {
+    f();
+    p as usize
+}
+"#,
+        );
+    }
+}

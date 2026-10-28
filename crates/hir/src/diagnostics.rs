@@ -134,6 +134,7 @@ diagnostics![AnyDiagnostic<'db> ->
     BorrowckError,
     BorrowckSkipped,
     BreakOutsideOfLoop,
+    ConstCheckError,
     CannotBeDereferenced<'db>,
     UnaryOperatorCannotBeApplied<'db>,
     BinaryOperatorCannotBeApplied<'db>,
@@ -415,6 +416,14 @@ pub struct BorrowckError {
     pub node: InFile<SyntaxNodePtr>,
     /// The span is the brace that closes `node`, where rustc has a scope end.
     pub at_end: bool,
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// An error of rustc's const checker: what a `const fn`, a `const` or a `static` may not do.
+#[derive(Debug)]
+pub struct ConstCheckError {
+    pub node: InFile<SyntaxNodePtr>,
     pub code: &'static str,
     pub message: String,
 }
@@ -1475,6 +1484,13 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     message: diagnostic.message.clone(),
                 }
                 .into(),
+            );
+        }
+        for diagnostic in &hir_ide::mir::const_check::const_check(self.db, def).diagnostics {
+            let Some(node) = node_of(diagnostic.span) else { continue };
+            self.acc.push(
+                ConstCheckError { node, code: diagnostic.code, message: diagnostic.message.clone() }
+                    .into(),
             );
         }
         if let Some(reason) = &result.skipped

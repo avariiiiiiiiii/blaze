@@ -15,6 +15,7 @@ pub(crate) use hir_ty::{
     next_solver::{GenericArgs, Ty},
 };
 
+pub mod const_check;
 mod eval;
 pub mod location;
 mod lower;

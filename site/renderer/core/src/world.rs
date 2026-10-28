@@ -108,6 +108,51 @@ impl World {
         v
     }
 
+    /// The lesson pages under `parent` (pages with `Lesson`), by `Lesson.order`, then path.
+    pub fn lessons(&self, parent: Id) -> Vec<Id> {
+        let order =
+            |e: &Entity| crate::js::to_number(e.value("Lesson").and_then(|v| v.get("order")));
+        let mut v: Vec<Id> = self
+            .get(parent)
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| self.get(c).is_a("Page") && self.get(c).has("Lesson"))
+            .collect();
+        v.sort_by(|&a, &b| {
+            let (x, y) = (self.get(a), self.get(b));
+            order(x).total_cmp(&order(y)).then_with(|| x.path.cmp(&y.path))
+        });
+        v
+    }
+
+    /// A `Course` widget's lessons: those under its `(Lessons, <page>)` target, or under the page holding it.
+    pub fn course_source(&self, course: Id) -> Result<Id, String> {
+        let e = self.get(course);
+        match e.targets("Lessons").and_then(|t| t.first()) {
+            Some(path) => self
+                .lookup(path)
+                .ok_or_else(|| format!("{}: (Lessons, {path}) names nothing", e.path)),
+            None => e.parent.ok_or_else(|| format!("{}: Course has no parent", e.path)),
+        }
+    }
+
+    /// The `Course` widget on a page (not looking into the page's child pages), if it has one.
+    pub fn course_in(&self, page: Id) -> Option<Id> {
+        let mut todo: Vec<Id> = self.get(page).children.clone();
+        while let Some(n) = todo.pop() {
+            let e = self.get(n);
+            if e.is_a("Page") {
+                continue;
+            }
+            if e.has_tag("Course") {
+                return Some(n);
+            }
+            todo.extend(e.children.iter().copied());
+        }
+        None
+    }
+
     /// Every entity, parents before children.
     pub fn iter(&self) -> impl Iterator<Item = (Id, &Entity)> {
         self.entities.iter().enumerate()

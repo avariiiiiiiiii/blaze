@@ -165,8 +165,11 @@ built by blaze with no cargo, rustc or rustdoc (below).
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
-status. Every test runs, unless `BLAZE_TESTS=affected` says otherwise, outside any sandbox,
-as cargo runs it, unless the workspace opts into sandboxed tests.
+status, outside any sandbox, as cargo runs it, unless the workspace opts into sandboxed tests.
+A hermetic test, one whose code reaches nothing outside the program and nothing blaze can't
+see into, is skipped while it has passed with the code it reaches as it is now; every other
+test runs every time ([below](#tests-are-hermetic-or-say-why-not)). `BLAZE_TESTS=all` runs
+every test.
 
 ### Sandboxed tests (an experiment, opt-in)
 
@@ -622,18 +625,20 @@ A module sees only what cargo documents for a proc macro:
   the environment of the shell or the daemon.
 - A clock that reads 0 and random bytes that are the same on every run.
 
-Each expansion is kept in the store. Its first key is what the module was built of (two
-builds of one source are not the same bytes), the macro, its input and the variables. Its
-second key adds the file reads the host recorded: each path, relative to the package, and
-what that file held. A later expansion is found only while each of those reads holds the
-same as before; the format is `cargo/keyed.rs`'s. The expansion's own keys hold no absolute
-path and no host triple. But what a module was built of names the checkout's paths, so for
-now only the same checkout finds it. An expansion that asked the compiler about a span (its
-source text, file, line or a join) is not kept. A module's machine code is kept too, for
-the machine that compiled it: a new process loads it in about 3 ms rather than compiling it
-again (4 to 11 s for the corpus's macros). The list of a module's macros is kept in a
-`.macros` file beside it, so a load compiles nothing; a module is compiled, or loaded from
-the store, when one of its macros first expands.
+Each calling crate gets its own module instance for a database revision. Its macros share
+guest statics, stored tokens, source locations and open package files. Every new database
+revision starts a fresh session, including a client request without source changes. Before cached bodies are checked, its declarations expand
+again in collection order, including unchanged registration attributes. A trap fails that
+session until the next revision.
+
+Expansion outputs are not cached: finding an earlier output would skip the macro's state
+changes. The compiled module's machine code remains cached for the host that compiled it.
+Frozen declaration, impl and language-item artifacts are disabled for crates whose
+declarations call these macros: those artifacts do not contain the macro's state. Depending
+on a macro crate alone does not disable frozen artifacts or force declaration expansion.
+Actual callers repeat declaration expansion every revision; compiled function caching remains enabled.
+The list of a module's macros is kept in a `.macros` file beside it; a load compiles nothing
+until a macro first expands.
 
 A proc macro that can't be built or loaded as a module fails the load, naming it:
 
@@ -654,23 +659,27 @@ names is an error.
 
 ### Running only the tests that have not passed
 
-With `BLAZE_TESTS=affected`, `blaze test` runs, of each test executable the daemon
-built, the tests that have not passed with what they are a function of as it is now. A pass is
-kept in blaze's store, as a compiled function is, so it travels with the store through a remote
-(`blaze-engine cache push|pull`, `BLAZE_REMOTE`): a pass on main's CI stands on every branch whose
-test and inputs are the same.
+`blaze test` runs, of each test executable the daemon built, the tests that have not passed
+with what they are a function of as it is now (`BLAZE_TESTS=affected`, the default;
+`BLAZE_TESTS=all` runs every test, as cargo does). A pass is kept in blaze's store, as a
+compiled function is, so it travels with the store through a remote (`blaze-engine cache push|pull`,
+`BLAZE_REMOTE`): a pass on main's CI stands on every branch whose test and inputs are the same.
+Beside each test executable, `tests-passed` has the keys of its hermetic tests' passes this
+machine found or kept, and `tests-programs` the digest of each program an integration test is
+handed (`CARGO_BIN_EXE_<name>`) by its size, time and inode: a command whose tests all passed
+before neither opens the store nor reads a program again (`BLAZE_TESTS=verify` asks the store).
 
-Only a sandboxed test's pass is kept, since only the sandbox records what a test read. In a
-workspace that has not opted into sandboxed tests
-([above](#sandboxed-tests-an-experiment-opt-in)) no test has a key, so every test runs every
-time, on every commit, as under `all`, and the command says so once, with the line to add and
-the manifest to add it to:
-
-    note: no test is sandboxed, so none is kept as passed and every test runs: sandboxed tests are an experiment a workspace opts into, with `experimental = ["sandboxed-tests"]` under `[workspace.metadata.blaze]` in /home/me/tsel/Cargo.toml
+A hermetic test's pass is kept by its code alone, sandboxed or not
+([below](#tests-are-hermetic-or-say-why-not)). A test that reaches the world outside the
+program (files, the environment, other processes, the network) is kept only in a workspace
+that opts into sandboxed tests ([above](#sandboxed-tests-an-experiment-opt-in)), where the
+sandbox records what it read and that is part of its key; elsewhere it runs every time, as does
+a test that reaches what nothing records (foreign code, assembly, a static other tests change,
+code blaze can't compile).
 
     Running unittests src/lib.rs (target/debug/deps/tsel-1f2e): 2 of 5 tests
     Cached tests/it.rs (target/debug/deps/it-9a8b): 2 tests, passed before as they are now
-    Cached 5 tests from commit 2bfa62d8ce (run 18834512), 2 from an earlier run on this machine; 1 test run every time (`-v` says why); `BLAZE_TESTS=all` runs every test
+    Cached 5 tests from commit 2bfa62d8ce (run 18834512), 2 from an earlier run on this machine; 1 test run every time (`blaze test --why` says why); `BLAZE_TESTS=all` runs every test
 
 At each build the daemon hashes every test's code with the code of every function it calls,
 directly or through others, in any crate of the workspace or its dependencies, and its
@@ -709,12 +718,13 @@ code runs:
 
     Sandboxed tests::reads_a_file: it read `/home/me/tsel/data.txt`, which changed
 
-A test the sandbox can't make hermetic runs every time and is never kept: one that reaches a
-function blaze can't compile, a benchmark, one its package takes out of the sandbox, every one
-of a workspace that has not opted in, every one under `BLAZE_SANDBOX=off`, and one whose reads are not all known (a program macOS starts
-without the interposer). The summary says how many there are and names those outside the
-sandbox. `blaze test -v` says, under each test executable, why each test it runs every
-time does (`Always`), by the fewest calls from the test to it.
+A test that is not hermetic and that no sandbox makes so runs every time and is never kept: one
+that reaches what nothing records, a benchmark, one that reaches the world outside and runs
+outside a sandbox (its package takes it out, its workspace has not opted in, or
+`BLAZE_SANDBOX=off`), and one whose reads are not all known (a program macOS starts without the
+interposer). The summary says how many there are. `blaze test -v` says, under each test
+executable, why each test it runs every time does (`Always`), by the fewest calls from the
+test to it, and `blaze test --why` says it of every test without running any.
 
 Of a test executable that fails, the tests libtest's summary lists as failed, and those the
 sandbox denied something, are not kept; the others that ran are. One that ends with no summary
@@ -757,12 +767,106 @@ test (axum) and 32.3 s against 28.8 s (just;
 
 A test executable cargo built, a command that names tests or passes the harness other flags
 than `-q`, `--nocapture`, `--show-output`, `--test-threads` and `--color`, and one that runs
-the ignored tests run as asked: every test, and nothing is kept. Unset, or `all`, runs every
-test, as cargo does; the daemon then hashes nothing. With no store (`BLAZE_CACHE=off`)
+the ignored tests run as asked: every test, and nothing is kept. `all` runs every test, as
+cargo does; the daemon then hashes nothing. With no store (`BLAZE_CACHE=off`)
 `affected` keeps nothing and runs every test. `BLAZE_TESTS_FROM` names where the passes a
 command keeps came from, for its summary; on GitHub Actions it is the commit and run
 (`GITHUB_SHA`, `GITHUB_RUN_ID`). What is left is
 [#227](https://github.com/indexable-inc/blaze/issues/227).
+
+### Tests are hermetic, or say why not
+
+"Instead of sandboxing tests, do the opposite: look at MIR, detect whether a test is hermetic,
+don't rerun it; keep a list of non-hermetic tests and why, so people (or an LLM) can work out
+how to speed up the repo" (Andrew, 2026-10-28). So by default, with no sandbox and nothing to
+opt into, blaze reads each test from the code it compiled: the walk above, from the test
+through every function it can call, finds what the test reaches that its code does not decide,
+by kind. A test that reaches none of the kinds that block is hermetic, and its pass is kept by
+its hash. Nothing is guessed pure: what blaze can't see into blocks.
+
+| kind | what it is | blocks |
+|---|---|---|
+| `fs` | a file call (`open`, `stat`, `readdir`, `mkdir`, `getcwd`, ... and their Windows names) | yes |
+| `env` | `getenv`, `environ`, `setenv` and the like | yes |
+| `net` | `socket`, `connect`, `bind`, `accept`, `getaddrinfo` | yes |
+| `process` | starting a process (`posix_spawn`, `fork`, `execve`, `CreateProcessW`), or ending this one (`exit`, which ends every other test of the run with it) | yes |
+| `ffi` | a foreign function or static declared outside the toolchain that is not known pure (the allocator, `mem*`, libm, where `errno` is: `__errno_location`, `__error`) nor one of the above: its code is not blaze's to see | yes |
+| `asm` | assembly in a function outside the toolchain | yes |
+| `indirect` | a function pointer made of data (a `transmute` to a `fn` type outside the toolchain): what it calls is no function the walk found | yes |
+| `uncompiled` | a function blaze can't compile, whose code tells nothing | yes |
+| `global-state` | a static outside the toolchain that can change: `static mut`, an atomic, a `Mutex`, a `Cell` (a `LazyLock`, `OnceLock` or once_cell's or lazy_static's cell only when what it holds is one of those) | yes |
+| `clock` | `clock_gettime`, `mach_absolute_time`, `QueryPerformanceCounter` (`Instant`, `SystemTime`) | no |
+| `random` | `getrandom` and the like, and the seed std's `HashMap` makes | no |
+| `thread` | starting a thread (`pthread_create`, `CreateThread`) | no |
+
+What was decided, and why:
+
+- The toolchain (std, core, alloc and the crates they are built of) is named by its commit.
+  Its foreign calls count only where the table names them; the rest (`write` to a pipe,
+  `futex`, `mmap`) give the same for the same input as far as a test can tell. std's
+  `RUST_MIN_STACK` read when a thread starts is left out: it sizes the stack, which a test sees
+  only by running out of it. So is what a panic's message and a backtrace read: what a failure
+  prints is not how it ends.
+- The clock, randomness and threads don't block. A test whose pass turns on them is flaky,
+  run again or not; kept by its code, it is caught as one ([above](#running-only-the-tests-that-have-not-passed):
+  passed and failed under one key, `BLAZE_TESTS=verify`). They are told, as
+  `nondeterministic`, so a slow test that sleeps or races is found.
+- `HashMap`'s random seed is not made fixed under `blaze test`. A fixed seed is not invisible
+  to a correct program: one that prints a map, or hashes in the order a map gives, would print
+  the same order every run under `blaze test` and another under `cargo test`, and std has no
+  way to set the seed from outside but to replace `RandomState`'s code. So the seed is its own
+  reason, `random`, which does not block: a test whose pass depends on a map's order is flaky.
+- A thread-local is no shared state: libtest runs each test on a thread of its own.
+- A static set once by code the test reaches (`LazyLock<Regex>`) is set to what that code
+  gives; its code is in the hash. One that holds a lock, a cell or an atomic, or any other
+  static that can change, can be changed by another test of the run, and a test whose pass
+  depends on which ran before it is not kept by its code: `global-state`.
+- A call through a `dyn` or a function pointer is bounded: the code reached makes every vtable
+  and takes the address of every function it can call through, and those are walked. What is
+  not bounded is a pointer made of data (`indirect`) or handed over by foreign code (`ffi`).
+- A test the sandbox records (a workspace that opts into sandboxed tests) that blocks only by
+  `fs`, `env`, `net` or `process` is kept with what it read, as before. One that blocks by any
+  other kind runs every time, sandboxed or not.
+
+Every `blaze test` writes what it found of each test it was asked about to
+`target/blaze/tests.ndjson`: a line a test, written as each test executable finishes, and the
+whole file written again at the end sorted by package, target and name, so two runs diff line
+by line. Each line is one JSON object of the same schema, version `v` 1:
+
+```json
+{"v":1,"package":"tsel","target":"lib","name":"tests::reads_a_file","hermetic":false,"cached":"never","result":"passed","flaky":false,
+ "reasons":[{"kind":"fs","what":"open64","why":"it reaches `open64`, which reads or writes files",
+   "chain":[{"fn":"tsel::tests::reads_a_file","file":"src/lib.rs","line":128,"col":17},{"fn":"std::fs::read_to_string::<…>","file":null,"line":null,"col":null},{"fn":"open64","file":null,"line":null,"col":null}]}],
+ "nondeterministic":[]}
+```
+
+(one line in the file; wrapped here). The fields:
+
+| field | value |
+|---|---|
+| `v` | the schema's version, 1 |
+| `package`, `target`, `name` | the package, `lib` or `bin:<name>`, `test:<name>`, `bench:<name>`, `example:<name>`, and libtest's name of the test |
+| `hermetic` | whether no reason blocks: its pass is kept by its code |
+| `cached` | `hit` (passed as it is now, not run), `miss` (it runs, and a pass is kept), `never` (it runs every time) |
+| `result` | `passed`, `failed`, `cached`, `unknown` (its executable ended without saying) or `not-run` (`--why`) |
+| `flaky` | it passed and failed under one key |
+| `reasons` | what blocks, the first of each kind found, by the fewest calls |
+| `nondeterministic` | `clock`, `random` and `thread`, found the same way |
+| `reasons[].kind`, `what`, `why` | the kind (or `benchmark`), what by name (a symbol, a static, a function), and a sentence |
+| `reasons[].chain` | the calls from the test to it: each `fn` without its type arguments, and the `file`, `line` and `col` where it calls the next (a file of the workspace relative to it, `null` where it is not told) |
+
+`target/blaze/tests.summary.json`, written beside it at the end, has the counts (`tests`,
+`hermetic`, `not_hermetic`, `cached` and `results` by value, `by_kind`: how many tests each kind
+blocks) and two rankings, the most first: `top_reasons`, each kind and `what` with how many
+tests it blocks and the first of them; and `top_helpers`, the last function of the workspace on
+the way to a reason, with how many tests reach a reason through it and how many reach every
+reason that blocks them through it (`only_through_it`): those are hermetic once it no longer
+reaches any, which is where to start to make a repository's tests faster.
+
+`blaze test --why` builds as `blaze test` does, runs no test, writes the same files (`result`
+`not-run`) and prints a table: how many tests are hermetic, the top reasons and helpers, and
+each test that is not with its reasons. `blaze test --why --json` prints the lines of
+`tests.ndjson` to stdout instead.
 
 While cargo builds, a spare worker already loads the workspace, resolves it and compiles the
 functions of each crate cargo is done with on a quarter of the cores, and reads the symbols of
@@ -992,8 +1096,8 @@ build a command line is, so changing one starts from a cargo build again.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `BLAZE_BACKEND` | `cranelift` or `llvm`. `llvm` needs a blaze built with `--features llvm` | `cranelift` |
-| `BLAZE_OPT` | LLVM optimisation level, 0 to 3. Functions are still compiled one at a time | 2 |
+| `BLAZE_BACKEND` | `cranelift` or `llvm`, whatever the profile asks for. `llvm` needs a blaze built with `--features llvm`, as the released ones are | the profile's ([below](#backends)) |
+| `BLAZE_OPT` | LLVM optimisation level, 0 to 3, whatever the profile's `opt-level`. Functions are still compiled one at a time | the profile's; 2 with `BLAZE_BACKEND=llvm` set |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast` | `optimized`; `fast` at level 0 |
 | `BLAZE_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `BLAZE_SPLICE` | `0` links in full after every edit instead of splicing | splice |
@@ -1029,6 +1133,37 @@ The disk store is on by default and shared by every daemon and checkout of the u
 daemon reads `BLAZE_CACHE` once, when it starts: a daemon started by a shell without the
 variable keeps the default store whatever later shells have set, so run `blaze stop`
 before changing it.
+
+## Backends
+
+A build compiles with the backend its profile's `opt-level` asks for, as cargo resolves the
+profile: the `[profile]` tables of the root manifest, the configuration's and `--config`'s over
+them, `CARGO_PROFILE_<NAME>_OPT_LEVEL`, and `inherits`. A custom profile that inherits
+`release` is built as `release` is, unless it sets its own `opt-level`.
+
+| `opt-level` | Backend | Profiles that have it by default |
+|---|---|---|
+| `0` | Cranelift | `dev`, `test` |
+| `1` | Cranelift: rustc's `-O1` has no LLVM pipeline blaze runs to match it | |
+| `2` | LLVM at `-O2` (`BLAZE_OPT=2`) | |
+| `3` | LLVM at `-O3` (`BLAZE_OPT=3`) | `release`, `bench` |
+| `s`, `z` | LLVM at `-O2`: blaze's LLVM has no pipeline for size yet, so the code is not smaller than at `-O2` | |
+
+`BLAZE_BACKEND` set is the backend whatever the profile (`BLAZE_BACKEND=cranelift blaze build
+--release` builds a release with Cranelift), and `BLAZE_OPT` set is LLVM's level. The level
+belongs to the build as a whole, the root profile's: a `[profile.release.package.<name>]`
+`opt-level` changes nothing. A blaze built without `--features llvm` refuses a profile that
+asks for LLVM, saying so, rather than building it with Cranelift. The released binaries have
+the feature on every target.
+
+The backend and its level are part of a worker's environment, so a dev and a release build of
+one project are kept by two workers, and neither evicts the other's state. The store keys each
+function's code by the backend and level that compiled it as well: code Cranelift compiled is
+never given to a build with LLVM, nor `-O2`'s to `-O3`'s.
+
+A build with LLVM takes longer than one with Cranelift. A first build takes the most longer,
+because LLVM compiles every function then
+([#807](https://github.com/indexable-inc/blaze/issues/807)).
 
 ## Known problems
 

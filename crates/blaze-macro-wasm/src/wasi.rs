@@ -1,14 +1,9 @@
 //! The part of WASI's first snapshot (`wasi_snapshot_preview1`) a proc macro's module is
 //! given: its package's directory to read, at [`PACKAGE`] and nothing else, its arguments and
 //! environment, a clock that always says the same and random bytes that are always the same,
-//! and stdout and stderr kept for its errors. Every read of the package is recorded with what
-//! it found ([`Files::reads`]), for the second key of what the expansion made
-//! ([`crate::keyed`]). A function this does not have answers `ENOSYS`.
+//! and stdout and stderr kept for its errors. A function this does not have answers `ENOSYS`.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use wasmtime::{Caller, Extern, FuncType, Linker, Memory, Module, Val, ValType};
 
@@ -52,12 +47,10 @@ enum Open {
     File { bytes: Vec<u8>, at: u64 },
 }
 
-/// The module's files: the package, read-only, and what of it was read.
+/// The module's files: the package, read-only, and its open descriptors.
 pub(crate) struct Files {
     root: PathBuf,
     fds: Vec<Option<Open>>,
-    /// Each read of the package, as a read set has it (`keyed`), and what it found.
-    pub(crate) reads: BTreeMap<String, String>,
     pub(crate) output: Vec<u8>,
     random: u64,
 }
@@ -73,7 +66,6 @@ impl Files {
         Files {
             root: root.map(Path::to_path_buf).unwrap_or_default(),
             fds,
-            reads: BTreeMap::new(),
             output: Vec::new(),
             random: 0x9e37_79b9_7f4a_7c15,
         }
@@ -135,21 +127,12 @@ impl Files {
         self.resolve(rel, path).map(|(rel, _)| rel)
     }
 
-    fn record(&mut self, read: String, found: String) {
-        self.reads.entry(read).or_insert(found);
-    }
-
     fn next_random(&mut self) -> u64 {
         self.random ^= self.random << 13;
         self.random ^= self.random >> 7;
         self.random ^= self.random << 17;
         self.random
     }
-}
-
-/// What a read set calls the read of the package's `rel`, the whole of what is there.
-fn read_of(rel: &str) -> String {
-    if rel.is_empty() { ".".to_owned() } else { rel.to_owned() }
 }
 
 fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<Memory> {
@@ -210,23 +193,15 @@ fn ino(rel: &str) -> u64 {
     u64::from_le_bytes(digest[..8].try_into().unwrap()) | 1
 }
 
-/// What the package has at `real`, as the module is told and as its read is recorded: a
-/// file's type and size are the file's, so a look at one is a read of all of it.
-fn stat(files: &mut Files, rel: &str, real: &Path) -> Result<[u8; 64], i32> {
+/// What the module is told of the package file at `real`.
+fn stat(rel: &str, real: &Path) -> Result<[u8; 64], i32> {
     match std::fs::metadata(real) {
-        Ok(meta) if meta.is_dir() => {
-            files.record(keyed::kind(&read_of(rel)), "d".to_owned());
-            Ok(filestat(ino(rel), FILETYPE_DIRECTORY, 0))
-        }
+        Ok(meta) if meta.is_dir() => Ok(filestat(ino(rel), FILETYPE_DIRECTORY, 0)),
         Ok(meta) => {
-            files.record(read_of(rel), keyed::digest_of(real));
             let filetype = if meta.is_file() { FILETYPE_REGULAR_FILE } else { FILETYPE_UNKNOWN };
             Ok(filestat(ino(rel), filetype, meta.len()))
         }
-        Err(_) => {
-            files.record(keyed::kind(&read_of(rel)), "-".to_owned());
-            Err(ENOENT)
-        }
+        Err(_) => Err(ENOENT),
     }
 }
 
@@ -524,19 +499,15 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                     return Err(EROFS);
                 }
                 let Ok(meta) = std::fs::metadata(&real) else {
-                    files.record(read_of(&rel), "-".to_owned());
                     return Err(ENOENT);
                 };
                 if meta.is_dir() {
-                    files.record(keyed::kind(&read_of(&rel)), "d".to_owned());
                     return Ok(files.insert(Open::Dir { rel }));
                 }
                 if oflags & OFLAGS_DIRECTORY != 0 {
-                    files.record(keyed::kind(&read_of(&rel)), "o".to_owned());
                     return Err(ENOTDIR);
                 }
                 let bytes = std::fs::read(&real).map_err(|_| ENOENT)?;
-                files.record(read_of(&rel), keyed::digest_bytes(&bytes));
                 Ok(files.insert(Open::File { bytes, at: 0 }))
             })();
             Ok(match opened {
@@ -556,7 +527,7 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 let path = text(mem, ptr, len)?;
                 let dir = files.dir(dirfd)?;
                 let (rel, real) = files.resolve(&dir, &path)?;
-                stat(files, &rel, &real)
+                stat(&rel, &real)
             })();
             Ok(match found {
                 Ok(stat) => errno(put(mem, out, &stat)),
@@ -581,7 +552,6 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 Err(e) => return Ok(e),
             };
             let real = files.root.join(&rel);
-            files.record(read_of(&rel), keyed::digest_of(&real));
             let mut names: Vec<_> = std::fs::read_dir(&real)
                 .into_iter()
                 .flatten()

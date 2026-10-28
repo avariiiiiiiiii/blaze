@@ -4,7 +4,7 @@ site {
     Title: {"Install"}
     Nav: {"Install", 1}
     Icon: {"download"}
-    (InGroup, nav.start)
+    (InGroup, nav.reference)
     Description: {"Install blaze with one line on macOS on Apple silicon or Linux, or with Nix."}
     Intro: {"[warm] Installing blaze. It's one line, and you don't need Rust installed first."}
     Outro: {"[warm] That's it: one line, then blaze run. The usage page picks up from there. Thanks for listening."}

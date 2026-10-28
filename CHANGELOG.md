@@ -64,6 +64,8 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   rustc's does, in a crate built without `-C overflow-checks` too (`--release`); it was given
   the wrapped value (#862). A `const fn`'s arithmetic still follows the crate.
 - Preserve WASM proc-macro state and stored token spans within each consuming crate, including napi-rs constructor registration. Reconstruct declaration state after edits instead of reusing output-only or frozen declaration cache entries; compiled-module and function caching remain enabled.
+- A workspace the daemon could not load because it reaches functions blaze could not compile
+  names those functions and why; the message stopped at "so it is not built:".
 - Native proc macros receive real source positions, text and file paths through the bidirectional server protocol; a server that cannot enable source spans is refused (#823).
 - `unchecked_add`, `unchecked_sub`, `unchecked_mul`, `unchecked_shl`, `unchecked_shr`,
   `unchecked_div`, `unchecked_rem` and `exact_div` in a constant fail to evaluate, as rustc's

@@ -179,6 +179,7 @@ body.chat-open .toc { display: none; }
 	.hero { padding-top: 28px; }
 	.pager { flex-direction: column; }
 	.doc .pager a { max-width: none; }
+	.pager .next { margin-left: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
 	.side, .sechead .chev, .fold > .caret .icon, .navlist .glide-hov { transition: none; }

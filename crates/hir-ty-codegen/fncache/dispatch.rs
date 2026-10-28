@@ -40,7 +40,8 @@ pub(super) fn is_cache(db: &dyn HirDatabase, id: StaticId) -> bool {
     }
     let ItemContainerId::ModuleId(module) = id.lookup(db).container else { return false };
     let Some(block) = module.block(db) else { return false };
-    let outer = block.module(db);
+    // SAFETY: the module is used in this call alone, as hir-def's own search for a block's body.
+    let outer = unsafe { block.module(db).to_static() };
     if outer.block(db).is_some() {
         return false;
     }

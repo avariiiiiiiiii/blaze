@@ -707,7 +707,7 @@ mod landlock {
     }
 
     /// The version of Landlock this kernel has, or why it has none.
-    pub fn abi() -> Result<i64, String> {
+    pub(super) fn abi() -> Result<i64, String> {
         let abi = unsafe {
             libc::syscall(
                 CREATE_RULESET,
@@ -730,7 +730,7 @@ mod landlock {
     /// Restricts this process and what it runs: no write but below `writable` and to
     /// [`DEVICES`], and, where the kernel has them, no TCP `bind` or `connect`, no abstract Unix
     /// socket and no signal outside.
-    pub fn restrict(writable: &[PathBuf]) -> Result<(), String> {
+    pub(super) fn restrict(writable: &[PathBuf]) -> Result<(), String> {
         let abi = abi()?;
         let mut file = WRITE_FILE;
         let mut dir = WRITE_FILE

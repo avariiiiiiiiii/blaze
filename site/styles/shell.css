@@ -238,6 +238,8 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-list .where a.away { opacity: 0.55; }
 .tl-head { margin: 0 4px 6px; color: var(--ink-3); }
 .tl-list li.tl-head { border: 0; }
+.tl-list p.tl-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tl-list .cursors-toggle { height: 24px; padding: 0 8px; font-size: 12px; }
 .tl-list .face, .tl-list .flag, .tl-list .tag { flex: none; }
 .tl-av { position: relative; flex: none; display: inline-grid; }
 .tl-av .face { width: 22px; height: 22px; }
@@ -435,3 +437,24 @@ body.chat-full .chat-back { order: 1; }
 .face.talking { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--ok); }
 .say-bubble.typing { padding: 9px 11px; color: var(--ink-3); }
 @media (prefers-reduced-motion: reduce) { .say-bubble, .chat-toast, .dots i, .chat-tr.pending { animation: none; } }
+
+/* The others on this page (client/lib/cursors.ts). Their pointers: an arrow in their colour (--c) and a chip with
+   their face and name, in a box over the whole document so they scroll with the page; below the sticky top line,
+   the chat and the drawer, and never in the way of a click. A pointer that rests fades. */
+.cursors { position: absolute; top: 0; left: 0; z-index: 14; width: 100%; overflow: clip; pointer-events: none; }
+.cursor { position: absolute; top: 0; left: 0; display: flex; align-items: flex-start; transition: opacity 0.4s; will-change: transform; }
+.cursor.idle { opacity: 0; transition-duration: 1s; }
+.cursor svg { width: 16px; height: 20px; flex: none; fill: var(--c); stroke: var(--bg); stroke-width: 1.2; stroke-linejoin: round; filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.3)); }
+.cursor-chip { display: inline-flex; align-items: center; gap: 4px; margin: 14px 0 0 -4px; padding: 2px 7px 2px 2px; border-radius: 10px; background: var(--c); color: #fff; font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.2); }
+.cursor-chip .face { width: 16px; height: 16px; box-shadow: none; }
+/* Where each is reading: a thin rail at the right edge, the page's length top to bottom, a band in their colour for
+   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. */
+.reading { position: fixed; z-index: 14; top: 0; right: 0; bottom: 0; width: 6px; pointer-events: none; }
+.reading[hidden] { display: none; }
+.reading-me, .reading-band { position: absolute; right: 1px; width: 4px; min-height: 4px; border-radius: 2px; }
+.reading-me { background: color-mix(in srgb, var(--ink-1) 10%, transparent); }
+.reading-band { background: color-mix(in srgb, var(--c) 55%, transparent); }
+.reading-face { position: absolute; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
+.reading-face .face { width: 18px; height: 18px; box-shadow: 0 0 0 2px var(--c); }
+.reading-face:hover .face { opacity: 1; transform: scale(1.15); }
+@media (min-width: 1280px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }

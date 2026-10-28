@@ -148,6 +148,11 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line: the
   page's discussion with its comment count, the faces on this page (click for everyone and where), and the reader's
   GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
+  On the page itself (`client/lib/cursors.ts`) the others there show as live pointers (desktop only; "Hide cursors"
+  in the who-is-here list turns them off) and as bands on a rail at the right edge where each is reading (click a
+  face to go there). Positions are anchors in the text (a block index and a fraction of it, x a fraction of `main`'s
+  width), so different window sizes line up; the object passes them only to the other tabs on the same page, rate
+  limited per person, and never stores them.
   The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the
   object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour, replies counted), taken
   back by their author or a `COMMENT_ADMINS` id. Messages have Slack-style threads, one level deep (a `parent` column):

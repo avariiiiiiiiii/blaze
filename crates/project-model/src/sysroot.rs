@@ -113,9 +113,8 @@ impl Sysroot {
     /// Attempts to discover the toolchain's sysroot from the given `dir`.
     pub fn discover(dir: &AbsPath, extra_env: &FxHashMap<String, Option<String>>) -> Sysroot {
         let sysroot_dir = discover_sysroot_dir(dir, extra_env);
-        let rust_lib_src_dir = sysroot_dir.as_ref().ok().map(|sysroot_dir| {
-            rust_lib_src_dir_of(sysroot_dir)
-        });
+        let rust_lib_src_dir =
+            sysroot_dir.as_ref().ok().map(|sysroot_dir| rust_lib_src_dir_of(sysroot_dir));
         Sysroot::assemble(Some(sysroot_dir), rust_lib_src_dir)
     }
 
@@ -172,7 +171,12 @@ impl Sysroot {
 
     /// The sysroot's own `tool`, else the one on the path. blaze: rustup is not asked which
     /// it would run (docs/no-rustc.md).
-    pub fn tool_path(&self, tool: Tool, _current_dir: impl AsRef<Path>, _envs: &Env) -> Utf8PathBuf {
+    pub fn tool_path(
+        &self,
+        tool: Tool,
+        _current_dir: impl AsRef<Path>,
+        _envs: &Env,
+    ) -> Utf8PathBuf {
         self.root()
             .and_then(|root| probe_for_binary(root.join("bin").join(tool.name()).into()))
             .unwrap_or_else(|| tool.path())
@@ -502,17 +506,16 @@ fn discover_rust_lib_src_dir(sysroot_path: &AbsPathBuf) -> Option<AbsPathBuf> {
 /// blaze: a sysroot without the library's source is an error; rustup is not run to add it
 /// (docs/no-rustc.md).
 fn rust_lib_src_dir_of(sysroot_path: &AbsPathBuf) -> Result<AbsPathBuf> {
-    discover_rust_lib_src_dir(sysroot_path)
-        .ok_or_else(|| {
-            tracing::error!(%sysroot_path, "can't load standard library, try installing `rust-src`");
-            format_err!(
-                "\
+    discover_rust_lib_src_dir(sysroot_path).ok_or_else(|| {
+        tracing::error!(%sysroot_path, "can't load standard library, try installing `rust-src`");
+        format_err!(
+            "\
 can't load standard library from sysroot
 {sysroot_path}
 (discovered via `rustc --print sysroot`)
 try installing `rust-src` the same way you installed `rustc`"
-            )
-        })
+        )
+    })
 }
 
 fn get_rustc_src(sysroot_path: &AbsPath) -> Option<ManifestPath> {

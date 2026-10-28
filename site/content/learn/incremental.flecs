@@ -1,6 +1,6 @@
 // Lesson 2: rebuilding only what changed. blaze's unit is the function; a body edit is private to the function, a
 // signature edit is seen by its callers (today blaze rechecks more than the callers; narrowing to them is #273,
-// planned). Changed functions are spliced into the built program, and with ra-jit-live into a running one.
+// planned). Changed functions are spliced into the built program, and with blaze-live into a running one.
 site {
   learn {
     incremental : Page {
@@ -64,13 +64,13 @@ site {
 
       Step live("Even while it runs") {
         Say: {"[warm] One step further. A program that links blaze's live crate takes the changed functions while it's running, with its state intact: about twenty milliseconds from your save, and under a millisecond to swap them in. It's released on macOS on Apple silicon, and Linux and Windows support, on x86, is on main."}
-        P running("A program that links blaze's `ra-jit-live` crate takes changed functions while it runs, state intact: about 20 ms from your save, and under a millisecond to swap them in.")
+        P running("A program that links blaze's `blaze-live` crate takes changed functions while it runs, state intact: about 20 ms from your save, and under a millisecond to swap them in.")
         Dim where("Released on macOS on Apple silicon; Linux x86-64 and Windows x86-64 support is on main, for the next release.")
       }
 
       Step game("What can it take live?") {
         Silent
-        Quiz q(prompt: "Your game links `ra-jit-live` and is running. Which edit can it take without restarting?") {
+        Quiz q(prompt: "Your game links `blaze-live` and is running. Which edit can it take without restarting?") {
           Choice jump("A change to how one function works out the height of a jump.", "That's a body edit: the new function is swapped in while the game keeps running.") {
             Right
           }

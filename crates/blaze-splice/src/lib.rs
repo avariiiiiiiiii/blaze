@@ -35,9 +35,29 @@
 //! That is the splice of an ELF executable. A wasm module is written again instead, with
 //! the patch's functions in place of its own: see [`wasm`].
 
-pub(crate) use blaze_cargo::splice::copy_file;
+pub use blaze_in_place::{copy_file, unwritten};
 
-mod wasm;
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What the name of a static a patch defines anew starts with: the code generator's
+/// `hir_ty_codegen::LASTING_STATIC`, which a test of the engine holds this equal to.
+pub const LASTING_STATIC: &str = "blaze::static::lasting::";
+
+/// What the name of a data object of a patch starts with that says the patch left the base's
+/// copy of a static behind: the code generator's `hir_ty_codegen::MOVED_STATIC`, which a test
+/// of the engine holds this equal to.
+pub const MOVED_STATIC: &str = "blaze::static::moved::";
+
+/// Milliseconds since the epoch, as the engine's `live` counts.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |it| it.as_millis() as u64)
+}
+
+pub mod wasm;
 
 use std::{
     fs::{File, OpenOptions},
@@ -56,23 +76,23 @@ use object::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub(crate) use self::lasting::Lasting;
+pub use self::lasting::Lasting;
 use self::lasting::{Own, is_lasting, left_behind};
 
-mod debug;
-mod lasting;
-mod macho;
-mod pe;
-mod sha256;
+pub mod debug;
+pub mod lasting;
+pub mod macho;
+pub mod pe;
+pub mod sha256;
 
 /// The executable of the last full link, which is read on a thread of its own while the
 /// daemon waits for the next edit.
-pub(crate) struct Linked(JoinHandle<anyhow::Result<Baseline>>);
+pub struct Linked(JoinHandle<anyhow::Result<Baseline>>);
 
 impl Linked {
     /// Starts reading the executable the linker just wrote at `binary` from `patch` and the
     /// rest of the link line. The patch is read here and now: the next edit writes another.
-    pub(crate) fn read(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
+    pub fn read(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
         let (patch, object) = (std::fs::read(patch), object.to_owned());
         // Taken before the daemon answers: whoever is given the program waits for the write.
         let lock = Writing::ahead(&binary);
@@ -83,7 +103,7 @@ impl Linked {
 
     /// As [`Linked::read`], of an executable linked with the object alone, no patch: a patch
     /// is then spliced into it with the read baseline. Read here and now, for the splice.
-    pub(crate) fn read_bare(binary: PathBuf, object: &Path) -> anyhow::Result<Baseline> {
+    pub fn read_bare(binary: PathBuf, object: &Path) -> anyhow::Result<Baseline> {
         let lock = Writing::ahead(&binary);
         Baseline::parse(&binary, None, object, false)?.laid_out(binary, lock)
     }
@@ -91,7 +111,7 @@ impl Linked {
     /// As [`Linked::read`], of what rustc linked, which `binary` is another name of: it is
     /// made a copy of its own first, for a splice to write. One the daemon linked is refused:
     /// cargo's place for the program has a copy of the daemon's once it served one.
-    pub(crate) fn read_rustcs(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
+    pub fn read_rustcs(binary: PathBuf, patch: &Path, object: &Path) -> Linked {
         let (patch, object) = (std::fs::read(patch), object.to_owned());
         Linked(std::thread::spawn(move || {
             let patch = patch?;
@@ -115,13 +135,13 @@ impl Linked {
         }))
     }
 
-    pub(crate) fn baseline(self) -> anyhow::Result<Baseline> {
+    pub fn baseline(self) -> anyhow::Result<Baseline> {
         self.0.join().map_err(|_| anyhow::anyhow!("reading the executable panicked"))?
     }
 }
 
 /// An executable as the linker wrote it, and what the last splice changed of it.
-pub(crate) struct Baseline {
+pub struct Baseline {
     path: PathBuf,
     /// Shared with the [`Baseline::view`]s an edit is published with while a splice runs.
     image: Arc<Executable>,
@@ -194,12 +214,12 @@ enum Executable {
 }
 
 /// What a splice did, for the log.
-pub(crate) struct Spliced {
-    pub(crate) redirected: usize,
-    pub(crate) appended: usize,
+pub struct Spliced {
+    pub redirected: usize,
+    pub appended: usize,
     /// What it copied of the executable to further on: what a debugger reads, which the
     /// first splice after a link finds copied already.
-    pub(crate) copied: u64,
+    pub copied: u64,
 }
 
 /// An executable as [`Baseline::parse`] read it, before [`Parsed::laid_out`] writes it.
@@ -296,7 +316,7 @@ impl Baseline {
     /// What an edit is published with ([`Baseline::live`]) while a splice of the executable
     /// runs on the baseline itself: the program that runs was started before the splice, so
     /// what the splice changes is nothing to it. Not one to splice with.
-    pub(crate) fn view(&self) -> Baseline {
+    pub fn view(&self) -> Baseline {
         Baseline {
             path: self.path.clone(),
             image: Arc::clone(&self.image),
@@ -311,14 +331,14 @@ impl Baseline {
         }
     }
 
-    pub(crate) fn is_of(&self, binary: &Path) -> bool {
+    pub fn is_of(&self, binary: &Path) -> bool {
         self.path == binary
     }
 
     /// Whether a splice leaves what a debugger reads of the executable as it was, so that
     /// it knows nothing of the code added. A PDB is a file of its own that only the linker
     /// writes.
-    pub(crate) fn leaves_debug_info(&self) -> bool {
+    pub fn leaves_debug_info(&self) -> bool {
         matches!(*self.image, Executable::Pe(_))
     }
 
@@ -326,7 +346,7 @@ impl Baseline {
     /// functions it defines. On an error the file may be neither: it has to be linked again.
     /// A Mach-O splice stops when `give_up` is set, with [`GaveUp`], and leaves the executable
     /// and what is known of it as they were.
-    pub(crate) fn splice(&mut self, patch: &[u8], give_up: &AtomicBool) -> anyhow::Result<Spliced> {
+    pub fn splice(&mut self, patch: &[u8], give_up: &AtomicBool) -> anyhow::Result<Spliced> {
         let before = file_key(&self.path);
         let spliced = self.splice_as(patch, give_up, false)?.0;
         names_spliced(&self.path, before);
@@ -338,7 +358,7 @@ impl Baseline {
     /// ahead of `object` ([`Linked::read`]): the next edits are patches of the object, spliced
     /// into it. So a build in full is not linked in full. Only of ELF executables; anything
     /// else, and whatever the splice declines, is an error.
-    pub(crate) fn spliced_whole(
+    pub fn spliced_whole(
         mut self,
         object_path: &Path,
         patch: &Path,
@@ -503,7 +523,7 @@ impl Baseline {
     /// Notes that a splice was just written with `lasting` in it.
     fn spliced_with(&mut self, lasting: Lasting) {
         const KEPT: usize = 8;
-        let now = crate::live::now();
+        let now = now();
         self.spliced.push((now, lasting));
         let over = self.spliced.len().saturating_sub(KEPT);
         self.spliced.drain(..over);
@@ -512,7 +532,7 @@ impl Baseline {
     /// The statics new in the splice that a program started at `started` (milliseconds since
     /// the epoch) runs, which a patch of it keeps: none for one started from what the linker
     /// wrote, or before the splices still known.
-    pub(crate) fn spliced_lasting(&self, started: u64) -> Lasting {
+    pub fn spliced_lasting(&self, started: u64) -> Lasting {
         let last = self.spliced.iter().rev().find(|it| it.0 <= started);
         last.map(|it| it.1.clone()).unwrap_or_default()
     }
@@ -520,7 +540,7 @@ impl Baseline {
     /// `patch` laid out at `base` of a program that runs the executable as the linker wrote
     /// it, for the program to apply in its memory; the `LC_UUID` of the executable; and where
     /// each function the patch replaces starts in it, with where the executable has it.
-    pub(crate) fn live(
+    pub fn live(
         &self,
         patch: &[u8],
         base: u64,
@@ -558,7 +578,7 @@ impl Baseline {
 
     /// Whether a patch can call the C symbol `name`, as far as the executable says: an
     /// executable other than Mach-O is not asked.
-    pub(crate) fn can_call(&self, name: &str) -> bool {
+    pub fn can_call(&self, name: &str) -> bool {
         match &*self.image {
             Executable::MachO(image) => image.can_call(name),
             _ => true,
@@ -567,7 +587,7 @@ impl Baseline {
 
     /// A symbol the patch `object` refers to that the executable does not give it, as far as
     /// the executable says: an executable other than Mach-O is not asked.
-    pub(crate) fn missing_in(&self, object: &[u8]) -> Option<String> {
+    pub fn missing_in(&self, object: &[u8]) -> Option<String> {
         let Executable::MachO(image) = &*self.image else { return None };
         let file = object::File::parse(object).ok()?;
         file.symbols().filter(|it| it.is_undefined()).find_map(|it| {
@@ -578,7 +598,7 @@ impl Baseline {
 
     /// The `LC_UUID` of the executable, when it is one that has it: the GNU build ID of an
     /// ELF one, the GUID of the PDB of a PE one.
-    pub(crate) fn uuid(&self) -> Option<[u8; 16]> {
+    pub fn uuid(&self) -> Option<[u8; 16]> {
         match &*self.image {
             Executable::MachO(image) => macho::uuid(image),
             Executable::Elf(image) => image.id,
@@ -590,7 +610,7 @@ impl Baseline {
     /// Takes the signature of a Mach-O executable that was signed again since we last wrote
     /// it, as `codesign` does to give it entitlements, for the splices after.
     /// A view taken before reads the executable as it was signed then.
-    pub(crate) fn read_again_if_signed(&mut self) -> anyhow::Result<()> {
+    pub fn read_again_if_signed(&mut self) -> anyhow::Result<()> {
         let Executable::MachO(_) = &*self.image else { return Ok(()) };
         let file = File::open(&self.path)?;
         let stamp = Stamp::of(&file)?;
@@ -651,11 +671,11 @@ fn file_key(_: &Path) -> Option<(u64, u64)> {
 /// moves what some of them are at and adds none, so what was read of the file it started from
 /// is true of the one it leaves, which on macOS is a new file ([`names_spliced`]): read again
 /// there, a 34 MB program's took 97 ms of each edit (#453).
-pub(crate) fn kept_names(path: &Path) -> Option<Arc<FxHashSet<String>>> {
+pub fn kept_names(path: &Path) -> Option<Arc<FxHashSet<String>>> {
     #[cfg(unix)]
     {
         let key = file_key(path)?;
-        let mut kept = crate::lock(&KEPT_NAMES);
+        let mut kept = lock(&KEPT_NAMES);
         if let Some((at, names)) = kept.get(path)
             && *at == key
         {
@@ -684,7 +704,7 @@ pub(crate) fn kept_names(path: &Path) -> Option<Arc<FxHashSet<String>>> {
 fn names_spliced(path: &Path, before: Option<(u64, u64)>) {
     #[cfg(unix)]
     if let (Some(before), Some(after)) = (before, file_key(path))
-        && let Some((at, _)) = crate::lock(&KEPT_NAMES).get_mut(path)
+        && let Some((at, _)) = lock(&KEPT_NAMES).get_mut(path)
         && *at == before
     {
         *at = after;
@@ -699,7 +719,7 @@ fn names_spliced(path: &Path, before: Option<(u64, u64)>) {
 /// was linked with defined: one it lacks would be as it first was, which the executable no
 /// longer has. A static the patch left behind ([`lasting::left_behind`]) is not one: nothing
 /// refers to the executable's copy any more.
-pub(super) fn has_baked<'a>(
+pub fn has_baked<'a>(
     baked: &[Box<[u8]>],
     defined: impl IntoIterator<Item = &'a [u8]>,
 ) -> anyhow::Result<()> {
@@ -720,13 +740,13 @@ pub(super) fn has_baked<'a>(
 /// The `-headerpad` to link the executable at `path` with again for an edit to be spliced into
 /// it, when the room its header has is too little: only Apple's linker leaves no more than it
 /// is told to. `None` for an executable that has the room, or needs none.
-pub(crate) fn headerpad_short(path: &Path) -> anyhow::Result<Option<u64>> {
+pub fn headerpad_short(path: &Path) -> anyhow::Result<Option<u64>> {
     Ok(headerpad_wanted(path)?.and_then(|(pad, short)| short.then_some(pad)))
 }
 
 /// The `-headerpad` of [`headerpad_short`] whether or not the executable at `path` has the
 /// room, and whether it is short of it.
-pub(crate) fn headerpad_wanted(path: &Path) -> anyhow::Result<Option<(u64, bool)>> {
+pub fn headerpad_wanted(path: &Path) -> anyhow::Result<Option<(u64, bool)>> {
     use std::io::Read as _;
     const HEADER: usize = size_of::<object::macho::MachHeader64<object::LittleEndian>>();
     let mut file = File::open(path)?;
@@ -745,7 +765,7 @@ pub(crate) fn headerpad_wanted(path: &Path) -> anyhow::Result<Option<(u64, bool)
 /// splices, at most, from their unwind information alone: what its first link is told, which
 /// has no executable of before to go by. `None` when none of them has an AArch64 Mach-O object
 /// with unwind information.
-pub(crate) fn headerpad_of_objects(paths: &[&Path]) -> anyhow::Result<Option<u64>> {
+pub fn headerpad_of_objects(paths: &[&Path]) -> anyhow::Result<Option<u64>> {
     let mut unwinding = macho::Unwinding::default();
     for path in paths {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -782,7 +802,7 @@ pub(crate) fn headerpad_of_objects(paths: &[&Path]) -> anyhow::Result<Option<u64
 
 /// Why a splice stopped half way: a newer edit wants the executable.
 #[derive(Debug)]
-pub(crate) struct GaveUp;
+pub struct GaveUp;
 
 impl std::fmt::Display for GaveUp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -998,7 +1018,7 @@ impl Drop for Writing {
 /// or replace: it runs on there. It is deleted once it has exited, by the first move to come
 /// after.
 #[cfg(windows)]
-pub(crate) fn move_aside(path: &Path) -> std::io::Result<()> {
+pub fn move_aside(path: &Path) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let name = path.file_name().unwrap_or_default().to_owned();
     let siblings = path.parent().map(std::fs::read_dir).transpose()?.into_iter().flatten();
@@ -1089,7 +1109,7 @@ fn copy_in_kernel(file: &File, moved: &debug::Moved) -> std::io::Result<()> {
 }
 
 #[derive(Clone, PartialEq)]
-struct Stamp {
+pub struct Stamp {
     len: u64,
     modified: SystemTime,
 }
@@ -2855,7 +2875,7 @@ impl<'a> Patch<'a> {
 }
 
 /// What a splice writes.
-struct Addition {
+pub struct Addition {
     /// Where in the file `appended` goes: behind what the linker wrote.
     offset: u64,
     appended: Vec<u8>,
@@ -2901,7 +2921,7 @@ mod tests {
         let names = |all: &[&str]| -> Vec<Box<[u8]>> {
             all.iter().map(|it| it.as_bytes().into()).collect()
         };
-        let moved = format!("{}blaze::static::7", hir_ty_codegen::MOVED_STATIC);
+        let moved = format!("{}blaze::static::7", crate::MOVED_STATIC);
         let baked = names(&["f", "blaze::static::7"]);
         assert!(has_baked(&baked, [&b"f"[..], moved.as_bytes()]).is_ok());
         assert!(has_baked(&baked, [&b"f"[..]]).is_err());
@@ -2931,7 +2951,7 @@ mod tests {
         };
         let linked = write(0);
         let names = std::sync::Arc::new(["f".to_owned()].into_iter().collect());
-        crate::lock(&KEPT_NAMES).insert(path.clone(), (linked, std::sync::Arc::clone(&names)));
+        super::lock(&KEPT_NAMES).insert(path.clone(), (linked, std::sync::Arc::clone(&names)));
         write(1);
         names_spliced(&path, Some(linked));
         assert!(std::sync::Arc::ptr_eq(&kept_names(&path).unwrap(), &names));
@@ -2964,7 +2984,8 @@ mod tests {
         let client = std::thread::spawn({
             let program = program.clone();
             move || {
-                let started = crate::cargo::run::started(&mut std::process::Command::new(program));
+                let started = super::unwritten(&program)
+                    .and_then(|_unwritten| std::process::Command::new(&program).spawn());
                 (std::time::Instant::now(), started.and_then(|mut it| it.wait()))
             }
         });

@@ -5,7 +5,7 @@ the save and the new code running, and what is refused.
 
 ## The two halves
 
-- **The daemon** (`crates/blaze-engine/src/live.rs`, `crates/blaze-engine/src/splice/macho.rs`). Every edit
+- **The daemon** (`crates/blaze-engine/src/live.rs`, `crates/blaze-splice/src/macho.rs`). Every edit
   it answers with a patch (the functions that changed, linked against the executable of the
   last full link) is spliced into the executable on disk as blaze always did. If a program
   that runs that executable has said where it wants patches, the daemon also lays the same

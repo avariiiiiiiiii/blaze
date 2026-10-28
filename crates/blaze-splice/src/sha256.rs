@@ -7,7 +7,7 @@ use sha2::Digest;
 
 /// Whether [`digest`] has the processor's instructions, so that the pages are hashed on one
 /// thread as fast as on several.
-pub(super) fn fast() -> bool {
+pub fn fast() -> bool {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("sha2") {
         return true;
@@ -15,7 +15,7 @@ pub(super) fn fast() -> bool {
     false
 }
 
-pub(super) fn digest(bytes: &[u8]) -> [u8; 32] {
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("sha2") {
         // SAFETY: the processor has the SHA-256 instructions.
@@ -53,7 +53,7 @@ mod aarch64 {
     ///
     /// The processor has the SHA-256 instructions.
     #[target_feature(enable = "sha2")]
-    pub(super) unsafe fn digest(bytes: &[u8]) -> [u8; 32] {
+    pub unsafe fn digest(bytes: &[u8]) -> [u8; 32] {
         let mut state = INITIAL;
         let whole = bytes.len() / 64 * 64;
         // SAFETY: as the caller's.

@@ -106,6 +106,8 @@ lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "x
 # graph, by hyper-util.
 base64 = "0.23"
 blaze-live = { path = "../blaze-live" }
+# What a client waits for of an executable the daemon splices in place (`crate::splice`).
+blaze-in-place = { path = "../blaze-in-place" }
 # blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
 # feature `wasi`.
 blaze-wasi = { path = "../blaze-wasi" }

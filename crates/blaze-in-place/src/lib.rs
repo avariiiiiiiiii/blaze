@@ -1,10 +1,7 @@
-//! What a client and the daemon's state do to an executable the engine splices edits into
-//! (`crates/blaze-engine/src/splice.rs`).
+//! What a client and the daemon's state do to an executable that is spliced in place: wait
+//! for the daemon to be through writing it, and copy it with the holes the splice left.
 
-use std::{
-    fs::{File, OpenOptions},
-    path::Path,
-};
+use std::{fs::File, path::Path};
 
 /// Waits until the daemon is through writing the executable at `path` in place: one it
 /// linked, which it writes after it answered. On Unix the file returned keeps it from writing
@@ -43,7 +40,7 @@ fn copy_holes(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
     let source = File::open(from)?;
     let metadata = source.metadata()?;
-    let target = OpenOptions::new().write(true).create(true).truncate(true).open(to)?;
+    let target = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(to)?;
     target.set_permissions(metadata.permissions())?;
     target.set_len(metadata.len())?;
     let (fd, out) = (source.as_raw_fd(), target.as_raw_fd());

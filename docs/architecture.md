@@ -3,7 +3,8 @@
 This is a map of the code for someone who wants to read or change it. Paths are those of the
 published tree: `crates/blaze-engine` is the worker, which compiles and links, over `crates/blaze-cargo`,
 the cargo drop-in (commands, the daemon and its client, plans, the sandbox and the remote store, which
-call up into the engine only through `blaze_cargo::engine`); `crates/hir-ty-codegen` is the code generator
+call up into the engine only through `blaze_cargo::engine`) and `crates/blaze-splice`, which writes an
+edit into the executable of the last link and depends on none of the front end; `crates/hir-ty-codegen` is the code generator
 (a crate over `hir-ty`'s MIR, see [contributing.md](contributing.md)), and the front end is
 the crates derived from rust-analyzer (`hir-def`, `hir-ty`, `syntax`, `parser` and the rest), with
 the borrow checker as its crate `hir-ty-borrowck` ([borrowck.md](borrowck.md)).
@@ -179,7 +180,7 @@ object holding the changed functions is linked ahead of it (`patch.rs`). Anythin
 cannot express starts a full object again.
 
 **Splice.** Linking still rewrites the whole executable. The splice
-(`crates/blaze-engine/src/splice.rs`) leaves the executable of the last full link as it is and
+(`crates/blaze-splice/src/lib.rs`) leaves the executable of the last full link as it is and
 appends the patch: it lays the patch out behind everything the linker loaded, resolves its
 references against the executable's symbols, and writes a jump to the new code over the
 entry of each replaced function. Calls, vtables and function pointers still arrive at the

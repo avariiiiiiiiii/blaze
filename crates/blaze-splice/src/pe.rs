@@ -39,8 +39,8 @@ use super::{Addition, relative};
 
 /// What a splice has to know of the executable, every address relative to where it is
 /// loaded. Nothing of the file is read again.
-pub(super) struct Image {
-    pub(super) len: u64,
+pub struct Image {
+    pub len: u64,
     /// Everything ahead of the first section.
     headers: Vec<u8>,
     /// Where `headers` has the file header, the optional header and the table of sections.
@@ -61,7 +61,7 @@ pub(super) struct Image {
     fixups: Option<Vec<u64>>,
     /// The GUID of the PDB the linker wrote with it, which a program that runs it reads to
     /// know which executable it is.
-    pub(super) guid: [u8; 16],
+    pub guid: [u8; 16],
 }
 
 enum Named {
@@ -93,7 +93,7 @@ const FUNCTION: usize = 12;
 impl Image {
     /// Reads the executable at `path` that was linked from `objects`, which define what
     /// they share a name for in that order.
-    pub(super) fn read(bytes: &[u8], path: &Path, objects: &[&[u8]]) -> anyhow::Result<Image> {
+    pub fn read(bytes: &[u8], path: &Path, objects: &[&[u8]]) -> anyhow::Result<Image> {
         let file = PeFile64::parse(bytes)?;
         let nt = file.nt_headers();
         let (header, optional) = (nt.file_header(), nt.optional_header());
@@ -258,7 +258,7 @@ impl Image {
 }
 
 /// A patch object, and what of the executable it needs.
-pub(super) struct Patch<'a> {
+pub struct Patch<'a> {
     file: CoffFile<'a>,
     /// The sections that are loaded, by the section of ours they go to.
     sections: [Vec<SectionIndex>; 3],
@@ -385,7 +385,7 @@ impl<'a> Patch<'a> {
     /// A block of `.reloc` that has one address: its page and length, the address, padding.
     const FIXUP: usize = 12;
 
-    pub(super) fn read(bytes: &'a [u8], image: &Image) -> anyhow::Result<Patch<'a>> {
+    pub fn read(bytes: &'a [u8], image: &Image) -> anyhow::Result<Patch<'a>> {
         let mut patch = Patch {
             file: CoffFile::parse(bytes)?,
             sections: Default::default(),
@@ -531,7 +531,7 @@ impl<'a> Patch<'a> {
     }
 
     /// The names the patch defines.
-    pub(super) fn defined(&self) -> impl Iterator<Item = &'a [u8]> {
+    pub fn defined(&self) -> impl Iterator<Item = &'a [u8]> {
         self.replaced.iter().map(|it| it.name)
     }
 
@@ -573,7 +573,7 @@ impl<'a> Patch<'a> {
     }
 
     /// Lays the patch out behind the executable and gives everything in it its address.
-    pub(super) fn place(&self, image: &Image) -> anyhow::Result<Addition> {
+    pub fn place(&self, image: &Image) -> anyhow::Result<Addition> {
         let page = image.section_alignment;
         // The file has each section as far behind the first as memory does: a file is
         // aligned to no more than memory is.
@@ -796,7 +796,7 @@ impl<'a> Patch<'a> {
     /// functions to read and run, the writable sections behind, and a jump over the entry of
     /// each function it replaces. With where each new function starts and where the
     /// executable has the old one.
-    pub(super) fn place_live(
+    pub fn place_live(
         &self,
         image: &Image,
         base: u64,

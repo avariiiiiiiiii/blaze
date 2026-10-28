@@ -243,7 +243,7 @@ struct Table {
 }
 
 /// The module as the linker wrote it.
-pub(super) struct Module {
+pub struct Module {
     bytes: Vec<u8>,
     sections: Vec<Section>,
     types: Vec<FuncType>,
@@ -266,7 +266,7 @@ pub(super) struct Module {
 }
 
 impl Module {
-    pub(super) fn read(bytes: Vec<u8>) -> anyhow::Result<Module> {
+    pub fn read(bytes: Vec<u8>) -> anyhow::Result<Module> {
         let parts = Parts::read(&bytes)?;
         ensure!(!parts.symbols.is_empty(), "a module without a symbol table (--emit-relocs)");
         let mut symbols = FxHashMap::<Box<str>, Named>::default();
@@ -391,7 +391,7 @@ impl Module {
     }
 
     /// The module with `patch` in place of what it defines, and what that took.
-    pub(super) fn splice(&self, patch: &[u8]) -> anyhow::Result<(Vec<u8>, Spliced)> {
+    pub fn splice(&self, patch: &[u8]) -> anyhow::Result<(Vec<u8>, Spliced)> {
         let parts = Parts::read(patch)?;
         let mut placed = Placed::new(self, &parts, patch)?;
         for (relocations, section) in
@@ -406,7 +406,7 @@ impl Module {
 }
 
 /// The names the patch defines for the rest of the program.
-pub(super) fn defined(patch: &[u8]) -> anyhow::Result<Vec<Box<[u8]>>> {
+pub fn defined(patch: &[u8]) -> anyhow::Result<Vec<Box<[u8]>>> {
     let parts = Parts::read(patch)?;
     let names = parts.symbols.iter().filter_map(|symbol| match *symbol {
         SymbolInfo::Func { flags, name: Some(name), .. }

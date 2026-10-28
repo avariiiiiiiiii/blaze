@@ -28,7 +28,7 @@ mod mirdump;
 mod outline;
 mod pin;
 mod shipped;
-mod splice;
+use blaze_splice as splice;
 mod splicer;
 mod symbols;
 mod test_harness;
@@ -11475,6 +11475,12 @@ fn report_stats(stats: &hir_ty_codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_splice_names_statics_as_the_code_generator_does() {
+        assert_eq!(splice::LASTING_STATIC, hir_ty_codegen::LASTING_STATIC);
+        assert_eq!(splice::MOVED_STATIC, hir_ty_codegen::MOVED_STATIC);
+    }
 
     #[test]
     fn a_fetched_crate_is_named_the_same_wherever_cargo_keeps_it() {

@@ -39,6 +39,7 @@ disabled-strategies = ["quick-install"]
 # The cargo drop-in and the modules under it: its modules are the engine's (`crate::cargo`,
 # `crate::trace`, ...) by the `use` at the top of lib.rs.
 blaze-cargo = { path = "../blaze-cargo" }
+blaze-splice = { path = "../blaze-splice" }
 memchr = "2"
 anyhow.workspace = true
 serde.workspace = true
@@ -57,7 +58,6 @@ rustc-hash.workspace = true
 salsa.workspace = true
 same-file = "1"
 dunce = "1"
-pdb = "0.8"
 sha2 = "0.10"
 shlex = "2"
 toml.workspace = true

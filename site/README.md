@@ -152,7 +152,7 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   in the who-is-here list turns them off) and as bands on a rail at the right edge where each is reading (click a
   face to go there). Positions are anchors in the text (a block index and a fraction of it, x a fraction of `main`'s
   width), so different window sizes line up; the object passes them only to the other tabs on the same page, rate
-  limited per person, and never stores them. On a desk T opens a one-line composer by the reader's pointer (Figma's
+  limited per person, and never stores them. On a desk T (or Enter, for Vimium users) opens a one-line composer where the reader's pointer is, which stays there (Figma's
   cursor chat): the others on the page see the line as it is typed (`say-live`, same budget, never stored), as a bubble
   under the pointer or out of the face on the rail; Enter sends it, and a signed-in reader's goes to the chat as well.
   The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the

@@ -473,6 +473,7 @@ body.chat-full .chat-back { order: 1; }
    the rail while their pointer is off this screen. A caret blinks while they write; a sent one fades after a while. */
 .say-live { position: fixed; z-index: 46; display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; border-radius: 4px 14px 14px 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), inset 0 0 0 1.5px var(--c), 0 10px 28px rgb(0 0 0 / 0.28); animation: say-live-in 0.15s ease-out; transition: opacity 0.3s; }
 .say-live[hidden] { display: none; }
+.say-live > .face { flex: none; width: 20px; height: 20px; margin-left: -4px; box-shadow: none; }
 .say-live.at-foot { left: 50%; bottom: 28px; transform: translateX(-50%); border-radius: 14px; }
 .say-live input, .say-live input:focus { field-sizing: content; width: auto; min-width: 24ch; max-width: min(420px, calc(100vw - 72px)); height: 24px; padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; color: var(--ink-1); font: inherit; font-size: 13.5px; outline: none; }
 .say-live input::placeholder { color: var(--ink-4); }

@@ -230,7 +230,7 @@ function drawHere(): void {
 	b.setAttribute('aria-expanded', String(!list.hidden));
 	b.setAttribute('aria-controls', list.id);
 	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
-	tipOn(b, `${on.length} on this page, ${total} on the site${cursors.hint() ? '. Press T to say something here' : ''}`);
+	tipOn(b, `${on.length} on this page, ${total} on the site${cursors.hint() ? '. Press T or Enter to say something here' : ''}`);
 	b.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!list.hidden) return closeList();

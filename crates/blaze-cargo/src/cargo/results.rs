@@ -80,7 +80,9 @@ pub enum Found {
 
 /// The store's test results, and what this command found of the paths tests read.
 pub struct Results {
-    store: &'static blaze_store::Store,
+    /// Opened by the first test that is not found in a program's [`Passed`]: opening reads
+    /// the index of every pack, which a command whose tests all passed before has no need of.
+    store: std::cell::OnceCell<Option<&'static blaze_store::Store>>,
     from: String,
     inputs: HashMap<(String, Seen), String>,
 }
@@ -89,9 +91,20 @@ impl Results {
     /// The results of the store this command uses, `None` when it uses none
     /// (`BLAZE_CACHE=off`).
     pub fn open() -> Option<Results> {
-        blaze_store::compiles_against(RESULTS);
-        let store = blaze_store::Store::global_or(super::daemon::store().as_deref())?;
-        Some(Results { store, from: from(), inputs: HashMap::new() })
+        super::daemon::store()?;
+        Some(Results { store: std::cell::OnceCell::new(), from: from(), inputs: HashMap::new() })
+    }
+
+    fn store(&self) -> Option<&'static blaze_store::Store> {
+        *self.store.get_or_init(|| {
+            blaze_store::compiles_against(RESULTS);
+            blaze_store::Store::global_or(super::daemon::store().as_deref())
+        })
+    }
+
+    /// What this command's results come from, as a pass kept now says.
+    pub fn from(&self) -> &str {
+        &self.from
     }
 
     /// The first key of the test `name`: `identity` is all that is known of it before it runs.
@@ -105,9 +118,10 @@ impl Results {
         if !reaches {
             return self.found(&pure(first));
         }
+        let Some(store) = self.store() else { return Found::Missing(None) };
         let (mut flaky, mut why) = (None, None);
         for set in 0..SETS {
-            let Some(kept) = self.store.get(&set_key(first, set)) else { break };
+            let Some(kept) = store.get(&set_key(first, set)) else { break };
             let Some(kept) = read_set(&kept) else { continue };
             let reads: Reads = kept.iter().map(|(path, (seen, _))| (path.clone(), *seen)).collect();
             let second = self.second(first, &reads);
@@ -129,11 +143,12 @@ impl Results {
     /// What the store has under the second key `key`: a mark that the test is flaky, with
     /// where that was found, before any pass.
     fn found(&self, key: &Key) -> Found {
+        let Some(store) = self.store() else { return Found::Missing(None) };
         let text = |it: Vec<u8>| String::from_utf8_lossy(&it).into_owned();
-        if let Some(from) = self.store.get(&marked(key, b"flaky")).map(text) {
+        if let Some(from) = store.get(&marked(key, b"flaky")).map(text) {
             return Found::Flaky { from };
         }
-        match self.store.get(key).map(text) {
+        match store.get(key).map(text) {
             Some(passed) => {
                 let from = passed.strip_prefix("passed\n").unwrap_or_default().to_owned();
                 Found::Passed { from }
@@ -146,19 +161,20 @@ impl Results {
     /// paths it read when it reaches the world outside its code, `None` when it reaches none.
     /// Whether it is flaky: it ended otherwise under the same key before.
     pub fn keep(&mut self, first: &Key, reads: Option<&Reads>, passed: bool) -> bool {
+        let Some(store) = self.store() else { return false };
         let key = match reads {
             None => pure(first),
             Some(reads) => self.second(first, reads),
         };
         let other = marked(&key, b"failed");
         let flaky = match passed {
-            true => self.store.get(&other).is_some(),
-            false => self.store.get(&key).is_some(),
+            true => store.get(&other).is_some(),
+            false => store.get(&key).is_some(),
         };
         match (passed, flaky) {
-            (_, true) => self.store.insert(&marked(&key, b"flaky"), self.from.as_bytes()),
-            (true, false) => self.store.insert(&key, format!("passed\n{}", self.from).as_bytes()),
-            (false, false) => self.store.insert(&other, self.from.as_bytes()),
+            (_, true) => store.insert(&marked(&key, b"flaky"), self.from.as_bytes()),
+            (true, false) => store.insert(&key, format!("passed\n{}", self.from).as_bytes()),
+            (false, false) => store.insert(&other, self.from.as_bytes()),
         }
         if let (true, Some(reads)) = (passed, reads) {
             self.keep_set(first, reads);
@@ -168,9 +184,10 @@ impl Results {
 
     /// Has a set of `first` be `reads`, unless one is or every set is taken.
     fn keep_set(&mut self, first: &Key, reads: &Reads) {
+        let Some(store) = self.store() else { return };
         for set in 0..SETS {
             let key = set_key(first, set);
-            match self.store.get(&key) {
+            match store.get(&key) {
                 Some(kept)
                     if read_set(&kept).is_some_and(|it| {
                         it.iter().map(|(path, (seen, _))| (path, seen)).eq(reads.iter())
@@ -185,7 +202,7 @@ impl Results {
                         let input = self.input(path, seen);
                         text.push_str(&format!("{input}\t{}\t{path}\n", seen.letter()));
                     }
-                    return self.store.insert(&key, text.as_bytes());
+                    return store.insert(&key, text.as_bytes());
                 }
             }
         }
@@ -221,12 +238,16 @@ impl Results {
 
     /// Writes what was kept to the store's files.
     pub fn flush(&self) {
-        self.store.flush();
+        if let Some(Some(store)) = self.store.get() {
+            store.flush();
+        }
     }
 
     /// Seals what was kept, for the next command and a push to a remote to have.
     pub fn seal(&self) {
-        self.store.seal();
+        if let Some(Some(store)) = self.store.get() {
+            store.seal();
+        }
     }
 }
 
@@ -292,18 +313,108 @@ fn input(path: &Path, seen: Seen) -> String {
 
 /// What stands for the programs `paths` (an integration test's `CARGO_BIN_EXE_<name>`) in a
 /// test's first key: their bytes, read once by a command.
-pub fn programs(paths: &[&Path]) -> String {
-    static KNOWN: std::sync::Mutex<BTreeMap<std::path::PathBuf, String>> =
-        std::sync::Mutex::new(BTreeMap::new());
-    let mut known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+/// The digests are kept in [`PROGRAMS`] in `kept_in` under what [`sandboxed::stat`] says of
+/// each program: one of hundreds of megabytes is read once a build links it again, not by
+/// every command.
+pub fn programs(paths: &[&Path], kept_in: Option<&Path>) -> String {
+    let file = kept_in.map(|it| it.join(PROGRAMS));
+    let text = file.as_ref().and_then(|it| std::fs::read_to_string(it).ok()).unwrap_or_default();
+    let kept: BTreeMap<&str, &str> = text.lines().filter_map(|it| it.rsplit_once('\t')).collect();
+    let mut now = BTreeMap::new();
     let mut hash = Sha256::new();
     for path in paths {
-        let digest =
-            known.entry(path.to_path_buf()).or_insert_with(|| sandboxed::digest(path)).clone();
+        let stat = sandboxed::stat(path);
+        let at = format!("{}\t{stat}", path.display());
+        let digest = match kept.get(at.as_str()) {
+            Some(digest) => (*digest).to_owned(),
+            None => sandboxed::digest(path),
+        };
+        // A program written again while it was read is not what the digest says it is.
+        if stat != "-" && sandboxed::stat(path) == stat {
+            now.insert(at, digest.clone());
+        }
         field(&mut hash, path.as_os_str().as_encoded_bytes());
         field(&mut hash, digest.as_bytes());
     }
+    let changed = now.len() != kept.len()
+        || now.iter().any(|(at, digest)| kept.get(at.as_str()) != Some(&digest.as_str()));
+    if let (Some(file), true) = (file, changed) {
+        let text: String = now.iter().map(|(at, digest)| format!("{at}\t{digest}\n")).collect();
+        write_whole(&file, text.as_bytes());
+    }
     format!("-{}", hex(&hash.finalize()[..16]))
+}
+
+/// The file beside a program of tests that has [`programs`]'s digests: a program's path, a
+/// tab, what [`sandboxed::stat`] says of it, a tab and its digest, a line each.
+const PROGRAMS: &str = "tests-programs";
+
+/// The file beside a program of tests that has [`Passed`].
+const PASSED: &str = "tests-passed";
+
+/// The first keys of a program's hermetic tests whose pass this machine found in the store or
+/// kept there, each with where it passed, in [`PASSED`] beside the program: what the store
+/// says of them, told without opening it. A test that fails under its key is taken out; a
+/// flaky mark that comes from a remote under a key kept here is not seen until the test runs
+/// again (`BLAZE_TESTS=verify`).
+pub struct Passed {
+    file: Option<std::path::PathBuf>,
+    read: BTreeMap<Key, String>,
+    now: BTreeMap<Key, String>,
+}
+
+impl Passed {
+    /// What `dir`, a program's directory, has; nothing when there is none.
+    pub fn read(dir: Option<&Path>) -> Passed {
+        let file = dir.map(|it| it.join(PASSED));
+        let text =
+            file.as_ref().and_then(|it| std::fs::read_to_string(it).ok()).unwrap_or_default();
+        let read = text
+            .lines()
+            .filter_map(|line| {
+                let (key, from) = line.split_once('\t')?;
+                let mut first = [0; 32];
+                for (at, byte) in first.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(key.get(at * 2..at * 2 + 2)?, 16).ok()?;
+                }
+                Some((first, from.to_owned()))
+            })
+            .collect();
+        Passed { file, read, now: BTreeMap::new() }
+    }
+
+    /// Where the test of `first` passed, when it is kept here.
+    pub fn get(&self, first: &Key) -> Option<&str> {
+        self.read.get(first).map(String::as_str)
+    }
+
+    /// Has the test of `first` be passed, from `from`, in what [`Self::write`] writes.
+    pub fn insert(&mut self, first: Key, from: String) {
+        self.now.insert(first, from);
+    }
+
+    pub fn remove(&mut self, first: &Key) {
+        self.now.remove(first);
+    }
+
+    /// Writes what was inserted, when it is not what was read.
+    pub fn write(&mut self) {
+        let Some(file) = &self.file else { return };
+        if self.now == self.read {
+            return;
+        }
+        let text: String =
+            self.now.iter().map(|(key, from)| format!("{}\t{from}\n", hex(key))).collect();
+        write_whole(file, text.as_bytes());
+        self.read = self.now.clone();
+    }
+}
+
+fn write_whole(file: &Path, bytes: &[u8]) {
+    let writing = file.with_extension(format!("{}.writing", std::process::id()));
+    if std::fs::write(&writing, bytes).and_then(|()| std::fs::rename(&writing, file)).is_err() {
+        _ = std::fs::remove_file(&writing);
+    }
 }
 
 fn pure(first: &Key) -> Key {
@@ -357,7 +468,7 @@ mod tests {
         blaze_store::compiles_against(RESULTS);
         let store = blaze_store::Store::open_at(dir).expect("a store");
         Results {
-            store: Box::leak(Box::new(store)),
+            store: std::cell::OnceCell::from(Some(&*Box::leak(Box::new(store)))),
             from: "commit abc (run 1)".to_owned(),
             inputs: HashMap::new(),
         }
@@ -368,6 +479,40 @@ mod tests {
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_program_is_read_again_once_it_is_written_again() {
+        let dir = scratch("program");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, "one").unwrap();
+        let one = programs(&[&exe], Some(&dir));
+        assert_eq!(one, programs(&[&exe], None));
+        let kept = std::fs::read_to_string(dir.join(PROGRAMS)).unwrap();
+        assert!(kept.ends_with(&format!("\t{}\n", sandboxed::digest(&exe))), "{kept}");
+        assert_eq!(programs(&[&exe], Some(&dir)), one);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&exe, "two").unwrap();
+        let two = programs(&[&exe], Some(&dir));
+        assert_ne!(two, one);
+        assert_eq!(two, programs(&[&exe], None));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn passes_kept_beside_a_program_read_back() {
+        let dir = scratch("passed");
+        let (a, b) = (Results::first("abc", "tests::a"), Results::first("abc", "tests::b"));
+        let mut passed = Passed::read(Some(&dir));
+        assert_eq!(passed.get(&a), None);
+        passed.insert(a, "commit abc (run 1)".to_owned());
+        passed.insert(b, "here".to_owned());
+        passed.remove(&b);
+        passed.write();
+        let passed = Passed::read(Some(&dir));
+        assert_eq!(passed.get(&a), Some("commit abc (run 1)"));
+        assert_eq!(passed.get(&b), None);
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -671,6 +671,10 @@ with what they are a function of as it is now (`BLAZE_TESTS=affected`, the defau
 `BLAZE_TESTS=all` runs every test, as cargo does). A pass is kept in blaze's store, as a
 compiled function is, so it travels with the store through a remote (`blaze-engine cache push|pull`,
 `BLAZE_REMOTE`): a pass on main's CI stands on every branch whose test and inputs are the same.
+Beside each test executable, `tests-passed` has the keys of its hermetic tests' passes this
+machine found or kept, and `tests-programs` the digest of each program an integration test is
+handed (`CARGO_BIN_EXE_<name>`) by its size, time and inode: a command whose tests all passed
+before neither opens the store nor reads a program again (`BLAZE_TESTS=verify` asks the store).
 
 A hermetic test's pass is kept by its code alone, sandboxed or not
 ([below](#tests-are-hermetic-or-say-why-not)). A test that reaches the world outside the

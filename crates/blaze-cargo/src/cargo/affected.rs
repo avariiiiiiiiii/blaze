@@ -21,7 +21,7 @@ use std::{
 use super::{
     cli::Invocation,
     plan,
-    results::{self, Found, Key, Results},
+    results::{self, Found, Key, Passed, Results},
     state::{Kind, Program, State},
 };
 use crate::sandbox::Line;
@@ -44,7 +44,9 @@ pub fn verifying() -> bool {
 }
 
 /// Has the daemon write [`plan::REACH`] at its builds of the programs of tests of `state`
-/// while only the tests an edit reached are run, and stop when every test is.
+/// while only the tests an edit reached are run, and stop when every test is. The one there
+/// stays: a build without the ask takes it away, so one left is of the program as it is, and
+/// a command after `BLAZE_TESTS=all` uses it with no build for it.
 pub fn ask(state: &State) {
     let on = on();
     for program in state.programs.iter().filter(|it| it.test) {
@@ -54,10 +56,7 @@ pub fn ask(state: &State) {
             true if wanted.is_file() => {}
             // A fresh target has no directory for the program until it is built.
             true => _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&wanted, "")),
-            false => {
-                _ = std::fs::remove_file(&wanted);
-                _ = std::fs::remove_file(dir.join(plan::REACH));
-            }
+            false => _ = std::fs::remove_file(&wanted),
         }
     }
 }
@@ -101,8 +100,10 @@ pub struct Planned {
     pub name: String,
     /// Whether its end is a function of its code alone.
     pub hermetic: bool,
-    /// What it reaches that its code does not decide, all kinds.
-    pub reasons: Vec<plan::Reason>,
+    /// What makes it not hermetic and what it reaches that does not, each a JSON list of
+    /// [`plan::Reason`]s as [`plan::REACH`] has it.
+    pub reasons: String,
+    pub nondeterministic: String,
     pub cached: Cached,
 }
 
@@ -128,8 +129,8 @@ impl Cached {
 }
 
 /// The first key of each test of a program that may be kept, and whether it reaches the world
-/// outside its code.
-pub struct Keys(BTreeMap<String, (Key, bool)>);
+/// outside its code; and the program's [`Passed`].
+pub struct Keys(BTreeMap<String, (Key, bool)>, std::cell::RefCell<Passed>);
 
 /// What a run of a program of tests ended with, for [`Keys::settle`].
 pub struct Ended<'a> {
@@ -165,6 +166,7 @@ impl Keys {
             return Vec::new();
         }
         let mut flaky = Vec::new();
+        let mut passed = self.1.borrow_mut();
         for name in ran {
             let Some((first, reaches)) = self.0.get(name) else { continue };
             let reads = match (reaches, ended.record) {
@@ -175,10 +177,17 @@ impl Keys {
                 },
                 (true, None) => continue,
             };
-            if results.keep(first, reads.as_ref(), !failures.contains(name.as_str())) {
+            let ok = !failures.contains(name.as_str());
+            let found_flaky = results.keep(first, reads.as_ref(), ok);
+            match (ok && !found_flaky, reaches) {
+                (true, false) => passed.insert(*first, results.from().to_owned()),
+                _ => passed.remove(first),
+            }
+            if found_flaky {
                 flaky.push(name.clone());
             }
         }
+        passed.write();
         results.flush();
         flaky
     }
@@ -213,8 +222,9 @@ pub fn pick(
     // Hashed only for a test that is kept: a program is read whole, and an integration test's
     // tests that all run every time need none.
     let hashed = std::cell::OnceCell::new();
-    let programs = || hashed.get_or_init(|| programs_run_by(state, test)).as_str();
+    let programs = || hashed.get_or_init(|| programs_run_by(state, test, dir)).as_str();
     let mut results = results;
+    let mut passed = Passed::read(results.is_some().then_some(dir));
     let (mut names, mut keys, mut always, mut reaching) =
         (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new());
     let (mut cached, mut flaky, mut total, mut planned) =
@@ -236,12 +246,18 @@ pub fn pick(
                 why: rest.to_owned(),
                 chain: Vec::new(),
             };
-            let reasons = vec![reason];
-            let name = name.to_owned();
-            planned.push(Planned { name, hermetic: false, reasons, cached: Cached::Never });
+            let reasons = serde_json::to_string(&[reason]).unwrap_or_else(|_| "[]".to_owned());
+            planned.push(Planned {
+                name: name.to_owned(),
+                hermetic: false,
+                reasons,
+                nondeterministic: "[]".to_owned(),
+                cached: Cached::Never,
+            });
             continue;
         }
-        let reasons: Vec<plan::Reason> = serde_json::from_str(rest).unwrap_or_default();
+        let (blocking, others) = rest.split_once('\t').unwrap_or((rest, "[]"));
+        let (reasons, nondeterministic) = (blocking.to_owned(), others.to_owned());
         let (mark, hash) = match hash.as_bytes().first() {
             Some(b'~' | b'!') => (&hash[..1], &hash[1..]),
             _ => ("", hash),
@@ -250,8 +266,14 @@ pub fn pick(
         let sandboxed = sandbox.ok().filter(|_| !outside.contains(name));
         let reads = mark == "~" && sandboxed.is_some();
         if !hermetic && !reads {
-            let first = reasons.iter().find(|it| it.blocks());
-            let why = first.map_or_else(
+            // Said only under `--verbose`: the reasons of thousands of tests are megabytes.
+            let first = match asked.flags.verbose {
+                true => serde_json::from_str::<Vec<plan::Reason>>(blocking)
+                    .ok()
+                    .and_then(|it| it.into_iter().next()),
+                false => None,
+            };
+            let why = first.as_ref().map_or_else(
                 || "it reaches what its code does not decide".to_owned(),
                 |it| it.why.clone(),
             );
@@ -261,7 +283,8 @@ pub fn pick(
             names.push(name.to_owned());
             always.push(Always { name: name.to_owned(), why, path });
             let name = name.to_owned();
-            planned.push(Planned { name, hermetic, reasons, cached: Cached::Never });
+            let cached = Cached::Never;
+            planned.push(Planned { name, hermetic, reasons, nondeterministic, cached });
             continue;
         }
         let identity = match (reads, sandboxed) {
@@ -270,12 +293,26 @@ pub fn pick(
         };
         let first = Results::first(&identity, name);
         keys.insert(name.to_owned(), (first, reads));
-        let found = results.as_mut().map_or(Found::Missing(None), |it| it.find(&first, reads));
+        let here = passed.get(&first).filter(|_| !reads && !verifying());
+        let found = match (here, results.as_mut()) {
+            (Some(from), _) => Found::Passed { from: from.to_owned() },
+            (None, Some(results)) => results.find(&first, reads),
+            (None, None) => Found::Missing(None),
+        };
+        if let (Found::Passed { from }, false) = (&found, reads) {
+            passed.insert(first, from.clone());
+        }
         let kept = match &found {
             Found::Passed { .. } => Cached::Hit,
             _ => Cached::Miss,
         };
-        planned.push(Planned { name: name.to_owned(), hermetic, reasons, cached: kept });
+        planned.push(Planned {
+            name: name.to_owned(),
+            hermetic,
+            reasons,
+            nondeterministic,
+            cached: kept,
+        });
         match found {
             Found::Passed { from } => {
                 cached.insert(name.to_owned(), from);
@@ -307,9 +344,11 @@ pub fn pick(
                 .map(|it| (it.clone(), "it is verified".to_owned())),
         );
     }
+    passed.write();
     let long = names.iter().map(|it| it.len() + 1).sum::<usize>() > NAMES_AT_MOST;
     let names = (names.len() != total && !long).then_some(names);
-    Pick::Some { names, total, always, reaching, cached, flaky, keys: Keys(keys), planned }
+    let keys = Keys(keys, std::cell::RefCell::new(passed));
+    Pick::Some { names, total, always, reaching, cached, flaky, keys, planned }
 }
 
 /// What stands for what the command `asked` builds and runs its tests with, beside each test's
@@ -366,14 +405,14 @@ pub fn plain(trailing: &[String]) -> bool {
 
 /// What stands for the programs an integration test of `test`'s package runs, which cargo
 /// gives it as `CARGO_BIN_EXE_<name>`: their bytes. Empty for a unit test.
-fn programs_run_by(state: &State, test: &Program) -> String {
+fn programs_run_by(state: &State, test: &Program, dir: &Path) -> String {
     if !matches!(test.kind, Kind::Test | Kind::Bench) {
         return String::new();
     }
     let runs = |it: &&Program| it.package == test.package && it.kind == Kind::Bin && !it.test;
     let paths: Vec<&Path> =
         state.programs.iter().filter(runs).map(|it| it.executable.as_path()).collect();
-    results::programs(&paths)
+    results::programs(&paths, Some(dir))
 }
 
 #[cfg(test)]

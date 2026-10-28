@@ -77,7 +77,9 @@ pub const REACH_WANTED: &str = "tests-reach-wanted";
 
 /// What the daemon wrote of each test of the program at its last build: [`REACH_FORMAT`], then
 /// one test a line, a hash of what decides how the test ends, a tab, libtest's name of it, a
-/// tab and what it reaches that its code does not decide, a JSON list of [`Reason`]s. The
+/// tab and what it reaches that its code does not decide, two JSON lists of [`Reason`]s with
+/// a tab between: those that [block](Reason::blocks), then the others. They are copied into
+/// `tests.ndjson` as they are, and read only for its summary. The
 /// hash of a test that is not hermetic has a mark before it: `~` when all that makes it so is
 /// the world outside the program, which a sandbox records, and `!` otherwise. Or `-`, the
 /// name, a tab and why the test runs every time, with no hash (a benchmark); or `*`, a tab and
@@ -85,7 +87,7 @@ pub const REACH_WANTED: &str = "tests-reach-wanted";
 pub const REACH: &str = "tests-reach";
 
 /// The first line of [`REACH`], which changes with what it holds.
-pub const REACH_FORMAT: &str = "tests-reach 2";
+pub const REACH_FORMAT: &str = "tests-reach 3";
 
 /// Whether a sandbox that records what a test reads makes what a reason of `kind` reaches part
 /// of the test's key: files, the environment, other processes and the network.

@@ -3835,8 +3835,11 @@ fn reach_of_tests(
                     .collect(),
             })
             .collect();
-        let found = serde_json::to_string(&found).unwrap_or_else(|_| "[]".to_owned());
-        text.push_str(&format!("{mark}{hex}\t{name}\t{found}\n"));
+        let (blocking, others): (Vec<_>, Vec<_>) = found.into_iter().partition(|it| it.blocks());
+        let json = |it: &[cargo::plan::Reason]| {
+            serde_json::to_string(it).unwrap_or_else(|_| "[]".to_owned())
+        };
+        text.push_str(&format!("{mark}{hex}\t{name}\t{}\t{}\n", json(&blocking), json(&others)));
     }
     text
 }

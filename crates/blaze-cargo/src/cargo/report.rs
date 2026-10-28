@@ -6,6 +6,7 @@
 //! prints a table of the same, `--why --json` the lines. docs/cargo.md has the schema.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     io::Write as _,
     path::{Path, PathBuf},
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     affected::{Cached, Planned},
-    plan::{Call, Reason},
+    plan::Reason,
     state::{Kind, Program},
 };
 
@@ -25,8 +26,8 @@ pub const SCHEMA: u32 = 1;
 /// How many of each ranking [`Summary`] keeps.
 const TOP: usize = 50;
 
-/// A test, as a line of `tests.ndjson`.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// A test, as a line of `tests.ndjson` ([`ndjson`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
     pub v: u32,
     pub package: String,
@@ -44,11 +45,46 @@ pub struct Line {
     pub result: String,
     /// It passed and failed under one key, and runs every time.
     pub flaky: bool,
-    /// What makes it not hermetic, a kind once each, by the fewest calls.
-    pub reasons: Vec<Reason>,
+    /// What makes it not hermetic, a kind once each, by the fewest calls: a JSON list of
+    /// [`Reason`]s, as the daemon wrote it.
+    pub reasons: String,
     /// What it reaches that a pass does not stand for but only makes a flaky test flaky:
-    /// the clock, randomness, threads.
-    pub nondeterministic: Vec<Reason>,
+    /// the clock, randomness, threads. A JSON list as `reasons` is.
+    pub nondeterministic: String,
+}
+
+/// What of a [`Line`] is not its reasons, as `tests.ndjson` has it first.
+#[derive(Serialize)]
+struct Head<'a> {
+    v: u32,
+    package: &'a str,
+    target: &'a str,
+    name: &'a str,
+    hermetic: bool,
+    cached: &'a str,
+    result: &'a str,
+    flaky: bool,
+}
+
+/// What [`Summary`] reads of a [`Reason`], borrowed from the JSON of a line.
+#[derive(Deserialize)]
+struct Seen<'a> {
+    #[serde(borrow)]
+    kind: Cow<'a, str>,
+    #[serde(borrow)]
+    what: Cow<'a, str>,
+    #[serde(borrow)]
+    chain: Vec<SeenCall<'a>>,
+}
+
+#[derive(Deserialize)]
+struct SeenCall<'a> {
+    #[serde(rename = "fn", borrow)]
+    name: Cow<'a, str>,
+    #[serde(borrow)]
+    file: Option<Cow<'a, str>>,
+    line: Option<u32>,
+    col: Option<u32>,
 }
 
 impl Line {
@@ -104,8 +140,6 @@ pub fn lines_of(program: &Program, planned: &[Planned], ended: &Ended<'_>) -> Ve
                     None => "unknown",
                 },
             };
-            let (reasons, nondeterministic) =
-                test.reasons.iter().cloned().partition(|it: &Reason| it.blocks());
             Line {
                 v: SCHEMA,
                 package: program.package.clone(),
@@ -115,8 +149,8 @@ pub fn lines_of(program: &Program, planned: &[Planned], ended: &Ended<'_>) -> Ve
                 cached: test.cached.name().to_owned(),
                 result: result.to_owned(),
                 flaky: ended.flaky.contains(name),
-                reasons,
-                nondeterministic,
+                reasons: test.reasons.clone(),
+                nondeterministic: test.nondeterministic.clone(),
             }
         })
         .collect();
@@ -185,9 +219,24 @@ fn write_whole(file: &Path, bytes: &[u8]) {
     }
 }
 
-/// A line of `tests.ndjson`, with its newline.
+/// A line of `tests.ndjson`, with its newline: the reasons are copied in as they are.
 pub fn ndjson(line: &Line) -> String {
-    serde_json::to_string(line).map(|it| it + "\n").unwrap_or_default()
+    let head = Head {
+        v: line.v,
+        package: &line.package,
+        target: &line.target,
+        name: &line.name,
+        hermetic: line.hermetic,
+        cached: &line.cached,
+        result: &line.result,
+        flaky: line.flaky,
+    };
+    let Ok(head) = serde_json::to_string(&head) else { return String::new() };
+    let head = head.strip_suffix('}').unwrap_or(&head);
+    format!(
+        "{head},\"reasons\":{},\"nondeterministic\":{}}}\n",
+        line.reasons, line.nondeterministic
+    )
 }
 
 /// What `tests.summary.json` holds: how many tests are hermetic and kept, and what makes the
@@ -245,62 +294,61 @@ impl Summary {
         };
         let (mut cached, mut results, mut by_kind) =
             (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
-        let mut reasons: BTreeMap<(String, String), (usize, String)> = BTreeMap::new();
-        let mut helpers: BTreeMap<(String, Option<String>), (TopHelper, BTreeSet<String>)> =
-            BTreeMap::new();
-        for line in lines {
+        let seen: Vec<Vec<Seen<'_>>> = (lines.iter())
+            .map(|it| serde_json::from_str(&it.reasons).unwrap_or_default())
+            .collect();
+        // A test by package, target and name, the order of `lines` sorted.
+        type Test<'a> = (&'a str, &'a str, &'a str);
+        let mut reasons: BTreeMap<(&str, &str), (usize, Test<'_>)> = BTreeMap::new();
+        type At<'a> = (&'a str, Option<&'a str>, Option<u32>, Option<u32>);
+        let mut helpers: BTreeMap<At<'_>, (usize, usize, BTreeSet<&str>)> = BTreeMap::new();
+        for (line, seen) in lines.iter().zip(&seen) {
             count(&mut cached, &line.cached);
             count(&mut results, &line.result);
-            let test = format!("{} {} {}", line.package, line.target, line.name);
+            let test = (line.package.as_str(), line.target.as_str(), line.name.as_str());
             let mut through = BTreeSet::new();
-            for reason in &line.reasons {
+            for reason in seen {
                 count(&mut by_kind, &reason.kind);
-                let entry = reasons
-                    .entry((reason.kind.clone(), reason.what.clone()))
-                    .or_insert_with(|| (0, test.clone()));
+                let entry = reasons.entry((&*reason.kind, &*reason.what)).or_insert((0, test));
                 entry.0 += 1;
-                if test < entry.1 {
-                    entry.1 = test.clone();
-                }
-                let helper = helper(&reason.chain);
-                through.insert(helper.map(|it| (it.name.clone(), at(it))));
-                let Some(call) = helper else { continue };
-                let (_, kinds) =
-                    helpers.entry((call.name.clone(), at(call))).or_insert_with(|| {
-                        let top = TopHelper {
-                            name: call.name.clone(),
-                            file: call.file.clone(),
-                            line: call.line,
-                            col: call.col,
-                            kinds: Vec::new(),
-                            tests: 0,
-                            only_through_it: 0,
-                        };
-                        (top, BTreeSet::new())
-                    });
-                kinds.insert(reason.kind.clone());
+                entry.1 = entry.1.min(test);
+                let helper = helper(&reason.chain)
+                    .map(|it| (&*it.name, it.file.as_deref(), it.line, it.col));
+                through.insert(helper);
+                let Some(at) = helper else { continue };
+                helpers.entry(at).or_default().2.insert(&*reason.kind);
             }
             let only = through.len() == 1;
             for key in through.into_iter().flatten() {
-                if let Some((top, _)) = helpers.get_mut(&key) {
-                    top.tests += 1;
-                    top.only_through_it += usize::from(only);
+                if let Some((tests, only_through_it, _)) = helpers.get_mut(&key) {
+                    *tests += 1;
+                    *only_through_it += usize::from(only);
                 }
             }
         }
         let mut top_reasons: Vec<TopReason> = reasons
             .into_iter()
-            .map(|((kind, what), (tests, example))| TopReason { kind, what, tests, example })
+            .map(|((kind, what), (tests, (package, target, name)))| TopReason {
+                kind: kind.to_owned(),
+                what: what.to_owned(),
+                tests,
+                example: format!("{package} {target} {name}"),
+            })
             .collect();
         top_reasons.sort_by(|a, b| {
             b.tests.cmp(&a.tests).then_with(|| (&a.kind, &a.what).cmp(&(&b.kind, &b.what)))
         });
         top_reasons.truncate(TOP);
         let mut top_helpers: Vec<TopHelper> = helpers
-            .into_values()
-            .map(|(mut top, kinds)| {
-                top.kinds = kinds.into_iter().collect();
-                top
+            .into_iter()
+            .map(|((name, file, line, col), (tests, only_through_it, kinds))| TopHelper {
+                name: name.to_owned(),
+                file: file.map(str::to_owned),
+                line,
+                col,
+                kinds: kinds.into_iter().map(str::to_owned).collect(),
+                tests,
+                only_through_it,
             })
             .collect();
         top_helpers.sort_by(|a, b| {
@@ -325,13 +373,8 @@ impl Summary {
 }
 
 /// The last call on `chain` made by code of the workspace, whose file is told relative to it.
-fn helper(chain: &[Call]) -> Option<&Call> {
+fn helper<'a, 'b>(chain: &'b [SeenCall<'a>]) -> Option<&'b SeenCall<'a>> {
     chain.iter().rev().find(|it| it.file.as_deref().is_some_and(|file| !file.starts_with('/')))
-}
-
-fn at(call: &Call) -> Option<String> {
-    let file = call.file.as_deref()?;
-    Some(format!("{file}:{}:{}", call.line.unwrap_or(0), call.col.unwrap_or(0)))
 }
 
 /// `blaze test --why`'s table of `lines` and `summary`, with where the files are.
@@ -381,8 +424,8 @@ pub fn table(lines: &[Line], summary: &Summary, dir: &Path) -> String {
     if !not.is_empty() {
         out.push_str(&format!("\nNot hermetic ({}):\n", not.len()));
         for line in not {
-            let why: Vec<String> = line
-                .reasons
+            let reasons: Vec<Reason> = serde_json::from_str(&line.reasons).unwrap_or_default();
+            let why: Vec<String> = reasons
                 .iter()
                 .map(|it| {
                     let chain: Vec<&str> = it.chain.iter().map(|it| it.name.as_str()).collect();
@@ -408,7 +451,7 @@ pub fn table(lines: &[Line], summary: &Summary, dir: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::plan::Call, *};
 
     fn reason(kind: &str, what: &str, chain: &[(&str, Option<&str>)]) -> Reason {
         Reason {
@@ -431,8 +474,8 @@ mod tests {
             cached: if reasons.is_empty() { "hit" } else { "never" }.to_owned(),
             result: if reasons.is_empty() { "cached" } else { "passed" }.to_owned(),
             flaky: false,
-            reasons,
-            nondeterministic,
+            reasons: serde_json::to_string(&reasons).unwrap(),
+            nondeterministic: serde_json::to_string(&nondeterministic).unwrap(),
         }
     }
 
@@ -484,6 +527,11 @@ mod tests {
         let text = ndjson(&written);
         assert!(text.starts_with("{\"v\":1,") && text.ends_with("}\n"));
         assert!(text.contains("\"fn\":\"tests::a\""));
-        assert_eq!(serde_json::from_str::<Line>(text.trim_end()).unwrap(), written);
+        let read: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(read["name"], "tests::a");
+        assert_eq!(read["hermetic"], false);
+        let reasons: Vec<Reason> = serde_json::from_value(read["reasons"].clone()).unwrap();
+        assert_eq!(serde_json::to_string(&reasons).unwrap(), written.reasons);
+        assert_eq!(read["nondeterministic"], serde_json::json!([]));
     }
 }

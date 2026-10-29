@@ -9,12 +9,7 @@
 //! The structs below mirror Flecs's own (`flecs.h`); `tests` compares their sizes, alignments and the member offsets
 //! Rust reads with what the C compiler saw, on every target.
 #![no_std]
-#![allow(
-    non_camel_case_types,
-    non_snake_case,
-    non_upper_case_globals,
-    clippy::missing_safety_doc
-)]
+#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
 
 #[cfg(target_arch = "wasm32")]
 extern crate alloc;
@@ -641,10 +636,7 @@ mod wasm_libc {
     ) -> T {
         // SAFETY: `s` is a NUL-terminated C string (strtod's contract).
         let bytes = unsafe { core::ffi::CStr::from_ptr(s) }.to_bytes();
-        let ws = bytes
-            .iter()
-            .take_while(|c| matches!(c, b' ' | b'\t'..=b'\r'))
-            .count();
+        let ws = bytes.iter().take_while(|c| matches!(c, b' ' | b'\t'..=b'\r')).count();
         let n = float_prefix(&bytes[ws..]);
         let text = core::str::from_utf8(&bytes[ws..ws + n]).unwrap_or("");
         let value = if n == 0 { None } else { parse(text) };
@@ -766,10 +758,7 @@ mod tests {
         // SAFETY: a fresh world, NUL-terminated strings, and a cursor over x's own S, freed before the world.
         unsafe {
             let w = ecs_init();
-            assert_eq!(
-                ecs_script_run(w, c"t".as_ptr(), code.as_ptr(), core::ptr::null_mut()),
-                0
-            );
+            assert_eq!(ecs_script_run(w, c"t".as_ptr(), code.as_ptr(), core::ptr::null_mut()), 0);
             let (ty, x, t) = (
                 ecs_lookup(w, c"S".as_ptr()),
                 ecs_lookup(w, c"x".as_ptr()),
@@ -805,14 +794,8 @@ mod tests {
             (size_of::<EcsStruct>(), align_of::<EcsStruct>()),
             (size_of::<ecs_member_t>(), align_of::<ecs_member_t>()),
             (size_of::<EcsEnum>(), align_of::<EcsEnum>()),
-            (
-                size_of::<ecs_enum_constant_t>(),
-                align_of::<ecs_enum_constant_t>(),
-            ),
-            (
-                size_of::<ecs_bitmask_constant_t>(),
-                align_of::<ecs_bitmask_constant_t>(),
-            ),
+            (size_of::<ecs_enum_constant_t>(), align_of::<ecs_enum_constant_t>()),
+            (size_of::<ecs_bitmask_constant_t>(), align_of::<ecs_bitmask_constant_t>()),
             (size_of::<EcsConstants>(), align_of::<EcsConstants>()),
             (size_of::<EcsArray>(), align_of::<EcsArray>()),
             (size_of::<EcsVector>(), align_of::<EcsVector>()),
@@ -832,11 +815,7 @@ mod tests {
         ];
         for (i, off) in offsets.iter().enumerate() {
             // SAFETY: plain query.
-            assert_eq!(
-                *off,
-                unsafe { glue_member_offset(i as i32) },
-                "ecs_member_t field {i}"
-            );
+            assert_eq!(*off, unsafe { glue_member_offset(i as i32) }, "ecs_member_t field {i}");
         }
     }
 }

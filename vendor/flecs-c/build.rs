@@ -34,10 +34,7 @@ fn main() {
     // repo's pin (vendor/flecs/distr), or, vendored into a host's tree, the host's amalgamation.
     let host = env::var_os("CARGO_FEATURE_HOST").is_some();
     let candidates: &[&str] = if host {
-        &[
-            "../../../flecs_ecs_sys/src",
-            "../../vendor/flecs_ecs_sys/src",
-        ]
+        &["../../../flecs_ecs_sys/src", "../../vendor/flecs_ecs_sys/src"]
     } else {
         // blaze: the amalgamation is the crate's own (SOURCE.md).
         &["flecs"]
@@ -103,10 +100,7 @@ fn main() {
         .warnings(false)
         .flag("-std=gnu99")
         .flag("-ffp-contract=off")
-        .flag_if_supported(format!(
-            "-ffile-prefix-map={}=.",
-            root.join("../..").display()
-        ));
+        .flag_if_supported(format!("-ffile-prefix-map={}=.", root.join("../..").display()));
     if rest {
         b.define("FLECS_REST", None).define("GLUE_REST", None);
     }
@@ -120,12 +114,9 @@ fn main() {
         b.flag_if_supported("-fno-sanitize=undefined");
     }
     b.compile("flecs");
-    for p in [
-        flecs.join("flecs.c"),
-        flecs.join("flecs.h"),
-        root.join("csrc"),
-        root.join("wasm-libc"),
-    ] {
+    for p in
+        [flecs.join("flecs.c"), flecs.join("flecs.h"), root.join("csrc"), root.join("wasm-libc")]
+    {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-env-changed=CC_wasm32_unknown_unknown");

@@ -70,9 +70,13 @@ impl Refused {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Route {
     Asset(&'static str, &'static [u8]),
-    Websocket { accept: String },
+    Websocket {
+        accept: String,
+    },
     /// Flecs's REST over the world, at `path` (with its query) of it.
-    Flecs { path: String },
+    Flecs {
+        path: String,
+    },
 }
 
 impl Site {
@@ -158,9 +162,12 @@ impl Site {
                 };
                 respond(stream, status, &answer.kind, &answer.body)
             }
-            Err(why) => {
-                respond(stream, "500 Internal Server Error", "text/plain; charset=utf-8", why.as_bytes())
-            }
+            Err(why) => respond(
+                stream,
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                why.as_bytes(),
+            ),
         }
     }
 

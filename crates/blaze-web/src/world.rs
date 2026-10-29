@@ -136,8 +136,12 @@ impl World {
                 return Err("Flecs made no world".into());
             }
             let code = CString::new(KINDS).map_err(|e| e.to_string())?;
-            if ecs::ecs_script_run(world, c"blaze-web".as_ptr(), code.as_ptr(), std::ptr::null_mut())
-                != 0
+            if ecs::ecs_script_run(
+                world,
+                c"blaze-web".as_ptr(),
+                code.as_ptr(),
+                std::ptr::null_mut(),
+            ) != 0
             {
                 ecs::ecs_fini(world);
                 return Err("Flecs did not take the build page's kinds".into());
@@ -399,10 +403,14 @@ impl World {
             program.edges += 1;
             changed.push(from);
             let (from, to) = (&program.nodes[from as usize], &program.nodes[to as usize]);
-            let crates = (program.crates_of[from.krate as usize], program.crates_of[to.krate as usize]);
+            let crates =
+                (program.crates_of[from.krate as usize], program.crates_of[to.krate as usize]);
             // A function at its crate's root is in no module: its calls are its crate's alone.
             let in_modules = from.module != crates.0 && to.module != crates.1;
-            if in_modules && from.module != to.module && program.calls.insert((from.module, to.module)) {
+            if in_modules
+                && from.module != to.module
+                && program.calls.insert((from.module, to.module))
+            {
                 program.module_calls.entry(from.module).or_default().push(to.module);
                 changed_modules.push(from.module);
             }
@@ -414,8 +422,10 @@ impl World {
         changed.sort_unstable();
         changed.dedup();
         for at in changed {
-            let callees: Vec<Entity> =
-                program.out[at as usize].iter().map(|&to| program.nodes[to as usize].entity).collect();
+            let callees: Vec<Entity> = program.out[at as usize]
+                .iter()
+                .map(|&to| program.nodes[to as usize].entity)
+                .collect();
             self.set_callees(program.nodes[at as usize].entity, callees);
         }
         changed_modules.sort_unstable();
@@ -448,7 +458,13 @@ impl World {
     }
 
     /// The module a function is in ([`module_path`]), under its crate, from the crate's name on.
-    fn module_of(&mut self, program: &mut Program, mut at: Entity, krate: &str, name: &str) -> Entity {
+    fn module_of(
+        &mut self,
+        program: &mut Program,
+        mut at: Entity,
+        krate: &str,
+        name: &str,
+    ) -> Entity {
         let mut segments = module_path(name);
         if segments.first() == Some(&krate) {
             segments.remove(0);
@@ -636,7 +652,8 @@ fn type_path(ty: &str) -> Vec<&str> {
             None => Vec::new(),
         };
     }
-    let fn_pointer = ty.starts_with("fn(") || ty.starts_with("unsafe ") || ty.starts_with("extern ");
+    let fn_pointer =
+        ty.starts_with("fn(") || ty.starts_with("unsafe ") || ty.starts_with("extern ");
     if fn_pointer || !ty.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
         return Vec::new();
     }

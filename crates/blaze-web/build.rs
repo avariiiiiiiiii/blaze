@@ -16,7 +16,10 @@ fn main() {
     for file in &files {
         let name = file.strip_prefix(&root).expect("under assets/").to_str().expect("UTF-8");
         let name = name.replace('\\', "/");
-        out.push_str(&format!("    ({name:?}, include_bytes!({:?})),\n", file.display().to_string()));
+        out.push_str(&format!(
+            "    ({name:?}, include_bytes!({:?})),\n",
+            file.display().to_string()
+        ));
     }
     out.push_str("];\n");
     let at = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("assets.rs");

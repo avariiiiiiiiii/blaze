@@ -707,7 +707,8 @@ impl Driver for Uring {
                 continue;
             }
             self.in_flight += 1;
-            let at = |file: &FileName| self.root.join(file.as_str());
+            let root = self.root.clone();
+            let at = |file: &FileName| root.join(file.as_str());
             let started = match effect {
                 Effect::Write { file, bytes, .. } => {
                     let path = at(&file);

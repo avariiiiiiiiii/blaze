@@ -229,3 +229,17 @@ small integers over `u32` indices, laid out the same in memory and on disk (sect
 
 `proof-perf` reports bytes per token, node, expression, statement and memo, memory per
 thousand lines, and cache misses per edit (`perf stat`), against these budgets.
+
+**Compression follows the columns** (format, store). Columns of one type compress far better
+than rows, and zero-copy holds by tier:
+- **hot**: plain fixed-width columns, mapped and used in place, each at the narrowest width
+  its range allows (`u8`, `u16` or `u32`, recorded in the schema);
+- **warm**: bit-packed with a frame of reference (each value as its offset from the column's
+  minimum, in as many bits as the range needs), still random-access (element *i* is a shift and
+  a mask) and unpacked 128 or more at a time with SIMD, so it is read in place too;
+- **cold**: a codec per column: run-length or entropy coding for tag columns, delta plus
+  bit-packing for sorted and monotonic columns (CSR offsets, sorted relocations and facts, the
+  store's keys), dictionaries for repeated values, then zstd with a dictionary per kind;
+  decoded when the page is read in.
+The store picks the tier by how recently a record was read, and moves records between tiers
+in the background. Every encoding round-trips exactly, which the proof checks.

@@ -36,6 +36,7 @@ include = [
   "harness/own_inputs.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
+  "harness/v2",
   "python/**/*.py",
 ]
 
@@ -46,6 +47,7 @@ include = [
 "harness/fuzz/edits.py" = ["E402"]
 "harness/includes.py" = ["E402"]
 "harness/keys.py" = ["E402"]
+"harness/v2/*.py" = ["E402"]
 
 [tool.pyright]
 include = [
@@ -61,6 +63,7 @@ include = [
   "harness/own_inputs.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
+  "harness/v2",
   "python",
 ]
 pythonVersion = "3.13"

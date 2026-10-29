@@ -38,6 +38,7 @@ pub mod db;
 pub mod drop;
 pub mod dyn_compatibility;
 pub mod effects;
+pub mod evict;
 pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;

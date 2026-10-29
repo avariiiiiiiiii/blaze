@@ -36,10 +36,16 @@ reference, into `target-ref` (engine.reference_env). Each (project, step) is one
            (blaze_cli.program_output); every test's outcome and the totals (blaze_cli.test_results)
     fail   they differ, one side's build fails and the other's does not, or the engine says the
            step was not blaze's (`not_blazes`)
-    error  the harness could not say: a fetch or a checksum failed, a command timed out, or the
-           reference did not get far enough to compare with (cargo's build or test build fails)
+    error  the harness could not say: a fetch or a checksum failed, a command timed out, the
+           engine lacks an interface it needs (`engine.Missing`), or the reference did not get
+           far enough to compare with (cargo's build or test build fails)
+    unmeasured
+           the engine has no answer to a step (`engine.Unmeasurable`)
 
-A project stops at a build step that does not pass. `selftest` runs the checks of the parts that
+A project stops at a build step that does not pass. Each project's dependencies resolve once,
+by `cargo fetch`, into the one `Cargo.lock` both sides build with; the result's
+`extra.locks` names its sha256 per project, so two runs that resolved differently show it.
+`selftest` runs the checks of the parts that
 need neither blaze nor the network.
 """
 
@@ -376,10 +382,10 @@ def run_program(eng: engine.Engine, program: Program, root: Path, store: Path,
             found.append(done)
             if step.command == "build" and done.verdict != "pass":
                 break
+    except engine.Unmeasurable as e:
+        found.append(Found(f"{program.name}: {doing}", "unmeasured", str(e)))
     except engine.Failed as e:
         found.append(Found(f"{program.name}: {doing}", "error", str(e)))
-    except NotImplementedError as e:
-        found.append(Found(f"{program.name}: {doing}", "error", f"not implemented: {e}"))
     except OSError as e:
         found.append(Found(f"{program.name}: {doing}", "error", f"{type(e).__name__}: {e}"))
     finally:

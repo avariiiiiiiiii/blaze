@@ -1,5 +1,5 @@
 """tightmemory.py: a cold build under a tight memory budget finishes, slower, or refuses saying what
-it needed; the kernel never kills it (docs/v2.md sections 4 and 11, docs/memory-budget.md).
+it needed; the kernel never kills it (docs/v2/core.md section 4, docs/v2/proof.md, docs/memory-budget.md).
 Linux, cgroup v2.
 
     uv run --frozen python harness/v2/tightmemory.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/tight.json"}'

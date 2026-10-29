@@ -77,6 +77,10 @@ impl fmt::Debug for TestDB {
 
 #[salsa::db]
 impl SourceDatabase for TestDB {
+    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
+        Box::new(self.clone())
+    }
+
     fn file_text(&self, file_id: base_db::FileId) -> FileText {
         self.files.file_text(file_id)
     }

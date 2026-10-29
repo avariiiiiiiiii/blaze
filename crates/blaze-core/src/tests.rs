@@ -69,6 +69,12 @@ fn every_driver_ends_the_script_the_same() {
     let root = dir("threads");
     let threads = script(&mut Threads::new(&root, 2));
     assert_eq!(simulated, threads);
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("kqueue");
+        let kqueue = script(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
+        assert_eq!(simulated, kqueue);
+    }
     assert_eq!(simulated[&5], format!("{:?}", Done::Read(b"again".to_vec())));
     assert_eq!(simulated[&13], format!("{:?}", Done::Read(b"again+".to_vec())));
     assert_eq!(simulated[&8], format!("{:?}", Done::Stat(None)));

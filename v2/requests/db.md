@@ -36,3 +36,6 @@ shares them (not `&mut Vfs`) can answer both. Wire it in `Database::new(Config {
   whenever the daemon holds the database alone.
 - Call `collect(kept, effects)` between requests with the roots to keep (the last build of each
   head), which also moves cold values to disk.
+
+---
+Routed or applied by the coordinator, 16:54.

@@ -64,3 +64,6 @@
   `docs/v2/proof.md` can link it.
 - Where: `docs/harness.md`, `docs/v2/proof.md` (coordinator).
 - Why: docs-say-what-they-are; the harnesses are otherwise undocumented.
+
+---
+Routed or applied by the coordinator, 16:54.

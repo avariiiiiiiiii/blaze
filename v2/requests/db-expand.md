@@ -19,3 +19,6 @@ Where: `crates/ide-db/src/lib.rs` (`impl SourceDatabase for RootDatabase`, coord
 
 Why: the def-map collector expands each round's macros in parallel (docs/v2/db.md, "Parallel
 macro expansion"); each worker thread reads through its own fork.
+
+---
+Routed or applied by the coordinator, 16:54.

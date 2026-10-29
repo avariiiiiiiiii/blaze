@@ -190,6 +190,10 @@ impl RootDatabase {
 
 #[salsa::db]
 impl SourceDatabase for RootDatabase {
+    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
+        Box::new(self.clone())
+    }
+
     fn file_text(&self, file_id: vfs::FileId) -> FileText {
         self.files.file_text(file_id)
     }

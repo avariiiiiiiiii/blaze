@@ -90,12 +90,48 @@ pub struct BorrowckDiagnostic {
     pub at_signature: bool,
 }
 
+impl BorrowckDiagnostic {
+    /// An error, which keeps the body out of any build (cargo's rule), not a lint.
+    pub fn is_error(&self) -> bool {
+        self.code.starts_with('E')
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
 pub struct BorrowckResult {
     pub diagnostics: Vec<BorrowckDiagnostic>,
     /// Why the body, or a closure in it, was not checked: MIR lowering does not support
     /// something in it.
     pub skipped: Option<String>,
+    /// Why the checker stopped before it checked the body, as rustc does: an error found before
+    /// borrow checking, which keeps the body out of a build as a borrow check error would.
+    pub not_checked: Option<NotChecked>,
+}
+
+/// Why a body was not borrow checked, by the error rustc reports before borrow checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub enum NotChecked {
+    /// `BLAZE_BORROWCK=off`.
+    Off,
+    /// Type checking found an error in it.
+    TypeErrors,
+    /// Lowering found an error in it (a cast that is not one, `..base` in a destructuring
+    /// assignment).
+    LoweringErrors,
+    /// A `static` of a type that is not `Sized`: rustc's E0277.
+    UnsizedStatic,
+    /// A const context drops a value of a type with drop glue: rustc's E0493.
+    DropInConst,
+    /// A where clause of a call does not hold: rustc's E0277, which type checking did not
+    /// report.
+    Unproven,
+}
+
+impl NotChecked {
+    /// Whether the body may still go into a build: only when borrow checking is turned off.
+    pub fn refuses(self) -> bool {
+        self != NotChecked::Off
+    }
 }
 
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
@@ -108,11 +144,13 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
 pub fn borrowck_in_mode(db: &dyn HirDatabase, def: DefWithBodyId, mode: Mode) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
+        result.not_checked = Some(NotChecked::Off);
         return result;
     }
     let owner = InferBodyId::DefWithBodyId(def);
     let infer = InferenceResult::of(db, owner);
     if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
+        result.not_checked = Some(NotChecked::TypeErrors);
         return result;
     }
     // rustc borrow checks no body its lowering or type check found an error in, which an
@@ -123,6 +161,7 @@ pub fn borrowck_in_mode(db: &dyn HirDatabase, def: DefWithBodyId, mode: Mode) ->
     if source_map.diagnostics().iter().any(|it| {
         !matches!(it, hir_def::expr_store::ExpressionStoreDiagnostics::InactiveCode { .. })
     }) {
+        result.not_checked = Some(NotChecked::LoweringErrors);
         return result;
     }
     // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
@@ -138,6 +177,7 @@ pub fn borrowck_in_mode(db: &dyn HirDatabase, def: DefWithBodyId, mode: Mode) ->
             )
         }
     {
+        result.not_checked = Some(NotChecked::UnsizedStatic);
         return result;
     }
     check_owner(db, owner, Some(def), mode)
@@ -150,13 +190,16 @@ pub fn borrowck_anon_const<'db>(
     db: &'db dyn HirDatabase,
     konst: hir_ty::db::AnonConstId<'db>,
 ) -> BorrowckResult {
-    if mode() == Mode::Off || konst.is_inline_const(db) {
+    if konst.is_inline_const(db) {
         return BorrowckResult::default();
+    }
+    if mode() == Mode::Off {
+        return BorrowckResult { not_checked: Some(NotChecked::Off), ..Default::default() };
     }
     let owner = InferBodyId::AnonConstId(konst);
     let infer = InferenceResult::of(db, owner);
     if infer.has_type_mismatches() || infer.is_erroneous() {
-        return BorrowckResult::default();
+        return BorrowckResult { not_checked: Some(NotChecked::TypeErrors), ..Default::default() };
     }
     check_owner(db, owner, None, mode())
 }
@@ -246,6 +289,7 @@ fn check_owner<'db>(
         });
         ctx.inline_const = inline_const.is_some();
         if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
+            result.not_checked = Some(NotChecked::DropInConst);
             return result;
         }
         let mut found = Vec::new();
@@ -253,6 +297,7 @@ fn check_owner<'db>(
         let (count, needs, used_mut_upvars) =
             check::check(&ctx, body, &requirements, &mut_upvars, &mut found, &mut moved);
         if ctx.tainted.get() {
+            result.not_checked = Some(NotChecked::Unproven);
             return result;
         }
         let this = diagnostics.len();

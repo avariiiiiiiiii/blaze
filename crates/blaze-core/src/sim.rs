@@ -831,4 +831,173 @@ mod tests {
         assert!(!sim.exists(&name("target/a")));
         assert_eq!(sim.contents(&name("target/b")), b"code");
     }
+
+    fn command(program: &str, memory: Option<u64>) -> Box<Command> {
+        Box::new(Command {
+            program: program.into(),
+            args: vec!["x".into()],
+            env: Vec::new(),
+            dir: "/".into(),
+            stdin: b"input".to_vec(),
+            sandbox: crate::Sandbox::On {
+                read: Vec::new(),
+                write: Vec::new(),
+                network: false,
+                trace: true,
+            },
+            memory,
+        })
+    }
+
+    fn echo(sim: &mut Sim) {
+        sim.program("/bin/echo", |command: &Command, rng: &mut Rng| Ran {
+            exit: Exit {
+                code: Some(0),
+                signal: None,
+                stdout: command.stdin.clone(),
+                stderr: Vec::new(),
+                traced: Some(crate::Traced::default()),
+                peak_memory: 1000 + rng.below(1000),
+            },
+            takes: Duration::from_millis(5),
+        });
+    }
+
+    #[test]
+    fn a_spawn_ends_as_its_program_says_or_is_killed() {
+        for seed in 0..300 {
+            let mut sim = Sim::new(seed, Faults::default());
+            echo(&mut sim);
+            let mut effects = vec![
+                Effect::Spawn { command: command("/bin/echo", None), tag: Tag(1) },
+                Effect::Spawn { command: command("/bin/echo", Some(500)), tag: Tag(2) },
+                Effect::Spawn { command: command("/bin/missing", None), tag: Tag(3) },
+                Effect::Spawn { command: command("/bin/echo", None), tag: Tag(4) },
+                Effect::Kill { tag: Tag(4) },
+                Effect::Kill { tag: Tag(99) },
+            ];
+            let mut seen = BTreeMap::new();
+            run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+            assert_eq!(sim.in_flight(), 0);
+            let Done::Exited(echoed) = &seen[&Tag(1)] else { panic!("seed {seed}: {seen:?}") };
+            assert_eq!((echoed.code, echoed.stdout.as_slice()), (Some(0), &b"input"[..]));
+            assert!(echoed.traced.is_some());
+            let Done::Exited(over) = &seen[&Tag(2)] else { panic!("seed {seed}: {seen:?}") };
+            assert_eq!((over.code, over.signal, over.peak_memory), (None, Some(KILLED), 500));
+            assert!(matches!(&seen[&Tag(3)], Done::Failed(why) if why.0.contains("no such")));
+            let Done::Exited(killed) = &seen[&Tag(4)] else { panic!("seed {seed}: {seen:?}") };
+            assert_eq!(killed.signal, Some(KILLED));
+            assert!(!seen.contains_key(&Tag(99)));
+        }
+    }
+
+    #[test]
+    fn a_kill_comes_before_the_end_it_cuts_short() {
+        let mut sim = Sim::new(5, Faults::default());
+        echo(&mut sim);
+        sim.submit(&mut vec![Effect::Spawn { command: command("/bin/echo", None), tag: Tag(1) }]);
+        sim.submit(&mut vec![Effect::Kill { tag: Tag(1) }]);
+        let mut out = Vec::new();
+        sim.poll(&mut out, Duration::ZERO);
+        assert!(sim.now() < Duration::from_millis(5), "{:?}", sim.now());
+        assert!(matches!(&out[..], [Completion { done: Done::Exited(it), .. }] if it.signal == Some(KILLED)));
+    }
+
+    /// A client and a server in one simulation, and a peer from outside, trade bytes and hang
+    /// up; every receive ends, with bytes or with nothing once the other end hung up.
+    #[test]
+    fn sockets_carry_bytes_and_hang_ups_on_every_seed() {
+        let at = Address::Unix(name("daemon.sock"));
+        for seed in 0..500 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let mut effects = vec![Effect::Listen { at: at.clone(), tag: Tag(1) }];
+            sim.submit(&mut effects);
+            effects.push(Effect::Connect { at: at.clone(), tag: Tag(2) });
+            let outside = sim.dial(&at).unwrap();
+            sim.peer_send(outside, b"from outside");
+            let mut client = None;
+            // What each server end received, and whether it has heard the hang-up.
+            let mut heard: BTreeMap<Conn, (Vec<u8>, bool)> = BTreeMap::new();
+            let mut receiving: BTreeMap<Tag, Conn> = BTreeMap::new();
+            let (mut next, mut outside_hung_up, mut unlistened) = (100, false, false);
+            let mut out = Vec::new();
+            while !effects.is_empty() || sim.in_flight() > 0 {
+                sim.submit(&mut effects);
+                sim.poll(&mut out, Duration::ZERO);
+                for done in out.drain(..) {
+                    next += 1;
+                    match done.done {
+                        Done::Accepted { conn } => {
+                            heard.insert(conn, (Vec::new(), false));
+                            receiving.insert(Tag(next), conn);
+                            effects.push(Effect::Recv { conn, most: 4, tag: Tag(next) });
+                            if conn == outside {
+                                let bytes = b"reply".to_vec();
+                                effects.push(Effect::Send { conn, bytes, tag: Tag(5) });
+                            }
+                        }
+                        Done::Connected { conn } => {
+                            client = Some(conn);
+                            let bytes = b"hello".to_vec();
+                            effects.push(Effect::Send { conn, bytes, tag: Tag(3) });
+                        }
+                        Done::Sent if done.tag == Tag(3) => {
+                            let conn = client.expect("connected");
+                            effects.push(Effect::Hangup { conn, tag: Tag(4) });
+                        }
+                        Done::Read(bytes) => {
+                            let conn = receiving.remove(&done.tag).expect("a receive's");
+                            let (got, ended) = heard.get_mut(&conn).expect("accepted");
+                            match bytes.is_empty() {
+                                true => *ended = true,
+                                false => {
+                                    assert!(bytes.len() <= 4, "seed {seed}");
+                                    got.extend(bytes);
+                                    receiving.insert(Tag(next), conn);
+                                    effects.push(Effect::Recv { conn, most: 4, tag: Tag(next) });
+                                }
+                            }
+                        }
+                        Done::Unlistened => unlistened = true,
+                        Done::Sent | Done::HungUp => {}
+                        other => panic!("seed {seed}: {other:?}"),
+                    }
+                }
+                if !outside_hung_up && heard.get(&outside).is_some_and(|it| it.0.len() == 12) {
+                    outside_hung_up = true;
+                    sim.peer_hangup(outside);
+                }
+                if heard.len() == 2 && heard.values().all(|it| it.1) && !unlistened {
+                    unlistened = true;
+                    effects.push(Effect::Unlisten { tag: Tag(1) });
+                }
+            }
+            assert_eq!(heard[&outside].0, b"from outside", "seed {seed}");
+            let inside = heard.keys().find(|&&it| it != outside).expect("the client's end");
+            assert_eq!(heard[inside].0, b"hello", "seed {seed}");
+            assert_eq!(sim.peer_received(outside), b"reply", "seed {seed}");
+            assert_eq!(sim.in_flight(), 0, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_connect_to_nothing_and_a_second_listen_fail() {
+        let mut sim = Sim::new(2, Faults::default());
+        let at = Address::Tcp("127.0.0.1:8080".parse().unwrap());
+        let mut effects = vec![
+            Effect::Connect { at: at.clone(), tag: Tag(1) },
+            Effect::Listen { at: at.clone(), tag: Tag(2) },
+        ];
+        sim.submit(&mut effects);
+        effects.push(Effect::Listen { at: at.clone(), tag: Tag(3) });
+        effects.push(Effect::Unlisten { tag: Tag(2) });
+        effects.push(Effect::Unlisten { tag: Tag(4) });
+        let mut seen = BTreeMap::new();
+        run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+        assert!(matches!(&seen[&Tag(1)], Done::Failed(why) if why.0.contains("refused")));
+        assert_eq!(seen[&Tag(2)], Done::Unlistened);
+        assert!(matches!(&seen[&Tag(3)], Done::Failed(_)));
+        assert!(matches!(&seen[&Tag(4)], Done::Failed(_)));
+        assert!(sim.dial(&at).is_err());
+    }
 }

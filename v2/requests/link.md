@@ -110,6 +110,9 @@ write. `Image::new(to)` has no target: a default (the host) would be a silent de
     /// a `Target::Function`, `Target::Direct` or `Target::Static`.
     pub names: Vec<(String, Target)>,
     pub unnamed: Vec<String>,
+    /// The symbol name a backtrace and a debugger show for a function (its v0 mangled name,
+    /// as rustc's symbol table has it); one with none shows as its address.
+    pub debug_names: Vec<(InstanceKey, String)>,
     /// C objects, archives and shared libraries, in link-line order (`Native::order`).
     pub natives: Vec<Native<'a>>,
     pub removed_natives: Vec<ContentId>,
@@ -118,7 +121,15 @@ write. `Image::new(to)` has no target: a default (the host) would be a silent de
 `Image::new` becomes `pub fn new(to: FileName, output: Output) -> Image`.
 
 `crates/blaze-link/Cargo.toml` gains `blaze-items.workspace = true` (for `ItemKey`) and
-`blaze-format.workspace = true` (for `SpanRef`), both in the workspace already.
+`blaze-format.workspace = true` (for `SpanRef`), both in the workspace already; that file is
+mine and already says so.
+
+The span side tables of `Change::spans` are bytes in the format `blaze_link::SpanTable`
+defines (`SpanTable::encode`, a new public item of blaze-link): per anchor, the file name as
+the program observes it (`file!()`, `Location::file`) and each span's line and column. The
+format lane owns spans; when it has its own side-table type, the link reads that instead and
+`SpanTable` goes. Until then whoever fills `Change::spans` (the coordinator's wiring) encodes
+with `SpanTable`.
 
 ## 3. `blaze-core`: write at an offset, rename, file mode
 
@@ -160,3 +171,6 @@ Mach-O, COFF, wasm), never writes one; `gimli` writes the DWARF of the debug sid
 `blaze-live` is the runtime a live program links; blaze-link writes the patches it reads, in
 the format `blaze_live::patch` defines. `crates/blaze-link/Cargo.toml` uses all three with
 `workspace = true`.
+
+---
+Routed or applied by the coordinator, 16:54.

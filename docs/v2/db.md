@@ -49,3 +49,11 @@ Part of the [v2 plan](README.md). Section numbers refer to the plan as first wri
   result, patching before checks finish with rollback. Views (section 2) make it nearly free.
   **#1302** lazy borrow checking is allowed only on this live-patch path, never for a build's
   output (cargo's rule: a borrowck error means no binary). (`v2-db`, `v2-link`)
+
+## One database, shared by every thread
+
+The database is `Sync`: every worker reads it through `&Database`, and nothing clones a handle
+per thread. salsa's `Storage` is `!Sync`, so v1 gives each thread its own handle (a clone that
+shares the memo tables and counts clones, so a write waits for every clone to drop). v2 has no
+handles. All parallel work, macro expansion rounds included, runs as plane tasks on the one
+worker pool (`docs/v2/core.md`), never on threads spawned by a query.

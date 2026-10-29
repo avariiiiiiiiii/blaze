@@ -52,7 +52,11 @@ what and where); an IDE. The only interface is the agent API (CBOR over a socket
 shaped for LLMs; the IDE crates (`ide-db`, `hir-ide`, `ide-diagnostics` and the rest) are not
 a constraint, and what the compiler needs from them (diagnostics) moves into the compiler.
 
-**Everything is ours.** Any dependency v2 needs to change is in the workspace and changed in
+**Everything is ours, at every level, for the best performance possible.** Nothing is fixed:
+not a crate, an interface, a data structure, a vendored dependency (salsa, cranelift, LLVM's
+bindings, the trait solver, std's build), the toolchain, the kernel interfaces we use, the
+file formats, the CI or the machines. If changing it makes blaze faster and keeps Rust's
+semantics, change it. Any dependency v2 needs to change is in the workspace and changed in
 place: salsa (`vendor/salsa`), cranelift, llvm-sys, `rustc_type_ir` and the trait solver are
 already there; anything else is vendored the moment it's in the way.
 

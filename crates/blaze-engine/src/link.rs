@@ -572,9 +572,14 @@ fn raw_dylib_file(lib: &NativeLib) -> String {
     if lib.verbatim { name.to_owned() } else { format!("{name}.dll") }
 }
 
-/// `dll` without its extension: `SHELL32.DLL` is `SHELL32`.
+/// `dll` without its `.dll`: `SHELL32.DLL` is `SHELL32`. Any other suffix stays, since `+verbatim`
+/// may name `plugin.debug` and `plugin.release` as two DLLs, and each needs an import library of
+/// its own.
 fn dll_stem(dll: &str) -> &str {
-    dll.rsplit_once('.').map_or(dll, |(stem, _)| stem)
+    match dll.len().checked_sub(".dll".len()).and_then(|at| dll.split_at_checked(at)) {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case(".dll") => stem,
+        _ => dll,
+    }
 }
 
 /// The import library of `dll`, the system's or the one made of the names imported.
@@ -985,6 +990,9 @@ mod tests {
         assert_eq!(raw_dylib_file(&lib("foo.bar", false)), "foo.bar.dll");
         assert_eq!(import_library("SHELL32.DLL"), "SHELL32.lib");
         assert_eq!(import_library("foo.bar.dll"), "foo.bar.lib");
+        // A `+verbatim` suffix other than `.dll` is part of the name, so two DLLs do not share one.
+        assert_eq!(import_library("plugin.debug"), "plugin.debug.lib");
+        assert_eq!(import_library("plugin.release"), "plugin.release.lib");
     }
 
     #[test]

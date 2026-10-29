@@ -164,6 +164,11 @@ blake3 = { version = "1.8", default-features = false, features = ["std"] }
 cargo_metadata = "0.23.1"
 camino = "1.2.2"
 crossbeam-channel = "0.5.15"
+crossbeam-deque = "0.8.6"
+base64 = "0.23"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 either = "1.15.0"
 expect-test = "1.5.1"
 indexmap = { version = "2.9.0", features = ["serde"] }

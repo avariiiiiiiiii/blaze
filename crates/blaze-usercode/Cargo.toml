@@ -14,11 +14,18 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blake3.workspace = true
+blaze-build-script.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

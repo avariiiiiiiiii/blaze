@@ -1,0 +1,180 @@
+//! Content IDs of what codegen makes: a data object's (what [`Target::Data`] names, so equal
+//! bytes are one object) and a compiled function's code (what code dedupe compares).
+
+use blaze_format::SpanRef;
+use blaze_ids::{ContentId, Hasher};
+
+use crate::{Arch, CompiledFunction, Data, Reloc, RelocKind, Target};
+
+pub const DATA_DOMAIN: &str = "blaze v2 data 1";
+pub const CODE_DOMAIN: &str = "blaze v2 code 1";
+
+/// The content ID of a read-only data object: its alignment, bytes and relocations. Two
+/// objects with one ID are one object.
+pub fn data_id(align: u32, bytes: &[u8], relocs: &[Reloc]) -> ContentId {
+    let mut hasher = Hasher::new(DATA_DOMAIN);
+    hasher.update(&align.to_le_bytes()).part(bytes);
+    relocs_into(&mut hasher, relocs);
+    hasher.finish()
+}
+
+impl Data {
+    /// A data object, its ID made from what it is.
+    pub fn new(align: u32, bytes: Vec<u8>, relocs: Vec<Reloc>) -> Data {
+        Data { id: data_id(align, &bytes, &relocs), align, bytes, relocs }
+    }
+}
+
+/// The content ID of what a compiled function does: its architecture, alignment, bytes,
+/// relocations and data. Not its key, what it inlined or its side table: two functions with
+/// one code ID run the same instructions against the same addresses.
+pub fn code_id(function: &CompiledFunction) -> ContentId {
+    let mut hasher = Hasher::new(CODE_DOMAIN);
+    hasher.update(&[arch_tag(function.arch)]);
+    hasher.update(&function.align.to_le_bytes()).part(&function.code);
+    relocs_into(&mut hasher, &function.relocs);
+    hasher.update(&(function.data.len() as u64).to_le_bytes());
+    for data in &function.data {
+        hasher.id(&data.id);
+    }
+    hasher.finish()
+}
+
+pub(crate) fn relocs_into(hasher: &mut Hasher, relocs: &[Reloc]) {
+    hasher.update(&(relocs.len() as u64).to_le_bytes());
+    for reloc in relocs {
+        hasher.update(&reloc.at.to_le_bytes());
+        hasher.update(&[kind_tag(reloc.kind)]);
+        hasher.update(&reloc.addend.to_le_bytes());
+        target_into(hasher, &reloc.target);
+    }
+}
+
+pub(crate) fn target_into(hasher: &mut Hasher, target: &Target) {
+    match target {
+        Target::Function(key) => hasher.update(&[0]).id(&key.0),
+        Target::Direct(key) => hasher.update(&[1]).id(&key.0),
+        Target::Static { item, instance } => hasher.update(&[2]).id(&item.0).id(instance),
+        Target::Data(id) => hasher.update(&[3]).id(id),
+        Target::Extern(name) => hasher.update(&[4]).part(name.as_bytes()),
+        Target::Position(SpanRef { anchor, index }) => {
+            hasher.update(&[5]).id(anchor).update(&index.to_le_bytes())
+        }
+    };
+}
+
+pub const TARGET_DOMAIN: &str = "blaze v2 target 1";
+
+/// A relocation target's content ID, to set targets apart without comparing them.
+pub fn target_id(target: &Target) -> ContentId {
+    let mut hasher = Hasher::new(TARGET_DOMAIN);
+    target_into(&mut hasher, target);
+    hasher.finish()
+}
+
+pub(crate) fn arch_tag(arch: Arch) -> u8 {
+    match arch {
+        Arch::X86_64 => 0,
+        Arch::Aarch64 => 1,
+        Arch::Wasm32 => 2,
+    }
+}
+
+pub(crate) fn arch_of(tag: u8) -> Option<Arch> {
+    Some(match tag {
+        0 => Arch::X86_64,
+        1 => Arch::Aarch64,
+        2 => Arch::Wasm32,
+        _ => return None,
+    })
+}
+
+const KINDS: [RelocKind; 12] = [
+    RelocKind::Abs64,
+    RelocKind::PcRel32,
+    RelocKind::GotPcRel32,
+    RelocKind::Call26,
+    RelocKind::AdrpPage21,
+    RelocKind::PageOffset12,
+    RelocKind::GotPage21,
+    RelocKind::GotPageOffset12,
+    RelocKind::TlsOffset,
+    RelocKind::WasmFunction,
+    RelocKind::WasmTable,
+    RelocKind::WasmMemory,
+];
+
+pub(crate) fn kind_tag(kind: RelocKind) -> u8 {
+    match kind {
+        RelocKind::Abs64 => 0,
+        RelocKind::PcRel32 => 1,
+        RelocKind::GotPcRel32 => 2,
+        RelocKind::Call26 => 3,
+        RelocKind::AdrpPage21 => 4,
+        RelocKind::PageOffset12 => 5,
+        RelocKind::GotPage21 => 6,
+        RelocKind::GotPageOffset12 => 7,
+        RelocKind::TlsOffset => 8,
+        RelocKind::WasmFunction => 9,
+        RelocKind::WasmTable => 10,
+        RelocKind::WasmMemory => 11,
+    }
+}
+
+pub(crate) fn kind_of(tag: u8) -> Option<RelocKind> {
+    KINDS.get(tag as usize).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InstanceKey;
+
+    fn function(code: &[u8], relocs: Vec<Reloc>) -> CompiledFunction {
+        CompiledFunction {
+            key: InstanceKey(ContentId([7; 32])),
+            arch: Arch::X86_64,
+            align: 16,
+            code: code.to_vec(),
+            relocs,
+            data: Vec::new(),
+            inlined: Vec::new(),
+            side: None,
+        }
+    }
+
+    #[test]
+    fn every_kind_has_its_own_tag() {
+        for tag in 0..12 {
+            assert_eq!(kind_tag(kind_of(tag).unwrap()), tag);
+        }
+        assert_eq!(kind_of(12), None);
+    }
+
+    #[test]
+    fn the_key_is_not_the_code() {
+        let a = function(&[0xc3], Vec::new());
+        let mut b = a.clone();
+        b.key = InstanceKey(ContentId([8; 32]));
+        assert_eq!(code_id(&a), code_id(&b));
+    }
+
+    #[test]
+    fn a_relocation_target_is_the_code() {
+        let reloc = |n| Reloc {
+            at: 1,
+            kind: RelocKind::PcRel32,
+            target: Target::Function(InstanceKey(ContentId([n; 32]))),
+            addend: -4,
+        };
+        let a = function(&[0xe8, 0, 0, 0, 0], vec![reloc(1)]);
+        let b = function(&[0xe8, 0, 0, 0, 0], vec![reloc(2)]);
+        assert_ne!(code_id(&a), code_id(&b));
+    }
+
+    #[test]
+    fn data_ids_frame_their_parts() {
+        assert_ne!(data_id(1, b"ab", &[]), data_id(2, b"ab", &[]));
+        assert_ne!(data_id(1, b"ab", &[]), data_id(1, b"abc", &[]));
+    }
+}

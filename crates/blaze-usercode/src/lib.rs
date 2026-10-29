@@ -7,9 +7,31 @@
 //! - The daemon hashes and checks every output before the store keeps it.
 //! - Tests: each test's reached functions are recorded by code hash ([`Reached`]); an edit
 //!   reruns the tests that reach a changed hash.
+//!
+//! The parts: [`trace`] turns what a sandbox saw into a [`Traced`]; [`index`] finds a run's
+//! result in the store by the shape of what it read and then by those inputs' values now;
+//! [`inputs`] has what reads are checked against (a view and the machine); [`rule`] is cargo's
+//! rule for what can't be traced; [`run`] is a run as a state machine, from the store or a
+//! sandboxed spawn to a kept result; [`script`] and [`pool`] are build scripts and the warm
+//! processes proc macros run in; [`test`] selects and runs tests (docs/v2/usercode-notes.md).
+
+pub mod confine;
+pub mod index;
+pub mod inputs;
+pub mod pool;
+pub mod rule;
+pub mod run;
+pub mod script;
+pub mod test;
+pub mod trace;
+
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+};
 
 use blaze_core::Traced;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +41,16 @@ pub enum RunKind {
     BuildScript,
     ProcMacro,
     Test,
+}
+
+impl RunKind {
+    fn byte(self) -> u8 {
+        match self {
+            RunKind::BuildScript => 0,
+            RunKind::ProcMacro => 1,
+            RunKind::Test => 2,
+        }
+    }
 }
 
 /// The key a run's result is first looked up by: its code and what it was given (arguments,
@@ -31,10 +63,99 @@ pub struct RunKey {
 }
 
 impl RunKey {
+    pub const DOMAIN: &'static str = "blaze v2 run traced 1";
+
     /// The store's key of the result: this and the hash of what the run read.
     pub fn traced(&self, traced: &Traced) -> ContentId {
-        let _ = traced;
-        unimplemented!("v2: the key of a run with its traced inputs (v2-usercode)")
+        let mut traced = traced.clone();
+        trace::normalize(&mut traced);
+        Hasher::new(RunKey::DOMAIN)
+            .id(&self.code)
+            .id(&self.given)
+            .part(&trace::encode(&trace::Report::Ran(Some(traced))))
+            .finish()
+    }
+}
+
+/// What a run is given, hashed into [`RunKey::given`]: its kind, program arguments, the
+/// variables blaze sets for it (cargo's, for a build script), its standard input and what
+/// else the caller names. The environment the user's shell passes through is not given: what
+/// of it the run reads is traced (#805).
+#[derive(Clone, Debug)]
+pub struct Given {
+    kind: RunKind,
+    args: Vec<OsString>,
+    env: BTreeMap<OsString, OsString>,
+    stdin: Vec<u8>,
+    parts: BTreeMap<&'static str, Vec<u8>>,
+}
+
+impl Given {
+    pub const DOMAIN: &'static str = "blaze v2 run given 1";
+
+    pub fn new(kind: RunKind) -> Given {
+        Given {
+            kind,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            stdin: Vec::new(),
+            parts: BTreeMap::new(),
+        }
+    }
+
+    pub fn arg(&mut self, arg: impl Into<OsString>) -> &mut Given {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// A variable blaze sets; set twice, the last value is the one the run sees.
+    pub fn env(&mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> &mut Given {
+        self.env.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn stdin(&mut self, bytes: &[u8]) -> &mut Given {
+        self.stdin = bytes.to_vec();
+        self
+    }
+
+    /// Something else the run is a function of, by a name of the caller's: a macro's input
+    /// tokens, its kind and name, the target. Named twice, the last is kept.
+    pub fn part(&mut self, name: &'static str, bytes: &[u8]) -> &mut Given {
+        self.parts.insert(name, bytes.to_vec());
+        self
+    }
+
+    pub fn id(&mut self, name: &'static str, id: &ContentId) -> &mut Given {
+        self.part(name, &id.0)
+    }
+
+    pub fn finish(&self) -> ContentId {
+        let mut hasher = Hasher::new(Given::DOMAIN);
+        hasher.update(&[self.kind.byte()]);
+        hasher.update(&(self.args.len() as u64).to_le_bytes());
+        for arg in &self.args {
+            hasher.part(trace::os_bytes(arg));
+        }
+        hasher.update(&(self.env.len() as u64).to_le_bytes());
+        for (name, value) in &self.env {
+            hasher.part(trace::os_bytes(name)).part(trace::os_bytes(value));
+        }
+        hasher.part(&self.stdin);
+        hasher.update(&(self.parts.len() as u64).to_le_bytes());
+        for (name, bytes) in &self.parts {
+            hasher.part(name.as_bytes()).part(bytes);
+        }
+        hasher.finish()
+    }
+
+    /// Whether `name` is one blaze sets, so not one to trace.
+    pub fn sets(&self, name: &OsStr) -> bool {
+        self.env.contains_key(name)
+    }
+
+    pub fn vars(&self) -> impl Iterator<Item = (&OsString, &OsString)> {
+        self.env.iter()
     }
 }
 
@@ -44,4 +165,51 @@ pub struct Reached {
     pub test: String,
     pub binary: ContentId,
     pub reached: Vec<CodeHash>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn key() -> RunKey {
+        RunKey { code: ContentId::of("blaze v2 test 1", b"script"), given: Given::new(RunKind::BuildScript).finish() }
+    }
+
+    #[test]
+    fn a_traced_key_ignores_order_and_sees_every_value() {
+        let a = Traced {
+            files: vec![(PathBuf::from("/b"), Some([1; 32])), (PathBuf::from("/a"), None)],
+            env: vec![("CC".into(), Some("cc".into()))],
+            ..Traced::default()
+        };
+        let mut b = a.clone();
+        b.files.reverse();
+        assert_eq!(key().traced(&a), key().traced(&b));
+        let mut c = a.clone();
+        c.files[0].1 = Some([2; 32]);
+        assert_ne!(key().traced(&a), key().traced(&c));
+        let mut d = a.clone();
+        d.env[0].1 = None;
+        assert_ne!(key().traced(&a), key().traced(&d));
+        let mut e = a.clone();
+        e.untraceable.push(blaze_core::Untraceable::Clock);
+        assert_ne!(key().traced(&a), key().traced(&e));
+    }
+
+    #[test]
+    fn given_is_framed_and_kind_counts() {
+        let mut one = Given::new(RunKind::BuildScript);
+        one.arg("ab").arg("c");
+        let mut two = Given::new(RunKind::BuildScript);
+        two.arg("a").arg("bc");
+        assert_ne!(one.finish(), two.finish());
+        assert_ne!(Given::new(RunKind::ProcMacro).finish(), Given::new(RunKind::Test).finish());
+        let mut env_one = Given::new(RunKind::BuildScript);
+        env_one.env("A", "1").env("B", "2");
+        let mut env_two = Given::new(RunKind::BuildScript);
+        env_two.env("B", "2").env("A", "1");
+        assert_eq!(env_one.finish(), env_two.finish());
+    }
 }

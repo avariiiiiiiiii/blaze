@@ -95,6 +95,9 @@ use crate::{
 pub use self::path_resolution::ResolvePathResultPrefixInfo;
 
 #[cfg(test)]
+pub(crate) use self::collector::EXPANSION_THREADS;
+
+#[cfg(test)]
 thread_local! {
     /// HACK: In order to test builtin derive expansion, we gate their fast path with this atomic when cfg(test).
     pub(crate) static ENABLE_BUILTIN_DERIVE_FAST_PATH: std::cell::Cell<bool> =

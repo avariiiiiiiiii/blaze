@@ -83,10 +83,10 @@ impl Vfs {
 }
 ```
 
-Until then lane ci's session answers `ViewRef::Head` of an unwritten head with an error naming
-the head, and blaze-ci makes a head's first commit against the root the daemon reports for
-the empty head (it asks `Open { view: Head(..) }` and the session maps an unwritten head to
-`Vfs::empty`). So the session calls `Vfs::empty` already: it needs this to build.
+Lane ci's session resolves `ViewRef::Head` of a head never written to `Vfs::empty()`
+(blaze-next's rule: an unwritten head is the empty tree), so a client learns the base of a
+head's first commit by `Open { view: Head(..) }`. The session calls `Vfs::empty` already: it
+needs this to build.
 
 ## 4. Two arenas name an open view (for the coordinator to know)
 
@@ -101,3 +101,6 @@ A git tree's symlinks (mode 120000) and executable files (100755) have no `Op`. 
 checkout refuses a tree with a symlink, naming the path (no-fallback), and writes an
 executable as a plain file. A build script that runs a checked-in script, or a crate with a
 symlinked file, needs `Op::Write` to carry a mode (lane vfs).
+
+---
+Applied by the coordinator, 16:46.

@@ -1,7 +1,11 @@
 //! A [`Driver`] on the real file system: a few threads run blocking calls, and the thread that
-//! polls keeps the timers. Portable, and the default on macOS. Two appends to one file in flight
-//! at once may land in either order, as with any asynchronous driver; a state machine that
-//! needs their order waits for the first.
+//! polls keeps the timers. Portable: the reference the other drivers are tested against. Two
+//! appends to one file in flight at once may land in either order, as with any asynchronous
+//! driver; a state machine that needs their order waits for the first.
+//!
+//! A process runs on a thread of its own that writes its input, reads its output and waits for
+//! it; a listen on a thread that waits for connections; each receive, send and connect on a
+//! thread of its own, since each may wait on a peer for as long as the peer likes.
 
 use std::{
     cmp::Reverse,
@@ -19,7 +23,7 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::{Completion, Done, Driver, Effect, IoError, Tag, fs};
+use crate::{Completion, Confine, Done, Driver, Effect, IoError, Tag, fs};
 
 pub struct Threads {
     start: Instant,
@@ -30,6 +34,11 @@ pub struct Threads {
     workers: Vec<JoinHandle<()>>,
     timers: BinaryHeap<Reverse<(Instant, Tag)>>,
     watches: FxHashMap<Tag, Watching>,
+    confine: Option<Arc<dyn Confine>>,
+    #[cfg(unix)]
+    world: Arc<world::World>,
+    #[cfg(unix)]
+    listens: FxHashMap<Tag, world::Listening>,
     in_flight: usize,
 }
 
@@ -58,8 +67,19 @@ impl Threads {
             workers,
             timers: BinaryHeap::new(),
             watches: FxHashMap::default(),
+            confine: None,
+            #[cfg(unix)]
+            world: Arc::default(),
+            #[cfg(unix)]
+            listens: FxHashMap::default(),
             in_flight: 0,
         }
+    }
+
+    /// The same driver, making the sandbox of each spawn whose sandbox is on with `confine`.
+    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Threads {
+        self.confine = Some(confine);
+        self
     }
 
     fn fire_timers(&mut self, out: &mut Vec<Completion>) -> usize {
@@ -78,19 +98,29 @@ impl Threads {
     }
 
     /// Takes a completion off the threads' channel, counting it out of what is in flight unless
-    /// a watch goes on after it.
+    /// a watch or a listen goes on after it.
     fn took(&mut self, completion: Completion, out: &mut Vec<Completion>) {
         match completion.done {
-            Done::Changed { .. } => {}
-            // A watch ends with its end or a failure.
+            Done::Changed { .. } | Done::Accepted { .. } => {}
+            // A watch or a listen ends with its end or a failure.
             _ => {
                 if let Some(watching) = self.watches.remove(&completion.tag) {
                     watching.join();
+                }
+                #[cfg(unix)]
+                if let Some(listening) = self.listens.remove(&completion.tag) {
+                    listening.join();
                 }
                 self.in_flight -= 1;
             }
         }
         out.push(completion);
+    }
+
+    /// Says `done` of `tag` as the threads' completions are said.
+    fn tell(&mut self, tag: Tag, done: Done) {
+        self.in_flight += 1;
+        _ = self.finished.send(Completion { tag, done });
     }
 }
 
@@ -100,6 +130,14 @@ impl Drop for Threads {
         for (_, watching) in self.watches.drain() {
             watching.stop();
             watching.join();
+        }
+        #[cfg(unix)]
+        {
+            for (_, listening) in self.listens.drain() {
+                listening.stop();
+                listening.join();
+            }
+            self.world.kill_all();
         }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -120,7 +158,9 @@ fn work_on(root: &Path, queue: &Mutex<Receiver<Effect>>, finished: &Sender<Compl
     }
 }
 
-fn run(root: &Path, effect: Effect) -> io::Result<Done> {
+/// A file effect done with blocking calls, for this driver's threads and for the drivers that
+/// keep their file calls on threads.
+pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
     let at = |file: &crate::FileName| root.join(file.as_str());
     match effect {
         Effect::ReadAll { file, .. } => match std::fs::read(at(&file)) {
@@ -177,10 +217,10 @@ fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::remove(&at(&file))?;
             Ok(Done::Removed)
         }
-        Effect::Timer { .. } | Effect::Watch { .. } | Effect::Unwatch { .. } => {
-            unreachable!("timers and watches are kept by the polling thread")
-        }
-        Effect::Map { .. }
+        Effect::Map { file, .. } => Ok(Done::Mapped(fs::map(&at(&file))?)),
+        Effect::Timer { .. }
+        | Effect::Watch { .. }
+        | Effect::Unwatch { .. }
         | Effect::Spawn { .. }
         | Effect::Kill { .. }
         | Effect::Listen { .. }
@@ -189,7 +229,7 @@ fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Recv { .. }
         | Effect::Send { .. }
         | Effect::Hangup { .. } => {
-            unimplemented!("v2: mapping, processes and sockets on the threads driver (v2-core)")
+            unreachable!("timers, watches, processes and sockets are kept by the driver")
         }
     }
 }
@@ -202,6 +242,315 @@ fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
 #[cfg(windows)]
 fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buffer, at)
+}
+
+/// Processes and sockets: what their threads share with the thread that polls.
+#[cfg(unix)]
+mod world {
+    use std::{
+        fs::File,
+        io::{Read as _, Write as _},
+        os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        path::Path,
+        sync::{
+            Arc, Mutex, PoisonError,
+            atomic::{AtomicU64, Ordering},
+            mpsc::Sender,
+        },
+        thread::JoinHandle,
+    };
+
+    use rustc_hash::FxHashMap;
+
+    use crate::{Address, Command, Completion, Confine, Conn, Done, IoError, Tag, net, process};
+
+    #[derive(Default)]
+    pub(super) struct World {
+        processes: Mutex<FxHashMap<Tag, Process>>,
+        conns: Mutex<FxHashMap<Conn, Arc<net::Socket>>>,
+        next_conn: AtomicU64,
+    }
+
+    enum Process {
+        /// Asked for and not yet started; `killed` once a kill came first.
+        Starting { killed: bool },
+        /// Started and not yet reaped: its pid is no one else's.
+        Running(libc::pid_t),
+    }
+
+    fn failed(tag: Tag, why: impl ToString) -> Completion {
+        Completion { tag, done: Done::Failed(IoError(why.to_string())) }
+    }
+
+    impl World {
+        fn conn(&self, socket: net::Socket) -> Conn {
+            let conn = Conn(self.next_conn.fetch_add(1, Ordering::Relaxed));
+            self.conns.lock().unwrap_or_else(PoisonError::into_inner).insert(conn, Arc::new(socket));
+            conn
+        }
+
+        fn socket(&self, conn: Conn) -> Option<Arc<net::Socket>> {
+            self.conns.lock().unwrap_or_else(PoisonError::into_inner).get(&conn).cloned()
+        }
+
+        pub(super) fn spawn(
+            self: &Arc<World>,
+            root: &Arc<Path>,
+            command: Box<Command>,
+            confine: Option<Arc<dyn Confine>>,
+            tag: Tag,
+            finished: Sender<Completion>,
+        ) {
+            self.processes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(tag, Process::Starting { killed: false });
+            let (world, root, told) = (self.clone(), root.clone(), finished.clone());
+            let started = std::thread::Builder::new().name("blaze-process".into()).spawn(move || {
+                let done = match world.run(&root, command, confine.as_ref(), tag) {
+                    Ok(exit) => Done::Exited(Box::new(exit)),
+                    Err(error) => Done::Failed(IoError(error.to_string())),
+                };
+                _ = finished.send(Completion { tag, done });
+            });
+            if let Err(error) = started {
+                self.processes.lock().unwrap_or_else(PoisonError::into_inner).remove(&tag);
+                _ = told.send(failed(tag, error));
+            }
+        }
+
+        fn run(
+            &self,
+            root: &Path,
+            command: Box<Command>,
+            confine: Option<&Arc<dyn Confine>>,
+            tag: Tag,
+        ) -> std::io::Result<crate::Exit> {
+            let started = match process::start(root, command, confine) {
+                Ok(started) => started,
+                Err(error) => {
+                    self.processes.lock().unwrap_or_else(PoisonError::into_inner).remove(&tag);
+                    return Err(error);
+                }
+            };
+            let pid = started.pid;
+            {
+                let mut processes = self.processes.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(Process::Starting { killed: true }) = processes.get(&tag) {
+                    process::kill(pid);
+                }
+                processes.insert(tag, Process::Running(pid));
+            }
+            let process::Started { stdin, stdout, stderr, mut finish, .. } = started;
+            let input = std::mem::take(&mut finish.command.stdin);
+            let writer = stdin.map(|fd| {
+                std::thread::spawn(move || {
+                    // A process that ends without reading all of its input is not an error of
+                    // the driver's: it is told by how the process ended.
+                    _ = File::from(fd).write_all(&input);
+                })
+            });
+            let errors = std::thread::spawn(move || read_all(stderr));
+            let output = read_all(stdout);
+            let errors = errors.join().unwrap_or_default();
+            if let Some(writer) = writer {
+                _ = writer.join();
+            }
+            process::wait_exited(pid)?;
+            self.processes.lock().unwrap_or_else(PoisonError::into_inner).remove(&tag);
+            let (status, rusage) = process::reap(pid)?;
+            finish.exited(status, &rusage, output, errors)
+        }
+
+        pub(super) fn kill(&self, tag: Tag) {
+            let mut processes = self.processes.lock().unwrap_or_else(PoisonError::into_inner);
+            match processes.get_mut(&tag) {
+                Some(Process::Starting { killed }) => *killed = true,
+                Some(Process::Running(pid)) => process::kill(*pid),
+                None => {}
+            }
+        }
+
+        pub(super) fn kill_all(&self) {
+            let mut processes = self.processes.lock().unwrap_or_else(PoisonError::into_inner);
+            for process in processes.values_mut() {
+                match process {
+                    Process::Starting { killed } => *killed = true,
+                    Process::Running(pid) => process::kill(*pid),
+                }
+            }
+        }
+
+        pub(super) fn connect(
+            self: &Arc<World>,
+            root: &Arc<Path>,
+            at: Address,
+            tag: Tag,
+            finished: Sender<Completion>,
+        ) {
+            let (world, root) = (self.clone(), root.clone());
+            on_thread("blaze-connect", tag, finished, move || {
+                let socket = net::connect(&root, &at)?;
+                Ok(Done::Connected { conn: world.conn(socket) })
+            });
+        }
+
+        pub(super) fn recv(
+            &self,
+            conn: Conn,
+            most: usize,
+            tag: Tag,
+            finished: Sender<Completion>,
+        ) {
+            let Some(socket) = self.socket(conn) else {
+                _ = finished.send(failed(tag, format!("no connection {conn:?}")));
+                return;
+            };
+            on_thread("blaze-recv", tag, finished, move || {
+                let mut bytes = vec![0; most];
+                let n = socket.read(&mut bytes)?;
+                bytes.truncate(n);
+                Ok(Done::Read(bytes))
+            });
+        }
+
+        pub(super) fn send(
+            &self,
+            conn: Conn,
+            bytes: Vec<u8>,
+            tag: Tag,
+            finished: Sender<Completion>,
+        ) {
+            let Some(socket) = self.socket(conn) else {
+                _ = finished.send(failed(tag, format!("no connection {conn:?}")));
+                return;
+            };
+            on_thread("blaze-send", tag, finished, move || {
+                socket.write_all(&bytes)?;
+                Ok(Done::Sent)
+            });
+        }
+
+        pub(super) fn hangup(&self, conn: Conn) -> Done {
+            let socket = self.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&conn);
+            match socket {
+                Some(socket) => match socket.shutdown() {
+                    Ok(()) => Done::HungUp,
+                    Err(error) => Done::Failed(IoError(error.to_string())),
+                },
+                None => Done::Failed(IoError(format!("no connection {conn:?}"))),
+            }
+        }
+
+        pub(super) fn listen(
+            self: &Arc<World>,
+            root: &Path,
+            at: &Address,
+            tag: Tag,
+            finished: Sender<Completion>,
+        ) -> std::io::Result<Listening> {
+            let listener = net::listen(root, at)?;
+            let mut ends = [0; 2];
+            // SAFETY: two descriptors written by the call.
+            if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: the call made both; each is owned once from here.
+            let (read_end, write_end) =
+                unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+            net::set_cloexec(read_end.as_raw_fd())?;
+            net::set_cloexec(write_end.as_raw_fd())?;
+            listener.set_nonblocking(true)?;
+            let world = self.clone();
+            let thread = std::thread::Builder::new().name("blaze-listen".into()).spawn(move || {
+                loop {
+                    let mut fds = [
+                        libc::pollfd { fd: listener.fd(), events: libc::POLLIN, revents: 0 },
+                        libc::pollfd { fd: read_end.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                    ];
+                    // SAFETY: two pollfds of open descriptors.
+                    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                    if ready < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        _ = finished.send(failed(tag, error));
+                        return;
+                    }
+                    if fds[1].revents != 0 {
+                        drop(listener);
+                        _ = finished.send(Completion { tag, done: Done::Unlistened });
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok(socket) => {
+                            if let Err(error) = socket.set_nonblocking(false) {
+                                _ = finished.send(failed(tag, error));
+                                return;
+                            }
+                            let done = Done::Accepted { conn: world.conn(socket) };
+                            if finished.send(Completion { tag, done }).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) => {}
+                        Err(error) => {
+                            _ = finished.send(failed(tag, error));
+                            return;
+                        }
+                    }
+                }
+            })?;
+            Ok(Listening { stop: write_end, thread })
+        }
+    }
+
+    fn on_thread(
+        name: &str,
+        tag: Tag,
+        finished: Sender<Completion>,
+        work: impl FnOnce() -> std::io::Result<Done> + Send + 'static,
+    ) {
+        let told = finished.clone();
+        let started = std::thread::Builder::new().name(name.into()).spawn(move || {
+            let done = work().unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
+            _ = finished.send(Completion { tag, done });
+        });
+        if let Err(error) = started {
+            _ = told.send(failed(tag, error));
+        }
+    }
+
+    fn read_all(fd: OwnedFd) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // An error reading the pipe ends what was read: the process's end says how it went.
+        _ = File::from(fd).read_to_end(&mut bytes);
+        bytes
+    }
+
+    /// A listen's thread, and how to stop it.
+    pub(super) struct Listening {
+        stop: OwnedFd,
+        thread: JoinHandle<()>,
+    }
+
+    impl Listening {
+        pub(super) fn stop(&self) {
+            // SAFETY: one byte to the pipe's write end.
+            unsafe { libc::write(self.stop.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        }
+
+        pub(super) fn join(self) {
+            _ = self.thread.join();
+        }
+    }
 }
 
 /// A watch's thread, and how to stop it.
@@ -220,7 +569,7 @@ impl Watching {
         finished: Sender<Completion>,
     ) -> io::Result<Watching> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-        let mut inotify = crate::watch::Inotify::new(root, dir, false)?;
+        let mut tree = crate::watch::Tree::new(root, dir, false)?;
         // SAFETY: no pointers; a descriptor of its own or -1.
         let stop = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
         if stop < 0 {
@@ -233,7 +582,7 @@ impl Watching {
             let mut buffer = vec![0u8; crate::watch::BUFFER];
             loop {
                 let mut fds = [
-                    libc::pollfd { fd: inotify.raw(), events: libc::POLLIN, revents: 0 },
+                    libc::pollfd { fd: tree.raw(), events: libc::POLLIN, revents: 0 },
                     libc::pollfd { fd: stop_fd, events: libc::POLLIN, revents: 0 },
                 ];
                 // SAFETY: two pollfds of open descriptors.
@@ -252,11 +601,10 @@ impl Watching {
                 }
                 if fds[0].revents != 0 {
                     // SAFETY: the buffer has room for what is read.
-                    let n = unsafe {
-                        libc::read(inotify.raw(), buffer.as_mut_ptr().cast(), buffer.len())
-                    };
+                    let n =
+                        unsafe { libc::read(tree.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
                     if n > 0 {
-                        let done = inotify.take(&buffer[..n as usize]);
+                        let done = tree.take(&buffer[..n as usize]);
                         if finished.send(Completion { tag, done }).is_err() {
                             return;
                         }
@@ -279,10 +627,47 @@ impl Watching {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// A watch of FSEvents', which calls back on a queue of its own.
+#[cfg(target_os = "macos")]
+struct Watching {
+    stream: Mutex<Option<crate::fsevents::Stream>>,
+    tag: Tag,
+    finished: Sender<Completion>,
+}
+
+#[cfg(target_os = "macos")]
+impl Watching {
+    fn start(
+        root: &Path,
+        dir: &crate::FileName,
+        tag: Tag,
+        finished: Sender<Completion>,
+    ) -> io::Result<Watching> {
+        let send = finished.clone();
+        let stream = crate::fsevents::Stream::start(
+            root,
+            dir,
+            tag,
+            Box::new(move |completion| _ = send.send(completion)),
+        )?;
+        Ok(Watching { stream: Mutex::new(Some(stream)), tag, finished })
+    }
+
+    fn stop(&self) {
+        let stream = self.stream.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(stream) = stream {
+            stream.stop();
+            _ = self.finished.send(Completion { tag: self.tag, done: Done::Unwatched });
+        }
+    }
+
+    fn join(self) {}
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct Watching;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Watching {
     fn start(
         _: &Path,
@@ -292,7 +677,7 @@ impl Watching {
     ) -> io::Result<Watching> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "watching files is built on Linux only (FSEvents is docs/v2/core.md's)",
+            "watching files is built on Linux (inotify, fanotify) and macOS (FSEvents) only",
         ))
     }
 
@@ -310,23 +695,89 @@ impl Driver for Threads {
                     self.timers.push(Reverse((Instant::now() + after, tag)))
                 }
                 Effect::Watch { dir, tag } => {
-                    self.in_flight += 1;
                     match Watching::start(&self.root, &dir, tag, self.finished.clone()) {
-                        Ok(watching) => _ = self.watches.insert(tag, watching),
-                        Err(error) => {
-                            let done = Done::Failed(IoError(error.to_string()));
-                            _ = self.finished.send(Completion { tag, done });
+                        Ok(watching) => {
+                            self.in_flight += 1;
+                            self.watches.insert(tag, watching);
                         }
+                        Err(error) => self.tell(tag, Done::Failed(IoError(error.to_string()))),
                     }
                 }
                 Effect::Unwatch { tag } => match self.watches.get(&tag) {
                     Some(watching) => watching.stop(),
-                    None => {
-                        self.in_flight += 1;
-                        let done = Done::Failed(IoError(format!("nothing is watched as {tag:?}")));
-                        _ = self.finished.send(Completion { tag, done });
-                    }
+                    None => self.tell(
+                        tag,
+                        Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
+                    ),
                 },
+                #[cfg(unix)]
+                Effect::Spawn { command, tag } => {
+                    self.in_flight += 1;
+                    self.world.spawn(
+                        &self.root,
+                        command,
+                        self.confine.clone(),
+                        tag,
+                        self.finished.clone(),
+                    );
+                }
+                #[cfg(unix)]
+                Effect::Kill { tag } => self.world.kill(tag),
+                #[cfg(unix)]
+                Effect::Listen { at, tag } => {
+                    match self.world.listen(&self.root, &at, tag, self.finished.clone()) {
+                        Ok(listening) => {
+                            self.in_flight += 1;
+                            self.listens.insert(tag, listening);
+                        }
+                        Err(error) => self.tell(tag, Done::Failed(IoError(error.to_string()))),
+                    }
+                }
+                #[cfg(unix)]
+                Effect::Unlisten { tag } => match self.listens.get(&tag) {
+                    Some(listening) => listening.stop(),
+                    None => self.tell(
+                        tag,
+                        Done::Failed(IoError(format!("nothing is listened on as {tag:?}"))),
+                    ),
+                },
+                #[cfg(unix)]
+                Effect::Connect { at, tag } => {
+                    self.in_flight += 1;
+                    self.world.connect(&self.root, at, tag, self.finished.clone());
+                }
+                #[cfg(unix)]
+                Effect::Recv { conn, most, tag } => {
+                    self.in_flight += 1;
+                    self.world.recv(conn, most, tag, self.finished.clone());
+                }
+                #[cfg(unix)]
+                Effect::Send { conn, bytes, tag } => {
+                    self.in_flight += 1;
+                    self.world.send(conn, bytes, tag, self.finished.clone());
+                }
+                #[cfg(unix)]
+                Effect::Hangup { conn, tag } => {
+                    let done = self.world.hangup(conn);
+                    self.tell(tag, done);
+                }
+                #[cfg(not(unix))]
+                Effect::Kill { .. } => {}
+                #[cfg(not(unix))]
+                effect @ (Effect::Spawn { .. }
+                | Effect::Listen { .. }
+                | Effect::Unlisten { .. }
+                | Effect::Connect { .. }
+                | Effect::Recv { .. }
+                | Effect::Send { .. }
+                | Effect::Hangup { .. }) => self.tell(
+                    effect.tag(),
+                    Done::Failed(IoError(
+                        "processes and sockets are built on Unix only; Windows' are lane \
+                         usercode's (AppContainer and job objects)"
+                            .into(),
+                    )),
+                ),
                 effect => {
                     self.in_flight += 1;
                     let work = self.work.as_ref().expect("the driver is running");

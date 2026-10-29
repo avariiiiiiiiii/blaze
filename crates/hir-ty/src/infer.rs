@@ -1132,22 +1132,27 @@ impl PartialOrd for UpvarCapture {
     }
 }
 
-#[salsa::tracked]
-impl<'db> InferenceResult<'db> {
-    #[salsa::tracked(returns(ref), cycle_result = infer_cycle_result)]
-    fn for_body(db: &dyn HirDatabase, def: DefWithBodyId) -> InferenceResult<'_> {
-        infer_query(db, def)
-    }
+/// The inference of a body. Free functions rather than methods of a tracked impl, so that
+/// [`crate::evict`] can name them to drop their values.
+#[salsa::tracked(returns(ref), cycle_result = infer_cycle_result)]
+pub(crate) fn infer_body_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: DefWithBodyId,
+) -> InferenceResult<'db> {
+    infer_query(db, def)
+}
 
-    /// Infer types for all const expressions in an item's signature.
-    ///
-    /// Returns an `InferenceResult` containing type information for array lengths,
-    /// const generic arguments, and other const expressions appearing in type
-    /// positions within the item's signature.
-    #[salsa::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result)]
-    fn for_anon_const(db: &'db dyn HirDatabase, def: AnonConstId<'db>) -> InferenceResult<'db> {
-        infer_anon_const_query(db, def)
-    }
+/// Infer types for all const expressions in an item's signature.
+///
+/// Returns an `InferenceResult` containing type information for array lengths,
+/// const generic arguments, and other const expressions appearing in type
+/// positions within the item's signature.
+#[salsa::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result)]
+pub(crate) fn infer_anon_const_body_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: AnonConstId<'db>,
+) -> InferenceResult<'db> {
+    infer_anon_const_query(db, def)
 }
 
 impl<'db> InferenceResult<'db> {
@@ -1157,16 +1162,16 @@ impl<'db> InferenceResult<'db> {
         def: impl Into<InferBodyId<'db>>,
     ) -> &'db InferenceResult<'db> {
         match def.into() {
-            InferBodyId::DefWithBodyId(it) => InferenceResult::for_body(db, it),
+            InferBodyId::DefWithBodyId(it) => infer_body_query(db, it),
             InferBodyId::AnonConstId(it) => {
                 // A `const { .. }` block of a body, which MIR lowering makes a constant of its
                 // own, was inferred with the body, as rustc infers inline consts.
                 if let ExpressionStoreOwnerId::Body(body) = it.loc(db).owner
                     && it.is_inline_const(db)
                 {
-                    return InferenceResult::for_body(db, body);
+                    return infer_body_query(db, body);
                 }
-                InferenceResult::for_anon_const(db, it)
+                infer_anon_const_body_query(db, it)
             }
         }
     }

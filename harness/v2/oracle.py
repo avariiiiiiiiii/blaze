@@ -21,9 +21,10 @@ one slot at a time. Each step:
 
 A step fails when the incremental build and the one from scratch differ in anything: whether
 the source is refused and with which errors, what the program prints and its exit status, the
-outcome of every test, with `bytes` every output file byte for byte, and the codegen input of
-every function where the engine says them (v2). That is under-invalidation, and the whole
-point. It is unmeasured where either build was not blaze's (v1 hands some to cargo). Apart
+outcome of every test, with `bytes` every output file byte for byte, and where the engine says
+them (v2) the codegen input of every function and the query database's trace of both builds,
+which `blaze-v2-proof` compares to name the query that went stale and the read it missed. That
+is under-invalidation, and the whole point. It is unmeasured where either build was not blaze's (v1 hands some to cargo). Apart
 from that:
 
 - `rustc/...` fails where the build from scratch differs from cargo's: not an invalidation bug
@@ -51,6 +52,9 @@ Input (JSON inline, a file's path, or `-`):
                   incremental programs are spliced)
     seed_std      give each build from scratch a store with the standard library alone
     jobs          sequences run at once, each with daemons of its own
+    proof         the `blaze-v2-proof` binary (crates/blaze-v2-proof), which compares two traces
+                  and counts reruns for nothing (default: beside `engine.blaze`); needed only
+                  when the engine gives traces
     reduce, keep
 """
 
@@ -65,7 +69,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -105,6 +109,7 @@ class Input:
     seed_std: bool = True
     jobs: int = 1
     reduce: int = 4
+    proof: str = ""
     keep: bool = False
 
 
@@ -119,6 +124,7 @@ class Replay:
     reference: bool = True
     bytes: bool | None = None
     seed_std: bool = True
+    proof: str = ""
     keep: bool = False
 
 
@@ -129,6 +135,8 @@ class Settings:
     tests: bool
     reference: bool
     bytes: bool
+    # `blaze-v2-proof`, which compares the traces of two builds.
+    proof: str
     keep: bool
 
 
@@ -144,6 +152,7 @@ class Built:
     tests: dict[str, object] = field(default_factory=dict[str, object])
     outputs: dict[str, dict[str, str]] = field(default_factory=dict[str, dict[str, str]])
     codegen: dict[str, str] | None = None
+    trace: Path | None = None
     not_blazes: str | None = None
     said: str = ""
 
@@ -160,6 +169,7 @@ class Step:
     rejects: bool = False
     compiled: int | None = None
     reran: int | None = None
+    needless: int | None = None
     link: str | None = None
     rustc: str | None = None
     state: dict[str, int] = field(default_factory=dict[str, int])
@@ -173,7 +183,8 @@ def profile_dir(profile: Profile) -> str:
 def errors_of(stdout: str, ws: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """The errors of a build's `--message-format=json`: each as its code (or the start of its
     message when it has none), file and line; and the codes alone."""
-    found = [d for d in check_apps.diagnostics(stdout, str(ws)) if d[0] == "error"]
+    diagnostics = cast(list[tuple[str, str | None, str, int, str]], check_apps.diagnostics(stdout, str(ws)))
+    found = [d for d in diagnostics if d[0] == "error"]
     keyed = sorted({f"{code or message[:60]} {path}:{line}" for _, code, path, line, message in found})
     codes = sorted({code or message[:60] for _, code, _, _, message in found})
     return tuple(keyed), tuple(codes)
@@ -239,9 +250,12 @@ class Round:
         self.fresh_store(self.inc_store)
         self.files: dict[str, str | None] | None = None
         self.last_env: dict[str, str] | None = None
-        # Why the engine cannot say what a build did, or its codegen inputs, once it has said.
+        # Why the engine cannot say what a build did, its codegen inputs or its trace, once said.
         self.work_gap: tuple[report.Verdict, str] | None = None
         self.codegen_gap: tuple[report.Verdict, str] | None = None
+        self.trace_gap: tuple[report.Verdict, str] | None = None
+        self.traces = 0
+        self.last_trace: Path | None = None
 
     def fresh_store(self, store: Path) -> None:
         shutil.rmtree(store, ignore_errors=True)
@@ -294,11 +308,11 @@ class Round:
             kept_file.unlink(missing_ok=True)
             ran = self.eng.build(f"{step}: test", self.ws, env, args, command="test", timeout=BUILD_SECS)
             built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
-            kept = blaze_cli.kept_passes(str(kept_file))
+            kept = cast(list[str], blaze_cli.kept_passes(str(kept_file)))
         else:
             ran = engine.cargo(f"{step}: test", ["test", *args], self.ws, env, BUILD_SECS)
-            kept = []
-        return blaze_cli.test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=kept))
+            kept: list[str] = []
+        return cast(object, blaze_cli.test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=kept)))
 
     def codegen(self, env: dict[str, str]) -> dict[str, str] | None:
         if self.codegen_gap is not None:
@@ -308,6 +322,34 @@ class Round:
         except (engine.Unmeasurable, engine.Missing) as e:
             self.codegen_gap = self.gap("codegen inputs", e)
             return None
+
+    def traced(self, env: dict[str, str], name: str) -> Path | None:
+        if self.trace_gap is not None:
+            return None
+        to = self.work / name
+        try:
+            self.eng.trace(self.ws, env, to)
+            return to
+        except (engine.Unmeasurable, engine.Missing) as e:
+            self.trace_gap = self.gap("the query database's trace", e)
+            return None
+
+    def compare_traces(self, inc: Path, scratch: Path) -> tuple[list[str], int | None]:
+        """What `blaze-v2-proof` finds stale in the incremental trace, and how many results it
+        reran for nothing against the trace of the build before."""
+        proof = Path(self.it.proof)
+        if not proof.is_file():
+            raise engine.Failed(f"proof: no `blaze-v2-proof` at {proof}, to compare the traces")
+        given: dict[str, str] = {"incremental": str(inc), "scratch": str(scratch)}
+        if self.last_trace is not None:
+            given["before"] = str(self.last_trace)
+        ran = engine.run("comparing the traces", [str(proof), json.dumps(given)], self.work, engine.scrubbed(), RUN_SECS)
+        if ran.returncode not in (0, 1):
+            raise engine.Failed(f"comparing the traces: `blaze-v2-proof` exited {ran.returncode}:\n{ran.said()}")
+        found = json.loads(ran.stdout)
+        stale = [f"the trace: {s['what']} {s['query']}: {s['detail']}" for s in found["stale"]]
+        work = found["work"]
+        return stale[:12], None if work is None else work["needless"]
 
     def incremental(self, state: fixture.State) -> tuple[Built, engine.Work | None]:
         env = self.env_of(self.eng.env(self.inc_home, self.inc_store, self.inc_target), state)
@@ -327,6 +369,8 @@ class Round:
                 self.work_gap = self.gap("what a build did", e)
         if built.ok:
             built.codegen = self.codegen(env)
+            self.traces += 1
+            built.trace = self.traced(env, f"trace-i{self.traces}.cbor")
         return built, work
 
     def scratch(self, state: fixture.State) -> Built:
@@ -346,6 +390,7 @@ class Round:
             built = self.side("from scratch", state, env, target, True)
             if built.ok:
                 built.codegen = self.codegen(env)
+                built.trace = self.traced(env, "trace-s.cbor")
             return built
         finally:
             try:
@@ -371,16 +416,22 @@ class Round:
             inc, work = self.incremental(state)
             scratch = self.scratch(state)
             cargo = self.reference(state) if self.it.reference else None
+            stale: list[str] = []
+            if inc.trace is not None and scratch.trace is not None:
+                stale, out.needless = self.compare_traces(inc.trace, scratch.trace)
         except engine.Failed as e:
             out.verdict, out.detail = "error", str(e)
             return out
+        if self.last_trace is not None:
+            self.last_trace.unlink(missing_ok=True)
+        self.last_trace = inc.trace
         if work is not None:
             out.compiled, out.reran, out.link = work.compiled, work.reran, work.link
         if inc.not_blazes or scratch.not_blazes:
             out.verdict = "unmeasured"
             out.detail = f"not blaze's: {inc.not_blazes or scratch.not_blazes}"
         else:
-            apart = compare(inc, scratch, ("the incremental build", "the build from scratch"), whole=True)
+            apart = compare(inc, scratch, ("the incremental build", "the build from scratch"), whole=True) + stale
             if apart:
                 out.verdict, out.detail = "fail", "\n".join(apart)
         if cargo is not None:
@@ -445,7 +496,7 @@ def run_sequence(eng: engine.Engine, it: Settings, seq: Sequence, work: Path, st
                 break
     finally:
         round_.close()
-    gaps = [g for g in (round_.work_gap, round_.codegen_gap) if g is not None]
+    gaps = [g for g in (round_.work_gap, round_.codegen_gap, round_.trace_gap) if g is not None]
     return Ran(steps, gaps)
 
 
@@ -518,10 +569,12 @@ def std_seed(eng: engine.Engine, work: Path) -> Path:
 
 
 def settings(spec: engine.EngineSpec, profiles: tuple[Profile, ...], tests: bool, reference: bool,
-             bytes_: bool | None, keep: bool) -> Settings:
+             bytes_: bool | None, proof: str, keep: bool) -> Settings:
     if not profiles:
         fail(SCRIPT, "profiles: name at least one")
-    return Settings(spec, profiles, tests, reference, spec.kind == "v2" if bytes_ is None else bytes_, keep)
+    proof_bin = Path(proof) if proof else Path(spec.blaze).parent / f"blaze-v2-proof{engine.EXE}"
+    return Settings(spec, profiles, tests, reference, spec.kind == "v2" if bytes_ is None else bytes_,
+                    str(proof_bin.resolve()), keep)
 
 
 def work_root(given: str) -> Path:
@@ -534,7 +587,8 @@ def work_root(given: str) -> Path:
 def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, str]],
            by_kind: dict[str, list[int]], rustc: list[Step]) -> None:
     for step in ran.steps:
-        numbers: dict[str, report.Number] = dict(kind=step.kind, compiled=step.compiled, reran=step.reran, link=step.link)
+        numbers: dict[str, report.Number] = dict(kind=step.kind, compiled=step.compiled, reran=step.reran,
+                                                 needless=step.needless, link=step.link)
         detail = step.edit + (f"\n{step.detail}" if step.detail else "") + (f"\nfiled: {step.found}" if step.found else "")
         out.add(f"oracle/{step.name}", step.verdict, detail.strip(), **numbers)
         if step.rustc:
@@ -556,7 +610,7 @@ def run(it: Input) -> None:
     unknown = [k for k in it.kinds if k not in fixture.KINDS] + [r for r in it.regressions if r not in fixture.REGRESSIONS]
     if unknown:
         fail(SCRIPT, f"no kind or regression {unknown}: kinds {list(fixture.KINDS)}, regressions {list(fixture.REGRESSIONS)}")
-    s = settings(it.engine, it.profiles, it.tests, it.reference, it.bytes, it.keep)
+    s = settings(it.engine, it.profiles, it.tests, it.reference, it.bytes, it.proof, it.keep)
     out = report.Report(SCRIPT, it.engine, it.out)
     root = work_root(it.work)
     print(f"work: {root}", flush=True)
@@ -613,7 +667,7 @@ def run(it: Input) -> None:
 
 
 def replay(it: Replay) -> None:
-    s = settings(it.engine, it.profiles, it.tests, it.reference, it.bytes, it.keep)
+    s = settings(it.engine, it.profiles, it.tests, it.reference, it.bytes, it.proof, it.keep)
     out = report.Report(SCRIPT, it.engine, it.out)
     found = json.loads(Path(it.found).read_text())
     states: list[dict[str, int]] = found.get("reduced") or found["history"]
@@ -660,7 +714,7 @@ def main() -> None:
                 print(line)
             print(f"{SCRIPT} selftest: {len(wrong)} wrong")
             sys.exit(1 if wrong else 0)
-        case ["run", text]:
+        case ["run", text] | [text]:
             run(parse(Input, text, SCRIPT))
         case ["replay", text]:
             replay(parse(Replay, text, SCRIPT))

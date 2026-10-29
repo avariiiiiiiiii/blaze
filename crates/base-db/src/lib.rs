@@ -492,6 +492,11 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     #[doc(hidden)]
     fn crates_map(&self) -> Arc<CratesMap>;
 
+    /// A handle on the same database for another thread: the same storage and inputs, its own
+    /// query stack. Results either computes are seen by both. A write to an input waits until
+    /// every fork is dropped, so a fork lives only as long as one parallel read.
+    fn fork(&self) -> Box<dyn SourceDatabase + Send>;
+
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision);
 
     fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()>;

@@ -1,0 +1,439 @@
+//! The VFS made durable, sans-IO: each head move becomes records appended to one file, and a
+//! commit is durable once the sync after its records completes.
+//!
+//! - **Records** are framed `MAGIC, length, kind, payload, checksum`. A node record carries what
+//!   the node is made of, never its ID: loading interns it again, so a record is checked by
+//!   construction and a node is written once however many roots share it. A head record names a
+//!   head, the root it moved to and the journal's sequence number; a removal names a head and
+//!   a sequence number.
+//! - **Group commit**: commits made while an append or a sync is in flight go out together in the
+//!   next append, and one sync makes them all durable.
+//! - **Failures**: a failed append or sync puts its batch back to be appended again. A record
+//!   written twice loads once (a node is interned, a head keeps the highest sequence), and a batch
+//!   half written by a failed append is skipped on load.
+//! - **Recovery** reads the file from the start, skips a damaged stretch by looking for the next
+//!   record whose checksum holds, and drops a head whose root's nodes did not survive. Before
+//!   appending it cuts the file after the last good record and syncs the cut: a torn record
+//!   followed by new ones can borrow their first bytes and pass its checksum, hiding them.
+//! - **Compaction**: after a collection, the next flush replaces the whole file, in one
+//!   [`Effect::Write`], with the nodes the heads reach and one record per head. Nothing is
+//!   appended while it is in flight; a failed one is made again from the state then.
+
+use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_ids::{ContentId, Hasher};
+use rustc_hash::FxHashMap;
+
+use crate::{
+    Recovered, Ticket,
+    tree::{NodeId, Tree},
+};
+
+const MAGIC: [u8; 4] = *b"BZJ2";
+const HEADER: usize = MAGIC.len() + 4 + 1;
+const CHECKSUM: usize = 8;
+const CHECKSUM_DOMAIN: &str = "blaze v2 vfs journal record 1";
+
+const FILE: u8 = 1;
+const DIR: u8 = 2;
+const HEAD: u8 = 3;
+const REMOVE: u8 = 4;
+/// The sequence a rewrite was made at, so the numbers of removals it drops are not given again.
+const SEQUENCE: u8 = 5;
+
+const APPEND: u64 = 0;
+const SYNC: u64 = 1;
+const CUT: u64 = 2;
+const REWRITE: u64 = 3;
+const TAGS: u64 = 4;
+
+#[derive(Default)]
+struct Batch {
+    bytes: Vec<u8>,
+    tickets: Vec<Ticket>,
+}
+
+/// What is in flight: at most one effect at a time, so the file's order is the order asked.
+enum Flight {
+    Idle,
+    Appending(Batch),
+    Syncing(Batch),
+    Cutting,
+    Rewriting(Vec<Ticket>),
+}
+
+pub(crate) struct Journal {
+    file: FileName,
+    tags: u64,
+    /// By node: whether a record of it is in the file, or will be before any record made now.
+    written: Vec<bool>,
+    sequence: u64,
+    /// The sequence of each head, as last written.
+    heads: FxHashMap<Box<str>, u64>,
+    /// Records made and not yet handed to an append.
+    open: Batch,
+    flight: Flight,
+    /// The length to cut the file to before appending.
+    cut: Option<u64>,
+    /// A rewrite is asked for at the next flush.
+    compact: bool,
+    /// Something was appended since the file was last rewritten.
+    dirty: bool,
+    next_ticket: u64,
+}
+
+/// What [`Journal::recover`] rebuilt.
+pub(crate) struct Loaded {
+    pub(crate) tree: Tree,
+    pub(crate) heads: FxHashMap<Box<str>, NodeId>,
+    pub(crate) journal: Journal,
+    pub(crate) found: Recovered,
+}
+
+impl Journal {
+    /// The journal whose file holds `bytes`, and the tree and heads it holds.
+    pub(crate) fn recover(file: FileName, tags: u64, bytes: &[u8]) -> Loaded {
+        let mut tree = Tree::new();
+        let mut found = Recovered::default();
+        let mut moves: FxHashMap<Box<str>, Vec<(u64, Option<ContentId>)>> = FxHashMap::default();
+        let mut sequence = 0;
+        let mut valid = 0;
+        let mut at = 0;
+        while at < bytes.len() {
+            match record(&bytes[at..]) {
+                Some((kind, payload, len)) => {
+                    if load(&mut tree, kind, payload, &mut moves, &mut sequence).is_some() {
+                        found.records += 1;
+                        at += len;
+                        valid = at;
+                        continue;
+                    }
+                    found.skipped += len;
+                    at += len;
+                }
+                None => {
+                    let next = bytes[at + 1..]
+                        .windows(MAGIC.len())
+                        .position(|it| it == MAGIC)
+                        .map_or(bytes.len(), |it| at + 1 + it);
+                    found.skipped += next - at;
+                    at = next;
+                }
+            }
+        }
+        let mut journal = Journal {
+            file,
+            tags,
+            written: vec![true; tree.len()],
+            sequence,
+            heads: FxHashMap::default(),
+            open: Batch::default(),
+            flight: Flight::Idle,
+            cut: (valid < bytes.len()).then_some(valid as u64),
+            compact: false,
+            dirty: !bytes.is_empty(),
+            next_ticket: 0,
+        };
+        let mut heads = FxHashMap::default();
+        let mut names: Vec<Box<str>> = moves.keys().cloned().collect();
+        names.sort_unstable();
+        for name in names {
+            let mut moves = moves.remove(&name).expect("a head read");
+            // The latest record whose root survived; a later one whose nodes did not is dropped.
+            moves.sort_unstable();
+            while let Some((sequence, root)) = moves.pop() {
+                let Some(root) = root else { break };
+                let Some(root) = tree.node(&root).filter(|it| tree.is_dir(*it)) else {
+                    found.heads_dropped += 1;
+                    continue;
+                };
+                heads.insert(name.clone(), root);
+                journal.heads.insert(name, sequence);
+                break;
+            }
+        }
+        Loaded { tree, heads, journal, found }
+    }
+
+    /// Records that `head` moved to `root`; the ticket is in what [`Journal::complete`] returns
+    /// once that is durable.
+    pub(crate) fn record_head(&mut self, tree: &Tree, head: &str, root: NodeId) -> Ticket {
+        self.written.resize(tree.len(), false);
+        write_node(tree, &mut self.written, &mut self.open.bytes, root);
+        self.sequence += 1;
+        self.heads.insert(head.into(), self.sequence);
+        head_record(&mut self.open.bytes, self.sequence, Some(&tree.id(root)), head);
+        self.ticket()
+    }
+
+    /// Records that `head` is gone.
+    pub(crate) fn record_removal(&mut self, head: &str) -> Ticket {
+        self.sequence += 1;
+        self.heads.remove(head);
+        head_record(&mut self.open.bytes, self.sequence, None, head);
+        self.ticket()
+    }
+
+    fn ticket(&mut self) -> Ticket {
+        let ticket = Ticket(self.next_ticket);
+        self.next_ticket += 1;
+        self.open.tickets.push(ticket);
+        ticket
+    }
+
+    /// The sequence number `head` was last written with.
+    pub(crate) fn sequence(&self, head: &str) -> Option<u64> {
+        self.heads.get(head).copied()
+    }
+
+    /// The largest sequence number given out.
+    pub(crate) fn last_sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Starts the next effect if none is in flight: a rewrite if one was asked for, else the cut
+    /// recovery asked for, else an append of what was recorded since the last.
+    pub(crate) fn flush(
+        &mut self,
+        tree: &Tree,
+        heads: &FxHashMap<Box<str>, NodeId>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if !matches!(self.flight, Flight::Idle) {
+            return;
+        }
+        if self.compact {
+            self.compact = false;
+            // The rewrite replaces the whole file, the torn tail with it.
+            self.cut = None;
+            self.dirty = false;
+            self.written = vec![false; tree.len()];
+            let mut names: Vec<&Box<str>> = heads.keys().collect();
+            names.sort_unstable();
+            let mut bytes = Vec::new();
+            for name in &names {
+                write_node(tree, &mut self.written, &mut bytes, heads[*name]);
+            }
+            for name in &names {
+                let sequence = self.heads[&***name];
+                head_record(&mut bytes, sequence, Some(&tree.id(heads[*name])), name);
+            }
+            frame(&mut bytes, SEQUENCE, &self.sequence.to_le_bytes());
+            // What was recorded and not appended is in the rewrite: the heads as they are now.
+            let tickets = std::mem::take(&mut self.open).tickets;
+            effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.tag(REWRITE) });
+            self.flight = Flight::Rewriting(tickets);
+            return;
+        }
+        if let Some(len) = self.cut {
+            effects.push(Effect::Truncate { file: self.file.clone(), len, tag: self.tag(CUT) });
+            self.flight = Flight::Cutting;
+            return;
+        }
+        if self.open.tickets.is_empty() && self.open.bytes.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.open);
+        effects.push(Effect::Append {
+            file: self.file.clone(),
+            bytes: batch.bytes.clone(),
+            tag: self.tag(APPEND),
+        });
+        self.dirty = true;
+        self.flight = Flight::Appending(batch);
+    }
+
+    fn tag(&self, offset: u64) -> Tag {
+        Tag(self.tags + offset)
+    }
+
+    pub(crate) fn owns(&self, tag: Tag) -> bool {
+        tag.0.checked_sub(self.tags).is_some_and(|it| it < TAGS)
+    }
+
+    /// Takes the completion of one of its effects; returns the tickets now durable.
+    pub(crate) fn complete(
+        &mut self,
+        tree: &Tree,
+        heads: &FxHashMap<Box<str>, NodeId>,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Vec<Ticket> {
+        let offset = completion.tag.0 - self.tags;
+        let mut durable = Vec::new();
+        match (offset, completion.done, std::mem::replace(&mut self.flight, Flight::Idle)) {
+            (APPEND, Done::Appended, Flight::Appending(batch)) => {
+                effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) });
+                self.flight = Flight::Syncing(batch);
+            }
+            (SYNC, Done::Synced, Flight::Syncing(batch)) => durable = batch.tickets,
+            (CUT, Done::Truncated, Flight::Cutting) => {
+                self.cut = None;
+                effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) });
+                self.flight = Flight::Syncing(Batch::default());
+            }
+            (CUT, Done::Failed(_), Flight::Cutting) => {}
+            (REWRITE, Done::Written, Flight::Rewriting(tickets)) => durable = tickets,
+            // The file is as it was; the next rewrite is made of the state then, which holds
+            // everything recorded since.
+            (REWRITE, Done::Failed(_), Flight::Rewriting(tickets)) => {
+                let later = std::mem::take(&mut self.open).tickets;
+                self.open.tickets = tickets;
+                self.open.tickets.extend(later);
+                self.compact = true;
+            }
+            // After a failed sync the kernel may have dropped the pages it could not write and
+            // a second sync can then succeed without them, so the batch is written again.
+            (
+                APPEND | SYNC,
+                Done::Failed(_),
+                Flight::Appending(batch) | Flight::Syncing(batch),
+            ) => {
+                let later = std::mem::replace(&mut self.open, batch);
+                self.open.bytes.extend_from_slice(&later.bytes);
+                self.open.tickets.extend(later.tickets);
+            }
+            (offset, done, _) => {
+                unreachable!("the journal has nothing in flight as tag +{offset} for {done:?}")
+            }
+        }
+        self.flush(tree, heads, effects);
+        durable
+    }
+
+    /// Follows a collection: each node's new number, and a rewrite asked for if the file holds
+    /// anything the heads may no longer reach.
+    pub(crate) fn collected(&mut self, renumbered: &[Option<NodeId>], len: usize) {
+        let mut written = vec![false; len];
+        for (old, new) in renumbered.iter().enumerate() {
+            if let Some(new) = new {
+                written[new.0 as usize] = self.written.get(old).copied().unwrap_or(false);
+            }
+        }
+        self.written = written;
+        self.compact |= self.dirty;
+    }
+}
+
+/// Records `node` and everything under it not recorded yet, children first, so a record only
+/// names nodes recorded before it.
+fn write_node(tree: &Tree, written: &mut [bool], out: &mut Vec<u8>, node: NodeId) {
+    let mut stack = vec![(node, false)];
+    while let Some((node, children_done)) = stack.pop() {
+        if written[node.0 as usize] {
+            continue;
+        }
+        if let Some(bytes) = tree.bytes(node) {
+            frame(out, FILE, bytes);
+        } else if !children_done {
+            stack.push((node, true));
+            let entries = tree.entries(node).expect("a directory");
+            stack.extend(
+                entries.iter().filter(|it| !written[it.1.0 as usize]).map(|it| (it.1, false)),
+            );
+            continue;
+        } else {
+            let entries = tree.entries(node).expect("a directory");
+            let mut payload = Vec::new();
+            for &(name, child) in entries {
+                let name = tree.name_str(name);
+                payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(name.as_bytes());
+                payload.extend_from_slice(&tree.id(child).0);
+            }
+            frame(out, DIR, &payload);
+        }
+        written[node.0 as usize] = true;
+    }
+}
+
+fn head_record(out: &mut Vec<u8>, sequence: u64, root: Option<&ContentId>, head: &str) {
+    let mut payload = Vec::with_capacity(8 + 32 + head.len());
+    payload.extend_from_slice(&sequence.to_le_bytes());
+    match root {
+        Some(root) => {
+            payload.extend_from_slice(&root.0);
+            payload.extend_from_slice(head.as_bytes());
+            frame(out, HEAD, &payload);
+        }
+        None => {
+            payload.extend_from_slice(head.as_bytes());
+            frame(out, REMOVE, &payload);
+        }
+    }
+}
+
+fn checksum(kind: u8, payload: &[u8]) -> [u8; CHECKSUM] {
+    let id = Hasher::new(CHECKSUM_DOMAIN).update(&[kind]).update(payload).finish();
+    id.0[..CHECKSUM].try_into().expect("eight bytes")
+}
+
+fn frame(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&u32::try_from(payload.len()).expect("a record under 4 GiB").to_le_bytes());
+    out.push(kind);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&checksum(kind, payload));
+}
+
+/// The record at the start of `bytes`, its payload and its whole length, if it is a whole record
+/// with a good checksum.
+fn record(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
+    if bytes.len() < HEADER + CHECKSUM || bytes[..4] != MAGIC {
+        return None;
+    }
+    let len = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let kind = bytes[8];
+    let end = HEADER.checked_add(len)?;
+    let payload = bytes.get(HEADER..end)?;
+    let sum = bytes.get(end..end.checked_add(CHECKSUM)?)?;
+    (checksum(kind, payload) == *sum).then_some((kind, payload, end + CHECKSUM))
+}
+
+/// Loads one record; `None` when it names a node that is not there or is malformed. `sequence`
+/// becomes the largest any record names.
+fn load(
+    tree: &mut Tree,
+    kind: u8,
+    payload: &[u8],
+    moves: &mut FxHashMap<Box<str>, Vec<(u64, Option<ContentId>)>>,
+    sequence: &mut u64,
+) -> Option<()> {
+    match kind {
+        FILE => {
+            tree.file(std::sync::Arc::from(payload));
+        }
+        DIR => {
+            let mut entries = Vec::new();
+            let mut rest = payload;
+            while !rest.is_empty() {
+                let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+                let name = std::str::from_utf8(rest.get(4..4 + len)?).ok()?;
+                let id = ContentId(rest.get(4 + len..4 + len + 32)?.try_into().ok()?);
+                rest = &rest[4 + len + 32..];
+                let child = tree.node(&id)?;
+                let name = tree.name(name);
+                entries.push((name, child));
+            }
+            tree.dir(entries);
+        }
+        HEAD => {
+            let at = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+            let root = ContentId(payload.get(8..40)?.try_into().ok()?);
+            let name = std::str::from_utf8(&payload[40..]).ok()?;
+            moves.entry(name.into()).or_default().push((at, Some(root)));
+            *sequence = (*sequence).max(at);
+        }
+        REMOVE => {
+            let at = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+            let name = std::str::from_utf8(&payload[8..]).ok()?;
+            moves.entry(name.into()).or_default().push((at, None));
+            *sequence = (*sequence).max(at);
+        }
+        SEQUENCE => {
+            let at = u64::from_le_bytes(payload.try_into().ok()?);
+            *sequence = (*sequence).max(at);
+        }
+        _ => return None,
+    }
+    Some(())
+}

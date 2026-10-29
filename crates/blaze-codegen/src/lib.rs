@@ -17,6 +17,20 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use serde::{Deserialize, Serialize};
 
+pub mod backend;
+pub mod blob;
+pub mod content;
+pub mod dedupe;
+pub mod driver;
+pub mod fold;
+pub mod imports;
+pub mod memo;
+pub mod plan;
+pub mod query;
+pub mod settings;
+pub mod summary;
+pub mod template;
+
 /// A function instance: what is compiled.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Instance {

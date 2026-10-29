@@ -3,6 +3,7 @@ mod imports;
 mod incremental;
 mod macros;
 mod mod_resolution;
+mod parallel;
 
 use expect_test::{Expect, expect};
 use test_fixture::WithFixture;

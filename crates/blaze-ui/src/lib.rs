@@ -9,7 +9,9 @@
 //!   and one summary line takes its place.
 //! - [`Plain`], elsewhere (CI, a pipe): one line per step and crate, as cargo writes them,
 //!   and a line every [`HEARTBEAT_NS`] that nothing else was said.
+//! - [`api`]: the agent API's responses, for a client of it to print.
 
+pub mod api;
 mod live;
 mod plain;
 #[cfg(test)]

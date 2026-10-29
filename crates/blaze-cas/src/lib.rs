@@ -45,6 +45,46 @@ pub enum Kind {
     Image,
 }
 
+impl Kind {
+    pub const ALL: [Kind; 6] =
+        [Kind::Query, Kind::Code, Kind::Debug, Kind::Run, Kind::Output, Kind::Image];
+
+    /// The kind's byte on disk and on the wire.
+    pub const fn code(self) -> u8 {
+        match self {
+            Kind::Query => 0,
+            Kind::Code => 1,
+            Kind::Debug => 2,
+            Kind::Run => 3,
+            Kind::Output => 4,
+            Kind::Image => 5,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Kind> {
+        match code {
+            0 => Some(Kind::Query),
+            1 => Some(Kind::Code),
+            2 => Some(Kind::Debug),
+            3 => Some(Kind::Run),
+            4 => Some(Kind::Output),
+            5 => Some(Kind::Image),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::Query => "query",
+            Kind::Code => "code",
+            Kind::Debug => "debug",
+            Kind::Run => "run",
+            Kind::Output => "output",
+            Kind::Image => "image",
+        }
+    }
+}
+
 /// A value as the store holds it, read in place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Entry<'a> {

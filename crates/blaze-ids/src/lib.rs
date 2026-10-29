@@ -5,11 +5,19 @@
 //! - An [`Idx`] is a dense `u32` index into one arena, assigned in arrival order by parallel
 //!   workers: it differs between runs, so it never goes into a hash, a key or the bytes of an
 //!   output. It may be kept in the daemon's image, which is one run's state.
-//! - An [`Interner`] holds one arena and maps each way between the two.
+//! - An [`Interner`] holds one arena and maps each way between the two; [`Sharded`] is the
+//!   one blaze uses.
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/items.md
 //!   section 6.2).
 
-use std::{fmt, hash, marker::PhantomData};
+use std::{
+    fmt, hash,
+    marker::PhantomData,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+    },
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -182,6 +190,182 @@ pub trait Interner<T>: Sync {
     fn len(&self) -> usize;
 }
 
+/// The [`Interner`] of blaze v2: values in an append-only arena of chunks that never move,
+/// found by content ID in one of [`SHARDS`] open-addressed tables.
+///
+/// Interning locks the one shard its content ID falls in; [`Interner::get`],
+/// [`Interner::content`] and [`Interner::find`] take no lock. A shard's table grows by
+/// copying into one twice its size, published once full; the tables it outgrew are kept until
+/// the interner is dropped, as a reader may be probing one, so the tables cost at most twice
+/// the last one.
+pub struct Sharded<T> {
+    slots: Chunks<T>,
+    next: AtomicU32,
+    /// The values interned and published, for [`Interner::len`].
+    published: AtomicUsize,
+    shards: Box<[Shard]>,
+}
+
+pub const SHARDS: usize = 64;
+
+/// Chunk `k` holds `FIRST << k` slots, so an index's chunk and place in it are arithmetic and
+/// 27 chunks hold every `u32`.
+const FIRST: usize = 64;
+const CHUNKS: usize = 27;
+/// Table `k` of a shard has `TABLE << k` places: 28 hold more than a `u32` of entries.
+const TABLE: usize = 16;
+const TABLES: usize = 28;
+
+type Chunks<T> = [OnceLock<Box<[OnceLock<(ContentId, T)>]>>; CHUNKS];
+
+struct Shard {
+    /// Held to intern; holds how many values the shard has.
+    lock: Mutex<u32>,
+    /// Which of `tables` is the one in use.
+    level: AtomicUsize,
+    /// A place holds an index plus one; 0 is empty.
+    tables: [OnceLock<Box<[AtomicU32]>>; TABLES],
+}
+
+fn chunk_of(raw: u32) -> (usize, usize) {
+    let biased = raw as usize / FIRST + 1;
+    let chunk = (usize::BITS - 1 - biased.leading_zeros()) as usize;
+    (chunk, raw as usize - FIRST * ((1 << chunk) - 1))
+}
+
+impl<T: Send + Sync> Sharded<T> {
+    pub fn new() -> Sharded<T> {
+        Sharded {
+            slots: std::array::from_fn(|_| OnceLock::new()),
+            next: AtomicU32::new(0),
+            published: AtomicUsize::new(0),
+            shards: (0..SHARDS)
+                .map(|_| Shard {
+                    lock: Mutex::new(0),
+                    level: AtomicUsize::new(0),
+                    tables: std::array::from_fn(|_| OnceLock::new()),
+                })
+                .collect(),
+        }
+    }
+
+    fn slot(&self, raw: u32) -> Option<&(ContentId, T)> {
+        let (chunk, at) = chunk_of(raw);
+        self.slots[chunk].get()?.get(at)?.get()
+    }
+
+    fn shard(&self, id: &ContentId) -> &Shard {
+        &self.shards[id.0[0] as usize % SHARDS]
+    }
+
+    /// Where `id`'s probe starts: bits of the ID the shard was not picked by.
+    fn home(id: &ContentId) -> usize {
+        let mut word = [0; 8];
+        word.copy_from_slice(&id.0[8..16]);
+        u64::from_le_bytes(word) as usize
+    }
+
+    fn table(shard: &Shard, level: usize) -> &[AtomicU32] {
+        shard.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU32::new(0)).collect())
+    }
+
+    fn probe(&self, table: &[AtomicU32], id: &ContentId) -> Result<Idx<T>, usize> {
+        let mask = table.len() - 1;
+        let mut at = Self::home(id) & mask;
+        loop {
+            match table[at].load(Ordering::Acquire) {
+                0 => return Err(at),
+                plus_one => {
+                    let raw = plus_one - 1;
+                    let (content, _) = self.slot(raw).expect("a table entry before its value");
+                    if content == id {
+                        return Ok(Idx::from_raw(raw));
+                    }
+                }
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Moves a full shard's entries into a table twice its size and makes it the one in use.
+    /// Called with the shard locked.
+    fn grow(&self, shard: &Shard, level: usize) -> usize {
+        assert!(level + 1 < TABLES, "a shard of more than 2^30 values");
+        let old = Self::table(shard, level);
+        let new = Self::table(shard, level + 1);
+        let mask = new.len() - 1;
+        for entry in old {
+            let plus_one = entry.load(Ordering::Relaxed);
+            if plus_one == 0 {
+                continue;
+            }
+            let (content, _) = self.slot(plus_one - 1).expect("a table entry before its value");
+            let mut at = Self::home(content) & mask;
+            while new[at].load(Ordering::Relaxed) != 0 {
+                at = (at + 1) & mask;
+            }
+            new[at].store(plus_one, Ordering::Relaxed);
+        }
+        shard.level.store(level + 1, Ordering::Release);
+        level + 1
+    }
+}
+
+impl<T: Send + Sync> Default for Sharded<T> {
+    fn default() -> Sharded<T> {
+        Sharded::new()
+    }
+}
+
+impl<T: Send + Sync> Interner<T> for Sharded<T> {
+    fn intern(&self, id: ContentId, value: impl FnOnce() -> T) -> Idx<T> {
+        let shard = self.shard(&id);
+        if let Some(found) = self.find(&id) {
+            return found;
+        }
+        let mut count = shard.lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut level = shard.level.load(Ordering::Acquire);
+        if let Ok(found) = self.probe(Self::table(shard, level), &id) {
+            return found;
+        }
+        if (*count as usize + 1) * 2 > TABLE << level {
+            level = self.grow(shard, level);
+        }
+        let raw = self.next.fetch_add(1, Ordering::Relaxed);
+        assert!(raw != u32::MAX, "an interner of 2^32 values");
+        let (chunk, at) = chunk_of(raw);
+        let slots = self.slots[chunk]
+            .get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
+        if slots[at].set((id, value())).is_err() {
+            unreachable!("index {raw} handed out twice");
+        }
+        let table = Self::table(shard, level);
+        let Err(empty) = self.probe(table, &id) else { unreachable!("interned under the lock") };
+        table[empty].store(raw + 1, Ordering::Release);
+        *count += 1;
+        self.published.fetch_add(1, Ordering::Relaxed);
+        Idx::from_raw(raw)
+    }
+
+    fn get(&self, idx: Idx<T>) -> &T {
+        &self.slot(idx.raw()).expect("an index this interner did not hand out").1
+    }
+
+    fn content(&self, idx: Idx<T>) -> ContentId {
+        self.slot(idx.raw()).expect("an index this interner did not hand out").0
+    }
+
+    fn find(&self, id: &ContentId) -> Option<Idx<T>> {
+        let shard = self.shard(id);
+        let level = shard.level.load(Ordering::Acquire);
+        self.probe(Self::table(shard, level), id).ok()
+    }
+
+    fn len(&self) -> usize {
+        self.published.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +381,80 @@ mod tests {
         let ab_c = Hasher::new("blaze v2 test 1").part(b"ab").part(b"c").finish();
         let a_bc = Hasher::new("blaze v2 test 1").part(b"a").part(b"bc").finish();
         assert_ne!(ab_c, a_bc);
+    }
+
+    fn id(n: u64) -> ContentId {
+        ContentId::of("blaze v2 test 1", &n.to_le_bytes())
+    }
+
+    #[test]
+    fn chunks_cover_every_index() {
+        let mut expected = (0, 0);
+        for raw in 0..100_000u32 {
+            assert_eq!(chunk_of(raw), expected, "{raw}");
+            expected.1 += 1;
+            if expected.1 == FIRST << expected.0 {
+                expected = (expected.0 + 1, 0);
+            }
+        }
+        assert!(chunk_of(u32::MAX).0 < CHUNKS);
+    }
+
+    #[test]
+    fn an_interner_maps_both_ways() {
+        let interner = Sharded::<u64>::new();
+        let indices: Vec<_> = (0..20_000).map(|n| interner.intern(id(n), || n)).collect();
+        assert_eq!(interner.len(), 20_000);
+        for (n, &idx) in indices.iter().enumerate() {
+            let n = n as u64;
+            assert_eq!(*interner.get(idx), n);
+            assert_eq!(interner.content(idx), id(n));
+            assert_eq!(interner.find(&id(n)), Some(idx));
+            assert_eq!(interner.intern(id(n), || unreachable!("interned twice")), idx);
+        }
+        assert_eq!(interner.find(&id(1 << 40)), None);
+        assert_eq!(interner.len(), 20_000);
+    }
+
+    #[test]
+    fn values_never_move() {
+        let interner = Sharded::<String>::new();
+        let first = interner.intern(id(0), || "zero".to_owned());
+        let at = interner.get(first) as *const String;
+        for n in 1..50_000 {
+            interner.intern(id(n), || n.to_string());
+        }
+        assert!(std::ptr::eq(at, interner.get(first)));
+    }
+
+    #[test]
+    fn threads_intern_one_index_per_value() {
+        let interner = Sharded::<u64>::new();
+        let seen: Vec<Vec<Idx<u64>>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8u64)
+                .map(|worker| {
+                    let interner = &interner;
+                    scope.spawn(move || {
+                        (0..10_000u64)
+                            .map(|n| (n + worker * 997) % 10_000)
+                            .map(|n| interner.intern(id(n), || n))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        assert_eq!(interner.len(), 10_000);
+        let mut raws: Vec<u32> = (0..10_000).map(|n| interner.find(&id(n)).unwrap().raw()).collect();
+        raws.sort_unstable();
+        raws.dedup();
+        assert_eq!(raws.len(), 10_000);
+        for (worker, indices) in seen.iter().enumerate() {
+            for (i, &idx) in indices.iter().enumerate() {
+                let n = (i as u64 + worker as u64 * 997) % 10_000;
+                assert_eq!(*interner.get(idx), n);
+                assert_eq!(interner.find(&id(n)), Some(idx));
+            }
+        }
     }
 }

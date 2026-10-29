@@ -7,16 +7,42 @@
 //!
 //! [`plane`] is the same graph for every request a daemon has under way (docs/v2/plane.md):
 //! memo by key, single flight, fair share, critical path and memory admission, with
-//! [`admission`]'s estimates of what each task holds.
+//! [`admission`]'s estimates of what each task holds and [`arena`]'s measure and cap of what it
+//! does hold. [`Machine`] is the plane with one request.
+//!
+//! [`pool`] is the threads the plane's tasks run on, one per core, stealing work nearest first
+//! by [`topology`] (a CCD or a cluster, then a socket, then any). [`pump`] is the rule for a
+//! wait inside a task (#1301): the waiting thread runs other work, and a wait that would close
+//! a cycle is [`Cancelled`] and its task posted again.
 
 pub mod admission;
+pub mod arena;
 pub mod exec;
 pub mod machine;
 pub mod plane;
+pub mod pool;
+pub mod pump;
+pub mod topology;
 pub mod trace;
 
 pub use machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec};
 pub use plane::{Budget, Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId};
 
+/// A task stopped before its end because going on could not end: a wait that would close a
+/// cycle of waits (#1301), memory that could not be had while every holder waits for more, or
+/// its request ended. Its task is posted again whole; nothing of it is kept.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled, to be run again")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+#[cfg(test)]
+mod plane_tests;
 #[cfg(test)]
 mod tests;

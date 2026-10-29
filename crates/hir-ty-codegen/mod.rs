@@ -172,6 +172,7 @@ pub mod bench {
 }
 mod type_id;
 mod unwind;
+pub mod v2;
 mod vtable;
 pub mod wasm;
 mod wasm_object;

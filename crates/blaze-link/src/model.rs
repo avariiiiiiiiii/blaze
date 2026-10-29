@@ -1,0 +1,575 @@
+//! What the linker's core and an object format's writer share (docs/v2/link-notes.md).
+//!
+//! The core is the same for every format: it interns symbols, places pieces in regions of
+//! one address space, makes the jump table, the GOT and the PLT, and applies every
+//! relocation. A format ([`Writer`]: ELF, Mach-O, PE, wasm) says where regions go
+//! ([`Plan`]), reads the format's native inputs ([`NativeFile`]), names the symbols the
+//! linker defines ([`Special`]), fills the regions only it knows the contents of (dynamic
+//! tables, unwind indexes, code signatures: [`Class::Synthetic`]), and writes the file's
+//! headers around the placed regions ([`Writer::file`]).
+//!
+//! Addresses are virtual addresses as the file states them, before the loader slides the
+//! image: [`Plan::base`] is the address of the image's first byte.
+
+use std::ops::Range;
+
+use blaze_codegen::Arch;
+
+use crate::{Format, LinkError, Output};
+
+/// What a region holds. A region is one range of the address space with one protection;
+/// the format writer orders them ([`Writer::order`]) and names them in the file.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub(crate) enum Class {
+    /// Code of a full link.
+    Text,
+    /// Code placed by incremental links since the last full one, and by live patches: kept
+    /// apart so a running program can map it writable.
+    Patch,
+    /// The jump table's stubs: one per [`crate::Slot`].
+    Stubs,
+    /// Stubs that jump through a GOT cell to an imported function.
+    Plt,
+    /// Range-extension veneers for AArch64 branches that can't reach their target.
+    Veneers,
+    Rodata,
+    /// Call frame information (`.eh_frame`, `__eh_frame`) that the core assembles.
+    EhFrame,
+    Data,
+    /// The jump table's cells, and the cell that points at the current table.
+    Table,
+    /// Address cells: of imports, of local symbols reached through the GOT, of TLS offsets
+    /// and descriptors.
+    Got,
+    /// Pointers the loader calls at start (`.init_array`, `__mod_init_func`), in order.
+    InitArray,
+    FiniArray,
+    /// Data placed by incremental links and live patches, as [`Class::Patch`] is for code.
+    PatchData,
+    /// A section a static or a native object names (`#[link_section]`), kept whole and in
+    /// input order so the program can walk it between its start and stop symbols.
+    Named { name: String, write: bool, exec: bool },
+    /// The thread-local template: initialized, then zeroed.
+    Tdata,
+    Tbss,
+    /// Zeroed data, not in the file.
+    Bss,
+    /// Bytes only the writer knows how to make, from the placed image: named by the writer.
+    Synthetic(&'static str),
+}
+
+/// What a region may be accessed as.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Prot {
+    pub read: bool,
+    pub write: bool,
+    pub exec: bool,
+}
+
+impl Prot {
+    pub const RX: Prot = Prot { read: true, write: false, exec: true };
+    pub const R: Prot = Prot { read: true, write: false, exec: false };
+    pub const RW: Prot = Prot { read: true, write: true, exec: false };
+}
+
+/// How a format lays an image out.
+#[derive(Clone, Debug)]
+pub(crate) struct Plan {
+    /// The address of the image's first byte (its headers).
+    pub base: u64,
+    /// Bytes at the start of the first segment for the headers ([`Writer::file`] writes
+    /// them; it may not need more than this).
+    pub headers: u64,
+    /// The alignment of a change of protection: the largest page size of the target.
+    pub page: u64,
+    /// Whether code is reached through a function table by index (wasm) rather than at
+    /// addresses: then each code piece's address is its function index.
+    pub indexed_code: bool,
+    /// Whether the GOT's import cells are grouped by library with a zero cell after each
+    /// group (a PE import address table).
+    pub got_by_library: bool,
+    /// Whether `#[thread_local]` statics are reached through descriptors (Mach-O's TLV) rather
+    /// than at an offset from the thread pointer.
+    pub tls_descriptors: bool,
+}
+
+/// A symbol the linker defines, by name ([`Writer::special`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Special {
+    /// The first byte of the image.
+    ImageBase,
+    /// The start or the end of the regions of a class; an error when there is none.
+    Start(Class),
+    Stop(Class),
+    /// An absolute value.
+    Absolute(u64),
+    /// The descriptor a live program finds its jump table by (`blaze_live::patch`).
+    LiveDescriptor,
+}
+
+/// How a relocation is written. Every format's relocation types are read into these, and
+/// codegen's [`blaze_codegen::RelocKind`]s map onto them; `S` is the target's address, `A`
+/// the addend, `P` the place's address, `G` the address of the target's GOT cell, `M` the
+/// address of [`Fixup::minus`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Apply {
+    /// `S + A`, 64 bits; the loader slides it ([`Placed::rebase`]) or binds it.
+    Abs64,
+    /// `S + A`, 32 bits, unsigned or signed: only in an image the loader never slides.
+    Abs32,
+    Abs32S,
+    /// `S + A - P`.
+    Rel64,
+    Rel32,
+    /// `S - M + A`.
+    Delta64,
+    Delta32,
+    /// `S + A - base`: an image-relative address (PE's `ADDR32NB`, unwind tables).
+    ImageRel32,
+    /// The offset of `S + A` in its output section (PE's `SECREL`), and its section's index.
+    SecRel32,
+    Section16,
+    /// A call or jump to `S + A`: through the PLT when `S` is imported. x86-64 `rel32`.
+    X86Branch32,
+    /// `G + A - P`: the GOT cell of `S` (x86-64 `GOTPCREL`, `GOTPCRELX`, `REX_GOTPCRELX`).
+    X86GotPcRel32,
+    /// `S - end of the TLS block + A`: local exec (`TPOFF32`).
+    X86TpOff32,
+    /// The GOT cell holding `S`'s offset from the thread pointer (`GOTTPOFF`).
+    X86GotTpOff32,
+    /// The GOT pair of `S`'s module and offset, for `__tls_get_addr` (`TLSGD`).
+    X86TlsGd32,
+    /// `S`'s offset in its module's TLS block (`DTPOFF32`, `DTPOFF64`).
+    DtpOff32,
+    DtpOff64,
+    /// AArch64 `BL`, `B`: through the PLT when `S` is imported, a veneer when out of reach.
+    A64Call26,
+    A64Jump26,
+    /// AArch64 `ADRP` of `S + A`'s page, and `ADR` of `S + A`.
+    A64Page21,
+    A64Adr21,
+    /// The low 12 bits of `S + A`, shifted right by `shift` (`ADD` 0, `LDR`/`STR` 0 to 4).
+    A64Lo12 { shift: u8 },
+    A64CondBr19,
+    A64TstBr14,
+    /// `MOVZ`/`MOVK` of 16 bits of `S + A` at `group * 16`.
+    A64MovW { group: u8 },
+    /// The GOT cell of `S`: its page, its low 12 bits for an `LDR` (Mach-O's `GOT_LOAD_*`).
+    A64GotPage21,
+    A64GotLo12,
+    /// `G + A - P`, 32 bits (Mach-O's `POINTER_TO_GOT`).
+    GotRel32,
+    /// Local exec: the offset of `S` from the thread pointer, high and low 12 bits.
+    A64TpHi12,
+    A64TpLo12,
+    /// Initial exec: the GOT cell holding the offset (`TLSIE_*`).
+    A64TlsIePage21,
+    A64TlsIeLo12,
+    /// A TLS descriptor's GOT pair (`TLSDESC_*`); the call needs nothing written.
+    A64TlsDescPage21,
+    A64TlsDescLo12,
+    A64TlsDescAdd12,
+    A64TlsDescCall,
+    /// Mach-O TLV: the page and low 12 bits of `S`'s thread-local variable descriptor.
+    TlvPage21,
+    TlvLo12,
+    /// x86-64 Mach-O TLV: `rel32` to the descriptor.
+    TlvRel32,
+    /// The thread-local offset of `S + A` codegen asks for ([`blaze_codegen::RelocKind::TlsOffset`]):
+    /// 32 bits on x86-64 (`TPOFF32`), a 64-bit literal on AArch64.
+    TlsOffset,
+    /// A relocation only the format's writer applies ([`Writer::apply`]), by its own type.
+    Native(u32),
+}
+
+/// One relocation of a piece.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Fixup {
+    /// From the start of the piece.
+    pub at: u64,
+    pub apply: Apply,
+    pub target: Sym,
+    pub addend: i64,
+    /// [`Apply::Delta64`], [`Apply::Delta32`]: the symbol subtracted.
+    pub minus: Option<Sym>,
+}
+
+/// A symbol of the image: a dense index into its symbol table. One run's state: never in a
+/// key or an output.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub(crate) struct Sym(pub u32);
+
+/// A native input as a format reads it.
+pub(crate) enum NativeFile {
+    Object(Object),
+    Archive(Archive),
+    Shared(Shared),
+}
+
+/// A relocatable object (`.o`, `.obj`, a member of an archive).
+#[derive(Clone, Default, Debug)]
+pub(crate) struct Object {
+    pub sections: Vec<Section>,
+    pub symbols: Vec<Symbol>,
+    /// COMDAT groups: of each name only the first object's sections are kept.
+    pub groups: Vec<Group>,
+    /// Libraries the object asks for (`/DEFAULTLIB` of a COFF object, `LC_LINKER_OPTION`).
+    pub libraries: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Section {
+    pub name: String,
+    pub what: SectionKind,
+    pub align: u64,
+    pub data: Data,
+    pub fixups: Vec<NativeFixup>,
+    /// Kept whatever refers to it (`SHF_GNU_RETAIN`, `S_ATTR_NO_DEAD_STRIP`).
+    pub retain: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SectionKind {
+    /// Placed in this class, at this rank ([`Writer::section`]).
+    Alloc(Class, u32),
+    /// Call frame information, merged into [`Class::EhFrame`] by the core.
+    EhFrame,
+    /// Format-specific unwind input the writer consumes (`__compact_unwind`, `.pdata`,
+    /// `.xdata`): placed in this class, and handed to [`Writer::synthesize`].
+    Unwind(Class),
+    /// Not loaded: debug info, notes, the linker's directives. Left out of the image.
+    Dropped,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Data {
+    Bytes(Vec<u8>),
+    Zero(u64),
+}
+
+impl Data {
+    pub fn len(&self) -> u64 {
+        match self {
+            Data::Bytes(bytes) => bytes.len() as u64,
+            Data::Zero(size) => *size,
+        }
+    }
+}
+
+/// A relocation of a native section, by the object's symbol indexes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct NativeFixup {
+    pub at: u64,
+    pub apply: Apply,
+    pub symbol: u32,
+    pub addend: i64,
+    pub minus: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Symbol {
+    pub name: String,
+    pub def: SymbolDef,
+    pub binding: Binding,
+    pub kind: SymbolKind,
+    /// Not exported from a shared library (`STV_HIDDEN`, a private extern).
+    pub hidden: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SymbolDef {
+    Undefined,
+    /// At `value` from the start of the object's section `section`.
+    Section { section: u32, value: u64, size: u64 },
+    /// A tentative definition, merged by name; the largest wins.
+    Common { size: u64, align: u64 },
+    Absolute(u64),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Binding {
+    Local,
+    Global,
+    Weak,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SymbolKind {
+    Function,
+    Data,
+    Tls,
+    /// The section's own symbol: its start.
+    Section,
+    Other,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Group {
+    pub name: String,
+    pub sections: Vec<u32>,
+}
+
+/// An archive: its members are read only when one defines a symbol the link needs, as a
+/// linker takes them, unless the archive is taken whole.
+#[derive(Clone, Debug)]
+pub(crate) struct Archive {
+    pub members: Vec<Member>,
+    /// Each symbol the archive's index names and the member defining it.
+    pub index: Vec<(String, u32)>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Member {
+    pub name: String,
+    pub bytes: Range<usize>,
+}
+
+/// A shared library: what the image may import from it.
+#[derive(Clone, Debug)]
+pub(crate) struct Shared {
+    /// What the loader finds it by: the ELF `DT_SONAME`, the Mach-O install name, the DLL.
+    pub name: String,
+    pub symbols: Vec<SharedSymbol>,
+    /// More shared libraries it stands for: a linker script's `GROUP`, a `.tbd`'s
+    /// re-exports, an import library's members of other DLLs.
+    pub more: Vec<Shared>,
+    /// Objects and archives a linker script adds (`libc_nonshared.a`): the caller reads
+    /// these by name as further inputs.
+    pub inputs: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct SharedSymbol {
+    pub name: String,
+    /// The version the library defines it at by default (`GLIBC_2.2.5`).
+    pub version: Option<String>,
+    pub kind: SymbolKind,
+    pub weak: bool,
+}
+
+/// A symbol the image imports from a shared library.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Import {
+    pub name: String,
+    /// Index into [`Placed::libraries`]; `None` for a weak symbol no library defines,
+    /// which the loader leaves 0 (ELF, Mach-O weak import).
+    pub library: Option<u32>,
+    pub version: Option<String>,
+    pub kind: SymbolKind,
+    pub weak: bool,
+}
+
+/// A GOT cell and what it holds.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct GotEntry {
+    pub addr: u64,
+    pub holds: Holds,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Holds {
+    /// The address of a symbol of the image (the core wrote it; it is in [`Placed::rebase`]).
+    Local(u64),
+    /// The address of an import, bound by the loader.
+    Import(u32),
+    /// The offset from the thread pointer of a thread-local of the image (written by the core).
+    TpOff(i64),
+    /// The thread pointer offset of an imported thread-local (`R_*_TPOFF64`).
+    ImportTpOff(u32),
+    /// A `__tls_get_addr` pair (module, offset) of a thread-local, local or imported: two cells.
+    TlsGd { import: Option<u32>, offset: u64 },
+    /// A TLS descriptor (two cells) of a thread-local, local or imported.
+    TlsDesc { import: Option<u32>, offset: u64 },
+    /// A Mach-O TLV descriptor: (`__tlv_bootstrap`, key, offset), three cells.
+    Tlv { offset: u64 },
+}
+
+/// An address holding an import's address plus `addend`, which the loader binds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Bind {
+    pub addr: u64,
+    pub import: u32,
+    pub addend: i64,
+}
+
+/// A name the image defines for the loader and other modules: `main` of a PIE that a
+/// shared library calls back, every export of a shared library, the live descriptor.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Export {
+    pub name: String,
+    pub addr: u64,
+    pub size: u64,
+    pub kind: SymbolKind,
+}
+
+/// A placed function, for the unwind tables and the debug info.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Function {
+    pub addr: u64,
+    pub size: u64,
+    /// Its call frame information's FDE in [`Class::EhFrame`], when it has one.
+    pub fde: Option<u64>,
+    /// Windows: its `UNWIND_INFO` in [`Class::Rodata`], and its handler and data, resolved.
+    pub windows: Option<WindowsUnwind>,
+    /// A name for debuggers and backtraces.
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WindowsUnwind {
+    pub info: u64,
+    pub handler: Option<u64>,
+    pub lsda: Option<u64>,
+}
+
+/// A placed region.
+#[derive(Clone, Debug)]
+pub(crate) struct Region {
+    pub class: Class,
+    pub addr: u64,
+    /// What its address range is: what was placed, and room to grow.
+    pub capacity: u64,
+    /// What was placed, from `addr`.
+    pub size: u64,
+    pub prot: Prot,
+    pub align: u64,
+}
+
+/// Where the TLS template is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Tls {
+    pub addr: u64,
+    /// The initialized part's size ([`Class::Tdata`]); the rest to `size` is zeroed.
+    pub init: u64,
+    pub size: u64,
+    pub align: u64,
+}
+
+/// An image placed and relocated, as a writer reads it.
+pub(crate) struct Placed<'a> {
+    pub output: &'a Output,
+    pub plan: &'a Plan,
+    /// In address order; each region's bytes are [`Placed::bytes`] of it.
+    pub regions: &'a [Region],
+    pub contents: &'a [Vec<u8>],
+    /// Shared libraries imported from, in the order the loader loads them.
+    pub libraries: &'a [Library],
+    pub imports: &'a [Import],
+    pub got: &'a [GotEntry],
+    /// Addresses holding an address of the image, which the loader adds the slide to.
+    pub rebase: &'a [u64],
+    pub binds: &'a [Bind],
+    pub exports: &'a [Export],
+    pub functions: &'a [Function],
+    pub entry: Option<u64>,
+    pub tls: Option<Tls>,
+    /// What the image is: the content ID's first 16 bytes, as its build ID or `LC_UUID`.
+    pub id: [u8; 16],
+    /// The debug sections the core made ([`crate::dwarf`]), by DWARF name (`.debug_line`).
+    pub debug: &'a [(&'static str, Vec<u8>)],
+}
+
+impl Placed<'_> {
+    /// The bytes placed in `region` (index into [`Placed::regions`]): empty for zeroed ones.
+    pub fn bytes(&self, region: usize) -> &[u8] {
+        &self.contents[region]
+    }
+
+    pub fn region(&self, class: &Class) -> Option<(usize, &Region)> {
+        self.regions.iter().enumerate().find(|(_, it)| &it.class == class)
+    }
+}
+
+/// A shared library the image needs.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Library {
+    pub name: String,
+    /// Loaded only for a symbol it gives (`--as-needed`): one none of whose symbols are
+    /// imported is left out.
+    pub as_needed: bool,
+}
+
+/// The counts a writer sizes its synthetic regions by, known before anything is placed.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct Counts {
+    pub imports: u64,
+    /// The total length of the imports' names and versions.
+    pub import_names: u64,
+    pub libraries: u64,
+    pub library_names: u64,
+    pub got: u64,
+    /// Places the loader slides or binds: every [`Apply::Abs64`] and every GOT cell.
+    pub absolute: u64,
+    pub exports: u64,
+    pub export_names: u64,
+    pub functions: u64,
+    /// The total length of the functions' debug names.
+    pub function_names: u64,
+    /// Bytes of code and data: a code signature hashes every page of them.
+    pub image: u64,
+}
+
+/// The file a writer makes of a placed image.
+pub(crate) struct File {
+    pub len: u64,
+    /// Byte ranges of the file and what is in them: the headers, the synthetic regions'
+    /// tables outside the address space (symbol tables, a signature). Regions themselves
+    /// are written by the core at [`Writer::offset`].
+    pub parts: Vec<(u64, Vec<u8>)>,
+}
+
+/// An object format.
+pub(crate) trait Writer: Send + Sync {
+    fn format(&self) -> Format;
+
+    fn arch(&self) -> Arch;
+
+    fn plan(&self) -> Plan;
+
+    /// Sorts the classes of the image into the order of the address space, each region a
+    /// run of one protection ([`Writer::prot`]).
+    fn order(&self, classes: &mut Vec<Class>);
+
+    fn prot(&self, class: &Class) -> Prot;
+
+    /// The class a section a static or native object names goes in, and its rank in that
+    /// class: pieces of a lower rank go first, of one rank in input order. `.init_array.00099`
+    /// is [`Class::InitArray`] of rank 99 (before `.init_array`, of rank `u32::MAX`, as GNU
+    /// ld sorts them), `.CRT$XCU` the PE writer's own; `linkme_ITEMS` a [`Class::Named`].
+    fn section(&self, name: &str, write: bool, exec: bool, tls: bool)
+    -> Result<(Class, u32), String>;
+
+    /// The symbol the linker defines under `name`, if it defines one.
+    fn special(&self, name: &str) -> Option<Special>;
+
+    /// Reads a native input of the format.
+    fn read(&self, name: &str, bytes: &[u8], kind: &crate::NativeKind)
+    -> Result<NativeFile, String>;
+
+    /// The synthetic regions the writer fills and how big each may get.
+    fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)>;
+
+    /// Applies an [`Apply::Native`] relocation at `place` of `bytes`, which is at address
+    /// `p`, to the target at `s`.
+    fn apply(&self, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64)
+    -> Result<(), String>;
+
+    /// The contents of each synthetic region, the image placed and its other regions filled.
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError>;
+
+    /// Where the region at `addr` is in the file: `None` for one not in the file (zeroed).
+    fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64>;
+
+    /// The file's headers and its parts outside the address space.
+    fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError>;
+}
+
+/// The writer of an output's format.
+pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
+    match output.format {
+        Format::Elf => crate::elf::writer(output),
+        Format::MachO => crate::macho::writer(output),
+        Format::Pe => crate::pe::writer(output),
+        Format::Wasm => crate::wasm::writer(output),
+    }
+}

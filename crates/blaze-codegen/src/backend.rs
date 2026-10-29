@@ -1,0 +1,216 @@
+//! What the build ([`crate::driver`]) asks of the front end and of a backend.
+//!
+//! The front end ([`Frontend`]) says what an instance is without compiling it: its item, its
+//! code hash and type-argument facts (its [`crate::Instance`]), whose code it is (for its
+//! settings) and what it refers to, in order ([`FrontRef`]). A backend ([`Prepare`]) builds an
+//! instance's IR against those references by place, says what the IR is ([`Shape`]: equal
+//! shapes are one compile, #1291), and compiles it.
+
+use std::{fmt::Debug, hash::Hash};
+
+use blaze_ids::ContentId;
+use blaze_items::{CodeHash, ItemKey};
+
+use crate::{
+    CodegenError, CompiledFunction, InstanceKey, Unit,
+    plan::Origin,
+    settings::Spec,
+    summary::{Imports, Summary},
+    template::{CompiledStatic, Refs},
+};
+
+/// Whether a function's address is something the program can tell apart from another's.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Address {
+    /// Rust functions: their addresses are not unique (rustc's `unnamed_addr`), so equal
+    /// code is one function.
+    Free,
+    /// A symbol outside code can name and compare: `#[no_mangle]`, `#[export_name]`, an
+    /// `extern` definition. Never merged.
+    Significant,
+}
+
+/// What an instance refers to, as its front end names it.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FrontRef<I, S> {
+    Function(I),
+    Static(S),
+    /// A symbol outside blaze's code, by its link name.
+    Extern(String),
+}
+
+/// What the front end says of a function instance, without compiling it.
+#[derive(Clone, Debug)]
+pub struct Described<I, S> {
+    pub item: ItemKey,
+    pub code: CodeHash,
+    /// The content ID of its type arguments' facts its code reads.
+    pub args: ContentId,
+    /// Whose code it is: the item's crate's, or for a generic, the crate that instantiates it.
+    pub origin: Origin,
+    /// `Some` when its MIR says (std's built without, `#[rustc_inherit_overflow_checks]`).
+    pub overflow_checks: Option<bool>,
+    pub address: Address,
+    /// The symbol it is defined as, for what outside code names it by.
+    pub symbol: Option<String>,
+    /// Everything it refers to, each once, in the order of its MIR: its template's places.
+    pub refs: Vec<FrontRef<I, S>>,
+}
+
+/// What the front end says of a static.
+#[derive(Clone, Debug)]
+pub struct DescribedStatic<I, S> {
+    pub item: ItemKey,
+    /// Which instance of the item: a generic's thread-local or a promoted constant's owner;
+    /// [`ContentId::default`] for a plain static.
+    pub instance: ContentId,
+    /// The content ID of its evaluated value and its layout: the key of its bytes.
+    pub value: ContentId,
+    pub origin: Origin,
+    pub symbol: Option<String>,
+    pub refs: Vec<FrontRef<I, S>>,
+}
+
+/// The front end of a build: which instances there are and what they refer to.
+pub trait Frontend: Sync {
+    /// A function instance, as the front end holds it. Never hashed: its content is
+    /// [`Described::code`] and [`Described::args`].
+    type Instance: Clone + Eq + Hash + Send + Sync + Debug;
+    type Static: Clone + Eq + Hash + Send + Sync + Debug;
+
+    /// `requester` is whose code asks for it: a generic is compiled as that crate asks.
+    fn describe(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+    ) -> Result<Described<Self::Instance, Self::Static>, CodegenError>;
+
+    fn describe_static(
+        &self,
+        value: &Self::Static,
+    ) -> Result<DescribedStatic<Self::Instance, Self::Static>, CodegenError>;
+}
+
+/// The canonical bytes of a prepared function: its IR with every reference by its place in
+/// [`Described::refs`] and every setting that changes its code. Two with equal bytes compile
+/// to one [`crate::template::Template`].
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Shape(pub Vec<u8>);
+
+pub const SHAPE_DOMAIN: &str = "blaze v2 shape 1";
+
+impl Shape {
+    pub fn key(&self, unit: &Unit) -> ContentId {
+        let mut hasher = blaze_ids::Hasher::new(SHAPE_DOMAIN);
+        hasher.id(&unit.instance.settings.0);
+        hasher.update(&[crate::content::arch_tag(unit.arch)]).part(&self.0);
+        hasher.finish()
+    }
+}
+
+/// What a compile gives.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Emitted {
+    pub function: CompiledFunction,
+    /// Its debug info and panic locations, kept in the store under
+    /// [`CompiledFunction::side`].
+    pub side: Option<Vec<u8>>,
+}
+
+/// A function a release compile imports: its export (its IR as the backend shows it to an
+/// importer) and what its places are in this build.
+#[derive(Debug)]
+pub struct Import<'a, E> {
+    pub key: InstanceKey,
+    pub export: &'a E,
+    pub refs: &'a Refs,
+}
+
+impl<E> Clone for Import<'_, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Copy for Import<'_, E> {}
+
+/// The references of a release compile: its own, then each imported function's, in
+/// [`Imports::imported`]'s order, each target once. The places of its template.
+pub fn release_refs(own: &Refs, imported: &[&Refs]) -> Vec<crate::Target> {
+    let mut seen: std::collections::HashSet<ContentId> =
+        own.iter().map(crate::content::target_id).collect();
+    let mut refs = own.to_vec();
+    for import in imported {
+        for target in import.iter() {
+            if seen.insert(crate::content::target_id(target)) {
+                refs.push(target.clone());
+            }
+        }
+    }
+    refs
+}
+
+/// A backend, as a build runs it per function.
+pub trait Prepare: Sync {
+    type Frontend: Frontend;
+    /// A function whose IR is built, waiting to be compiled.
+    type Prepared: Send;
+    /// A release function's IR as its importers link it; held for one build, never stored.
+    type Export: Send + Sync;
+
+    /// Builds the IR of `instance` against `refs`, which are [`Described::refs`] as this
+    /// build resolved them. A reference the IR needs that `refs` lacks is an error, never
+    /// added: the front end's list is the template's places.
+    fn prepare(
+        &self,
+        frontend: &Self::Frontend,
+        unit: &Unit,
+        spec: &Spec,
+        instance: &<Self::Frontend as Frontend>::Instance,
+        refs: &Refs,
+    ) -> Result<(Shape, Self::Prepared), CodegenError>;
+
+    /// Release: what cross-function passes need of the function, and its export, from its
+    /// prepared IR. Only asked of units whose backend is LLVM.
+    fn summarize(
+        &self,
+        unit: &Unit,
+        spec: &Spec,
+        prepared: &Self::Prepared,
+        refs: &Refs,
+    ) -> Result<(Summary, Self::Export), CodegenError>;
+
+    /// Compiles a prepared function. `imports` is what a release unit may build in, decided
+    /// from the summaries of the whole build, with [`release_refs`] as `refs`; `None` for
+    /// every other, with its own.
+    fn emit(
+        &self,
+        unit: &Unit,
+        spec: &Spec,
+        prepared: Self::Prepared,
+        refs: &Refs,
+        imports: Option<(&Imports, &[Import<'_, Self::Export>])>,
+    ) -> Result<Emitted, CodegenError>;
+
+    /// #1292: the prepared IR with its constants masked, for [`crate::fold::groups`]; `None`
+    /// for one that can't be folded (a backend or a function that has no thunk).
+    fn masked(&self, unit: &Unit, prepared: &Self::Prepared) -> Option<crate::fold::Masked>;
+
+    /// Compiles a group's one body, taking the constants that differ as parameters, and a
+    /// thunk for each member, which calls it with the member's constants. `members` are in
+    /// the group's order, each with its own references.
+    fn merge(
+        &self,
+        group: &crate::fold::Group,
+        members: Vec<(&Unit, &Spec, Self::Prepared, &Refs)>,
+    ) -> Result<crate::fold::Merged, CodegenError>;
+
+    /// A static's value, its references by place in `refs`.
+    fn compile_static(
+        &self,
+        frontend: &Self::Frontend,
+        spec: &Spec,
+        value: &<Self::Frontend as Frontend>::Static,
+        refs: &Refs,
+    ) -> Result<CompiledStatic, CodegenError>;
+}

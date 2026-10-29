@@ -34,7 +34,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE.parent
@@ -294,6 +294,11 @@ class Engine(ABC):
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
         """The length in seconds of the longest chain of work the last cold build of `ws` waited on."""
 
+    @abstractmethod
+    def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
+        """Writes to `to` what the last build of `ws` left in the query database, as the
+        deterministic CBOR of `blaze_v2_proof::Trace`, which `blaze-v2-proof` compares."""
+
 
 class V1(Engine):
     """Today's blaze (`blaze` beside `blaze-engine`): a daemon of workers, each logging what it
@@ -302,7 +307,7 @@ class V1(Engine):
     def not_blazes(self, ran: Ran) -> str | None:
         import blaze_cli
 
-        how = blaze_cli.how_built(ran.stderr)
+        how = cast(str, blaze_cli.how_built(ran.stderr))
         return None if how == "daemon" or how.startswith("unchanged") else how
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
@@ -370,6 +375,9 @@ class V1(Engine):
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
         raise Unmeasurable("v1 does not record the critical path of a build")
 
+    def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
+        raise Unmeasurable("v1 has no query database of fingerprints and edges to trace")
+
 
 class V2(Engine):
     """blaze v2 (docs/v2/README.md): one daemon per machine, whose only interface is the agent
@@ -401,6 +409,9 @@ class V2(Engine):
 
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
         raise Missing("the critical path of a request, as the plane measured it")
+
+    def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
+        raise Missing("a view's trace: every result of its last build with its fingerprint, edges and whether it ran")
 
 
 def platform_name() -> str:

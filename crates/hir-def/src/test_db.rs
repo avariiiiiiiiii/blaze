@@ -138,6 +138,10 @@ impl SourceDatabase for TestDB {
         self.crates_map.clone()
     }
 
+    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
+        Box::new(self.clone())
+    }
+
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
         (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
     }
@@ -315,9 +319,14 @@ impl TestDB {
         None
     }
 
+    /// The events of `f`, in the order they happened: its def maps expand their macros on this
+    /// thread alone, so the order is one a test can expect.
     pub(crate) fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
+        use crate::nameres::EXPANSION_THREADS;
         *self.events.lock().unwrap() = Some(Vec::new());
+        let threads = EXPANSION_THREADS.replace(Some(1));
         f();
+        EXPANSION_THREADS.set(threads);
         self.events.lock().unwrap().take().unwrap()
     }
 

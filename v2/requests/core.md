@@ -8,3 +8,6 @@
   = true`).
 - Why: the worker pool (docs/v2/core.md section 4) steals work between threads; each worker's
   deque is crossbeam's Chase-Lev deque, so the hot path takes no lock.
+
+---
+Applied by the coordinator, 16:46.

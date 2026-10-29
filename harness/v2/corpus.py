@@ -1,6 +1,6 @@
 """corpus.py: real crates built, run and tested by blaze and by plain cargo with the pinned
-nightly, and what each program prints and how each test ends compared (docs/v2.md section 11,
-"Differential against rustc").
+nightly, and what each program prints and how each test ends compared (docs/v2/proof.md
+section 11, "Differential against rustc").
 
     uv run --frozen python harness/v2/corpus.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/corpus.json"}'
     uv run --frozen python harness/v2/corpus.py '{"engine": {...}, "out": "...", "projects": ["crates.io"], "crates": ["itoa"]}'
@@ -350,22 +350,26 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
     return Found(name, verdict, detail, {"blaze_s": round(ours.seconds, 2), "cargo_s": round(theirs.seconds, 2)})
 
 
-def run_program(eng: engine.Engine, program: Program, root: Path, store: Path, keep: bool) -> list[Found]:
-    """Every outcome of `program`, built in `root`. Never raises for what the harness could not
-    do: that is an outcome too."""
+def run_program(eng: engine.Engine, program: Program, root: Path, store: Path,
+                keep: bool) -> tuple[list[Found], str]:
+    """Every outcome of `program`, built in `root`, and the sha256 of the `Cargo.lock` both
+    sides built with ("" when it never got that far). Never raises for what the harness could
+    not do: that is an outcome too."""
     ws, home = root / "ws", root / "h"
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     try:
         program.prepare(ws)
     except (engine.Failed, OSError) as e:
-        return [Found(f"{program.name}: fetch", "error", str(e))]
+        return [Found(f"{program.name}: fetch", "error", str(e))], ""
     ours_env = eng.env(home, store, extra=program.env)
     theirs_env = engine.reference_env(ws / "target-ref", program.env)
     found: list[Found] = []
+    lock = ""
     doing = "cargo fetch"
     try:
         engine.run(f"{program.name}: cargo fetch", ["cargo", "fetch"], ws, theirs_env, 1800, check=True)
+        lock = hashlib.sha256((ws / "Cargo.lock").read_bytes()).hexdigest()
         for step in program.steps:
             doing = step.label
             done = step_of(eng, program, step, ws, root, ours_env, theirs_env)
@@ -386,7 +390,7 @@ def run_program(eng: engine.Engine, program: Program, root: Path, store: Path, k
             found.append(Found(f"{program.name}: stopping the daemon", "error", str(e)))
         if not keep:
             shutil.rmtree(root, ignore_errors=True)
-    return found
+    return found, lock
 
 
 def programs_of(args: Input, corpus: Corpus, cache: Path) -> list[Program]:
@@ -422,11 +426,15 @@ def main(args: Input) -> None:
     rep.extra.update(work=str(work), programs=[p.name for p in programs], toolchain=engine.TOOLCHAIN)
     print(f"work: {work}", flush=True)
     store = work / "store"
+    locks: dict[str, str] = {}
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        running = [pool.submit(run_program, eng, p, work / p.dir, store, args.keep) for p in programs]
+        running = {pool.submit(run_program, eng, p, work / p.dir, store, args.keep): p.name for p in programs}
         for done in concurrent.futures.as_completed(running):
-            for found in done.result():
+            founds, lock = done.result()
+            locks[running[done]] = lock
+            for found in founds:
                 rep.add(found.name, found.verdict, found.detail, **found.numbers)
+    rep.extra["locks"] = dict(sorted(locks.items()))
     if not args.keep:
         shutil.rmtree(store, ignore_errors=True)
     rep.finish()
@@ -552,7 +560,7 @@ def selftest() -> int:
         try:
             test()
             print(f"ok    {test.__name__}", flush=True)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             failed += 1
             print(f"FAIL  {test.__name__}: {type(e).__name__}: {e}", flush=True)
     print(f"{SCRIPT} selftest: {len(SELFTESTS) - failed} of {len(SELFTESTS)} pass", flush=True)

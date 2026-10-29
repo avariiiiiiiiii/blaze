@@ -1,6 +1,7 @@
 //! Statics with `#[link_section]`, which on wasm are custom sections of the module: two in
 //! one section (the linker joins them, as it does those of every object), one in a section
-//! of its own that nothing refers to, and one the code reads, which is in memory too.
+//! of its own that nothing refers to, and one the code reads, which is in memory too; and two
+//! in `.init_array`, which are no custom section but init functions.
 
 #[unsafe(link_section = "blaze_joined")]
 pub static FIRST: [u8; 5] = *b"hello";
@@ -18,3 +19,16 @@ pub static READ: (u16, [u8; 2]) = (0xbeef, *b"ok");
 pub fn read() -> u32 {
     u32::from(READ.0) + u32::from(READ.1[0]) + u32::from(FIRST[4])
 }
+
+/// What `ctor` puts on wasm: a function pointer in `.init_array`, which is no custom section but
+/// an init function of the module, called from `__wasm_call_ctors`; one of the default priority
+/// and one of priority 101.
+#[unsafe(link_section = ".init_array")]
+#[used]
+static INIT: extern "C" fn() = init;
+
+#[unsafe(link_section = ".init_array.101")]
+#[used]
+static EARLY: extern "C" fn() = init;
+
+extern "C" fn init() {}

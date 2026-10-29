@@ -721,6 +721,7 @@
      "blaze-build-script",
      "blaze-cache",
      "blaze-fmt",
+     "blaze-graph",
      "blaze-in-place",
      "blaze-lints",
      "blaze-live",
@@ -6744,6 +6745,9 @@
     },
     "blaze-fuzz": {
      "path": "crates/blaze-fuzz"
+    },
+    "blaze-graph": {
+     "path": "crates/blaze-graph"
     },
     "blaze-lints": {
      "path": "crates/blaze-lints"
@@ -19266,6 +19270,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -20818,6 +20826,47 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
     },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",
@@ -40657,6 +40706,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -42209,6 +42262,47 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
     },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",
@@ -61921,6 +62015,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -63473,6 +63571,47 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
     },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",
@@ -83339,6 +83478,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -84891,6 +85034,47 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_fmt"
+    },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
     },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",

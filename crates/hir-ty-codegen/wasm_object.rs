@@ -295,21 +295,14 @@ pub(super) fn from_elf(
         writer.code_relocs.push(fixup);
     }
 
-    // A pointer in `.init_array` is no data of the module: it names an init function, which
-    // the linker calls from `__wasm_call_ctors` (listed below, once every function has its
-    // symbol).
-    let mut inits = Vec::new();
-    let datas: Vec<_> = datas
-        .into_iter()
+    // A pointer in `.init_array` is an init function too, which the linker calls from
+    // `__wasm_call_ctors` (listed below, once every function has its symbol). The static stays
+    // data as well, as rustc's object has it, since code may take its address or read it.
+    let inits: Vec<_> = datas
+        .iter()
         .filter_map(|symbol| {
             let section = symbol.section_index().and_then(|it| file.section_by_index(it).ok());
-            match section.and_then(|it| init_priority(it.name().ok()?)) {
-                Some(priority) => {
-                    inits.push((symbol, priority));
-                    None
-                }
-                None => Some(symbol),
-            }
+            Some((symbol.index(), init_priority(section?.name().ok()?)?))
         })
         .collect();
 
@@ -449,38 +442,38 @@ pub(super) fn from_elf(
         }
     }
 
-    // Each pointer of `.init_array` is one init function, of its section's priority.
-    for (symbol, priority) in inits {
+    // Each pointer of `.init_array` is one init function, of its section's priority: a static
+    // holds any number of them, as `[extern "C" fn(); 2]` two, or none, as a null one.
+    for (index, priority) in inits {
+        let symbol = file.symbol_by_index(index).map_err(|e| format!("wasm object: {e}"))?;
         let name = symbol.name().map_err(|e| format!("wasm object: {e}"))?;
         let section_index = symbol.section_index().expect("a defined symbol");
         let (section, _) = section_data(section_index)?;
         let range = symbol.address()..symbol.address() + symbol.size();
-        let mut pointers = section.relocations().filter(|(offset, _)| range.contains(offset));
-        let (Some((_, reloc)), None) = (pointers.next(), pointers.next()) else {
-            return Err(format!(
-                "wasm object: `{name}` in `.init_array` is not one function pointer"
-            ));
-        };
-        let RelocationTarget::Symbol(target) = reloc.target() else {
-            return Err("wasm object: relocation against no symbol".to_owned());
-        };
-        let target_symbol =
-            file.symbol_by_index(target).map_err(|e| format!("wasm object: {e}"))?;
-        let function = if target_symbol.kind() == SymbolKind::Section {
-            target_symbol
-                .section_index()
-                .and_then(|section| containing(section, reloc.addend() as u64))
-                .filter(|it| it.is_function && it.address == reloc.addend() as u64)
-                .map(|it| it.symbol)
-        } else {
-            symbol_of.get(&target).filter(|(_, is_function)| *is_function).map(|&(it, _)| it)
-        };
-        let Some(function) = function else {
-            return Err(format!("wasm object: `{name}` in `.init_array` points to no function"));
-        };
-        priority.encode(&mut writer.init_funcs);
-        function.encode(&mut writer.init_funcs);
-        writer.init_count += 1;
+        for (_, reloc) in section.relocations().filter(|(offset, _)| range.contains(offset)) {
+            let RelocationTarget::Symbol(target) = reloc.target() else {
+                return Err("wasm object: relocation against no symbol".to_owned());
+            };
+            let target_symbol =
+                file.symbol_by_index(target).map_err(|e| format!("wasm object: {e}"))?;
+            let function = if target_symbol.kind() == SymbolKind::Section {
+                target_symbol
+                    .section_index()
+                    .and_then(|section| containing(section, reloc.addend() as u64))
+                    .filter(|it| it.is_function && it.address == reloc.addend() as u64)
+                    .map(|it| it.symbol)
+            } else {
+                symbol_of.get(&target).filter(|(_, is_function)| *is_function).map(|&(it, _)| it)
+            };
+            let Some(function) = function else {
+                return Err(format!(
+                    "wasm object: `{name}` in `.init_array` points to no function"
+                ));
+            };
+            priority.encode(&mut writer.init_funcs);
+            function.encode(&mut writer.init_funcs);
+            writer.init_count += 1;
+        }
     }
 
     let mut sections: Vec<(&str, Vec<u8>)> = Vec::new();

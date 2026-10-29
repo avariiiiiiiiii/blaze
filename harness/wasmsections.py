@@ -7,10 +7,17 @@ and compares the custom sections of the two objects, leaving out the linker's ow
 tools. A static in `.init_array` is none: it is an init function of the module (`ctor`'s), and
 the priorities of the `WASM_INIT_FUNCS` of the two `linking` sections are compared too.
 
-usage: wasmsections.py [target ...]   (default: wasm32-unknown-unknown wasm32-wasip1)
+    uv run --frozen python harness/wasmsections.py '{}'
+    uv run --frozen python harness/wasmsections.py '{"targets": ["wasm32-wasip1"]}'
+
+One JSON object, inline, a file's path, or `-` for stdin: `targets` names the wasm targets
+(empty runs wasm32-unknown-unknown and wasm32-wasip1). Unknown fields are refused.
 """
 import os, subprocess, sys, tempfile
+from dataclasses import dataclass
+
 from difftest import BLAZE
+from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "wasmsections")
@@ -107,9 +114,19 @@ def check(target, work):
     return False
 
 
+@dataclass(frozen=True)
+class Input:
+    targets: tuple[str, ...] = ()
+
+
 def main():
+    match sys.argv[1:]:
+        case [text]:
+            options = parse(Input, text, "wasmsections.py")
+        case _:
+            fail("wasmsections.py", "usage: wasmsections.py JSON (see the top of the file)")
     os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-    targets = sys.argv[1:] or ["wasm32-unknown-unknown", "wasm32-wasip1"]
+    targets = options.targets or ("wasm32-unknown-unknown", "wasm32-wasip1")
     with tempfile.TemporaryDirectory(prefix="wasmsections-") as work:
         right = sum(check(target, work) for target in targets)
     print(f"{right} of {len(targets)} right")

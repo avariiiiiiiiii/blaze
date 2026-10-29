@@ -3795,8 +3795,7 @@ impl<'db> Evaluator<'db> {
                 self.exec_fn_pointer(func_data, destination, &args[1..], locals, target_bb, span)
             }
             TyKind::Closure(closure, subst) => {
-                let consumed = (Some(def) == self.cached_fn_once_trait_func
-                    && func_ty == func.ty)
+                let consumed = (Some(def) == self.cached_fn_once_trait_func && func_ty == func.ty)
                     .then_some(func_ty);
                 self.exec_closure(
                     closure.0,
@@ -3983,7 +3982,9 @@ impl<'db> Evaluator<'db> {
                         ty,
                     )
                     .map_err(|_| {
-                        MirEvalError::NotSupported(format!("dropping {ty:?}, which does not normalize"))
+                        MirEvalError::NotSupported(format!(
+                            "dropping {ty:?}, which does not normalize"
+                        ))
                     })?;
                 if matches!(normalized.kind(), TyKind::Alias(..) | TyKind::Infer(..)) {
                     not_supported!("dropping {ty:?}, which does not normalize");
@@ -4003,7 +4004,9 @@ impl<'db> Evaluator<'db> {
                 }
                 let layout = self.layout_adt(id, subst)?;
                 if adt_def.is_box() {
-                    let AdtId::StructId(s) = id else { not_supported!("a box that is not a struct") };
+                    let AdtId::StructId(s) = id else {
+                        not_supported!("a box that is not a struct")
+                    };
                     let field_types = self.db.field_types(s.into());
                     let Some((_, pointer)) = field_types.iter().next() else {
                         not_supported!("a box with no pointer");
@@ -4046,7 +4049,8 @@ impl<'db> Evaluator<'db> {
                 for (index, (field, _)) in fields.iter().enumerate() {
                     let offset =
                         layout.fields.offset(u32::from(field.into_raw()) as usize).bytes_usize();
-                    let ty = field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    let ty =
+                        field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
                     // The metadata of an unsized struct is its last field's (`RefCell<dyn FnMut()>`).
                     let metadata = if Some(index) == last { metadata.to_vec() } else { Vec::new() };
                     parts.push(DropStep::Glue(ty, addr.offset(offset), metadata));

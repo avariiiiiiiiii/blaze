@@ -116,7 +116,9 @@ pub fn detect_variant_from_bytes<'a>(
                     // A direct tag is the discriminant, read as signed when its type is (a
                     // `#[repr(i8)]` variant `= -1`), as the evaluator's `Discriminant` reads it.
                     let tag = match signed {
-                        true => i128::from_le_bytes(pad16(&b[offset..offset + size], IsSigned::Yes)),
+                        true => {
+                            i128::from_le_bytes(pad16(&b[offset..offset + size], IsSigned::Yes))
+                        }
                         false => tag,
                     };
                     let (def, var_idx) = variants.indices().find_map(|var_idx| {

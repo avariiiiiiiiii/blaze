@@ -15699,13 +15699,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 } else {
                     // x86-64's LLVM makes `simd_relaxed_fma` (`llvm.fmuladd`) of a CPU without
                     // FMA a multiply and then an add (`mulps`, `addps`), rounded twice.
-                    let unfused =
-                        name == "simd_relaxed_fma" && self.cg.target.arch == Arch::X86_64;
+                    let unfused = name == "simd_relaxed_fma" && self.cg.target.arch == Arch::X86_64;
                     let lanes: Vec<Value> = (0..count)
                         .map(|i| {
                             let offset = (i * lane.ty.bytes() as u64) as i32;
-                            let [x, y, z] = [a, b, c]
-                                .map(|v| self.builder.ins().load(lane.ty, MEM, v, offset));
+                            let [x, y, z] =
+                                [a, b, c].map(|v| self.builder.ins().load(lane.ty, MEM, v, offset));
                             if unfused {
                                 let product = self.builder.ins().fmul(x, y);
                                 self.builder.ins().fadd(product, z)

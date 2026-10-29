@@ -86,9 +86,9 @@ pub(crate) fn description(
         out["sysroot"] = json!(sysroot.to_string());
         // The library the graph was loaded with: `library/` above `core/src/lib.rs`, which is
         // blaze's own and not the toolchain's.
-        let core = graph.iter().find(|it| {
-            matches!(graph[*it].basic.origin, CrateOrigin::Lang(LangCrateOrigin::Core))
-        });
+        let core = graph
+            .iter()
+            .find(|it| matches!(graph[*it].basic.origin, CrateOrigin::Lang(LangCrateOrigin::Core)));
         let library = core.and_then(|it| {
             let root = vfs.file_path(graph[it].basic.root_file_id);
             Some(root.as_path()?.parent()?.parent()?.parent()?.to_owned())

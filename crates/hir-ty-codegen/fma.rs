@@ -1174,9 +1174,7 @@ impl<'db> FunctionCx<'_, 'db> {
             if !FunctionSignature::is_intrinsic(db, callee) {
                 let inlined =
                     self.rustc_inlines(Some(func), callee).map_err(|e| format!("{e:?}"))?;
-                if inlined != Some(false)
-                    && self.has_fma(callee).map_err(|e| format!("{e:?}"))?
-                {
+                if inlined != Some(false) && self.has_fma(callee).map_err(|e| format!("{e:?}"))? {
                     return Err(format!("its call of `{name}` may have one"));
                 }
                 continue;
@@ -1403,10 +1401,8 @@ fn rustc_inlines_at(
     if flags.contains(AttrFlags::INLINE_NEVER) {
         return Ok(Some(false));
     }
-    let (mine, theirs) = (
-        AttrFlags::target_feature_list(db, caller),
-        AttrFlags::target_feature_list(db, callee),
-    );
+    let (mine, theirs) =
+        (AttrFlags::target_feature_list(db, caller), AttrFlags::target_feature_list(db, callee));
     if mine != theirs {
         let (enabled, enabled_there) = (
             hir_ty::TargetFeatures::from_fn(db, caller),
@@ -1428,10 +1424,7 @@ fn rustc_inlines_at(
         body.basic_blocks
             .iter()
             .filter(|(_, it)| {
-                matches!(
-                    it.terminator.as_ref().map(|t| &t.kind),
-                    Some(TerminatorKind::Call { .. })
-                )
+                matches!(it.terminator.as_ref().map(|t| &t.kind), Some(TerminatorKind::Call { .. }))
             })
             .count()
     };
@@ -1535,9 +1528,7 @@ fn inline_cost<'db>(
                     (25 + pad).max(inner + 5 * (args.len() + 1))
                 }
             }
-            TerminatorKind::Goto { .. }
-            | TerminatorKind::Return
-            | TerminatorKind::Unreachable => 0,
+            TerminatorKind::Goto { .. } | TerminatorKind::Return | TerminatorKind::Unreachable => 0,
             TerminatorKind::SwitchInt { .. } => 5,
             TerminatorKind::Assert { .. } | TerminatorKind::Drop { .. } => 75,
             TerminatorKind::UnwindResume => 45,

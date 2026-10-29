@@ -11,6 +11,7 @@ since the release before and the title of each change merged since.
 
 ### Added
 
+- `blaze lock --fetches` hands fframes its downloads: `ffmpeg-sys-fframes` its prebuilt FFmpeg (`FFMPEG_BINARIES_CACHE`), or, for a feature set none was made for, FFmpeg's source as the git repository its build script clones (git's `insteadOf`, through `GIT_CONFIG_COUNT`); `skia-bindings` its prebuilt Skia (`SKIA_BINARIES_URL`, a `file://` address). It takes a build's `-p`, `--workspace`, `--exclude` and `--tests`, recording the downloads for the features that build resolves, and keeps the entries of other feature sets: a download that depends on features was refused to every build whose features were not the whole workspace's (#1349).
 - Remote cache: every push writes the project's key index (`manifests/<project>.index`, runs and shards under `index/`), which says which pack holds a key without the key list of every pack; the gateway takes `index/<sha256>` (docs/cache.md, "The remote").
 - `blaze ui` opens the build page: the daemon serves it on 127.0.0.1 under a random token,
   starting it at the first `blaze ui` (`--no-open` prints the address alone). It draws every

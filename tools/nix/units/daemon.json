@@ -2506,6 +2506,7 @@
      "itertools 0.15.0",
      "la-arena",
      "macros",
+     "parser",
      "project-model",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_pattern_analysis",
@@ -2518,6 +2519,7 @@
      "span",
      "stdx",
      "syntax",
+     "syntax-bridge",
      "test-fixture",
      "test-utils",
      "tracing",
@@ -22388,6 +22390,28 @@
      "src": "src/lib.rs",
      "target": "cobs"
     },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
+    },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
      "deps": [],
@@ -25891,6 +25915,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -25931,6 +25959,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -25969,6 +26001,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",
@@ -43804,6 +43840,28 @@
      "src": "src/lib.rs",
      "target": "cobs"
     },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
+    },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
      "deps": [],
@@ -47227,6 +47285,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -47267,6 +47329,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -47305,6 +47371,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",
@@ -65133,6 +65203,28 @@
      "src": "src/lib.rs",
      "target": "cobs"
     },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
+    },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
      "deps": [],
@@ -68667,6 +68759,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -68707,6 +68803,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -68745,6 +68845,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",
@@ -86576,6 +86680,28 @@
      "src": "src/lib.rs",
      "target": "cobs"
     },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
+    },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
      "deps": [],
@@ -90030,6 +90156,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -90070,6 +90200,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -90108,6 +90242,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",

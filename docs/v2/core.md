@@ -50,3 +50,16 @@ From blaze-next's `blaze-core` and the `sansio` lane's steps 1-3 of `docs/driver
 - **#1301 owner thread with pump-wait**: the rule for any wait inside a step: a waiting
   thread serves requests, and a nested request that needs what an outer one holds is cancelled
   and reposted, so no deadlock by construction. (`v2-core`)
+
+## One memo, the database's
+
+The plane schedules; it does not remember. The only memo of results is the query database's
+(`docs/v2/db.md`), keyed by input hash. Before the plane runs a node with a key, it asks the
+database through one trait (`Memo::settled(key) -> Option<Outcome>`), and single flight joins
+nodes of the same key while one runs. `plane.rs`'s own memo of settled keys goes.
+
+## Windows
+
+A driver for Windows: IOCP for files, sockets and timers, `ReadDirectoryChangesW` for file
+changes, job objects for children, alongside io_uring and kqueue. Its sandbox is usercode's
+(AppContainer and job objects, #1390).

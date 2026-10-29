@@ -247,3 +247,33 @@ than rows, and zero-copy holds by tier:
   decoded when the page is read in.
 The store picks the tier by how recently a record was read, and moves records between tiers
 in the background. Every encoding round-trips exactly, which the proof checks.
+
+## 18. Lanes added after the first plan
+
+- **`cargo`**: everything cargo-shaped that no lane had: the workspace load (what `load-cargo`
+  does today, the 238 s of #1450's smoke job) rebuilt as queries over a view of `Cargo.toml`s
+  and lock files; the unit graph as queries; `blaze-cargo`'s daemon and client moved onto the
+  plane, `blaze-core` and `blaze-api`; the CLI (`blaze build`, `run`, `test`, `check`, and
+  `cargo blaze`) as a client of the agent API with cargo's flags, output and exit codes
+  unchanged (superset-of-rust: users see cargo's behavior); the standard library as one more
+  crate graph built through the same pipeline (no-rustc F, #86), its results in the shared base
+  layer. Owns `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`,
+  `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `library/`.
+- **`diagnostics`**: compile errors and warnings as rustc prints them (codes, spans, notes,
+  suggestions, `--message-format=json`), computed in the compiler from the queries that found
+  them, with the facts they read (for the agent API). What builds need from `ide-diagnostics`
+  moves here; the IDE crates are then removed. Owns `crates/blaze-diagnostics/` (new) and
+  `crates/ide-diagnostics/` until it is removed.
+
+## 19. How the coordinator integrates
+
+- **Checkpoints**: every hour the coordinator commits the whole worktree, then runs one type
+  check of the workspace (`blaze check`, in an ix VM) and sends each error to the lane that
+  owns its path. Agents still run nothing; the coordinator checking early is what keeps the
+  final all-at-once run from starting with thousands of errors.
+- **Main merges** happen only at a checkpoint, right after the commit, so a merge never meets
+  an agent's uncommitted edit. A conflict in a lane's path goes to that lane.
+- **The freeze** is a pinned issue on main naming the crates v2 replaces; on them, main takes
+  bug fixes only, and the coordinator merges each into `blaze-v2` at the next checkpoint.
+- **Sections**: the lane files keep the plan's first numbering (6.2 is items, 6.5 usercode,
+  9 codegen and link). 1, 2 and 12 to 19 are in this README.

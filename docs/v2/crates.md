@@ -109,7 +109,9 @@ coordinator's: a change there is a request.
 | `hir-ty-borrowck`, `hir-ty-wfcheck` | changed only as `hir-ty` moves | db |
 | `blaze-protocol` | left: `blaze-api` uses its CBOR and frames; its `events` stay for the build view | ci |
 | `blaze-ui`, `blaze-web` | changed: clients of `blaze-api` | ci |
-| `hir-ide`, `ide-db`, `ide-diagnostics`, `load-cargo`, `test-fixture` | removed at integration; diagnostics move into the compiler | coordinator |
+| `hir-ide`, `ide-db`, `test-fixture` | removed at integration | coordinator |
+| `ide-diagnostics` | replaced by `blaze-diagnostics` (README section 18), then removed | diagnostics |
+| `load-cargo`, `project-model` | replaced by the workspace load as queries (README section 18) | cargo |
 | `blaze-fmt`, `blaze-lints` | left; moved onto the flat tree at integration | coordinator |
 | every other crate | left | coordinator |
 

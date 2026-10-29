@@ -3591,7 +3591,16 @@ fn resolve_all(
             deps.dedup();
             let name = krate.extra_data(db).display_name.as_ref();
             let name = name.map(|it| it.to_string()).unwrap_or_default();
-            Spec { id: id(at), kind: NodeKind::Names, name, deps, pool: Pool::Work, cost: 1 }
+            Spec {
+                id: id(at),
+                kind: NodeKind::Names,
+                name,
+                deps,
+                pool: Pool::Work,
+                cost: 1,
+                key: None,
+                memory: 0,
+            }
         })
         .collect();
     let threads = threads.max(1);

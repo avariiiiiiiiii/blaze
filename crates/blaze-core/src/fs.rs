@@ -164,6 +164,66 @@ fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// The file mapped read-only and shared. The store and the image replace a file only by
+/// renaming another over it, so the pages under a mapping are never written while it lives.
+#[cfg(unix)]
+pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(path)?;
+    let len = usize::try_from(file.metadata()?.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
+    if len == 0 {
+        return Ok(crate::Mapping(std::sync::Arc::new(Vec::<u8>::new())));
+    }
+    // SAFETY: a shared read-only mapping of an open file's whole length; the descriptor may
+    // close after, the mapping keeps the file.
+    let at = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0)
+    };
+    if at == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(crate::Mapping(std::sync::Arc::new(Mapped { at: at.cast(), len })))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{}: mapping a file is built on Unix only", path.display()),
+    ))
+}
+
+/// Pages mapped by [`map`], unmapped when the last [`crate::Mapping`] of them goes.
+#[cfg(unix)]
+struct Mapped {
+    at: *const u8,
+    len: usize,
+}
+
+// SAFETY: read-only pages no one writes while they are mapped (see `map`).
+#[cfg(unix)]
+unsafe impl Send for Mapped {}
+// SAFETY: as above.
+#[cfg(unix)]
+unsafe impl Sync for Mapped {}
+
+#[cfg(unix)]
+impl AsRef<[u8]> for Mapped {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `len` bytes mapped at `at` for as long as `self` lives.
+        unsafe { std::slice::from_raw_parts(self.at, self.len) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `map` made, unmapped once.
+        unsafe { libc::munmap(self.at.cast_mut().cast(), self.len) };
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no call that shares blocks on this system"))

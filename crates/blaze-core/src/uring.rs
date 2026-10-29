@@ -796,6 +796,17 @@ impl Driver for Uring {
                     self.start(tag, Op::Timer { after });
                     Ok(None)
                 }
+                Effect::Map { .. }
+                | Effect::Spawn { .. }
+                | Effect::Kill { .. }
+                | Effect::Listen { .. }
+                | Effect::Unlisten { .. }
+                | Effect::Connect { .. }
+                | Effect::Recv { .. }
+                | Effect::Send { .. }
+                | Effect::Hangup { .. } => {
+                    unimplemented!("v2: mapping, processes and sockets on io_uring (v2-core)")
+                }
             };
             match started {
                 Ok(None) => {}

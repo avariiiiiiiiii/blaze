@@ -180,6 +180,17 @@ fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         Effect::Timer { .. } | Effect::Watch { .. } | Effect::Unwatch { .. } => {
             unreachable!("timers and watches are kept by the polling thread")
         }
+        Effect::Map { .. }
+        | Effect::Spawn { .. }
+        | Effect::Kill { .. }
+        | Effect::Listen { .. }
+        | Effect::Unlisten { .. }
+        | Effect::Connect { .. }
+        | Effect::Recv { .. }
+        | Effect::Send { .. }
+        | Effect::Hangup { .. } => {
+            unimplemented!("v2: mapping, processes and sockets on the threads driver (v2-core)")
+        }
     }
 }
 
@@ -281,7 +292,7 @@ impl Watching {
     ) -> io::Result<Watching> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "watching files is built on Linux only (FSEvents is step 1 of docs/v2.md)",
+            "watching files is built on Linux only (FSEvents is docs/v2/core.md's)",
         ))
     }
 

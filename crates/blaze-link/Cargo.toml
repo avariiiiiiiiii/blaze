@@ -1,0 +1,22 @@
+[package]
+name = "blaze-link"
+description = "blaze v2's linker: compiled functions placed in per-thread chunks of address space, relocations applied in parallel, callers through a jump table, and one atomic commit that makes the new image visible"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-codegen.workspace = true
+blaze-core.workspace = true
+blaze-ids.workspace = true
+
+[lints]
+workspace = true

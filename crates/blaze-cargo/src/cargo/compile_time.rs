@@ -503,7 +503,16 @@ impl<'a> Driver<'a> {
                 );
                 // One pool for compiles and runs alike: a run can be a C build that takes cores
                 // of its own, and together they are held to `workers` as before.
-                Spec { id: id(at), kind, name, deps, pool: Pool::Work, cost: 1 }
+                Spec {
+                    id: id(at),
+                    kind,
+                    name,
+                    deps,
+                    pool: Pool::Work,
+                    cost: 1,
+                    key: None,
+                    memory: 0,
+                }
             })
             .collect();
         let workers =

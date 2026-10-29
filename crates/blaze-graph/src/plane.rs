@@ -1,4 +1,4 @@
-//! The plane (docs/v2-plane.md, "The plane"): one scheduler for every request a daemon has under
+//! The plane (docs/v2/plane.md, "The plane"): one scheduler for every request a daemon has under
 //! way, as a state machine that does no IO.
 //!
 //! A request (a build, a test run, an edit) is opened with a weight, adds nodes, and is closed;
@@ -74,8 +74,18 @@ pub enum PlaneInput {
     /// No more nodes are added to the request but by [`PlaneInput::Done`].
     Close { at_ns: u64, request: RequestId },
     /// The task the plane asked to run as `id` is done, on the thread group `group` where the
-    /// executor has groups; its work found the nodes `added`, of `id`'s request.
-    Done { at_ns: u64, id: NodeId, outcome: Outcome, added: Vec<Spec>, group: Option<u32> },
+    /// executor has groups; its work found the nodes `added`, of `id`'s request. `peak` is the
+    /// most its arena held, measured, for [`crate::admission::Estimates::observe`]; 0 when
+    /// not measured.
+    Done {
+        at_ns: u64,
+        id: NodeId,
+        outcome: Outcome,
+        added: Vec<Spec>,
+        group: Option<u32>,
+        #[serde(default)]
+        peak: u64,
+    },
     /// The bytes the process holds now, measured.
     Held { at_ns: u64, bytes: u64 },
 }
@@ -525,7 +535,8 @@ impl Plane {
             self.flight.insert(key, task);
         }
         self.nodes[me].task = Some(task);
-        let (r, pool, priority) = (self.nodes[me].request, pool_at(spec.pool), self.nodes[me].priority);
+        let (r, pool, priority) =
+            (self.nodes[me].request, pool_at(self.tasks[task].pool), self.nodes[me].priority);
         self.requests[r].ready[pool].insert((Reverse(priority), me));
         self.moved(at, me, NodeState::Ready, out);
     }

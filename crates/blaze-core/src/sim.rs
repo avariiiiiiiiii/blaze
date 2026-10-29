@@ -282,6 +282,19 @@ impl Sim {
             Effect::Watch { .. } | Effect::Unwatch { .. } => {
                 unreachable!("watches are not pending effects")
             }
+            Effect::Map { file, .. } => {
+                Done::Mapped(crate::Mapping(std::sync::Arc::new(self.contents(&file))))
+            }
+            Effect::Spawn { .. }
+            | Effect::Kill { .. }
+            | Effect::Listen { .. }
+            | Effect::Unlisten { .. }
+            | Effect::Connect { .. }
+            | Effect::Recv { .. }
+            | Effect::Send { .. }
+            | Effect::Hangup { .. } => {
+                unimplemented!("v2: the simulation's processes and sockets (v2-core)")
+            }
         };
         Completion { tag, done }
     }

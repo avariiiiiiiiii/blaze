@@ -1,4 +1,4 @@
-//! blaze's sans-IO core ([docs/v2.md](../../../docs/v2.md#the-io-core-blaze-core)).
+//! blaze's sans-IO core (docs/v2/core.md section 3, docs/v2/plane.md).
 //!
 //! A state machine of blaze's (the build's plane, a journal, the store's index) does no IO,
 //! reads no clock and starts no thread. It asks for IO by pushing [`Effect`]s, each with a
@@ -9,8 +9,26 @@
 //!
 //! Files are named relative to the driver's root, so the same state machine runs in a
 //! simulation, a temporary directory or the daemon's state directory unchanged.
+//!
+//! On macOS [`kqueue::Kqueue`] keeps timers, sockets, processes and FSEvents' watches on one
+//! kqueue and the file calls on threads. A process of [`Effect::Spawn`] in a sandbox is made
+//! by the [`Confine`] a driver is given; a driver given none refuses it.
 
+#[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
+mod fanotify;
+#[cfg(target_os = "macos")]
+mod footprint;
 mod fs;
+#[cfg(target_os = "macos")]
+mod fsevents;
+#[cfg(target_os = "macos")]
+pub mod kqueue;
+#[cfg(unix)]
+mod net;
+#[cfg(unix)]
+mod process;
 pub mod sim;
 pub mod threads;
 #[cfg(target_os = "linux")]
@@ -19,6 +37,29 @@ pub mod uring;
 mod watch;
 
 use std::{fmt, time::Duration};
+
+/// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox
+/// (`blaze-usercode`), so the driver starts what it says in place of the program. A driver
+/// given none fails every spawn whose [`Sandbox`] is on.
+pub trait Confine: Send + Sync {
+    /// What to start so that `command` runs in its sandbox, usually a launcher with the
+    /// program after it. `scratch` is a directory of this run's own, empty, made by the
+    /// driver and removed once [`Confine::traced`] has been asked: where the launcher keeps
+    /// its record. An error says why no sandbox can be made here; nothing runs then.
+    fn confine(&self, command: &Command, scratch: &std::path::Path) -> Result<Confined, String>;
+    /// What the sandbox recorded the process read, once it has exited: asked only of a
+    /// sandbox that traces.
+    fn traced(&self, command: &Command, scratch: &std::path::Path) -> Result<Traced, String>;
+}
+
+/// The process a [`Confine`] starts for a command: its whole environment is this one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Confined {
+    pub program: std::path::PathBuf,
+    pub args: Vec<std::ffi::OsString>,
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub dir: std::path::PathBuf,
+}
 
 /// Names a request so its completion can be matched to it. The state machine chooses tags; a
 /// driver hands them back unchanged.
@@ -92,6 +133,30 @@ pub enum Effect {
     Unwatch { tag: Tag },
     /// Completes once `after` has passed.
     Timer { after: Duration, tag: Tag },
+    /// The whole file mapped read-only into memory, shared with every other mapping of it
+    /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`].
+    Map { file: FileName, tag: Tag },
+    /// A process started as `command` says, in its sandbox; completes with [`Done::Exited`]
+    /// once it has exited and its output is read, or with [`Done::Failed`] when it could not
+    /// start (no sandbox can be made here is a failure, never a run outside one).
+    Spawn { command: Box<Command>, tag: Tag },
+    /// The process of the spawn `tag` killed: its spawn completes, with the signal. No
+    /// completion of its own; a spawn that ended already is left as it is.
+    Kill { tag: Tag },
+    /// Completes with [`Done::Accepted`] for each connection made to `at`, until an
+    /// [`Effect::Unlisten`] of the same tag, which ends it with [`Done::Unlistened`]. In
+    /// flight until it ends, as a watch is.
+    Listen { at: Address, tag: Tag },
+    Unlisten { tag: Tag },
+    /// A connection made to `at`; completes with [`Done::Connected`].
+    Connect { at: Address, tag: Tag },
+    /// The bytes the peer of `conn` sent since the last receive, at most `most`: empty once it
+    /// has hung up.
+    Recv { conn: Conn, most: usize, tag: Tag },
+    /// All of `bytes` sent on `conn`.
+    Send { conn: Conn, bytes: Vec<u8>, tag: Tag },
+    /// `conn` closed; a receive in flight on it completes empty.
+    Hangup { conn: Conn, tag: Tag },
 }
 
 impl Effect {
@@ -109,8 +174,129 @@ impl Effect {
             | Effect::Remove { tag, .. }
             | Effect::Watch { tag, .. }
             | Effect::Unwatch { tag }
-            | Effect::Timer { tag, .. } => *tag,
+            | Effect::Timer { tag, .. }
+            | Effect::Map { tag, .. }
+            | Effect::Spawn { tag, .. }
+            | Effect::Kill { tag }
+            | Effect::Listen { tag, .. }
+            | Effect::Unlisten { tag }
+            | Effect::Connect { tag, .. }
+            | Effect::Recv { tag, .. }
+            | Effect::Send { tag, .. }
+            | Effect::Hangup { tag, .. } => *tag,
         }
+    }
+}
+
+/// Where [`Effect::Listen`] listens or [`Effect::Connect`] connects. A socket listened on is
+/// reachable by its owner only; a TCP address listened on is for a webhook behind the VM's
+/// own proxy. TLS is above this, in whoever speaks it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Address {
+    /// A Unix socket under the driver's root, made with mode 0600.
+    Unix(FileName),
+    Tcp(std::net::SocketAddr),
+}
+
+/// A connection a listen accepted or a connect made, named by the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Conn(pub u64);
+
+/// A process to run. Paths outside the driver's root (a toolchain's, the C compiler's) are
+/// absolute; everything the process may touch is in its [`Sandbox`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Command {
+    pub program: std::path::PathBuf,
+    pub args: Vec<std::ffi::OsString>,
+    /// The whole environment: nothing of the daemon's is inherited.
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub dir: std::path::PathBuf,
+    pub stdin: Vec<u8>,
+    pub sandbox: Sandbox,
+    /// The most memory it may use, held by the system (a cgroup on Linux, a resource limit
+    /// on macOS): the backstop behind admission's estimates.
+    pub memory: Option<u64>,
+}
+
+/// What a spawned process may see and do. User code (build scripts, proc macros, tests) runs
+/// in one always; [`Sandbox::Off`] is only for what `BLAZE_SANDBOX=off` or a documented
+/// manifest opt-out says.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Sandbox {
+    Off,
+    On {
+        /// Read-only, with what is under them.
+        read: Vec<std::path::PathBuf>,
+        /// Writable, with what is under them: an `OUT_DIR`, a temporary directory.
+        write: Vec<std::path::PathBuf>,
+        network: bool,
+        /// Whether to record what it read ([`Traced`]).
+        trace: bool,
+    },
+}
+
+/// What a sandboxed process read, recorded by its sandbox: its result is keyed by exactly
+/// these (docs/v2/usercode.md section 6.5), so the paths are as the process named them.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Traced {
+    /// Each file it opened to read, and the BLAKE3 hash of its bytes then; `None` for a file
+    /// it looked for and did not find.
+    pub files: Vec<(std::path::PathBuf, Option<[u8; 32]>)>,
+    /// Each directory it listed, and the hash of its sorted names then.
+    pub dirs: Vec<(std::path::PathBuf, [u8; 32])>,
+    /// Each environment variable it read, and its value then.
+    pub env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+    /// What it read that cannot be traced (the clock, randomness, the network): a result
+    /// with any of these is keyed as cargo keys it.
+    pub untraceable: Vec<Untraceable>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum Untraceable {
+    Clock,
+    Random,
+    Network,
+    /// A file read through a descriptor the sandbox did not see opened.
+    Descriptor,
+}
+
+/// How a spawned process ended.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Exit {
+    /// Its exit code, or `None` when a signal ended it ([`Exit::signal`]).
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Of a sandbox that traces.
+    pub traced: Option<Traced>,
+    /// The most memory it held, as the system measured it.
+    pub peak_memory: u64,
+}
+
+/// A file mapped read-only by [`Effect::Map`]: its bytes, which stay as they are for as long
+/// as any clone of it lives (the store and the image only ever replace a file by renaming
+/// another over it, never write one in place).
+#[derive(Clone)]
+pub struct Mapping(pub std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
+
+impl Mapping {
+    pub fn bytes(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
+impl PartialEq for Mapping {
+    fn eq(&self, other: &Mapping) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for Mapping {}
+
+impl fmt::Debug for Mapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Mapping({} bytes)", self.bytes().len())
     }
 }
 
@@ -142,6 +328,13 @@ pub enum Done {
     Changed { files: Vec<FileName>, lost: bool },
     Unwatched,
     Fired,
+    Mapped(Mapping),
+    Exited(Box<Exit>),
+    Accepted { conn: Conn },
+    Connected { conn: Conn },
+    Unlistened,
+    Sent,
+    HungUp,
     /// It did not happen. For an append, none of its bytes are durable unless a later sync
     /// says so; for a sync, nothing appended since the last successful one is known durable;
     /// for a write, the file is as it was.

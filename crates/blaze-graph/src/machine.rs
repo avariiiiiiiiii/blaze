@@ -15,6 +15,8 @@ use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+use crate::plane::Key;
+
 /// A node's name in the graph, chosen by whoever adds it.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
@@ -54,6 +56,13 @@ pub struct Spec {
     /// What it is expected to cost, in a unit that is the same for every node of the build:
     /// it orders the ready nodes and nothing else.
     pub cost: u64,
+    /// The hash of everything its value depends on, for the [`crate::plane::Plane`]'s memo and
+    /// single flight; `None` for work that is not a pure function of its inputs.
+    #[serde(default)]
+    pub key: Option<Key>,
+    /// Its predicted peak memory in bytes ([`crate::admission`]), for the plane's admission.
+    #[serde(default)]
+    pub memory: u64,
 }
 
 /// What came of a node's work.
@@ -118,6 +127,11 @@ pub enum Error {
     NotRunning(NodeId),
     Closed,
     Over,
+    /// A plane's request opened twice.
+    RequestTwice(u32),
+    /// A plane's request opened with no share of the threads.
+    NoWeight(u32),
+    UnknownRequest(u32),
 }
 
 impl fmt::Display for Error {
@@ -135,6 +149,9 @@ impl fmt::Display for Error {
             Error::NotRunning(id) => write!(f, "node {id} is said done, but it is not running"),
             Error::Closed => write!(f, "nodes added or the build closed after it was closed"),
             Error::Over => write!(f, "an input after the build finished"),
+            Error::RequestTwice(id) => write!(f, "request {id} is opened twice"),
+            Error::NoWeight(id) => write!(f, "request {id} is opened with a weight of 0"),
+            Error::UnknownRequest(id) => write!(f, "request {id} is not open"),
         }
     }
 }

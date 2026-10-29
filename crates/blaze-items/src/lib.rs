@@ -1,0 +1,242 @@
+//! Items by content (docs/v2/items.md section 6), from blaze-next's `blaze-items` (#344): a
+//! front-end crate, next to `hir-ty`.
+//!
+//! An item (fn, struct, enum, union, trait, impl, const, static, type alias, macro) has two
+//! kinds of name:
+//!
+//! - **which** item it is: its [`ItemKey`], like rustc's `DefPathHash` (its crate, its
+//!   parent's key, its kind, its name and a disambiguator). Queries are asked of it. It is
+//!   never part of a code hash: a rename gives a new key, and every query of the new key
+//!   produces the old fingerprints, so nothing is compiled.
+//! - **what** it is: its four hashes ([`ItemHashes`]), of its normalized form after expansion,
+//!   resolution and inference, with no names, spans or order, each reference the hash of what
+//!   it refers to, a cycle hashed as one unit with members by position (Unison's rule). Names
+//!   and positions are in a hash only where the program can observe them (`type_name`,
+//!   `module_path!`, symbol names, `line!`, `#[track_caller]`): a query that reads one records
+//!   the fact [`Fact::Name`] or reads a [`blaze_format::SpanRef`] filled at link time.
+//!
+//! A query depends on [`Fact`]s, the narrowest thing it read, each a query of its own whose
+//! fingerprint is what it stands for. Negative facts ("no impl of Trait for T", "N is not in
+//! S") are answered from indexes keyed by [`ImplIndexKey`] and [`ScopeIndexKey`], so an added
+//! impl or item touches only the queries that asked a question it now answers differently.
+
+use blaze_ids::{ContentId, Hasher};
+use blaze_query::{QueryKey, QueryKind};
+use serde::{Deserialize, Serialize};
+
+/// Which item: stable across edits of what it is, changed by a rename or a move.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct ItemKey(pub ContentId);
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum ItemKind {
+    Fn,
+    Struct,
+    Enum,
+    Union,
+    Trait,
+    Impl,
+    Const,
+    Static,
+    TypeAlias,
+    Macro,
+}
+
+/// What a user of the item can see: a fn's signature and bounds; a type's fields, variants
+/// and generics; a trait's items. It includes what a body leaks: an `impl Trait` return's and
+/// an `async fn`'s hidden type and its auto traits, a `const fn`'s body, a closure's inferred
+/// signature and captures.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct InterfaceHash(pub ContentId);
+
+/// A type's size, alignment, field offsets, niches and ABI, deep: its fields' layouts, `repr`
+/// and the target, transitively.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct LayoutHash(pub ContentId);
+
+/// The normalized MIR body, each callee by its interface hash: a callee's body edit leaves
+/// it as it was.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct CodeHash(pub ContentId);
+
+/// The code with every callee's deep hash, for what inlines (release).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct DeepHash(pub ContentId);
+
+/// An item's four hashes.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ItemHashes {
+    pub kind: ItemKind,
+    pub interface: InterfaceHash,
+    /// Of a type.
+    pub layout: Option<LayoutHash>,
+    /// Of an item with a body: a fn, a const, a static.
+    pub code: Option<CodeHash>,
+    pub deep: DeepHash,
+}
+
+/// rustc's simplified self type (`SimplifiedType`), hashed: the key under which impls and
+/// method candidates are found.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct SimplifiedType(pub ContentId);
+
+/// A name, hashed: `Hasher::new(NAME_DOMAIN).update(name)`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct NameHash(pub ContentId);
+
+pub const NAME_DOMAIN: &str = "blaze v2 name 1";
+
+/// A scope names resolve in: a module's or a block's [`ItemKey`].
+pub type Scope = ItemKey;
+
+/// The narrowest thing a query read (docs/v2/items.md section 6.2), and what invalidates it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Fact {
+    /// F's interface hash: read by callers' type checking.
+    Signature(ItemKey),
+    /// T's layout hash: read by the codegen of everything that moves or stores a T.
+    Layout(ItemKey),
+    /// The type and offset of T's field `field` (by position).
+    Field { ty: ItemKey, field: u32 },
+    /// What `x.m()` resolves to on T: changes when an impl or trait adds, removes or changes
+    /// an `m` reachable for T.
+    Method { self_ty: SimplifiedType, name: NameHash },
+    /// Whether T implements Trait: changes when an impl of Trait whose simplified self type
+    /// unifies with T's is added, removed or changed.
+    Implements { trait_: ItemKey, self_ty: SimplifiedType },
+    /// What N in S resolves to (globs included): changes when an item named N appears or
+    /// disappears in a scope S sees.
+    Resolves { scope: Scope, name: NameHash },
+    /// F's code hash: read by F's codegen, and by callers that inlined F (release).
+    Code(ItemKey),
+    /// A const's evaluated value, not its expression.
+    ConstValue(ItemKey),
+    /// X's name and path, for what observes them: `type_name`, `module_path!`, mangling,
+    /// `#[no_mangle]`, `#[export_name]`, `#[link_name]`.
+    Name(ItemKey),
+    /// A closure's inferred signature and captures (#906).
+    Captures(ItemKey),
+    /// Whether an opaque type's hidden type is `Send`, `Sync`, `Unpin` (auto-trait leakage).
+    AutoTraits(ItemKey),
+    /// The rules that reach across items, each a fact of its own: coherence and orphan
+    /// checks of an impl, specialization, drop check, vtable layout, a derive's output.
+    Coherence(ItemKey),
+    Specializes(ItemKey),
+    DropCheck(ItemKey),
+    Vtable { trait_: ItemKey, self_ty: SimplifiedType },
+    Derive(ItemKey),
+}
+
+/// The facts' query kinds, in [`blaze_query::kinds::FACTS`].
+pub mod kinds {
+    use blaze_query::QueryKind;
+
+    pub const SIGNATURE: QueryKind = QueryKind(0x1000);
+    pub const LAYOUT: QueryKind = QueryKind(0x1001);
+    pub const FIELD: QueryKind = QueryKind(0x1002);
+    pub const METHOD: QueryKind = QueryKind(0x1003);
+    pub const IMPLEMENTS: QueryKind = QueryKind(0x1004);
+    pub const RESOLVES: QueryKind = QueryKind(0x1005);
+    pub const CODE: QueryKind = QueryKind(0x1006);
+    pub const CONST_VALUE: QueryKind = QueryKind(0x1007);
+    pub const NAME: QueryKind = QueryKind(0x1008);
+    pub const CAPTURES: QueryKind = QueryKind(0x1009);
+    pub const AUTO_TRAITS: QueryKind = QueryKind(0x100a);
+    pub const COHERENCE: QueryKind = QueryKind(0x100b);
+    pub const SPECIALIZES: QueryKind = QueryKind(0x100c);
+    pub const DROP_CHECK: QueryKind = QueryKind(0x100d);
+    pub const VTABLE: QueryKind = QueryKind(0x100e);
+    pub const DERIVE: QueryKind = QueryKind(0x100f);
+    /// An item's [`crate::ItemHashes`].
+    pub const HASHES: QueryKind = QueryKind(0x1010);
+}
+
+pub const FACT_DOMAIN: &str = "blaze v2 fact 1";
+
+impl Fact {
+    pub fn kind(&self) -> QueryKind {
+        match self {
+            Fact::Signature(_) => kinds::SIGNATURE,
+            Fact::Layout(_) => kinds::LAYOUT,
+            Fact::Field { .. } => kinds::FIELD,
+            Fact::Method { .. } => kinds::METHOD,
+            Fact::Implements { .. } => kinds::IMPLEMENTS,
+            Fact::Resolves { .. } => kinds::RESOLVES,
+            Fact::Code(_) => kinds::CODE,
+            Fact::ConstValue(_) => kinds::CONST_VALUE,
+            Fact::Name(_) => kinds::NAME,
+            Fact::Captures(_) => kinds::CAPTURES,
+            Fact::AutoTraits(_) => kinds::AUTO_TRAITS,
+            Fact::Coherence(_) => kinds::COHERENCE,
+            Fact::Specializes(_) => kinds::SPECIALIZES,
+            Fact::DropCheck(_) => kinds::DROP_CHECK,
+            Fact::Vtable { .. } => kinds::VTABLE,
+            Fact::Derive(_) => kinds::DERIVE,
+        }
+    }
+
+    /// The fact as the query a dependency edge names.
+    pub fn key(&self) -> QueryKey {
+        let mut hasher = Hasher::new(FACT_DOMAIN);
+        hasher.update(&self.kind().0.to_le_bytes());
+        match *self {
+            Fact::Signature(it)
+            | Fact::Layout(it)
+            | Fact::Code(it)
+            | Fact::ConstValue(it)
+            | Fact::Name(it)
+            | Fact::Captures(it)
+            | Fact::AutoTraits(it)
+            | Fact::Coherence(it)
+            | Fact::Specializes(it)
+            | Fact::DropCheck(it)
+            | Fact::Derive(it) => hasher.id(&it.0),
+            Fact::Field { ty, field } => hasher.id(&ty.0).update(&field.to_le_bytes()),
+            Fact::Method { self_ty, name } => hasher.id(&self_ty.0).id(&name.0),
+            Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {
+                hasher.id(&trait_.0).id(&self_ty.0)
+            }
+            Fact::Resolves { scope, name } => hasher.id(&scope.0).id(&name.0),
+        };
+        QueryKey { kind: self.kind(), input: hasher.finish() }
+    }
+}
+
+/// The key of the index of impls of a trait for a simplified self type, which answers
+/// [`Fact::Implements`] both ways.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct ImplIndexKey {
+    pub trait_: ItemKey,
+    pub self_ty: SimplifiedType,
+}
+
+/// The key of the index of what a name is in a scope, which answers [`Fact::Resolves`] both
+/// ways.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct ScopeIndexKey {
+    pub scope: Scope,
+    pub name: NameHash,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(n: u8) -> ItemKey {
+        ItemKey(ContentId([n; 32]))
+    }
+
+    #[test]
+    fn facts_of_one_item_have_distinct_keys() {
+        let facts = [Fact::Signature(item(1)), Fact::Layout(item(1)), Fact::Code(item(1))];
+        let keys: std::collections::BTreeSet<QueryKey> = facts.iter().map(Fact::key).collect();
+        assert_eq!(keys.len(), facts.len());
+    }
+
+    #[test]
+    fn a_field_fact_names_its_field() {
+        let a = Fact::Field { ty: item(1), field: 0 }.key();
+        let b = Fact::Field { ty: item(1), field: 1 }.key();
+        assert_ne!(a, b);
+    }
+}

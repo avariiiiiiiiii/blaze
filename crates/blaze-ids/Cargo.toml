@@ -1,0 +1,21 @@
+[package]
+name = "blaze-ids"
+description = "blaze v2's two kinds of IDs: content IDs (BLAKE3) for identity, dense u32 indices per arena for speed, and the interners that map one to the other"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blake3.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

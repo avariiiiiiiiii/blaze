@@ -23,6 +23,8 @@ fn spec(id: u32, kind: NodeKind, deps: &[u32], pool: Pool, cost: u64) -> Spec {
         deps: deps.iter().map(|&it| NodeId(it)).collect(),
         pool,
         cost,
+        key: None,
+        memory: 0,
     }
 }
 

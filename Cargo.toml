@@ -102,6 +102,18 @@ blaze-graph = { path = "crates/blaze-graph" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }
 blaze-web = { path = "crates/blaze-web" }
+# v2 (docs/v2/crates.md)
+blaze-api = { path = "crates/blaze-api" }
+blaze-cas = { path = "crates/blaze-cas" }
+blaze-ci = { path = "crates/blaze-ci" }
+blaze-codegen = { path = "crates/blaze-codegen" }
+blaze-format = { path = "crates/blaze-format" }
+blaze-ids = { path = "crates/blaze-ids" }
+blaze-items = { path = "crates/blaze-items" }
+blaze-link = { path = "crates/blaze-link" }
+blaze-query = { path = "crates/blaze-query" }
+blaze-usercode = { path = "crates/blaze-usercode" }
+blaze-vfs = { path = "crates/blaze-vfs" }
 # Flecs's C and its read-only REST, for the build page's world (vendor/flecs-c/SOURCE.md).
 flecs-c = { path = "vendor/flecs-c" }
 hir-ide = { path = "crates/hir-ide", version = "0.0.0" }
@@ -148,6 +160,7 @@ la-arena = { version = "0.3.1" }
 anyhow = "1.0.98"
 arrayvec = "0.7.6"
 bitflags = "2.9.1"
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
 cargo_metadata = "0.23.1"
 camino = "1.2.2"
 crossbeam-channel = "0.5.15"

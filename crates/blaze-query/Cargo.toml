@@ -1,0 +1,25 @@
+[package]
+name = "blaze-query"
+description = "blaze v2's query database: queries keyed by input hashes, a fingerprint on every dependency edge, facts as the narrowest thing a query read, many views at once, and why a query reran"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-graph.workspace = true
+blaze-ids.workspace = true
+blaze-vfs.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

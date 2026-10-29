@@ -131,3 +131,16 @@ fn watches_hear_a_file_written_under_them() {
     let heard = run(&mut crate::uring::Uring::new(&root).unwrap(), Some(&root));
     assert!(heard.contains(&name("src/keep")), "{heard:?}");
 }
+
+#[test]
+fn a_mapping_is_the_file() {
+    let mut sim = Sim::new(7, Faults::default());
+    sim.change(&name("store/pack"), b"packed");
+    let mut effects = vec![Effect::Map { file: name("store/pack"), tag: Tag(1) }];
+    let mut mapped = None;
+    run_until_idle(&mut sim, &mut effects, |done, _| match done.done {
+        Done::Mapped(it) => mapped = Some(it),
+        other => panic!("{other:?}"),
+    });
+    assert_eq!(mapped.expect("mapped").bytes(), b"packed");
+}

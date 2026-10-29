@@ -1,0 +1,24 @@
+[package]
+name = "blaze-usercode"
+description = "blaze v2's user code: build scripts and proc macros in sandboxes that trace what they read, keyed by exactly that; wasm proc macros; a warm process pool; tests selected by the code they reach"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

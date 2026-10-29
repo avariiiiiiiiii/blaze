@@ -24,6 +24,10 @@ since the release before and the title of each change merged since.
 - `blaze-engine cache build` prints what this build's store keys are made with apart from the toolchain (the store's format and the hash of blaze's sources), and fails for a build keyed by its executable's bytes: CI will name the remote's project by it instead of by the release, so a release whose compiled-in sources did not change keeps the store (docs/cache.md).
 - Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).
 
+### Fixed
+
+- Windows: a `raw-dylib` named with `+verbatim` imports from the DLL as it is written, as rustc does: `ort-sys`'s `#[link(name = "SHELL32.DLL", kind = "raw-dylib", modifiers = "+verbatim")]` imported from `SHELL32.DLL.dll`, and its build script stopped with 0xc0000135 (DLL not found).
+
 ## [0.20261028.9] - 2026-10-28
 
 ### Merged

@@ -284,9 +284,9 @@ fn as_rustc_spells(path: &str) -> String {
 /// what is stored names them where they were when the library was built, as every machine can.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibrarySources {
-    /// The directory they are in here.
+    /// The directory they are in here: the library's, `library/`.
     pub here: String,
-    /// The directory they were built in, `/rustc/<commit>`.
+    /// The directory they were built in, `/rustc/<commit>/library`.
     pub built_in: String,
 }
 

@@ -822,6 +822,7 @@
      "blaze-cargo",
      "blaze-doc",
      "blaze-expand",
+     "blaze-graph",
      "blaze-lints",
      "blaze-live",
      "blaze-macro-wasm",
@@ -1196,7 +1197,7 @@
      "sha1 0.10.7"
     ],
     "name": "blaze-web",
-    "version": "0.20261028.9"
+    "version": "0.0.0"
    },
    {
     "checksum": "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71",
@@ -8468,7 +8469,7 @@
    },
    "version": "0.0.0"
   },
-  "blaze-web@0.20261028.9": {
+  "blaze-web@0.0.0": {
    "authors": "blaze contributors",
    "description": "blaze's build page: the daemon serves the build, down to every function, on 127.0.0.1 (docs/web.md)",
    "homepage": "",
@@ -8483,7 +8484,7 @@
     "dir": "crates/blaze-web",
     "kind": "path"
    },
-   "version": "0.20261028.9"
+   "version": "0.0.0"
   },
   "block-buffer@0.10.4": {
    "authors": "RustCrypto Developers",
@@ -19337,7 +19338,7 @@
       },
       {
        "name": "blaze_web",
-       "unit": "blaze-web@0.20261028.9 lib blaze_web build"
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -19658,6 +19659,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -19907,6 +19912,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -20154,6 +20163,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -20444,6 +20457,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -21757,14 +21774,14 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build build host": {
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21777,12 +21794,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build": {
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build build host"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -21793,7 +21810,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -21806,7 +21823,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 lib blaze_web build": {
+    "blaze-web@0.0.0 lib blaze_web build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -21815,11 +21832,11 @@
       },
       {
        "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.20261028.9 lib blaze_protocol build"
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "flate2",
@@ -21846,7 +21863,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -40807,7 +40824,7 @@
       },
       {
        "name": "blaze_web",
-       "unit": "blaze-web@0.20261028.9 lib blaze_web build"
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -41128,6 +41145,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -41377,6 +41398,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -41624,6 +41649,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -41914,6 +41943,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -43227,14 +43260,14 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build build host": {
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -43247,12 +43280,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build": {
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build build host"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -43263,7 +43296,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -43276,7 +43309,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 lib blaze_web build": {
+    "blaze-web@0.0.0 lib blaze_web build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -43285,11 +43318,11 @@
       },
       {
        "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.20261028.9 lib blaze_protocol build"
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "flate2",
@@ -43316,7 +43349,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -62150,7 +62183,7 @@
       },
       {
        "name": "blaze_web",
-       "unit": "blaze-web@0.20261028.9 lib blaze_web build"
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -62471,6 +62504,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -62720,6 +62757,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -62967,6 +63008,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -63257,6 +63302,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -64570,14 +64619,14 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build build host": {
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -64590,12 +64639,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build": {
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build build host"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -64606,7 +64655,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -64619,7 +64668,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 lib blaze_web build": {
+    "blaze-web@0.0.0 lib blaze_web build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -64628,11 +64677,11 @@
       },
       {
        "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.20261028.9 lib blaze_protocol build"
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "flate2",
@@ -64659,7 +64708,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -83647,7 +83696,7 @@
       },
       {
        "name": "blaze_web",
-       "unit": "blaze-web@0.20261028.9 lib blaze_web build"
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -83968,6 +84017,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -84217,6 +84270,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -84464,6 +84521,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -84754,6 +84815,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -86067,14 +86132,14 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build build host": {
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
      "features": [],
      "kind": "custom-build",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -86087,12 +86152,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build": {
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build build host"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
       },
       {
        "name": "build_script_build",
@@ -86103,7 +86168,7 @@
      "features": [],
      "kind": "custom-build",
      "mode": "run-custom-build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,
@@ -86116,7 +86181,7 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "blaze-web@0.20261028.9 lib blaze_web build": {
+    "blaze-web@0.0.0 lib blaze_web build": {
      "crate_type": "lib",
      "deps": [
       {
@@ -86125,11 +86190,11 @@
       },
       {
        "name": "blaze_protocol",
-       "unit": "blaze-protocol@0.20261028.9 lib blaze_protocol build"
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
       },
       {
        "name": "build_script_build",
-       "unit": "blaze-web@0.20261028.9 custom-build build-script-build run-custom-build"
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "flate2",
@@ -86156,7 +86221,7 @@
      "features": [],
      "kind": "lib",
      "mode": "build",
-     "pkg": "blaze-web@0.20261028.9",
+     "pkg": "blaze-web@0.0.0",
      "profile": {
       "codegen_units": null,
       "debug_assertions": false,

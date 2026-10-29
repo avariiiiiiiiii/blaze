@@ -9244,7 +9244,9 @@ fn run_holding(
                         })
                         .collect();
                     if including.is_empty() {
-                        bail!("a file an `include!` or a module named was loaded late, with no crate noted as naming it");
+                        bail!(
+                            "a file an `include!` or a module named was loaded late, with no crate noted as naming it"
+                        );
                     }
                     eprintln!("included late, by {}", named.join(", "));
                     known.touch(&db, Some(&including));

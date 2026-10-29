@@ -27,8 +27,10 @@ depended on its library alone.
 
 ## Running them
 
-You need Python 3, the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`) with
-`rust-src`, a C compiler and linker, and a release build of blaze. Some harnesses need
+You need Python 3, the pinned nightly (`harness/toolchain`) with `rust-src`, a C compiler
+and linker, and a release build of blaze. `rust-src` is for rustc's side alone: a program
+rustc builds names a file of std it inlines (a panic's location) where `rust-src` installed
+it, as blaze names its own `library/`'s; blaze reads no toolchain's `rust-src`. Some harnesses need
 more: `debuginfo.py` needs gdb and `llvm-dwarfdump`,
 `buildmodel.py` needs the `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl`
 targets with their cross tools and qemu, `remote.py` needs a MinIO or SeaweedFS binary,
@@ -190,6 +192,7 @@ writes them again.
 | `staticcallbacks.py` | A `LazyLock` static whose initializer calls an `#[inline(always)]` helper of a dependency: an edit of a sibling of the helper, then of the helper itself, under one daemon, each printing what cargo's build prints (astral-experiments/blaze#83, #87) |
 | `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon reads the file only once the names are resolved, as bun's generated bindings are: an edit that adds a function then patches a few functions, not every one the file declares |
 | `rustsrc.py` | A build without the standard library's source (`BLAZE_LIBRARY` naming an empty one) is turned down, saying how blaze gets it |
+| `libraryfetch.py` | The release's `library-<digest>.tar.xz`, made by `library.py archive` and served locally, is installed from once (`BLAZE_LIBRARY_FROM`) with blaze's digest; a lying or missing archive is an error and nothing is kept |
 | `splices.py` | Edits that are hard on the splice: thread-locals, statics, vtables, function pointers, closures, panics, foreign calls. Counts how each step was linked |
 | `loadretry.py` | A refused load reports changed flags and recovers after configuration files are removed or rewritten, without restarting the daemon (#597). Both configuration filenames, inherited configuration, and cached source diagnostics are checked |
 | `scriptenv.py` | A build script that says it reads `SDK_DIR` and fails without it (cef-dll-sys's shape) is given the command's value, with a fresh daemon and with one started without it, and another value or none reruns it; a path dependency that is a workspace of its own is given what the build's root manifest names in `build-script-env` ([#720](https://github.com/indexable-inc/blaze/issues/720)) |

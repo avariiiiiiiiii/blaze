@@ -424,6 +424,16 @@ the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so wh
 the tests link runs on the runner; the train's tiers still build with cargo in the flake's dev
 shell, against its glibc, and their harness jobs install Nix for that.
 
+The tests job runs after the build job and starts from what it compiled. Both take their
+packages, profile and features from `harness/unittests.py` (the build is
+`unittests.py '{"build": true}'`, `blaze build --release --features blaze-engine/llvm` of the
+crates the tests are of), since a crate's key holds its features and whether it is a package the
+command named (`CARGO_PRIMARY_PACKAGE`), and each crate's key holds those of the crates it is
+built on. The build job hands the packs it added to the store to the tests job as an artifact,
+since a pull request's build pushes nowhere, and the tests job also pulls the build job's project
+on the remote. What the tests compile of their own is then the crates built with `cfg(test)`,
+their test programs, and the libraries only their dev-dependencies reach.
+
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;
 there is no merge queue, and the branch need not be up to date with main (removed 2026-10-27:

@@ -62,7 +62,9 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 
 | lane | paths |
 |---|---|
-| coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but `plane.md` and the lanes' notes, `v2/requests/` (applying them), `crates/blaze-cargo/` but for the paths below, `crates/project-model/`, `crates/load-cargo/`, the IDE crates until they are removed |
+| coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but `plane.md` and the lanes' notes, `v2/requests/` (applying them), `crates/hir-ide/`, `crates/ide-db/`, `crates/test-fixture/` until they are removed |
+| cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`, `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `library/` |
+| diagnostics | `crates/blaze-diagnostics/` (new), `crates/ide-diagnostics/` |
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plane.md` |
 | vfs | `crates/blaze-vfs/`, `crates/vfs/`, `crates/vfs-notify/` |
 | format | `crates/blaze-ids/`, `crates/blaze-format/`, `crates/syntax-tree/`, `crates/syntax/`, `crates/parser/`, `crates/span/`, `crates/intern/`, `crates/tt/`, `crates/mbe/`, `crates/syntax-bridge/`, `crates/const-ast/`; in `crates/hir-def/src/`: `expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`, `item_tree.rs`, `item_tree/` |

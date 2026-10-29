@@ -457,8 +457,7 @@ pub(crate) fn keeping(
     for path in wrote {
         // Read and not mapped: the next build may write the file again, in place, while
         // this is kept.
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         files.push((named(args, path), bytes));
     }
     Ok(Keeping { store, key: *key, reads: Reads::of(db), files })

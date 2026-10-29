@@ -2943,14 +2943,15 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        let added_at = start.elapsed();
         *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
-            let files = start.elapsed() - workspaces_at;
             eprintln!(
-                "load-us: workspaces={} files={}",
+                "load-us: workspaces={} files={} sessions={}",
                 workspaces_at.as_micros(),
-                files.as_micros()
+                (added_at - workspaces_at).as_micros(),
+                (start.elapsed() - added_at).as_micros()
             );
         }
         self.roots.extend(roots);
@@ -9230,6 +9231,9 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // Whether the store is keeping the program as this build compiled it from cold: a worker
+    // started once it has settled would load it from there.
+    let mut kept = false;
     // What the compile of the program counted, for what is said of it once it is built.
     let mut counted = None;
     let cold = {
@@ -9428,6 +9432,7 @@ fn run_holding(
                 }
                 _ => match manifest::keeping(&db, &args, key, &cold.wrote) {
                     Ok(keeping) => {
+                        kept = true;
                         let (files, read) = (cold.wrote.len(), start.elapsed());
                         keeping.settle(move |bytes, took| {
                             eprintln!(
@@ -9598,6 +9603,18 @@ fn run_holding(
         builds.unasked.push(0);
     } else if programs[0].dehydrate() {
         builds.unasked.push(0);
+    } else if kept
+        && let Some(socket) = &programs[0].args.socket
+        && let Some(store) = blaze_store::Store::global()
+    {
+        // Once the store has it all, the daemon starts a worker from it in this one's place,
+        // which holds what a warm start holds (`Daemon::settle`).
+        let settles = cargo::daemon::settles_beside(socket);
+        store.settle_with(move || {
+            if let Err(why) = std::fs::write(&settles, b"") {
+                eprintln!("{}: {why}", settles.display());
+            }
+        });
     }
     // How many times running each checkout that is read as a loaded one has been long to turn
     // to or from.

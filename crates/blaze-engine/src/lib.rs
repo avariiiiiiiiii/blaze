@@ -6670,7 +6670,7 @@ impl Unedited {
                     // A registry by its layout, `<home>/registry/src/<index>/<package>`: a
                     // directory only named `registry` above a vendored package can be the
                     // project's own.
-                    let Some(home) = cargo::hermetic::cargo_home_of(&dir) else { continue };
+                    let Some(home) = cargo::home::cargo_home_of(&dir) else { continue };
                     let registry = home.join("registry");
                     if dir.starts_with(&registry) {
                         install(&mut unedited.installed, registry);

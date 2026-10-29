@@ -66,7 +66,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plane.md` |
 | vfs | `crates/blaze-vfs/`, `crates/vfs/`, `crates/vfs-notify/` |
 | format | `crates/blaze-ids/`, `crates/blaze-format/`, `crates/syntax-tree/`, `crates/syntax/`, `crates/parser/`, `crates/span/`, `crates/intern/`, `crates/tt/`, `crates/mbe/`, `crates/syntax-bridge/`, `crates/const-ast/`; in `crates/hir-def/src/`: `expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`, `item_tree.rs`, `item_tree/` |
-| db | `crates/blaze-query/`, `vendor/salsa/`, `vendor/salsa-macros/`, `vendor/salsa-macro-rules/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
+| db | `crates/blaze-query/`, `vendor/salsa/`, `vendor/rustc_type_ir/`, `vendor/rustc_next_trait_solver/`, `vendor/salsa-macros/`, `vendor/salsa-macro-rules/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
 | items | `crates/blaze-items/`; in `crates/hir-ty/src/`: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`, `drop.rs` |
 | store | `crates/blaze-cas/`, `crates/blaze-store/`, `crates/blaze-cargo/src/remote/`, `crates/blaze-cargo/src/remote.rs` |
 | codegen | `crates/blaze-codegen/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-engine/`, `vendor/llvm-sys/` |
@@ -79,7 +79,7 @@ Every other path (the cargo crates `blaze-manifest`, `blaze-metadata`, `blaze-ne
 `blaze-registry`, `blaze-resolve`, `blaze-source`, `blaze-tree`, `blaze-units`; `cfg`,
 `edition`, `paths`, `stdx`, `profile`, `toolchain`, `macros`, `rustc_abi`, `test-utils`,
 `blaze-doc`, `blaze-fmt`, `blaze-lints`, `blaze-fuzz`, `blaze-bench`, `blaze-cache`,
-`blaze-cache-macros`, `blaze-wasm`, `vendor/rustc_type_ir`, `vendor/rustc_next_trait_solver`,
+`blaze-cache-macros`, `blaze-wasm`,
 `library/`, `harness/` but `harness/v2/`, `.github/`, `docs/` but the lanes' notes) is the
 coordinator's: a change there is a request.
 

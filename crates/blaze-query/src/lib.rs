@@ -165,6 +165,7 @@ pub const CONFIG_DOMAIN: &str = "blaze v2 db input config 1";
 pub const VALUE_DOMAIN: &str = "blaze v2 db value 1";
 const ABSENT_DOMAIN: &str = "blaze v2 db input absent 1";
 const NAMES_DOMAIN: &str = "blaze v2 db input names 1";
+const FILE_DOMAIN: &str = "blaze v2 db input file 1";
 
 impl Input {
     pub fn key(&self) -> QueryKey {
@@ -340,15 +341,16 @@ impl<'db> Cx<'db> {
         Ok(read_value::<Q>(bytes))
     }
 
-    /// A file of the view: its content ID and bytes; `None` for none. Records the edge.
+    /// A file of the view: its content ID, mode and bytes; `None` for none. Records the edge.
     pub fn file(&mut self, path: &str) -> Result<Option<blaze_vfs::File<'db>>, Cancelled> {
         let (key, value) = self.db.input(&self.state, Input::File(path.to_owned()));
         self.edges.push(Edge { read: key, saw: value.fingerprint });
         Ok(match &value.data {
-            InputData::File(Some((id, bytes))) => {
+            InputData::File(Some((id, mode, bytes))) => {
                 // SAFETY: the bytes are the view's input, held by its state until it is
                 // retired (`Database::close`).
-                Some(blaze_vfs::File { id: *id, bytes: unsafe { kept(self.db, bytes) } })
+                let bytes = unsafe { kept(self.db, bytes) };
+                Some(blaze_vfs::File { id: *id, mode: *mode, bytes })
             }
             _ => None,
         })
@@ -492,7 +494,7 @@ struct InputValue {
 }
 
 enum InputData {
-    File(Option<(ContentId, Arc<[u8]>)>),
+    File(Option<(ContentId, blaze_vfs::Mode, Arc<[u8]>)>),
     Dir(Option<Arc<[(String, bool)]>>),
     Config,
 }
@@ -1028,7 +1030,11 @@ impl Database {
             Input::File(path) => {
                 let file = self.tree().file(state.view.root, path);
                 let fingerprint = match &file {
-                    Some((id, _)) => id.fingerprint(),
+                    Some((id, mode, _)) => Hasher::new(FILE_DOMAIN)
+                        .id(id)
+                        .update(&mode.git().to_le_bytes())
+                        .finish()
+                        .fingerprint(),
                     None => absent("file"),
                 };
                 InputValue { fingerprint, data: InputData::File(file) }

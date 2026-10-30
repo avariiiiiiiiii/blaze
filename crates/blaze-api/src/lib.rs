@@ -33,7 +33,7 @@ use blaze_vfs::{Change, Op, View};
 use serde::{Deserialize, Serialize};
 
 /// The version of every body's schema. A change to any type here is a new number.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.

@@ -4,6 +4,7 @@ pub mod body;
 mod expander;
 pub mod lower;
 pub mod path;
+pub mod persist;
 pub mod pretty;
 pub mod scope;
 #[cfg(test)]

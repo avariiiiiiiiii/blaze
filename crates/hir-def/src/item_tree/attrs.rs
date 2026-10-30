@@ -19,7 +19,7 @@ use hir_expand::{
     name::Name,
 };
 use intern::{Interned, Symbol, sym};
-use syntax::{AstNode, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, ast};
 use syntax_bridge::DocCommentDesugarMode;
 use tt::token_to_literal;
 
@@ -261,5 +261,126 @@ impl AttrsOrCfg {
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
         matches!(self, AttrsOrCfg::Enabled { attrs } if attrs.0.is_empty())
+    }
+}
+
+/// A `fn` whose body is entered for its inner attributes only when the body may have one.
+/// An outline's lazy body (#1294) is parsed when a cursor enters it, and lowering an item tree
+/// lowers no body: a body that surely starts with no `#!` stays unparsed.
+#[derive(Clone)]
+pub(super) struct OutlineFn(pub(super) ast::Fn);
+
+impl AstNode for OutlineFn {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        ast::Fn::can_cast(kind)
+    }
+
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        ast::Fn::cast(syntax).map(OutlineFn)
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        self.0.syntax()
+    }
+}
+
+impl ast::HasAttrs for OutlineFn {
+    fn inner_attributes_node(&self) -> Option<SyntaxNode> {
+        if self.0.body_is_lazy() {
+            let body = self.0.body()?;
+            let Some((tree, at)) = body.syntax().flat() else {
+                unreachable!("a lazy body outside a flat tree")
+            };
+            if !may_start_with_inner_attr(&tree.source()[tree.range(at)]) {
+                return None;
+            }
+        }
+        <ast::Fn as ast::HasAttrs>::inner_attributes_node(&self.0)
+    }
+}
+
+/// Whether the text of a block, its `{` included, may start with an inner attribute after
+/// whitespace and comments, as the parser's `inner_attrs` takes them: false only when it surely
+/// does not. A non-ASCII character, an unterminated comment or a text that is not a block is a
+/// maybe.
+fn may_start_with_inner_attr(block: &str) -> bool {
+    let Some(mut rest) = block.strip_prefix('{') else { return true };
+    loop {
+        rest = rest.trim_start_matches(|c: char| matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' '));
+        if let Some(comment) = rest.strip_prefix("//") {
+            match comment.find('\n') {
+                Some(end) => rest = &comment[end..],
+                None => return true,
+            }
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            match block_comment_len(comment) {
+                Some(end) => rest = &comment[end..],
+                None => return true,
+            }
+        } else {
+            return rest.chars().next().is_none_or(|c| c == '#' || !c.is_ascii());
+        }
+    }
+}
+
+/// How long the rest of a block comment is, after its opening `/*`, to just past the `*/` that
+/// closes it, nested comments included as the lexer counts them.
+fn block_comment_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut at) = (1usize, 0);
+    while at + 1 < bytes.len() {
+        match (bytes[at], bytes[at + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                at += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_start_with_inner_attr;
+
+    #[test]
+    fn a_block_may_start_with_an_inner_attribute() {
+        for maybe in [
+            "{ #![allow(unused)] }",
+            "{#!}",
+            "{ // a comment\n #![a] }",
+            "{ /* a /* nested */ comment */ #![a] }",
+            "{ //! inner docs\n#![a] }",
+            "{ /// outer docs\n #[a] x }",
+            "{ \u{2028} x }",
+            "{ /* unterminated ",
+            "{ // no newline",
+            "not a block",
+            "{",
+        ] {
+            assert!(may_start_with_inner_attr(maybe), "{maybe:?}");
+        }
+    }
+
+    #[test]
+    fn a_block_surely_starts_with_no_inner_attribute() {
+        for not in [
+            "{}",
+            "{ }",
+            "{ let x = 1; #![a] }",
+            "{ // #![a]\n x }",
+            "{ /* #![a] /* #![b] */ #![c] */ x }",
+            "{\r\n\t\u{0B}\u{0C} foo() }",
+        ] {
+            assert!(!may_start_with_inner_attr(not), "{not:?}");
+        }
     }
 }

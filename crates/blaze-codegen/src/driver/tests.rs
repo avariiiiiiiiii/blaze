@@ -165,6 +165,7 @@ impl Prepare for Machine {
             params: 0,
             unused: Vec::new(),
             attrs: Attrs::default(),
+            body: Attrs::default(),
             external: false,
         };
         Ok((summary, prepared.body))

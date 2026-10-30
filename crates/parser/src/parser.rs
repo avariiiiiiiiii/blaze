@@ -37,6 +37,8 @@ pub(crate) struct Parser<'t> {
     /// into this vec, keeping `Event` itself a flat 8-byte enum.
     errors: Vec<String>,
     steps: Cell<u32>,
+    /// Whether `fn` bodies are skipped as lazy nodes ([`crate::outline`]).
+    outline: bool,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
@@ -49,7 +51,35 @@ impl<'t> Parser<'t> {
             events: Vec::with_capacity(2 * inp.len()),
             errors: Vec::new(),
             steps: Cell::new(0),
+            outline: false,
         }
+    }
+
+    pub(super) fn new_outline(inp: &'t Input) -> Parser<'t> {
+        Parser { outline: true, ..Parser::new(inp) }
+    }
+
+    /// In an outline, the number of tokens of the `fn` body at the current `{` when it can be
+    /// left unparsed ([`crate::outline::lazy_block_len`]).
+    pub(crate) fn lazy_body(&self) -> Option<u32> {
+        if !self.outline {
+            return None;
+        }
+        crate::outline::lazy_block_len(self.inp, self.pos)
+    }
+
+    /// Skips the next `n_input_tokens` tokens as one lazy node of `kind`.
+    pub(crate) fn bump_lazy(&mut self, kind: SyntaxKind, n_input_tokens: u32) {
+        self.pos += n_input_tokens as usize;
+        self.steps.set(0);
+        self.push_event(Event::Lazy { kind, n_input_tokens });
+    }
+
+    /// Runs `parse` with every body in it parsed, in an outline too.
+    pub(crate) fn in_full(&mut self, parse: impl FnOnce(&mut Parser<'t>)) {
+        let outline = std::mem::replace(&mut self.outline, false);
+        parse(self);
+        self.outline = outline;
     }
 
     pub(crate) fn finish(self) -> (Vec<Event>, Vec<String>) {
@@ -425,6 +455,8 @@ impl CompletedMarker {
         debug_assert_eq!(p.events[end_pos - 1], Event::Finish);
         p.events[..end_pos].iter().rev().find_map(|event| match event {
             Event::Token { kind, .. } => Some(*kind),
+            // A lazy node is a balanced `{ ... }`.
+            Event::Lazy { .. } => Some(T!['}']),
             _ => None,
         })
     }

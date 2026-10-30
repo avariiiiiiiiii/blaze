@@ -392,7 +392,8 @@ fn request_head(head: &[u8]) -> Result<(String, String, Vec<(String, String)>), 
         }
         _ => return Err(HttpError::new(400, "a request line whose version is not HTTP/1.x")),
     }
-    let headers = lines[1..].iter().map(|line| header_line(line)).collect::<Result<_, _>>()?;
+    let headers: Vec<(String, String)> =
+        lines[1..].iter().map(|line| header_line(line)).collect::<Result<_, _>>()?;
     Ok((method.to_owned(), path.to_owned(), headers))
 }
 
@@ -408,7 +409,8 @@ fn response_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), HttpError>
         return Err(bad());
     }
     let status = status.parse().map_err(|_| bad())?;
-    let headers = lines[1..].iter().map(|line| header_line(line)).collect::<Result<_, _>>()?;
+    let headers: Vec<(String, String)> =
+        lines[1..].iter().map(|line| header_line(line)).collect::<Result<_, _>>()?;
     Ok((status, headers))
 }
 
@@ -630,7 +632,8 @@ fn head_bytes(start: &str, headers: &[(&str, &str)], last: (&str, &str)) -> Vec<
 /// A whole response, with its Content-Length.
 pub fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
     let start = format!("HTTP/1.1 {status} {}", reason(status));
-    let mut out = head_bytes(&start, headers, ("Content-Length", &body.len().to_string()));
+    let len = body.len().to_string();
+    let mut out = head_bytes(&start, headers, ("Content-Length", len.as_str()));
     out.extend_from_slice(body);
     out
 }
@@ -665,8 +668,10 @@ pub fn request(
     body: &[u8],
 ) -> Vec<u8> {
     let start = format!("{method} {path} HTTP/1.1");
-    let headers: Vec<(&str, &str)> = [("Host", host)].into_iter().chain(headers.iter().copied()).collect();
-    let mut out = head_bytes(&start, &headers, ("Content-Length", &body.len().to_string()));
+    let headers: Vec<(&str, &str)> =
+        [("Host", host)].into_iter().chain(headers.iter().copied()).collect();
+    let len = body.len().to_string();
+    let mut out = head_bytes(&start, &headers, ("Content-Length", len.as_str()));
     out.extend_from_slice(body);
     out
 }

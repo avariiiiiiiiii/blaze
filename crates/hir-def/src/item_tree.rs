@@ -32,6 +32,7 @@
 
 mod attrs;
 mod lower;
+pub mod persist;
 mod pretty;
 #[cfg(test)]
 mod tests;

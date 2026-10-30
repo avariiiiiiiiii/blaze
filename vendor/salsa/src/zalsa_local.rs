@@ -2125,8 +2125,11 @@ impl Drop for ActiveQueryGuard<'_> {
 pub(crate) mod persistence {
     #[cfg(test)]
     use super::QueryOriginRef;
+    use thin_vec::ThinVec;
+
     use super::{OriginAndExtra, QueryEdge, QueryEdges, QueryRevisions, QueryRevisionsExtra};
     use crate::DatabaseKeyIndex;
+    use crate::fingerprint::Fingerprint;
     use crate::sync::atomic::{AtomicBool, Ordering};
     use crate::{Durability, Revision};
 
@@ -2253,6 +2256,10 @@ pub(crate) mod persistence {
                 #[cfg(feature = "accumulator")]
                     accumulated_inputs: _, // TODO: Support serializing accumulators
                 ref origin_and_extra,
+                // The value fingerprint is computed again from the deserialized value, and the
+                // serialized origin's edges are not the recorded ones, so neither is persisted.
+                fingerprint: _,
+                edge_fingerprints: _,
             } = *self;
 
             MappedQueryRevisions {
@@ -2290,6 +2297,8 @@ pub(crate) mod persistence {
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: Default::default(), // TODO: Support serializing accumulators
                 verified_final: revisions.verified_final,
+                fingerprint: Fingerprint::NONE,
+                edge_fingerprints: ThinVec::new(),
             })
         }
     }

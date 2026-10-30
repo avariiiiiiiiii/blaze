@@ -1376,13 +1376,10 @@ impl<'db> rustc_type_ir::inherent::Ty<DbInterner<'db>> for Ty<'db> {
             TyKind::Coroutine(_, args) => args.as_coroutine().discr_ty(interner),
 
             TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(InferTy::TyVar(_)) => {
-                /*
-                let assoc_items = tcx.associated_item_def_ids(
-                    tcx.require_lang_item(hir::LangItem::DiscriminantKind, None),
-                );
-                TyKind::new_projection_from_args(tcx, assoc_items[0], tcx.mk_args(&[self.into()]))
-                */
-                unimplemented!()
+                let discriminant = interner.lang_items().Discriminant.unwrap_or_else(|| {
+                    panic!("`discriminant_ty` of {self:?} needs the `discriminant_type` lang item")
+                });
+                Ty::new_projection(interner, discriminant.into(), [self])
             }
 
             TyKind::Pat(ty, _) => ty.discriminant_ty(interner),
@@ -1417,11 +1414,9 @@ impl<'db> rustc_type_ir::inherent::Ty<DbInterner<'db>> for Ty<'db> {
             | TyKind::Infer(
                 InferTy::FreshTy(_) | InferTy::FreshIntTy(_) | InferTy::FreshFloatTy(_),
             ) => {
-                panic!(
-                    "`dself.iter().map(|v| v.try_fold_with(folder)).collect::<Result<_, _>>()?iscriminant_ty` applied to unexpected type: {self:?}"
-                )
+                panic!("`discriminant_ty` applied to unexpected type: {self:?}")
             }
-            TyKind::UnsafeBinder(..) => unimplemented!(),
+            TyKind::UnsafeBinder(..) => interner.default_types().types.u8,
         }
     }
 }

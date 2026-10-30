@@ -1203,7 +1203,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::AnonConstId(def_id) => {
                 AliasTermKind::UnevaluatedConst { def_id: GeneralConstIdWrapper(def_id.into()) }
             }
-            _ => unimplemented!("Unexpected alias: {:?}", def_id),
+            _ => unreachable!("an alias of {def_id:?}, which is no type alias, opaque or constant"),
         }
     }
 

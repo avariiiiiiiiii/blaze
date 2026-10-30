@@ -15,5 +15,8 @@ doctest = false
 [dependencies]
 rustc-hash.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

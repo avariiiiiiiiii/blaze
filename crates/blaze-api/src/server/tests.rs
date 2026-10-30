@@ -446,7 +446,7 @@ fn any_split_of_a_unix_stream_gives_the_same_arrivals_and_answers() {
         out.extend(rig.sent(conn));
         (rig.arrived(), out)
     };
-    let (arrived, out) = run(&mut |left| left);
+    let (arrived, out) = run(&mut |left: usize| left);
     assert_eq!(arrived, [
         asked(Conn(1), 1, Request::Status),
         asked(Conn(1), 2, Request::Cancel { id: 1 }),
@@ -456,7 +456,7 @@ fn any_split_of_a_unix_stream_gives_the_same_arrivals_and_answers() {
     assert_eq!(ids, [4, 4, 0, 0]);
     for seed in 0..300 {
         let mut rng = Rng::new(seed);
-        let got = run(&mut |left| (1 + rng.below(40) as usize).min(left));
+        let got = run(&mut |left: usize| (1 + rng.below(40) as usize).min(left));
         assert_eq!(got, (arrived.clone(), out.clone()), "seed {seed}");
     }
 }
@@ -669,7 +669,7 @@ fn any_split_of_an_http_stream_gives_the_same_arrivals_and_answers() {
         }
         (arrived, out)
     };
-    let (arrived, out) = run(&mut |left| left);
+    let (arrived, out) = run(&mut |left: usize| left);
     assert_eq!(arrived, [
         asked(Conn(1), 1, Request::Status),
         asked(Conn(1), 3, Request::Cancel { id: 1 }),
@@ -677,7 +677,7 @@ fn any_split_of_an_http_stream_gives_the_same_arrivals_and_answers() {
     assert_eq!(http_responses(&out).len(), 3);
     for seed in 0..200 {
         let mut rng = Rng::new(seed);
-        let got = run(&mut |left| (1 + rng.below(50) as usize).min(left));
+        let got = run(&mut |left: usize| (1 + rng.below(50) as usize).min(left));
         assert_eq!(got, (arrived.clone(), out.clone()), "seed {seed}");
     }
 }

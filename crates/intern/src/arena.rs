@@ -4,10 +4,15 @@
 //! stores are statics, so a pointer to a value is good for the life of the process. Memory is
 //! bounded by the database rebuilding what it keeps (docs/v2/db.md), not by counting references.
 //!
-//! A shard's table maps a hash to the values with it. Finding a value takes no lock; interning
-//! one takes its shard's lock only to look again and insert. A table grows by copying into one
-//! twice its size, published once full; the tables it outgrew are kept, as a reader may be
-//! probing one, so a shard's tables cost at most twice its last.
+//! A shard's table maps a hash to the values with it, SwissTable-style (docs/v2/plan/hardware.md,
+//! "interner and memo lookups"): slots in groups of eight, each group with one control word of
+//! eight tag bytes, so one load and a few word operations check eight slots. Finding a value
+//! takes no lock; interning one takes its shard's lock only to look again and insert. A table
+//! grows by copying into one twice its size, published once full; the tables it outgrew are
+//! kept, as a reader may be probing one, so a shard's tables cost at most twice its last.
+//!
+//! Chunks grow to 2 MiB; on Linux those are aligned to 2 MiB and backed by huge pages
+//! (docs/v2/plan/hardware.md, "memory").
 
 use std::{
     alloc::{self, Layout},
@@ -20,11 +25,17 @@ use std::{
 
 const SHARD_BITS: u32 = 6;
 const SHARDS: usize = 1 << SHARD_BITS;
-const FIRST_TABLE: usize = 16;
+
+/// Slots in a group: one tag byte each in the group's control word.
+const GROUP: usize = 8;
+const FIRST_GROUPS: usize = 2;
+const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 
 const CHUNK_ALIGN: usize = 64;
 const FIRST_CHUNK: usize = 1024;
-const LAST_CHUNK: usize = 256 * 1024;
+/// The largest chunk, one huge page.
+const LAST_CHUNK: usize = 2 * 1024 * 1024;
 
 pub(crate) struct Store {
     shards: Box<[Shard]>,
@@ -42,51 +53,104 @@ struct State {
     bump: Bump,
 }
 
+/// `ctrl[g]` holds the tags of `slots[g * GROUP..][..GROUP]`, byte `i` (from the least
+/// significant) for slot `i`: 0 when empty, `0x80 | ` the hash's top seven bits when full.
+///
+/// Only the holder of the shard's lock writes, and each slot once: its `hash` and `value`
+/// first, then its tag into the control word with `Release`. A reader that loads the word with
+/// `Acquire` and sees the tag sees the slot and the value's bytes.
 struct Table {
+    ctrl: Box<[AtomicU64]>,
     slots: Box<[Slot]>,
 }
 
-/// Empty while `value` is null. Written once, by the holder of the shard's lock: `hash` first,
-/// then `value` with `Release`, so a reader that loads a non-null `value` with `Acquire` sees
-/// `hash` and the value's bytes.
 struct Slot {
     hash: AtomicU64,
     value: AtomicPtr<u8>,
 }
 
+fn tag(hash: u64) -> u64 {
+    0x80 | (hash >> 57)
+}
+
+/// A byte's high bit set for each byte of `word` that may equal `tag`: every equal byte, and
+/// rarely the byte above one (the borrow of the subtraction), which the caller checks.
+fn matching(word: u64, tag: u64) -> u64 {
+    let x = word ^ (LOW_BITS * tag);
+    x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS
+}
+
+/// A byte's high bit set for each empty byte of `word`: full bytes have their high bit set.
+fn empty(word: u64) -> u64 {
+    !word & HIGH_BITS
+}
+
 impl Table {
-    fn new(len: usize) -> Table {
-        debug_assert!(len.is_power_of_two());
+    fn new(groups: usize) -> Table {
+        debug_assert!(groups.is_power_of_two());
         Table {
-            slots: (0..len)
+            ctrl: (0..groups).map(|_| AtomicU64::new(0)).collect(),
+            slots: (0..groups * GROUP)
                 .map(|_| Slot { hash: AtomicU64::new(0), value: AtomicPtr::new(ptr::null_mut()) })
                 .collect(),
         }
     }
 
-    /// The value with `hash` that `matches`, probing from the hash's home until an empty slot.
+    fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The value with `hash` that `matches`, probing groups from the hash's home until one with
+    /// an empty slot.
     fn find(&self, hash: u64, mut matches: impl FnMut(NonNull<u8>) -> bool) -> Option<NonNull<u8>> {
-        let mask = self.slots.len() - 1;
-        let mut at = hash as usize & mask;
+        let mask = self.ctrl.len() - 1;
+        let tag = tag(hash);
+        let mut group = hash as usize & mask;
         loop {
-            let slot = &self.slots[at];
-            let value = NonNull::new(slot.value.load(Ordering::Acquire))?;
-            if slot.hash.load(Ordering::Relaxed) == hash && matches(value) {
-                return Some(value);
+            let word = self.ctrl[group].load(Ordering::Acquire);
+            let mut hits = matching(word, tag);
+            while hits != 0 {
+                let byte = hits.trailing_zeros() / 8;
+                hits &= hits - 1;
+                // A byte matched only by the borrow may be a slot not published in `word`,
+                // which a writer may be filling: only a published tag orders its slot.
+                if (word >> (byte * 8)) & 0xff != tag {
+                    continue;
+                }
+                let slot = &self.slots[group * GROUP + byte as usize];
+                // Relaxed: the tag's `Acquire` above ordered the slot's writes before us.
+                let value = NonNull::new(slot.value.load(Ordering::Relaxed))
+                    .expect("a published slot holds a value");
+                if slot.hash.load(Ordering::Relaxed) == hash && matches(value) {
+                    return Some(value);
+                }
             }
-            at = (at + 1) & mask;
+            if empty(word) != 0 {
+                return None;
+            }
+            group = (group + 1) & mask;
         }
     }
 
-    /// The first empty slot from `hash`'s home. Called by the holder of the shard's lock, the
-    /// only writer, on a table at most half full.
-    fn empty(&self, hash: u64) -> &Slot {
-        let mask = self.slots.len() - 1;
-        let mut at = hash as usize & mask;
-        while !self.slots[at].value.load(Ordering::Relaxed).is_null() {
-            at = (at + 1) & mask;
+    /// Fills the first empty slot from `hash`'s home group. Called by the holder of the shard's
+    /// lock, the only writer, on a table that stays at most half full.
+    fn put(&self, hash: u64, value: *mut u8, publish: Ordering) {
+        let mask = self.ctrl.len() - 1;
+        let mut group = hash as usize & mask;
+        loop {
+            let ctrl = &self.ctrl[group];
+            let word = ctrl.load(Ordering::Relaxed);
+            let free = empty(word);
+            if free != 0 {
+                let byte = free.trailing_zeros() / 8;
+                let slot = &self.slots[group * GROUP + byte as usize];
+                slot.hash.store(hash, Ordering::Relaxed);
+                slot.value.store(value, Ordering::Relaxed);
+                ctrl.store(word | (tag(hash) << (byte * 8)), publish);
+                return;
+            }
+            group = (group + 1) & mask;
         }
-        &self.slots[at]
     }
 }
 
@@ -116,7 +180,8 @@ impl Store {
     }
 
     fn shard(&self, hash: u64) -> &Shard {
-        // The probe starts from the hash's low bits; the shard is picked by all of them, mixed.
+        // The probe starts from the hash's low bits and the tag is its top ones; the shard is
+        // picked by all of them, mixed.
         let mixed = hash.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         &self.shards[(mixed >> (u64::BITS - SHARD_BITS)) as usize]
     }
@@ -129,7 +194,7 @@ impl Store {
     ) -> Option<NonNull<u8>> {
         let table = self.shard(hash).table.load(Ordering::Acquire);
         // SAFETY: A published table is leaked and never freed or written but to fill an empty
-        // slot (see `Slot`).
+        // slot (see `Table`).
         unsafe { table.as_ref() }?.find(hash, matches)
     }
 
@@ -176,9 +241,7 @@ impl Vacant<'_> {
     /// process, as everything [`Store::find`] hands out is.
     pub(crate) fn publish(mut self, value: NonNull<u8>) {
         let table = self.table_for_one_more();
-        let slot = table.empty(self.hash);
-        slot.hash.store(self.hash, Ordering::Relaxed);
-        slot.value.store(value.as_ptr(), Ordering::Release);
+        table.put(self.hash, value.as_ptr(), Ordering::Release);
         self.state.len += 1;
     }
 
@@ -187,23 +250,25 @@ impl Vacant<'_> {
         let current = self.shard.table.load(Ordering::Acquire);
         // SAFETY: As in `Store::find`; tables are leaked, so `'static`.
         let current: Option<&'static Table> = unsafe { current.as_ref() };
-        let capacity = current.map_or(0, |table| table.slots.len());
+        let capacity = current.map_or(0, Table::capacity);
         if let Some(table) = current
             && (self.state.len + 1) * 2 <= capacity
         {
             return table;
         }
-        let grown = Table::new((capacity * 2).max(FIRST_TABLE));
-        for slot in current.into_iter().flat_map(|table| &*table.slots) {
+        let groups = current.map_or(FIRST_GROUPS, |table| table.ctrl.len() * 2);
+        let grown = Table::new(groups);
+        if let Some(old) = current {
             // Relaxed: every write to the table was made by a holder of the lock we hold.
-            let value = slot.value.load(Ordering::Relaxed);
-            if value.is_null() {
-                continue;
+            for (group, ctrl) in old.ctrl.iter().enumerate() {
+                let mut full = ctrl.load(Ordering::Relaxed) & HIGH_BITS;
+                while full != 0 {
+                    let slot = &old.slots[group * GROUP + (full.trailing_zeros() / 8) as usize];
+                    full &= full - 1;
+                    let hash = slot.hash.load(Ordering::Relaxed);
+                    grown.put(hash, slot.value.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
             }
-            let hash = slot.hash.load(Ordering::Relaxed);
-            let to = grown.empty(hash);
-            to.hash.store(hash, Ordering::Relaxed);
-            to.value.store(value, Ordering::Relaxed);
         }
         let grown: &'static Table = Box::leak(Box::new(grown));
         // Release: a reader that loads the new table sees its slots and, through the lock's
@@ -245,8 +310,7 @@ impl Bump {
         if pad + size > self.left {
             let bytes = self.next.max(size.next_multiple_of(CHUNK_ALIGN));
             self.next = (self.next * 2).min(LAST_CHUNK);
-            self.cursor = own(Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout"))
-                .as_ptr();
+            self.cursor = chunk(bytes).as_ptr();
             self.left = bytes;
             pad = 0;
         }
@@ -258,6 +322,27 @@ impl Bump {
             NonNull::new_unchecked(at)
         }
     }
+}
+
+/// A chunk of `bytes`, never freed. A chunk of `LAST_CHUNK` bytes is one huge page.
+fn chunk(bytes: usize) -> NonNull<u8> {
+    if bytes != LAST_CHUNK {
+        return own(Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout"));
+    }
+    let at = own(Layout::from_size_align(LAST_CHUNK, LAST_CHUNK).expect("a chunk's layout"));
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `at..at + LAST_CHUNK` is one allocation of ours, aligned to the huge page
+        // size; `MADV_HUGEPAGE` changes only how it is backed, not its contents.
+        let advised = unsafe { libc::madvise(at.as_ptr().cast(), LAST_CHUNK, libc::MADV_HUGEPAGE) };
+        assert!(
+            advised == 0,
+            "intern: madvise(MADV_HUGEPAGE) of a 2 MiB interner chunk failed: {} \
+             (the kernel needs transparent huge pages in `madvise` or `always` mode)",
+            std::io::Error::last_os_error(),
+        );
+    }
+    at
 }
 
 /// An allocation of its own, never freed. `layout` has a non-zero size.
@@ -280,8 +365,9 @@ mod tests {
         }
     }
 
-    /// Values of one hash all land in one shard and probe past each other: the table grows
-    /// many times and every value is still found, where it was written.
+    /// Values of one hash all land in one shard, one home group and one tag, and probe past
+    /// each other: the table grows many times and every value is still found where it was
+    /// written.
     #[test]
     fn colliding_hashes_grow_one_shard() {
         let store = Store::new();
@@ -292,6 +378,43 @@ mod tests {
             assert_eq!(unsafe { *at.cast::<u64>().as_ref() }, n as u64);
         }
         assert_eq!(store.len(), 5_000);
+    }
+
+    /// Hashes that share a home group and differ in tag, and ones that share a tag and differ
+    /// in the rest: each value is found under its own hash only.
+    #[test]
+    fn tags_and_groups_tell_values_apart() {
+        let store = Store::new();
+        let hashes: Vec<u64> = (0..2_000u64)
+            .map(|n| if n % 2 == 0 { (n << 57) | 3 } else { (5 << 57) | (n << 8) })
+            .collect();
+        let at: Vec<_> = hashes.iter().map(|&hash| intern(&store, hash, hash)).collect();
+        for (&hash, &at) in hashes.iter().zip(&at) {
+            let same = |it: NonNull<u8>| unsafe { *it.cast::<u64>().as_ref() == hash };
+            assert_eq!(store.find(hash, same), Some(at));
+            assert_eq!(store.find(hash ^ (1 << 56), |_| true), None);
+        }
+    }
+
+    #[test]
+    fn matching_finds_every_equal_byte() {
+        for tag in [0x80u64, 0x81, 0xfe, 0xff] {
+            for slots in 0..=255u64 {
+                let mut word = 0;
+                let mut want = 0;
+                for byte in 0..8 {
+                    if slots & (1 << byte) != 0 {
+                        word |= tag << (byte * 8);
+                        want |= 0x80 << (byte * 8);
+                    } else if byte % 3 == 0 {
+                        word |= (tag ^ 1) << (byte * 8);
+                    }
+                }
+                let hits = matching(word, tag);
+                assert_eq!(hits & want, want, "{word:x} {tag:x}");
+            }
+        }
+        assert_eq!(empty(0x80ff_0000_8100_0080), 0x0000_8080_0080_8000);
     }
 
     #[test]
@@ -308,7 +431,7 @@ mod tests {
     fn bump_aligns_and_never_overlaps() {
         let mut bump = Bump::new();
         let mut taken: Vec<(usize, usize)> = Vec::new();
-        for i in 0..10_000usize {
+        for i in 0..40_000usize {
             let align = 1 << (i % 8);
             let size = (i * 7) % 300;
             let at = bump.alloc(Layout::from_size_align(size, align).unwrap());
@@ -324,5 +447,6 @@ mod tests {
         for pair in taken.windows(2) {
             assert!(pair[0].0 + pair[0].1 <= pair[1].0, "{pair:?}");
         }
+        assert_eq!(bump.next, LAST_CHUNK, "the test reached huge chunks");
     }
 }

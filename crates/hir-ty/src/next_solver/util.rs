@@ -283,7 +283,10 @@ impl PrimitiveExt for Primitive {
 
 impl<'db> HasDataLayout for DbInterner<'db> {
     fn data_layout(&self) -> &rustc_abi::TargetDataLayout {
-        unimplemented!()
+        let krate = self.expect_crate();
+        self.db.target_data_layout(krate).unwrap_or_else(|error| {
+            panic!("the data layout of {krate:?}'s target does not load: {error}")
+        })
     }
 }
 

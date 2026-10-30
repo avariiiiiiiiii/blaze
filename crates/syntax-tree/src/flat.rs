@@ -913,3 +913,703 @@ impl FlatTreeBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{hash_map::DefaultHasher, BTreeMap},
+        hash::{Hash, Hasher},
+        sync::{
+            atomic::{AtomicU32, AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
+        },
+    };
+
+    use super::{Expand, FlatTree, BIG};
+    use crate::{
+        cursor::{SyntaxElement, SyntaxNode},
+        FlatTreeBuilder, GreenNodeBuilder, NodeOrToken, SyntaxKind, TextRange, TextSize,
+        TokenAtOffset, WalkEvent,
+    };
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+        }
+
+        fn below(&mut self, below: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % below
+        }
+    }
+
+    /// A tree to build each way: a node is its kind, its children and, when it is lazy in an
+    /// outline, the number of its part in [`PARTS`].
+    #[derive(Clone, Debug)]
+    enum Shape {
+        Node(SyntaxKind, Vec<Shape>, Option<usize>),
+        Token(SyntaxKind, String),
+    }
+
+    /// A tree from a seed: nodes up to five deep, some empty, tokens of zero to three bytes.
+    fn random_shape(seed: u64) -> Shape {
+        fn close(open: &mut Vec<(SyntaxKind, Vec<Shape>)>) {
+            let (kind, children) = open.pop().unwrap();
+            open.last_mut().unwrap().1.push(Shape::Node(kind, children, None));
+        }
+        let mut rng = Rng::new(seed);
+        let mut open = vec![(SyntaxKind(100), Vec::new())];
+        for _ in 0..rng.below(60) {
+            match rng.below(4) {
+                0 if open.len() < 5 => {
+                    open.push((SyntaxKind(100 + rng.below(5) as u16), Vec::new()))
+                }
+                1 if open.len() > 1 => close(&mut open),
+                _ => {
+                    let kind = SyntaxKind(rng.below(5) as u16);
+                    let text = "abc"[..rng.below(4) as usize].to_owned();
+                    open.last_mut().unwrap().1.push(Shape::Token(kind, text));
+                }
+            }
+        }
+        while open.len() > 1 {
+            close(&mut open);
+        }
+        let (kind, children) = open.pop().unwrap();
+        Shape::Node(kind, children, None)
+    }
+
+    /// A tree past what an element's word holds: rows of 170 tokens, in nodes of more than
+    /// 2^14 elements, and a few tokens of more than 2^14 bytes.
+    fn big_shape(seed: u64) -> Shape {
+        let mut rng = Rng::new(seed);
+        let mut rows = Vec::new();
+        for row in 0..100u64 {
+            let mut tokens = Vec::new();
+            for i in 0..170u16 {
+                let text = "abc"[..rng.below(4) as usize].to_owned();
+                tokens.push(Shape::Token(SyntaxKind(i % 5), text));
+            }
+            if row % 37 == seed % 37 {
+                let long = "x".repeat(BIG as usize + rng.below(3000) as usize);
+                tokens.insert(rng.below(170) as usize, Shape::Token(SyntaxKind(3), long));
+            }
+            rows.push(Shape::Node(SyntaxKind(101 + (row % 4) as u16), tokens, None));
+        }
+        let rows = Shape::Node(SyntaxKind(102), rows, None);
+        Shape::Node(SyntaxKind(100), vec![rows, Shape::Token(SyntaxKind(1), "ab".into())], None)
+    }
+
+    /// The parts of the lazy nodes of every outline the tests build, by the number in their
+    /// first token.
+    static PARTS: Mutex<BTreeMap<usize, FlatTree>> = Mutex::new(BTreeMap::new());
+    static NEXT_PART: AtomicUsize = AtomicUsize::new(0);
+    const DATA: u32 = 0x5eed;
+
+    /// A lazy node: its first token is `<n>`, `n` the number of its part.
+    fn lazy_node(kind: SyntaxKind, mut children: Vec<Shape>) -> Shape {
+        let n = NEXT_PART.fetch_add(1, Ordering::Relaxed);
+        children.insert(0, Shape::Token(SyntaxKind(4), format!("<{n}>")));
+        Shape::Node(kind, children, Some(n))
+    }
+
+    /// Makes some nodes below the root of `shape` lazy, none inside another.
+    fn make_lazy(shape: &mut Shape, rng: &mut Rng) {
+        let Shape::Node(_, children, _) = shape else { return };
+        for child in children.iter_mut() {
+            if let Shape::Node(kind, grandchildren, None) = child {
+                if rng.below(3) == 0 {
+                    *child = lazy_node(*kind, std::mem::take(grandchildren));
+                    continue;
+                }
+            }
+            make_lazy(child, rng);
+        }
+    }
+
+    /// The expander of the tests' outlines.
+    fn expand(kind: SyntaxKind, text: &str, data: u32) -> FlatTree {
+        assert_eq!(data, DATA);
+        let n: usize = text[1..text.find('>').expect("a part's number")].parse().unwrap();
+        let part = PARTS.lock().unwrap()[&n].clone();
+        assert_eq!(part.kind(0), kind);
+        part
+    }
+
+    fn text_of(shape: &Shape, text: &mut String) {
+        match shape {
+            Shape::Node(_, children, _) => children.iter().for_each(|it| text_of(it, text)),
+            Shape::Token(_, it) => text.push_str(it),
+        }
+    }
+
+    fn to_green(shape: &Shape, builder: &mut GreenNodeBuilder<'_>) {
+        match shape {
+            Shape::Node(kind, children, _) => {
+                builder.start_node(*kind);
+                children.iter().for_each(|it| to_green(it, builder));
+                builder.finish_node();
+            }
+            Shape::Token(kind, text) => builder.token(*kind, text),
+        }
+    }
+
+    /// Builds `shape`, its lazy nodes lazy when `outline`, keeping their parts in [`PARTS`].
+    fn to_flat(shape: &Shape, builder: &mut FlatTreeBuilder, outline: bool) {
+        fn node(kind: SyntaxKind, children: &[Shape], builder: &mut FlatTreeBuilder, outline: bool) {
+            builder.start_node(kind);
+            children.iter().for_each(|it| to_flat(it, builder, outline));
+            builder.finish_node();
+        }
+        match shape {
+            Shape::Node(kind, children, Some(n)) if outline => {
+                let mut text = String::new();
+                text_of(shape, &mut text);
+                builder.lazy(*kind, text.len() as u32);
+                let mut part = FlatTreeBuilder::new();
+                node(*kind, children, &mut part, false);
+                PARTS.lock().unwrap().insert(*n, part.finish());
+            }
+            Shape::Node(kind, children, _) => node(*kind, children, builder, outline),
+            Shape::Token(kind, text) => builder.token(*kind, text),
+        }
+    }
+
+    fn build_green(shape: &Shape) -> SyntaxNode {
+        let mut builder = GreenNodeBuilder::new();
+        to_green(shape, &mut builder);
+        SyntaxNode::new_root(builder.finish())
+    }
+
+    /// `shape` as a flat tree in full, appending its text or over its source.
+    fn build_flat(shape: &Shape, sourced: bool) -> FlatTree {
+        let mut builder = match sourced {
+            true => {
+                let mut text = String::new();
+                text_of(shape, &mut text);
+                FlatTreeBuilder::sourced(text.into())
+            }
+            false => FlatTreeBuilder::new(),
+        };
+        to_flat(shape, &mut builder, false);
+        builder.finish()
+    }
+
+    /// `shape` as an outline over its source.
+    fn build_outline(shape: &Shape, expand: Expand) -> Arc<FlatTree> {
+        let mut text = String::new();
+        text_of(shape, &mut text);
+        let mut builder = FlatTreeBuilder::sourced(text.into());
+        to_flat(shape, &mut builder, true);
+        builder.expand_with(expand, DATA);
+        Arc::new(builder.finish())
+    }
+
+    fn describe(element: Option<SyntaxElement>) -> Option<(SyntaxKind, TextRange, bool)> {
+        element.map(|it| (it.kind(), it.text_range(), it.as_token().is_some()))
+    }
+
+    fn elements(root: &SyntaxNode) -> Vec<SyntaxElement> {
+        root.preorder_with_tokens()
+            .filter_map(|it| match it {
+                WalkEvent::Enter(it) => Some(it),
+                WalkEvent::Leave(_) => None,
+            })
+            .collect()
+    }
+
+    fn hash_of(node: &SyntaxNode) -> u64 {
+        let mut state = DefaultHasher::new();
+        node.hash(&mut state);
+        state.finish()
+    }
+
+    /// The ranges a node's checks look at when not every range: its own, its children's,
+    /// those one byte shorter at either end, and the empty ones at their starts.
+    fn around(node: &SyntaxNode) -> Vec<TextRange> {
+        let one = TextSize::from(1);
+        let mut ranges = vec![node.text_range(), TextRange::empty(node.text_range().end())];
+        for child in node.children_with_tokens() {
+            let range = child.text_range();
+            ranges.extend([range, TextRange::empty(range.start())]);
+            if range.len() > one {
+                ranges.extend([
+                    TextRange::new(range.start() + one, range.end()),
+                    TextRange::new(range.start(), range.end() - one),
+                ]);
+            }
+        }
+        ranges
+    }
+
+    /// Every function of the cursor on every element of `flat` against `green`, the same tree:
+    /// with every range in every node when `exhaustive`, else the ranges [`around`] it.
+    fn compare(green: &SyntaxNode, flat: &SyntaxNode, exhaustive: bool, seed: u64) {
+        assert_eq!(green.to_string(), flat.to_string());
+        let (greens, flats) = (elements(green), elements(flat));
+        assert_eq!(greens.len(), flats.len());
+        for (g, f) in greens.iter().zip(&flats) {
+            assert_eq!(describe(Some(g.clone())), describe(Some(f.clone())), "seed {seed}");
+            assert_eq!(g.index(), f.index());
+            assert_eq!(describe(g.parent().map(Into::into)), describe(f.parent().map(Into::into)));
+            assert_eq!(describe(g.next_sibling_or_token()), describe(f.next_sibling_or_token()));
+            assert_eq!(describe(g.prev_sibling_or_token()), describe(f.prev_sibling_or_token()));
+            assert_eq!(
+                describe(g.first_token().map(Into::into)),
+                describe(f.first_token().map(Into::into))
+            );
+            assert_eq!(
+                describe(g.last_token().map(Into::into)),
+                describe(f.last_token().map(Into::into))
+            );
+            match (g, f) {
+                (NodeOrToken::Node(g), NodeOrToken::Node(f)) => {
+                    let node = |it: Option<SyntaxNode>| describe(it.map(Into::into));
+                    assert_eq!(node(g.first_child()), node(f.first_child()));
+                    assert_eq!(node(g.last_child()), node(f.last_child()));
+                    assert_eq!(node(g.next_sibling()), node(f.next_sibling()));
+                    assert_eq!(node(g.prev_sibling()), node(f.prev_sibling()));
+                    assert_eq!(describe(g.first_child_or_token()), describe(f.first_child_or_token()));
+                    assert_eq!(describe(g.last_child_or_token()), describe(f.last_child_or_token()));
+                    assert_eq!(g.green(), f.green());
+                    assert_eq!(g.text().to_string(), f.text().to_string());
+                    assert_eq!(g.first_child_token_text(), f.first_child_token_text());
+                    let range = g.text_range();
+                    let (start, end) = (u32::from(range.start()), u32::from(range.end()));
+                    let ranges: Vec<TextRange> = match exhaustive {
+                        true => (start..=end)
+                            .flat_map(|from| {
+                                (from..=end).map(move |to| TextRange::new(from.into(), to.into()))
+                            })
+                            .collect(),
+                        false => around(g),
+                    };
+                    for &at in &ranges {
+                        assert_eq!(
+                            describe(g.child_or_token_at_range(at)),
+                            describe(f.child_or_token_at_range(at)),
+                            "seed {seed}, {at:?} in {range:?}"
+                        );
+                        assert_eq!(
+                            describe(Some(g.covering_element(at))),
+                            describe(Some(f.covering_element(at)))
+                        );
+                        for kind in (0..5).chain(100..105).map(SyntaxKind) {
+                            let stepped = |from: &SyntaxNode| {
+                                std::iter::successors(Some(from.clone()), |it| {
+                                    it.child_or_token_at_range(at)?.into_node()
+                                })
+                                .find(|it| it.text_range() == at && it.kind() == kind)
+                            };
+                            let found =
+                                f.flat_node_at_range(at, kind).unwrap_or_else(|| stepped(f));
+                            assert_eq!(
+                                stepped(g).map(|it| describe(Some(it.into()))),
+                                found.map(|it| describe(Some(it.into()))),
+                                "seed {seed}, {kind:?} at {at:?}"
+                            );
+                        }
+                    }
+                    let offsets: Vec<u32> = match exhaustive {
+                        true => (start..=end).collect(),
+                        false => ranges.iter().map(|it| u32::from(it.start())).collect(),
+                    };
+                    for offset in offsets {
+                        let offset = TextSize::from(offset);
+                        let tokens = |it: TokenAtOffset<_>| {
+                            it.map(|it| describe(Some(NodeOrToken::Token(it)))).collect::<Vec<_>>()
+                        };
+                        assert_eq!(tokens(g.token_at_offset(offset)), tokens(f.token_at_offset(offset)));
+                    }
+                }
+                (NodeOrToken::Token(g), NodeOrToken::Token(f)) => {
+                    assert_eq!(g.text(), f.text());
+                    assert_eq!(g.green(), f.green());
+                    let token = |it: Option<_>| describe(it.map(NodeOrToken::Token));
+                    assert_eq!(token(g.next_token()), token(f.next_token()));
+                    assert_eq!(token(g.prev_token()), token(f.prev_token()));
+                }
+                _ => unreachable!(),
+            }
+        }
+        let hash = |it: &SyntaxNode| {
+            let (tree, at) = it.flat().unwrap();
+            let mut state = DefaultHasher::new();
+            tree.hash_subtree(at, &mut state);
+            state.finish()
+        };
+        // Whether the arrays hold all of a node's subtree, no lazy node in it.
+        let full = |it: &SyntaxNode| {
+            let (tree, at) = it.flat().unwrap();
+            (at..tree.end(at)).all(|it| !tree.is_lazy(it))
+        };
+        for (g, f) in greens.iter().zip(&flats).filter(|(g, _)| g.as_node().is_some()) {
+            let (g, f) = (g.as_node().unwrap(), f.as_node().unwrap());
+            let replacement = g.green().to_owned();
+            assert_eq!(g.replace_with(replacement.clone()), f.replace_with(replacement));
+            assert_eq!(g.clone_subtree().to_string(), f.clone_subtree().to_string());
+            let alone = f.clone_subtree();
+            assert_eq!(alone.green(), g.green());
+            assert_eq!(hash(f), hash(&alone), "seed {seed}");
+            if full(f) {
+                let mut again = FlatTreeBuilder::new();
+                for event in g.preorder_with_tokens() {
+                    match event {
+                        WalkEvent::Enter(NodeOrToken::Node(it)) => again.start_node(it.kind()),
+                        WalkEvent::Enter(NodeOrToken::Token(it)) => again.token(it.kind(), it.text()),
+                        WalkEvent::Leave(NodeOrToken::Node(_)) => again.finish_node(),
+                        WalkEvent::Leave(NodeOrToken::Token(_)) => {}
+                    }
+                }
+                assert_eq!(alone.flat_tree().map(|it| &**it), Some(&again.finish()));
+            }
+            if exhaustive {
+                let twin = g.to_flat();
+                assert_eq!(describe(Some(twin.clone().into())), describe(Some(f.clone().into())));
+                assert_eq!(twin.parent().is_none(), g.parent().is_none());
+                if full(f) {
+                    assert_eq!(hash(&twin), hash(f));
+                }
+            }
+            for node in [g, f] {
+                for kind in (0..5).chain(100..105).map(SyntaxKind) {
+                    let ancestor = node.ancestors().find(|it| it.kind() == kind);
+                    assert_eq!(node.ancestor_where(|it| it == kind), ancestor);
+                    let child = node.children().find(|it| it.kind() == kind);
+                    assert_eq!(node.child_where(|it| it == kind), child);
+                    let token = node
+                        .children_with_tokens()
+                        .filter_map(NodeOrToken::into_token)
+                        .find(|it| it.kind() == kind);
+                    assert_eq!(node.child_token(kind), token);
+                }
+                let mut odd = node.children_where();
+                let by_kind = std::iter::from_fn(|| odd.next_where(|it| it.0 % 2 == 1));
+                let children = node.children().filter(|it| it.kind().0 % 2 == 1);
+                assert!(by_kind.eq(children));
+            }
+            let (tree, at) = f.flat().unwrap();
+            if !tree.is_lazy(at) {
+                let children: Vec<_> = f.children().collect();
+                let read: Vec<_> = tree.children(at).map(|it| f.flat_element(it)).collect();
+                assert_eq!(read, children.into_iter().map(NodeOrToken::Node).collect::<Vec<_>>());
+            }
+            if full(f) {
+                let descendants = f.descendants().map(|it| (it.kind(), it.text_range()));
+                assert!(
+                    descendants.eq(tree.descendants(at).map(|it| (tree.kind(it), tree.range(it))))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_tree_answers_as_a_green_one() {
+        for seed in 0..2000 {
+            let shape = random_shape(seed);
+            let flat = SyntaxNode::new_flat_root(Arc::new(build_flat(&shape, seed % 2 == 1)));
+            compare(&build_green(&shape), &flat, true, seed);
+        }
+        for seed in 0..4 {
+            let shape = big_shape(seed);
+            let tree = build_flat(&shape, seed % 2 == 1);
+            assert!(tree.big.iter().any(|&(it, _)| tree.is_token(it)), "a token past the word");
+            assert!(tree.big.iter().any(|&(it, _)| !tree.is_token(it)), "a node past the word");
+            compare(&build_green(&shape), &SyntaxNode::new_flat_root(Arc::new(tree)), false, seed);
+        }
+    }
+
+    #[test]
+    fn a_tree_of_millions_of_elements_and_a_token_of_megabytes() {
+        const ROWS: u32 = 30_000;
+        let long = "y".repeat(5 << 20);
+        let mut builder = FlatTreeBuilder::new();
+        builder.start_node(SyntaxKind(100));
+        for _ in 0..ROWS {
+            builder.start_node(SyntaxKind(101));
+            for _ in 0..99 {
+                builder.token(SyntaxKind(1), "ab");
+            }
+            builder.finish_node();
+        }
+        builder.token(SyntaxKind(2), &long);
+        builder.finish_node();
+        let tree = builder.finish();
+        assert_eq!(tree.len(), 1 + ROWS * 100 + 1);
+        assert_eq!(tree.end(0), tree.len());
+        for row in [0, 1, 7, 12_345, ROWS - 1] {
+            let at = 1 + row * 100;
+            assert_eq!((tree.kind(at), tree.end(at), tree.parent(at)), (SyntaxKind(101), at + 100, Some(0)));
+            assert_eq!(tree.range(at), TextRange::at((row * 198).into(), 198.into()));
+            assert_eq!(tree.parent(at + 99), Some(at));
+            assert_eq!(tree.range(at + 99), TextRange::at((row * 198 + 196).into(), 2.into()));
+        }
+        let last = tree.len() - 1;
+        assert_eq!(tree.range(last), TextRange::at((ROWS * 198).into(), (5u32 << 20).into()));
+        assert_eq!(tree.token_text(last), long);
+        assert_eq!(tree.range(0).end(), TextSize::of(tree.text()));
+        let root = SyntaxNode::new_flat_root(Arc::new(tree));
+        let found = root.covering_element(TextRange::at((12_345 * 198 + 3).into(), 1.into()));
+        assert_eq!(found.text_range(), TextRange::at((12_345 * 198 + 2).into(), 2.into()));
+        let row = found.parent().unwrap();
+        assert_eq!(row.text_range(), TextRange::at((12_345 * 198).into(), 198.into()));
+        assert_eq!(row.index(), 12_345);
+        let in_long = TextRange::at((ROWS * 198 + 1_000_000).into(), 5.into());
+        assert_eq!(root.covering_element(in_long).kind(), SyntaxKind(2));
+        let alone = row.clone_subtree();
+        assert_eq!(alone.text_range(), TextRange::up_to(198.into()));
+        assert_eq!(alone.to_string(), "ab".repeat(99));
+    }
+
+    #[test]
+    fn an_outline_answers_as_the_tree_in_full() {
+        for seed in 0..2004 {
+            let big = seed >= 2000;
+            let mut shape = match big {
+                true => big_shape(seed),
+                false => random_shape(seed),
+            };
+            make_lazy(&mut shape, &mut Rng::new(seed ^ 0x1a2b));
+            let tree = build_outline(&shape, expand);
+            let lazies: Vec<u32> = tree.lazies().collect();
+            let outline = SyntaxNode::new_flat_root(tree.clone());
+            for &at in &lazies {
+                let node = outline.flat_element(at).into_node().unwrap();
+                assert!(tree.is_lazy(at) && node.is_lazy() && !tree.is_parsed(at));
+                assert_eq!(tree.end(at), at + 1);
+                let (of, n) = node.flat().unwrap();
+                assert!(Arc::ptr_eq(of, &tree) && n == at);
+            }
+            // Reading the arrays parses nothing.
+            tree.hash_subtree(0, &mut DefaultHasher::new());
+            assert_eq!(tree.descendants(0).filter(|&it| tree.is_lazy(it)).count(), lazies.len());
+            let _ = tree.subtree(0);
+            assert!(lazies.iter().all(|&at| !tree.is_parsed(at)));
+            compare(&build_green(&shape), &outline, !big, seed);
+            for &at in &lazies {
+                let node = outline.flat_element(at).into_node().unwrap();
+                assert!(!node.is_lazy() && tree.is_parsed(at));
+                let part = tree.part(at);
+                assert!(Arc::ptr_eq(part.source(), tree.source()));
+                assert_eq!((part.kind(0), part.range(0)), (tree.kind(at), tree.range(at)));
+                assert_eq!(part.lazies().count(), 0);
+                for child in node.children_with_tokens() {
+                    let parent = child.parent().unwrap();
+                    assert_eq!(parent, node);
+                    assert_eq!(hash_of(&parent), hash_of(&node));
+                    assert_eq!(parent.index(), node.index());
+                    let (of, n) = parent.flat().unwrap();
+                    assert!(Arc::ptr_eq(of, &tree) && n == at);
+                    if let NodeOrToken::Node(child) = &child {
+                        let (of, n) = child.flat().unwrap();
+                        assert!(Arc::ptr_eq(of, part));
+                        assert_eq!(part.parent(n), Some(0));
+                        assert_eq!(child.flat_element(0), NodeOrToken::Node(node.clone()));
+                        assert!(child.ancestors().any(|it| it == node));
+                        assert_eq!(child.tree_top(), outline);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_is_parsed_once_whichever_thread_asks() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        fn counting(kind: SyntaxKind, text: &str, data: u32) -> FlatTree {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            expand(kind, text, data)
+        }
+        let body = vec![
+            Shape::Token(SyntaxKind(2), "{".into()),
+            Shape::Node(SyntaxKind(102), vec![Shape::Token(SyntaxKind(3), "x".into())], None),
+            Shape::Token(SyntaxKind(2), "}".into()),
+        ];
+        let children = vec![Shape::Token(SyntaxKind(1), "fn".into()), lazy_node(SyntaxKind(101), body)];
+        let tree = build_outline(&Shape::Node(SyntaxKind(100), children, None), counting);
+        let at = tree.lazies().next().unwrap();
+        let barrier = Barrier::new(4);
+        let parts: Vec<Arc<FlatTree>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        tree.part(at).clone()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        assert!(parts.iter().all(|it| Arc::ptr_eq(it, &parts[0])));
+        assert!(Arc::ptr_eq(&parts[0], tree.part(at)));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert!(tree.is_parsed(at));
+    }
+
+    #[test]
+    fn a_sourced_tree_and_its_parts_share_the_source() {
+        let body = vec![
+            Shape::Token(SyntaxKind(2), "{ ".into()),
+            Shape::Token(SyntaxKind(3), "body".into()),
+            Shape::Token(SyntaxKind(2), " }".into()),
+        ];
+        let children = vec![Shape::Token(SyntaxKind(1), "fn f() ".into()), lazy_node(SyntaxKind(101), body)];
+        let shape = Shape::Node(SyntaxKind(100), children, None);
+        let mut text = String::new();
+        text_of(&shape, &mut text);
+        let source: Arc<str> = text.into();
+        let mut builder = FlatTreeBuilder::sourced(source.clone());
+        to_flat(&shape, &mut builder, true);
+        builder.expand_with(expand, DATA);
+        let tree = Arc::new(builder.finish());
+        assert!(Arc::ptr_eq(tree.source(), &source));
+        let at = tree.lazies().next().unwrap();
+        assert!(Arc::ptr_eq(tree.part(at).source(), &source));
+        let mut builder = FlatTreeBuilder::sourced(source.clone());
+        to_flat(&shape, &mut builder, false);
+        let full = builder.finish();
+        assert!(Arc::ptr_eq(full.source(), &source));
+        assert_eq!(full, build_flat(&shape, false));
+        assert!(full.heap_size() <= full.len() as usize * 9 + 8, "arrays only, no text");
+        let root = SyntaxNode::new_flat_root(tree.clone());
+        let body = root.last_child().unwrap();
+        assert!(body.is_lazy());
+        let token = body.last_token().unwrap();
+        assert!(!body.is_lazy());
+        assert_eq!(token.text(), " }");
+        assert_eq!(token.text_range().end(), TextSize::of(&*source));
+        assert_eq!(token.parent(), Some(body.clone()));
+        let (of, n) = token.parent().unwrap().flat().map(|(it, n)| (it.clone(), n)).unwrap();
+        assert!(Arc::ptr_eq(&of, &tree) && n == at);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not the source's next bytes")]
+    fn a_sourced_builder_takes_only_its_source() {
+        let mut builder = FlatTreeBuilder::sourced("ab".into());
+        builder.start_node(SyntaxKind(100));
+        builder.token(SyntaxKind(1), "b");
+    }
+
+    #[test]
+    #[should_panic(expected = "the part of the lazy")]
+    fn a_part_must_be_its_lazy_node_over_its_text() {
+        fn short(kind: SyntaxKind, text: &str, _: u32) -> FlatTree {
+            let mut builder = FlatTreeBuilder::new();
+            builder.start_node(kind);
+            builder.token(SyntaxKind(1), &text[1..]);
+            builder.finish_node();
+            builder.finish()
+        }
+        let mut builder = FlatTreeBuilder::sourced("{x}".into());
+        builder.start_node(SyntaxKind(100));
+        builder.lazy(SyntaxKind(101), 3);
+        builder.finish_node();
+        builder.expand_with(short, 0);
+        let _ = builder.finish().part(1);
+    }
+
+    /// The elements of `shape`'s outline: a lazy node is one.
+    fn count(shape: &Shape) -> u32 {
+        match shape {
+            Shape::Node(_, children, None) => 1 + children.iter().map(count).sum::<u32>(),
+            _ => 1,
+        }
+    }
+
+    /// `shape` with the node that is element `at` of its outline replaced by `with`, `next`
+    /// the number of `shape` in it.
+    fn replaced(shape: &Shape, at: u32, with: &Shape, next: &mut u32) -> Shape {
+        if *next == at {
+            *next += count(shape);
+            return with.clone();
+        }
+        *next += 1;
+        match shape {
+            Shape::Node(kind, children, None) => {
+                let children = children.iter().map(|it| replaced(it, at, with, next)).collect();
+                Shape::Node(*kind, children, None)
+            }
+            _ => shape.clone(),
+        }
+    }
+
+    #[test]
+    fn replacing_a_subtree_is_building_the_edited_tree() {
+        for seed in 0..1000 {
+            let mut rng = Rng::new(seed ^ 0x9e37);
+            let mut shape = random_shape(seed);
+            make_lazy(&mut shape, &mut rng);
+            let tree = build_outline(&shape, expand);
+            for (i, at) in tree.lazies().enumerate() {
+                if i % 2 == 0 {
+                    let _ = tree.part(at);
+                }
+            }
+            let nodes: Vec<u32> = (0..tree.len()).filter(|&it| !tree.is_token(it)).collect();
+            let at = nodes[rng.below(nodes.len() as u64) as usize];
+            let mut with = random_shape(seed + 10_000);
+            if let Shape::Node(kind, ..) = &mut with {
+                *kind = tree.kind(at);
+            }
+            if rng.below(2) == 0 {
+                make_lazy(&mut with, &mut rng);
+            }
+            let edited = replaced(&shape, at, &with, &mut 0);
+            let mut text = String::new();
+            text_of(&edited, &mut text);
+            let (lo, hi) = (at, tree.end(at));
+            let carried =
+                tree.lazies().filter(|&it| (it < lo || it >= hi) && tree.is_parsed(it)).count();
+            let spliced = tree.replace_subtree(at, &build_outline(&with, expand), text.into());
+            let built = build_outline(&edited, expand);
+            assert_eq!(spliced, *built, "seed {seed}");
+            for it in 0..built.len() {
+                assert_eq!(
+                    (spliced.parent(it), spliced.range(it), spliced.end(it), spliced.is_lazy(it)),
+                    (built.parent(it), built.range(it), built.end(it), built.is_lazy(it)),
+                    "seed {seed}, element {it}"
+                );
+            }
+            assert!(spliced.lazies().eq(built.lazies()));
+            assert_eq!(spliced.lazies().filter(|&it| spliced.is_parsed(it)).count(), carried);
+            for it in spliced.lazies() {
+                assert_eq!(spliced.part(it), built.part(it), "seed {seed}, lazy {it}");
+            }
+            compare(&build_green(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), true, seed);
+        }
+    }
+
+    #[test]
+    fn replacing_in_a_big_tree_moves_what_is_past_the_word() {
+        for seed in 0..3 {
+            let shape = big_shape(seed);
+            let tree = build_flat(&shape, true);
+            let row = tree.children(tree.first_child(0).unwrap()).nth(seed as usize * 40).unwrap();
+            let with = Shape::Node(tree.kind(row), vec![Shape::Token(SyntaxKind(3), "z".repeat(BIG as usize + 5))], None);
+            let edited = replaced(&shape, row, &with, &mut 0);
+            let mut text = String::new();
+            text_of(&edited, &mut text);
+            let spliced = tree.replace_subtree(row, &build_flat(&with, false), text.into());
+            let built = build_flat(&edited, true);
+            assert_eq!(spliced, built);
+            assert!((0..built.len()).all(|it| spliced.parent(it) == built.parent(it)));
+            compare(&build_green(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), false, seed);
+        }
+    }
+
+    #[test]
+    fn equal_cursors_are_the_same_element() {
+        let flat = SyntaxNode::new_flat_root(Arc::new(build_flat(&random_shape(7), false)));
+        let all = elements(&flat);
+        let again = elements(&SyntaxNode::new_flat_root(flat.flat_tree().unwrap().clone()));
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in again.iter().enumerate() {
+                assert_eq!(a == b, i == j);
+            }
+        }
+    }
+}

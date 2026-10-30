@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use blaze_core::{Conn, FileName};
 use blaze_ids::ContentId;
 use blaze_query::{Database, QueryKey, QueryKind};
-use blaze_vfs::{Change, ChangeKind, Op, View, Vfs};
+use blaze_vfs::{Change, ChangeKind, Mode, Op, View, Vfs};
 
 use super::{Daemon, Session};
 use crate::{
@@ -87,7 +87,7 @@ impl World {
         let base = self.vfs.head("main").unwrap_or_else(|| self.vfs.empty());
         let ops = files
             .iter()
-            .map(|(path, bytes)| Op::Write { path: (*path).to_owned(), bytes: bytes.as_bytes().to_vec() })
+            .map(|(path, bytes)| write(path, bytes))
             .collect();
         assert_eq!(self.request(9, 9, Request::Commit { head: "main".to_owned(), base, ops }), []);
         let replies = self.durable();
@@ -163,7 +163,7 @@ fn of_error_at(reply: &Reply) -> Option<(u32, Option<String>)> {
 }
 
 fn write(path: &str, bytes: &str) -> Op {
-    Op::Write { path: path.to_owned(), bytes: bytes.as_bytes().to_vec() }
+    Op::Write { path: path.to_owned(), bytes: bytes.as_bytes().to_vec(), mode: Mode::Regular }
 }
 
 #[test]

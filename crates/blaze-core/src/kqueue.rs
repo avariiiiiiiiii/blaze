@@ -4,7 +4,8 @@
 //! completions back through a channel and wake the kqueue with an `EVFILT_USER` trigger.
 //!
 //! Every registration carries an id of the driver's in `udata`, so an event of a descriptor
-//! closed and reused within one batch is told apart from the new one's and dropped.
+//! closed and reused within one batch is told apart from the new one's and dropped. Changes are
+//! made with the next wait, all in one call, their failures coming back as events.
 
 use std::{
     collections::VecDeque,
@@ -28,8 +29,26 @@ use crate::{
 
 /// The id of the trigger that says the channel has completions.
 const TRIGGER: u64 = 0;
-/// Events taken off the kqueue at once.
+/// Events taken off the kqueue at once, besides the failures of the changes made with them.
 const EVENTS: usize = 64;
+
+/// `struct kevent` as the system lays it out, with `udata` the driver's id, so the lists of
+/// changes and events are plain data of the driver's own.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Kevent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: usize,
+}
+
+const _: () = assert!(
+    size_of::<Kevent>() == size_of::<libc::kevent>()
+        && align_of::<Kevent>() == align_of::<libc::kevent>()
+);
 
 /// The kqueue and the channel, shared with the file threads and the watches' queues.
 struct Notify {
@@ -47,20 +66,13 @@ impl Notify {
         data: isize,
         id: u64,
     ) -> io::Result<()> {
-        let event = libc::kevent {
-            ident,
-            filter,
-            flags,
-            fflags,
-            data,
-            udata: std::ptr::without_provenance_mut(id as usize),
-        };
+        let event = Kevent { ident, filter, flags, fflags, data, udata: id as usize };
         loop {
-            // SAFETY: one change to read and no events to write.
+            // SAFETY: one change, laid out as a `kevent`, to read and no events to write.
             let changed = unsafe {
                 libc::kevent(
                     self.kq.as_raw_fd(),
-                    &event,
+                    (&raw const event).cast(),
                     1,
                     std::ptr::null_mut(),
                     0,
@@ -146,8 +158,11 @@ pub struct Kqueue {
     work: Option<Sender<Effect>>,
     workers: Vec<JoinHandle<()>>,
     confine: Option<Arc<dyn Confine>>,
-    /// Where a process's output is read into.
+    /// Where a process's output and a connection's bytes are read into.
     buffer: Vec<u8>,
+    /// Made with the next wait.
+    changes: Vec<Kevent>,
+    events: Vec<Kevent>,
     /// Completions made on the polling thread, in the order they happened.
     ready: Vec<Completion>,
     next_id: u64,
@@ -202,6 +217,8 @@ impl Kqueue {
             workers,
             confine: None,
             buffer: vec![0; 64 << 10],
+            changes: Vec::new(),
+            events: Vec::new(),
             ready: Vec::new(),
             next_id: TRIGGER + 1,
             owners: FxHashMap::default(),
@@ -228,23 +245,24 @@ impl Kqueue {
         id
     }
 
-    /// `ident` of `filter` registered as `owner`'s.
-    fn register(
-        &mut self,
-        owner: Owner,
-        ident: usize,
-        filter: i16,
-        flags: u16,
-        fflags: u32,
-    ) -> io::Result<u64> {
+    /// A change made with the next wait; a failure of it comes back as an event of `id`'s with
+    /// `EV_ERROR`.
+    fn change(&mut self, ident: usize, filter: i16, flags: u16, fflags: u32, data: isize, id: u64) {
+        self.changes.push(Kevent { ident, filter, flags, fflags, data, udata: id as usize });
+    }
+
+    /// `ident` of `filter` registered as `owner`'s, with the next wait.
+    fn register(&mut self, owner: Owner, ident: usize, filter: i16, flags: u16, fflags: u32) -> u64 {
         let id = self.own(owner);
-        match self.notify.change(ident, filter, flags, fflags, 0, id) {
-            Ok(()) => Ok(id),
-            Err(error) => {
-                self.owners.remove(&id);
-                Err(error)
-            }
-        }
+        self.change(ident, filter, flags, fflags, 0, id);
+        id
+    }
+
+    /// `id` ends: no event of it is acted on, and a change of it not yet made is dropped, so it
+    /// cannot land on a descriptor closed and reused since.
+    fn disown(&mut self, id: u64) {
+        self.owners.remove(&id);
+        self.changes.retain(|it| it.udata != id as usize);
     }
 
     fn begin(&mut self, effect: Effect) -> io::Result<()> {
@@ -268,18 +286,8 @@ impl Kqueue {
                 let id = self.own(Owner::Timer { tag, at: self.start.elapsed().saturating_add(after) });
                 let nanos = isize::try_from(after.as_nanos()).unwrap_or(isize::MAX).max(1);
                 let flags = libc::EV_ADD | libc::EV_ONESHOT;
-                let set = self.notify.change(
-                    id as usize,
-                    libc::EVFILT_TIMER,
-                    flags,
-                    libc::NOTE_NSECONDS,
-                    nanos,
-                    id,
-                );
-                if set.is_err() {
-                    self.owners.remove(&id);
-                }
-                set
+                self.change(id as usize, libc::EVFILT_TIMER, flags, libc::NOTE_NSECONDS, nanos, id);
+                Ok(())
             }
             Effect::Watch { dir, tag } => {
                 let notify = self.notify.clone();
@@ -336,8 +344,8 @@ impl Kqueue {
                 Ok(())
             }
             Err(error) => {
-                for id in &spawned.ids {
-                    self.owners.remove(id);
+                for &id in &spawned.ids {
+                    self.disown(id);
                 }
                 let program = spawned.finish.command.program.display().to_string();
                 abandon(spawned);
@@ -352,32 +360,19 @@ impl Kqueue {
             let fd = fd.as_ref().expect("a pipe just made").as_raw_fd();
             set_nonblocking(fd)?;
             let owner = Owner::Output { tag, err };
-            let id = self.register(owner, fd as usize, libc::EVFILT_READ, libc::EV_ADD, 0)?;
+            let id = self.register(owner, fd as usize, libc::EVFILT_READ, libc::EV_ADD, 0);
             spawned.ids.push(id);
         }
         if let Some(fd) = &spawned.stdin {
             let fd = fd.as_raw_fd();
             set_nonblocking(fd)?;
             let id =
-                self.register(Owner::Input(tag), fd as usize, libc::EVFILT_WRITE, libc::EV_ADD, 0)?;
+                self.register(Owner::Input(tag), fd as usize, libc::EVFILT_WRITE, libc::EV_ADD, 0);
             spawned.ids.push(id);
         }
-        let flags = libc::EV_ADD | libc::EV_ONESHOT;
-        match self.register(
-            Owner::Exit(tag),
-            spawned.pid as usize,
-            libc::EVFILT_PROC,
-            flags,
-            libc::NOTE_EXIT,
-        ) {
-            Ok(id) => spawned.ids.push(id),
-            // Exited already: a child not reaped, which the kernel no longer follows.
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
-                spawned.exited = true;
-                spawned.stdin = None;
-            }
-            Err(error) => return Err(error),
-        }
+        let (pid, flags) = (spawned.pid as usize, libc::EV_ADD | libc::EV_ONESHOT);
+        let id = self.register(Owner::Exit(tag), pid, libc::EVFILT_PROC, flags, libc::NOTE_EXIT);
+        spawned.ids.push(id);
         Ok(())
     }
 
@@ -455,8 +450,8 @@ impl Kqueue {
             _ => return,
         }
         let spawned = self.spawns.remove(&tag).expect("looked up above");
-        for id in &spawned.ids {
-            self.owners.remove(id);
+        for &id in &spawned.ids {
+            self.disown(id);
         }
         let Spawned { pid, out, err, failed, finish, .. } = spawned;
         let program = finish.command.program.display().to_string();
@@ -476,9 +471,7 @@ impl Kqueue {
         let listener = net::listen(&self.root, at).map_err(context)?;
         listener.set_nonblocking(true).map_err(context)?;
         let fd = listener.fd() as usize;
-        let id = self
-            .register(Owner::Listen(tag), fd, libc::EVFILT_READ, libc::EV_ADD, 0)
-            .map_err(context)?;
+        let id = self.register(Owner::Listen(tag), fd, libc::EVFILT_READ, libc::EV_ADD, 0);
         self.listens.insert(tag, Listening { listener, id });
         Ok(())
     }
@@ -505,7 +498,7 @@ impl Kqueue {
                 Err(error) => {
                     // A failure ends the listen.
                     let listening = self.listens.remove(&tag).expect("looked up above");
-                    self.owners.remove(&listening.id);
+                    self.disown(listening.id);
                     let done = Done::Failed(IoError(format!("accepting a connection: {error}")));
                     self.ready.push(Completion { tag, done });
                     return;
@@ -546,8 +539,7 @@ impl Kqueue {
         }
         let ident = fd.as_raw_fd() as usize;
         let flags = libc::EV_ADD | libc::EV_ONESHOT;
-        self.register(Owner::Connecting(tag), ident, libc::EVFILT_WRITE, flags, 0)
-            .map_err(context)?;
+        self.register(Owner::Connecting(tag), ident, libc::EVFILT_WRITE, flags, 0);
         self.connecting.insert(tag, Connecting { fd, at, unix });
         Ok(())
     }
@@ -575,24 +567,21 @@ impl Kqueue {
     fn serve_recvs(&mut self, conn: Conn) {
         let Some(connection) = self.conns.get_mut(&conn) else { return };
         while let Some(&(tag, most)) = connection.recvs.front() {
-            let mut bytes = vec![0; most];
-            let done = match connection.socket.read(&mut bytes) {
-                Ok(n) => {
-                    bytes.truncate(n);
-                    Done::Read(bytes)
-                }
+            // At most a buffer's worth, which a receive may be: nothing is allocated for a
+            // receive that would wait.
+            let most = most.min(self.buffer.len());
+            let done = match connection.socket.read(&mut self.buffer[..most]) {
+                Ok(n) => Done::Read(self.buffer[..n].to_vec()),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    match self.notify.change(
-                        connection.socket.fd() as usize,
-                        libc::EVFILT_READ,
-                        libc::EV_ADD | libc::EV_ONESHOT,
-                        0,
-                        0,
-                        connection.read,
-                    ) {
-                        Ok(()) => return,
-                        Err(error) => Done::Failed(IoError(error.to_string())),
-                    }
+                    self.changes.push(Kevent {
+                        ident: connection.socket.fd() as usize,
+                        filter: libc::EVFILT_READ,
+                        flags: libc::EV_ADD | libc::EV_ONESHOT,
+                        fflags: 0,
+                        data: 0,
+                        udata: connection.read as usize,
+                    });
+                    return;
                 }
                 Err(error) => Done::Failed(IoError(error.to_string())),
             };
@@ -615,17 +604,15 @@ impl Kqueue {
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        match self.notify.change(
-                            connection.socket.fd() as usize,
-                            libc::EVFILT_WRITE,
-                            libc::EV_ADD | libc::EV_ONESHOT,
-                            0,
-                            0,
-                            connection.write,
-                        ) {
-                            Ok(()) => return,
-                            Err(error) => Done::Failed(IoError(error.to_string())),
-                        }
+                        self.changes.push(Kevent {
+                            ident: connection.socket.fd() as usize,
+                            filter: libc::EVFILT_WRITE,
+                            flags: libc::EV_ADD | libc::EV_ONESHOT,
+                            fflags: 0,
+                            data: 0,
+                            udata: connection.write as usize,
+                        });
+                        return;
                     }
                     Err(error) => Done::Failed(IoError(error.to_string())),
                 },
@@ -637,8 +624,8 @@ impl Kqueue {
 
     fn hangup(&mut self, conn: Conn, tag: Tag) -> io::Result<()> {
         let connection = self.conns.remove(&conn).ok_or_else(|| no_connection(conn))?;
-        self.owners.remove(&connection.read);
-        self.owners.remove(&connection.write);
+        self.disown(connection.read);
+        self.disown(connection.write);
         let shut = connection.socket.shutdown();
         for (recv, _) in connection.recvs {
             self.ready.push(Completion { tag: recv, done: Done::Read(Vec::new()) });
@@ -652,46 +639,65 @@ impl Kqueue {
         Ok(())
     }
 
-    /// Waits up to `left` (forever for `None`) for events, and acts on them.
+    /// Makes the changes asked for and waits up to `left` (forever for `None`) for events, and
+    /// acts on them.
     fn wait(&mut self, left: Option<Duration>) {
         let timeout = left.map(|it| libc::timespec {
             tv_sec: libc::time_t::try_from(it.as_secs()).unwrap_or(libc::time_t::MAX),
             tv_nsec: it.subsec_nanos().into(),
         });
         let timeout = timeout.as_ref().map_or(std::ptr::null(), |it| it as *const libc::timespec);
-        // SAFETY: all zeros is a valid `kevent`.
-        let mut events: [libc::kevent; EVENTS] = unsafe { std::mem::zeroed() };
-        // SAFETY: no changes, room for `EVENTS` events, and a timeout that outlives the call.
+        let mut changes = std::mem::take(&mut self.changes);
+        let mut events = std::mem::take(&mut self.events);
+        // Room for a failure of every change besides the events: a failure with no room for it
+        // would fail the whole call.
+        let room = changes.len() + EVENTS;
+        events.clear();
+        events.reserve(room);
+        // SAFETY: the changes and the room for events laid out as `kevent`s, and a timeout that
+        // outlives the call.
         let got = unsafe {
             libc::kevent(
                 self.notify.kq.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                events.as_mut_ptr(),
-                EVENTS as libc::c_int,
+                changes.as_ptr().cast(),
+                changes.len() as libc::c_int,
+                events.as_mut_ptr().cast(),
+                room as libc::c_int,
                 timeout,
             )
         };
+        // Made before the call waits, interrupted or not.
+        changes.clear();
+        self.changes = changes;
         if got < 0 {
             let error = io::Error::last_os_error();
             assert!(error.kind() == io::ErrorKind::Interrupted, "waiting on the kqueue: {error}");
+            self.events = events;
             return;
         }
+        // SAFETY: the call wrote `got` events.
+        unsafe { events.set_len(got as usize) };
         let mut fired = Vec::new();
-        for event in &events[..got as usize] {
-            let id = event.udata.addr() as u64;
+        for event in &events {
+            let id = event.udata as u64;
             if id == TRIGGER {
                 continue;
             }
             // Of a registration that has ended.
             let Some(&owner) = self.owners.get(&id) else { continue };
+            if event.flags & libc::EV_ERROR != 0 {
+                if event.data != 0 {
+                    self.refused(id, owner, io::Error::from_raw_os_error(event.data as i32));
+                }
+                continue;
+            }
             match owner {
                 Owner::Timer { tag, at } => {
-                    self.owners.remove(&id);
+                    self.disown(id);
                     fired.push((at, tag));
                 }
                 Owner::Exit(tag) => {
-                    self.owners.remove(&id);
+                    self.disown(id);
                     if let Some(spawned) = self.spawns.get_mut(&tag) {
                         spawned.exited = true;
                         spawned.stdin = None;
@@ -702,17 +708,88 @@ impl Kqueue {
                 Owner::Input(tag) => self.write_input(tag),
                 Owner::Listen(tag) => self.accept(tag),
                 Owner::Connecting(tag) => {
-                    self.owners.remove(&id);
+                    self.disown(id);
                     self.ended_connecting(tag);
                 }
                 Owner::Read(conn) => self.serve_recvs(conn),
                 Owner::Write(conn) => self.serve_sends(conn),
             }
         }
+        self.events = events;
         // Timers that fired together, in the order they were due.
         fired.sort();
         for (_, tag) in fired {
             self.ready.push(Completion { tag, done: Done::Fired });
+        }
+    }
+
+    /// The kqueue refused a change of `id`'s.
+    fn refused(&mut self, id: u64, owner: Owner, error: io::Error) {
+        let failed = |error: &io::Error| Done::Failed(IoError(error.to_string()));
+        match owner {
+            Owner::Timer { tag, .. } => {
+                self.disown(id);
+                self.ready.push(Completion { tag, done: failed(&error) });
+            }
+            Owner::Exit(tag) => {
+                self.disown(id);
+                let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+                // `ESRCH`: exited already, a child not reaped, which the kernel no longer
+                // follows. Anything else: its end cannot be heard, so it does not run on.
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    process::kill(spawned.pid);
+                    if let Err(waiting) = process::wait_exited(spawned.pid) {
+                        spawned.failed.get_or_insert(waiting);
+                    }
+                    spawned.failed.get_or_insert(error);
+                }
+                spawned.exited = true;
+                spawned.stdin = None;
+                self.finish_spawn(tag);
+            }
+            // Its output or input cannot be moved: it does not run on.
+            Owner::Output { tag, err } => {
+                let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+                process::kill(spawned.pid);
+                spawned.failed.get_or_insert(error);
+                match err {
+                    true => spawned.stderr = None,
+                    false => spawned.stdout = None,
+                }
+                self.finish_spawn(tag);
+            }
+            Owner::Input(tag) => {
+                let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+                process::kill(spawned.pid);
+                spawned.failed.get_or_insert(error);
+                spawned.stdin = None;
+            }
+            Owner::Listen(tag) => {
+                let Some(listening) = self.listens.remove(&tag) else { return };
+                self.disown(listening.id);
+                let done = Done::Failed(IoError(format!("listening: {error}")));
+                self.ready.push(Completion { tag, done });
+            }
+            Owner::Connecting(tag) => {
+                self.disown(id);
+                let Some(connecting) = self.connecting.remove(&tag) else { return };
+                let done = Done::Failed(IoError(format!("connecting to {:?}: {error}", connecting.at)));
+                self.ready.push(Completion { tag, done });
+            }
+            Owner::Read(conn) => {
+                let Some(connection) = self.conns.get_mut(&conn) else { return };
+                if let Some((tag, _)) = connection.recvs.pop_front() {
+                    self.ready.push(Completion { tag, done: failed(&error) });
+                }
+                self.serve_recvs(conn);
+            }
+            Owner::Write(conn) => {
+                let Some(connection) = self.conns.get_mut(&conn) else { return };
+                if let Some((tag, ..)) = connection.sends.pop_front() {
+                    self.ready.push(Completion { tag, done: failed(&error) });
+                }
+                self.serve_sends(conn);
+            }
         }
     }
 
@@ -764,7 +841,7 @@ impl Driver for Kqueue {
                 // The end of the listen, which is in flight since it was asked for.
                 Effect::Unlisten { tag } => match self.listens.remove(&tag) {
                     Some(listening) => {
-                        self.owners.remove(&listening.id);
+                        self.disown(listening.id);
                         self.ready.push(Completion { tag, done: Done::Unlistened });
                     }
                     None => {
@@ -790,6 +867,11 @@ impl Driver for Kqueue {
         loop {
             self.take(out);
             if out.len() > before || self.in_flight == 0 {
+                // Changes asked for are made now, not once nothing else is ready.
+                if !self.changes.is_empty() {
+                    self.wait(Some(Duration::ZERO));
+                    self.take(out);
+                }
                 break;
             }
             let left = deadline.map(|it| it.saturating_duration_since(Instant::now()));

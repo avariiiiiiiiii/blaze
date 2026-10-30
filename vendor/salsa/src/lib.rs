@@ -353,6 +353,7 @@ pub mod plumbing {
     pub use crate::cycle::CycleRecoveryStrategy;
     pub use crate::database::{Database, current_revision};
     pub use crate::durability::Durability;
+    pub use crate::fingerprint::Fingerprint;
     pub use crate::id::{AsId, FromId, FromIdWithDb, Id};
     pub use crate::ingredient::{Ingredient, Jar, Location};
     pub use crate::ingredient_cache::IngredientCache;
@@ -411,11 +412,6 @@ pub mod plumbing {
 
     pub mod interned {
         pub use crate::interned::{Configuration, IngredientImpl, JarImpl, Value};
-    }
-
-    pub mod fingerprint {
-        pub use crate::fingerprint::Fingerprint;
-        pub use crate::fingerprint::probe::{Probe, ViaHash, ViaRevision};
     }
 
     pub mod function {

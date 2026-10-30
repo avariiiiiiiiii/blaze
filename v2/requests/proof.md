@@ -33,8 +33,9 @@
   `Response::Trace(Vec<(QueryKey, Fingerprint, Vec<Edge>, bool)>)`: every result the view's
   last build ran or kept, its fingerprint, its edges in read order, and whether that build ran
   it. CLI: `blaze trace --out PATH` writing it as the deterministic CBOR of
-  `blaze_v2_proof::Trace` (`crates/blaze-v2-proof`), which the `blaze-v2-proof` binary
-  compares.
+  `blaze_v2_proof::Trace` (`crates/blaze-v2-proof`: columns over `u32` key indices, edges as
+  CSR, per docs/v2/README.md section 17; made with `TraceBuilder::record` from each `Memo`),
+  which the `blaze-v2-proof` binary compares.
 - Where: `crates/blaze-api` (ci), from `blaze_query::Database::memo` (db).
 - Why: the oracle names the query that went stale and the read it missed (a fact missing from
   docs/v2/items.md section 6.2), not only the wrong program. `V2.trace` raises
@@ -83,3 +84,28 @@ Routed or applied by the coordinator, 16:54.
 The children's own files (`v2/requests/proof-corpus.md`, `v2/requests/proof-perf.md`) are
 folded in here: what they asked of `proof` (engine, fixture, proof.py) is done in
 `harness/v2/`; what they asked of the coordinator is items 4 and 7 above.
+
+## 8. blaze-api: the size of each long-lived table (docs/v2/README.md section 17)
+
+- What: `Request::Tables { view: ViewRef }` answered with `Response::Tables(Vec<(String, u64,
+  u64)>)`: per table its name, elements and bytes (all columns and side tables), at least
+  `token`, `syntax-node`, `hir-expr`, `mir-statement`, `memo`, `memo-edge` and `relocation`.
+  CLI: `blaze tables --format=json` printing `{"<name>": {"elements": N, "bytes": N}}`.
+- Where: `crates/blaze-api` (ci), each table's owner reporting its own (format, db, codegen,
+  link).
+- Why: section 17 has proof report bytes per token, node, expression, statement, memo and
+  relocation against its size budgets (`budgets.py`'s `layout` rows). `V2.tables` raises
+  `engine.Missing` until then.
+
+## 9. format and store: run every column codec through `blaze_v2_proof::columns::round_trips`
+
+- What: `blaze-v2-proof` as a dev-dependency (`blaze-v2-proof.workspace = true` once the
+  coordinator adds it to `[workspace.dependencies]` as `{ path = "crates/blaze-v2-proof" }`),
+  and a test per column encoding (hot narrow widths, warm frame-of-reference bit-packing, cold
+  run-length, delta, dictionary and zstd) calling `columns::round_trips(encode, decode, seed)`
+  over several seeds.
+- Where: root `Cargo.toml` (coordinator); `crates/blaze-format`, `crates/blaze-cas` (format,
+  store).
+- Why: docs/v2/README.md section 17: "Every encoding round-trips exactly, which the proof
+  checks." `shapes` holds the columns each tier is chosen for and their edges (empty, runs,
+  sorted, CSR offsets, every narrow range, a frame far from zero, the extremes).

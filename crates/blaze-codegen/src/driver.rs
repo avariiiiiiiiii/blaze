@@ -16,7 +16,7 @@
 //! error naming the unit, never a reason to compile again.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -252,11 +252,21 @@ pub struct Build<'a, B: Prepare> {
     policy: &'a Policy,
     memo: &'a Memo,
     nodes: BTreeMap<InstanceKey, FnNode<B>>,
+    /// Functions the last run's statics refer to.
+    static_callees: BTreeSet<InstanceKey>,
+}
+
+/// The function a target names, if it names one.
+fn callee(target: &Target) -> Option<InstanceKey> {
+    match target {
+        Target::Function(key) | Target::Direct(key) => Some(*key),
+        _ => None,
+    }
 }
 
 impl<'a, B: Prepare> Build<'a, B> {
     pub fn new(backend: &'a B, frontend: &'a B::Frontend, policy: &'a Policy, memo: &'a Memo) -> Self {
-        Build { backend, frontend, policy, memo, nodes: BTreeMap::new() }
+        Build { backend, frontend, policy, memo, nodes: BTreeMap::new(), static_callees: BTreeSet::new() }
     }
 
     fn node(
@@ -443,6 +453,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         out.stats.instances = nodes.len();
         out.stats.statics = statics.len();
+        self.static_callees = statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
 
         self.dev(&nodes, store, &mut out);
         let release: Vec<Job<'_, B>> = nodes
@@ -554,13 +565,23 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Err(why) => out.errors.push(why),
             }
         }
-        let candidates: Vec<_> = masked
-            .iter()
-            .filter_map(|(key, it)| {
-                let node = &nodes[key];
-                Some((*key, node.unit.instance.settings, it.as_ref()?, node.refs.as_slice()))
-            })
-            .collect();
+        let mut candidates = Vec::new();
+        for (key, it) in &masked {
+            let (node, Some(it)) = (&nodes[key], it) else { continue };
+            let places = node.refs.len();
+            let beyond = it.constants.iter().find_map(|constant| match *constant {
+                fold::Constant::Place(at) if at as usize >= places => Some(at),
+                _ => None,
+            });
+            match beyond {
+                Some(at) => out.errors.push(error(
+                    *key,
+                    node.unit.item,
+                    format!("its masked IR names place {at} of its {places} references"),
+                )),
+                None => candidates.push((*key, node.unit.instance.settings, it, node.refs.as_slice())),
+            }
+        }
         let groups = fold::groups(&candidates, &fold::Limits::default());
         let grouped: HashSet<InstanceKey> = groups.iter().flat_map(|it| it.members.iter().copied()).collect();
 
@@ -666,11 +687,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         store: &dyn Lookup,
         out: &mut Out,
     ) {
-        let thunk_refs = |group: &Group, member: &InstanceKey| {
-            let mut refs = nodes[member].refs.clone();
-            refs.push(Target::Direct(group.key()));
-            refs
-        };
+        let thunk_refs = |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
         let mut merging = Vec::new();
         for group in groups {
             let key = group.key();
@@ -832,16 +849,23 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Err(why) => out.errors.push(why),
             }
         }
-        // What only this build knows of a function: whether anything outside it calls it.
+        // What only this build knows of a function: whether anything outside it calls it, or
+        // anything without a summary (another phase's unit, a static's value) refers to it.
         for (name, summary) in &mut summaries {
             summary.key = *name;
             summary.external |= by_name[name].node.external();
         }
+        let outside = nodes
+            .iter()
+            .filter(|(key, _)| !by_name.contains_key(*key))
+            .flat_map(|(_, node)| node.refs.iter().filter_map(callee))
+            .chain(self.static_callees.iter().copied());
+        imports::called_from_outside(&mut summaries, outside);
         let decided = match imports::decide(&summaries, &imports::Limits::default()) {
             Ok(it) => it,
             Err(why) => {
                 let job = &jobs[0];
-                out.errors.push(error(job.name, job.unit.item, format!("deciding the imports: {why:?}")));
+                out.errors.push(error(job.name, job.unit.item, format!("deciding the imports: {why}")));
                 return;
             }
         };

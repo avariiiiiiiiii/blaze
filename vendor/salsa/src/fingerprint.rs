@@ -1,10 +1,15 @@
 //! 128-bit fingerprints of memoized values.
 //!
-//! Every memo carries a [`Fingerprint`]. For a tracked function whose output implements
-//! [`Hash`] it is a stable hash of the value, so a value that was dropped (by the LRU or by
-//! `evict_values`) can still be compared with its recomputation: equal fingerprints backdate the
-//! new value exactly as an equal value would. Other functions carry the revision the value last
-//! changed in, which is what dependency checks compare anyway.
+//! Every memo carries a [`Fingerprint`]. For a tracked function with the `lru` option (and
+//! without `no_eq`) it is a stable hash of the value, which requires the output to implement
+//! [`Hash`]. A value that was dropped (by the LRU or by `evict_values`) can then still be compared
+//! with its recomputation: equal fingerprints backdate the new value exactly as an equal value
+//! would, and a query that read the value is unchanged when the value it read has the same
+//! fingerprint. Other functions carry the revision the value last changed in, which is what
+//! dependency checks compare anyway; their values are never dropped, so `Eq` decides backdating.
+//!
+//! The `Hash` impl of such an output must hash everything its `Eq` compares and nothing that
+//! depends on where a value lives in memory.
 //!
 //! A value fingerprint is SipHash-1-3 with 128-bit output and a fixed key over the bytes the
 //! value's [`Hash`] impl writes. Integers are written little-endian and `usize`/`isize` as 64
@@ -244,41 +249,10 @@ impl<const C: usize, const D: usize> Hasher for Sip<C, D> {
     }
 }
 
-/// Picks [`Fingerprint::of_value`] for outputs that implement [`Hash`] and no value fingerprint
-/// for the rest, by autoref: `(&&Probe(value)).salsa_fingerprint()`.
-pub mod probe {
-    use std::hash::Hash;
-
-    use super::Fingerprint;
-
-    pub struct Probe<'a, T: ?Sized>(pub &'a T);
-
-    pub trait ViaHash {
-        fn salsa_fingerprint(&self) -> Option<Fingerprint>;
-    }
-
-    impl<T: Hash + ?Sized> ViaHash for &Probe<'_, T> {
-        fn salsa_fingerprint(&self) -> Option<Fingerprint> {
-            Some(Fingerprint::of_value(self.0))
-        }
-    }
-
-    pub trait ViaRevision {
-        fn salsa_fingerprint(&self) -> Option<Fingerprint>;
-    }
-
-    impl<T: ?Sized> ViaRevision for Probe<'_, T> {
-        fn salsa_fingerprint(&self) -> Option<Fingerprint> {
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::hash::{Hash, Hasher};
 
-    use super::probe::{Probe, ViaHash as _, ViaRevision as _};
     use super::{Fingerprint, Sip, StableHasher};
 
     const REFERENCE_KEY: (u64, u64) = (0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908);
@@ -348,20 +322,6 @@ mod tests {
         let revision = crate::Revision::start().next();
         assert!(!Fingerprint::of_revision(revision).is_value());
         assert_ne!(Fingerprint::of_revision(revision), Fingerprint::NONE);
-    }
-
-    #[test]
-    fn probe_hashes_only_hash_types() {
-        #[derive(Hash)]
-        struct Hashable(u32);
-        struct Opaque;
-        let hashable = Hashable(7);
-        assert_eq!(
-            (&&Probe(&hashable)).salsa_fingerprint(),
-            Some(Fingerprint::of_value(&hashable))
-        );
-        let opaque = Opaque;
-        assert_eq!((&&Probe(&opaque)).salsa_fingerprint(), None);
     }
 
     #[test]

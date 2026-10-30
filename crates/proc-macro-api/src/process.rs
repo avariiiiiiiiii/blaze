@@ -1,6 +1,7 @@
 //! Handle process life-time and message passing for proc-macro client
 
 use std::{
+    ffi::OsString,
     fmt::Debug,
     io::{self, BufRead, BufReader, Read, Write},
     panic::AssertUnwindSafe,
@@ -25,6 +26,7 @@ use crate::{
     },
     legacy_protocol::{self, SpanMode},
     version,
+    warm::{self, Environment, LinkExit, LinkReader, LinkWriter, Tracer, Warm},
 };
 
 /// Represents a process handling proc-macro communication.
@@ -37,6 +39,8 @@ pub(crate) struct ProcMacroServerProcess {
     /// Populated when the server exits.
     exited: OnceLock<AssertUnwindSafe<ServerError>>,
     active: AtomicU32,
+    /// Of a warm server: what the shell passes through, sent with each expansion.
+    environment: Option<Arc<Environment>>,
 }
 
 impl std::fmt::Debug for ProcMacroServerProcess {
@@ -165,6 +169,8 @@ pub(crate) struct ProcessSrvState {
     process: Box<dyn ProcessExit>,
     stdin: Box<dyn Write + Send + Sync>,
     stdout: Box<dyn BufRead + Send + Sync>,
+    /// Of a warm server in a sandbox that traces: its live record, read by scope.
+    tracer: Option<Tracer>,
 }
 
 impl ProcMacroServerProcess {
@@ -215,12 +221,43 @@ impl ProcMacroServerProcess {
         // JSON cannot ask for a span's text, file or position and would return placeholders.
         let format = ProtocolFormat::BidirectionalPostcardPrototype;
         let (process, stdin, stdout) = spawn(Some(format))?;
+        let state = ProcessSrvState { process, stdin, stdout, tracer: None };
+        Self::start(state, version::RUST_ANALYZER_SPAN_SUPPORT, None, binary_server_version)
+    }
+
+    /// Talks to the warm server `warm`, which marks the scope of each expansion: the passed
+    /// through variables of `environment` go with each.
+    pub(crate) fn warm(
+        warm: Warm,
+        environment: Arc<Environment>,
+    ) -> io::Result<ProcMacroServerProcess> {
+        let Warm { link, traced } = warm;
+        let state = ProcessSrvState {
+            process: Box::new(LinkExit(link.clone())),
+            stdin: Box::new(LinkWriter::new(link.clone())),
+            stdout: Box::new(LinkReader::new(link)),
+            tracer: traced.map(|(live, socket)| Tracer::new(live, socket)),
+        };
+        Self::start(state, version::SCOPED_EXPANSIONS, Some(environment), || {
+            "a warm server".to_owned()
+        })
+    }
+
+    /// Checks the server's version, which must be `least` or newer, and turns on source spans.
+    fn start(
+        state: ProcessSrvState,
+        least: u32,
+        environment: Option<Arc<Environment>>,
+        binary_server_version: impl Fn() -> String,
+    ) -> io::Result<ProcMacroServerProcess> {
+        let format = ProtocolFormat::BidirectionalPostcardPrototype;
         let mut srv = ProcMacroServerProcess {
-            state: Mutex::new(ProcessSrvState { process, stdin, stdout }),
+            state: Mutex::new(state),
             version: 0,
             protocol: Protocol::from(format),
             exited: OnceLock::new(),
             active: AtomicU32::new(0),
+            environment,
         };
         let v = srv.version_check(Some(&reject_subrequests)).map_err(|e| {
             io::Error::other(format!("proc-macro server version check failed: {e}"))
@@ -235,6 +272,14 @@ impl ProcMacroServerProcess {
         if v < version::RUST_ANALYZER_SPAN_SUPPORT {
             return Err(io::Error::other(format!(
                 "proc-macro server API {v} does not support source spans"
+            )));
+        }
+        if v < least {
+            return Err(io::Error::other(format!(
+                "proc-macro server API {v} does not mark the scope of each expansion, which a \
+                 warm server must (API {least}): what an expansion read can't be told apart, so \
+                 it can't be kept; server {}",
+                binary_server_version()
             )));
         }
         srv.version = v;
@@ -329,7 +374,16 @@ impl ProcMacroServerProcess {
         current_dir: String,
         callback: Option<SubCallback<'_>>,
     ) -> Result<Result<tt::TopSubtree, String>, ServerError> {
+        warm::set_traced(None);
         self.active.fetch_add(1, Ordering::AcqRel);
+        let (env, seen) = match &self.environment {
+            Some(environment) => {
+                let passed = environment.passed();
+                let seen = Environment::seen(&passed, &env);
+                (Environment::sent(&passed, env), Some(seen))
+            }
+            None => (env, None),
+        };
         let result = match self.protocol {
             Protocol::LegacyJson { .. } => legacy_protocol::expand(
                 proc_macro,
@@ -353,6 +407,7 @@ impl ProcMacroServerProcess {
                 mixed_site,
                 current_dir,
                 callback.expect("callback required for bidirectional protocol"),
+                seen,
             ),
         };
 
@@ -388,10 +443,19 @@ impl ProcMacroServerProcess {
 
     fn with_locked_io<R, B>(
         &self,
-        mut buf: B,
+        buf: B,
         f: impl FnOnce(&mut dyn Write, &mut dyn BufRead, &mut B) -> Result<R, ServerError>,
     ) -> Result<R, ServerError> {
         let state = &mut *self.state.lock().unwrap();
+        self.with_io(state, buf, f)
+    }
+
+    fn with_io<R, B>(
+        &self,
+        state: &mut ProcessSrvState,
+        mut buf: B,
+        f: impl FnOnce(&mut dyn Write, &mut dyn BufRead, &mut B) -> Result<R, ServerError>,
+    ) -> Result<R, ServerError> {
         f(&mut state.stdin, &mut state.stdout, &mut buf).map_err(|e| {
             if e.io.as_ref().map(|it| it.kind()) == Some(io::ErrorKind::BrokenPipe) {
                 match state.process.exit_err() {
@@ -414,6 +478,28 @@ impl ProcMacroServerProcess {
         self.with_locked_io(Vec::new(), |writer, reader, buf| {
             bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
         })
+    }
+
+    /// Runs the conversation of one expansion. Of a traced warm server, it is the next scope
+    /// of the connection, and what it read is this thread's to take once the server answered
+    /// ([`warm::take_traced`]): it saw the environment `seen`.
+    pub(crate) fn run_expansion(
+        &self,
+        initial: BidirectionalMessage,
+        callback: SubCallback<'_>,
+        seen: Option<Vec<(OsString, OsString)>>,
+    ) -> Result<BidirectionalMessage, ServerError> {
+        let state = &mut *self.state.lock().unwrap();
+        let scope = state.tracer.as_mut().map(Tracer::scope);
+        let answered = self.with_io(state, Vec::new(), |writer, reader, buf| {
+            bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
+        });
+        if answered.is_ok()
+            && let (Some(scope), Some(tracer)) = (scope, state.tracer.as_mut())
+        {
+            warm::set_traced(Some(tracer.traced(&scope, seen.unwrap_or_default())));
+        }
+        answered
     }
 
     pub(crate) fn number_of_active_req(&self) -> u32 {

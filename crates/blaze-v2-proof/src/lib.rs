@@ -12,63 +12,178 @@
 //!   build from scratch and still came out otherwise ([`Stale::UnrecordedRead`]: it read
 //!   something it has no edge for, a fact missing from docs/v2/items.md section 6.2's table).
 //!   Under-invalidation is a failure.
-//! - [`over`]: an incremental build's reruns against the build before it. A rerun whose edges
-//!   are the ones it had is work for nothing; it is measured and budgeted.
+//! - [`over`]: an incremental build's reruns against the build before it. A rerun that read
+//!   what it read before and came out as before is work for nothing; it is measured and
+//!   budgeted.
 //! - [`apart`]: where two maps differ, for the codegen inputs (each `InstanceKey` with its
 //!   `CodeHash`) and the output files.
 //! - [`Rng`] and [`sample`]: the seeded choice of what to check when not everything is.
 //! - [`bytes`]: where two outputs first differ, by SIMD chosen at run time.
+//! - [`columns`]: the exact round trip every column encoding must make.
+//!
+//! A trace of nushell has millions of results and tens of millions of edges, so it is columns
+//! over `u32` indices (docs/v2/README.md section 17): keys sorted once, flags as bitsets, edges
+//! as one CSR array.
 
 pub mod bytes;
+pub mod columns;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use blaze_ids::Fingerprint;
 use blaze_query::{Edge, Memo, QueryKey};
 use serde::{Deserialize, Serialize};
 
-/// One result as a build left it.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct Recorded {
-    pub fingerprint: Fingerprint,
-    /// In the order they were read.
-    pub edges: Vec<Edge>,
-    /// Executed by this build, rather than kept from an earlier one.
-    pub ran: bool,
+/// A bit per index, 64 to a word.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct Bits(pub Vec<u64>);
+
+impl Bits {
+    pub fn with_len(len: usize) -> Bits {
+        Bits(vec![0; len.div_ceil(64)])
+    }
+
+    pub fn get(&self, i: u32) -> bool {
+        (self.0[i as usize / 64] >> (i % 64)) & 1 == 1
+    }
+
+    pub fn set(&mut self, i: u32) {
+        self.0[i as usize / 64] |= 1 << (i % 64);
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.iter().map(|w| w.count_ones() as usize).sum()
+    }
 }
 
-/// What one build left in the database: every result it ran or kept, by key.
+/// What one build left in the database: every key it names (its results and what they read),
+/// sorted, and per key index whether there is a result, its fingerprint, whether this build
+/// ran it, and its edges in read order.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Trace {
-    pub results: BTreeMap<QueryKey, Recorded>,
+    pub keys: Vec<QueryKey>,
+    pub has: Bits,
+    /// Executed by this build, rather than kept from an earlier one.
+    pub ran: Bits,
+    /// `Fingerprint(0)` where there is no result.
+    pub fingerprints: Vec<Fingerprint>,
+    /// Key `i`'s edges are `edges_from[i]..edges_from[i + 1]` of `reads` and `saw`.
+    pub edges_from: Vec<u32>,
+    /// The key index each edge read.
+    pub reads: Vec<u32>,
+    /// Its fingerprint when it was read.
+    pub saw: Vec<Fingerprint>,
 }
 
-impl Trace {
-    pub fn insert(&mut self, key: QueryKey, fingerprint: Fingerprint, edges: Vec<Edge>, ran: bool) {
-        self.results.insert(key, Recorded { fingerprint, edges, ran });
+/// An edge costs its two columns and nothing more.
+const _: () = assert!(size_of::<u32>() + size_of::<Fingerprint>() == 20);
+
+/// The results of a build as they are found, in any order, made a [`Trace`] by
+/// [`TraceBuilder::finish`]. A key inserted twice keeps the last.
+#[derive(Default)]
+pub struct TraceBuilder {
+    results: BTreeMap<QueryKey, (Fingerprint, bool, u32, u32)>,
+    edges: Vec<Edge>,
+}
+
+impl TraceBuilder {
+    pub fn insert(&mut self, key: QueryKey, fingerprint: Fingerprint, edges: &[Edge], ran: bool) {
+        let from = u32::try_from(self.edges.len()).expect("a trace has fewer than 2^32 edges");
+        self.edges.extend_from_slice(edges);
+        let len = u32::try_from(edges.len()).expect("a result has fewer than 2^32 edges");
+        self.results.insert(key, (fingerprint, ran, from, len));
     }
 
     pub fn record(&mut self, memo: &Memo, ran: bool) {
-        self.insert(memo.key, memo.fingerprint, memo.edges.clone(), ran);
+        self.insert(memo.key, memo.fingerprint, &memo.edges, ran);
     }
 
-    /// The results reachable from `roots` through edges, the roots included; every result when
-    /// `roots` is empty. A key the trace has no result for is reachable but has no edges.
-    pub fn reachable(&self, roots: &[QueryKey]) -> BTreeSet<QueryKey> {
-        if roots.is_empty() {
-            return self.results.keys().copied().collect();
+    pub fn finish(self) -> Trace {
+        let mut keys: Vec<QueryKey> = self.results.keys().copied().collect();
+        for &(_, _, from, len) in self.results.values() {
+            keys.extend(self.edges[from as usize..(from + len) as usize].iter().map(|e| e.read));
         }
-        let mut seen = BTreeSet::new();
-        let mut next: Vec<QueryKey> = roots.to_vec();
-        while let Some(key) = next.pop() {
-            if !seen.insert(key) {
+        keys.sort_unstable();
+        keys.dedup();
+        let n = keys.len();
+        let mut trace = Trace {
+            has: Bits::with_len(n),
+            ran: Bits::with_len(n),
+            fingerprints: vec![Fingerprint(0); n],
+            edges_from: Vec::with_capacity(n + 1),
+            ..Trace::default()
+        };
+        let index = |key: &QueryKey| keys.binary_search(key).expect("every read is a key") as u32;
+        trace.edges_from.push(0);
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(&(fingerprint, ran, from, len)) = self.results.get(key) {
+                let i = i as u32;
+                trace.has.set(i);
+                if ran {
+                    trace.ran.set(i);
+                }
+                trace.fingerprints[i as usize] = fingerprint;
+                for edge in &self.edges[from as usize..(from + len) as usize] {
+                    trace.reads.push(index(&edge.read));
+                    trace.saw.push(edge.saw);
+                }
+            }
+            trace.edges_from.push(u32::try_from(trace.reads.len()).expect("a trace has fewer than 2^32 edges"));
+        }
+        trace.keys = keys;
+        trace
+    }
+}
+
+impl Trace {
+    pub fn index(&self, key: &QueryKey) -> Option<u32> {
+        self.keys.binary_search(key).ok().map(|i| i as u32)
+    }
+
+    /// Key `i`'s fingerprint, `None` when the build has no result for it.
+    pub fn result(&self, i: u32) -> Option<Fingerprint> {
+        self.has.get(i).then(|| self.fingerprints[i as usize])
+    }
+
+    pub fn results(&self) -> usize {
+        self.has.count()
+    }
+
+    /// Key `i`'s edges as (key index read, fingerprint seen).
+    pub fn edges(&self, i: u32) -> impl Iterator<Item = (u32, Fingerprint)> + '_ {
+        let range = self.edges_from[i as usize] as usize..self.edges_from[i as usize + 1] as usize;
+        self.reads[range.clone()].iter().copied().zip(self.saw[range].iter().copied())
+    }
+
+    /// The key indices reachable from `roots` through edges, the roots included, as a bitset;
+    /// every result when `roots` is empty. A root the trace does not name is not reachable.
+    pub fn reachable(&self, roots: &[QueryKey]) -> Bits {
+        if roots.is_empty() {
+            return self.has.clone();
+        }
+        let mut seen = Bits::with_len(self.keys.len());
+        let mut next: Vec<u32> = roots.iter().filter_map(|k| self.index(k)).collect();
+        while let Some(i) = next.pop() {
+            if seen.get(i) {
                 continue;
             }
-            if let Some(result) = self.results.get(&key) {
-                next.extend(result.edges.iter().map(|edge| edge.read));
-            }
+            seen.set(i);
+            next.extend(self.edges(i).map(|(read, _)| read));
         }
         seen
+    }
+}
+
+/// Whether key `i` of `a` and key `j` of `b` read the same keys with the same fingerprints, in
+/// the same order.
+fn same_edges(a: &Trace, i: u32, b: &Trace, j: u32) -> bool {
+    let (mut x, mut y) = (a.edges(i), b.edges(j));
+    loop {
+        match (x.next(), y.next()) {
+            (None, None) => return true,
+            (Some((ra, sa)), Some((rb, sb))) if sa == sb && a.keys[ra as usize] == b.keys[rb as usize] => {}
+            _ => return false,
+        }
     }
 }
 
@@ -114,36 +229,32 @@ impl Stale {
     }
 }
 
-/// Where the incremental trace is not the one from scratch, over what the build from scratch
-/// reached from `roots` (everything when empty): the culprits first, then by key.
+/// Where the incremental trace is not the one from scratch, over the results the build from
+/// scratch reached from `roots` (every result when empty): the culprits first, then by key.
 pub fn under(incremental: &Trace, scratch: &Trace, roots: &[QueryKey]) -> Vec<Stale> {
+    let reached = scratch.reachable(roots);
     let mut stale = Vec::new();
-    for key in scratch.reachable(roots) {
-        let Some(theirs) = scratch.results.get(&key) else { continue };
-        let Some(ours) = incremental.results.get(&key) else {
-            stale.push(Stale::Absent { query: key });
+    for i in 0..scratch.keys.len() as u32 {
+        let Some(theirs) = scratch.result(i).filter(|_| reached.get(i)) else { continue };
+        let query = scratch.keys[i as usize];
+        let Some((j, ours)) = incremental.index(&query).and_then(|j| Some((j, incremental.result(j)?))) else {
+            stale.push(Stale::Absent { query });
             continue;
         };
-        if !ours.ran {
-            let now = |read: &QueryKey| incremental.results.get(read).map(|r| r.fingerprint);
-            if let Some(edge) = ours.edges.iter().find(|edge| now(&edge.read) != Some(edge.saw)) {
-                stale.push(Stale::Unverified {
-                    query: key,
-                    read: edge.read,
-                    saw: edge.saw,
-                    now: now(&edge.read),
-                });
+        if !incremental.ran.get(j) {
+            if let Some((read, saw)) = incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw)) {
+                let now = incremental.result(read);
+                stale.push(Stale::Unverified { query, read: incremental.keys[read as usize], saw, now });
                 continue;
             }
         }
-        if ours.fingerprint == theirs.fingerprint {
+        if ours == theirs {
             continue;
         }
-        let (incremental, scratch) = (ours.fingerprint, theirs.fingerprint);
-        stale.push(if ours.edges == theirs.edges {
-            Stale::UnrecordedRead { query: key, incremental, scratch }
+        stale.push(if same_edges(incremental, j, scratch, i) {
+            Stale::UnrecordedRead { query, incremental: ours, scratch: theirs }
         } else {
-            Stale::Downstream { query: key, incremental, scratch }
+            Stale::Downstream { query, incremental: ours, scratch: theirs }
         });
     }
     stale.sort_by_key(|s| (s.rank(), s.query()));
@@ -155,7 +266,7 @@ pub fn under(incremental: &Trace, scratch: &Trace, roots: &[QueryKey]) -> Vec<St
 pub struct Work {
     /// Results the build executed.
     pub ran: usize,
-    /// Of those, ones whose edges are what they were before: work for nothing.
+    /// Of those, ones whose edges and result are what they were before: work for nothing.
     pub needless: usize,
     /// Ones whose edges changed and whose result did not: early cutoff stopped there.
     pub cut_off: usize,
@@ -167,15 +278,18 @@ pub struct Work {
 pub fn over(before: &Trace, after: &Trace) -> (Work, Vec<QueryKey>) {
     let mut work = Work::default();
     let mut needless = Vec::new();
-    for (key, result) in after.results.iter().filter(|(_, r)| r.ran) {
+    for i in 0..after.keys.len() as u32 {
+        let Some(now) = after.result(i).filter(|_| after.ran.get(i)) else { continue };
         work.ran += 1;
-        match before.results.get(key) {
+        let key = after.keys[i as usize];
+        match before.index(&key).and_then(|j| Some((j, before.result(j)?))) {
             None => work.new += 1,
-            Some(was) if was.edges == result.edges => {
+            // Same edges and another result is an input that changed (a file read), not waste.
+            Some((j, was)) if was == now && same_edges(before, j, after, i) => {
                 work.needless += 1;
-                needless.push(*key);
+                needless.push(key);
             }
-            Some(was) if was.fingerprint == result.fingerprint => work.cut_off += 1,
+            Some((_, was)) if was == now => work.cut_off += 1,
             Some(_) => {}
         }
     }

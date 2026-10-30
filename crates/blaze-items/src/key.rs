@@ -312,7 +312,7 @@ fn variant_id_key(db: &dyn HirDatabase, variant: VariantId) -> ItemKey {
     }
 }
 
-fn generic_def_item(def: GenericDefId) -> ItemId {
+pub(crate) fn generic_def_item(def: GenericDefId) -> ItemId {
     match def {
         GenericDefId::AdtId(it) => ItemId::Adt(it),
         GenericDefId::ConstId(it) => ItemId::Const(it),

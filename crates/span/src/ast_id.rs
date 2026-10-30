@@ -1321,8 +1321,19 @@ fn hash_ast_id(ptr: &ErasedFileAstId) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode, Edition, SourceFile, SyntaxKind, SyntaxNodePtr, WalkEvent, ast};
+    use std::{
+        hash::BuildHasher,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
+    use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+    use syntax::{
+        AstNode, AstPtr, Edition, SourceFile, SyntaxKind, SyntaxNode, SyntaxNodePtr, WalkEvent,
+        ast::{self, HasName},
+    };
+
+    use super::ErasedFileAstId;
     use crate::AstIdMap;
 
     #[test]
@@ -1450,5 +1461,209 @@ fn foo() {
         let ast_id_map = AstIdMap::from_source(&syntax);
         let block = syntax.descendants().find_map(ast::BlockExpr::cast).expect("no block");
         assert!(ast_id_map.ast_id_for_block(&block).is_none());
+    }
+
+    fn outline_of(text: &Arc<str>) -> SyntaxNode {
+        SourceFile::parse_outline(text.clone(), Edition::CURRENT).syntax_node()
+    }
+
+    fn full_of(text: &Arc<str>) -> SyntaxNode {
+        SourceFile::parse_shared(text.clone(), Edition::CURRENT).syntax_node()
+    }
+
+    fn count(ids: &[(SyntaxNodePtr, ErasedFileAstId)], kind: SyntaxKind) -> usize {
+        ids.iter().filter(|(ptr, _)| ptr.kind() == kind).count()
+    }
+
+    /// The lazy bodies of `root`'s tree that are parsed.
+    fn parsed(root: &SyntaxNode) -> Vec<syntax::TextRange> {
+        let (tree, _) = root.flat().expect("a flat tree");
+        tree.lazies().filter(|&it| tree.is_parsed(it)).map(|it| tree.range(it)).collect()
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|it| it.expect("a directory entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|it| it == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The parser's test data and the `syntax` crate's own sources.
+    fn corpus() -> Vec<(PathBuf, Arc<str>)> {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut paths = Vec::new();
+        for dir in ["parser/test_data/parser", "syntax/src"] {
+            rust_files(&crates.join(dir), &mut paths);
+        }
+        assert!(paths.len() > 300, "the corpus is {} files", paths.len());
+        paths
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                (path, Arc::from(text))
+            })
+            .collect()
+    }
+
+    /// Each node a map has an id of, with it.
+    fn ids(map: &AstIdMap) -> Vec<(SyntaxNodePtr, ErasedFileAstId)> {
+        map.ptrs().map(|ptr| (ptr, map.erased_ast_id(ptr))).collect()
+    }
+
+    #[test]
+    fn an_outline_has_the_ids_of_a_full_parse() {
+        for (path, text) in corpus() {
+            let path = path.display();
+            let full = full_of(&text);
+            let full_map = AstIdMap::from_source(&full);
+            let want = ids(&full_map);
+            let distinct: FxHashSet<_> = want.iter().map(|&(_, id)| id).collect();
+            assert_eq!(distinct.len(), want.len(), "{path}: two nodes have one id");
+            let with_id: FxHashSet<_> = want.iter().map(|&(ptr, _)| ptr).collect();
+            for node in full.descendants() {
+                let ptr = SyntaxNodePtr::new(&node);
+                if ErasedFileAstId::should_alloc(node.kind()).is_some() {
+                    assert!(with_id.contains(&ptr), "{path}: {node:?} has no id");
+                }
+                if full_map.try_erased_ast_id(ptr).is_some() {
+                    assert!(with_id.contains(&ptr), "{path}: `ptrs` misses {node:?}");
+                }
+            }
+
+            for reverse in [false, true] {
+                let outline = outline_of(&text);
+                let map = AstIdMap::from_source(&outline);
+                assert!(parsed(&outline).is_empty(), "{path}: making the map parsed a body");
+                assert!(map == full_map, "{path}: the outline's map is not the full parse's");
+                assert_eq!(FxBuildHasher.hash_one(&map), FxBuildHasher.hash_one(&full_map));
+                let mut order: Vec<_> = want.iter().copied().collect();
+                if reverse {
+                    order.reverse();
+                }
+                for (i, (ptr, id)) in order.into_iter().enumerate() {
+                    match i % 2 {
+                        0 => assert_eq!(map.try_erased_ast_id(ptr), Some(id), "{path}: {ptr:?}"),
+                        _ => assert_eq!(map.try_get_erased(id), Some(ptr), "{path}: {id:?}"),
+                    }
+                }
+                assert!(map == full_map, "{path}: walking bodies changed the map");
+            }
+
+            let outline = outline_of(&text);
+            let map = AstIdMap::from_source(&outline);
+            std::thread::scope(|scope| {
+                for thread in 0..4 {
+                    let (map, want) = (&map, &want);
+                    scope.spawn(move || {
+                        let skip = thread * want.len() / 4;
+                        for &(ptr, id) in want.iter().cycle().skip(skip).take(want.len()) {
+                            assert_eq!(map.try_erased_ast_id(ptr), Some(id));
+                            assert_eq!(map.try_get_erased(id), Some(ptr));
+                        }
+                    });
+                }
+            });
+            let got: FxHashMap<_, _> = ids(&map).into_iter().collect();
+            assert!(got == want.into_iter().collect::<FxHashMap<_, _>>(), "{path}: `ptrs` differ");
+        }
+    }
+
+    #[test]
+    fn a_body_is_walked_when_asked_about() {
+        let text: Arc<str> =
+            "fn a() { m!(); struct S; }\nfn b() { n!(); }\nimpl T { fn c() { fn d() { o!() } } }\n"
+                .into();
+        let full = full_of(&text);
+        let call = full
+            .descendants()
+            .filter_map(ast::MacroCall::cast)
+            .find(|it| it.path().is_some_and(|it| it.syntax().to_string() == "n"))
+            .expect("`n!()`");
+        let body = full
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .find(|it| it.name().is_some_and(|it| it.syntax().to_string() == "b"))
+            .and_then(|it| it.body())
+            .expect("`b`'s body")
+            .syntax()
+            .text_range();
+
+        let outline = outline_of(&text);
+        let map = AstIdMap::from_source(&outline);
+        let (tree, _) = outline.flat().expect("a flat tree");
+        assert_eq!(tree.lazies().count(), 3, "the bodies of `a`, `b` and `c`");
+        assert!(parsed(&outline).is_empty());
+        let id = map.ast_id(&call);
+        assert!(id.erase().in_body());
+        assert_eq!(parsed(&outline), [body], "asking for `n!()` parses `b`'s body alone");
+        assert_eq!(map.get(id), AstPtr::new(&call));
+
+        // An id from another map of the same text finds its body by its slots.
+        let again = outline_of(&text);
+        let map = AstIdMap::from_source(&again);
+        assert_eq!(map.get(id), AstPtr::new(&call));
+        assert_eq!(parsed(&again), [body]);
+    }
+
+    #[test]
+    fn many_bodies_with_the_same_macros_have_distinct_ids() {
+        let text: String =
+            (0..5000).map(|i| format!("fn f{i}() {{ a!(); a!(); {{ b!(); }} }}\n")).collect();
+        let text: Arc<str> = text.into();
+        let full_map = AstIdMap::from_source(&full_of(&text));
+        let want = ids(&full_map);
+        assert_eq!(count(&want, SyntaxKind::FN), 5000);
+        assert_eq!(count(&want, SyntaxKind::MACRO_CALL), 3 * 5000);
+        let distinct: FxHashSet<_> = want.iter().map(|&(_, id)| id).collect();
+        assert_eq!(distinct.len(), want.len());
+        let map = AstIdMap::from_source(&outline_of(&text));
+        for &(ptr, id) in want.iter().rev() {
+            assert_eq!(map.try_get_erased(id), Some(ptr));
+        }
+    }
+
+    #[test]
+    fn relative_to_an_outline_or_a_full_parse() {
+        let text: Arc<str> =
+            "struct A;\nimpl T for A {\n    fn c() { m!(); fn d() { n!() } }\n    fn e() {}\n}\n"
+                .into();
+        let full_map = AstIdMap::from_source(&full_of(&text));
+        for file in [outline_of(&text), full_of(&text)] {
+            let map = AstIdMap::from_source(&file);
+            let anchor =
+                file.children().find(|it| it.kind() == SyntaxKind::IMPL).expect("the impl");
+            let (start, range) = (anchor.text_range().start(), anchor.text_range());
+            let anchor_text: Arc<str> = Arc::from(&text[range]);
+            for relative_root in [outline_of(&anchor_text), full_of(&anchor_text)] {
+                let relative = relative_root
+                    .children()
+                    .find(|it| it.kind() == SyntaxKind::IMPL)
+                    .expect("the impl");
+                let relative_map = map.relative_to(&anchor, &relative);
+                assert_eq!(relative_map.root().text_range(), relative.text_range());
+                let inside = ids(&full_map)
+                    .into_iter()
+                    .filter(|(ptr, _)| range.contains_range(ptr.text_range()))
+                    .collect::<Vec<_>>();
+                assert_eq!(count(&inside, SyntaxKind::IMPL), 1);
+                assert_eq!(count(&inside, SyntaxKind::FN), 3, "`c`, `d` and `e`");
+                assert_eq!(count(&inside, SyntaxKind::MACRO_CALL), 2);
+                for (ptr, id) in inside {
+                    let moved = SyntaxNodePtr::from_parts(ptr.kind(), ptr.text_range() - start);
+                    assert_eq!(relative_map.try_erased_ast_id(moved), Some(id));
+                    assert_eq!(relative_map.try_get_erased(id), Some(moved));
+                }
+            }
+            assert!(parsed(&file).is_empty(), "the file's bodies are walked in the relative trees");
+        }
     }
 }

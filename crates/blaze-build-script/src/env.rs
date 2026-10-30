@@ -9,7 +9,7 @@
 //! dependencies' variables (`-Z bindeps`) and the host runner (`-Z host-config`).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Command,
@@ -17,15 +17,56 @@ use std::{
 
 use crate::{Error, unit::Unit};
 
-/// A script's whole environment.
+/// A script's whole environment, and which of it cargo sets from the unit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Env {
     pub vars: BTreeMap<OsString, OsString>,
+    /// The names of `vars` cargo sets from the unit, its configuration and the build (#805):
+    /// `CARGO_*`, `OUT_DIR`, `TARGET`, `HOST`, the profile's, the tools', the `DEP_*` of its
+    /// dependencies, `[env]`'s, the dynamic library path (with what cargo's own environment
+    /// had of it after the unit's directories), the jobserver's `CARGO_MAKEFLAGS`. Every other
+    /// variable of `vars` is passed through from the environment cargo was started with.
+    pub from_unit: BTreeSet<OsString>,
+}
+
+/// Where a variable of a script's environment comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Set by cargo from the unit: what a run is given.
+    Unit,
+    /// Passed through from the environment cargo was started with: what a run reads of it
+    /// is traced.
+    PassedThrough,
 }
 
 impl Env {
     pub fn get(&self, name: &str) -> Option<&OsStr> {
         self.vars.get(OsStr::new(name)).map(OsString::as_os_str)
+    }
+
+    /// Where `name` comes from, if the script has it.
+    pub fn origin(&self, name: &OsStr) -> Option<Origin> {
+        match (self.vars.contains_key(name), self.from_unit.contains(name)) {
+            (false, _) => None,
+            (true, true) => Some(Origin::Unit),
+            (true, false) => Some(Origin::PassedThrough),
+        }
+    }
+
+    /// The variables set from the unit, sorted by name.
+    pub fn set_from_unit(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.vars
+            .iter()
+            .filter(|(name, _)| self.from_unit.contains(*name))
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+    }
+
+    /// The variables passed through from cargo's environment, sorted by name.
+    pub fn passed_through(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.vars
+            .iter()
+            .filter(|(name, _)| !self.from_unit.contains(*name))
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
     }
 
     /// Gives `command` this environment and no other.
@@ -414,13 +455,17 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     }
 
     let mut vars: BTreeMap<OsString, OsString> = inherited.iter().cloned().collect();
+    let mut from_unit = BTreeSet::new();
     for (name, value) in cmd.vars {
         match value {
-            Some(value) => _ = vars.insert(name, value),
+            Some(value) => {
+                from_unit.insert(name.clone());
+                vars.insert(name, value);
+            }
             None => _ = vars.remove(&name),
         }
     }
-    Ok(Env { vars })
+    Ok(Env { vars, from_unit })
 }
 
 /// The parts of a version cargo names apart.

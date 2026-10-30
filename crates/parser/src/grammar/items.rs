@@ -480,7 +480,12 @@ fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
     // test fn_decl
     // trait T { fn foo(); }
     if !p.eat(T![;]) {
-        expressions::block_expr(p);
+        // An outline skips the body, or parses it, and all in it, in full: the same tree
+        // either way (`crate::outline`).
+        match p.lazy_body() {
+            Some(n_tokens) => p.bump_lazy(BLOCK_EXPR, n_tokens),
+            None => p.in_full(expressions::block_expr),
+        }
     }
     m.complete(p, FN);
 }

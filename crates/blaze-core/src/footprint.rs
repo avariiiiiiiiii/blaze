@@ -1,15 +1,14 @@
 //! The memory backstop of a spawned process on macOS (docs/v2/core.md section 4, "Hard
-//! backstop"): resource limits set in the child before its program runs, and a thread that
-//! watches its physical footprint, the number Activity Monitor and the kernel's memory pressure
-//! go by, and kills it once it passes the limit.
+//! backstop"): resource limits set in the child before its program runs, and one thread for
+//! every watched process that reads its physical footprint, the number Activity Monitor and the
+//! kernel's memory pressure go by, and kills it once it passes the limit.
 
 use std::{
     io,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Condvar, Mutex, MutexGuard, Once, PoisonError,
+        atomic::{AtomicU64, Ordering},
     },
-    thread::JoinHandle,
     time::Duration,
 };
 
@@ -44,81 +43,117 @@ pub(crate) fn limit_self(limit: u64) -> io::Result<()> {
     Ok(())
 }
 
-struct Shared {
-    stop: AtomicBool,
+/// One watched process.
+struct Entry {
+    id: u64,
+    pid: libc::pid_t,
+    limit: u64,
     /// The most footprint read so far.
-    seen: AtomicU64,
+    seen: u64,
+    /// Killed or gone: read no more.
+    done: bool,
+}
+
+/// The one thread that reads every watched process's footprint, and what it reads. A kill is
+/// made with the lock held and the entry in the list, so once [`Watch::stop`] has taken the entry
+/// out, nothing signals its pid.
+struct Sampler {
+    entries: Mutex<Vec<Entry>>,
+    wake: Condvar,
+}
+
+static SAMPLER: Sampler = Sampler { entries: Mutex::new(Vec::new()), wake: Condvar::new() };
+static STARTED: Once = Once::new();
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+fn entries() -> MutexGuard<'static, Vec<Entry>> {
+    SAMPLER.entries.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub(crate) struct Watch {
+    id: u64,
     pid: libc::pid_t,
-    shared: Arc<Shared>,
-    thread: Option<JoinHandle<()>>,
 }
 
 impl Watch {
     /// Watches `pid`'s physical footprint (proc_pid_rusage RUSAGE_INFO_V4 ri_phys_footprint)
-    /// on a thread of its own, every few milliseconds, and SIGKILLs it once it passes `limit`.
+    /// on the one footprint thread, every few milliseconds, and SIGKILLs it once it passes
+    /// `limit`.
     pub(crate) fn start(pid: libc::pid_t, limit: u64) -> Watch {
-        let shared = Arc::new(Shared { stop: AtomicBool::new(false), seen: AtomicU64::new(0) });
-        let thread = std::thread::Builder::new()
-            .name(format!("blaze-footprint-{pid}"))
-            .spawn({
-                let shared = shared.clone();
-                move || watch(pid, limit, &shared)
-            })
-            .expect("starting a footprint watch");
-        Watch { pid, shared, thread: Some(thread) }
+        STARTED.call_once(|| {
+            std::thread::Builder::new()
+                .name("blaze-footprint".into())
+                .spawn(sample)
+                .expect("starting the footprint watch");
+        });
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        entries().push(Entry { id, pid, limit, seen: 0, done: false });
+        SAMPLER.wake.notify_one();
+        Watch { id, pid }
     }
 
     /// Called once the process exited and before it is reaped: stops the thread and says
     /// the most it saw (ri_lifetime_max_phys_footprint where it could read it).
-    pub(crate) fn stop(mut self) -> u64 {
-        self.halt();
-        let seen = self.shared.seen.load(Ordering::Acquire);
+    pub(crate) fn stop(self) -> u64 {
+        let seen = self.remove();
         match footprint(self.pid) {
             Ok(usage) => seen.max(usage.now).max(usage.most),
             Err(_) => seen,
         }
     }
 
-    /// The thread stopped: it signals nothing once this returns.
-    fn halt(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
-            _ = thread.join();
+    /// Out of the sampler's list: nothing signals the pid once this returns. The most seen.
+    fn remove(&self) -> u64 {
+        let mut entries = entries();
+        match entries.iter().position(|it| it.id == self.id) {
+            Some(at) => entries.swap_remove(at).seen,
+            None => 0,
         }
     }
 }
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        self.halt();
+        self.remove();
     }
 }
 
-fn watch(pid: libc::pid_t, limit: u64, shared: &Shared) {
-    while !shared.stop.load(Ordering::Acquire) {
-        match footprint(pid) {
-            Ok(usage) => {
-                shared.seen.fetch_max(usage.now.max(usage.most), Ordering::AcqRel);
-                if usage.now > limit {
-                    // SAFETY: no pointers; the pid is not reaped until this thread has stopped.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    return;
-                }
-            }
-            // Gone: there is nothing left to hold.
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return,
-            // Its footprint cannot be read, so its limit cannot be held: it does not run on.
-            Err(_) => {
-                // SAFETY: as above.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                return;
+fn sample() {
+    let mut entries = entries();
+    loop {
+        if entries.iter().all(|it| it.done) {
+            entries = SAMPLER.wake.wait(entries).unwrap_or_else(PoisonError::into_inner);
+            continue;
+        }
+        for entry in entries.iter_mut().filter(|it| !it.done) {
+            check(entry);
+        }
+        entries = SAMPLER
+            .wake
+            .wait_timeout(entries, INTERVAL)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+}
+
+fn check(entry: &mut Entry) {
+    match footprint(entry.pid) {
+        Ok(usage) => {
+            entry.seen = entry.seen.max(usage.now).max(usage.most);
+            if usage.now > entry.limit {
+                // SAFETY: no pointers; the pid is in the list, so not yet reaped.
+                unsafe { libc::kill(entry.pid, libc::SIGKILL) };
+                entry.done = true;
             }
         }
-        std::thread::park_timeout(INTERVAL);
+        // Gone: there is nothing left to hold.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => entry.done = true,
+        // Its footprint cannot be read, so its limit cannot be held: it does not run on.
+        Err(_) => {
+            // SAFETY: as above.
+            unsafe { libc::kill(entry.pid, libc::SIGKILL) };
+            entry.done = true;
+        }
     }
 }
 
@@ -189,6 +224,22 @@ mod tests {
         assert!(!libc::WIFSIGNALED(status));
         assert_eq!(libc::WEXITSTATUS(status), 3);
         assert!(peak > 0 && peak < 1 << 30, "{peak}");
+    }
+
+    /// The one thread holds each process to its own limit.
+    #[test]
+    fn watches_at_once_keep_their_own_limits() {
+        let grows = spawn(
+            r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#,
+            None,
+        );
+        let small = spawn("sleep 0.3; exit 0", None);
+        let small_watch = Watch::start(small.id() as libc::pid_t, 1 << 30);
+        let grows_watch = Watch::start(grows.id() as libc::pid_t, 32 << 20);
+        let (grew, _) = end(grows, grows_watch);
+        let (stayed, _) = end(small, small_watch);
+        assert!(libc::WIFSIGNALED(grew) && libc::WTERMSIG(grew) == libc::SIGKILL, "{grew:#x}");
+        assert!(!libc::WIFSIGNALED(stayed) && libc::WEXITSTATUS(stayed) == 0, "{stayed:#x}");
     }
 
     /// The resource limits leave a program that fits them as it is.

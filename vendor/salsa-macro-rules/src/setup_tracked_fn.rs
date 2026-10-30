@@ -52,6 +52,9 @@ macro_rules! setup_tracked_fn {
         // Equality check strategy function
         values_equal: {$($values_equal:tt)+},
 
+        // The function used to implement `C::fingerprint`
+        fingerprint: {$($fingerprint:tt)+},
+
         // If true, the input needs an interner (because it has >1 argument).
         needs_interner: $needs_interner:tt,
 
@@ -344,6 +347,8 @@ macro_rules! setup_tracked_fn {
 
                 $($values_equal)+
 
+                $($fingerprint)+
+
                 $(
                     fn heap_size(value: &Self::Output<'_>) -> Option<usize> {
                         Some($heap_size_fn(value))
@@ -512,6 +517,45 @@ macro_rules! setup_tracked_fn {
                 /// is owned by the current thread, this could trigger deadlock.
                 fn set_lru_capacity(db: &mut dyn $Db, value: usize) where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
                     $Configuration::fn_ingredient_mut(db).set_capacity(value);
+                }
+
+                /// Drops the memoized values of this function to free memory, keeping each
+                /// memo's fingerprint and dependency edges. A later call computes the value
+                /// again and, when it hashes to the kept fingerprint, backdates it, so nothing
+                /// that read it runs again. Returns how many values were dropped.
+                ///
+                /// Only functions with an `lru` option have this; `lru = 0` keeps every value
+                /// until it is evicted here.
+                ///
+                /// **WARNING:** Just like an ordinary write, this method triggers
+                /// cancellation. If you invoke it while a snapshot exists, it
+                /// will block until that snapshot is dropped -- if that snapshot
+                /// is owned by the current thread, this could trigger deadlock.
+                #[allow(dead_code)]
+                $vis fn evict_values(db: &mut dyn $Db) -> usize where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
+                    let zalsa = db.zalsa_mut();
+                    let index = zalsa.lookup_jar_by_type::<$fn_name>();
+                    $zalsa::function::IngredientImpl::<$Configuration>::evict_values(zalsa, index, None)
+                }
+
+                $zalsa::macro_if! {
+                    if $needs_interner {} else {
+                        /// Like [`evict_values`](Self::evict_values), for the memos of `keys`
+                        /// only.
+                        #[allow(dead_code, clippy::needless_lifetimes, clippy::extra_unused_lifetimes)]
+                        $vis fn evict_values_of<$db_lt>(
+                            db: &mut dyn $Db,
+                            keys: impl ::std::iter::IntoIterator<Item = ($($interned_input_ty),*)>,
+                        ) -> usize where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
+                            let keys: ::std::vec::Vec<::salsa::Id> = keys
+                                .into_iter()
+                                .map(|key| $zalsa::AsId::as_id(&key))
+                                .collect();
+                            let zalsa = db.zalsa_mut();
+                            let index = zalsa.lookup_jar_by_type::<$fn_name>();
+                            $zalsa::function::IngredientImpl::<$Configuration>::evict_values(zalsa, index, Some(&keys))
+                        }
+                    }
                 }
 
                 $zalsa::macro_if! { $needs_interner =>

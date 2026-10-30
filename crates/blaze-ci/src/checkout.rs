@@ -11,7 +11,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use blaze_vfs::Op;
+use blaze_vfs::{Mode, Op};
 
 use crate::github::Token;
 
@@ -98,14 +98,16 @@ impl Git {
                 listing(&self.run(self.git(&args), &args)?.stdout)?
             }
         };
-        let blobs: Vec<&str> = changes.iter().filter_map(|it| it.blob.as_deref()).collect();
+        let blobs: Vec<&str> =
+            changes.iter().filter_map(|it| it.blob.as_ref().map(|(blob, _)| &**blob)).collect();
         let mut contents = self.blobs(&blobs)?.into_iter();
         let mut ops: Vec<Op> = changes
             .into_iter()
             .map(|change| match change.blob {
-                Some(_) => Op::Write {
+                Some((_, mode)) => Op::Write {
                     path: change.path,
                     bytes: contents.next().expect("a blob for each written file"),
+                    mode,
                 },
                 None => Op::Delete { path: change.path },
             })
@@ -200,10 +202,10 @@ impl Git {
     }
 }
 
-/// A file of the tree that changed: its new blob, or `None` when it is gone.
+/// A file of the tree that changed: its new blob and mode, or `None` when it is gone.
 struct Change {
     path: String,
-    blob: Option<String>,
+    blob: Option<(String, Mode)>,
 }
 
 /// `diff-tree -r -z` raw output: `:<mode> <mode> <sha> <sha> <status>\0<path>\0` each.
@@ -219,11 +221,11 @@ fn diff(output: &[u8]) -> Result<Vec<Change>, CheckoutError> {
         };
         let blob = match status {
             "A" | "M" | "T" => {
-                file_mode(new_mode, path)?;
-                if old_blob == new_blob && file_mode(old_mode, path).is_ok() {
+                let mode = file_mode(new_mode, path)?;
+                if old_blob == new_blob && file_mode(old_mode, path).ok() == Some(mode) {
                     continue;
                 }
-                Some(new_blob.to_owned())
+                Some((new_blob.to_owned(), mode))
             }
             "D" => {
                 file_mode(old_mode, path)?;
@@ -245,24 +247,22 @@ fn listing(output: &[u8]) -> Result<Vec<Change>, CheckoutError> {
         let [mode, _, blob] = header.split(' ').collect::<Vec<_>>()[..] else {
             return Err(odd("ls-tree", entry));
         };
-        file_mode(mode, path)?;
-        changes.push(Change { path: path.to_owned(), blob: Some(blob.to_owned()) });
+        let mode = file_mode(mode, path)?;
+        changes.push(Change { path: path.to_owned(), blob: Some((blob.to_owned(), mode)) });
     }
     Ok(changes)
 }
 
-/// A regular file; an executable is written as one (the VFS has no mode). The VFS has no
-/// symlink or submodule (v2/requests/ci.md item 5).
-fn file_mode(mode: &str, path: &str) -> Result<(), CheckoutError> {
-    let refuse = |what: &str| -> Result<(), CheckoutError> {
-        Err(CheckoutError::new(what, Some(path.to_owned())))
-    };
-    match mode {
-        "100644" | "100755" | "100664" => Ok(()),
-        "120000" => refuse("the tree has a symlink, and the VFS has none"),
-        "160000" => refuse("the tree has a submodule, and the VFS has none"),
-        _ => refuse(&format!("the tree has an entry of mode {mode}, which is no file")),
+/// A file's mode, as git writes it; a symlink's blob is its target. The VFS has no submodule.
+fn file_mode(mode: &str, path: &str) -> Result<Mode, CheckoutError> {
+    let refuse = |what: &str| CheckoutError::new(what, Some(path.to_owned()));
+    if mode == "160000" {
+        return Err(refuse("the tree has a submodule, and the VFS has none"));
     }
+    u32::from_str_radix(mode, 8)
+        .ok()
+        .and_then(Mode::from_git)
+        .ok_or_else(|| refuse(&format!("the tree has an entry of mode {mode}, which is no file")))
 }
 
 /// `cat-file --batch` output: `<sha> blob <size>\n<bytes>\n` each, in the order asked.

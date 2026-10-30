@@ -125,6 +125,28 @@ impl Macro {
             }
         };
 
+        // A function with `lru` hashes its output so that a value dropped by eviction can be
+        // compared with its recomputation. Other functions are fingerprinted by revision: their
+        // values are never dropped, and an output's `Hash` impl may hash addresses, which a
+        // fingerprint compared across revisions must not.
+        let fingerprint = if self.args.lru.is_some() && self.args.no_eq.is_none() {
+            quote_spanned!(output_ty.span() =>
+                ::salsa::plumbing::Some(::salsa::plumbing::Fingerprint::of_value(value))
+            )
+        } else {
+            quote! {{
+                let _ = value;
+                ::salsa::plumbing::None
+            }}
+        };
+        let fingerprint = quote! {
+            fn fingerprint<#db_lt>(
+                value: &Self::Output<#db_lt>,
+            ) -> ::salsa::plumbing::Option<::salsa::plumbing::Fingerprint> {
+                #fingerprint
+            }
+        };
+
         let mut inner_fn = item.clone();
         inner_fn.attrs.retain_mut(fn_util::retain_body_attr);
         inner_fn.vis = syn::Visibility::Inherited;
@@ -240,6 +262,7 @@ impl Macro {
                 cycle_recovery_strategy: #cycle_recovery_strategy,
                 is_specifiable: #is_specifiable,
                 values_equal: {#eq},
+                fingerprint: {#fingerprint},
                 needs_interner: #needs_interner,
                 revisions: #(#revisions)*,
                 heap_size_fn: #(#heap_size_fn)*,

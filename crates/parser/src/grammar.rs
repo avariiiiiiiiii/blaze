@@ -179,6 +179,11 @@ pub(crate) mod entry {
     }
 }
 
+/// One item of a source file, as its top level parses one (`items::mod_contents`).
+pub(crate) fn top_level_item(p: &mut Parser<'_>) {
+    items::item_or_macro(p, false, true, false);
+}
+
 pub(crate) fn reparser(
     node: SyntaxKind,
     first_child: Option<SyntaxKind>,

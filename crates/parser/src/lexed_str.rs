@@ -529,3 +529,43 @@ fn err_to_msg(error: EscapeError, mode: Mode) -> String {
     }
     .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every start, range and text found by arithmetic is the one found by walking the tokens,
+    /// across checkpoints and for tokens longer than a packed length holds.
+    #[test]
+    fn packed_tokens_answer_as_a_walk() {
+        let long_string = format!("\"{}\"", "x".repeat(LONG as usize + 7));
+        let long_comment = format!("/*{}*/", "y".repeat(LONG as usize * 2));
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("fn f{i}(a: u32) -> u32 {{ a + {i} }} // {i}\n"));
+            if i == 37 {
+                text.push_str(&long_string);
+            }
+            if i == 150 {
+                text.push_str(&long_comment);
+                text.push('\n');
+            }
+        }
+        let lexed = LexedStr::new(Edition::CURRENT, &text);
+        assert!(lexed.long.len() == 2, "both long tokens are in the side table");
+        let mut start = 0;
+        for i in 0..lexed.len() {
+            let len = lexed.text_len(i);
+            assert_eq!(lexed.text_start(i), start);
+            assert_eq!(lexed.text_range(i), start..start + len);
+            assert_eq!(lexed.text(i), &text[start..start + len]);
+            start += len;
+        }
+        assert_eq!(start, text.len());
+        assert_eq!(lexed.text_start(lexed.len()), text.len());
+        assert_eq!(lexed.range_text(0..lexed.len()), text);
+        let kinds: Vec<_> = (0..lexed.len()).map(|i| lexed.kind(i)).collect();
+        assert!(kinds.contains(&STRING) && kinds.contains(&COMMENT) && kinds.contains(&FN_KW));
+        assert_eq!(LexedStr::single_token(Edition::CURRENT, &long_string).map(|it| it.0), Some(STRING));
+    }
+}

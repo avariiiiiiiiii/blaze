@@ -328,5 +328,5 @@ fn read_some(from: &mut impl Read) -> io::Result<Vec<u8>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

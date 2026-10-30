@@ -462,11 +462,11 @@ impl Server {
                 {
                     *answering = Some(Answering { id: envelope.id, json, close });
                 }
-                self.queue(conn, bytes, effects);
                 self.told.push(Arrived::Request {
                     from: RequestRef { conn, id: envelope.id },
                     request: envelope.body,
                 });
+                self.queue(conn, bytes, effects);
             }
             Err(refused) => {
                 let id = refused.id.unwrap_or(0);

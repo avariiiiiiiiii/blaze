@@ -158,6 +158,7 @@ pub(crate) fn expand(
     mixed_site: Span,
     current_dir: String,
     callback: SubCallback<'_>,
+    seen: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 ) -> Result<Result<tt::TopSubtree, String>, crate::ServerError> {
     let version = process.version();
     let mut span_data_table = SpanDataIndexMap::default();
@@ -182,7 +183,10 @@ pub(crate) fn expand(
         current_dir: Some(current_dir),
     })));
 
-    let response_payload = run_request(process, task, callback)?;
+    if let Some(err) = process.exited() {
+        return Err(err.clone());
+    }
+    let response_payload = process.run_expansion(task, callback, seen)?;
 
     match response_payload {
         BidirectionalMessage::Response(Response::ExpandMacro(it)) => Ok(it

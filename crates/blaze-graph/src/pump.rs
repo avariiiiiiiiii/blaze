@@ -169,6 +169,10 @@ impl<V: Clone> Flight<V> {
             State::Cancelled => Some(None),
         }
     }
+
+    fn ended(&self) -> bool {
+        !matches!(&*lock(&self.state), State::Running { .. })
+    }
 }
 
 enum Joined<V> {
@@ -344,7 +348,7 @@ fn wait<V: Clone>(flight: &Flight<V>) -> Option<V> {
             }
             continue;
         }
-        crate::pool::park(&|| flight.outcome().is_some(), pump);
+        crate::pool::park(&|| flight.ended(), pump);
     }
 }
 
@@ -403,7 +407,7 @@ mod tests {
     fn two_tasks_that_ask_for_each_others_keys_end_with_one_cancelled() {
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
-        let (tx, rx) = unbounded::<(char, Result<u32, Cancelled>)>();
+        let (tx, rx) = unbounded::<(char, Result<Result<u32, Cancelled>, &'static str>)>();
         let post = |name: char, barrier: Option<Arc<Barrier>>| {
             let (mine, theirs, add) = if name == 'a' { (1, 2, 2) } else { (2, 1, 1) };
             let (flights, tx) = (flights.clone(), tx.clone());
@@ -417,14 +421,18 @@ mod tests {
                         flights.get_or_run(key(theirs), || Ok(add)).map(|it| it + 10)
                     })
                 },
-                move |result| _ = tx.send((name, result.expect("no panic"))),
+                move |result| _ = tx.send((name, result.map_err(|_| "panicked"))),
             );
         };
         let barrier = Arc::new(Barrier::new(2));
         post('a', Some(barrier.clone()));
         post('b', Some(barrier));
-        let first = rx.recv_timeout(LONG).unwrap();
-        let second = rx.recv_timeout(LONG).unwrap();
+        let heard = || {
+            let (name, result) = rx.recv_timeout(LONG).unwrap();
+            (name, result.unwrap())
+        };
+        let first = heard();
+        let second = heard();
         let (cancelled, done) = match (first.1, second.1) {
             (Err(Cancelled), Ok(value)) => (first.0, (second.0, value)),
             (Ok(value), Err(Cancelled)) => (second.0, (first.0, value)),
@@ -432,7 +440,7 @@ mod tests {
         };
         assert_eq!(done.1, 12);
         post(cancelled, None);
-        let (name, again) = rx.recv_timeout(LONG).unwrap();
+        let (name, again) = heard();
         assert_eq!(name, cancelled);
         assert_eq!(again, Ok(12));
         assert_eq!(flights.running(), 0);
@@ -443,11 +451,11 @@ mod tests {
     /// ends.
     #[test]
     fn a_chain_of_waits_through_pumping_stops_at_the_bound() {
-        let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         let started = Arc::new(AtomicUsize::new(0));
         let deepest = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = unbounded::<Result<u32, Cancelled>>();
+        let (tx, rx) = unbounded::<Result<Result<u32, Cancelled>, &'static str>>();
         let value = flights.get_or_run(key(0), || {
             for _ in 0..100 {
                 let (flights, started, deepest, tx) =
@@ -459,7 +467,7 @@ mod tests {
                         deepest.fetch_max(depth(), Ordering::SeqCst);
                         flights.get_or_run(key(0), || Ok(0))
                     },
-                    move |result| _ = tx.send(result.expect("no panic")),
+                    move |result| _ = tx.send(result.map_err(|_| "panicked")),
                 );
             }
             let until = Instant::now() + LONG;
@@ -473,7 +481,7 @@ mod tests {
         });
         assert_eq!(value, Ok(7));
         let values: Vec<u32> =
-            (0..100).map(|_| rx.recv_timeout(LONG).unwrap().unwrap()).collect();
+            (0..100).map(|_| rx.recv_timeout(LONG).unwrap().unwrap().unwrap()).collect();
         assert_eq!(values.iter().filter(|&&it| it == 7).count(), PUMP_DEPTH + 1);
         assert_eq!(values.iter().filter(|&&it| it == 0).count(), 100 - PUMP_DEPTH - 1);
         assert_eq!(deepest.load(Ordering::SeqCst), PUMP_DEPTH);
@@ -523,7 +531,7 @@ mod tests {
                 running: (0..KEYS).map(|_| AtomicU32::new(0)).collect(),
             });
             let pool = Pool::new(&topology, false).unwrap();
-            let (tx, rx) = unbounded::<(usize, Result<(), Cancelled>)>();
+            let (tx, rx) = unbounded::<(usize, Result<Result<(), Cancelled>, &'static str>)>();
             let post = |task: usize| {
                 let (world, asks, tx) = (world.clone(), tasks[task].clone(), tx.clone());
                 pool.submit(
@@ -535,7 +543,7 @@ mod tests {
                         }
                         Ok(())
                     },
-                    move |result| _ = tx.send((task, result.expect("a task panicked"))),
+                    move |result| _ = tx.send((task, result.map_err(|_| "panicked"))),
                 );
             };
             for task in 0..tasks.len() {
@@ -543,9 +551,13 @@ mod tests {
             }
             let mut done = 0;
             while done < tasks.len() {
-                match rx.recv_timeout(LONG).expect("seed {seed}: a task did not end") {
-                    (_, Ok(())) => done += 1,
-                    (task, Err(Cancelled)) => post(task),
+                let heard = rx
+                    .recv_timeout(LONG)
+                    .unwrap_or_else(|_| panic!("seed {seed}: a task did not end"));
+                match heard {
+                    (_, Ok(Ok(()))) => done += 1,
+                    (task, Ok(Err(Cancelled))) => post(task),
+                    (task, Err(why)) => panic!("seed {seed}: task {task} {why}"),
                 }
             }
             assert_eq!(world.flights.running(), 0, "seed {seed}");

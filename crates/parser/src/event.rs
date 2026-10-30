@@ -76,6 +76,8 @@ pub(crate) enum Event {
     FloatSplitHack { ends_in_dot: bool },
     /// Index into the parser's side `errors` vec.
     Error { err: u32 },
+    /// A node of `kind` an outline leaves unparsed, over the next `n_input_tokens` tokens.
+    Lazy { kind: SyntaxKind, n_input_tokens: u32 },
 }
 
 impl Event {
@@ -138,6 +140,7 @@ pub(super) fn process(mut events: Vec<Event>, mut errors: Vec<String>) -> Output
                 let msg = mem::take(&mut errors[err as usize]);
                 res.error(msg);
             }
+            Event::Lazy { kind, n_input_tokens } => res.lazy(kind, n_input_tokens),
         }
     }
 

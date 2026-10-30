@@ -15,14 +15,19 @@ fn edge(read: u8, saw: u128) -> Edge {
 
 /// A file (1) read by a parse (2), read by a type check (3), read by codegen (4); and a
 /// result (5) of another root, read by nothing here.
-fn chain(file: u128, parse: u128, check: u128, codegen: u128, ran: bool) -> Trace {
-    let mut trace = Trace::default();
-    trace.insert(key(1), Fingerprint(file), vec![], ran);
-    trace.insert(key(2), Fingerprint(parse), vec![edge(1, file)], ran);
-    trace.insert(key(3), Fingerprint(check), vec![edge(2, parse)], ran);
-    trace.insert(key(4), Fingerprint(codegen), vec![edge(3, check)], ran);
-    trace.insert(key(5), Fingerprint(50), vec![], ran);
+fn links(file: u128, parse: u128, check: u128, codegen: u128, ran: bool) -> TraceBuilder {
+    let mut trace = TraceBuilder::default();
+    trace.insert(key(1), Fingerprint(file), &[], ran);
+    trace.insert(key(2), Fingerprint(parse), &[edge(1, file)], ran);
+    trace.insert(key(3), Fingerprint(check), &[edge(2, parse)], ran);
+    trace.insert(key(4), Fingerprint(codegen), &[edge(3, check)], ran);
     trace
+}
+
+fn chain(file: u128, parse: u128, check: u128, codegen: u128, ran: bool) -> Trace {
+    let mut trace = links(file, parse, check, codegen, ran);
+    trace.insert(key(5), Fingerprint(50), &[], ran);
+    trace.finish()
 }
 
 #[test]
@@ -51,10 +56,11 @@ fn a_result_that_read_the_same_and_came_out_otherwise_is_the_culprit() {
 fn a_result_kept_though_what_it_read_changed_is_unverified() {
     let scratch = chain(11, 21, 30, 40, true);
     // The file and the parse reran; the type check was kept with its edge to the old parse.
-    let mut incremental = chain(10, 20, 30, 40, false);
-    incremental.insert(key(1), Fingerprint(11), vec![], true);
-    incremental.insert(key(2), Fingerprint(21), vec![edge(1, 11)], true);
-    let stale = under(&incremental, &scratch, &[]);
+    let mut incremental = links(10, 20, 30, 40, false);
+    incremental.insert(key(1), Fingerprint(11), &[], true);
+    incremental.insert(key(2), Fingerprint(21), &[edge(1, 11)], true);
+    incremental.insert(key(5), Fingerprint(50), &[], false);
+    let stale = under(&incremental.finish(), &scratch, &[]);
     assert_eq!(
         stale[0],
         Stale::Unverified { query: key(3), read: key(2), saw: Fingerprint(20), now: Some(Fingerprint(21)) }
@@ -66,41 +72,48 @@ fn a_result_kept_though_what_it_read_changed_is_unverified() {
 fn a_cut_off_edge_is_not_unverified() {
     // The file changed, the parse reran to the same fingerprint: keeping the check is right.
     let scratch = chain(11, 20, 30, 40, true);
-    let mut incremental = chain(10, 20, 30, 40, false);
-    incremental.insert(key(1), Fingerprint(11), vec![], true);
-    incremental.insert(key(2), Fingerprint(20), vec![edge(1, 11)], true);
-    assert_eq!(under(&incremental, &scratch, &[]), vec![]);
+    let mut incremental = links(10, 20, 30, 40, false);
+    incremental.insert(key(1), Fingerprint(11), &[], true);
+    incremental.insert(key(2), Fingerprint(20), &[edge(1, 11)], true);
+    incremental.insert(key(5), Fingerprint(50), &[], false);
+    assert_eq!(under(&incremental.finish(), &scratch, &[]), vec![]);
 }
 
 #[test]
 fn a_result_missing_from_the_incremental_build_is_absent() {
     let scratch = chain(10, 20, 30, 40, true);
-    let mut incremental = chain(10, 20, 30, 40, false);
-    incremental.results.remove(&key(5));
+    let incremental = links(10, 20, 30, 40, false).finish();
     assert_eq!(under(&incremental, &scratch, &[]), vec![Stale::Absent { query: key(5) }]);
 }
 
 #[test]
 fn only_what_the_roots_reach_is_compared() {
     let scratch = chain(10, 20, 30, 40, true);
-    let mut incremental = chain(10, 20, 30, 40, false);
-    incremental.insert(key(5), Fingerprint(51), vec![], true);
+    let mut incremental = links(10, 20, 30, 40, false);
+    incremental.insert(key(5), Fingerprint(51), &[], true);
+    let incremental = incremental.finish();
     assert_eq!(under(&incremental, &scratch, &[key(4)]), vec![]);
     assert_eq!(under(&incremental, &scratch, &[key(5)]).len(), 1);
-    assert_eq!(scratch.reachable(&[key(3)]), [key(1), key(2), key(3)].into_iter().collect());
+    let reached = scratch.reachable(&[key(3)]);
+    let names: Vec<QueryKey> =
+        (0..scratch.keys.len() as u32).filter(|&i| reached.get(i)).map(|i| scratch.keys[i as usize]).collect();
+    let mut want = vec![key(1), key(2), key(3)];
+    want.sort();
+    assert_eq!(names, want);
 }
 
 #[test]
 fn over_counts_reruns_for_nothing_cutoffs_and_new_results() {
     let before = chain(10, 20, 30, 40, true);
-    let mut after = chain(11, 20, 30, 40, false);
-    after.insert(key(1), Fingerprint(11), vec![], true);
+    let mut after = links(11, 20, 30, 40, false);
+    after.insert(key(5), Fingerprint(50), &[], false);
+    after.insert(key(1), Fingerprint(11), &[], true);
     // The parse reran and came out the same: cut off.
-    after.insert(key(2), Fingerprint(20), vec![edge(1, 11)], true);
+    after.insert(key(2), Fingerprint(20), &[edge(1, 11)], true);
     // The check reran though its edge is what it was: for nothing.
-    after.insert(key(3), Fingerprint(30), vec![edge(2, 20)], true);
-    after.insert(key(6), Fingerprint(60), vec![], true);
-    let (work, needless) = over(&before, &after);
+    after.insert(key(3), Fingerprint(30), &[edge(2, 20)], true);
+    after.insert(key(6), Fingerprint(60), &[], true);
+    let (work, needless) = over(&before, &after.finish());
     assert_eq!(work, Work { ran: 4, needless: 1, cut_off: 1, new: 1 });
     assert_eq!(needless, vec![key(3)]);
 }
@@ -199,4 +212,61 @@ fn files_are_compared_across_buffer_boundaries() {
     std::fs::write(&b, &body[..1 << 20]).unwrap();
     assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), Some(1 << 20));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_builder_keeps_the_last_insert_and_names_every_read() {
+    let mut trace = TraceBuilder::default();
+    trace.insert(key(2), Fingerprint(20), &[edge(1, 10)], true);
+    trace.insert(key(2), Fingerprint(21), &[edge(1, 11), edge(3, 30)], false);
+    let trace = trace.finish();
+    assert_eq!(trace.keys.len(), 3);
+    assert_eq!(trace.results(), 1);
+    let two = trace.index(&key(2)).unwrap();
+    assert_eq!(trace.result(two), Some(Fingerprint(21)));
+    assert!(!trace.ran.get(two));
+    let read: Vec<(QueryKey, Fingerprint)> = trace.edges(two).map(|(r, s)| (trace.keys[r as usize], s)).collect();
+    assert_eq!(read, vec![(key(1), Fingerprint(11)), (key(3), Fingerprint(30))]);
+    assert_eq!(trace.result(trace.index(&key(1)).unwrap()), None);
+    assert_eq!(trace.edges_from.len(), trace.keys.len() + 1);
+}
+
+#[test]
+fn bits_cross_word_boundaries() {
+    let mut bits = Bits::with_len(130);
+    for i in [0, 63, 64, 129] {
+        bits.set(i);
+    }
+    assert_eq!(bits.0.len(), 3);
+    assert!([0, 63, 64, 129].iter().all(|&i| bits.get(i)));
+    assert!(!bits.get(1) && !bits.get(65) && !bits.get(128));
+    assert_eq!(bits.count(), 4);
+}
+
+fn le_bytes(column: &[u32]) -> Vec<u8> {
+    column.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+#[test]
+fn an_exact_encoding_round_trips_every_shape() {
+    let decode = |bytes: &Vec<u8>| -> Result<Vec<u32>, String> {
+        if bytes.len() % 4 != 0 {
+            return Err(format!("{} bytes is no whole number of u32s", bytes.len()));
+        }
+        Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    };
+    let checked = columns::round_trips(le_bytes, decode, 17).unwrap();
+    assert_eq!(checked, columns::shapes(17).len());
+    assert_eq!(columns::shapes(17), columns::shapes(17));
+}
+
+#[test]
+fn a_lossy_encoding_is_named_with_where_it_lost() {
+    let encode = |column: &[u32]| -> Vec<u16> { column.iter().map(|&v| v as u16).collect() };
+    let decode = |packed: &Vec<u16>| -> Result<Vec<u32>, String> { Ok(packed.iter().map(|&v| u32::from(v)).collect()) };
+    let wrong = columns::round_trips(encode, decode, 17).unwrap_err();
+    assert!(wrong.starts_with("max of 1:"), "{wrong}");
+    let shapes = columns::shapes(3);
+    assert!(shapes.iter().any(|(name, c)| *name == "CSR offsets" && c.windows(2).all(|w| w[0] <= w[1])));
+    assert!(shapes.iter().any(|(name, c)| *name == "strictly increasing" && c.windows(2).all(|w| w[0] < w[1])));
 }

@@ -1,0 +1,393 @@
+//! ELF: Linux executables (PIE: `ET_DYN` with `PT_INTERP`) and shared libraries on x86-64
+//! and AArch64, laid out as lld lays out what rustc's link line asks of it (`-pie`, `-z relro
+//! -z now`, `--eh-frame-hdr`, `--build-id`, `--as-needed`, `-Bsymbolic` for a shared library).
+//!
+//! Four segments, each its own `PT_LOAD` starting on a page: read-only (the headers, the
+//! dynamic linking tables, `.rodata`, `.eh_frame_hdr`, `.eh_frame`), code, relro (what the
+//! loader writes and then makes read-only: `.data.rel.ro`, the init arrays, `.dynamic`, the
+//! GOT) and writable data with the TLS template and `.bss` last. A region's file offset is
+//! its address, so a region never moves in the file while its address stays.
+
+mod dynamic;
+mod image;
+mod native;
+mod read;
+#[cfg(test)]
+mod tests;
+
+use blaze_codegen::Arch;
+
+use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Special, Writer};
+use crate::{Format, LinkError, NativeKind, Output};
+
+/// The ELF header and the most program headers an image has: `PT_PHDR`, `PT_INTERP`, four
+/// `PT_LOAD`s, `PT_DYNAMIC`, `PT_GNU_RELRO`, `PT_GNU_EH_FRAME`, `PT_GNU_STACK`, `PT_TLS`,
+/// `PT_NOTE`.
+const EHDR: u64 = 64;
+const PHDR: u64 = 56;
+const PHDRS: u64 = 12;
+
+pub(crate) const INTERP: &str = ".interp";
+pub(crate) const BUILD_ID: &str = ".note.gnu.build-id";
+pub(crate) const DYNSYM: &str = ".dynsym";
+pub(crate) const DYNSTR: &str = ".dynstr";
+pub(crate) const GNU_HASH: &str = ".gnu.hash";
+pub(crate) const VERSYM: &str = ".gnu.version";
+pub(crate) const VERNEED: &str = ".gnu.version_r";
+pub(crate) const RELA_DYN: &str = ".rela.dyn";
+pub(crate) const DYNAMIC: &str = ".dynamic";
+pub(crate) const EH_FRAME_HDR: &str = ".eh_frame_hdr";
+
+/// The `Class::Named` sections the loader writes before the program starts, so relro.
+const DATA_REL_RO: &str = ".data.rel.ro";
+const PREINIT_ARRAY: &str = ".preinit_array";
+
+pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
+    let error = |what: String| LinkError { function: None, what };
+    if output.format != Format::Elf {
+        return Err(error(format!("the ELF writer was asked for a {:?} image", output.format)));
+    }
+    match output.arch {
+        Arch::X86_64 | Arch::Aarch64 => {}
+        Arch::Wasm32 => return Err(error("an ELF image for wasm32: wasm is linked as wasm".into())),
+    }
+    Ok(Box::new(Elf { output: output.clone() }))
+}
+
+pub(crate) struct Elf {
+    pub(crate) output: Output,
+}
+
+/// Which `PT_LOAD` a class goes in, in address order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum Segment {
+    Read,
+    Code,
+    Relro,
+    Write,
+}
+
+impl Segment {
+    pub(crate) fn of(class: &Class) -> Segment {
+        match class {
+            Class::Synthetic(DYNAMIC) => Segment::Relro,
+            Class::Synthetic(_) | Class::Rodata | Class::EhFrame => Segment::Read,
+            Class::Text | Class::Patch | Class::Stubs | Class::Plt | Class::Veneers => Segment::Code,
+            Class::InitArray | Class::FiniArray | Class::Got => Segment::Relro,
+            Class::Table | Class::Data | Class::PatchData | Class::Tdata | Class::Tbss | Class::Bss => {
+                Segment::Write
+            }
+            Class::Named { name, write, exec } => match (name.as_str(), write, exec) {
+                (DATA_REL_RO | PREINIT_ARRAY, _, _) => Segment::Relro,
+                (_, _, true) => Segment::Code,
+                (_, true, false) => Segment::Write,
+                (_, false, false) => Segment::Read,
+            },
+        }
+    }
+
+    /// The `p_flags` of its `PT_LOAD`.
+    pub(crate) fn flags(self) -> u32 {
+        const R: u32 = 4;
+        const W: u32 = 2;
+        const X: u32 = 1;
+        match self {
+            Segment::Read => R,
+            Segment::Code => R | X,
+            Segment::Relro | Segment::Write => R | W,
+        }
+    }
+
+    /// Whether the loader may write it: where dynamic relocations may point.
+    pub(crate) fn loader_writes(self) -> bool {
+        matches!(self, Segment::Relro | Segment::Write)
+    }
+}
+
+/// Whether a region's bytes are in the file: everything but the zeroed tail of the writable
+/// segment.
+pub(crate) fn in_file(class: &Class) -> bool {
+    !matches!(class, Class::Tbss | Class::Bss)
+}
+
+/// A class's place in its segment.
+fn rank(class: &Class) -> u32 {
+    match class {
+        Class::Synthetic(INTERP) => 0,
+        Class::Synthetic(BUILD_ID) => 1,
+        Class::Synthetic(DYNSYM) => 2,
+        Class::Synthetic(DYNSTR) => 3,
+        Class::Synthetic(GNU_HASH) => 4,
+        Class::Synthetic(VERSYM) => 5,
+        Class::Synthetic(VERNEED) => 6,
+        Class::Synthetic(RELA_DYN) => 7,
+        Class::Rodata => 8,
+        Class::Named { exec: false, write: false, .. } => 9,
+        Class::Synthetic(EH_FRAME_HDR) => 10,
+        Class::EhFrame => 11,
+        Class::Synthetic(_) => 12,
+
+        Class::Text => 0,
+        Class::Named { exec: true, .. } => 1,
+        Class::Patch => 2,
+        Class::Stubs => 3,
+        Class::Plt => 4,
+        Class::Veneers => 5,
+
+        Class::Named { name, .. } if name == DATA_REL_RO => 0,
+        Class::Named { name, .. } if name == PREINIT_ARRAY => 1,
+        Class::InitArray => 2,
+        Class::FiniArray => 3,
+        Class::Got => 5,
+
+        Class::Table => 0,
+        Class::Data => 1,
+        Class::Named { .. } => 2,
+        Class::PatchData => 3,
+        Class::Tdata => 4,
+        Class::Tbss => 5,
+        Class::Bss => 6,
+    }
+}
+
+fn order_key(class: &Class) -> (Segment, u32, &str) {
+    let name = match class {
+        Class::Named { name, .. } => name.as_str(),
+        Class::Synthetic(name) => name,
+        _ => "",
+    };
+    let rank = match class {
+        Class::Synthetic(DYNAMIC) => 4,
+        _ => rank(class),
+    };
+    (Segment::of(class), rank, name)
+}
+
+/// The class and rank of an allocated section of this name and these flags, as lld places
+/// input sections: `.init_array.N` before `.init_array`, `.ctors.N` as `.init_array` of
+/// priority `65535 - N`, `.text.*` in `.text`, and any other name an output section of its
+/// own (an orphan), kept whole for its `__start_`/`__stop_` symbols.
+pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<(Class, u32), String> {
+    if name.is_empty() {
+        return Err("a section with no name".into());
+    }
+    if write && exec {
+        return Err(format!("section `{name}` is both writable and executable"));
+    }
+    let under = |prefix: &str| {
+        name == prefix || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'))
+    };
+    let suffix = |prefix: &str| name.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('.'));
+    let priority = |prefix: &str, reversed: bool| match suffix(prefix).map(str::parse::<u32>) {
+        Some(Ok(n)) if n <= 65535 => if reversed { 65535 - n } else { n },
+        _ => 65536,
+    };
+    if tls || under(".tdata") || under(".tbss") {
+        let class = if under(".tbss") { Class::Tbss } else { Class::Tdata };
+        return Ok((class, 0));
+    }
+    let placed = if under(".init_array") {
+        (Class::InitArray, priority(".init_array", false))
+    } else if under(".ctors") {
+        (Class::InitArray, priority(".ctors", true))
+    } else if under(".fini_array") {
+        (Class::FiniArray, priority(".fini_array", false))
+    } else if under(".dtors") {
+        (Class::FiniArray, priority(".dtors", true))
+    } else if under(PREINIT_ARRAY) {
+        (Class::Named { name: PREINIT_ARRAY.into(), write: true, exec: false }, 0)
+    } else if under(DATA_REL_RO) {
+        (Class::Named { name: DATA_REL_RO.into(), write: true, exec: false }, 0)
+    } else if under(".rodata") && !write && !exec || under(".gcc_except_table") {
+        (Class::Rodata, 0)
+    } else if under(".data") && !exec {
+        (Class::Data, 0)
+    } else if under(".bss") && !exec {
+        (Class::Bss, 0)
+    } else if under(".text") && !write {
+        (Class::Text, 0)
+    } else {
+        (Class::Named { name: name.into(), write, exec }, 0)
+    };
+    Ok(placed)
+}
+
+/// A name `__start_X` and `__stop_X` are defined for: a C identifier.
+fn c_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|it| it == '_' || it.is_ascii_alphabetic())
+        && chars.all(|it| it == '_' || it.is_ascii_alphanumeric())
+}
+
+fn start(regions: &[Region], matches: impl Fn(&Class) -> bool) -> Option<u64> {
+    regions.iter().filter(|it| matches(&it.class)).map(|it| it.addr).min()
+}
+
+fn end(regions: &[Region], matches: impl Fn(&Class) -> bool) -> Option<u64> {
+    regions.iter().filter(|it| matches(&it.class)).map(|it| it.addr + it.size).max()
+}
+
+fn preinit(class: &Class) -> bool {
+    matches!(class, Class::Named { name, .. } if name == PREINIT_ARRAY)
+}
+
+/// lld defines the bounds of an absent array at the image's start (address 0: `Plan::base`).
+fn init_array_start(regions: &[Region]) -> u64 {
+    start(regions, |it| *it == Class::InitArray).unwrap_or(0)
+}
+fn init_array_end(regions: &[Region]) -> u64 {
+    end(regions, |it| *it == Class::InitArray).unwrap_or(0)
+}
+fn fini_array_start(regions: &[Region]) -> u64 {
+    start(regions, |it| *it == Class::FiniArray).unwrap_or(0)
+}
+fn fini_array_end(regions: &[Region]) -> u64 {
+    end(regions, |it| *it == Class::FiniArray).unwrap_or(0)
+}
+fn preinit_array_start(regions: &[Region]) -> u64 {
+    start(regions, preinit).unwrap_or(0)
+}
+fn preinit_array_end(regions: &[Region]) -> u64 {
+    end(regions, preinit).unwrap_or(0)
+}
+fn dynamic_start(regions: &[Region]) -> u64 {
+    start(regions, |it| *it == Class::Synthetic(DYNAMIC)).unwrap_or(0)
+}
+/// Code computes the GOT's address with `GOTPC32` and offsets from it with `GOTOFF64`, so
+/// any one address serves; lld's is the GOT's start on AArch64.
+fn got_base(regions: &[Region]) -> u64 {
+    start(regions, |it| *it == Class::Got).unwrap_or_else(|| dynamic_start(regions))
+}
+fn eh_frame_hdr_start(regions: &[Region]) -> u64 {
+    start(regions, |it| *it == Class::Synthetic(EH_FRAME_HDR)).unwrap_or(0)
+}
+fn tls_start(regions: &[Region]) -> u64 {
+    start(regions, |it| matches!(it, Class::Tdata | Class::Tbss)).unwrap_or(0)
+}
+/// The end of the last region whose bytes are in the file.
+fn edata(regions: &[Region]) -> u64 {
+    end(regions, in_file).unwrap_or(0)
+}
+fn image_end(regions: &[Region]) -> u64 {
+    end(regions, |_| true).unwrap_or(0)
+}
+fn bss_start(regions: &[Region]) -> u64 {
+    start(regions, |it| *it == Class::Bss).unwrap_or_else(|| edata(regions))
+}
+fn etext(regions: &[Region]) -> u64 {
+    end(regions, |it| Segment::of(it) == Segment::Code).unwrap_or(0)
+}
+
+impl Writer for Elf {
+    fn format(&self) -> Format {
+        Format::Elf
+    }
+
+    fn arch(&self) -> Arch {
+        self.output.arch
+    }
+
+    fn plan(&self) -> Plan {
+        Plan {
+            base: 0,
+            headers: EHDR + PHDR * PHDRS,
+            page: self.page(),
+            indexed_code: false,
+            got_by_library: false,
+            tls_descriptors: false,
+        }
+    }
+
+    fn order(&self, classes: &mut Vec<Class>) {
+        classes.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+    }
+
+    /// Relro is read-only once the loader has relocated it (`-z now`): `Prot::R` here, so it
+    /// starts on a page of its own; its `PT_LOAD` is writable for the loader.
+    fn prot(&self, class: &Class) -> Prot {
+        match Segment::of(class) {
+            Segment::Read | Segment::Relro => Prot::R,
+            Segment::Code => Prot::RX,
+            Segment::Write => Prot::RW,
+        }
+    }
+
+    fn section(&self, name: &str, write: bool, exec: bool, tls: bool) -> Result<(Class, u32), String> {
+        section(name, write, exec, tls)
+    }
+
+    fn special(&self, name: &str) -> Option<Special> {
+        let placed = |at: fn(&[Region]) -> u64| Some(Special::Placed(at));
+        match name {
+            "__ehdr_start" | "__executable_start" | "__dso_handle" => Some(Special::ImageBase),
+            "__blaze_live" => Some(Special::LiveDescriptor),
+            "_DYNAMIC" => placed(dynamic_start),
+            "_GLOBAL_OFFSET_TABLE_" => placed(got_base),
+            "__init_array_start" => placed(init_array_start),
+            "__init_array_end" => placed(init_array_end),
+            "__fini_array_start" => placed(fini_array_start),
+            "__fini_array_end" => placed(fini_array_end),
+            "__preinit_array_start" => placed(preinit_array_start),
+            "__preinit_array_end" => placed(preinit_array_end),
+            "__GNU_EH_FRAME_HDR" => placed(eh_frame_hdr_start),
+            "_TLS_MODULE_BASE_" => placed(tls_start),
+            "__bss_start" => placed(bss_start),
+            "_edata" | "edata" => placed(edata),
+            "_end" | "end" => placed(image_end),
+            "etext" | "_etext" | "__etext" => placed(etext),
+            _ => {
+                let (section, end) = match (name.strip_prefix("__start_"), name.strip_prefix("__stop_")) {
+                    (Some(section), _) => (section, false),
+                    (_, Some(section)) => (section, true),
+                    _ => return None,
+                };
+                c_identifier(section).then(|| Special::Section { name: section.into(), end })
+            }
+        }
+    }
+
+    fn read(&self, name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
+        read::read(self.output.arch, name, bytes, kind)
+    }
+
+    fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
+        dynamic::sizes(&self.output, counts)
+    }
+
+    fn apply(&self, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64) -> Result<(), String> {
+        native::apply(self.output.arch, r_type, bytes, p, s, addend)
+    }
+
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+        Ok(dynamic::Tables::of(self, placed)?.regions())
+    }
+
+    fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {
+        in_file(&region.class).then(|| region.addr - placed.plan.base)
+    }
+
+    fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {
+        image::file(self, placed)
+    }
+}
+
+impl Elf {
+    /// lld's maximum page size: what a `PT_LOAD` is aligned to.
+    fn page(&self) -> u64 {
+        match self.output.arch {
+            Arch::Aarch64 => 0x10000,
+            Arch::X86_64 | Arch::Wasm32 => 0x1000,
+        }
+    }
+
+    pub(crate) fn machine(&self) -> u16 {
+        match self.output.arch {
+            Arch::Aarch64 => object::elf::EM_AARCH64,
+            Arch::X86_64 | Arch::Wasm32 => object::elf::EM_X86_64,
+        }
+    }
+}
+
+pub(crate) fn error(what: String) -> LinkError {
+    LinkError { function: None, what }
+}

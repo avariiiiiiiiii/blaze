@@ -150,7 +150,7 @@ impl<'db> InferCtxt<'db> {
     /// #![feature(generic_const_exprs)]
     ///
     /// fn bind<const N: usize>(value: [u8; N]) -> [u8; 3 + 4] {
-    ///     todo!()
+    ///     loop {}
     /// }
     ///
     /// fn main() {

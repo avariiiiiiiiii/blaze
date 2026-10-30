@@ -1,8 +1,16 @@
 ---
-status: current
-summary: The build page blaze ui serves: every function of the build drawn live on the GPU, from a Flecs world of the program.
+status: record
+date: 2026-10-30
+summary: The build page v1's blaze ui served, every function of the build drawn live on the GPU from a Flecs world of the program. v2 has no blaze ui and its daemon does not start the page.
 ---
 # The build page
+
+This is the build page as blaze v1 served it, as of its integration into v2 on 2026-10-30.
+`crates/blaze-web` is still in the tree, but v2's blaze has no `ui` command and its daemon
+never starts the page's server or sends it records. In v2 the page is to be a client of the
+agent API, `crates/blaze-api` (the ci lane:
+[v2/plan/reference/crates.md](v2/plan/reference/crates.md),
+[v2/plan/lanes/ci.md](v2/plan/lanes/ci.md)).
 
 `blaze ui` prints the address of a page the daemon serves on 127.0.0.1 and opens it: the build
 as it goes, down to every function. Nothing of it runs until it is asked for: the first

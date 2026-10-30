@@ -66,8 +66,8 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 
 | lane | paths |
 |---|---|
-| coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but the lanes' notes folders (`docs/v2/plan/lanes/<lane>/`), `v2/requests/` (applying them), `crates/hir-ide/`, `crates/ide-db/`, `crates/test-fixture/` until they are removed |
-| cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`, `crates/project-model/`, `crates/blaze-lower/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`, `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`, `crates/blaze-source/`, `library/` |
+| coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but the lanes' notes folders (`docs/v2/plan/lanes/<lane>/`), `v2/requests/` (applying them) |
+| cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/blaze-lower/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`, `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`, `crates/blaze-source/`, `library/` |
 | diagnostics | `crates/blaze-diagnostics/` (new), `crates/ide-diagnostics/` |
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plan/lanes/core/plane.md` |
 | vfs | `crates/blaze-vfs/` (v1 `vfs` and `vfs-notify` deleted 2026-10-30) |
@@ -76,8 +76,8 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | items | `crates/blaze-items/`; in `crates/hir-ty/src/`: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`, `drop.rs` |
 | store | `crates/blaze-cas/`, `crates/blaze-store/`, `crates/blaze-cargo/src/remote/`, `crates/blaze-cargo/src/remote.rs` |
 | codegen | `crates/blaze-codegen/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-engine/`, `vendor/llvm-sys/`; in `crates/hir-ty/src/`: `mir.rs`, `mir/` (the MIR types, whose layout is codegen's, [data.md](../design/data.md)) |
-| link | `crates/blaze-link/`, `crates/blaze-splice/`, `crates/blaze-live/`, `crates/blaze-in-place/`, `vendor/cranelift-object/` |
-| usercode | `crates/blaze-usercode/`, `crates/blaze-build-script/`, `crates/blaze-expand/`, `crates/blaze-macro-wasm/`, `crates/blaze-wasi/`, `crates/proc-macro-api/`, `crates/proc-macro-srv/`, `crates/blaze-cargo/src/sandbox.rs`, `crates/blaze-cargo/src/sandbox/` |
+| link | `crates/blaze-link/`, `crates/blaze-live/`, `vendor/cranelift-object/` |
+| usercode | `crates/blaze-usercode/`, `crates/blaze-build-script/`, `crates/blaze-macro-wasm/`, `crates/blaze-wasi/`, `crates/proc-macro-api/`, `crates/proc-macro-srv/`, `crates/blaze-cargo/src/sandbox.rs`, `crates/blaze-cargo/src/sandbox/` |
 | ci | `crates/blaze-api/`, `crates/blaze-ci/`, `crates/blaze-protocol/`, `crates/blaze-ui/`, `crates/blaze-web/` |
 | proof | `crates/blaze-v2-proof/`, `harness/v2/` |
 | safety | `crates/hir-ty-ub/`, `crates/blaze-check/`, `fuzz/` |
@@ -97,15 +97,15 @@ coordinator's: a change there is a request.
 | `blaze-graph` | changed: the plane becomes the one scheduler, `Machine` its one-request case; the executor's cache-aware groups | core |
 | `blaze-store` | replaced by `blaze-cas`, deleted at integration | store |
 | `blaze-cargo` | changed: its daemon and client move onto `blaze-core`, `blaze-graph`'s plane and `blaze-api` at integration; its sandbox gains tracing (usercode); its remote store becomes the read-through tier (store) | coordinator, usercode, store |
-| `blaze-engine` | replaced: the crate-at-a-time codegen tail becomes per-function units; tail deleted at integration, 2026-10-30. Kept: the `blaze` program (`src/program.rs`: the sandbox launcher, the release hand-over, the build-script `rustc`/`rustdoc` stand-ins in `as_rustc`, the pinned release and `pin`/`version-fetch`/`version-resolve`, then `blaze_cargo::cli::main`), `pin.rs`, `versions.rs` | codegen |
+| `blaze-engine` | replaced: the crate-at-a-time codegen tail becomes per-function units; tail deleted at integration, 2026-10-30. Stays as the `blaze` program only, the binary the release ships: `program.rs` (the sandbox launcher, the build-script `rustc`/`rustdoc` stand-ins on v2's front end in `as_rustc`, the pinned release, `pin`/`version-*`), `pin.rs`, `versions.rs`, in front of `blaze_cargo::cli` | codegen |
 | `hir-ty-codegen` | changed: compiles one `Unit` to one `CompiledFunction` | codegen |
 | `hir-ty-mir` | changed: instances keyed by `Instance`, code dedupe, inlining edges | codegen |
 | `blaze-splice` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
 | `blaze-in-place` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
 | `blaze-live` | changed: patches through `blaze-link`'s slots and commit | link |
-| `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs; deleted at integration, 2026-10-30 | usercode |
+| `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs; deleted at integration, 2026-10-30 (its code is now `proc_macro_api::{kept, bridge}` and `blaze_macro_wasm::native`) | usercode |
 | `blaze-build-script`, `blaze-macro-wasm`, `blaze-wasi`, `proc-macro-api`, `proc-macro-srv` | changed: run in tracing sandboxes, from a warm pool | usercode |
-| `vfs`, `vfs-notify` | replaced by `blaze-vfs` and `blaze-core`'s watch | vfs |
+| `vfs`, `vfs-notify` | replaced by `blaze-vfs` and `blaze-core`'s watch; deleted at integration, 2026-10-30 (`span` owns `FileId`, base-db the file sets and source paths) | vfs |
 | `syntax-tree`, `syntax`, `parser` | changed: one flat tree per file replaces rowan (#42) | format |
 | `span`, `intern` | changed: spans in side tables; sharded interners | format |
 | `tt`, `mbe`, `syntax-bridge`, `const-ast` | changed: onto the flat tree | format |
@@ -120,7 +120,7 @@ coordinator's: a change there is a request.
 | `ide-db` | deleted at integration, 2026-10-30: callers import from `base-db`, `RootDatabase` became `base_db::Db` | coordinator |
 | `test-fixture` | deleted at integration, 2026-10-30: its users run on the v2 fixture, `hir_expand::fixture` (feature `fixture`), which builds a `base_db::Db` through a `blaze-vfs` view | coordinator |
 | `ide-diagnostics` | replaced by `blaze-diagnostics` ([building.md](../process/building.md) section 18), then removed | diagnostics |
-| `load-cargo`, `project-model` | replaced by the workspace load as queries ([building.md](../process/building.md) section 18); the units' lowering into base-db's crate graph is the new crate `blaze-lower` | cargo |
+| `load-cargo`, `project-model` | replaced by the workspace load as queries ([building.md](../process/building.md) section 18), the units lowered into base-db's crate graph by the new crate `blaze-lower`; deleted at integration, 2026-10-30 | cargo |
 | `blaze-fmt`, `blaze-lints` | left; moved onto the flat tree at integration | coordinator |
 | every other crate | left | coordinator |
 

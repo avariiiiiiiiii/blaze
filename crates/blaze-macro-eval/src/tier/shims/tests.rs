@@ -83,6 +83,11 @@ fn what_a_shim_cant_do_stops_and_a_raise_goes_up_the_frames() {
     let Err(Escape::Raise(at)) = run(&mut shims, Own::UnwindResume, &[0x4010]) else { panic!("no resume") };
     assert_eq!(at, 0x4010);
     assert_eq!(run(&mut shims, Own::Backtrace, &[0, 0]).unwrap(), URC_END_OF_STACK);
+
+    let text = run(&mut shims, Own::Malloc, &[8]).unwrap();
+    assert_eq!(run(&mut shims, Own::Write, &[2, text, 8]).unwrap(), 8, "stderr takes it all");
+    let Err(Escape::Stop(stop)) = run(&mut shims, Own::Write, &[3, text, 8]) else { panic!("wrote to fd 3") };
+    assert!(stop.0.contains("descriptor 3"), "{stop}");
 }
 
 #[test]

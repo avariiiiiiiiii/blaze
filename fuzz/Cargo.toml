@@ -72,10 +72,6 @@ name = "cas_remote"
 path = "targets/cas_remote.rs"
 
 [[bin]]
-name = "codegen_asm"
-path = "targets/codegen_asm.rs"
-
-[[bin]]
 name = "codegen_blob"
 path = "targets/codegen_blob.rs"
 
@@ -282,7 +278,6 @@ blaze-usercode.workspace = true
 blaze-vfs.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
-hir-ty-codegen.workspace = true
 # `intern::fuzz`, a table section restored into a fresh table and the writer of one, which `intern_table` runs.
 intern = { workspace = true, features = ["fuzz"] }
 # The object-file targets build their seeds with `object::write`.

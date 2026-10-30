@@ -15,11 +15,7 @@ pub enum PrettifyWsKind {
 }
 
 /// Renders a [`SyntaxNode`] with whitespace inserted between tokens that require them.
-///
-/// This is an internal API that is only exported because `mbe` needs it for tests and cannot depend
-/// on `hir-expand`. For any purpose other than tests, you are supposed to use the `prettify_macro_expansion`
-/// from `hir-expand` that handles `$crate` for you.
-#[deprecated = "use `hir_expand::prettify_macro_expansion()` instead"]
+/// Each `$crate` token is replaced with what `dollar_crate_replacement` gives it.
 pub fn prettify_macro_expansion(
     syn: SyntaxNode,
     dollar_crate_replacement: &mut impl FnMut(&SyntaxToken, &SyntaxFactory) -> Option<SyntaxToken>,
@@ -203,7 +199,6 @@ mod tests {
     use super::*;
     use expect_test::{Expect, expect};
 
-    #[expect(deprecated)]
     fn check_pretty(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let ra_fixture = stdx::trim_indent(ra_fixture);
         let source_file = syntax::ast::SourceFile::parse(&ra_fixture, span::Edition::CURRENT);
@@ -229,7 +224,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(deprecated)]
     fn replaces_each_dollar_crate() {
         // `$crate::x` as an expansion has it: `$crate` one identifier, which no parse makes.
         let mut builder = syntax::SyntaxTreeBuilder::default();

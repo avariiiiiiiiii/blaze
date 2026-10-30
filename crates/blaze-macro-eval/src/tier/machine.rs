@@ -111,6 +111,7 @@ pub(crate) struct Running<'i> {
     fault: Cell<Option<Fault>>,
     escaped: Cell<Option<Escaped>>,
     /// The shims of the innermost entry, while one runs.
+    // dyn: one call per stub call, which leaves the macro's code anyway
     dispatch: Cell<Option<ptr::NonNull<dyn Dispatch + 'static>>>,
     /// The image's `resume` routine.
     resume: u64,
@@ -154,10 +155,9 @@ thread_local! {
 impl<'i> Running<'i> {
     pub(crate) fn new(image: &'i Image, stack: Range<u64>, resume: u64) -> Result<Running<'i>, Stop> {
         install()?;
-        // alloc: once per run, the thunks' list
         Ok(Running {
             image,
-            thunks: UnsafeCell::new(Vec::new()),
+            thunks: UnsafeCell::new(Vec::new()), // alloc: once per run, the thunks' list
             stack,
             fault: Cell::new(None),
             escaped: Cell::new(None),
@@ -200,7 +200,7 @@ impl<'i> Running<'i> {
     /// again from inside a call, passing itself.
     pub(crate) fn enter(
         &self,
-        dispatch: &mut dyn Dispatch,
+        dispatch: &mut dyn Dispatch, // dyn: as the field it is put in
         thunk: Thunk,
         code: u64,
         vmctx: u64,
@@ -211,6 +211,7 @@ impl<'i> Running<'i> {
         // function) while the entry below runs, inside `dispatch`'s borrow here, and the
         // entry's before it is put back before this returns.
         let shims = unsafe {
+            // dyn: as the field
             std::mem::transmute::<ptr::NonNull<dyn Dispatch + '_>, ptr::NonNull<dyn Dispatch + 'static>>(
                 ptr::NonNull::from(dispatch),
             )

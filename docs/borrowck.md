@@ -5,27 +5,28 @@ summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's ve
 # The borrow checker
 
 blaze has its own borrow checker, the crate `hir-ty-borrowck` in the front end
-(`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR rust-analyzer
-lowers, the same MIR the code generator compiles, and it is meant to give exactly rustc's
-verdict: the same errors, on the same lines, and none where rustc gives none. It gives
-rustc's verdict on 95% of rustc's own borrow-check tests today, and on every one rustc
-accepts; how they are scored and what is left is below.
+(`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR `hir-ty-mir`
+lowers (from rust-analyzer's lowering), the same MIR the code generator compiles, and it is meant to give exactly rustc's
+verdict: the same errors, on the same lines, and none where rustc gives none. At its last
+scoring it gave rustc's verdict on 99.8% of the rustc borrow-check tests in scope, and on
+every one rustc accepts; how they were scored and what is left is below.
 
-It runs as part of the front end's diagnostics, so the daemon computes it for every edited
-file, and `blaze check` reports what it finds. The daemon refuses an edit it finds a
-borrow-check error in (below), but the checker still misses about a sixth of the errors
-rustc gives, so `cargo check` stays the final word.
+It runs as part of the front end's diagnostics (`crates/hir/src/diagnostics.rs`), in each
+unit's check beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), and `blaze
+check` reports what it finds. A build it finds a borrow-check error in fails (below), but the
+checker still misses some errors rustc gives (What is left, below).
 
 ## Refusing builds
 
-An edit with a borrow-check error fails its build, with the file, line and error, as an edit
-with a type error does; under `blaze`, cargo then runs and rustc reports it.
+A build with a borrow-check error fails, with the file, line and error, as one with a type
+error does: the unit's check failed, so what its codegen made is dropped. Nothing else runs;
+no cargo or rustc is asked.
 
 This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
 fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
-borrow-check error blaze reports where rustc reports none is a bug. What it does not do: it misses about a sixth of the
-errors rustc gives (it accepts code rustc rejects, listed below), so code with such an error
-still builds and runs from memory.
+borrow-check error blaze reports where rustc reports none is a bug. What it does not do: it
+misses some errors rustc gives (it accepts code rustc rejects, listed below), so code with
+such an error still builds.
 
 ## Modes
 
@@ -602,7 +603,7 @@ changes to rust-analyzer were needed, each made as rustc does it:
   deref drops `boom()` first, so an `impl Trait` it returns keeps no borrow of the string
   alive (`impl-trait/wf-check-hidden-type.rs`).
 - Type lowering gives a trait object written without a lifetime, as a type argument, the
-  lifetime of its parameter's one outlives bound (`hir-ty/src/generics.rs`,
+  lifetime of its parameter's one outlives bound (`hir-ty/src/lower.rs`,
   `object_lifetime_default`, RFC 599): `Ref<'x, dyn Trait>` with `T: 'a + ?Sized` on `Ref`
   is `dyn Trait + 'x`, not `'static`. In an impl header, a trait object behind a reference
   whose lifetime is elided has that lifetime too (`hir-ty/src/lower.rs`, `impl_header`), as
@@ -655,8 +656,9 @@ missed rather than errors made up:
 
 ## What it costs
 
-On every edit the daemon runs the diagnostics of the edited files on a thread of its own,
-beside the build, so the check adds to an edit only when it takes longer than the build.
+A unit's check runs beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), so
+it adds to a build only when it takes longer than the codegen. The numbers below are v1's,
+whose daemon checked the edited files on a thread of their own beside the build.
 For an edit of the corpus's largest file, the check went from a median of 40 ms with the
 checker off to 52-74 ms with it on, while the build took 250-400 ms. A cold check of all of
 nushell used 10-25% more CPU time. Both were measured on a loaded machine, so read them as
@@ -664,7 +666,7 @@ rough.
 
 ## Speed
 
-The check runs on every edited file, so its time is on the edit's path. Two things keep it
+The check runs in every build of an edited crate, so its time is on the edit's path. Two things keep it
 small: an edit re-checks only the bodies it changed (the query reads each body's source map
 relative to its item, which moving the body does not change), and each check should cost a
 small fraction of type inference, which it needs anyway.

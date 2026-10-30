@@ -2,7 +2,7 @@
 """storefull.py: v2's store on a disk that has no room. Linux: the disk is a tmpfs mounted with
 `sudo -n`.
 
-    python3 storefull.py '{"blaze": "target/release/blaze"}'
+    uv run --frozen python harness/storefull.py '{"blaze": "target/release/blaze"}'
 
 `blaze` is the v2 command line. The input is one JSON object, inline, a file's path, or `-`.
 

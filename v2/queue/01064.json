@@ -1,0 +1,25 @@
+{
+  "id": "01064",
+  "from_lane": "integrate-docs",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/toolchain/own.rs",
+    "crates/blaze-cargo/src/toolchain.rs",
+    "crates/blaze-units/"
+  ],
+  "what": "From integrate-docs: v2 cannot get its toolchain. Nothing calls crates/blaze-cargo/src/toolchain/own.rs `fetch`, and v2 has no `blaze toolchain` command, so on a machine without rustup nightly-2026-10-27 or ~/.blaze a build stops at toolchain::found (\"blaze toolchain is not installed\"). install.sh:305 runs `blaze toolchain`, and BLAZE_NO_TOOLCHAIN / --no-toolchain promise the first build downloads it; neither happens. Also: v2 never refuses a member whose rust-version is newer than blaze Rust, and --ignore-rust-version is parsed and unused (blaze-units). docs/toolchain.md and docs/install.md now say both as v2 gaps; fix them there when this lands.",
+  "state": "open",
+  "created": "2026-10-30T15:03:40Z",
+  "updated": "2026-10-30T15:03:40Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:03:40Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -63,6 +63,9 @@ pub(crate) enum Own {
     Backtrace,
     /// `abort`: the expansion stops.
     Abort,
+    /// `write` to stdout or stderr, which the evaluator's run takes and drops; to any other
+    /// descriptor the expansion stops, as the evaluator's does.
+    Write,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -184,6 +187,7 @@ fn own_function(symbol: &str) -> Option<Own> {
         "_Unwind_DeleteException" => Own::DeleteException,
         "_Unwind_Backtrace" => Own::Backtrace,
         "abort" => Own::Abort,
+        "write" => Own::Write,
         _ => return None,
     })
 }

@@ -40,28 +40,30 @@ programs).
 
 ## Extensions (beyond the pinned nightly)
 
-The interpreter runs these. rustc refuses the programs, so a workspace that uses them builds
-with blaze only. Each will be opt-in by name in the root manifest:
+Two are planned; v2 has neither yet. rustc refuses the programs, so a workspace that uses them
+would build with blaze only, each opt-in by name in the root manifest:
 
 ```toml
 [workspace.metadata.blaze]
 experimental = ["const-hash", "const-fn-pointers"]
 ```
 
+Today v2 knows only the experiments `sandboxed-tests` and `const-macros`
+(`crates/blaze-units/src/load/sandbox.rs`, `KNOWN`) and stops at any other name, so this table
+is refused.
+
 - `const-hash`: `core::hash::Hash`, `Hasher` and `BuildHasher` are const traits, so
   `T: [const] Hash`, `const impl Hasher for MyHasher` and `#[derive(Hash)]` types hash in
   const. In the pinned nightly none of the three is const ("`[const]` can only be applied to
   `const` traits"). Hashing in const is what lets a build graph key its steps by a hash
-  computed at compile time. The values are those of the same code run at run time, checked
-  against rustc's run time (FNV-1a over a derived `Hash` struct, a tuple with `Option`, `str`
-  and `char`, a slice, and through a const closure).
+  computed at compile time. The `library/` blaze builds declares them as the nightly does
+  (`library/core/src/hash/mod.rs`), so v2 refuses these programs.
 - `const-fn-pointers`: calling a `fn` pointer in const. The nightly refuses it ("function
-  pointer calls are not allowed in constant functions").
+  pointer calls are not allowed in constant functions"), and so does v2's const checker.
 
-blaze checks const bodies against rustc's `check_consts` rules (#914,
-`crates/hir-ty-mir/src/mir/const_check.rs`). That includes E0015 for a non-const call and
-rustc's refusal of a call to an intrinsic not declared `const`. Two gaps remain (issue #1440).
-The build does not yet fail on those errors: they are IDE diagnostics, so these programs, and
-any ordinary function called in a `const`, are accepted without the opt-in. And const stability
-is not checked: the nightly's atomics are `const` only under `#![feature(const_atomic)]`, which
-blaze does not ask for.
+blaze checks const bodies against rustc's `check_consts` rules (#914, #1440,
+`crates/hir-ty-mir/src/mir/const_check.rs`): E0015 for a non-const call, a call of a `fn`
+pointer, an intrinsic not declared `const`, and const stability (`const_check/calls.rs`: the
+nightly's atomics are `const` only under `#![feature(const_atomic)]`). Its errors are part of a
+unit's check (`crates/hir/src/diagnostics.rs`, `crates/blaze-cargo/src/serve/unit/checks.rs`),
+so they fail the build as rustc's do.

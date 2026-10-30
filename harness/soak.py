@@ -19,7 +19,6 @@ worktrees. Every step is drawn from the seed and the number of the step alone:
   burst      dozens of clients at once, over every worktree
   cancel     clients interrupted or killed in the middle of a request
   kill       the daemon or one of its workers killed, alone or under a burst
-  collect    `blaze-engine cache gc` and `blaze-engine cache verify` under a burst
 After a step, the worktrees it touched are built by `blaze` (run, test or build, with
 or without the feature) or by `blaze sync` to the worker's own socket, and at the sampled
 rate by blaze from nothing (`blaze_cli.Scratch`: a home, store and target directory of its
@@ -354,13 +353,13 @@ class Soak:
         self.work = args.work
         self.from_nothing = threading.Lock()
         self.state_path = os.path.join(self.work, "state.json")
-        self.home, self.store = os.path.join(self.work, "home"), os.path.join(self.work, "store")
-        self.env = dict(base_env(self.home), BLAZE_CACHE=self.store, SOAK_REPORT="1", BLAZE_IDLE_SECS=str(args.idle))
+        self.home = os.path.join(self.work, "home")
+        self.store = os.path.join(self.home, "v2", "store")
+        self.env = dict(base_env(self.home), SOAK_REPORT="1", BLAZE_IDLE_SECS=str(args.idle))
         if not args.debuginfo:
             # A tenth of the disk, for cargo and the daemon alike; the switch of profile to
             # release and back is a step of its own.
             self.env.update(CARGO_PROFILE_DEV_DEBUG="0", CARGO_PROFILE_TEST_DEBUG="0", CARGO_INCREMENTAL="0")
-        self.env.pop("BLAZE_REMOTE", None)
         self.metrics = open(os.path.join(self.work, "metrics.jsonl"), "a")
         self.requests, self.touched, self.killed, self.log_at = [], [], False, {}
         if os.path.exists(self.state_path):
@@ -773,24 +772,7 @@ class Soak:
         except ProcessLookupError:
             pass
 
-    def cache(self, *args):
-        return subprocess.run([BLAZE, "cache", *args], env=self.env, capture_output=True, text=True, timeout=REQUEST_SECS)
-
-    def step_collect(self, rng):
-        said = self.step_edit(rng)
-        size = rng.choice(["1M", "16M", "64M", "256M"])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            burst = pool.submit(self.burst, random.Random(rng.random()), rng.randrange(4, 16))
-            time.sleep(rng.uniform(0, 1.0))
-            collected = [self.cache("gc", "--max", size) for _ in range(rng.randrange(1, 4))]
-            said += f"; the store collected to {size} under {burst.result()}"
-        verified = self.cache("verify")
-        for ran in [*collected, verified]:
-            if ran.returncode:
-                raise Failure(f"`blaze-engine cache {' '.join(ran.args[2:])}` ended with {ran.returncode}", {"cache.txt": ran.stdout + ran.stderr})
-        return said
-
-    STEPS = [("edit", 48), ("lock", 2), ("macros", 6), ("git", 12), ("worktree", 4), ("burst", 8), ("cancel", 8), ("kill", 4), ("collect", 4)]
+    STEPS = [("edit", 48), ("lock", 2), ("macros", 6), ("git", 12), ("worktree", 4), ("burst", 8), ("cancel", 8), ("kill", 4)]
 
     def name(self, tree):
         return os.path.relpath(tree.root, self.work)

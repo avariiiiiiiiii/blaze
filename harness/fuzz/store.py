@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """store.py: generated programs and changed asm! bodies built by v2 from an empty and a warm store.
 
-    python3 fuzz/store.py '{"blaze": "target/release/blaze"}'
-    python3 fuzz/store.py '{"blaze": "...", "profiles": ["release"]}'
+    uv run --frozen python harness/fuzz/store.py '{"blaze": "target/release/blaze"}'
+    uv run --frozen python harness/fuzz/store.py '{"blaze": "...", "profiles": ["release"]}'
 
 `blaze` is the v2 command line; `profiles` (dev and release) the cargo profiles built, which pick
 the backend (v2 compiles opt-level 0 and 1 with Cranelift, the rest with LLVM). The input is one

@@ -5,20 +5,16 @@ summary: Every blaze command and setting: cargo's commands and flags, what a bui
 # Using blaze
 
 `blaze <command>` takes cargo's commands and flags (`blaze build`, `blaze test`, `blaze run`),
-described here. The other way, switching blaze on globally so that plain `cargo` goes through
-it, has its own section at the end.
+described here. Plain `cargo` never goes through blaze (the section at the end).
 
 blaze had another name and another command before 2026-10-28; [rename.md](rename.md) maps them.
-Every setting below is `BLAZE_<NAME>`, and blaze stops when one is set under its name from
-before, saying what it is called now.
 
-This file was checked against v1's code (blaze-cargo's `cargo/` directory) and run on
-Linux x86-64. That code was deleted on 2026-10-30: blaze is its daemon (`crates/blaze-cargo/src/serve/`)
-and the client of it (`crates/blaze-cargo/src/cli.rs`, whose commands are build, check, run,
-test, bench, serve, stop, status, daemon, codegen-inputs, trace and tables). Where a section
-below names a v1 setting or command the daemon lacks, it says so. On macOS arm64 `harness/blaze_cli.py --small` was run, and what is known of
-it is under [macOS arm64](#macos-arm64). The design notes it was written from are in
-[reports/CARGO.md](reports/CARGO.md).
+This file describes blaze v2, checked against its code on 2026-10-30: the program `blaze`
+(`crates/blaze-engine/src/program.rs`), in front of the client (`crates/blaze-cargo/src/cli.rs`
+and `cli/`) of the daemon `blaze serve` (`crates/blaze-cargo/src/serve/`), on the crates of
+[v2/plan/reference/crates.md](v2/plan/reference/crates.md). v1's code was deleted that day;
+where v1 had a setting or command v2 lacks, the section says so. v2's design is
+[v2/plan.md](v2/plan.md).
 
 ## Install
 
@@ -47,12 +43,10 @@ working on blaze; it is not what ships.
 `harness/toolchain` (`nightly-2026-10-27`): the language and standard library are the ones this
 blaze ships. It ignores `rust-toolchain`/`rust-toolchain.toml`, `rustup override`,
 `+toolchain`, `RUSTUP_TOOLCHAIN`, rustup's default and `RUSTC`, and never runs or asks a rustc
-to learn anything ([toolchain.md](toolchain.md)): it runs cargo and the daemon under its own
-release by naming it in `CARGO`, `RUSTC`, `RUSTDOC` and `RUSTUP_TOOLCHAIN`. The nightly builds
+to learn anything ([toolchain.md](toolchain.md)). The nightly builds
 what older releases built, so a project on a stable release or an older nightly builds as it
 is, `#![feature(...)]` included. A project that needs another Rust pins another blaze. Plain
-`cargo` still builds with the project's toolchain, in the same target directory: cargo keys
-what it builds by the rustc, so neither rebuilds the other's.
+`cargo` still builds with the project's toolchain, in the same target directory.
 
 Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`,
 when rustup has it (only as a copy of the same files; what rustup would pick
@@ -66,25 +60,43 @@ and 710 MB on Linux x86-64 once unpacked). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
 `crates/blaze-cargo/src/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
 builds download it once; a download that stopped goes on from where it stopped the next time.
-Building with blaze's copy, blaze names its cargo, rustc and rustdoc in `CARGO`, `RUSTC` and
-`RUSTDOC` and puts its `bin` first on `PATH`, for the commands it runs and not for your shell.
+A build script is given blaze itself as `CARGO`, and as `RUSTC` and `RUSTDOC` links to blaze
+in the daemon's tools directory, which answer what a script asks of rustc with no rustc run
+(`crates/blaze-engine/src/as_rustc.rs`).
 `BLAZE_RUST_DIST` names a mirror of `https://static.rust-lang.org/dist` (or a directory with
-the files), for a machine that cannot reach it. `blaze toolchain` (or `blaze toolchain`)
-says which Rust blaze builds with, downloading its copy first when there is none.
+the files), for a machine that cannot reach it. v1's `blaze toolchain`, which said which Rust
+blaze builds with and fetched its copy, is gone; v2 has no such command (`blaze --version`
+names blaze's release and commit, and why it is the one that runs), and fetches the copy when
+a build first needs it.
 
 ## Commands
 
-    blaze build [cargo's flags]
-    blaze run   [cargo's flags] [-- program arguments]
-    blaze test  [cargo's flags] [test names] [-- test arguments]
-    blaze check [cargo's flags]
-    blaze status
+    blaze build [cargo's flags]                                       (b)
+    blaze check [cargo's flags]                                       (c)
+    blaze run   [cargo's flags] [-- program arguments]                (r)
+    blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
+    blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
+    blaze serve [--socket PATH] [--http ADDR] [--activated]
     blaze stop
-    blaze toolchain
+    blaze status
+    blaze daemon install | uninstall
+    blaze codegen-inputs --format=json
+    blaze trace --out PATH
+    blaze tables --format=json
     blaze pin
+    blaze --version
 
-`blaze <command>` is the same as `blaze <command>`, for a machine where blaze brought
-its own Rust and there is no `cargo` on the path.
+`blaze help <command>` lists the flags a command takes: cargo's, read as cargo's clap reads them
+(`crates/blaze-cargo/src/cli/args.rs`), with clap's errors and exit code 1 for a command line
+cargo would refuse. `-C DIRECTORY` (with `-Z unstable-options`) and the global flags before
+the command work as in cargo. `test` alone takes four flags of blaze's own (extensions,
+[below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`.
+`serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
+print what the daemon's last build of the checkout did (each instance it made with its code
+hash, every result with its edges as CBOR, the size of each long-lived table); `pin` is
+[below](#pinning-a-release-of-blaze). Any other command (v1's `fmt`, `clippy`, `doc`, `tree`,
+`metadata`, `toolchain`, ...) fails with `error: no such command` and status 101; none is
+passed to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
 `blaze check` checks the targets `cargo check` with the same flags does: a plain one
 the libraries and binaries of the packages selected, and `--lib`, `--bins`, `--tests`,
@@ -93,30 +105,23 @@ with a name those they pick, as cargo's unit graph of the check has them. A targ
 a test (a library's unit tests under `--tests`) is checked with `cfg(test)` and the
 dev-dependencies; a member the selected packages only depend on is checked as its library.
 
-`build`, `run` and `test` take the flags cargo takes and leave the same files in the same
-places under `target/`. `check` is what the daemon says of the source as it builds the
-programs of the build with the same flags, when it has that build loaded: the errors a build
-would fail with, or `Finished`, and no rustc. Any other check is the daemon's too: it loads
-the workspace as a build of those flags would, builds nothing, and says what it finds in every
-file of the workspace's crates. The build scripts and proc macros are the ones cargo built
-before; a workspace that never had them built has rustc build them first. A check takes
-`--message-format` (each of cargo's values), `-Z`, `--exclude` and several `--target`s, a
-check for each; in JSON its errors are rustc's `compiler-message`s, with their spans,
-`rendered` and the failure notes, then `build-finished`, which is what rust-analyzer's
-check-on-save and other editors read, so they show the daemon's verdict. What only rustc writes
-is not there: the labels and the help and notes of an error, its other spans, and
-`code.explanation`; the message is rust-analyzer's, worded otherwise than rustc's. E0061's
-span is where the missing argument goes, not the function called. `status` prints what the daemon holds, and for every workspace how many builds
-the daemon served and how many went to cargo, with the reasons. `stop` ends the daemon. Every
-other subcommand of cargo's is blaze's own, or fails saying blaze has none yet: none is passed
-to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
+`build`, `run`, `test` and `bench` take the flags cargo takes and leave the same files in the
+same places under `target/`. The client reads no manifest: it finds the checkout, sends the
+daemon one request with the whole command line, its environment and the configuration files
+outside the checkout, and prints the responses as cargo prints its build (`Compiling`,
+`Fresh` under `-v`, warnings, `Finished`), with cargo's exit codes. `check` is the daemon's
+check of every body of each crate the command picks, as rustc checks them
+(`crates/blaze-cargo/src/serve/unit/checks.rs`): the errors a build would fail with, or
+`Finished`, and no rustc. `--message-format` takes each of cargo's values; in JSON the
+messages are cargo's (`compiler-artifact`, `build-script-executed`, `compiler-message` with
+rustc's diagnostic, `build-finished`), written as cargo and rustc write them
+(`crates/blaze-cargo/src/cli/json.rs`), which is what rust-analyzer's check-on-save and other
+editors read. The wording of a diagnostic is blaze's (`crates/blaze-diagnostics`), not always
+rustc's. `status` prints the daemon's process, the requests it has served, the checkouts it
+watches and the memory it holds of its budget. `stop` has the daemon write its state and end.
 
-While a build or check waits for the daemon, the command shows what the worker is at: the
-worker sends events (`crates/blaze-protocol/src/events.rs`: each step as it starts and ends, and
-`Progress` counts within it), and `crates/blaze-ui` draws them (`Resolving names 2.40s (3/120
-crates)`). On a terminal that is a live view, cleared when the answer comes; off a terminal, one
-line for each step the command saw; with `-q`, nothing. `harness/experience.py` runs each cold build on a terminal and fails one that shows
-nothing for more than 1.5 s.
+While a build waits, the client prints each unit's lines as the daemon sends them; there is no
+live progress view in v2.
 
 ## What a build does
 
@@ -525,8 +530,7 @@ is keyed by its bytes, which name `CARGO_HOME`, so another checkout path misses 
 v1's setting that wrote each key's fields to a file is gone with v1; the daemon has none.
 
 Compiling a build script, running it and building a proc macro are each an entry of the
-store, so they travel with `blaze-engine cache push` and `pull` and through the gateway like any
-compiled function ([remote-cache.md](remote-cache.md)). Each is kept under two keys
+store, found again like any compiled function. Each is kept under two keys
 (`cargo/keyed.rs`): the first of what it is declared to be made of, and a second of what it
 was seen reading and what each of those has, so `rerun-if-*` is a hint and the record is what
 counts. A first key holds up to 16 sets of reads.
@@ -699,8 +703,7 @@ names is an error.
 `blaze test` runs, of each test executable the daemon built, the tests that have not passed
 with what they are a function of as it is now (`BLAZE_TESTS=affected`, the default;
 `BLAZE_TESTS=all` runs every test, as cargo does). A pass is kept in blaze's store, as a
-compiled function is, so it travels with the store through a remote (`blaze-engine cache push|pull`,
-`BLAZE_REMOTE`): a pass on main's CI stands on every branch whose test and inputs are the same.
+compiled function is.
 Beside each test executable, `tests-passed` has the keys of its hermetic tests' passes this
 machine found or kept, and `tests-programs` the digest of each program an integration test is
 handed (`CARGO_BIN_EXE_<name>`) by its size, time and inode: a command whose tests all passed
@@ -805,8 +808,7 @@ test (axum) and 32.3 s against 28.8 s (just;
 A test executable cargo built, a command that names tests or passes the harness other flags
 than `-q`, `--nocapture`, `--show-output`, `--test-threads` and `--color`, and one that runs
 the ignored tests run as asked: every test, and nothing is kept. `all` runs every test, as
-cargo does; the daemon then hashes nothing. With no store (`BLAZE_CACHE=off`)
-`affected` keeps nothing and runs every test. `BLAZE_TESTS_FROM` names where the passes a
+cargo does; the daemon then hashes nothing. `BLAZE_TESTS_FROM` names where the passes a
 command keeps came from, for its summary; on GitHub Actions it is the commit and run
 (`GITHUB_SHA`, `GITHUB_RUN_ID`). What is left is
 [#227](https://github.com/indexable-inc/blaze/issues/227).
@@ -1108,9 +1110,9 @@ inflated again for the next: the executable has the debug information, so nothin
 it. With `split-debuginfo` set, or on macOS, where a debugger reads the object, it stays as it
 is.
 
-The store is on by default: `$XDG_CACHE_HOME/blaze/store`, else `~/.cache/blaze/store`,
-limited to a tenth of its disk (at most 32 GiB). `BLAZE_CACHE=<dir>` moves it,
-`BLAZE_CACHE=off` disables it, `BLAZE_CACHE_MAX` sets the limit.
+The store is always on: one per daemon, in `$BLAZE_HOME/v2/store`, the user's alone (the
+daemon refuses one another user owns or others may write to;
+[v2/plan/lanes/store.md](v2/plan/lanes/store.md)).
 
 ## Pinning a release of blaze
 
@@ -1200,13 +1202,6 @@ started it. To change one, run `blaze stop` first.
 | `BLAZE_MEMORY_BUDGET` | the limit of the memory budget the daemon says at start (`memory budget:` in its log; [memory-budget.md](memory-budget.md)), a size such as `12G`, or `off`; the budget is that less what other processes hold and a reserve of 5% (at least 512 MB) | the machine's memory, or the fewest its control groups' `memory.max` and `memory.high` allow |
 | `BLAZE_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `BLAZE_LRU` | how many values of the queries a build in full holds the most of a worker keeps once the build is over, `mir=N,runtime=N,compiled=N,inlinable=N` (lowered MIR, runtime and monomorphized MIR, each instance's code, bodies to inline); 0 keeps every value. One let go is computed again when an edit asks for it ([#261](https://github.com/indexable-inc/blaze/issues/261)) | `mir=2048,runtime=2048,compiled=16384,inlinable=8192` |
-| `BLAZE_CACHE` | directory of the disk store, or `off` for none | `blaze/store` in the user's cache directory ([cache.md](cache.md)) |
-| `BLAZE_REMOTE` and the other store variables | see [cache.md](cache.md) | not set |
-
-The disk store is on by default and shared by every daemon and checkout of the user. The
-daemon reads `BLAZE_CACHE` once, when it starts: a daemon started by a shell without the
-variable keeps the default store whatever later shells have set, so run `blaze stop`
-before changing it.
 
 ## Backends
 

@@ -1,8 +1,15 @@
 ---
-status: current
-summary: What is supported, cell by cell, each pointing at the report or harness run behind it.
+status: record
+summary: What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.
+date: 2026-10-30
 ---
 # What is supported
+
+This is what blaze v1 supported, as of its integration into v2 on 2026-10-30. Much of it
+describes v1's machinery: rustc's copy of a refused function, handing a build to cargo, the
+splice, tiers and live edits through `blaze-live`, rustc linking with blaze's objects. v2 builds
+with no rustc and no cargo, and none of these cells has been measured for it; what v2 must reach
+is [v2/plan/goals/targets.md](v2/plan/goals/targets.md).
 
 Every cell here points at a report or a harness run. The harnesses that compared blaze with
 rustc or cargo (the corpus, the breakers, the build-model cases, the fuzzer's differential
@@ -51,7 +58,7 @@ another blaze ([toolchain.md](toolchain.md)).
 | Debug info | yes (6) | yes (6) | lines only (7) | unverified (7) | no |
 | `blaze` | yes (8) | unverified (9) | yes, by hand (9) | yes, by hand (9) | `wasm32-wasip1` and `wasm32-unknown-unknown` cdylibs, by hand (2) |
 | Disk store | yes (10) | yes (10) | yes (10) | yes (10) | unverified |
-| Remote store | yes, not real AWS (11) | unverified | unverified | unverified | unverified |
+| Remote store | no (11) | no | no | no | no |
 | Fuzzed | yes (12) | no | no | no | no |
 
 1. CI, at the commit above: the corpus comparison compiled every function of the corpus
@@ -101,9 +108,9 @@ another blaze ([toolchain.md](toolchain.md)).
     `storefull.py` on Linux only. The earlier
     [reports/DISKCACHE.md](reports/DISKCACHE.md) says "Linux x86-64 only"; PLAT-ABI2 is
     later and is what this row follows.
-11. `harness/remote.py` against MinIO and SeaweedFS over loopback
-    ([reports/REMOTE.md](reports/REMOTE.md)); MinIO runs in the Linux x86-64 CI job. Real
-    AWS S3 has not been run.
+11. v1's remote (S3, a directory or the gateway; [reports/REMOTE.md](reports/REMOTE.md)) was
+    deleted on 2026-10-30 with its harness. v2's remote is a read-through tier of the store
+    (`blaze_cas::remote`), tested in blaze-cas but not yet wired into the daemon.
 12. [reports/FUZZ.md](reports/FUZZ.md), the differential fuzzer's runs, Linux x86-64 only. The
     fuzzers left (`fuzz/edits.py`, `fuzz/store.py`) hold a warm daemon and store to blaze's own
     cold build; their smoke runs are in that CI job.

@@ -11,9 +11,9 @@ of the harnesses, the reports under `docs/reports/` and these documents. The rep
 written in the first person by the session that did the work; "I ran" in a report means
 that session ran it.
 
-What makes that workable is the testing method. Every change is judged by comparing blaze's
-output with rustc's on real programs, and a change that makes a harness differ does not
-land. If you contribute with AI assistance, the expectation is the same as without: you
+What makes that workable is the testing method. Every change is judged by real crates' own
+test suites passing under blaze and by tests that state their expected result, and a change
+that breaks one does not land. If you contribute with AI assistance, the expectation is the same as without: you
 understand the change, you ran the gate, and you say what you ran and what you did not.
 
 rust-analyzer has its own AI policy for contributions to rust-analyzer. It applies to what
@@ -47,6 +47,9 @@ you send them, including fixes you find here and want to upstream.
     crates/rustc_abi/         rustc's layout crate at the pinned nightly's commit
     vendor/source.rev         the commit of the old development branch this tree last took from
 
+Every crate of v2, what it is for and which lane owns it:
+[v2/plan/reference/crates.md](v2/plan/reference/crates.md).
+
 `crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
 it uses of `hir-ty` is public there. Its root is `mod.rs`, the file it was compiled from when
 it was a module of `hir-ty`. The front end's crates depend on none of blaze's machinery
@@ -63,7 +66,7 @@ names. Edit them, build and test from the root, and commit like any other file. 
 builds:
 
     git clone https://github.com/indexable-inc/blaze && cd blaze
-    cargo +"$(cat harness/toolchain)" build -p blaze-engine --release   # cargo +nightly-2026-10-25
+    cargo +"$(cat harness/toolchain)" build -p blaze-engine --release   # cargo +nightly-2026-10-27
 
 `crates/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
 crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
@@ -83,8 +86,8 @@ There, a crate of its own is better than growing `hir-ty` or `hir-def`, which ar
 longest builds in the workspace.
 
 blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
-writing, the splice, the daemon and its socket, the cargo drop-in, the store and the remote,
-tiers and sampling, the live runtime, and the harnesses. A change there is one ordinary
+writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
+the sandbox, and the harnesses. A change there is one ordinary
 commit.
 
 New code never adds a path to rustc ([no-rustc.md](no-rustc.md)). blaze compiles
@@ -103,7 +106,7 @@ with blaze's changes made in place. That branch and its history are kept as
 ## The toolchain
 
 blaze supports one toolchain, the latest nightly, pinned by date in `harness/toolchain`
-(`nightly-2026-10-25`, which says `rustc 1.101.0-nightly (12433c307 2026-10-24)`). Stable
+(`nightly-2026-10-27`, which says `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`). Stable
 Rust is not a separate target: what a stable release builds, the nightly builds. blaze
 itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix develop`
 plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that

@@ -23,7 +23,7 @@ use crate::{ObjectFormat, Target};
 const ID_DOMAIN: &str = "blaze v2 toolchain id 2";
 
 /// The nightly blaze is pinned to (`harness/toolchain`).
-const NIGHTLY: &str = include_str!("../../../harness/toolchain").trim_ascii_end();
+pub(crate) const NIGHTLY: &str = include_str!("../../../harness/toolchain").trim_ascii_end();
 
 /// The code generator's producer: bump it whenever what it emits for the same input changes.
 const PRODUCER: &str = "blaze v2 codegen 1";

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """storekills.py: v2's daemon killed at random moments while it writes its store.
 
-    python3 storekills.py '{"blaze": "target/release/blaze"}'
-    python3 storekills.py '{"blaze": "...", "kills": 300, "workers": 4, "seed": 7}'
+    uv run --frozen python harness/storekills.py '{"blaze": "target/release/blaze"}'
+    uv run --frozen python harness/storekills.py '{"blaze": "...", "kills": 300, "workers": 4, "seed": 7}'
 
 `blaze` is the v2 command line; `kills` (100) are shared among `workers` (4), each with a
 checkout of the stress workspace and a home, so a store, of its own; `seed` (0: the clock)
@@ -91,8 +91,12 @@ class Worker:
         self.build_time = 0.7 * self.build_time + 0.3 * (time.time() - start)
         self.seen.add(self.checkout.value)
 
-    def killed(self, daemon):
+    def killed(self, daemon, client=None):
+        """Kills the daemon; then, once its client has ended (a client that found nothing
+        listening started a daemon of its own and waited for it), stops any such daemon."""
         daemon.kill()
+        if client is not None:
+            client.communicate()
         self.found["a build started a daemon of its own"] += daemon.stray()
 
     def kill_writing(self):
@@ -117,8 +121,7 @@ class Worker:
             before = now
         self.found["as the store changed" if not changes else "after it answered"] += 1
         time.sleep(self.rng.choice([0, 0, self.rng.uniform(0, 0.003)]))
-        self.killed(daemon)
-        client.communicate()
+        self.killed(daemon, client)
 
     def kill_starting(self, mode):
         if mode == "cold":
@@ -133,8 +136,7 @@ class Worker:
             client = daemon.asking(self.checkout.ws)
             time.sleep(self.rng.uniform(0, self.build_time))
             self.found["before it answered" if client.poll() is None else "after it answered"] += 1
-            self.killed(daemon)
-            client.communicate()
+            self.killed(daemon, client)
             return
         time.sleep(self.rng.uniform(0, self.start_time * 1.2))
         self.found["after it listened" if daemon.listens() else "before it listened"] += 1
@@ -153,8 +155,7 @@ class Worker:
             self.build_time = 0.7 * self.build_time + 0.3 * (time.time() - start)
             # What it commits and settles once it has answered.
             time.sleep(self.rng.uniform(0, 0.05 if mode == "settle" else 0.01))
-        self.killed(daemon)
-        client.communicate()
+        self.killed(daemon, client)
         self.found["after it answered" if answered else "before it answered"] += 1
 
     def run(self):

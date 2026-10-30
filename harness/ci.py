@@ -23,9 +23,8 @@ tier, the release train's (every push to main) and by hand, is every harness, in
 core-1 ... core-N (packed as the fast tier is, to about CORE_SECS by the seconds CORE says),
 keys-N, store-kills, store and daemon (docs/harness.md, "CI").
 
-Each harness runs with an BLAZE_HOME of its own (a harness may set its own over it), so no
-daemon or socket of one harness is seen by the next. BLAZE_CACHE is left alone: set, it turns
-the store on.
+Each harness runs with a BLAZE_HOME of its own (a harness may set its own over it), so no
+daemon, socket or store (`<home>/v2/store`) of one harness is seen by the next.
 
 Every harness in a part runs even when one before it fails; the part fails at the end and names
 them. BLAZE_BIN is the blaze the harnesses run, as for each harness on its own.
@@ -347,8 +346,7 @@ def parts(tier="full"):
 
 def run_one(args, env):
     """Runs one harness with a daemon home of its own, kept when it fails (CI shows the daemon
-    logs under /tmp then). BLAZE_CACHE stays as the caller has it: set, it turns the store on,
-    which only the store harnesses do."""
+    logs under /tmp then)."""
     # Under /tmp, short: a daemon's socket is under its home, and macOS allows 104 bytes.
     home = tempfile.mkdtemp(prefix="rj-ci-", dir="/tmp" if SYSTEM != "windows" else None)
     own = {"BLAZE_HOME": home}

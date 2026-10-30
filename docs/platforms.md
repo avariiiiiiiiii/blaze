@@ -1,10 +1,16 @@
 ---
-status: current
-summary: The state of each platform blaze runs on, from the last CI run that covered them all.
+status: record
+summary: The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all. v2 has not been run on any platform yet.
+date: 2026-10-30
 ---
 # Platforms
 
-This is the current state of each platform blaze has been run on, in one place. The
+This is the state of each platform blaze v1 was run on, as of its integration into v2 on
+2026-10-30. v1's link (rustc's link line with blaze's object first), its splice
+(`crates/blaze-splice`), `blaze-engine weaken`, `blaze-live` as described here and
+`BLAZE_STD_FROM` are gone; v2 links with its own linker (`crates/blaze-link`,
+[v2/plan/lanes/link.md](v2/plan/lanes/link.md)), and no v2 build has been run on any platform
+in CI yet. The
 numbers are from GitHub Actions run 39057174862 on commit 888e87df74, the last recorded run
 that covered all four native platforms under both backends, unless a line says otherwise.
 The report behind it is [reports/PLAT-ABI2.md](reports/PLAT-ABI2.md). The table of what is

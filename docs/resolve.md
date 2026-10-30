@@ -23,7 +23,7 @@ run, and the committed fixtures are what holds it now. Part of the self-containe
   configured (`[lib]`, `[[bin]]`, examples, tests, benches, build scripts, `auto*`, editions,
   the 2015 inference warning), `publish`, `readme` found by default, `license-file`,
   `rust-version`, `links`, `default-run`, and dependencies renamed, per target, for build and
-  for dev, with git and registry sources. `cargo run -p blaze-manifest --example metadata --
+  for dev, with git and registry sources. `blaze run -p blaze-manifest --example metadata --
   --no-deps` prints the same JSON, warnings and errors.
 - `cargo-features`: the stable ones accepted, the unstable ones refused with cargo's message on
   the stable channel, the removed ones refused.
@@ -41,7 +41,8 @@ run, and the committed fixtures are what holds it now. Part of the self-containe
   runner and the linker, one matching `cfg` at most), `[registry]` and `[registries]`,
   `[source]` with each source's location checked and `replace-with` followed, `[resolver]`, and
   `[profile.<name>]` read as cargo's `TomlProfile`. The `cfg` of a target and the host triple
-  are the caller's, from rustc.
+  are the caller's: blaze computes the cfgs `rustc --print cfg` would print itself
+  (`blaze_units::stdlib::target::target_cfg`), running no rustc.
 - `cargo config get` as cargo 1.99 prints it (`blaze_manifest::config::get`, the `config`
   example): `toml` with and without `--show-origin`, `json`, `json-value`, `--merged no`, the
   variables that may affect a table, and the warnings of old and doubled config files. It is how
@@ -87,8 +88,8 @@ sharing pass of `rebuild_unit_graph_shared`, made from blaze-metadata's resolve,
 resolution and blaze-manifest's profiles, and printed in cargo's `--unit-graph` schema
 (version 1). It reads no file and runs no process, and builds for wasm32-wasip1 (issue #458;
 wasm32-unknown-unknown waits on blaze-resolve's `url` file paths). `blaze_metadata::units`
-does the reading and the resolve around it, and blaze's `plan.rs` plans every load from it:
-no `cargo build --unit-graph` is run. A build it does not port (cargo's `-Z` flags,
+does the reading and the resolve around it, and blaze-units' `load/plan.rs` plans each unit
+from it: no `cargo build --unit-graph` is run. A build it does not port (cargo's `-Z` flags,
 `-Zbuild-std`, artifact dependencies, multiple build scripts, per-package targets) is an error
 naming it, not a cargo run.
 
@@ -194,12 +195,13 @@ On VM nc-sysroot (Linux arm64), 2026-10-27, with the pinned nightly: 26 of 26 eq
 the 12 targets, each `--no-deps` and full; 15 packages without dependencies, 30 to 50 with).
 
 The `toolchain` part asks what a workspace load asked cargo of the toolchain and the
-configuration, of cargo and of `blaze-engine cargo-answer`, which answers it with no cargo run
-(v1's `answers/cargo.rs` over blaze-manifest, deleted on 2026-10-30): `cargo --version`, `cargo config
+configuration, of cargo and of v1's `blaze-engine cargo-answer`, which answered it with no cargo
+run (`answers/cargo.rs` over blaze-manifest; the command and the file went with v1 on 2026-10-30,
+and v2 asks no such questions: blaze-units plans from blaze-manifest's `Config` directly): `cargo --version`, `cargo config
 get` as TOML with `--show-origin` and as JSON, `cargo rustc --print cfg -- -O` and `--print
 target-spec-json` for the host and five other targets (and for `build.target`), comparing exit
 code and stdout as text, and, in a tree with a package, the flags cargo hands rustc for each
-target (seen by a `RUSTC_WRAPPER` that prints them) against those `plan.rs` reads
+target (seen by a `RUSTC_WRAPPER` that prints them) against those v1's `plan.rs` read
 (`cargo-answer --rustflags`). The trees: the harness's toolchain fixtures (`build.target`,
 `[target.'cfg(..)']` tables, `RUSTFLAGS` per target and a forced `[env] RUSTC_BOOTSTRAP=-1`,
 which cargo hands the rustc it asks, so the stable channel's cfgs print), the config fixtures,
@@ -211,7 +213,7 @@ refused by both (the config fixtures have no package, and some have broken files
 The `units` part runs `cargo <run> --unit-graph -Zunstable-options` (with `RUSTC_BOOTSTRAP=1`)
 and blaze-metadata's `units` example (blaze-units' graph) for `build`, `build --all-targets`,
 `build --release`, `build --profile test --all-targets`, `build --profile bench --all-targets`
-(what blaze's `plan.rs` asks for its builds, tests and benchmarks) and `test --no-run`, on
+(what v1's `plan.rs` asked for its builds, tests and benchmarks) and `test --no-run`, on
 harness/norustc/fixture and the bench projects, and compares the whole JSON: every unit in
 order, with its package, target, profile, platform, mode, features and dependencies, and the
 roots. A build both refuse must be refused with cargo's error text. One order is not compared:
@@ -234,9 +236,9 @@ rust-analyzer's `cargo check --compile-time-deps`) to cargo's. For harness/norus
 each bench project, copied into a directory of its own, and for a build and a test load (the
 test adds `--cfg-test`, cargo's `--all-targets`, and the project's `test=[...]` flags of
 `bench.py`), it runs `cargo check --compile-time-deps --message-format=json` as rust-analyzer's
-`build_command` does and reads the messages as `WorkspaceBuildScripts` does, then `blaze
-compile-time-deps` with the same flags, which loads the workspace as a build's daemon does
-(`--own-target`) and prints what the load read. Per package it compares the script's cfgs and
+`build_command` does and reads the messages as `WorkspaceBuildScripts` does, then v1's `blaze
+compile-time-deps` (gone with v1; v2's `blaze` has no such command) with the same flags, which
+loaded the workspace as a build's daemon did (`--own-target`) and printed what the load read. Per package it compares the script's cfgs and
 variables (`OUT_DIR` and other paths replaced), every file of `OUT_DIR` by sha256 (its own path
 replaced in the bytes), and which packages have a proc macro built; a difference fails the part.
 cargo's target directory is named so that its `OUT_DIR`s are as long as blaze's, which keeps
@@ -251,7 +253,7 @@ something the machine or checkout lacks (a program a script spawns, the linker, 
 On main 8470a70e6a (#658, arm64 ix VM, 2026-10-27), 10 of 14 equal: the fixture, ripgrep,
 cargo, bat, hyperfine, just, axum, nushell, helix and bevy. fd differs only in jemalloc's
 `config.log` and `config.status`, which record `SHELL`: the build-script sandbox gives a script
-only the variables `script_sandbox.rs` `given` lets through, so `configure` records its own
+only the variables v1's `script_sandbox.rs` `given` let through, so `configure` records its own
 `/bin/sh` where cargo's run had the shell's; with `BLAZE_SANDBOX=off` its 9 packages are equal.
 biome stops at a syn-1 proc macro blaze cannot compile (`darling_macro`, #327). zed fails for
 both (cargo at gcc's missing `-fuse-ld=lld`, blaze at `cmake`), and bun for both at a path

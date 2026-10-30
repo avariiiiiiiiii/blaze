@@ -1,0 +1,22 @@
+[package]
+name = "blaze-wasm-pack"
+version = "0.0.0"
+description = "A cargo workspace as one file for blaze's in-browser compiler: made of a front end `blaze serve` lowered, loaded with no cargo"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# No codegen here: `blaze serve` depends on this, and `blaze-wasm`'s `hir-ty-codegen` feature
+# must not reach the native build.
+[dependencies]
+base-db = { path = "../../base-db", version = "0.0.0" }
+cfg = { path = "../../cfg", version = "0.0.0", features = ["tt", "syntax"] }
+hir = { path = "../../hir", version = "0.0.0" }
+hir-expand = { path = "../../hir-expand", version = "0.0.0" }
+intern = { path = "../../intern", version = "0.0.0" }
+rustc-hash = "2.1.1"
+serde = { version = "1.0.219", features = ["derive"] }
+span = { path = "../../span", version = "0.0.0" }
+syntax-bridge = { path = "../../syntax-bridge", version = "0.0.0" }
+triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
+tt = { path = "../../tt", version = "0.0.0" }

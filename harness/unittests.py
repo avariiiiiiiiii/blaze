@@ -59,11 +59,7 @@ OPEN_BLAZE = {
     "blaze_cargo::sandbox::linux::tests::a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing",
 }
 # Pass or fail on a blaze run, by the runner's load: neither is an error.
-UNSURE_BLAZE = {
-    # A 64 MiB part has 5 s to be answered: in time on linux x64, not on arm64
-    # (https://github.com/indexable-inc/blaze/issues/893).
-    "blaze_cargo::remote::gateway::tests::what_is_over_a_put_goes_up_in_parts_checked_whole",
-}
+UNSURE_BLAZE: set[str] = set()
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 # A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and

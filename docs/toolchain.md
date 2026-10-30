@@ -18,10 +18,11 @@ the blaze version instead.
 
 ## Why one toolchain, and why blaze's
 
-blaze compiles your code itself (Cranelift or LLVM, from rust-analyzer's MIR) and links it with
-code rustc compiled. The two must agree on how types are laid out, how functions are called,
-what a `TypeId` hashes, the names of symbols, libtest's entry point, the proc-macro bridge and
-what rustc answers about targets. blaze knows those facts for one toolchain, and that toolchain is the base blaze replaces piece by piece
+blaze compiles your code itself (Cranelift or LLVM, from its front end's MIR), the standard
+library too (from `library/`, below), and must behave as that nightly's rustc would: how types
+are laid out, how functions are called, what a `TypeId` hashes, the names of symbols, libtest's
+entry point, the proc-macro bridge and what rustc answers about targets. blaze knows those facts
+for one toolchain, and that toolchain is the base blaze replaces piece by piece
 ([no-rustc.md](no-rustc.md): cargo, then rustc, then the standard library's build). Following
 each project's pin would mean knowing every release's facts and checking every release; the
 goal is the reverse, no rustc at all. So the toolchain is part of blaze, versioned with it, like
@@ -30,15 +31,18 @@ the standard library is part of a compiler.
 ## What it is today
 
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
-  from (`harness/toolchain`, `nightly-2026-10-27`). `blaze toolchain` prints it and where it
-  is; `blaze toolchain --path` prints the directory alone.
+  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`). v2's blaze
+  has no command that prints it or where it is (v1's `blaze toolchain` did).
 - **Bytes:** the upstream nightly's `rustc`, `cargo` and `rust-std` (the host's, and
   `wasm32-wasip1`'s, which proc macros are built for), unchanged, from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
-  when rustup already has it (the same bytes). The installer downloads it once;
-  `blaze toolchain --path` prints its directory.
+  when rustup already has it (the same bytes), found with nothing run
+  (`crates/blaze-cargo/src/toolchain.rs`, `found`). The installer downloads it by running
+  `blaze toolchain`, which v2's blaze does not have, and no v2 build downloads it
+  (`toolchain::own::fetch` has no caller): today it must already be in one of those two places,
+  or a build stops with "blaze's toolchain is not installed".
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
@@ -48,14 +52,17 @@ the standard library is part of a compiler.
   harnesses (`.github/actions/toolchain`, [harness.md](harness.md#running-them)), rust-analyzer
   in an editor of this repository (the dev shell of `flake.nix`), and `harness/library.py`,
   which imports `library/` from the nightly's `rust-src` tarball.
-- **Who uses it:** cargo, rustc and the daemon that blaze starts (`CARGO`, `RUSTC`, `RUSTDOC`,
-  `RUSTUP_TOOLCHAIN`, `PATH` for its own processes), whatever they were set to. The user's
-  `cargo`, `rustc` and pins are untouched, and blaze reads none of them.
+- **Who uses it:** the daemon, which runs none of its programs. Its linker takes the C runtime
+  WASI links and the sanitizer runtimes from the toolchain's sysroot
+  (`blaze_link::target::locate`), and blaze answers `rustc --print sysroot` with it. A build
+  script's `RUSTC` and `RUSTDOC` are blaze itself, linked as `rustc` and `rustdoc` in the
+  daemon's `tools` directory (`crates/blaze-engine/src/as_rustc.rs`). The user's `cargo`,
+  `rustc` and pins are untouched, and blaze reads none of them.
 - **What rustc says:** blaze answers every question asked of rustc (`--version`, `-vV`,
-  `--print cfg|sysroot|target-libdir|target-spec-json|...`) itself, for this release, whoever
-  asks: cargo through blaze's wrapper, rust-analyzer in process, a build script through blaze's
-  rustc stand-in, which also checks the probes build scripts compile (`autocfg`, `rustversion`,
-  `version_check`, `anyhow`'s and `thiserror`'s). No rustc is run to find any of it
+  `--print cfg|sysroot|target-libdir|target-spec-json|...`) itself, for this release
+  (`blaze_cargo::answers`): the daemon in process, and a build script through blaze's rustc
+  stand-in, which also checks the probes build scripts compile (`autocfg`, `rustversion`,
+  `version_check`, `anyhow`'s and `thiserror`'s) with `blaze check`'s verdict. No rustc is run to find any of it
   ([no-rustc.md](no-rustc.md), step B).
 - **Bumps:** every day, to the newest nightly, by a workflow, with the merge gate and the
   release train as the gate ([The daily bump](#the-daily-bump)).
@@ -212,11 +219,11 @@ Measured 2026-10-27, on the first bump the workflow made.
 
 - A project that pins another toolchain (a stable release, an older nightly, in a
   rust-toolchain file, `rustup override` or `RUSTUP_TOOLCHAIN`) builds with blaze's. The pin is
-  not read: blaze runs nothing to learn what it names. Under `-v`, a rust-toolchain file blaze
-  passes over gets one line: `blaze: <file> is ignored: blaze builds with its own Rust, ...`.
-- `edition` applies as cargo applies it. A workspace member whose `rust-version` is newer than
-  blaze's Rust is one error naming both versions and saying to update blaze (and pin it);
-  `--ignore-rust-version` builds it anyway, as with cargo.
+  not read: blaze runs nothing to learn what it names, and says nothing about the file.
+- `edition` applies as cargo applies it. `rust-version` is read for resolving dependencies
+  (cargo's `incompatible-rust-versions`), but v2 does not yet refuse a member whose
+  `rust-version` is newer than blaze's Rust, as cargo does; `--ignore-rust-version` is taken
+  and changes nothing.
 - Rust keeps building old code, so stable code builds; `#![feature(...)]` code builds too.
 - Code blaze's toolchain cannot build (a nightly feature it removed, a library item newer than
   it) fails with blaze's error. A project that needs another Rust pins another blaze.

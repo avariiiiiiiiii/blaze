@@ -1,7 +1,8 @@
 # blaze-gateway API v0 (slice 1 of docs/remote-cache.md)
 
-The contract between `blaze`'s `Place::Gateway` client (crates/blaze-cargo/src/remote/gateway.rs)
-and the Worker in this directory. v0 serves today's remote layout (packs/, keys/, units/,
+The contract between blaze v1's `Place::Gateway` client (`crates/blaze-cargo/src/remote/gateway.rs`,
+deleted from the tree on 2026-10-30; the pinned v1 release in `.github/blaze-version` still uses it in
+CI until that pin moves to a v2 release) and the Worker in this directory. v0 serves today's remote layout (packs/, keys/, units/,
 manifests/, deps/) per tenant. Slice 3 adds `/has`, `/get`, `/put` beside it (API.md).
 
 Base address of a tenant: `https://<gateway>/t/<tenant>/v3`. The client is given that base

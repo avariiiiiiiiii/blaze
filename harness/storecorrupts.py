@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """storecorrupts.py: the files of v2's store damaged on disk, and a head of another format.
 
-    python3 storecorrupts.py '{"blaze": "target/release/blaze"}'
-    python3 storecorrupts.py '{"blaze": "...", "rounds": 40, "seed": 7}'
+    uv run --frozen python harness/storecorrupts.py '{"blaze": "target/release/blaze"}'
+    uv run --frozen python harness/storecorrupts.py '{"blaze": "...", "rounds": 40, "seed": 7}'
 
 `blaze` is the v2 command line, `rounds` (16) how many damages, `seed` (0: the clock) which.
 The input is one JSON object, inline, a file's path, or `-`.

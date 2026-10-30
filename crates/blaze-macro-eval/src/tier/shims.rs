@@ -74,10 +74,12 @@ pub(crate) struct Shims<'s, 'e> {
     stubs: &'s [Stub],
     memory: &'s mut Memory,
     os: &'s mut Os<'e>,
+    // dyn: one call per request of the client, which crosses the bridge anyway
     bridge: Option<&'s mut dyn Bridge>,
 }
 
 impl<'s, 'e> Shims<'s, 'e> {
+    // dyn: as the field
     pub(crate) fn new(stubs: &'s [Stub], memory: &'s mut Memory, os: &'s mut Os<'e>, bridge: &'s mut dyn Bridge) -> Self {
         Shims { stubs, memory, os, bridge: Some(bridge) }
     }
@@ -172,6 +174,14 @@ impl<'s, 'e> Shims<'s, 'e> {
                 return Err(Stop("deleted a foreign exception, which no macro has".to_owned()).into());
             }
             Own::Backtrace => URC_END_OF_STACK,
+            Own::Write => match a[0] as i32 {
+                1 | 2 => {
+                    region.read(a[1], n()?)?;
+                    a[2]
+                }
+                // alloc: error path
+                fd => return Err(Stop(format!("writes to file descriptor {fd}, which only stdout and stderr may be")).into()),
+            },
         };
         ret[..8].copy_from_slice(&value.to_le_bytes());
         ret[8..].fill(0);

@@ -1,0 +1,25 @@
+{
+  "id": "01055",
+  "from_lane": "integrate-store-harness",
+  "owner": "integrate-store",
+  "paths": [
+    "harness/storelib.py",
+    "harness/ci.py",
+    "docs/harness.md"
+  ],
+  "what": "integrate-store-harness done; report /tmp/blaze-lanes/v2-integrate-store-harness.md. Ported onto the v2 daemon (typed input): storelib, storekills, storecorrupts, storefull, storeguards (fails until 00999), storetracked, storerevisions, fuzz/store. Deleted: remote, s3fake, packs, storebuilds, storeshared, storefirst. ci.py rows, docs/harness.md, unittests, cpufold, testselect, soak cut. Open: 01052, 01053, 01054 (docs/support.md:104 is the last tools/docs.py check problem). Nothing run.",
+  "state": "open",
+  "created": "2026-10-30T14:50:43Z",
+  "updated": "2026-10-30T14:50:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:50:43Z",
+      "by": "integrate-store-harness",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

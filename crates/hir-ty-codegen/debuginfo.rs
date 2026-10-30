@@ -398,12 +398,9 @@ pub(super) struct FunctionDebug {
     pub(super) declared: Option<Place>,
     /// Where the code is from, from each offset on, in the order of the offsets.
     pub(super) rows: Vec<(CodeOffset, Place)>,
-    /// The types of the variables and what those are made of. The store keeps a set once,
-    /// for every function that has it: see `stored_types`.
+    /// The types of the variables and what those are made of.
     #[serde(skip)]
     pub(super) types: Vec<TypeSet>,
-    /// The keys `types` are in the store under, of an entry of the store.
-    pub(super) stored_types: Vec<[u8; super::store::KEY]>,
     pub(super) scopes: Vec<Scope>,
     pub(super) variables: Vec<VariableDebug>,
     /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
@@ -506,9 +503,8 @@ pub(super) struct Describer {
     sent: std::sync::atomic::AtomicUsize,
 }
 
-/// A function to describe, with the entries it is of when the store had it: its types are read
-/// on the describing thread.
-type Sent = (FuncId, u32, FunctionDebug, Option<std::sync::Arc<super::cached::Entries>>);
+/// A function to describe: the function, its length in bytes, and what to tell of it.
+type Sent = (FuncId, u32, FunctionDebug);
 
 struct Shard {
     functions: std::sync::mpsc::Sender<Sent>,
@@ -536,7 +532,6 @@ impl Describer {
             && dwarf.apart.is_none()
             && !dwarf.grouped
         {
-            // The types of the functions put in from the store are read here as well.
             contexts.extend((1..(threads / 4).clamp(1, 16)).map(|_| dwarf.like()));
         }
         let contexts = std::iter::once(context)
@@ -549,18 +544,7 @@ impl Describer {
 
     /// Describes the function `func` of the module, which is `len` bytes of code.
     pub(super) fn add_function(&self, func: FuncId, len: u32, debug: FunctionDebug) {
-        self.send((func, len, debug, None));
-    }
-
-    /// Describes the function `func` put in the module from `entries`.
-    pub(super) fn add_stored(
-        &self,
-        func: FuncId,
-        len: u32,
-        debug: FunctionDebug,
-        entries: std::sync::Arc<super::cached::Entries>,
-    ) {
-        self.send((func, len, debug, Some(entries)));
+        self.send((func, len, debug));
     }
 
     fn send(&self, function: Sent) {
@@ -599,10 +583,7 @@ impl Shard {
     fn new(mut context: DebugContext) -> Shard {
         let (functions, sent) = std::sync::mpsc::channel::<Sent>();
         let described = std::thread::spawn(move || {
-            for (func, len, mut debug, entries) in sent {
-                if let Some(entries) = entries {
-                    entries.describe(&mut debug);
-                }
+            for (func, len, debug) in sent {
                 context.add_function(func, len, &debug);
             }
             match context {

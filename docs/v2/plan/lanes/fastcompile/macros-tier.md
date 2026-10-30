@@ -214,15 +214,17 @@ it gives at their run addresses (no unsafe code), fills the call table, and lays
 region's image (statics, constants, `Location` records) with its 8-byte addresses resolved to
 guest offsets and table pointers. Targets are resolved before it runs (`load::To`).
 
-What runs it (decided 2026-10-30 by fastcompile-next1; to write):
+What runs it (decided 2026-10-30 by fastcompile-next1; written, in `tier/glue.rs`,
+`tier/machine.rs` and `tier/shims.rs`, all compiled; the build driver and the run are not):
 
 - **The machine stack** is the stack of a thread the run starts for its expansions (64 MiB,
   std's guard page below, std's alternate signal stack), outside every region. No code
   switches stacks: blaze enters the macro through an **entry thunk**, a function of our own IR
   compiled by stencil, `thunk(args, rets, vmctx, code) -> i64`, which loads the target's
   arguments from 16-byte slots, `try_call`s `code`, stores its results, and returns 0, or 1
-  from its handler block when an escape lands there. One thunk per table signature entered,
-  made the first time (the bridge's `run`, `reserve` and `drop`), in its own `Executable`.
+  from its handler block when an escape lands there. One thunk per signature the host enters
+  (the bridge's `run`, the buffer's `reserve` and `drop`), built with the crate and placed in
+  its image like any function (`glue::thunk`).
   A struct argument is passed as a host pointer to its bytes (the thunk's call copies it); a
   struct return as a guest pointer into the shadow stack.
 - **Shim stubs** are our IR too, one per binding, of the signature the macro calls it with:
@@ -255,6 +257,23 @@ What runs it (decided 2026-10-30 by fastcompile-next1; to write):
   expansion naming the symbol when called, as the evaluator stops at it; `_Unwind_Backtrace`
   is a shim that walks no frame (`_URC_END_OF_STACK`). Data with no shim is still refused
   when the crate is compiled.
+- **The OS shims' calls given back to the evaluator** (`futex`, `gettid`, the monotonic
+  clocks) are answered as its thread shims answer a run of one thread (`Os::as_one_thread`,
+  `os/thread.rs`); writes to stdout and stderr are taken and dropped, as the evaluator's run
+  drops its captured output.
+
+**Building** (to write, `tier/build.rs`). The roots are the build's own list of the crate's
+macros: the static `__blaze_proc_macros::BLAZE_PROC_MACROS`
+(`hir_ty_codegen::v2::roots::proc_macros`), whose initializer is each macro's
+`Client::expand1`/`expand2`, so `Build::reach(&[], &[that static])` reaches every client's
+`run` and all it calls. Each function is `lowered` (with `Backend::Stencil`, as
+`lowered/tests.rs` makes the frontend, policy and unit), `confine`d, and compiled by
+`blaze_stencil::compile`; each static and each function's `Data` is a `load::Blob` with
+`Prepare::compile_static`'s bytes and relocations; each `Target` maps to a `load::To`
+(`Function`/`Direct` to `Code`, a function's address to `Pointer`, `Static`/`Data` to `Blob`,
+`Extern`/`Weak` through `bind::external` to a stub, `Pure` to `Host`). A `run` pointer of the
+list is read from the static's relocation at its offset. The image is kept per code hash of
+the crate's reach, so one compile serves every expansion of the crate's version.
 
 ## Which tier
 

@@ -2,7 +2,7 @@
 """storetracked.py: a v2 daemon that starts on a store holding the checkout's code builds the
 checkout right, and every edit after it too (#105, #216). Linux and macOS.
 
-    python3 storetracked.py '{"blaze": "target/release/blaze"}'
+    uv run --frozen python harness/storetracked.py '{"blaze": "target/release/blaze"}'
 
 `blaze` is the v2 command line. The input is one JSON object, inline, a file's path, or `-`.
 

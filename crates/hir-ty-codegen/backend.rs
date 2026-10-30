@@ -611,22 +611,16 @@ pub(super) enum Step {
     Translate,
     /// Lines and variables for a debugger.
     Describe,
-    /// Reading an entry of the store.
-    StoreRead,
-    /// Encoding an entry and adding it to the store.
-    StoreWrite,
 }
 
 impl Step {
-    const COUNT: usize = 7;
+    const COUNT: usize = 5;
     const ALL: [(Step, &str); Step::COUNT] = [
         (Step::Infer, "infer"),
         (Step::Mir, "mir"),
         (Step::Monomorphize, "monomorphize"),
         (Step::Translate, "translate"),
         (Step::Describe, "describe"),
-        (Step::StoreRead, "store read"),
-        (Step::StoreWrite, "store write"),
     ];
 }
 
@@ -728,8 +722,6 @@ impl Tally {
             Step::Monomorphize => tracing::info_span!(target: "blaze", "monomorphize"),
             Step::Translate => tracing::info_span!(target: "blaze", "translate"),
             Step::Describe => tracing::info_span!(target: "blaze", "describe"),
-            Step::StoreRead => tracing::info_span!(target: "blaze", "store read"),
-            Step::StoreWrite => tracing::info_span!(target: "blaze", "store write"),
         }
         .entered();
         let start = Instant::now();

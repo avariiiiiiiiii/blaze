@@ -45,7 +45,6 @@ The key of a call is three things:
   The toolchain is its commit and the names of its library and compiler, and a hash of what the
   metadata of its `core`, `alloc` and `std` says of each crate (with the crate's hash, its SVH),
   so a library rebuilt under the same toolchain (`-Zbuild-std`, a patched sysroot) is another.
-  The code store keys by the same.
 
 The hash is a salsa query, `cache_code`, of the database blaze compiles from
 (`crates/hir-ty-codegen/fncache.rs`), so a daemon works it out once per edit, and two daemons
@@ -140,9 +139,6 @@ directory the program was built in, or `BLAZE_FN_CACHE_DIR`, up to 512 MiB
 a file of its own and renamed into place, so a run that stops partway leaves a whole entry or
 none, and each holds its key, so a damaged one is never taken for another.
 
-A setting under its name from before the rename stops blaze, which says what it is called now
-([rename.md](rename.md)).
-
 | Variable | |
 |---|---|
 | `BLAZE_FN_CACHE=off` | caches nothing |
@@ -156,16 +152,18 @@ A function's results on disk are kept for the code it has and the two codes befo
 first call of a run with code the function did not have drops what any older code computed,
 at once rather than when the size is reached.
 
-`blaze cache` lists what each function holds, for its code and for the older ones;
-`blaze cache clear --stale` forgets all but what each function's code computed, and
-`blaze cache clear` everything.
+v2 has no command that lists or clears what is kept: `blaze cache` was v1's. The library has
+`clear_stale` (`crates/blaze-cache/src/store.rs`) with nothing calling it; deleting the
+directory forgets everything.
 
 ## Live edits
 
-When a live edit changes the code a cached function reaches, the function is in the patch with
-its new hash: the next call computes again, and what the old code computed is dropped from
-memory. Results on disk are kept under the old hash, with those of the code before it, and are
-found again if the edit is taken back.
+v2 does not yet follow a cached function through a live edit. The function that asks for the
+code holds the hash as a constant, so it has to be compiled again when any code its body reaches
+changes. v1 did that in `crates/hir-ty-codegen/patch.rs` (`cached_roots`), which v2's build does
+not use. v2's code identity of a body (`hir_ty_share::code`, read by
+`crates/hir-ty-codegen/v2/hashes.rs`) takes each callee by its interface hash and does not hold
+that constant.
 
 ## How it is built
 
@@ -175,10 +173,9 @@ found again if the edit is taken back.
 - `crates/blaze-cache` (the `blaze` library): the store and that function, whose body
   answers "unknown", so under rustc nothing is cached.
 - `crates/hir-ty-codegen/fncache.rs`: blaze compiles a call of `__blaze_cache_code` into the
-  hash (or why the function can't be cached) as a constant. The function asking is compiled
-  again after any edit, since its constant can change with code in any file
-  (`patch.rs`, `cached_roots`). Only crates with `blaze` as a dependency are looked through
-  for such functions, and nothing is hashed or compiled for the hash unless one is called, so
-  a workspace without the attribute builds and patches as it did before.
+  hash (or why the function can't be cached) as a constant. Only crates with `blaze` as a
+  dependency are looked through for such functions (`hir_ty::fn_cache::uses_fn_cache`), and
+  nothing is hashed or compiled for the hash unless one is called, so a workspace without the
+  attribute builds as it did before.
 
-`harness/fncache.py` checks it end to end, and `fncache.py --live` the live edit on macOS.
+`harness/fncache.py` checks it end to end; its `--live` mode checked v1's live edit.

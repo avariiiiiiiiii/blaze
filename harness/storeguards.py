@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """storeguards.py: v2's store is its user's alone. Linux and macOS.
 
-    python3 storeguards.py '{"blaze": "target/release/blaze"}'
+    uv run --frozen python harness/storeguards.py '{"blaze": "target/release/blaze"}'
 
 `blaze` is the v2 command line. The input is one JSON object, inline, a file's path, or `-`.
 
@@ -27,7 +27,7 @@ from storelib import Checkout, Daemon, Failed, blaze_of, files, listing, named, 
 
 SCRIPT = "storeguards.py"
 # How blaze says that others than the user can write to a file or directory.
-OTHERS_WRITE = re.compile(r"other users|others can write|writable by|written to by", re.I)
+OTHERS_WRITE = re.compile(r"can be written to by other users|belongs to another user", re.I)
 
 
 @dataclass(frozen=True)

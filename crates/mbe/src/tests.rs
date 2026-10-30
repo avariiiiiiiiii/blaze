@@ -11,7 +11,6 @@ use tt::{TextRange, TextSize};
 
 use crate::DeclarativeMacro;
 
-#[expect(deprecated)]
 fn check_(
     def_edition: Edition,
     call_edition: Edition,

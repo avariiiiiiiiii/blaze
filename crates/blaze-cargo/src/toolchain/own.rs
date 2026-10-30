@@ -753,7 +753,7 @@ mod tests {
                 "rust-std-x86_64-unknown-linux-gnu",
                 "rust-std-wasm32-wasip1",
             ],
-            "proc macros are built for wasm32-wasip1 (own_macro.rs), so its library is pinned"
+            "proc macros are built for wasm32-wasip1 (blaze-macro-wasm), so its library is pinned"
         );
         assert!(
             !names.iter().any(|it| it == "rust-src"),

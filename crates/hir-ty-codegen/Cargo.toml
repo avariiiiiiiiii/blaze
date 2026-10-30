@@ -56,7 +56,6 @@ blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-stencil.workspace = true
-blaze-store.workspace = true
 
 cranelift-codegen = { version = "0.136", features = ["incremental-cache", "x86", "arm64"] }
 cranelift-frontend = "0.136"

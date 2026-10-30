@@ -372,7 +372,7 @@ impl TypeSet {
         for (at, nth, name) in named {
             types[at as usize].1[nth] = names.get(&name).copied();
         }
-        // alloc: the list the store keeps, once per set written (`cached.rs` keeps its key)
+        // alloc: the list, once per set listed
         types.iter().map(|(told, of)| expand(told, of)).collect()
     }
 
@@ -492,7 +492,7 @@ impl Found for Listed<'_> {
     type Key = TypeIndex;
 
     fn own(&mut self, key: &TypeIndex) -> Option<Arc<Own<TypeIndex>>> {
-        // alloc: once per type of a list read from the store (`cached.rs` keeps the set)
+        // alloc: once per type of a list read
         let mut of = Vec::new();
         let told = Interned::new(shape(self.types.get(*key as usize)?, &mut of));
         // alloc: as above, `Found::own` answers an `Own` counted

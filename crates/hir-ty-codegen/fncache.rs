@@ -141,8 +141,10 @@ pub(super) fn cache_code(
         return Err(format!("`{name}` is not cached: {why}"));
     }
     let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    // No toolchain is hashed: the `None` holds its place, which every hash so far was of.
-    (FORMAT, super::target::Target::current().triple(), None::<&str>).hash(&mut hasher);
+    // The nightly: what is outside the checkout is hashed by its stable name, which a
+    // nightly's std can change the code of.
+    let toolchain = crate::v2::toolchain::NIGHTLY;
+    (FORMAT, super::target::Target::current().triple(), toolchain).hash(&mut hasher);
     closure.checked.hash(&mut hasher);
     for arg in closure.args.as_ref().iter() {
         arg.ty()
@@ -182,8 +184,8 @@ pub fn tests_reach(
         FORMAT,
         "tests by stable names",
         super::target::Target::current().triple(),
-        // As in `cache_code`: the place of a toolchain, which is not hashed.
-        None::<&str>,
+        // As in `cache_code`.
+        crate::v2::toolchain::NIGHTLY,
     );
     let started = std::time::Instant::now();
     let zero = std::time::Duration::ZERO;

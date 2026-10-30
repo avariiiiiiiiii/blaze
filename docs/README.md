@@ -10,7 +10,6 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 - [benchmarks.md](benchmarks.md): How long an edit takes to build, the memory and disk it uses and how fast its programs run, against cargo, on three platforms.
 - [borrowck.md](borrowck.md): blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
-- [cache.md](cache.md): The disk store every daemon shares and the remote (a directory or S3) machines push to and pull from.
 - [cargo.md](cargo.md): Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
 - [const.md](const.md): Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
 - [contributing.md](contributing.md): How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.

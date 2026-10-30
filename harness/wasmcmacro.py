@@ -5,8 +5,7 @@ zed's `include_flate_codegen` links zstd-sys, whose build script compiles zstd w
 compiler of `TARGET`. blaze ran that script for the host alone, so the macro's module, built
 for wasm32-wasip1, was linked with the host's `libzstd.a` ("neither Wasm object file nor LLVM
 bitcode") and failed (promote run 40895100165). For a module, the build script of each library
-it links runs for wasm32-wasip1, as cargo runs it for a library built for that target
-(compile_time.rs).
+it links runs for wasm32-wasip1, as cargo runs it for a library built for that target.
 
 The macro here hashes its input with a C function of `csum`, whose build script compiles it
 with the compiler of `TARGET` (`CC_<target>`, `CC` or `cc`, as cc-rs looks) and archives it
